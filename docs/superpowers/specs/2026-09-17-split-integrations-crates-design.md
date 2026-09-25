@@ -46,11 +46,15 @@ discovery order will never affect execution. For auction providers, that order
 is also operational priority: it controls launch and response order, mediator
 input order, and local equal-price tie-breaking.
 
-The compatibility baseline is the behavior shipped on `origin/main` at
-`a4e01eb55`, not either prior pull request discussed below. This design changes
-only the configuration, activation, and ordering behavior called out explicitly
-in this document; all other current runtime, browser, CLI, and cache behavior is
-preserved.
+Repository discovery started from `origin/main` at `a4e01eb55`, not either
+prior pull request discussed below. That commit contains the known P1 output
+defects listed as prerequisites here and is not an acceptable compatibility
+golden. Implementation branching is blocked until the prerequisite fixes land;
+the recorded baseline is then the resulting `origin/main` commit plus captured
+Next.js/GTM/RSC and browser-runtime output goldens. This design changes only the
+configuration, activation, and ordering behavior called out explicitly in this
+document; all other corrected-baseline runtime, browser, CLI, and cache behavior
+is preserved.
 
 This remains one design, but it has two merge milestones. The crate and runtime
 boundary moves first without changing operator configuration. The ordered,
@@ -182,11 +186,57 @@ PR #1135 is part of the current baseline. Its parser-aware streaming Next.js
 processor, test support, and cross-adapter parity case move with the integration;
 the removed HTML post-processor is not recreated by this work.
 
-Before either milestone branches for implementation, its baseline commit and
-locked EdgeZero revision are recorded again and every baseline-dependent
-inventory in this document is rechecked. Open or previously approved pull
-requests never override a decision in this specification merely because of
-their review status.
+### Open Defect and In-Flight Work Disposition
+
+The following items are open as of 2026-09-24. They are coordination inputs,
+not design authorities. “Prerequisite” means the focused fix lands on `main`
+and this specification records a new baseline before extraction begins; the
+crate split does not absorb that bug fix into a move commit.
+
+| Item         | Disposition                                                                                                                                                                                                                                                                             |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1196        | Prerequisite. Restore cross-IIFE context/log state on the current layout, remove or debug-gate Creative's unconditional log-level bump, and add a production-artifact test. The milestone-one typed facade supersedes any transitional `Symbol.for` storage without reverting behavior. |
+| #1197        | Prerequisite. Make set-valued configuration serialization deterministic before EdgeZero or template hashes depend on it.                                                                                                                                                                |
+| #1198        | Prerequisite. Add the deterministic build digest defined below to the current template key before extraction; the split reuses the same contract.                                                                                                                                       |
+| #1199        | Prerequisite. Replace substring DOM ownership with parsed host/path ownership on the current layout.                                                                                                                                                                                    |
+| #1200        | Prerequisite. Remove the shared-`dist` partial-build race before two Rust crates consume browser outputs; milestone one then adopts owner-private outputs and the lock contract below.                                                                                                  |
+| #1201        | Milestone two. New source and schema 2 reject unknown catalog IDs and fields. The temporary schema-1 reader deliberately retains baseline acceptance with a warning and is not “fixed” retroactively.                                                                                   |
+| #1202        | Prerequisite. Make `ts prebid bundle` use the permission-preserving atomic writer and non-disclosing parse errors; the moved command retains that corrected behavior.                                                                                                                   |
+| #1203        | Prerequisite and adopted decision. A parsed non-2xx mediator response is a mediation failure and falls back to local ranking as specified below.                                                                                                                                        |
+| #1204        | Prerequisite. Every Rust CI job that can trigger a browser build installs the pinned Node toolchain and dependencies; obsolete direct Rust browser dependencies are removed.                                                                                                            |
+| #1205        | Proposed remedy superseded. This specification keeps operator order and uses the pure script-source claim validation below instead of an unconditional hidden first phase. The issue must be revised to that contract or closed.                                                        |
+| #1206, #1207 | Prerequisites resolved by #1208. Their output regressions are not accepted as differential-harness goldens.                                                                                                                                                                             |
+| #1208        | Prerequisite. Compose script-text rewriters on the current layout and add Next.js/GTM output goldens before the baseline is captured.                                                                                                                                                   |
+
+PR #1052 may contribute neutral renderer diagnostics, but APS-named browser
+core members do not enter core; they move with APS or become generic renderer
+reason fields. PR #1175 and EdgeZero PR #381 are rollout prerequisites: the
+typed-config extension and Fastly store procedure build on their reviewed
+environment-selector line or an equivalent merged successor, never on v0.0.8.
+
+This specification partially supersedes the following earlier design documents
+only where they conflict with the new ownership, configuration, or fingerprint
+contracts:
+
+- `2026-08-10-config-first-auction-provider-architecture-design.md`: its
+  provider inventory, selection, and ordering syntax are superseded; reusable
+  neutral auction-engine findings remain evidence to reverify.
+- `2026-07-15-gam-ts-cohort-attribution-design.md` and
+  `2026-08-19-gam-attribution-review-resolution-design.md`: attribution wire
+  behavior remains, while concrete GPT code and assets move to their integration
+  owner.
+- `2026-09-08-1138-per-cookie-template-cache-policy-design.md`: cookie/Vary
+  policy remains, while complete-settings fingerprinting is replaced by the
+  composition/build digest defined here.
+- `2026-07-24-prevent-duplicate-gpt-slot-requests-design.md`: duplicate-slot
+  behavior remains, while concrete GPT state and browser ownership move outward.
+
+Before either milestone branches for implementation, all prerequisite issues in
+the disposition table must have landed, then the baseline commit, output
+goldens, and locked EdgeZero revision are recorded again and every
+baseline-dependent inventory in this document is rechecked. Open or previously
+approved pull requests never override a decision in this specification merely
+because of their review status.
 
 ## Rejected Alternatives and Rationale
 
@@ -219,6 +269,28 @@ implementation cannot quietly reintroduce the rejected mechanism.
   **Decision:** `[integrations.<id>]` selects the statically cataloged
   integration, while nested instance names identify reusable provider
   configurations. Capability types remain Rust contracts, not configuration.
+- **Keeping local provider IDs as the permanent global identity.** Stable
+  external values during the dual-reader rollout are required; that concern is
+  accepted. **Objection:** local IDs can collide across owning integrations and
+  cannot safely key one cross-integration plan. **Decision:** the plan always
+  uses `QualifiedProviderId`, while an explicit external label preserves local
+  schema-1 values and changes to qualified values only at the schema-2 cutover.
+- **Keeping concrete browser integrations in the neutral JS crate or splitting
+  them into one package per vendor.** One tested Node dependency graph is
+  required. **Objection:** leaving vendor sources in the neutral crate preserves
+  the ownership inversion, while per-vendor packages multiply lockfiles,
+  resolution rules, and release surfaces without independent consumers.
+  **Decision:** use one `trusted-server-integrations-js` Rust/source crate for
+  concrete integration browser code and one canonical Node project shared with
+  neutral browser core.
+- **Keeping the existing mediator trait object unchanged.** One reusable
+  mediator implementation and stable fallback behavior are required.
+  **Objection:** the existing object couples configuration selection, request
+  preparation, transport, response parsing, and provider-specific state, which
+  forces concrete knowledge and downcasts across the core boundary.
+  **Decision:** use a typed mediator registration, prepared request, and bound
+  response parser while retaining the existing wire protocol and the corrected
+  fallback policy.
 - **An operator-written `[auction] provider_order` list.** Provider priority
   must represent schema-1's globally interleaved lexical order; that concern is
   accepted. **Objection:** a second operator list would duplicate every provider
@@ -235,9 +307,11 @@ implementation cannot quietly reintroduce the rejected mechanism.
   order contract false and still would not reproduce baseline Prebid removal
   behavior, because Prebid precedes `js_asset_proxy` today. **Decision:** legacy
   compatibility paths reproduce the complete baseline sequence. Schema 2
-  exposes chained replacement and terminal removal in declaration order and
-  diagnoses known overlaps rather than silently overriding the operator's
-  order.
+  exposes chained replacement and terminal removal in declaration order. Pure
+  per-definition script-source claims make an earlier conflicting owner a
+  validation error, so the operator must place `js_asset_proxy` first for a
+  deliberate per-URL override instead of receiving a silent order-dependent
+  bypass.
 - **Treating PR #1016, PR #1084, or earlier review statements as design
   authority.** Their code and tests can reveal compatibility constraints, and
   conflicting in-flight work needs an explicit disposition. **Objection:**
@@ -254,10 +328,11 @@ implementation cannot quietly reintroduce the rejected mechanism.
   project with explicit, tested resolver and tool-root configuration for the
   sibling sources. Moving the root remains a fallback only if that contract
   cannot be made reliable.
-- **A new public configuration-status endpoint.** Runtime settings must be
+- **A new configuration-status endpoint, public or authenticated.** Runtime settings must be
   loaded and the expected schema must be observable during rollout; that
-  concern is accepted. **Objection:** a new endpoint would add an authentication
-  and public-API surface unrelated to the crate split.
+  concern is accepted. **Objection:** even an authenticated endpoint would add
+  a new route, authorization contract, and public support surface unrelated to
+  the crate split.
   **Decision:** use adapter-native version/binding inspection, startup
   schema-and-digest logging, and an existing authenticated or
   settings-dependent probe.
@@ -357,12 +432,13 @@ The following terms are distinct:
 - **Integration configuration:** the single ordered operator block at
   `[integrations.<id>]` that activates and configures the definition.
 - **Auction provider instance:** one named endpoint and policy configuration
-  below an integration, such as `aps.main`. Multiple instances may use the same
+  below an integration, such as `aps.aps-main`. Multiple instances may use the same
   integration implementation.
 - **Local provider ID:** the provider name within one integration, such as
-  `main`.
+  `aps-main`.
 - **Qualified provider ID:** the strong, globally unique pair of an integration
-  ID and local provider ID, serialized as `<integration>.<local-provider>`.
+  ID and local provider ID, such as `aps.aps-main`, serialized as
+  `<integration>.<local-provider>`.
 - **Integration registry:** core runtime state containing the enabled page,
   request, response, and browser capabilities in configuration order.
 - **Auction plan:** core runtime state containing the validated configured
@@ -523,6 +599,11 @@ not added to core's `Settings`. Composition consumes the integration portion
 into capabilities and returns a neutral runtime `Settings` value containing
 only state that core execution engines understand.
 
+The public-API snapshot classifies exports as stable neutral contract,
+integration-owned facade, or milestone-one transitional delegation. A
+transitional export must name its replacement and owning move step; adding one
+requires review, and the class must be empty before milestone 1 exits.
+
 The public API has four explicit levels:
 
 1. `SourceConfigView` performs the TOML pre-pass, typed parse, catalog
@@ -550,14 +631,16 @@ The public API has four explicit levels:
 
 This distinction makes "runtime-only construction" precise: it does not move
 any currently push-time, secret-independent plan failure to startup. Diff and
-push have one selected adapter and fail when its target validation fails.
-`config validate` has no adapter selector: it runs target validation for every
-supported adapter declared by the manifest and prints a named result per target.
-Ordinary validate fails on target-neutral errors and reports target-specific
-failures as warnings so a valid Fastly configuration is not rejected merely
-because the same multi-provider plan cannot run on Cloudflare or Spin;
-`config validate --strict` fails if any declared target fails. A fixture rejected
-by runtime composition for a secret-independent reason must produce the same
+push have one selected adapter and fail when its target validation fails. The
+existing EdgeZero `config validate --strict` meaning is unchanged: it enforces
+the manifest-completeness and handler-path checks already owned by EdgeZero.
+Trusted Server target-plan validation is exposed separately as a repeatable
+`ts config validate --target <adapter>` option. With no `--target`, the command
+runs target-neutral Trusted Server checks plus existing EdgeZero validation;
+with one or more targets, every selected target is checked and any target
+failure makes the command fail. Auction-testing documentation and smoke
+commands use this same target spelling. A fixture rejected by runtime
+composition for a secret-independent reason must produce the same
 target-neutral error or the same named target result in the CLI.
 
 The complete source and validated views retain the typed operator configuration
@@ -602,12 +685,15 @@ verified-data boundary. The integration crate composes it in this order:
 ```text
 config-store bytes
   → core chunk reconstruction and envelope verification
-  → settings-only neutral view
+  → application-schema dispatch
+  → schema-2 sidecar/map bijection or schema-1 normalization
   → core-owned neutral/global inactive-secret preprocessing
   → catalog-owned integration inactive-secret preprocessing
   → aggregated core + integration secret resolution
-  → catalog-aware config validation
+  → resolved settings-only neutral view
+  → catalog-aware resolved-value validation
   → core AuctionPlan compilation
+  → target validation
   → plan-dependent capability construction
   → core IntegrationRegistry and orchestrator construction
   → browser asset composition and document fingerprint
@@ -622,16 +708,17 @@ dependency;
 depends on `edgezero-cli`.
 
 The current locked EdgeZero revision does not expose enough context for this
-contract. EdgeZero therefore gains one narrow typed-config extension with two
-default no-op stages. The source stage receives the selected app-config path and
-exact raw bytes before deserialization. The effective-config stage receives a
-borrow of the overlay-applied typed value plus the command kind and target
-context EdgeZero already resolved: one adapter for diff/push and the manifest's
-declared supported adapter set for validate. It does not select or mutate a
-target. EdgeZero reads the file once, runs the source-aware pre-pass, constructs
-one typed value, invokes command validation on that value, and serializes that
-same value. Validate, diff, and push therefore cannot validate one app-config
-read or typed value and serialize another.
+contract. Building on EdgeZero PR #381 and Trusted Server PR #1175, EdgeZero
+therefore gains one narrow typed-config extension with two default no-op
+stages. Target resolution occurs before either hook. One exact source read is
+shared by the source pre-pass, environment overlay, secret checks, typed
+callback, diff, and serialization; a callback cannot reopen the path. Hook
+context contains the command kind, the one selected target for diff/push or
+the explicitly requested target set for validate, app environment-variable
+prefix, `--no-env`, EdgeZero's existing `strict` flag, raw path and bytes, and a
+borrow of the overlay-applied typed value. EdgeZero invokes command validation
+and serializes that same value. Validate, diff, and push therefore cannot
+validate one app-config read or typed value and serialize another.
 
 All workspace `edgezero-*` dependencies are then repinned together from v0.0.8
 to one immutable, reviewed tag or commit containing this extension. The
@@ -641,7 +728,10 @@ replaces the filesystem snapshot wrapper entirely: config commands do not write
 temporary operator or manifest copies, require a writable checkout, rewrite
 logged paths, or rely on destructor cleanup around `process::exit` and signals.
 If the extension cannot land and the workspace cannot repin to its reviewed
-revision, milestone 2 is blocked rather than restoring the snapshot design.
+revision, milestone 1 is blocked rather than restoring the snapshot design.
+Push-time selected-target validation is an explicit milestone-one CLI delta
+needed to place all deploy validation behind the new composition root; it does
+not enable schema 2 or configuration-order semantics.
 
 Read-only `config ad-templates` and `audit ad-templates` commands load the
 effective `SourceConfigView` with the existing optional environment overlay when
@@ -660,6 +750,11 @@ an already-invalid baseline retains the current warning and atomic-write escape
 hatch without disclosing source values. Final validate, diff, and push always
 use the complete `ValidatedSourceConfig` path.
 
+The migration updates ad-template lint/help text and `--explain` rule counts in
+the same commit so neither describes `[auction.providers]` or reports a stale
+number of checks. Documentation-snippet and exact-message tests pin the new
+integration-owned paths and counts.
+
 `ts prebid bundle` obtains typed bidder, User ID, analytics, and managed-module
 requirements through an integration-owned
 `PartialSourceConfigView<PrebidConfig>` rather than a duplicate CLI schema. It
@@ -667,15 +762,20 @@ intentionally does not require unrelated app
 configuration or an `external_bundle_url` to be deploy-valid: `bundle.modules`,
 `external_bundle_sha256`, and `external_bundle_sri` are inert staging metadata,
 while `external_bundle_url` activates the browser capability. The command
-retains its current ability to build first, atomically patch hash/SRI metadata,
-and tell the operator to upload and set the URL. It validates the structural
+retains its current ability to build first, patch hash/SRI metadata through the
+permission-preserving `write_file_atomically` path, and tell the operator to
+upload and set the URL. It validates the structural
 pre-pass and affected Prebid subtree before writing; full app validation remains
 the contract of config validate/push. Because parent position is runtime order,
 the command no longer invents or appends a missing `[integrations.prebid]`
 parent. It requires an existing parent with explicit `enabled`, or exits with a
 placement example; it may create only owned descendants beneath that parent.
 Provider diagnostics display qualified providers in configuration order rather
-than alphabetizing a detached map.
+than alphabetizing a detached map. TOML parse failures report only the path and
+line/column; diagnostics never echo source lines or configuration values. The
+command canonicalizes both the Node package root and every integration-owned
+source input and rejects realpaths that do not belong to the same workspace and
+worktree checkout.
 
 `ts audit generate` may retain detector and edit metadata for concrete
 integrations under this design's audit-reorganization non-goal. That metadata is
@@ -716,33 +816,45 @@ owned unit/artifact tests live under `trusted-server-integrations-js`. The
 shared configuration does more than include that sibling source root:
 
 - Vite and Vitest resolve bare packages through the canonical project's
-  exports-aware resolver and deduplicate stateful browser-core entry points.
+  exports-aware resolver. Runtime state is externalized behind the facade; the
+  build does not depend on bundler deduplication of stateful entry points.
 - TypeScript includes both source roots and supplies exact package paths where
   Node's ancestor walk cannot reach the canonical `node_modules`.
-- Vitest names the sibling test directory, includes its runtime and type tests,
-  and has a deliberately failing typecheck canary so `ignoreSourceErrors` or an
-  empty glob cannot make the gate pass silently.
-- ESLint uses an explicit common base path and source globs. Prettier always
+- Vitest names the sibling test directory and includes its runtime tests. A
+  separate canary command intentionally typechecks a fixture with one expected
+  error and asserts that exact diagnostic, so an empty glob or disabled source
+  checking cannot pass silently. The canonical package provides a real
+  `npm run typecheck` script for both roots.
+- ESLint is invoked from their common ancestor with explicit source globs; it
+  does not require moving `package.json`. Prettier always
   receives the canonical `--config` path for sibling files.
 - Generated external-Prebid entries live under the canonical project or use an
   explicit resolver that preserves the `prebid.js` package `exports` map; a
   directory alias that bypasses package exports is forbidden.
+- Because the current `gpt_bootstrap.js` fails the canonical formatter and
+  legacy browser lint rules, its move preserves output behind one exact-path
+  Prettier ignore and one documented, exact-path ESLint legacy override. The
+  shared rules are not weakened; modernizing that file is separate work.
 
 Separate build targets emit neutral and integration artifacts directly into
 private owner-specific directories below their Cargo `$OUT_DIR` and validate
 per-target manifests before embedding them. They never clean, discover, or copy
-from one shared `dist` directory. A cross-process lock covers dependency
-installation or mutation only; completed dependency trees may be read by
-parallel owner builds. This removes stale/partial discovery races without
-serializing every adapter build.
+from one shared `dist` directory. The dependency installer takes an exclusive
+cross-process lock; Vite, Vitest, TypeScript, ESLint, Prettier, both embed
+builds, and the CLI Prebid builder take a shared lock for their whole process,
+so `npm ci` cannot remove `node_modules` beneath a reader. Owner manifests
+record a digest of their complete source inputs and
+reject stale output. This removes stale/partial discovery races while allowing
+parallel readers. Every Rust and Node participant uses the same canonical lock
+path and compatible shared/exclusive protocol; per-crate locks are invalid.
 
 The integration build discovers immediate directories containing `index.ts`
 and emits one IIFE per entry point. An IIFE may call the external versioned
 browser runtime facade and therefore is not described as self-contained. Its Cargo build embeds each
 output and its SHA-256 hash. CI, browser integration scripts, and the CLI
 Prebid builder use the single workspace root rather than maintaining a second
-dependency graph; Dependabot continues to watch the one browser lockfile in
-addition to the repository's unrelated Node projects.
+dependency graph. Dependabot's existing browser entry continues to watch this
+one lockfile; the existing docs entry is unchanged.
 
 Canonical npm build, typecheck, lint, format, and test commands include both
 source roots explicitly, and CI invokes those commands rather than core-only
@@ -762,7 +874,20 @@ paths explicitly and has no hard-coded `src/integrations/prebid` assumption.
 The CLI resolves the canonical package root for dependencies and obtains the
 integration-owned input paths and typed module requirements from the
 integrations facade; it does not locate a registry through its own relative
-path constant.
+path constant. The facade returns repository-relative paths, never absolute
+compile-checkout paths. The CLI resolves both the package root and inputs under
+one selected runtime repository/worktree root, canonicalizes them, and rejects
+any realpath that escapes or crosses that checkout. A two-worktree test proves
+it cannot fall back to a compile-time `CARGO_MANIFEST_DIR` in the other checkout.
+
+When a browser build is required, a missing `npm` or failed dependency setup is
+a hard error. `TSJS_SKIP_BUILD=1` is a local-development escape hatch only when
+every expected owner manifest and artifact exists and its recorded input digest
+matches; CI never sets it. Build scripts emit `rerun-if-env-changed` for
+`TSJS_SKIP_BUILD`, `TSJS_TEST`, and every tool environment variable that changes
+output, in addition to complete `rerun-if-changed` input coverage. Every Rust CI
+job that can build either browser crate installs the repository-pinned Node
+version and dependencies, satisfying prerequisite #1204.
 
 The generated Rust API exposes typed module identifiers rather than accepting
 unchecked strings. A Rust registration referencing a missing browser module
@@ -812,6 +937,35 @@ an OpenRTB profile or mediator may appear at most once per integration
 definition; duplicate registration fails composition. Because provider tables
 have no profile discriminator, an integration that owns
 `auction.providers` must register exactly one OpenRTB profile capability.
+
+Before constructing executable capabilities, each definition produces a pure
+`IntegrationDeclaration` from its validated, unresolved-secret source view. It
+contains provider/profile facts, mediator presence, browser modules, reserved
+inputs, exact or pattern-based route claims, and ordered script-source claims.
+These declarations are the shared input to CLI and runtime validation; they do
+not allocate clients, read secrets, or execute a rewriter.
+
+A script-source claim is a pure
+`claims_script_src(url) -> Replace | Remove | None` predicate with its owning
+integration ID and source field. Native integration claims use the same parsed
+URL/pattern semantics as their executable attribute rewriter. During schema-2
+validation, every `js_asset_proxy` asset URL is evaluated against claims from
+earlier enabled integrations. Any earlier `Replace` or `Remove` conflicts with
+the asset's `enabled` or `blocked` policy and fails validate, diff, push, and
+startup, naming both integration tables and the URL. Placing `js_asset_proxy`
+before the native owner is the explicit, visible per-URL override; terminal
+blocking or replacement then follows the ordinary chain. Schema-1 compatibility
+uses the frozen legacy sequence and does not apply new schema-2 overlap
+strictness. `ts config migrate` evaluates its schema-2 candidate and refuses to
+write a conflicting result until the operator reorders the parent or removes
+the contradictory asset.
+
+Route claims likewise carry method plus canonical path/pattern ownership and
+are derived from pure configuration, including Prebid `script_patterns` and
+`js_asset_proxy` routes. Duplicate routes therefore fail in
+`ValidatedSourceConfig` as well as runtime composition. A future integration
+whose route shape depends on a resolved secret needs a separate contract; it
+may not defer an otherwise source-visible route collision to startup.
 
 The OpenRTB profile boundary has three stages:
 
@@ -876,13 +1030,15 @@ neutral boundary has three parts:
    normalized mediation result.
 
 Core retains mediator transport, deadline enforcement, telemetry, and the
-existing outcome policy. Dispatch or parse errors warn and fall back to local
-ranking. A successfully parsed non-2xx `adserver_mock` error response is a
-mediator response with zero winners and does not fall back; that current
-distinction is covered by a contract test. The current mediator endpoint policy,
-including an allowed HTTP endpoint where supported today, is preserved. Its
-response correlation remains the current mediator integration identity rather
-than being silently rewritten as an auction-provider identity.
+corrected prerequisite #1203 outcome policy. Dispatch errors, parse errors, and
+all non-2xx responses are mediation failures: they warn and fall back to local
+ranking. Non-2xx telemetry records stable reason `http_status`, the numeric
+status, and `fallback_used = true`; it never fabricates a mediator winner, and
+the original ordered provider outcomes and locally selected winner remain
+attributed to their providers. The current mediator endpoint policy, including
+an allowed HTTP endpoint where supported today, is preserved. Its response
+correlation remains the current mediator integration identity rather than being
+silently rewritten as an auction-provider identity.
 `adserver_mock` owns only request construction and response interpretation. The
 old mediator use of `Arc<dyn AuctionProvider>` is deleted when its last caller
 migrates.
@@ -922,9 +1078,10 @@ capabilities or providers. Configuration cannot activate APS or Prebid through
 an auction plan while omitting its parent. References to an absent or unknown
 parent fail validation. References to an explicitly disabled, known integration
 remain in source as a kill switch: they are omitted from the compiled route or
-mediator plan with one aggregated warning and ordered diagnostics, and become
-subject to full validation again when the parent is enabled. No unknown ID is
-silently treated this way.
+mediator plan with one aggregated warning and ordered diagnostics. Their IDs,
+references, and structure are still fully validated; only active-value
+semantics resume when the parent is enabled. No unknown ID is silently treated
+this way.
 
 Provider-owning integrations use the following explicit activation rules. They
 do not add capability names or implementation discriminators to operator
@@ -944,11 +1101,13 @@ Thus a current server-only Prebid provider migrates beneath an enabled Prebid
 parent without activating Prebid's page/browser behavior. Browser-only Prebid
 continues to be selected by the same required external-bundle URL that current
 startup validation already uses. The closed browser-only source-field set is
-`account_id`, `debug`, `script_patterns`, `client_side_bidders`,
-`excluded_gam_ad_unit_path_suffixes`, and `managed_user_ids`. Any explicitly
-configured or effectively non-default value in that set without
+`account_id`, `debug`, `timeout_ms`, `script_patterns`, `client_side_bidders`,
+`excluded_gam_ad_unit_path_suffixes`, and `managed_user_ids`. Any defaulted
+typed value in that set that differs from its declared default without
 `external_bundle_url` fails validation rather than activating a partial browser
-path; an implicit default script-pattern list alone does not activate or fail.
+path. Validation is value-based, not source-presence-based: explicitly spelling
+the default is equivalent to omitting it, and an implicit default script-pattern
+list alone does not activate or fail.
 CLI-only `bundle.modules`, `external_bundle_sha256`, and
 `external_bundle_sri` may be staged without a URL and never activate runtime
 browser behavior. For APS, a configured provider necessarily activates its
@@ -1062,9 +1221,9 @@ repeat under different integrations without collision.
 Provider identity uses three strong types rather than broadening the existing
 local identifier:
 
-- `IntegrationId` matches `^[a-z][a-z0-9_]{0,62}$`. The underscore permits the
-  existing Rust module IDs such as `adserver_mock`; dots are forbidden. Its
-  maximum length is 63 ASCII bytes.
+- `IntegrationId` matches `^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$`, with a maximum of
+  63 ASCII bytes. This permits existing IDs such as `adserver_mock` while
+  forbidding dots, leading/trailing underscores, and repeated underscores.
 - `LocalProviderId` retains the current
   `^[a-z][a-z0-9-]{0,62}$` grammar; dots are forbidden. Its maximum length is
   63 ASCII bytes.
@@ -1072,17 +1231,25 @@ local identifier:
   exactly one dot separator, and has a maximum serialized length of 127 ASCII
   bytes.
 
-`QualifiedProviderId` is the type used by bidder routes, provider plans,
-backend discriminators, auction responses, diagnostics, and telemetry. Its
-canonical `Display` and serde representation is `<integration>.<local>`. No
-consumer reconstructs it with string concatenation, truncates it, or treats a
-local provider ID as globally unique. Adapter target validation continues to
-predict and reject backend-name collisions using the complete qualified
-identity. A platform backend name is not itself the provider identity. Where an
-adapter's normalization is lossy, as with Axum mapping dots, hyphens, and
-underscores to the same character, its correlation name includes a stable
-digest of the full qualified ID. Target validation rejects any remaining final
-name collision. Tests cover aliases such as `a_b.c` and `a.b-c`.
+`QualifiedProviderId` is the internal identity used by bidder routes, provider
+plans, and lookup indexes. Its canonical `Display` and serde representation is
+`<integration>.<local>`. `ExternalProviderLabel` is the separate validated
+string used on backend discriminators, auction responses, diagnostics,
+telemetry, mediator correlation, and other externally keyed maps: it contains
+the legacy local ID for schema 1 and the qualified ID for schema 2. Every such
+map is built from an explicit `ExternalProviderLabel -> plan ordinal` index;
+label collisions fail validation and no lookup uses `unwrap_or(usize::MAX)` or
+map iteration as a fallback ordering rule.
+
+No consumer reconstructs either type with ad hoc string concatenation,
+truncates it, or treats a local provider ID as globally unique. Adapter target
+validation predicts and rejects backend-name collisions using the complete
+qualified identity. A platform backend name is not itself the provider
+identity. Where an adapter's normalization is lossy, as with Axum mapping dots,
+hyphens, and underscores to the same character, its correlation name includes
+a stable digest of the full qualified ID. Target validation rejects any
+remaining final name collision. Tests cover aliases such as `a_b.c` and
+`a.b-c`.
 
 Internal qualified identity and externally serialized identity cut over at
 different times. The schema-1 compatibility reader constructs a qualified
@@ -1138,13 +1305,17 @@ The contract is:
    flattened plan. With the existing strict-greater-than price comparison, the
    first configured provider retains an equal-price tie during local winner
    selection. Dispatch checks the remaining shared deadline immediately before
-   each back-to-back launch, so every later launch observes a smaller logical
-   budget and may also cross an adapter timeout bucket; order is budget-visible
-   even when the deadline does not expire.
-10. Shared browser dispatchers execute handlers by the owning integration's
-    configured ordinal and then definition-local registration order. Wall-clock
-    registration timing, numeric priority, and lexical handler ID are not
-    alternate ordering mechanisms.
+   each back-to-back launch. A later provider receives
+   `min(remaining_deadline, provider_timeout)`; elapsed time reduces the shared
+   remainder but may not change the logical budget when the provider's own
+   shorter timeout still caps it. Order remains launch-, response-, mediator-,
+   and tie-visible even when budget values happen to match.
+10. Shared browser dispatchers execute immediate handlers by IIFE registration
+    sequence and then definition-local registration order. Because immediate
+    IIFEs are concatenated in configuration order and must register
+    synchronously during evaluation, this sequence is the configured order
+    without a second ordinal channel. Numeric priority, lexical handler ID, and
+    later wall-clock callbacks are not alternate ordering mechanisms.
 
 Ordered runtime introspection carries the configured ordinal with each
 integration and provider. Lookup indexes may use maps, but iterating a
@@ -1163,30 +1334,33 @@ sourcepoint, osano, google_tag_manager, datadome, gpt, gpt_diagnostics
 Milestone-one normalization and schema-one decoding use that complete sequence;
 they do not move `js_asset_proxy` ahead of Prebid. Schema 2 instead chains
 attribute rewriters in operator-visible integration order: a replacement becomes
-the next rewriter's input and a removal is terminal. Operators are told that an
-earlier native rewrite can prevent a later exact-original-URL proxy rule from
-matching, and that moving `js_asset_proxy` ahead of Prebid can prevent the
-publisher-Prebid remover from recognizing a rewritten URL. Overlap tests cover
-GPT, Google Tag Manager, DataDome, Sourcepoint, Permutive, Lockr, Testlight, and
-Prebid in both legacy-compatible and deliberately reordered configurations. No
-engine-only override is hidden from TOML.
+the next rewriter's input and a removal is terminal. The pure claim validation
+defined above prevents an earlier native owner from silently bypassing a later
+`js_asset_proxy` asset policy. Moving `js_asset_proxy` before that owner is the
+only supported explicit override; the TOML diff then shows the precedence
+change. Overlap tests cover blocked and enabled assets against GPT, Google Tag
+Manager, DataDome, Sourcepoint, Permutive, Lockr, Testlight, and Prebid in both
+legacy-compatible and deliberately reordered configurations. No engine-only
+override is hidden from TOML.
 
-Script-text rewriters also receive the current text produced by the preceding
-rewriter rather than having independent `lol_html` handlers repeatedly replace
-the original chunk. DOM-insertion guards claim canonical parsed host/path
-ownership, not substring coincidences in a query string. Built-in ownership
-sets are disjoint and tested with exactly one claimant for every canonical URL;
+Before either crate move, prerequisite #1208 makes script-text rewriters receive
+the current text produced by the preceding rewriter rather than having
+independent `lol_html` handlers repeatedly replace the original chunk. That
+composition applies to schema-1 and schema-2 blobs; milestone two changes only
+which integration order supplies the already-composed chain. Prerequisite #1199
+similarly makes DOM-insertion guards claim canonical parsed host/path ownership,
+not substring coincidences in a query string. Built-in ownership sets are
+disjoint and tested with exactly one claimant for every canonical URL;
 configured order applies to genuinely composable handlers, not to select the
 winner of an ownership bug.
 
 Browser load mode remains a lifecycle phase, not a second operator priority:
 immediate code necessarily evaluates before deferred code. Config order is
-preserved within each phase and remains the stored ordinal used by any shared
-dispatcher after a module registers. A hook that must arbitrate during initial
-document mutation, including a DOM-insertion guard, is immediate-only;
-composition rejects it on a deferred asset. Diagnostics display each module's
-fixed load mode so this phase boundary is visible rather than inferred from
-timing.
+preserved within each phase. A browser capability that declares a DOM-insertion
+handler has `requires_initial_dom_dispatch = true`; composition accepts that
+capability only with `load_mode = immediate`, and the IIFE must register the
+handler synchronously before returning. Diagnostics display each module's fixed
+load mode so this phase boundary is visible rather than inferred from timing.
 
 All recovery paths obey the same provider ordinals. Existing stable plan-index
 sorts remain. The abandon/failure path that can emit providers from `HashMap`
@@ -1197,13 +1371,13 @@ Inline-table and dotted-key shorthand may not define an integration parent or
 provider parent. Requiring ordinary table headers makes activation, ownership,
 and order visible in one form and lets the pre-pass produce targeted errors.
 
-The integrations crate directly enables the `preserve_order` feature on the
-workspace's single resolved `toml` package; it does not rely on an unrelated
-dependency to activate that feature through Cargo unification. EdgeZero's
-`toml::Value` then sees the same ordered map implementation. A test asserts that
-typed integration/provider order equals the independent `toml_edit` pre-pass
-order. The integration-owned source model uses ordered map types with explicit
-iteration semantics, never `HashMap` or `BTreeMap`.
+The workspace already receives `toml/preserve_order` transitively through
+`handlebars`; this design does not pretend that feature is absent or depend on
+Cargo feature toggling for correctness. A test asserts that typed
+integration/provider order equals the independent `toml_edit` pre-pass order.
+The integration-owned source model uses ordered map types with explicit
+iteration semantics, never `HashMap` or `BTreeMap`, and stored runtime order
+comes only from sidecars.
 
 Before typed deserialization, the host-only `source-config` module of
 `trusted-server-integrations` parses the source with `toml_edit`. The dependency
@@ -1238,7 +1412,9 @@ construction, consent, and store writes after the pre-pass succeeds.
 The EdgeZero extension uses EdgeZero's existing path and target resolution: an
 explicit `--app-config` wins; otherwise the path is
 `<manifest-dir>/<app.name>.toml`; diff/push provide their resolved adapter; and
-validate provides the supported adapter set declared by the manifest. Parity
+the Trusted Server validate hook receives only the repeatable `--target`
+selections, possibly empty. EdgeZero separately retains the manifest-declared
+target set for its existing validation and `--strict` checks. Parity
 tests cover exact-byte validation and serialization, command/target context,
 explicit and default paths, manifest paths with and without parent directories,
 concurrent app-config replacement, and `--no-env`. The environment overlay can
@@ -1290,10 +1466,12 @@ three boundaries.
 This is an explicit asymmetric serde boundary. EdgeZero's typed CLI
 deserializes and validates `TrustedServerAppConfig`, then its manual `Serialize`
 implementation emits the schema-2 storage DTO. Runtime reads that DTO rather
-than deserializing it back into the operator type. `integration_order` is always
-present. `provider_order` is required whenever the corresponding `providers`
-object is present, including when both are empty; both are absent when an
-integration has no provider collection.
+than deserializing it back into the operator type. The DTO stores normalized
+typed values after defaults, not source-field presence; the retained
+`toml_edit` view alone preserves comments and editing intent. `integration_order`
+is always present. `provider_order` is required whenever the corresponding
+`providers` object is present, including when both are empty; both are absent
+when an integration has no provider collection.
 
 `trusted_server_schema`, `integration_order`, and `provider_order` are reserved
 storage fields. They are generated by serialization and rejected if supplied in
@@ -1310,8 +1488,9 @@ Object-shaped storage keeps secret paths such as
 `integrations.datadome.server_side_key_secret_name` valid. Core and integration
 secret metadata traverse that resolution view before ordered settings are
 constructed. Integration-owned inactive-secret preprocessing also receives the
-object-shaped integration entry by ID and writes any resolved value back to the
-same entry; it never searches an `{ id, config }` sequence. End-to-end tests
+object-shaped integration entry by ID and removes inactive references; the
+shared resolver later writes active resolved values back to the same entry.
+Neither searches an `{ id, config }` sequence. End-to-end tests
 prove both active DataDome secret fields are presence-checked, resolved, and
 removed when inactive. Before storage, EdgeZero's static secret metadata still
 validates every reference actually present in source, including a reference
@@ -1390,14 +1569,22 @@ Validation fails for:
 - A referenced browser module absent from the generated browser catalog.
 - An unsupported capability combination.
 
-A disabled integration may retain structurally valid provider configuration;
-those providers are not added to the plan. A globally disabled auction may
-likewise retain otherwise valid enabled integration and provider configuration
-so operators can prepare configuration before enabling the auction. References
-from bidder routing or mediator selection to an explicitly disabled integration
-are retained but omitted from the compiled plan with one aggregated warning.
-This makes `enabled = false` a one-line integration kill switch without making
-typos or absent definitions valid. The global auction switch remains the
+A disabled integration may retain provider configuration, but every retained
+child ID and reference is resolved and structurally validated before pruning;
+a typo or missing child fails even while disabled. Active-only semantic checks
+remain skipped. A globally disabled auction may likewise retain otherwise
+valid enabled integration and provider configuration so operators can prepare
+configuration before enabling the auction.
+
+References to an explicitly disabled known integration are retained in a
+validated suppression set and omitted from executable capabilities with one
+aggregated warning. A pruned bidder route produces the distinct diagnostic
+outcome `disabled_by_integration`, not `unroutable`, and its bidder stays
+suppressed from Prebid client-side fallback. A selected disabled mediator
+intentionally falls back to local ranking with a warning instead of the
+baseline startup error; this is an explicit behavior change. This makes
+`enabled = false` a one-line integration kill switch without making typos or
+absent definitions valid. The global auction switch remains the
 cross-integration emergency stop. The design does not add a second generic
 capability-specific enablement system; server-only Prebid remains an enabled
 parent without browser-activating fields.
@@ -1434,14 +1621,20 @@ comment-preserving `toml_edit` transformation, never a push. It:
 - maps every profile to its owning integration, flattens `profile_config`, drops
   the fixed protocol, qualifies cross-integration references, and creates each
   required parent before its descendants;
-- emits retained/required integration parents in the deterministic migration
-  sequence `prebid, aps, js_asset_proxy, testlight, nextjs, permutive, lockr,
-didomi, sourcepoint, osano, google_tag_manager, datadome, gpt,
-gpt_diagnostics, openrtb, adserver_mock`, filtered to configured entries. The
-  first fourteen reproduce the complete baseline hook-registration sequence;
-  `openrtb` and the mediator have no competing page-hook position. This does not
-  preserve the previously cosmetic order of legacy `[integrations.*]` tables or
-  assume `js_asset_proxy` was globally first;
+- first derives the complete legacy flat provider sequence in lexical local-ID
+  order. Provider-owning parents with active providers are promoted to a prefix
+  before `js_asset_proxy`, ordered by the first occurrence of one of their
+  providers in that sequence; each parent's provider tables retain their legacy
+  local order. If each owner's entries were contiguous, this exactly preserves
+  legacy priority. If owners were interleaved, grouping is unavoidable: the
+  report prints every old and new ordinal and every reordered pair, then asks
+  for confirmation before writing. Remaining parents follow the frozen legacy
+  hook sequence `prebid, aps, js_asset_proxy, testlight, nextjs, permutive,
+lockr, didomi, sourcepoint, osano, google_tag_manager, datadome, gpt,
+gpt_diagnostics, openrtb, adserver_mock`, excluding promoted entries and
+  filtering to configured entries. This does not preserve the previously
+  cosmetic order of legacy `[integrations.*]` tables or assume
+  `js_asset_proxy` was globally first;
 - writes explicit `enabled` using a frozen table of the baseline defaults rather
   than guessing one value for every integration; the baseline-true set is
   Prebid, GPT, Didomi, Lockr, and Permutive, and retained blocks for other
@@ -1450,17 +1643,25 @@ gpt_diagnostics, openrtb, adserver_mock`, filtered to configured entries. The
 - handles server-only Prebid and implicit APS activation explicitly, and warns
   before enabling a retained disabled APS block whose `rendering_mode` would
   change renderer-route behavior;
-- emits providers in the new integration/provider declaration order, reports
-  every legacy globally interleaved priority that schema 2 cannot retain, and
-  shows the resulting qualified sequence before writing;
-- prints old-to-new environment-overlay variable paths and fails when an
-  app-prefixed environment variable targets a retired path;
+- for a server-only Prebid migration, enables the parent, comments out rather
+  than activates inactive legacy browser-only non-default fields including
+  `debug`, `client_side_bidders`, and `timeout_ms`, and reports each edit. It
+  preserves inert `bundle.modules`, `external_bundle_sha256`, and
+  `external_bundle_sri` staging fields. The emitted candidate must pass the new
+  value-based activation validation;
+- prints old-to-new environment-overlay variable paths. Migration warns and
+  maps stale names when possible; `--no-env` skips even the environment-name
+  scan and reports that it did so. Ordinary validate, diff, and push fail any
+  app-prefixed variable that still targets a retired path;
 - preserves file permissions and uses the existing permission-preserving atomic
   writer.
 
 Missing-`enabled` diagnostics name the exact old default even when operators
-migrate by hand. The shipped example, `config init`, audit drafts, operator
-guides, and environment-overlay examples contain a complete migrated shape.
+migrate by hand. An exact golden test migrates the shipped example and proves
+that its previously inactive Prebid browser-only values stay commented/inert,
+its bundle staging metadata is preserved, and the result validates. The shipped
+example, `config init`, audit drafts, operator guides, and environment-overlay
+examples contain a complete migrated shape.
 
 Old `[auction.providers]`, `profile`, `profile_config`, and `protocol` fields
 fail with an actionable message naming the new integration-owned location or
@@ -1494,13 +1695,16 @@ New CLI writes schema 2 only.
 
 Rollout is adapter-specific:
 
-| Adapter    | Forward cutover                                                                                                                                                                                                                                                                                                                                      | Rollback isolation and evidence                                                                                                                                                                                                                                                                       |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly     | Export and reconstruct the complete schema-one envelope, including every referenced chunk. Create a new physical Config Store, seed it with schema one, and link it as `trusted_server_config` only in the service version containing the dual reader. After settings-dependent probes pass at representative POPs, push schema 2 to that new store. | The prior service version remains linked to the untouched schema-one store, so reactivation cannot observe schema two. Config GC is forbidden for either rollback generation until the rollback window closes. Control-plane confirmation alone is insufficient because store visibility is eventual. |
-| Cloudflare | Create a new Worker version whose `TRUSTED_SERVER_CONFIG` variable contains schema 2; `ts config push` to KV is not treated as a runtime cutover.                                                                                                                                                                                                    | Worker rollback restores the previous code and schema-one binding together. Verify the bound version, startup schema/digest log, and a settings-dependent route.                                                                                                                                      |
-| Spin       | Use a named versioned KV key/store only when the deployment platform can export, restore, and select it atomically with the component version.                                                                                                                                                                                                       | The default remote Spin path is blocked from schema-2 rollout until a concrete control-plane export/restore drill exists; liveness alone is not evidence because the startup-error router stays healthy.                                                                                              |
-| Axum       | Use the migrated local file/environment as a development-only cutover.                                                                                                                                                                                                                                                                               | Retain the archived schema-one file and restart the matching binary/config pair.                                                                                                                                                                                                                      |
+| Adapter    | Forward cutover                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Rollback isolation and evidence                                                                                                                                                                                                                                                                                                                                    |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Fastly     | A native Fastly entry copy, not `ts` reserialization, reconstructs the complete source root and every referenced chunk. It writes identical chunk keys/values to a new physical Config Store first, reads and reconstructs them there, verifies the archived `BlobEnvelope.sha256`, and writes the pointer/root entry last. Production and staging stores/selectors are copied and verified separately under PR #1175/EdgeZero PR #381. The dual-reader service version alone links the new store; representative POPs must observe the expected setting and a settings-dependent route before schema 2 is pushed. Missing or not-yet-propagated chunks block cutover; milestone 1 explicitly maps this condition to the adapter's transient startup/503 path instead of today's configuration/500, and partial decode is forbidden. | Rollback is only reactivation of the prior service version, which remains linked to the untouched schema-one store. Never redeploy an old release or bind an old binary to the new store. Config GC is forbidden for either rollback generation until the rollback window closes; control-plane confirmation alone is insufficient because visibility is eventual. |
+| Cloudflare | Create a new Worker version whose `TRUSTED_SERVER_CONFIG` variable contains schema 2; `ts config push` to KV is not treated as a runtime cutover.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Worker rollback restores the previous code and schema-one binding together. Verify the bound version, startup schema/digest log, and a settings-dependent route.                                                                                                                                                                                                   |
+| Spin       | Use a named versioned KV key/store only when the deployment platform can export, restore, and select it atomically with the component version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | The default remote Spin path is blocked from schema-2 rollout until a concrete control-plane export/restore drill exists; liveness alone is not evidence because the startup-error router stays healthy.                                                                                                                                                           |
+| Axum       | Use the migrated local file/environment as a development-only cutover.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Retain the archived schema-one file and restart the matching binary/config pair.                                                                                                                                                                                                                                                                                   |
 
+Before rollout, the candidate dual reader decodes an archived production
+schema-one envelope and compares normalized settings, plan, integration and
+provider order, and every `ExternalProviderLabel` with the old binary's output.
 The common release order is: archive and verify schema one; deploy the
 dual-reader code against schema one; verify a settings-dependent route and
 startup log reporting application schema and non-secret composition digest;
@@ -1511,12 +1715,13 @@ authenticated diagnostics may expose the same evidence, but no new public
 status route is introduced.
 
 Store/version isolation makes downgrade structurally safe where the platform
-supports it. The operational old-CLI fence remains defense in depth, not the
-only protection: an old writer has no release credentials or destination
-mapping for the new Fastly store/version or Cloudflare binding. Schema-one
-reappearance after cutover is an explicit rollback event. The compatibility
-reader is removed only in a later release after every supported deployment has
-completed and drilled its rollback window.
+supports it. The operational old-writer fence is defense in depth, not a
+credential guarantee or the only protection. The dual reader still accepts a
+schema-one write on the new generation but records one structured
+schema-regression/rollback event. Schema-one reappearance after cutover is an
+explicit rollback event. The compatibility reader is removed only in a later
+release after every production adapter, including Spin, has completed and
+drilled its rollback window; a blocked Spin cutover blocks reader cleanup.
 
 ## Required Neutral Lifecycle Boundaries
 
@@ -1580,13 +1785,17 @@ for every compiled definition whether that integration is absent, disabled, or
 enabled.
 
 The GPT-diagnostics reserved-input normalizer preserves the baseline behavior
-that is independent of activation: it captures then removes `ts_console`,
-removes `__Host-ts-console`, merges retained Cookie fields, and drops Cookie
-fields that cannot be represented as visible ASCII. It runs before EC setup,
-generic cookie parsing/classification, template-key construction, and origin
-forwarding at every existing adapter boundary, with the direct publisher call
-remaining an idempotent safety net. This static normalization contract is not
-an enabled runtime capability. Therefore an absent GPT-diagnostics block cannot
+that is independent of activation: it captures console activation from the
+`ts_console` query and `__Host-ts-console` cookie into neutral
+`ReservedInputState`, then removes those reserved inputs, merges retained Cookie
+fields, and drops Cookie fields that cannot be represented as visible ASCII.
+The integrations composition boundary exposes one request wrapper that runs
+this catalog normalization before EC setup, template-key construction, origin
+forwarding, or generic classification. All four adapters and direct core test
+entry points use that wrapper. Core's generic Cookie parser remains a lenient,
+idempotent safety net, but cannot call the concrete catalog because dependency
+direction forbids it. This static normalization contract is not an enabled
+runtime capability. Therefore an absent GPT-diagnostics block cannot
 reintroduce HTTP 400 responses for non-ASCII Cookie fields or leak reserved
 inputs upstream.
 
@@ -1594,10 +1803,10 @@ Preparation returns the opaque per-integration decision plus its declared
 `RequestProcessingRequirements`. The neutral requirements are available before
 the existing template-cache/private decision; under ESI, request-private opaque
 state is never copied into a shared template. Registry preparation remains at
-both existing locations: adapter boundaries and the idempotent core publisher
-safety-net boundary used by direct core callers. Request extensions make a
-second preparation a no-op. Core invokes finalization on the existing response
-path. GPT diagnostics may request the fixed synchronous post-unified asset phase
+the integrations-owned wrapper; request extensions make a repeated neutral
+preparation a no-op where an adapter boundary can be re-entered. Core invokes
+finalization on the existing response path. GPT diagnostics may request the
+fixed synchronous post-unified asset phase
 and all-response privacy; ordinary head injectors cannot approximate that
 position. The current auction-correlation decision is deployment-scoped, not
 request-activation-scoped, and becomes a neutral enabled-capability query so
@@ -1627,7 +1836,11 @@ is classified rather than copied blindly:
   relative imports across the two crate source roots.
 
 Runtime calls use a stateless accessor mapped by the integration build to the
-already-installed namespace. The integration build fails on any undeclared
+already-installed namespace. Facade version 1 is exact, not a compatible range;
+each install callback resolves `getRuntimeV1()` lazily when it runs instead of
+capturing an eager imported object. A mismatch logs one diagnostic, skips that
+integration, and leaves its installed/shim flag unset so a failed Prebid load
+cannot look successful. The integration build fails on any undeclared
 cross-root value import. This covers current imports such as Permutive context
 registration, Prebid auction helpers, Testlight queue installation, GPT slot
 resolution, and the shared script/beacon guards; it is not limited to the APS
@@ -1637,7 +1850,10 @@ The GPT bootstrap still runs before the unified bundle, creates or adopts
 `window.tsjs`, and may install the first-impression state and GPT lifecycle
 listeners. The core IIFE must adopt that exact object identity, preserve
 pre-bundle claims and listener markers, validate the runtime-facade version, and
-initialize only missing registries. It never replaces bootstrap state. Immediate
+initialize only missing registries. The legacy bootstrap state has no version,
+so adoption shape-validates it. GPT may intentionally replace legacy
+`adInit`/`scheduleInitialAdInit` functions as the facade is installed; object and
+first-impression state identity are preserved, not function identity. Immediate
 GPT and deferred Prebid likewise adopt the facade and keep listener installation
 idempotent. Integration bundles consume it through an external runtime shim and
 type-only browser-core declarations; their bundler must not inline the stateful
@@ -1645,6 +1861,24 @@ registry implementation. Artifact tests load bootstrap, core, immediate GPT,
 and deferred Prebid in production order and prove that first-impression claims,
 Permutive context, logging configuration, renderer registrations, and APS frame
 supersession use the same shared state.
+
+Prerequisite #1196 removes or debug-gates Creative's unconditional log-level
+bump before extraction. The default remains `warn`, and an explicit publisher
+`warn` setting is never overwritten; a production-artifact test pins both.
+Restoring shared context makes Permutive context visible to core collection,
+which is an intentional bug fix with a consent caveat: server-side
+`allowed_context_keys` remains only a key allowlist, not a browser consent gate.
+This extraction adds no new browser consent check and does not redesign consent
+policy.
+
+Browser core publishes the queue API without draining preloaded `requestAds()`
+calls. Composition appends one neutral finalizer after every immediate
+integration IIFE; only that finalizer drains the preloaded queue, after
+Permutive and all other synchronous registrations are complete. A production
+order artifact test queues a call before loading the bundle and proves its
+context providers are present. For one deprecation window, the facade also
+backs the compatibility alias `window.tsjs.apsPrebidRenderers` used by bundles
+predating #967.
 
 Every integration IIFE declares the facade version it requires. A mismatched
 deferred or stale asset fails closed for that integration with a diagnostic
@@ -1680,20 +1914,24 @@ containing:
   hashes;
 - the fixed creative prelude;
 - a deterministic document fingerprint covering injected asset IDs, hashes,
-  order, attributes, immutable inline-asset bytes, and stable configuration
-  fingerprints for generated inline head output.
+  order, attributes, and the exact static or configuration-rendered inline
+  bytes.
 
 Trusted attributes from immediate assets are merged onto the unified script
-tag. Duplicate names with different values fail composition; equal duplicates
-collapse to one attribute.
+tag through validated name/value constructors. Invalid names or values and
+duplicate names with different values fail release-mode composition; equal
+duplicates collapse to one attribute. None of these checks is only a debug
+assertion.
 
 Static serving, cache-busting URLs, and immutable-cache validation consume
 `BrowserDocumentAssets`; core no longer performs a crate-global
 `all_module_ids()` lookup. Its document fingerprint includes only assets that
 can affect the composed document and includes GPT bootstrap bytes. Each head
 injector whose generated inline output varies with integration configuration
-supplies the exact immutable bytes or a deterministic contribution for that
-output. Request-dependent head variation is permitted only when its neutral
+supplies the exact immutable bytes for that output. The verified EdgeZero
+envelope hash already covers configuration, so injectors do not invent
+additional configuration fingerprints. Request-dependent head variation is
+permitted only when its neutral
 `RequestProcessingRequirements` bypass shared-template reuse; request data is
 never folded into a composition-wide fingerprint.
 
@@ -1704,7 +1942,7 @@ The composition digest is:
 ```text
 SHA-256(
   UTF8("ts-composition-v1\0") ||
-  HEX_DECODE_32(verified_envelope.data_sha256) ||
+  HEX_DECODE_32(verified_envelope.sha256) ||
   BrowserDocumentAssets.document_fingerprint_raw_32 ||
   U32_BE(application_schema) ||
   U32_BE(LEN_UTF8(build_id)) || UTF8(build_id)
@@ -1718,7 +1956,7 @@ is UTF-8 with a four-byte big-endian byte-length prefix. These fixed widths and
 the one explicit length prefix make the input unambiguous; implementations do
 not hash the displayed formula, hexadecimal text, or delimiter-free strings.
 
-`data_sha256` is EdgeZero's already-verified canonical hash of stored data
+`BlobEnvelope.sha256` is EdgeZero's already-verified canonical hash of stored data
 before secret resolution. It covers schema 2 order sidecars, enabled and
 disabled source, neutral settings, overlay results, and secret references
 without exposing secret values. Raw resolved secrets never enter a template
@@ -1726,16 +1964,48 @@ key. If a future resolved secret changes document bytes rather than only
 authorizing an upstream call, its owner must contribute a reviewed non-secret
 behavior fingerprint or make the output request-private; it may not hash the
 secret itself. Semantically set-valued fields serialize in deterministic order
-before EdgeZero hashes them.
+before EdgeZero hashes them. When `trusted_server_schema` is absent, the
+application schema contribution is exactly `1`.
+
+`build_id` is a deterministic build-time digest:
+
+```text
+SHA-256("ts-build-v1\0" || LENGTH_FRAMED_SORTED(PATH || RAW_BYTES))
+```
+
+Inputs include core and integrations Rust sources plus both neutral
+`trusted-server-js` and `trusted-server-integrations-js` Rust sources, build
+scripts, and manifests; neutral and integration browser sources and their
+configuration/build scripts; embedded assets and templates; root `Cargo.toml`,
+`Cargo.lock`, and pinned toolchain/version files; the canonical `package.json`
+and `package-lock.json`; and any target or feature value that can alter emitted
+output. Every file uses a normalized workspace-relative UTF-8 path label;
+non-file inputs use stable labels such as `target-triple` and
+`cargo-features`. Labels and byte values each have an explicit big-endian
+length, and records are sorted bytewise by label. One canonical build-ID
+generator supplies the value embedded by every composition consumer; generated
+output and other self-referential derived artifacts are excluded from its input
+set. The build
+scripts emit matching
+`rerun-if-changed`/`rerun-if-env-changed` lines and generate the digest into the
+artifact. Individual asset hashes are build-time inputs; the unified
+concatenated hash is a composition-time output. Each deployed artifact forces a
+cold template namespace once when this `build_id` changes.
 
 The digest is computed lazily and memoized on the immutable composition so
 non-document routes and ineligible template-cache requests pay no repeated
 full-config hash cost. Normal request execution does not force it merely for
 logging. During a rollout, each adapter's configuration-activation path forces
-it once for the activated snapshot and emits one rate-limited schema/digest log;
-subsequent template use reads the memoized value. An adapter that cannot retain
-the composition still deduplicates this rollout log per schema/data hash and
-build ID rather than logging per request. The composition digest is distinct
+it once for the activated snapshot and emits one rate-limited schema/digest log.
+A process/adapter `CompositionObservationCache`, keyed only by application
+schema, envelope hash, and build ID, retains at most 32 entries with LRU
+eviction and deduplicates observations without retaining configuration values;
+adapters that cannot retain the composition use the same cache instead of
+logging per request. The once-per-snapshot structured activation log includes
+ordered active integration IDs and ordered browser asset IDs/hashes. Runtime
+provider-order evidence comes from existing ordered `/auction`
+`ext.orchestrator.provider_details`. Together these make rollout registry/order
+verification executable without a new endpoint. The composition digest is distinct
 from the exact concatenated unified-bundle hash, whose existing byte-content
 semantics remain unchanged.
 
@@ -1746,8 +2016,9 @@ already covers it. This replaces only the old complete-`Settings` plus
 global-bundle digest; it does not replace any other `TemplateCacheKey`
 dimension. Full URL, request host and scheme, origin identity, assembly mode,
 ordered `Vary` values, selected cookie values, and `TEMPLATE_SCHEMA_VERSION`
-remain independent key inputs. Transform-shape changes still bump
-`TEMPLATE_SCHEMA_VERSION`. Tests prove neutral settings, non-head integration
+remain independent key inputs. `TEMPLATE_SCHEMA_VERSION` changes only when the
+cache-entry serialization or interpretation format changes; transform/output
+code changes are already covered by `build_id`. Tests prove neutral settings, non-head integration
 rewriter settings, external and inline assets, and cookie policy changes
 invalidate templates without exposing raw configuration.
 
@@ -1779,28 +2050,40 @@ type-keyed handler registry and neutral calls into it:
   The Prebid `adId` path and server-bid path remain distinct neutral entry
   points so one cannot consume the other's authority accidentally.
 - The direct `/auction` renderer-bid path in browser core also dispatches
-  through this registry; it is not a third APS-aware implementation. Renderer
-  failure reasons cross the neutral boundary as stable reason codes for the GPT
-  bridge without adding an APS enum to core.
+  through this registry; it is not a third APS-aware implementation. Its
+  neutral handler receives the validated `impid` targeting/slot ID, width,
+  height, and creative ID. The parser preserves the exact current fallback
+  order: numeric `bid.w`/`bid.h`, then descriptor dimensions, then `300x250`;
+  string `bid.crid`, then descriptor creative ID, then `<seat>-<impid>`. A
+  malformed descriptor is treated as absent and an otherwise valid `adm`
+  follows the ordinary generic-creative path, matching the baseline. Only after
+  a descriptor is valid and renderer dispatch is selected does a missing or
+  rejecting handler suppress the bid without generic fallback. Provider
+  admission/drop classification remains unchanged and failures expose stable
+  neutral reason codes.
+  Renderer failure reasons cross the neutral boundary as stable reason codes
+  for the GPT bridge without adding an APS enum to core.
 
 An enabled APS integration whose provider can emit APS renderer descriptors
 includes its immediate APS browser module. The core IIFE and fixed creative
 prelude load first, so APS registration is complete before a bid can render.
-APS renderer registration is an immediate-only capability; composition rejects
+APS module activation is explicit in the activation matrix above. APS renderer
+registration is an immediate-only capability; composition rejects
 a deferred APS renderer. Its current rendering mode continues to be read while
 the synchronous unified script tag is executing, and the APS-owned trusted
 attribute remains on that tag. A future switch to a standalone or deferred APS
 asset requires replacing `document.currentScript` configuration first.
 
-GPT is also immediate. Its current bootstrap reads `document.currentScript`
+GPT is also immediate. Its current GPT module reads `document.currentScript`
 during module evaluation, so `data-ts-gam-attribution` remains on the unified
 synchronous tag and an artifact-level test proves the value is available at
 evaluation time. Moving source ownership must not silently make GPT deferred or
 move that attribute to a later tag.
 
-Renderer failure is scoped to the owning renderer-bearing bid or message. A
-missing or rejecting renderer suppresses that bid with no generic-creative or
-native-Prebid fallback; unrelated bids and the page continue. A duplicate type
+Renderer failure is scoped to the owning valid renderer-bearing bid or message.
+A missing or rejecting renderer suppresses that bid with no generic-creative
+or native-Prebid fallback; malformed direct-auction descriptors retain the
+ordinary `adm` behavior above, and unrelated bids and the page continue. A duplicate type
 fails Rust composition, while a defensive browser-side duplicate poisons that
 type rather than using last-registration-wins. No renderer route, DOM, message,
 response, or beacon side effect is newly created before the selected handler
@@ -1834,16 +2117,24 @@ location used by both Rust and browser tests.
 The move includes a repository-wide inventory of production executable browser
 programs assembled by integration Rust, not only files that already end in
 `.js`. The current DataDome, Didomi, GPT, Prebid, and Sourcepoint config
-initializers; Sourcepoint response patches and `_sp_` property trap; and
-GPT-diagnostics activation/history bootstrap move byte-for-byte with their
-owners. Core-owned `build_bids_script`, `build_seam_script`, and
-`build_ad_slots_script` remain core-owned neutral document programs.
+initializers, Sourcepoint `_sp_` property trap, and GPT-diagnostics
+activation/history bootstrap move with their owners. Sourcepoint response
+patches are Rust regex rewriting behavior rather than standalone browser
+programs, so that patch logic stays with the Rust Sourcepoint integration while
+only executable fragments/assets move. Core-owned `build_bids_script`,
+`build_seam_script`, and `build_ad_slots_script` remain core-owned neutral
+document programs.
 
 This split does not introduce a general template language. Integration-owned
 program bodies live in `trusted-server-integrations-js`; integration Rust may
 serialize safe data and fill a narrowly generated owner-specific renderer that
-preserves the baseline escaping model and output bytes. Exact rendered inline
-bytes and hashes participate in the document fingerprint. A source/artifact
+preserves the baseline escaping model. This permits the existing narrowly
+scoped safe substitutions but does not expose generic templating. Static and
+configuration-rendered inline bytes and hashes participate in the document
+fingerprint. Request-dependent GPT-diagnostics bytes bypass shared-template
+reuse and do not enter the composition-wide document fingerprint. Canonical
+formatting may change generated bytes during the move, so behavior and reviewed
+goldens—not a blanket byte-for-byte promise—are the acceptance contract. A source/artifact
 guard fails when a new production executable integration algorithm is
 introduced directly in Rust without an explicitly reviewed data-only exception.
 
@@ -1883,17 +2174,30 @@ inventories current vendor-bearing fixtures, registry constructors, and test
 call sites and checks that moved tests are still selected by a native or
 target-matched gate.
 
+The integrations crate exposes test-only
+`routes_with_source_config`/`routes_with_composition_and_services` helpers (or
+an equivalent `TestCompositionFactory` under `test-utils`) for adapter route
+tests and cross-adapter parity. Core unit tests use only neutral stub
+registrations. The #1135 end-to-end case remains in
+`trusted-server-integration-tests/tests/parity.rs`; only integration-owned unit
+fixtures move outward. This keeps test construction on the production
+composition path without creating a core-to-integrations dev-dependency cycle.
+
 Some names remain in core because they are established wire/configuration
 contracts rather than implementation ownership. The reviewed retained-name
 allowlist includes `creative_opportunities.slot.providers.{aps,prebid}`, the
-browser `tsjs.scheduleInitialAdInit` and GAM `hb_*` handshake, and the historical
-`prebid_eids` neutral identity module. Their current serialized forms and CLI
-editing behavior remain. Conversely, `TrustedServerError::Prebid`, concrete
-Prebid request extensions, the JS-asset-proxy header constant, the
-`"adserver_mock"` plan literal, DataDome-only staging input, vendor benches, and
-the concrete core test fixture move outward or become a named neutral contract.
-A mechanical guard rejects any additional concrete vendor token in core unless
-it is added to this allowlist with a wire-compatibility reason.
+browser `tsjs.scheduleInitialAdInit` and `trustedServer` namespace, the GAM
+`hb_*` handshake and slot fields, `nextjs-static`, `TrustedServerError::Gam`,
+`rsc_flight`, APS/Prebid slot parameter types, and the historical `prebid_eids`
+neutral identity module. Their current serialized forms and CLI editing
+behavior remain. Conversely, `TrustedServerError::Prebid`, concrete Prebid
+request extensions, the JS-asset-proxy header constant, the `"adserver_mock"`
+plan literal, DataDome-only staging input, vendor benches, and the concrete core
+test fixture move outward or become a named neutral contract. A mechanical
+guard scans production Rust/JS beneath core, excluding tests, fixtures,
+generated output, and exact allowlisted paths/tokens. It rejects any additional
+concrete vendor token unless added with a wire-compatibility reason; it is not a
+raw substring ban across the repository.
 
 ## Compatibility Contract
 
@@ -1911,12 +2215,10 @@ provider-ID order to qualified configuration order. It preserves:
 - OpenRTB request, response, routing, timeout, notification, and response
   admission behavior.
 - Auction price comparison, mediation protocol, renderer descriptors, and
-  telemetry schema. Provider response order and a locally selected equal-price
+  provider telemetry schema, apart from the explicit #1203 mediator-failure
+  fields below. Provider response order and a locally selected equal-price
   winner may change when configuration order differs from the old lexical
   order.
-- Existing provider identity fields. Schema 1 retains local external values;
-  schema 2 migrates them from values such as `pbs-main` to qualified values such
-  as `prebid.pbs-main` at the documented cutover.
 - Managed Prebid User ID aliases, collision checks, consent gating, opaque
   LiveRamp envelopes, OpenRTB EID production, EC partner ingestion, and admin
   diagnostics.
@@ -1926,13 +2228,21 @@ provider-ID order to qualified configuration order. It preserves:
   cookie-key and bypass policy, and every
   existing publisher template-key dimension.
 - Current CLI ad-template diagnostics, audit/generator recovery behavior, and
-  Prebid bundle mutation behavior.
-- The route and behavioral parity of Fastly, Axum, Cloudflare, and Spin.
+  corrected prerequisite #1202 Prebid bundle mutation behavior.
+- The route and behavioral parity of Fastly, Axum, Cloudflare, and Spin, except
+  for the explicitly listed Fastly missing-chunk error-class correction.
 
 The intentional compatibility breaks are:
 
 - Auction providers move from `[auction.providers]` beneath their owning
   integration and references become qualified.
+- External provider labels change at the schema-2 cutover from local values
+  such as `pbs-main` to qualified values such as `prebid.pbs-main`; schema 1
+  retains the legacy labels during the dual-reader window.
+- The corrected #1203 mediator-failure telemetry adds `reason = "http_status"`,
+  numeric `http_status`, and `fallback_used = true` on the structured mediator
+  outcome/log surface for non-2xx fallback; provider outcome telemetry remains
+  unchanged.
 - The fixed legacy `protocol = "openrtb-2.6"` field is removed from operator
   source rather than copied into each integration-owned provider.
 - Every retained integration parent requires an explicit `enabled` value,
@@ -1948,6 +2258,11 @@ The intentional compatibility breaks are:
 - A retained enabled Prebid parent with neither a provider nor browser-activating
   URL becomes a valid staged no-op; the activation matrix and migration tool
   make this explicit rather than inheriting an integration-specific default.
+- References to a known disabled integration are pruned as a kill switch:
+  bidder routes report `disabled_by_integration` and stay suppressed from
+  client-side fallback, while a disabled selected mediator warns and uses local
+  ranking instead of the baseline startup error. Absent and unknown targets
+  still fail.
 - Attribute and script rewriters use schema-2 configuration order instead of
   the complete legacy sequence. The migration tool shows this order and its
   overlap diagnostics; it does not falsely describe `js_asset_proxy` as the
@@ -1960,7 +2275,10 @@ The intentional compatibility breaks are:
   unified behind the runtime facade: Permutive context reaches core collection,
   integration logging follows `tsjs.setConfig`, and APS renderer/frame state is
   shared across core, GPT, and Prebid. These are explicit baseline bug fixes,
-  not invisible "pure moves."
+  not invisible "pure moves." Permutive's newly restored context can now be
+  emitted for allowlisted keys without a new browser consent gate;
+  `allowed_context_keys` is not represented as consent enforcement, and a
+  consent-policy redesign is explicitly out of scope.
 - Stored data gains the application schema and explicit order sidecars. The
   rollout decoder, not the steady-state schema, provides temporary old-blob
   compatibility.
@@ -2018,13 +2336,20 @@ Milestone exit criteria are independent:
 
 - **Milestone 1 — crate boundary:** only the current operator and stored schema
   are accepted; fixed integration-builder order, lexical provider priority,
-  implicit APS activation, CLI behavior, cache policy, adapter behavior, and
-  Fastly settings-only failure paths remain unchanged. The browser-state
+  implicit APS activation, operator source semantics, cache policy, adapter behavior, and
+  Fastly settings-only failure paths remain unchanged except that a missing or
+  not-yet-propagated config chunk becomes the documented transient startup/503
+  outcome instead of configuration/500. The EdgeZero typed hook,
+  `config validate --target`, and selected-target diff/push validation are the
+  explicit milestone-one CLI deltas. The browser-state
   corrections listed in the compatibility contract and one-time artifact/hash
-  invalidation are explicit milestone deltas. DOM-handler ordering and trusted
-  attribute conflict policy remain at baseline until milestone 2. Every live
-  consumer uses the new composition root, every concrete source has moved, all
-  transitional delegations are deleted, and the full repository gates pass.
+  invalidation are explicit milestone deltas. Corrected script chaining,
+  disjoint parsed DOM ownership, and release-mode trusted-attribute conflict
+  validation are prerequisites and apply to schema 1 as well as schema 2; only
+  their ordering source changes later. Every live consumer uses the new
+  composition root, every concrete source has moved, the public-API snapshot's
+  explicitly classified transitional-export set is empty, and the full
+  repository gates pass.
 - **Milestone 2 — ordered configuration cutover:** the new operator source is
   the only writable shape; the dual stored-schema reader is deployed; qualified
   identities and order sidecars are used end to end; every normal and recovery
@@ -2050,11 +2375,18 @@ transitional catalog.
 3. Create both new crates and update Cargo aliases, native/WASM checks, JS
    discovery/typecheck/lint/format commands, Dependabot inputs, and test package
    selection in the same change. Update compiled documentation snippets and
-   crate-path documentation required for that workspace state. Create the
-   explicit Rust catalog as the one active catalog, initially delegating through
-   a shrinking, reviewed set of transitional core exports. Create the one
-   browser manifest with an equally explicit shrinking map to legacy source
-   paths. No production code is copied into an unused duplicate tree.
+   crate-path documentation required for that workspace state. Move
+   `TrustedServerAppConfig`, integration validation/secret metadata, and the
+   composition facade to the integrations crate; rewire every adapter and the
+   CLI to that one composition root while retaining the legacy schema through
+   the shared converter. Create the explicit Rust catalog as the one active
+   catalog, initially delegating through a shrinking, reviewed class of
+   transitional core exports, and delete core's old `builders()` and concrete
+   `with_plan` composition paths. Create the one browser manifest with an
+   equally explicit shrinking map to legacy source paths. No production code is
+   copied into an unused duplicate tree. The EdgeZero extension and selected-
+   target push validation land here so config consumers cannot bypass the new
+   root.
 4. Move ordinary Rust integrations one owner at a time, then DataDome and GPT
    diagnostics after their lifecycle seams, APS and Prebid after the profile
    seam, and `adserver_mock` after the mediator seam. Add `openrtb`. Each move is
@@ -2066,27 +2398,27 @@ transitional catalog.
    programs, registry inputs, and shared fixtures. Each move removes one legacy
    manifest path and updates its JS gates immediately. Complete the cross-root
    import audit, remove browser-core APS imports, adopt the shared runtime
-   facade, and make composed assets authoritative. Keep baseline DOM priority
-   ordering until milestone 2. Cross-adapter system tests remain in
+   facade, and make composed assets authoritative. Under schema 1, immediate
+   concatenation reproduces the corrected frozen legacy order through the new
+   registration-sequence dispatcher; schema 2 later changes only the order
+   source. Cross-adapter system tests remain in
    `trusted-server-integration-tests` and gain bootstrap/core/immediate/deferred
    load-order coverage.
-6. Move `TrustedServerAppConfig`, all integration-specific configuration,
-   validation, inactive-secret preprocessing, and secret metadata into the
-   integrations crate. Land the EdgeZero typed-config source/command extension,
-   repin all EdgeZero workspace dependencies together, rewire the CLI to the
-   source-view APIs, and rewire all adapters to the single runtime composition entry
-   point while retaining the existing operator schema through the shared legacy
-   converter. Remove all transitional catalog/source entries.
+6. Remove the final Rust and browser transitional exports/path mappings, prove
+   the public-API snapshot's transitional class is empty, and run the complete
+   schema-one differential and repository gates. This is cleanup and
+   verification of the composition switch made in step 3, not a second switch.
 7. Add the TOML source pre-pass, ordered in-memory maps, application schema 2,
    object-shaped storage with explicit order sidecars, strong qualified
    provider IDs, the shared schema-one reader, `ts config migrate`, and the
    integration-owned provider schema. Replace and remove only the legacy source
    entry point from ordinary config commands; the isolated migration parser may
    read legacy source only to emit a schema-2 candidate.
-8. Activate configuration-order provider and hook semantics, chained script
-   rewriting, disjoint DOM claims, strict trusted-attribute conflicts, external
-   qualified IDs, and plan-order recovery only after focused baseline and
-   failure-path tests pass.
+8. Switch the already-composed hook and provider pipelines from frozen legacy
+   order to schema-2 configuration order, and activate schema-2 external
+   qualified labels and plan-order recovery only after focused baseline and
+   failure-path tests pass. Script chaining, disjoint DOM ownership, and trusted
+   attribute validation do not wait for this step.
 9. Update operator examples, fixtures, migration diagnostics, guides, and the
    adapter-specific rollout runbook. Repository/CI path updates associated with
    moved code are already complete from steps 3 through 6. Deploy the dual
@@ -2133,11 +2465,11 @@ to preserve `cfg(test)` imports.
 - TOML parent-table order becomes the integration-owned source-model order.
 - The `toml_edit` pre-pass and typed `toml`/EdgeZero parser use the same TOML
   language generation and agree on parity fixtures outside `[integrations]`.
-- A dependency-graph gate proves the host CLI graph enables
-  `toml/preserve_order` through the integrations crate's direct feature request,
-  while adapter graphs consume only explicit stored sidecars and never depend
-  on TOML or JSON object iteration order. Running the storage round trip with
-  and without `serde_json/preserve_order` yields identical runtime order.
+- A dependency-graph gate records the existing unified `toml/preserve_order`
+  feature while adapter graphs consume only explicit stored sidecars and never
+  depend on TOML or JSON object iteration order. Storage tests permute JSON
+  object members and prove identical runtime order; they do not claim to toggle
+  a unified Cargo feature within one graph.
 - Nested provider declaration order is retained.
 - A parent integration or provider table declared after one of its descendants
   fails before typed deserialization.
@@ -2160,10 +2492,12 @@ to preserve `cfg(test)` imports.
 - CLI validation compiles and discards the complete secret-independent plan,
   including routes, bidder ownership, mediator capability, and duplicate
   claims, without constructing runtime capabilities from unresolved secret key
-  names. Diff/push fail selected-target validation. Validate reports a result
-  for every supported target declared in the manifest, and `--strict` fails on
-  any target rejection. Every secret-independent runtime rejection has a
-  matching target-neutral error or named-target CLI fixture.
+  names. Diff/push fail selected-target validation. Validate with no `--target`
+  runs target-neutral Trusted Server checks plus unchanged EdgeZero validation;
+  each explicit repeatable `--target` is reported and any selected-target
+  rejection fails. EdgeZero `--strict` retains its existing manifest meaning.
+  Every secret-independent runtime rejection has a matching target-neutral
+  error or named-target CLI fixture.
 - Read-only CLI consumers see the effective overlay through
   `SourceConfigView` without deploy validation; deploy commands use
   `ValidatedSourceConfig` after the overlay. Mutators and generators operate on
@@ -2182,7 +2516,8 @@ to preserve `cfg(test)` imports.
   patched atomically over an otherwise-invalid unrelated baseline. The command
   fails with a placement example when the explicit `[integrations.prebid]`
   parent is absent and never appends a parent that silently chooses runtime
-  order.
+  order. Tests preserve the original file mode and prove parse diagnostics
+  contain path and line/column but no source content.
 - Disabled integrations may retain structurally valid provider settings, contribute no
   providers or capabilities, and do not reorder enabled neighbors.
 - Disabled placeholder values that current examples rely on, including the
@@ -2194,7 +2529,9 @@ to preserve `cfg(test)` imports.
   runtime.
 - Bidder and mediator references to explicitly disabled known integrations are
   omitted from the compiled plan with one warning, including while the global
-  auction is disabled; absent and unknown targets still fail.
+  auction is disabled; absent and unknown targets still fail. Pruned routes
+  report `disabled_by_integration` and remain suppressed from Prebid client-side
+  fallback, while a disabled selected mediator warns and uses local ranking.
 - Nested-only, unknown, missing-enabled, descendant-before-parent, and mixed
   old/new configurations fail with actionable messages.
 - Qualified provider references resolve correctly and reject missing or
@@ -2217,21 +2554,24 @@ to preserve `cfg(test)` imports.
   correlation names or fail target validation before deployment.
 - `ts config migrate --dry-run` preserves comments and permissions, emits
   frozen explicit defaults and environment-variable path mappings, handles
-  server-only Prebid and implicit APS, reports priority changes, rejects mixed
-  input, and never performs a remote write.
+  server-only Prebid and implicit APS, preserves exact legacy priority when
+  provider owners are contiguous, reports every old/new ordinal and reordered
+  pair when grouping cannot preserve an interleaving, rejects mixed input, and
+  never performs a remote write. The shipped-example golden validates.
 - Ordering diagnostics cover provider details, ts-debug, telemetry `is_win`,
   mediator `ext.bidder_responses`, backend names, and CLI provider listings in
   addition to launch and response order.
 
 ### Capability and behavior parity tests
 
-- A focused differential harness captures the `a4e01eb55` baseline for a matrix
-  covering all integrations, APS/Prebid/standard providers including globally
-  interleaved IDs, deferred Prebid, GPT diagnostics, and the #1135 Next.js
-  streaming path. It compares hook order, module ID lists, head inserts, trusted
-  tag attributes, route tables, plan/provider order, mediator input order, and
-  relevant CLI views. It compares semantic IDs/order rather than rebuilt bundle
-  bytes and records the explicit milestone deltas separately.
+- After every prerequisite lands, a focused differential harness records the
+  exact baseline commit and captures actual output goldens for a matrix covering
+  all integrations, APS/Prebid/standard providers including globally interleaved
+  IDs, deferred Prebid, GPT diagnostics, Next.js/GTM script rewriting, RSC
+  streaming, and the #1135 path. It compares hook order, rendered output,
+  module ID lists, head inserts, trusted tag attributes, route tables,
+  plan/provider order, mediator input order, and relevant CLI views. Rebuilt
+  artifact hashes are recorded separately from behavior deltas.
 - The static catalog contains all current integration IDs plus `openrtb`.
 - APS and Prebid register page/browser and auction capabilities without core
   importing their types.
@@ -2277,11 +2617,14 @@ to preserve `cfg(test)` imports.
 - The dedicated mediator capability preserves request construction, ordered
   response input, bounded transport, parsing, and launch/parse-error fallback
   without exposing the legacy `AuctionProvider` trait. A parsed non-2xx error
-  response retains its current zero-winner/no-fallback behavior.
+  response records `http_status` and falls back to local ranking without a
+  fabricated mediator winner, as fixed by prerequisite #1203.
 - Fastly's JA4 gate and failed-startup finalization still receive the
   settings-only view when full composition fails; reusable capability objects
   are immutable and request-stateless, with document buffers created per HTML
-  processor.
+  processor. A Fastly adapter test proves a missing referenced config chunk
+  takes the milestone-one transient startup/503 path and never partially
+  decodes the envelope.
 
 ### Browser tests
 
@@ -2292,10 +2635,12 @@ to preserve `cfg(test)` imports.
   visible to core context collection; Prebid auction helpers and Testlight
   queue behavior still use the single installed runtime.
 - Built-in DOM-insertion guards claim disjoint parsed host/path sets with
-  exactly one claimant per canonical URL. Composable handlers run in immediate
-  IIFE registration order; numeric priority and lexical handler ID cannot affect
-  the result, query-string substrings cannot steal ownership, and a deferred DOM
-  handler fails composition.
+  exactly one claimant per canonical URL. In milestone 1, composable handlers
+  run in immediate IIFE registration order sourced from the corrected frozen
+  legacy sequence; in milestone 2, the same dispatcher receives schema-2
+  configuration order. Numeric priority and lexical handler ID cannot affect
+  either result, query-string substrings cannot steal ownership, and a deferred
+  DOM handler fails composition.
 - APS is absent from browser core and registers its renderer from its own IIFE.
 - Core, GPT, and Prebid artifacts contain no private copy of APS renderer state.
 - Existing APS validation, sandbox, messaging, timeout, and rendering tests pass
@@ -2307,12 +2652,16 @@ to preserve `cfg(test)` imports.
   unified tag; a deferred APS renderer is rejected during composition.
 - GPT remains immediate and reads `data-ts-gam-attribution` from the unified
   tag through `document.currentScript` at evaluation time.
-- Equal duplicate trusted script attributes collapse, while conflicting values
-  fail composition before HTML is served.
+- Equal duplicate trusted script attributes collapse, while invalid names,
+  invalid values, and conflicting duplicates fail release-mode composition
+  before HTML is served.
 - Missing or rejecting renderers drop only the renderer-bearing bid with no
   fallback or newly created route/DOM/message/response/beacon side effect;
   baseline supersession and fail-closed event handling remain, and duplicate
   registration poisons the type or fails composition.
+- Direct-auction tests pin `w`/`h`/descriptor/default dimension precedence,
+  `crid`/descriptor/seat-plus-impid creative-ID precedence, malformed-descriptor
+  generic-`adm` fallback, and valid-descriptor fail-closed dispatch.
 - Both server-bid and Prebid-`adId` renderer paths cover carrier scrubbing,
   failed admission/registration, bounded TTL and capacity, authenticated source
   and slot binding, atomic consume, replay rejection, renderer-owned Universal
@@ -2326,22 +2675,28 @@ to preserve `cfg(test)` imports.
   resolved secret values; and are lazily memoized. Rollout activation forces
   and logs the digest once per snapshot, while ordinary non-document requests do
   not. Set-valued source fields serialize deterministically.
+- Build-ID generator vectors are deterministic across repeated builds and
+  independently perturb core Rust, integration Rust, neutral browser source,
+  integration browser source, `Cargo.lock`, target triple, and feature inputs;
+  each relevant change alters the ID while file ordering does not.
 - Changing any integration setting that affects generated head output changes
   the document fingerprint; request-dependent head variation bypasses shared
   template reuse through processing requirements.
 - GPT bootstrap, APS renderer document, Sourcepoint trap, GPT-diagnostics
-  bootstrap, Sourcepoint response patches, and
-  DataDome/Didomi/GPT/Prebid/Sourcepoint inline programs resolve byte-for-byte
-  from their integration-owned package locations. A guard rejects handwritten
-  production integration browser algorithms in Rust string literals without
-  introducing a general template framework.
+  bootstrap, and DataDome/Didomi/GPT/Prebid/Sourcepoint executable inline
+  programs resolve from their integration-owned package locations and pass
+  reviewed behavior/output goldens. Sourcepoint's Rust regex response patches
+  stay with its Rust owner. A guard rejects handwritten production integration
+  browser algorithms in Rust string literals without introducing a general
+  template framework.
 - External Prebid artifacts preserve bidder, User ID, and analytics category
   selection, manifest/hash/SRI generation, managed-name alias and collision
   checks, `identityLinkIdSystem` requirements, consent behavior, and runtime
   codes after registry and shim paths move.
 - Owner-specific private `$OUT_DIR` directories and manifests reject stale or
-  partial output; concurrent neutral/integration Cargo builds share only a lock
-  around dependency mutation and cannot discover one another's output.
+  partial output; installation holds the exclusive dependency lock while every
+  Vite, Vitest, TypeScript, ESLint, Prettier, Cargo browser build, and CLI
+  Prebid reader holds the shared lock for its entire process.
 - Clean and incremental Cargo builds prove that changing a sibling integration
   source reruns the integration embed build and changes its manifest/hash while
   leaving an unrelated neutral artifact unchanged.
@@ -2350,7 +2705,13 @@ to preserve `cfg(test)` imports.
   Prebid load order using the moved assets.
 - An artifact test loads GPT bootstrap, core, immediate GPT, and deferred Prebid
   in production order, proves object identity/listener idempotence and
-  first-impression preservation, and rejects an incompatible facade version.
+  first-impression preservation, rejects an incompatible facade version without
+  setting the Prebid shim flag, and verifies the temporary
+  `apsPrebidRenderers` compatibility alias. A queued pre-load `requestAds()` is
+  drained only by the post-immediate finalizer and observes Permutive context.
+- Production logging artifacts prove the default remains `warn`, an explicit
+  publisher `warn` is not overwritten, and Creative does not raise the shared
+  level.
 - Sibling-root gates resolve `vitest`, `prebid.js`, and an exported Prebid module
   through the canonical project; a failing typecheck canary proves moved type
   tests are actually selected, and Prettier/ESLint use explicit canonical roots.
@@ -2385,8 +2746,8 @@ A repository path guard rejects active code or tooling that still points to
 `trusted-server-js/lib/src/integrations` or concrete
 `trusted-server-core/src/integrations/<vendor>` paths, except for an explicitly
 allowlisted transitional or historical reference. It checks string literals and
-known path joins, not only exact static paths. Dependabot keeps one entry for
-the browser lockfile; unrelated Node projects retain their own entries. The
+known path joins, not only exact static paths. Dependabot's existing browser and
+docs entries remain; this split adds no second browser entry. The
 Cargo graph also records the direct `trusted-server-openrtb`
 and integration-test dependencies explicitly and removes unused direct browser
 crate dependencies from adapters.
@@ -2490,8 +2851,9 @@ than reconstructing them.
 Splitting Rust ownership while sharing one Node workspace can embed previous
 output, race build scripts, or load APS too late.
 
-Mitigation: write each build directly into a private owner `$OUT_DIR`, lock only
-dependency mutation, configure every sibling-root resolver/tool explicitly,
+Mitigation: write each build directly into a private owner `$OUT_DIR`, use an
+exclusive dependency-mutation lock and full-process shared locks for every
+browser/tooling reader, configure every sibling-root resolver/tool explicitly,
 retain stale-output refusal, hash built bytes, load core and the creative
 prelude first, reject deferred APS composition, and run artifact-level renderer,
 fingerprint, version-skew, and ordering tests.
@@ -2529,8 +2891,9 @@ The change is complete when:
 12. Browser core imports no concrete integration, and APS rendering works
     through one immediate registration without private copies in core, GPT, or
     Prebid bundles; the shared-state facade adopts GPT bootstrap state, DOM
-    ownership is disjoint, composable handler registration obeys configuration
-    order, and GPT retains its synchronous-tag bootstrap contract.
+    ownership is disjoint, composable handler registration obeys frozen legacy
+    order for schema 1 and configuration order for schema 2, and GPT retains its
+    synchronous-tag bootstrap contract.
 13. `TrustedServerAppConfig`, `SourceConfigView`,
     `PartialSourceConfigView<T>`, `ValidatedSourceConfig`, integration secret
     handling, and final runtime composition are owned by
@@ -2582,7 +2945,7 @@ The change is complete when:
 24. Reserved GPT-diagnostics inputs and malformed Cookie fields are normalized
     on baseline routes even when diagnostics is absent or disabled.
 25. The adapter-specific rollout proves schema/binding state through logs and a
-    settings-dependent probe without adding a public status endpoint.
+    settings-dependent probe without adding any new status endpoint.
 
 ## Deferred Work
 
