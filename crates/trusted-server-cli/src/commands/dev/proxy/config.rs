@@ -46,8 +46,8 @@ pub enum ConfigError {
          can reach the proxy. Bind a loopback address, or drop --basic-auth."
     )]
     BasicAuthNonLoopback { value: String },
-    /// An unknown browser name was passed to `--launch`.
-    #[display("unknown browser `{value}` (expected chrome|firefox|safari|all)")]
+    /// An unknown or unsupported browser was passed to `--launch`.
+    #[display("unsupported browser `{value}` (use chrome|firefox|all, plus safari on macOS)")]
     Browser { value: String },
 }
 
@@ -94,8 +94,12 @@ impl core::fmt::Debug for BasicAuth {
 /// A browser the proxy can launch and configure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Browser {
+    /// Chrome or Chromium using a temporary profile.
     Chrome,
+    /// Firefox using a temporary profile.
     Firefox,
+    /// Safari using the macOS system proxy settings.
+    #[cfg(target_os = "macos")]
     Safari,
 }
 
@@ -107,7 +111,12 @@ impl Browser {
     /// Returns [`ConfigError::Browser`] on an unknown name.
     pub fn parse_list(raw: &str) -> Result<Vec<Self>, ConfigError> {
         if raw.trim() == "all" {
-            return Ok(vec![Self::Chrome, Self::Firefox, Self::Safari]);
+            return Ok(vec![
+                Self::Chrome,
+                Self::Firefox,
+                #[cfg(target_os = "macos")]
+                Self::Safari,
+            ]);
         }
         raw.split(',')
             .map(str::trim)
@@ -115,6 +124,7 @@ impl Browser {
             .map(|name| match name {
                 "chrome" => Ok(Self::Chrome),
                 "firefox" => Ok(Self::Firefox),
+                #[cfg(target_os = "macos")]
                 "safari" => Ok(Self::Safari),
                 other => Err(ConfigError::Browser {
                     value: other.to_string(),
@@ -634,11 +644,23 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rejects_safari_explicitly() {
+        assert!(Browser::parse_list("safari").is_err());
+        assert!(Browser::parse_list("chrome,safari").is_err());
+    }
+
     #[test]
     fn browser_list_parses_all() {
         assert_eq!(
             Browser::parse_list("all").expect("parses"),
-            vec![Browser::Chrome, Browser::Firefox, Browser::Safari]
+            vec![
+                Browser::Chrome,
+                Browser::Firefox,
+                #[cfg(target_os = "macos")]
+                Browser::Safari
+            ]
         );
         assert_eq!(
             Browser::parse_list("firefox,chrome").expect("parses"),
