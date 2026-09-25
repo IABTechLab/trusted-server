@@ -179,7 +179,7 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
     }
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
+        if self.config.rewrite_attributes.is_empty() {
             return ScriptRewriteAction::keep();
         }
 
@@ -364,7 +364,6 @@ mod tests {
 
     fn test_config() -> Arc<NextJsIntegrationConfig> {
         Arc::new(NextJsIntegrationConfig {
-            enabled: true,
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
             max_combined_payload_bytes: 10 * 1024 * 1024,
         })

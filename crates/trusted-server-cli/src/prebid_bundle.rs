@@ -300,12 +300,12 @@ fn run_bundle_with_context(
     if config.external_bundle_url.is_none() {
         writeln!(
             out,
-            "Next: upload {bundle_filename} and set integrations.prebid.external_bundle_url to its HTTPS URL."
+            "Next: upload {bundle_filename} and set integration.prebid.external_bundle_url to its HTTPS URL."
         )
     } else {
         writeln!(
             out,
-            "Next: upload {bundle_filename} and update integrations.prebid.external_bundle_url if the hosted filename changed."
+            "Next: upload {bundle_filename} and update integration.prebid.external_bundle_url if the hosted filename changed."
         )
     }
     .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
@@ -326,7 +326,7 @@ fn validate_managed_user_id_modules(
             .any(|module| module == &requirement.module_name)
         {
             return cli_error(format!(
-                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to integrations.prebid.bundle.modules.user_id and rerun `ts prebid bundle`",
+                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to integration.prebid.bundle.modules.user_id and rerun `ts prebid bundle`",
                 config_path.display(),
                 requirement.config_name,
                 requirement.module_name,
@@ -343,7 +343,7 @@ fn read_managed_user_id_names(prebid: &toml::Value, config_path: &Path) -> CliRe
     };
     let entries = value.as_array().ok_or_else(|| {
         report_error(format!(
-            "{} integrations.prebid.managed_user_ids must be an array of tables",
+            "{} integration.prebid.managed_user_ids must be an array of tables",
             config_path.display()
         ))
     })?;
@@ -354,11 +354,11 @@ fn read_managed_user_id_names(prebid: &toml::Value, config_path: &Path) -> CliRe
         .map(|(index, entry)| {
             let table = entry.as_table().ok_or_else(|| {
                 report_error(format!(
-                    "{} integrations.prebid.managed_user_ids[{index}] must be a table",
+                    "{} integration.prebid.managed_user_ids[{index}] must be a table",
                     config_path.display()
                 ))
             })?;
-            let field = format!("integrations.prebid.managed_user_ids[{index}].name");
+            let field = format!("integration.prebid.managed_user_ids[{index}].name");
             let name = table
                 .get("name")
                 .and_then(toml::Value::as_str)
@@ -486,48 +486,48 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     })?;
 
     let prebid = root
-        .get("integrations")
-        .and_then(|integrations| integrations.get("prebid"))
+        .get("integration")
+        .and_then(|integration| integration.get("prebid"))
         .ok_or_else(|| {
             report_error(format!(
-                "{} is missing [integrations.prebid]",
+                "{} is missing [integration.prebid]",
                 config_path.display()
             ))
         })?;
     let bundle = prebid.get("bundle").ok_or_else(|| {
         report_error(format!(
-            "{} is missing [integrations.prebid.bundle]",
+            "{} is missing [integration.prebid.bundle]",
             config_path.display()
         ))
     })?;
 
     let bundle_table = bundle.as_table().ok_or_else(|| {
         report_error(format!(
-            "{} integrations.prebid.bundle must be a TOML table",
+            "{} integration.prebid.bundle must be a TOML table",
             config_path.display()
         ))
     })?;
     for (removed, replacement) in [
-        ("adapters", "integrations.prebid.bundle.modules.bidder"),
+        ("adapters", "integration.prebid.bundle.modules.bidder"),
         (
             "user_id_modules",
-            "integrations.prebid.bundle.modules.user_id",
+            "integration.prebid.bundle.modules.user_id",
         ),
         (
             "analytics_adapters",
-            "integrations.prebid.bundle.modules.analytics",
+            "integration.prebid.bundle.modules.analytics",
         ),
     ] {
         if bundle_table.contains_key(removed) {
             return cli_error(format!(
-                "integrations.prebid.bundle.{removed} is no longer supported; configure exact module stems under {replacement}"
+                "integration.prebid.bundle.{removed} is no longer supported; configure exact module stems under {replacement}"
             ));
         }
     }
 
     let section: PrebidBundleSection = bundle.clone().try_into().map_err(|error| {
         report_error(format!(
-            "{} has invalid integrations.prebid.bundle configuration: {error}",
+            "{} has invalid integration.prebid.bundle configuration: {error}",
             config_path.display()
         ))
     })?;
@@ -548,22 +548,22 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
 fn validate_bundle_modules(modules: &PrebidBundleModules, config_path: &Path) -> CliResult<()> {
     if modules.bidder.is_empty() {
         return cli_error(format!(
-            "{} integrations.prebid.bundle.modules.bidder must contain at least one module stem",
+            "{} integration.prebid.bundle.modules.bidder must contain at least one module stem",
             config_path.display()
         ));
     }
 
     let selections = [
         (
-            "integrations.prebid.bundle.modules.bidder",
+            "integration.prebid.bundle.modules.bidder",
             Some(modules.bidder.as_slice()),
         ),
         (
-            "integrations.prebid.bundle.modules.user_id",
+            "integration.prebid.bundle.modules.user_id",
             modules.user_id.as_deref(),
         ),
         (
-            "integrations.prebid.bundle.modules.analytics",
+            "integration.prebid.bundle.modules.analytics",
             modules.analytics.as_deref(),
         ),
     ];
@@ -754,25 +754,25 @@ fn patch_config_metadata(config_path: &Path, sha256: &str, sri: &str) -> CliResu
         ))
     })?;
 
-    if !document.contains_key("integrations") {
-        document.insert("integrations", table());
+    if !document.contains_key("integration") {
+        document.insert("integration", table());
     }
-    let integrations = table_like_mut(
+    let integration = table_like_mut(
         document
-            .get_mut("integrations")
-            .expect("should have integrations table"),
-        "integrations",
+            .get_mut("integration")
+            .expect("should have the integration table"),
+        "integration",
         config_path,
     )?;
 
-    if !integrations.contains_key("prebid") {
-        integrations.insert("prebid", table());
+    if !integration.contains_key("prebid") {
+        integration.insert("prebid", table());
     }
     let prebid = table_like_mut(
-        integrations
+        integration
             .get_mut("prebid")
             .expect("should have prebid table"),
-        "integrations.prebid",
+        "integration.prebid",
         config_path,
     )?;
 
@@ -838,12 +838,11 @@ mod tests {
     fn managed_config(managed: &str, user_id: &str) -> String {
         format!(
             r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 server_url = "https://prebid.example.com/openrtb2/auction"
 {managed}
 
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 user_id = [{user_id}]
 "#
@@ -868,7 +867,7 @@ user_id = [{user_id}]
     #[test]
     fn bundle_config_loader_reads_managed_user_id_names_in_order() {
         let (_temp, path) = write_config(&managed_config(
-            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n\n[[integrations.prebid.managed_user_ids]]\nname = \"pubCommonId\"\n",
+            "\n[[integration.prebid.managed_user_ids]]\nname = \"identityLink\"\n\n[[integration.prebid.managed_user_ids]]\nname = \"pubCommonId\"\n",
             "\"identityLinkIdSystem\", \"sharedIdSystem\"",
         ));
 
@@ -904,7 +903,7 @@ user_id = [{user_id}]
             let error = load_bundle_config(&path).expect_err("should require an array");
 
             assert!(
-                error.contains("integrations.prebid.managed_user_ids must be an array of tables"),
+                error.contains("integration.prebid.managed_user_ids must be an array of tables"),
                 "should identify the malformed managed list: {error}"
             );
         }
@@ -920,7 +919,7 @@ user_id = [{user_id}]
         let error = load_bundle_config(&path).expect_err("should require managed tables");
 
         assert!(
-            error.contains("integrations.prebid.managed_user_ids[0] must be a table"),
+            error.contains("integration.prebid.managed_user_ids[0] must be a table"),
             "should identify the malformed managed entry: {error}"
         );
     }
@@ -941,7 +940,7 @@ user_id = [{user_id}]
             let error = load_bundle_config(&path).expect_err("should reject malformed name");
 
             assert!(
-                error.contains("integrations.prebid.managed_user_ids[0].name"),
+                error.contains("integration.prebid.managed_user_ids[0].name"),
                 "should identify the malformed managed name: {error}"
             );
         }
@@ -1015,7 +1014,7 @@ user_id = [{user_id}]
     #[test]
     fn run_bundle_rejects_managed_name_when_bundle_omits_required_module() {
         let (_temp, config_path) = write_config(&managed_config(
-            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n",
+            "\n[[integration.prebid.managed_user_ids]]\nname = \"identityLink\"\n",
             "\"sharedIdSystem\"",
         ));
         let original = fs::read_to_string(&config_path).expect("should read original config");
@@ -1039,7 +1038,7 @@ user_id = [{user_id}]
             "should name the managed entry and its required module: {error}"
         );
         assert!(
-            error.contains("integrations.prebid.bundle.modules.user_id"),
+            error.contains("integration.prebid.bundle.modules.user_id"),
             "should identify the corrective field: {error}"
         );
         assert_eq!(
@@ -1052,7 +1051,7 @@ user_id = [{user_id}]
     #[test]
     fn run_bundle_accepts_bundle_with_required_managed_module() {
         let (_temp, config_path) = write_config(&managed_config(
-            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n",
+            "\n[[integration.prebid.managed_user_ids]]\nname = \"identityLink\"\n",
             "\"sharedIdSystem\", \"identityLinkIdSystem\"",
         ));
         let output_root = tempfile::tempdir().expect("should create output root");
@@ -1127,7 +1126,7 @@ user_id = [{user_id}]
     #[test]
     fn run_bundle_rejects_ambiguous_managed_name_before_generation() {
         let (_temp, config_path) = write_config(&managed_config(
-            "\n[[integrations.prebid.managed_user_ids]]\nname = \"ambiguousId\"\n",
+            "\n[[integration.prebid.managed_user_ids]]\nname = \"ambiguousId\"\n",
             "\"sharedIdSystem\"",
         ));
         let original = fs::read_to_string(&config_path).expect("should read original config");
@@ -1189,7 +1188,7 @@ user_id = [{user_id}]
     #[test]
     fn run_bundle_rejects_unknown_managed_name_before_generation() {
         let (_temp, config_path) = write_config(&managed_config(
-            "\n[[integrations.prebid.managed_user_ids]]\nname = \"unknownId\"\n",
+            "\n[[integration.prebid.managed_user_ids]]\nname = \"unknownId\"\n",
             "\"sharedIdSystem\"",
         ));
         let original = fs::read_to_string(&config_path).expect("should read original config");
@@ -1263,7 +1262,7 @@ user_id = [{user_id}]
     #[test]
     fn run_bundle_requires_every_managed_module() {
         let (_temp, config_path) = write_config(&managed_config(
-            "\n[[integrations.prebid.managed_user_ids]]\nname = \"identityLink\"\n\n[[integrations.prebid.managed_user_ids]]\nname = \"sharedId\"\n",
+            "\n[[integration.prebid.managed_user_ids]]\nname = \"identityLink\"\n\n[[integration.prebid.managed_user_ids]]\nname = \"sharedId\"\n",
             "\"identityLinkIdSystem\"",
         ));
         let original = fs::read_to_string(&config_path).expect("should read original config");
@@ -1302,12 +1301,11 @@ user_id = [{user_id}]
 
     fn valid_config() -> String {
         r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 server_url = "https://prebid.example.com/openrtb2/auction"
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-old.js"
 
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
 user_id = ["sharedIdSystem", "uid2IdSystem"]
 analytics = ["atsAnalyticsAdapter"]
@@ -1366,7 +1364,7 @@ analytics = ["atsAnalyticsAdapter"]
     fn bundle_config_loader_preserves_omitted_and_empty_optional_lists() {
         let (_omitted_temp, omitted_path) = write_config(
             r#"
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 "#,
         );
@@ -1376,7 +1374,7 @@ bidder = ["rubiconBidAdapter"]
 
         let (_empty_temp, empty_path) = write_config(
             r#"
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 user_id = []
 analytics = []
@@ -1394,7 +1392,7 @@ analytics = []
         let error = load_bundle_config(&path).expect_err("should reject missing prebid block");
 
         assert!(
-            error.contains("missing [integrations.prebid]"),
+            error.contains("missing [integration.prebid]"),
             "error should explain missing prebid block: {error:?}"
         );
     }
@@ -1403,10 +1401,10 @@ analytics = []
     fn bundle_config_loader_rejects_missing_bundle_or_modules() {
         for (contents, expected) in [
             (
-                "[integrations.prebid]\nenabled = true\n",
-                "missing [integrations.prebid.bundle]",
+                "[integration.prebid]\nenabled = true\n",
+                "missing [integration.prebid.bundle]",
             ),
-            ("[integrations.prebid.bundle]\n", "missing field `modules`"),
+            ("[integration.prebid.bundle]\n", "missing field `modules`"),
         ] {
             let (_temp, path) = write_config(contents);
             let error = load_bundle_config(&path).expect_err("should reject missing table");
@@ -1421,15 +1419,15 @@ analytics = []
     fn bundle_config_loader_rejects_empty_or_malformed_bidder_lists() {
         for (contents, expected) in [
             (
-                "[integrations.prebid.bundle.modules]\nbidder = []\n",
+                "[integration.prebid.bundle.modules]\nbidder = []\n",
                 "must contain at least one",
             ),
             (
-                "[integrations.prebid.bundle.modules]\nbidder = [\"rubiconBidAdapter\", 123]\n",
+                "[integration.prebid.bundle.modules]\nbidder = [\"rubiconBidAdapter\", 123]\n",
                 "invalid type",
             ),
             (
-                "[integrations.prebid.bundle.modules]\nbidder = \"rubiconBidAdapter\"\n",
+                "[integration.prebid.bundle.modules]\nbidder = \"rubiconBidAdapter\"\n",
                 "invalid type",
             ),
         ] {
@@ -1455,7 +1453,7 @@ analytics = []
             "rubiconBidAdapter'",
             "rubicon\nBidAdapter",
         ] {
-            let contents = format!("[integrations.prebid.bundle.modules]\nbidder = [{stem:?}]\n");
+            let contents = format!("[integration.prebid.bundle.modules]\nbidder = [{stem:?}]\n");
             let (_temp, path) = write_config(&contents);
             let error = load_bundle_config(&path).expect_err("should reject invalid stem");
             assert!(
@@ -1469,11 +1467,11 @@ analytics = []
     fn bundle_config_loader_rejects_duplicates_within_and_across_kinds() {
         for contents in [
             r#"
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "rubiconBidAdapter"]
 "#,
             r#"
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["exampleModule"]
 analytics = ["exampleModule"]
 "#,
@@ -1491,12 +1489,12 @@ analytics = ["exampleModule"]
     fn bundle_config_loader_rejects_removed_fields_in_fixed_order() {
         let (_temp, path) = write_config(
             r#"
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["rubicon"]
 user_id_modules = ["sharedIdSystem"]
 analytics_adapters = ["atsAnalyticsAdapter"]
 
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 "#,
         );
@@ -1516,10 +1514,10 @@ bidder = ["rubiconBidAdapter"]
         ] {
             let contents = format!(
                 r#"
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 {field} = ["exampleModule"]
 
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 "#
             );
@@ -1542,7 +1540,7 @@ bidder = ["rubiconBidAdapter"]
     fn bundle_config_loader_rejects_unknown_module_kinds() {
         let (_temp, path) = write_config(
             r#"
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 real_time_data = ["exampleRtdProvider"]
 "#,
@@ -1551,7 +1549,7 @@ real_time_data = ["exampleRtdProvider"]
         let error = load_bundle_config(&path).expect_err("should reject unknown kind");
 
         assert!(error.contains("unknown field `real_time_data`"));
-        assert!(error.contains("integrations.prebid.bundle"));
+        assert!(error.contains("integration.prebid.bundle"));
     }
 
     #[test]
@@ -1645,8 +1643,8 @@ real_time_data = ["exampleRtdProvider"]
         let contents = fs::read_to_string(&path).expect("should read patched config");
         let value: toml::Value = toml::from_str(&contents).expect("should parse patched config");
         let prebid = value
-            .get("integrations")
-            .and_then(|integrations| integrations.get("prebid"))
+            .get("integration")
+            .and_then(|integration| integration.get("prebid"))
             .expect("should have prebid table");
         assert_eq!(
             prebid
@@ -1752,7 +1750,7 @@ real_time_data = ["exampleRtdProvider"]
         assert!(output.contains("generator stdout"));
         assert!(
             output.contains(&format!(
-                "Next: upload trusted-prebid-{}.js and update integrations.prebid.external_bundle_url",
+                "Next: upload trusted-prebid-{}.js and update integration.prebid.external_bundle_url",
                 "b".repeat(64)
             )),
             "should tell operators which content-addressed filename to host: {output}"

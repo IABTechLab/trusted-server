@@ -562,7 +562,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
             .any(|p| payload_contains_incomplete_tchunk(p))
         {
             log::warn!(
-                "RSC payloads contain cross-script T-chunks; skipping RSC URL rewriting to avoid breaking hydration (consider increasing integrations.nextjs.max_combined_payload_bytes)"
+                "RSC payloads contain cross-script T-chunks; skipping RSC URL rewriting to avoid breaking hydration (consider increasing integration.nextjs.max_combined_payload_bytes)"
             );
             return payloads.iter().map(|p| (*p).to_owned()).collect();
         }

@@ -108,12 +108,13 @@ unavailable capabilities fail through explicit unavailable implementations.
 
 External configuration via `trusted-server.toml` allows deployment-time customization without code changes.
 
-Server-side auctions are configuration-first. `[auction.providers.<id>]` declares
+Server-side auctions are configuration-first. `[demand] provider` selects the
+demand sources and each `[demand.<name>]` table
 provider instances and `[auction.bidders.<id>]` maps browser-visible bidders to
 exactly one provider. Startup compiles these maps into one immutable
 `AuctionPlan` shared by orchestration and integration registration. Provider IDs
 remain distinct from upstream returned seats and browser delivery bidder codes.
-The optional mediator is selected separately by `[auction].mediator`.
+The optional ad server is selected separately by `[adserver] provider`.
 
 ### Consent-Aware Design
 

@@ -16,15 +16,21 @@ Prebid is the leading open-source header bidding solution that allows publishers
 
 Prebid configuration has two independent owners:
 
-- `[integrations.prebid]` owns browser Prebid.js behavior: bundle selection and
-  injection, browser timeout/debug, account injection, script interception,
-  client-side bidders, and refresh exclusions.
-- `[auction.providers.<id>]`, its `profile_config`, `notifications`, and
-  `[auction.bidders]` own every Prebid Server request.
+- `[integration.prebid]` owns browser Prebid.js behavior, being bundle
+  selection and injection, browser timeout and debug, account injection,
+  script interception, client-side bidders, and refresh exclusions. It runs
+  when `prebid` is named in `[integration] provider`.
+- A `[demand.<name>]` table that sets `implementation = "prebid_server"`, its
+  `notifications`, and `[auction.bidders]` own every Prebid Server request.
+  Prebid Server is a demand implementation, not a page integration, so it is
+  never named in `[integration] provider`. See
+  [Configuration Rules](/guide/configuration-rules).
 
 ```toml
-[integrations.prebid]
-enabled = true
+[integration]
+provider = ["prebid"]
+
+[integration.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -35,11 +41,11 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 # external_bundle_sri = "sha384-<fictional digest>"
 
 # Optional operator-owned Prebid User ID modules, forwarded to Prebid verbatim.
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "identityLink"
 params = { pid = "999", notUse3P = false }
 
-[integrations.prebid.managed_user_ids.storage]
+[integration.prebid.managed_user_ids.storage]
 type = "cookie"
 name = "idl_env"
 expires = 15
@@ -47,7 +53,7 @@ refresh_in_seconds = 1800
 
 # External bundle generation inputs used by `ts prebid bundle`.
 # Values are exact Prebid module stems without `.js`.
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 user_id = ["sharedIdSystem", "identityLinkIdSystem"]
 analytics = ["atsAnalyticsAdapter"]
@@ -59,14 +65,14 @@ allowed_domains = ["assets.example.com"]
 enabled = true
 timeout_ms = 2000
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+provider = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 900
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = false
 debug_query_params = "example-debug=1"
@@ -74,56 +80,57 @@ consent_forwarding = "both"
 bid_param_overrides = { example-server = { placement = "example-placement" } }
 bid_param_zone_overrides = { example-server = { header = { placement = "example-header" } } }
 
-[[auction.providers.pbs-main.profile_config.bid_param_override_rules]]
+[[demand.pbs_main.bid_param_override_rules]]
 when.bidder = "example-server"
 when.zone = "header"
 set = { placement = "example-rule-placement" }
 
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+provider = "pbs_main"
 ```
 
 ### Browser configuration options
 
-| Field                                           | Default                                                                | Ownership and behavior                                                              |
-| ----------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `enabled`                                       | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
-| `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                             |
-| `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
-| `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                        |
-| `client_side_bidders`                           | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                    |
-| `excluded_gam_ad_unit_path_suffixes`            | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                           |
-| `script_patterns`                               | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                 |
-| `external_bundle_url`                           | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains`   |
-| `external_bundle_sha256`                        | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                   |
-| `external_bundle_sri`                           | `None`                                                                 | Optional SRI metadata                                                               |
-| `bundle.modules.bidder`                         | Required and non-empty                                                 | Exact Prebid bidder module stems compiled into the external bundle                  |
-| `bundle.modules.user_id`                        | Curated preset when omitted                                            | Curated User ID module stems compiled into the external bundle                      |
-| `bundle.modules.analytics`                      | `[]`                                                                   | Analytics adapter module stems compiled into the external bundle                    |
-| `managed_user_ids[].name`                       | Required                                                               | Prebid `userSync.userIds` entry Trusted Server installs and keeps installed         |
-| `managed_user_ids[].params`                     | `{}`                                                                   | Module-specific parameters, forwarded to Prebid.js unchanged                        |
-| `managed_user_ids[].storage.type`               | `cookie`                                                               | Browser storage for the module's value: `cookie` or `html5`                         |
-| `managed_user_ids[].storage.name`               | Required when `storage` exists                                         | Cookie or local-storage key the module reads and writes                             |
-| `managed_user_ids[].storage.expires`            | Prebid's own default                                                   | Storage lifetime in days; at least 1. Any per-module ceiling is the module's own    |
-| `managed_user_ids[].storage.refresh_in_seconds` | Prebid's own default                                                   | Seconds before the module may refresh the stored value; at least 1                  |
+| Field                                           | Default                                                                | Ownership and behavior                                                            |
+| ----------------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `account_id`                                    | `None`                                                                 | Optional browser-injected account value                                           |
+| `timeout_ms`                                    | `1000`                                                                 | Browser Prebid.js timeout only                                                    |
+| `debug`                                         | `false`                                                                | Browser Prebid.js debug only                                                      |
+| `client_side_bidders`                           | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                  |
+| `excluded_gam_ad_unit_path_suffixes`            | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                         |
+| `script_patterns`                               | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances               |
+| `external_bundle_url`                           | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains` |
+| `external_bundle_sha256`                        | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                 |
+| `external_bundle_sri`                           | `None`                                                                 | Optional SRI metadata                                                             |
+| `bundle.modules.bidder`                         | Required and non-empty                                                 | Exact Prebid bidder module stems compiled into the external bundle                |
+| `bundle.modules.user_id`                        | Curated preset when omitted                                            | Curated User ID module stems compiled into the external bundle                    |
+| `bundle.modules.analytics`                      | `[]`                                                                   | Analytics adapter module stems compiled into the external bundle                  |
+| `managed_user_ids[].name`                       | Required                                                               | Prebid `userSync.userIds` entry Trusted Server installs and keeps installed       |
+| `managed_user_ids[].params`                     | `{}`                                                                   | Module-specific parameters, forwarded to Prebid.js unchanged                      |
+| `managed_user_ids[].storage.type`               | `cookie`                                                               | Browser storage for the module's value: `cookie` or `html5`                       |
+| `managed_user_ids[].storage.name`               | Required when `storage` exists                                         | Cookie or local-storage key the module reads and writes                           |
+| `managed_user_ids[].storage.expires`            | Prebid's own default                                                   | Storage lifetime in days; at least 1. Any per-module ceiling is the module's own  |
+| `managed_user_ids[].storage.refresh_in_seconds` | Prebid's own default                                                   | Seconds before the module may refresh the stored value; at least 1                |
 
-### Server provider options
+### Demand source options
 
-Common fields are `protocol`, `profile`, required HTTPS `endpoint`, optional
-`timeout_ms`, and `routing`. The `prebid-server` timeout defaults to 1000 ms;
-an explicit provider value overrides it, and the remaining auction budget caps
-runtime `tmax`.
+The settings every `[demand.<name>]` table shares are the required `endpoint`,
+optional `timeout_ms`, `routing`, and `notifications`. The `prebid_server`
+timeout defaults to 1000 ms, an explicit value in the table overrides it, and
+the remaining auction budget caps runtime `tmax`. `routing` must stay
+`explicit`, because PBS rejects impressions with no routed bidder or
+stored-request demand.
 
 When migrating an origin-only legacy `server_url`, use that origin as the
-provider `endpoint`. The compiler adds `/openrtb2/auction` and preserves query
+`endpoint`. The compiler adds `/openrtb2/auction` and preserves query
 parameters. A configured non-root path, such as `/bid` or `/custom/pbs`, stays
 exact. `/openrtb2/auction/` is normalized to `/openrtb2/auction`.
 
-The typed `profile_config` fields are:
+The settings `prebid_server` adds to its own table are:
 
 | Field                      | Default | Behavior                                            |
 | -------------------------- | ------- | --------------------------------------------------- |
@@ -155,14 +162,14 @@ at most 128 bidder entries. The optional `zone` fact is limited to 256 UTF-8
 bytes. Missing, `null`, or empty `bidderParams` invokes Prebid stored-request
 routing; malformed envelopes do not.
 
-Browser `timeout_ms`/`debug` never inherit a server provider timeout or profile
-debug value. Enabling the browser integration does not create a server provider,
-and a `prebid-server` provider can exist independently from browser injection.
+Browser `timeout_ms` and `debug` never inherit a demand source's timeout or
+debug value. Selecting the browser integration does not create a demand source,
+and a `prebid_server` demand source can exist without browser injection.
 
 ## External Bundle Generation
 
 Use `ts prebid bundle` to build the publisher-specific browser bundle from
-`[integrations.prebid.bundle.modules]` selections:
+`[integration.prebid.bundle.modules]` selections:
 
 ```bash
 ts prebid bundle
@@ -206,7 +213,7 @@ that bundle with the server and push its new hash and SRI. The sentinel
 ### Upgrading from `bundle.adapters` and `bundle.user_id_modules`
 
 Before deploying this server version, move the old bundle fields under
-`[integrations.prebid.bundle.modules]` and expand short bidder names to exact
+`[integration.prebid.bundle.modules]` and expand short bidder names to exact
 upstream stems. For example, `adapters = ["rubicon"]` becomes
 `bidder = ["rubiconBidAdapter"]`; `client_side_bidders` continues to use the
 runtime code `rubicon`.
@@ -450,7 +457,7 @@ Use `bid_param_overrides` for static per-bidder param overrides when the same ov
 **Example**:
 
 ```toml
-[auction.providers.pbs-main.profile_config.bid_param_overrides.example-server]
+[demand.pbs_main.bid_param_overrides.example-server]
 networkId = 99999
 pubid = "example-server-pub"
 ```
@@ -476,7 +483,7 @@ The JS adapter reads the zone from `mediaTypes.banner.name` on each Prebid ad un
 **Example**:
 
 ```toml
-[auction.providers.pbs-main.profile_config.bid_param_zone_overrides.example-server]
+[demand.pbs_main.bid_param_zone_overrides.example-server]
 header = { placementId = "example-header-placement" }
 in_content = { placementId = "example-content-placement" }
 fixed_bottom = { placementId = "example-bottom-placement" }
@@ -517,7 +524,7 @@ Use `bid_param_override_rules` for the canonical ordered override format. Each r
 **Example**:
 
 ```toml
-[[auction.providers.pbs-main.profile_config.bid_param_override_rules]]
+[[demand.pbs_main.bid_param_override_rules]]
 when.bidder = "example-server"
 when.zone = "header"
 set = { placementId = "example-header-placement", keep = "example" }
@@ -533,7 +540,7 @@ impression or measurement purpose but must not participate in Trusted Server's
 Prebid refresh auction:
 
 ```toml
-[integrations.prebid]
+[integration.prebid]
 excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 ```
 
@@ -577,17 +584,17 @@ owned by Trusted Server.
 3. **Client-side bidders** are left as standalone bids — their native Prebid.js adapters handle them in the browser.
 4. **Bidders present in `[auction.bidders]`** are absorbed into the
    `trustedServer` adapter and routed through `/auction` to their configured
-   provider. Unowned bidders remain native browser demand.
+   demand source. Unowned bidders remain native browser demand.
 5. Both sets of bids compete in the same Prebid.js auction.
 
 ### Configuration
 
 ```toml
-[integrations.prebid]
+[integration.prebid]
 client_side_bidders = ["example-browser"]
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+provider = "pbs_main"
 ```
 
 Do not route the same bidder through `[auction.bidders]` while also listing it in
@@ -600,10 +607,10 @@ Client-side bidders need their exact Prebid.js module stems in the generated
 bundle:
 
 ```toml
-[integrations.prebid]
+[integration.prebid]
 client_side_bidders = ["rubicon", "appnexus", "openx"]
 
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "appnexusBidAdapter", "openxBidAdapter"]
 user_id = ["sharedIdSystem", "uid2IdSystem"]
 ```
@@ -668,7 +675,7 @@ Add analytics modules by exact stem. When the pinned Prebid.js package includes
 ATS, use this build selection:
 
 ```toml
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 analytics = ["atsAnalyticsAdapter"]
 ```
@@ -699,7 +706,7 @@ Trusted Server can own one or more Prebid `userSync.userIds` entries so
 operators configure identity centrally instead of asking publishers to edit
 their Prebid JavaScript.
 
-Each `[[integrations.prebid.managed_user_ids]]` entry is forwarded to Prebid.js
+Each `[[integration.prebid.managed_user_ids]]` entry is forwarded to Prebid.js
 verbatim. Trusted Server validates only what Prebid needs to address the module
 — a usable entry name and storage key, positive expiry and refresh values — and
 never interprets `params`. Supported names come from the checked-in
@@ -728,15 +735,15 @@ is stale, or was modified after generation. Core remains vendor-neutral: it
 forwards each managed entry's `params` to Prebid.js without interpreting them.
 
 ```toml
-[integrations.prebid.bundle]
+[integration.prebid.bundle]
 adapters = ["rubicon"]
 user_id_modules = ["identityLinkIdSystem"]
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "identityLink"
 params = { pid = "999", notUse3P = false }
 
-[integrations.prebid.managed_user_ids.storage]
+[integration.prebid.managed_user_ids.storage]
 type = "cookie"
 name = "idl_env"
 expires = 15
@@ -744,7 +751,7 @@ refresh_in_seconds = 1800
 ```
 
 Run `ts prebid bundle`, upload the generated content-addressed bundle, copy its
-hash metadata into `[integrations.prebid]`, and validate the configuration
+hash metadata into `[integration.prebid]`, and validate the configuration
 before rollout.
 
 ### Worked example: LiveRamp RampID
@@ -989,8 +996,8 @@ Optimize mobile ad serving with reduced JavaScript overhead.
 
 ## Implementation
 
-Production Prebid Server providers compile from
-`[auction.providers.<id>]` into a shared OpenRTB request and response driver.
+Production Prebid Server demand sources compile from `[demand.<name>]` into a
+shared OpenRTB request and response driver.
 The browser integration lives in
 [crates/trusted-server-core/src/integrations/prebid.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs),
 while provider execution uses

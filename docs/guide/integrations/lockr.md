@@ -41,8 +41,10 @@ Lockr is an identity resolution and privacy platform that helps publishers manag
 Add Lockr configuration to `trusted-server.toml`:
 
 ```toml
-[integrations.lockr]
-enabled = true
+[integration]
+provider = ["lockr"]
+
+[integration.lockr]
 api_endpoint = "https://api.lockr.io"
 organization_id = "your-org-id"
 project_id = "your-project-id"
@@ -50,20 +52,18 @@ project_id = "your-project-id"
 
 ### Configuration Options
 
-| Field             | Type    | Required | Description                                   |
-| ----------------- | ------- | -------- | --------------------------------------------- |
-| `enabled`         | boolean | No       | Enable/disable integration (default: `false`) |
-| `api_endpoint`    | string  | Yes      | Lockr API endpoint URL                        |
-| `organization_id` | string  | Yes      | Your Lockr organization ID                    |
-| `project_id`      | string  | Yes      | Your Lockr project ID                         |
+| Field             | Type   | Required | Description                |
+| ----------------- | ------ | -------- | -------------------------- |
+| `api_endpoint`    | string | Yes      | Lockr API endpoint URL     |
+| `organization_id` | string | Yes      | Your Lockr organization ID |
+| `project_id`      | string | Yes      | Your Lockr project ID      |
 
 ### Environment Variables
 
 ```bash
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__API_ENDPOINT=https://api.lockr.io
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__ORGANIZATION_ID=your-org-id
-TRUSTED_SERVER__INTEGRATIONS__LOCKR__PROJECT_ID=your-project-id
+TRUSTED_SERVER__INTEGRATION__LOCKR__API_ENDPOINT=https://api.lockr.io
+TRUSTED_SERVER__INTEGRATION__LOCKR__ORGANIZATION_ID=your-org-id
+TRUSTED_SERVER__INTEGRATION__LOCKR__PROJECT_ID=your-project-id
 ```
 
 ## Features

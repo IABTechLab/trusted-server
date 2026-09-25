@@ -63,11 +63,8 @@ const ROUTE_PREFIX: &str = "/integrations/gpt";
 
 /// Configuration for the Google Publisher Tags integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct GptConfig {
-    /// Enable/disable the integration.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
     /// Enable page-level `ts=true` delivery attribution in GAM.
     #[serde(default)]
     pub gam_attribution_enabled: bool,
@@ -97,11 +94,7 @@ pub struct GptConfig {
     pub slim_prebid_url: Option<String>,
 }
 
-impl IntegrationConfig for GptConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for GptConfig {}
 
 /// Google Publisher Tags integration implementation.
 ///
@@ -377,11 +370,24 @@ fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<Trus
     Ok(Some(GptIntegration::new(config)))
 }
 
+/// Validates the GPT configuration for deployment and reports whether
+/// `[integration] provider` names the integration.
+///
+/// # Errors
+///
+/// Returns an error when the GPT configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GptConfig>(GPT_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the GPT integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the GPT integration is enabled with invalid
+/// Returns an error when the GPT integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
@@ -541,10 +547,6 @@ const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
 
 // Default value functions
 
-fn default_enabled() -> bool {
-    true
-}
-
 fn default_script_url() -> String {
     "https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()
 }
@@ -567,7 +569,6 @@ mod tests {
 
     fn test_config() -> GptConfig {
         GptConfig {
-            enabled: true,
             gam_attribution_enabled: false,
             script_url: default_script_url(),
             cache_ttl_seconds: 3600,
@@ -1066,11 +1067,10 @@ mod tests {
     fn build_with_valid_config() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 GPT_INTEGRATION_ID,
                 &serde_json::json!({
-                    "enabled": true,
                     "script_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
                     "cache_ttl_seconds": 3600,
                     "rewrite_script": true
@@ -1087,23 +1087,14 @@ mod tests {
     }
 
     #[test]
-    fn build_disabled_returns_none() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                GPT_INTEGRATION_ID,
-                &serde_json::json!({
-                    "enabled": false
-                }),
-            )
-            .expect("should insert GPT config");
+    fn build_without_the_integration_named_returns_none() {
+        let settings = create_test_settings();
 
         assert!(
             build(&settings)
                 .expect("should evaluate integration build")
                 .is_none(),
-            "should not build when integration is disabled"
+            "should not build an integration [integration] provider does not name"
         );
     }
 

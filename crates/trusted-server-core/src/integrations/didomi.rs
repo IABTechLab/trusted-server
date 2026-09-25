@@ -23,10 +23,8 @@ const DIDOMI_DEFAULT_PREFIX: &str = "/integrations/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct DidomiIntegrationConfig {
-    /// Whether the integration is enabled.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// Add trusted country and region parameters to notice-loader URLs.
     #[serde(default)]
     pub geo_query_parameters: bool,
@@ -80,15 +78,7 @@ fn validate_proxy_path(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-impl IntegrationConfig for DidomiIntegrationConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-fn default_enabled() -> bool {
-    true
-}
+impl IntegrationConfig for DidomiIntegrationConfig {}
 
 fn default_sdk_origin() -> String {
     "https://sdk.privacy-center.org".to_string()
@@ -388,11 +378,25 @@ fn build(
     Ok(Some(DidomiIntegration::new(Arc::new(config))))
 }
 
-/// Register the Didomi consent notice integration when enabled.
+/// Validates the Didomi configuration for deployment and reports whether
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the Didomi integration is enabled with invalid
+/// Returns an error when the Didomi configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
+/// Register the Didomi consent notice integration when `[integration]
+/// provider` names it.
+///
+/// # Errors
+///
+/// Returns an error when the Didomi integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
@@ -438,7 +442,11 @@ impl IntegrationProxy for DidomiIntegration {
             && matches!(backend, DidomiBackend::Sdk)
             && is_notice_loader(&parts.method, consent_path)
         {
-            let geo = match services.geo().lookup(services.client_info().client_ip) {
+            let geo = match services
+                .geo()
+                .lookup(services.client_info().client_ip, services)
+                .await
+            {
                 Ok(Some(geo)) => match normalize_didomi_geo(&geo) {
                     Ok(geo) => geo,
                     Err(error) => return Ok(Self::geo_failure_response(error.reason())),
@@ -559,7 +567,7 @@ mod tests {
         build_services_with_http_client,
     };
     use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo};
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{crate_test_settings_str_running, create_test_settings};
     use http::Method;
 
     enum GeoResult {
@@ -569,10 +577,12 @@ mod tests {
 
     struct StubGeo(GeoResult);
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformGeo for StubGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<IpAddr>,
+            _services: &RuntimeServices,
         ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
             match &self.0 {
                 GeoResult::Value(geo) => Ok(geo.clone()),
@@ -581,9 +591,8 @@ mod tests {
         }
     }
 
-    fn config(enabled: bool) -> DidomiIntegrationConfig {
+    fn config() -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
-            enabled,
             geo_query_parameters: false,
             proxy_path: None,
             sdk_origin: "https://sdk.example.com".to_string(),
@@ -607,7 +616,7 @@ mod tests {
     fn config_with_geo_query_parameters() -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
             geo_query_parameters: true,
-            ..config(true)
+            ..config()
         }
     }
 
@@ -632,8 +641,8 @@ mod tests {
     #[test]
     fn geo_query_parameters_defaults_to_disabled() {
         let settings = Settings::from_toml(&format!(
-            "{}\n[integrations.didomi]\nenabled = true\n",
-            crate_test_settings_str()
+            "{}\n[integration.didomi]\n",
+            crate_test_settings_str_running(DIDOMI_INTEGRATION_ID)
         ))
         .expect("should parse Didomi configuration");
 
@@ -651,8 +660,8 @@ mod tests {
     #[test]
     fn geo_query_parameters_parses_explicit_opt_in() {
         let settings = Settings::from_toml(&format!(
-            "{}\n[integrations.didomi]\nenabled = true\ngeo_query_parameters = true\n",
-            crate_test_settings_str()
+            "{}\n[integration.didomi]\ngeo_query_parameters = true\n",
+            crate_test_settings_str_running(DIDOMI_INTEGRATION_ID)
         ))
         .expect("should parse Didomi geo configuration");
 
@@ -933,7 +942,7 @@ mod tests {
             GeoResult::Value(Some(geo_info("US", Some("CA")))),
         );
         let settings = create_test_settings();
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let request = http::Request::builder()
             .method(Method::GET)
             .uri("https://publisher.example/integrations/didomi/consent/key/loader.js?target_type=notice")
@@ -1045,7 +1054,7 @@ mod tests {
         );
         let services = services_with_geo(Arc::clone(&stub), GeoResult::Value(None));
         let settings = create_test_settings();
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let request = http::Request::builder()
             .method(Method::GET)
             .uri("https://publisher.example/integrations/didomi/consent/api/events?x=1")
@@ -1144,7 +1153,7 @@ mod tests {
 
     #[test]
     fn selects_api_backend_for_api_paths() {
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         assert!(matches!(
             integration.backend_for_path("/api/events"),
             DidomiBackend::Api
@@ -1157,7 +1166,7 @@ mod tests {
 
     #[test]
     fn builds_target_url_with_query() {
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let url = integration
             .build_target_url("https://sdk.privacy-center.org", "/loader.js", Some("v=1"))
             .expect("should build target URL");
@@ -1168,8 +1177,8 @@ mod tests {
     fn registers_prefix_routes() {
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config(DIDOMI_INTEGRATION_ID, &config(true))
+            .integration
+            .insert_config(DIDOMI_INTEGRATION_ID, &config())
             .expect("should insert config");
 
         let registry = IntegrationRegistry::with_plan(
@@ -1187,7 +1196,7 @@ mod tests {
 
     #[test]
     fn copy_headers_sets_x_forwarded_for_from_client_ip() {
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let backend = DidomiBackend::Sdk;
         let original_req = http::Request::builder()
             .method(Method::GET)
@@ -1223,7 +1232,7 @@ mod tests {
     fn copy_headers_strips_authorization() {
         // Security regression guard: the publisher's Authorization header must
         // not be forwarded to the Didomi upstream (credential leak).
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let backend = DidomiBackend::Api;
         let original_req = http::Request::builder()
             .method(Method::POST)
@@ -1264,14 +1273,13 @@ mod tests {
     fn registers_custom_proxy_path() {
         let mut settings = create_test_settings();
         let custom_config = DidomiIntegrationConfig {
-            enabled: true,
             geo_query_parameters: false,
             proxy_path: Some("my-custom-consent".to_string()),
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
         };
         settings
-            .integrations
+            .integration
             .insert_config(DIDOMI_INTEGRATION_ID, &custom_config)
             .expect("should insert config");
 
@@ -1333,7 +1341,6 @@ mod tests {
     #[test]
     fn head_injector_emits_proxy_path() {
         let custom_config = DidomiIntegrationConfig {
-            enabled: true,
             geo_query_parameters: false,
             proxy_path: Some("my-consent".to_string()),
             sdk_origin: default_sdk_origin(),
@@ -1357,7 +1364,7 @@ mod tests {
 
     #[test]
     fn copy_headers_omits_x_forwarded_for_when_no_client_ip() {
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let backend = DidomiBackend::Sdk;
         let original_req = http::Request::builder()
             .method(Method::GET)
@@ -1392,7 +1399,7 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let req = http::Request::builder()
             .method(http::Method::GET)
             .uri("https://publisher.example/integrations/didomi/consent/api/events")
@@ -1416,7 +1423,7 @@ mod tests {
 
     #[test]
     fn head_injector_default_path() {
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let integration = DidomiIntegration::new(Arc::new(config()));
         let doc_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
             request_host: "example.com",

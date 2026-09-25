@@ -6,11 +6,8 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
-use http::{Method, Request, StatusCode, header};
-use serde_json::{Value, json};
-
-use crate::integrations::aps::{ApsDebugRequest, parse_planned_aps_response};
-use crate::integrations::prebid::{apply_prebid_transport_headers, parse_planned_prebid_response};
+use http::{Method, Request, header};
+use serde_json::json;
 
 use crate::error::TrustedServerError;
 use crate::platform::{
@@ -18,25 +15,23 @@ use crate::platform::{
 };
 use crate::request_signing::{RequestSigner, SigningParams};
 
+use super::demand::{CompiledDemand, DemandResponse, DemandTransport};
 use super::openrtb::{
     OpenRtbBuildOutcome, RequestFinalization, apply_notification_policy, build_request,
-    extract_standard_response, unused_bidder_params_count,
+    unused_bidder_params_count,
 };
 use super::plan::ProviderPlan;
-use super::profile::CompiledOpenRtbProfile;
 use super::routing::{ProviderAuctionInput, RoutedAuction};
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
-const MAX_PLANNED_RESPONSE_BYTES: usize = 1024 * 1024;
-
 fn attach_provider_routing_metadata(
     response: &mut AuctionResponse,
-    profile: &CompiledOpenRtbProfile,
+    demand: &dyn CompiledDemand,
     input: &ProviderAuctionInput,
 ) {
     response.metadata.insert(
         "routing".to_string(),
-        json!({"unused_bidder_params_count": unused_bidder_params_count(profile, input)}),
+        json!({"unused_bidder_params_count": unused_bidder_params_count(demand, input)}),
     );
 }
 
@@ -197,27 +192,14 @@ pub(crate) struct GenericOpenRtbProvider {
     plan: ProviderPlan,
 }
 
-/// Typed state created by and returned to one [`GenericOpenRtbProvider`].
-#[allow(
-    dead_code,
-    clippy::large_enum_variant,
-    reason = "typed Stage 6 state avoids provider-state confusion; Stage 7/8 replace profile variants"
-)]
-pub(crate) enum GenericOpenRtbParseState {
-    Standard {
-        provider_id: String,
-        input: ProviderAuctionInput,
-    },
-    Prebid {
-        provider_id: String,
-        auction_id: String,
-        input: ProviderAuctionInput,
-    },
-    Aps {
-        provider_id: String,
-        input: ProviderAuctionInput,
-        debug_request: Option<ApsDebugRequest>,
-    },
+/// State created by and returned to one [`GenericOpenRtbProvider`].
+///
+/// `captured` holds whatever the demand implementation kept from its own
+/// request, and only that implementation reads it back.
+pub(crate) struct GenericOpenRtbParseState {
+    provider_id: String,
+    input: ProviderAuctionInput,
+    captured: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl GenericOpenRtbProvider {
@@ -235,23 +217,11 @@ impl GenericOpenRtbProvider {
 
     #[cfg(test)]
     pub(crate) fn parse_state_for_test(&self, input: ProviderAuctionInput) -> ProviderParseState {
-        let state = match &self.plan.profile {
-            CompiledOpenRtbProfile::Standard(_) => GenericOpenRtbParseState::Standard {
-                provider_id: self.provider_name().to_string(),
-                input,
-            },
-            CompiledOpenRtbProfile::PrebidServer(_) => GenericOpenRtbParseState::Prebid {
-                provider_id: self.provider_name().to_string(),
-                auction_id: input.common_request().id.clone(),
-                input,
-            },
-            CompiledOpenRtbProfile::Aps(_) => GenericOpenRtbParseState::Aps {
-                provider_id: self.provider_name().to_string(),
-                input,
-                debug_request: None,
-            },
-        };
-        Box::new(state)
+        Box::new(GenericOpenRtbParseState {
+            provider_id: self.provider_name().to_string(),
+            input,
+            captured: None,
+        })
     }
 
     /// Build, register, and start exactly one routed provider request.
@@ -347,20 +317,28 @@ impl GenericOpenRtbProvider {
                 self.provider_name()
             ),
         })?;
-        let mut outbound = Request::builder()
+        let demand = self.plan.demand.as_ref();
+        let mut builder = Request::builder()
             .method(Method::POST)
             .uri(self.plan.endpoint.as_str())
             .header(header::CONTENT_TYPE, "application/json");
-        if matches!(&self.plan.profile, CompiledOpenRtbProfile::Standard(_)) {
-            outbound = outbound.header(header::ACCEPT, "application/json");
+        if demand.field_policy().accept_json {
+            builder = builder.header(header::ACCEPT, "application/json");
         }
-        let aps_debug_body = matches!(
-            &self.plan.profile,
-            CompiledOpenRtbProfile::Aps(profile) if profile.debug
-        )
-        .then(|| body.clone());
-        let mut outbound =
-            outbound
+        if let Some(headers) = builder.headers_mut() {
+            demand.prepare_outbound(
+                headers,
+                DemandTransport {
+                    headers: routed.transport_headers(),
+                    attested_client_ip: routed.attested_client_ip(),
+                },
+            );
+        }
+        let captured = builder
+            .headers_ref()
+            .and_then(|headers| demand.capture_request(&body, headers));
+        let outbound =
+            builder
                 .body(EdgeBody::from(body))
                 .change_context(TrustedServerError::Auction {
                     message: format!(
@@ -368,17 +346,6 @@ impl GenericOpenRtbProvider {
                         self.provider_name()
                     ),
                 })?;
-        let aps_debug_request = aps_debug_body
-            .as_deref()
-            .map(|body| ApsDebugRequest::capture(body, outbound.headers()));
-        if let CompiledOpenRtbProfile::PrebidServer(profile) = &self.plan.profile {
-            apply_prebid_transport_headers(
-                routed.prebid_transport_headers(),
-                &mut outbound,
-                profile.consent_forwarding,
-                routed.attested_client_ip(),
-            );
-        }
         let pending = services
             .http_client()
             .send_async(PlatformHttpRequest::new(outbound, backend_name.clone()))
@@ -394,29 +361,22 @@ impl GenericOpenRtbProvider {
                 ),
             }));
         }
-        let parse_state = match &self.plan.profile {
-            CompiledOpenRtbProfile::Standard(_) => GenericOpenRtbParseState::Standard {
-                provider_id: self.provider_name().to_string(),
-                input: input.clone(),
-            },
-            CompiledOpenRtbProfile::PrebidServer(_) => GenericOpenRtbParseState::Prebid {
-                provider_id: self.provider_name().to_string(),
-                auction_id: input.common_request().id.clone(),
-                input: input.clone(),
-            },
-            CompiledOpenRtbProfile::Aps(_) => GenericOpenRtbParseState::Aps {
-                provider_id: self.provider_name().to_string(),
-                input: input.clone(),
-                debug_request: aps_debug_request,
-            },
-        };
         Ok(ProviderRequestOutcome::pending_with_state(
             pending,
-            Box::new(parse_state),
+            Box::new(GenericOpenRtbParseState {
+                provider_id: self.provider_name().to_string(),
+                input: input.clone(),
+                captured,
+            }),
         ))
     }
 
     /// Parse a response using state created by this exact provider instance.
+    ///
+    /// The implementation reads its own response and reports an unusable one as
+    /// an error response. The driver then applies the common notification
+    /// policy and routing diagnostics, so every demand source reports them the
+    /// same way.
     pub(crate) async fn parse_response_with_state(
         &self,
         response: PlatformResponse,
@@ -433,153 +393,31 @@ impl GenericOpenRtbProvider {
                     ),
                 })
             })?;
-        let state_provider_id = match parse_state {
-            GenericOpenRtbParseState::Standard { provider_id, .. }
-            | GenericOpenRtbParseState::Prebid { provider_id, .. }
-            | GenericOpenRtbParseState::Aps { provider_id, .. } => provider_id,
-        };
-        if state_provider_id != self.provider_name() {
+        if parse_state.provider_id != self.provider_name() {
             return Err(Report::new(TrustedServerError::Auction {
                 message: format!(
                     "Provider {} received response state owned by provider {}",
                     self.provider_name(),
-                    state_provider_id
+                    parse_state.provider_id
                 ),
             }));
         }
 
-        if let GenericOpenRtbParseState::Prebid {
-            auction_id, input, ..
-        } = parse_state
-        {
-            let CompiledOpenRtbProfile::PrebidServer(profile) = &self.plan.profile else {
-                return Err(Report::new(TrustedServerError::Auction {
-                    message: format!(
-                        "Provider {} received PBS response state for profile {}",
-                        self.provider_name(),
-                        self.plan.profile.id()
-                    ),
-                }));
-            };
-            let mut parsed = match parse_planned_prebid_response(
-                self.provider_name(),
-                profile,
-                input,
+        let demand = self.plan.demand.as_ref();
+        let mut parsed = demand
+            .parse_response(
+                DemandResponse {
+                    provider_id: self.provider_name(),
+                    endpoint: self.plan.endpoint.as_str(),
+                    input: &parse_state.input,
+                    response_time_ms,
+                    captured: parse_state.captured.as_deref(),
+                },
                 response,
-                response_time_ms,
-                auction_id,
             )
-            .await
-            {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    log::warn!(
-                        "Provider '{}' PBS response parse failed: {:?}",
-                        self.provider_name(),
-                        error
-                    );
-                    AuctionResponse::error(self.provider_name(), response_time_ms)
-                        .with_metadata("error_type", json!("parse_response"))
-                }
-            };
-            apply_notification_policy(&mut parsed.bids, &self.plan.notifications);
-            attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
-            return Ok(parsed);
-        }
-
-        if let GenericOpenRtbParseState::Aps {
-            input,
-            debug_request,
-            ..
-        } = parse_state
-        {
-            let CompiledOpenRtbProfile::Aps(profile) = &self.plan.profile else {
-                return Err(Report::new(TrustedServerError::Auction {
-                    message: format!(
-                        "Provider {} received APS response state for profile {}",
-                        self.provider_name(),
-                        self.plan.profile.id()
-                    ),
-                }));
-            };
-            let mut parsed = match parse_planned_aps_response(
-                self.provider_name(),
-                profile,
-                self.plan.endpoint.as_str(),
-                input,
-                response,
-                response_time_ms,
-                debug_request.clone(),
-            )
-            .await
-            {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    log::warn!(
-                        "Provider '{}' APS response parse failed: {:?}",
-                        self.provider_name(),
-                        error
-                    );
-                    let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms)
-                        .with_metadata("error_type", json!("parse_response"));
-                    attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
-                    parsed
-                }
-            };
-            apply_notification_policy(&mut parsed.bids, &self.plan.notifications);
-            return Ok(parsed);
-        }
-
-        let response = response.response;
-        let status = response.status();
-        let GenericOpenRtbParseState::Standard { input, .. } = parse_state else {
-            unreachable!("profile-specific states are handled before standard parsing");
-        };
-        if status == StatusCode::NO_CONTENT {
-            let mut parsed = AuctionResponse::no_bid(self.provider_name(), response_time_ms);
-            attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
-            return Ok(parsed);
-        }
-        if !status.is_success() {
-            if status.is_redirection() {
-                log::warn!(
-                    "Provider '{}' returned a redirect; generic OpenRTB redirects are refused",
-                    self.provider_name()
-                );
-            }
-            let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms)
-                .with_metadata("error_type", json!("http_status"))
-                .with_metadata("http_status", json!(status.as_u16()));
-            attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
-            return Ok(parsed);
-        }
-
-        let body = response
-            .into_body()
-            .into_bytes_bounded(MAX_PLANNED_RESPONSE_BYTES)
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: format!("Provider {} response body failed", self.provider_name()),
-            })?;
-        let value: Value = match serde_json::from_slice(&body) {
-            Ok(value) => value,
-            Err(error) => {
-                log::warn!(
-                    "Provider '{}' response JSON was invalid: {}",
-                    self.provider_name(),
-                    error
-                );
-                let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms)
-                    .with_metadata("error_type", json!("parse_response"));
-                attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
-                return Ok(parsed);
-            }
-        };
-
-        let mut parsed =
-            extract_standard_response(self.provider_name(), input, &value, response_time_ms);
+            .await?;
         apply_notification_policy(&mut parsed.bids, &self.plan.notifications);
-        attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
+        attach_provider_routing_metadata(&mut parsed, demand, &parse_state.input);
         Ok(parsed)
     }
 }

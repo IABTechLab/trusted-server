@@ -5,7 +5,7 @@
  *
  * Unlike build-all.mjs, this script is intended to run outside the Cargo build.
  * It produces an immutable bundle and manifest that can be hosted on an asset
- * CDN, then referenced by integrations.prebid.external_bundle_url.
+ * CDN, then referenced by integration.prebid.external_bundle_url.
  */
 
 import crypto from 'node:crypto';

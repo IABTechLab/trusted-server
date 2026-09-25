@@ -144,9 +144,8 @@ static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleTagManagerConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     /// GTM Container ID (e.g., "GTM-XXXXXX").
     #[validate(
         length(min = 1, max = 50),
@@ -187,15 +186,7 @@ pub struct GoogleTagManagerConfig {
     pub max_beacon_body_size: usize,
 }
 
-impl IntegrationConfig for GoogleTagManagerConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-fn default_enabled() -> bool {
-    false
-}
+impl IntegrationConfig for GoogleTagManagerConfig {}
 
 /// Rejects a non-HTTPS `upstream_url` at config load.
 ///
@@ -899,11 +890,25 @@ fn build(
     Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
-/// Register the Google Tag Manager integration when enabled.
+/// Validates the Google Tag Manager configuration for deployment and reports whether
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the Google Tag Manager integration is enabled with
+/// Returns an error when the Google Tag Manager configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
+/// Register the Google Tag Manager integration when `[integration]
+/// provider` names it.
+///
+/// # Errors
+///
+/// Returns an error when the Google Tag Manager integration runs with
 /// invalid configuration.
 pub fn register(
     settings: &Settings,
@@ -1234,7 +1239,6 @@ mod tests {
 
     fn tag_config(container_id: &str, allowed_tag_ids: &[&str]) -> GoogleTagManagerConfig {
         GoogleTagManagerConfig {
-            enabled: true,
             container_id: container_id.to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
@@ -2558,7 +2562,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     #[test]
     fn test_default_configuration() {
         let config = GoogleTagManagerConfig {
-            enabled: default_enabled(),
             container_id: "GTM-DEFAULT".to_string(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
@@ -2566,7 +2569,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             allowed_tag_ids: Vec::new(),
         };
 
-        assert!(!config.enabled);
         assert_eq!(config.upstream_url, "https://www.googletagmanager.com");
     }
 
@@ -2582,7 +2584,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         // Custom upstream
         let config_custom = GoogleTagManagerConfig {
-            enabled: true,
             container_id: "GTM-TEST1234123".to_string(),
             upstream_url: "https://gtm.example.com".to_string(),
             cache_max_age: default_cache_max_age(),
@@ -2666,7 +2667,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         futures::executor::block_on(async {
             let max_size = default_max_beacon_body_size();
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: "GTM-TEST1234".to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -2712,7 +2712,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             // Test with a custom smaller limit
             let custom_max_size = 1024; // 1KB
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: "GTM-TEST1234".to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -2772,7 +2771,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             // we still catch it and return 413 (not 502)
             let max_size = default_max_beacon_body_size();
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: "GTM-TEST1234".to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -2828,7 +2826,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             // Verify that handle() actually returns 413 status code for oversized POST
             let max_size = 1024; // Use small size for testing
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: "GTM-TEST1234".to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -2906,7 +2903,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             // but still checked against max size after read
             let max_size = default_max_beacon_body_size();
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: "GTM-TEST1234".to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -2989,7 +2985,6 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_gtag_proxy_config_requests_identity_encoding() {
         futures::executor::block_on(async {
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: "GT-123".to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -3073,26 +3068,33 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
-[integrations.google_tag_manager]
-enabled = true
+[integration]
+provider = ["google_tag_manager"]
+
+[integration.google_tag_manager]
 container_id = "GTM-PARSED"
 upstream_url = "https://custom.gtm.example"
+
+[geo]
+assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings
             .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
             .expect("should get config")
-            .expect("should be enabled");
+            .expect("should read the settings of a named integration");
 
-        assert!(config.enabled);
         assert_eq!(config.container_id, "GTM-PARSED");
         assert_eq!(config.upstream_url, "https://custom.gtm.example");
     }
 
     #[test]
-    fn test_config_defaults() {
+    fn a_block_for_an_unnamed_integration_is_refused() {
         let toml_str = r#"
 [[handlers]]
 path = "^/_ts/admin"
@@ -3106,22 +3108,23 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
-[integrations.google_tag_manager]
+[integration.google_tag_manager]
 container_id = "GTM-DEFAULT"
-"#;
-        let settings = Settings::from_toml(toml_str).expect("should parse TOML");
-        let config = settings
-            .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
-            .expect("should get config");
 
-        // Default is now false, so integration_config returns None for disabled
-        // When we explicitly parse the config with container_id but no enabled field,
-        // the config is present but disabled
+[geo]
+assume_single_jurisdiction = true
+"#;
+        let error = Settings::from_toml(toml_str)
+            .expect_err("a block for an integration nothing names should be refused");
+
         assert!(
-            config.is_none(),
-            "Config with default enabled=false should return None from integration_config"
+            format!("{error:?}").contains("[integration.google_tag_manager]"),
+            "should name the block that nothing runs: {error:?}"
         );
     }
 
@@ -3134,11 +3137,10 @@ container_id = "GTM-DEFAULT"
         let mut settings = make_settings();
         // Enable GTM
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-TEST1234",
                     "upstream_url": "https://www.googletagmanager.com"
                 }),
@@ -3180,11 +3182,10 @@ container_id = "GTM-DEFAULT"
 
         // Use the ID from the fixture: GTM-522ZT3X6
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-522ZT3X6",
                     "upstream_url": "https://www.googletagmanager.com"
                 }),
@@ -3253,11 +3254,10 @@ container_id = "GTM-DEFAULT"
     fn test_inline_script_rewriting() {
         let mut settings = make_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-12345",
                     "upstream_url": "https://www.googletagmanager.com"
                 }),
@@ -3328,7 +3328,6 @@ container_id = "GTM-DEFAULT"
 
         for container_id in valid_ids {
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: container_id.to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -3361,7 +3360,6 @@ container_id = "GTM-DEFAULT"
 
         for (container_id, reason) in invalid_ids {
             let config = GoogleTagManagerConfig {
-                enabled: true,
                 container_id: container_id.to_string(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
@@ -3384,7 +3382,6 @@ container_id = "GTM-DEFAULT"
         let too_long = "GTM-".to_string() + &"X".repeat(50); // 54 chars total
 
         let config = GoogleTagManagerConfig {
-            enabled: true,
             container_id: too_long.clone(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
@@ -3576,11 +3573,10 @@ container_id = "GTM-DEFAULT"
     fn small_chunk_gtm_rewrite_survives_fragmentation() {
         let mut settings = make_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-SMALL1"
                 }),
             )
@@ -3634,11 +3630,10 @@ container_id = "GTM-DEFAULT"
     fn a_split_inside_the_shared_marker_prefix_leaves_the_url_third_party() {
         let mut settings = make_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-SMALL1"
                 }),
             )
@@ -3673,7 +3668,7 @@ container_id = "GTM-DEFAULT"
     }
 
     /// Regression test for the overlapping-rewriter bug: when both the GTM and
-    /// Next.js integrations are enabled and a `<script id="__NEXT_DATA__">`
+    /// Next.js integrations run and a `<script id="__NEXT_DATA__">`
     /// payload is fragmented across chunk boundaries, the GTM rewriter must
     /// NOT clobber the Next.js URL rewrite. In `lol_html`, multiple `text!`
     /// handlers on overlapping selectors run in registration order and the
@@ -3688,21 +3683,19 @@ container_id = "GTM-DEFAULT"
 
         let mut settings = make_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-MIX1"
                 }),
             )
             .expect("should update gtm config");
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -3761,21 +3754,19 @@ container_id = "GTM-DEFAULT"
 
         let mut settings = make_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "google_tag_manager",
                 &serde_json::json!({
-                    "enabled": true,
                     "container_id": "GTM-GTAIL1"
                 }),
             )
             .expect("should update gtm config");
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )

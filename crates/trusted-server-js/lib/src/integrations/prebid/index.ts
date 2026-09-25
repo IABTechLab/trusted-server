@@ -45,8 +45,8 @@ type PbjsGlobal = typeof _pbjsDefault & {
 };
 
 // Prebid.js itself is NOT bundled into this module. It is served as the
-// external bundle configured via `integrations.prebid.external_bundle_url`
-// (required whenever the prebid integration is enabled) and owns the
+// external bundle configured via `integration.prebid.external_bundle_url`
+// (required whenever the prebid integration runs) and owns the
 // `window.pbjs` global. The Rust head injector emits a stub
 // (`window.pbjs = window.pbjs || {que:[],cmd:[]}`) before any script runs and
 // Prebid.js installs its API onto that same object, so capturing the reference
@@ -1907,7 +1907,7 @@ function installApsBidResponseRegistry(): void {
 
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
   // The prebid integration requires the external Prebid.js bundle
-  // (integrations.prebid.external_bundle_url). When it failed to load (network
+  // (integration.prebid.external_bundle_url). When it failed to load (network
   // error, SRI mismatch) window.pbjs is still the head-injected stub with no
   // API — installing the adapter is impossible, so bail out loudly.
   if (!hasPrebidJsApi()) {
@@ -2523,7 +2523,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         log.error(
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
             'Prebid bundle. Add its exact Prebid module stem to ' +
-            '[integrations.prebid.bundle.modules].bidder in trusted-server.toml and ' +
+            '[integration.prebid.bundle.modules].bidder in trusted-server.toml and ' +
             'rebuild it with `ts prebid bundle`.'
         );
       }

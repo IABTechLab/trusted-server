@@ -14,7 +14,9 @@ use lol_html::{
 };
 
 use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
-use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
+use crate::integrations::gpt_diagnostics::{
+    GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsRequestDecision,
+};
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
     IntegrationHtmlContext, IntegrationRegistry, IntegrationScriptContext, ScriptRewriteAction,
@@ -79,6 +81,14 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    /// Pre-computed
+    /// `<script>(window.tsjs=window.tsjs||{}).permissions=...;</script>`.
+    /// Injected at `<head>` open, ahead of [`Self::ad_slots_script`] and the
+    /// tsjs bundle, so page code can read the request's permission state before
+    /// anything runs. `None` under a shared-template mode, where the head is
+    /// cached and served to many readers and nothing request-scoped may appear
+    /// in it, so the seam carries the state there instead.
+    pub permissions_script: Option<String>,
     /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
     /// Injected at `<head>` open. `None` when no slots matched.
     pub ad_slots_script: Option<String>,
@@ -118,6 +128,7 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_owned(),
             request_scheme: request_scheme.to_owned(),
             integrations: integrations.clone(),
+            permissions_script: None,
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
@@ -143,6 +154,17 @@ impl HtmlProcessorConfig {
     ) -> Self {
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
+        self
+    }
+
+    /// Attach the head script carrying this request's permission state.
+    ///
+    /// Separate from [`with_ad_state`](Self::with_ad_state) because the two are
+    /// independent decisions: the permission state travels on every HTML
+    /// document the processor handles, whether or not the ad stack ran.
+    #[must_use]
+    pub fn with_permissions_script(mut self, permissions_script: Option<String>) -> Self {
+        self.permissions_script = permissions_script;
         self
     }
 
@@ -268,6 +290,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
+    let permissions_script = config.permissions_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
@@ -300,10 +323,17 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let patterns = patterns.clone();
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
+            let permissions_script = permissions_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
+                    // The permission state goes first, ahead of the slots and
+                    // the bundle, because both of those and any vendor module
+                    // may read it as soon as they run.
+                    if let Some(ref state_script) = permissions_script {
+                        snippet.push_str(state_script);
+                    }
                     // Inject ad slots script first so it appears before tsjs bundle.
                     if let Some(ref slots_script) = ad_slots_script {
                         snippet.push_str(slots_script);
@@ -326,24 +356,27 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         snippet.push_str(&bootstrap);
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
-                    let immediate_ids = integrations.js_module_ids_immediate();
+                    let immediate_parts = integrations.js_parts_immediate();
                     let script_attributes = integrations.tsjs_script_tag_attributes();
                     snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
-                        &immediate_ids,
+                        &immediate_parts,
                         &script_attributes,
                     ));
                     // Active diagnostics loads synchronously after core so its
                     // GPT listeners precede publisher scripts in the origin head.
-                    if let Some(module_tag) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::module_script_tag)
-                    {
+                    // The decision says whether to inject; the registry's part
+                    // says what to inject. Nothing is injected without a part.
+                    if let Some(module_tag) = gpt_diagnostics.as_ref().and_then(|decision| {
+                        integrations
+                            .js_part(GPT_DIAGNOSTICS_INTEGRATION_ID)
+                            .and_then(|part| decision.module_script_tag(&part))
+                    }) {
                         snippet.push_str(&module_tag);
                     }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
-                    let deferred_ids = integrations.js_module_ids_deferred();
-                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
+                    let deferred_parts = integrations.js_parts_deferred();
+                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_parts));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -745,6 +778,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -879,15 +913,14 @@ mod tests {
 
     #[test]
     fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
-        fn process(gpt_config: Option<(bool, bool)>) -> String {
-            let integrations = if let Some((enabled, gam_attribution_enabled)) = gpt_config {
+        fn process(gam_attribution_enabled: Option<bool>) -> String {
+            let integrations = if let Some(gam_attribution_enabled) = gam_attribution_enabled {
                 let mut settings = create_test_settings();
                 settings
-                    .integrations
+                    .integration
                     .insert_config(
                         "gpt",
                         &json!({
-                            "enabled": enabled,
                             "gam_attribution_enabled": gam_attribution_enabled
                         }),
                     )
@@ -906,12 +939,11 @@ mod tests {
             String::from_utf8(output).expect("should produce valid UTF-8")
         }
 
-        let attributed = process(Some((true, true)));
-        let unattributed = process(Some((true, false)));
-        let disabled_gpt = process(Some((false, true)));
+        let attributed = process(Some(true));
+        let unattributed = process(Some(false));
         let without_gpt = process(None);
 
-        for html in [&attributed, &unattributed, &disabled_gpt, &without_gpt] {
+        for html in [&attributed, &unattributed, &without_gpt] {
             assert_eq!(
                 html.matches("id=\"trustedserver-js\"").count(),
                 1,
@@ -927,12 +959,8 @@ mod tests {
             "should leave an attribution-disabled GPT publisher bundle unmarked"
         );
         assert!(
-            !disabled_gpt.contains("data-ts-gam-attribution"),
-            "should let the GPT master switch suppress attribution metadata"
-        );
-        assert!(
             !without_gpt.contains("data-ts-gam-attribution"),
-            "should leave a non-GPT publisher bundle unmarked"
+            "should leave a bundle unmarked when [integration] provider does not name gpt"
         );
 
         let head_insert_index = attributed
@@ -951,10 +979,7 @@ mod tests {
     fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
-            .expect("should insert GPT diagnostics config");
+        settings.integration.select("gpt_diagnostics");
 
         let mut request = http::Request::builder()
             .method(http::Method::GET)
@@ -1094,11 +1119,10 @@ mod tests {
     fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &json!({
-                    "enabled": true,
                     "client_side_key": "test-client-key",
                 }),
             )
@@ -1232,11 +1256,10 @@ mod tests {
         let mut settings = Settings::default();
         let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "testlight",
                 &json!({
-                    "enabled": true,
                     "endpoint": "https://example.com/openrtb2/auction",
                     "rewrite_scripts": true,
                     "shim_src": shim_src,
@@ -1550,6 +1573,7 @@ mod tests {
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1627,6 +1651,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1666,6 +1691,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1704,6 +1730,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1760,6 +1787,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1790,6 +1818,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1815,6 +1844,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1966,10 +1996,10 @@ mod tests {
     #[test]
     fn nextjs_output_overflow_restores_in_progress_script_at_every_split() {
         let mut settings = create_test_settings();
-        settings.integrations.insert(
-            "nextjs".to_owned(),
-            json!({"enabled": true, "max_combined_payload_bytes": 128}),
-        );
+        settings
+            .integration
+            .insert_config("nextjs", &json!({"max_combined_payload_bytes": 128}))
+            .expect("should select the nextjs integration");
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
@@ -2076,6 +2106,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,

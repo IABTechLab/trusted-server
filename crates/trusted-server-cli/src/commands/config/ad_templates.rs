@@ -183,18 +183,21 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
     .map_err(output_error)?;
     writeln!(
         out,
-        "auction.providers: {}",
-        if loaded.settings.auction.providers.is_empty() {
+        "demand.provider: {}",
+        if loaded.settings.demand.selected().is_empty() {
             "(none)".to_string()
         } else {
-            loaded
+            // Sorted rather than in selection order, so the report reads the
+            // same however the document happens to be written.
+            let mut names = loaded
                 .settings
-                .auction
-                .providers
-                .keys()
-                .map(|id| escape_terminal_text(id.as_str()).into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
+                .demand
+                .selected()
+                .into_iter()
+                .map(|name| escape_terminal_text(name).into_owned())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            names.join(", ")
         }
     )
     .map_err(output_error)?;
@@ -213,10 +216,10 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
             "status: slots are configured, but [auction].enabled is false"
         )
         .map_err(output_error)?;
-    } else if loaded.settings.auction.providers.is_empty() {
+    } else if loaded.settings.demand.selected().is_empty() {
         writeln!(
             out,
-            "status: slots are configured, but [auction].providers is empty"
+            "status: slots are configured, but [demand] provider is empty"
         )
         .map_err(output_error)?;
     } else {
@@ -351,7 +354,7 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         .creative_opportunities
         .as_ref()
         .is_some_and(|config| config.enabled);
-    let providers_configured = !loaded.settings.auction.providers.is_empty();
+    let providers_configured = !loaded.settings.demand.selected().is_empty();
 
     let gate = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: method_pass,
@@ -666,10 +669,14 @@ mod tests {
             .as_table_mut()
             .expect("should find the auction table");
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
-        // Remove the provider map and its bidder references structurally to
-        // isolate the runtime verdict from the provider advisory.
-        auction.remove("providers");
+        // Remove the bidder references, and the demand sources the auction
+        // would route to, structurally, to isolate the runtime verdict from the
+        // provider advisory.
         auction.remove("bidders");
+        config_value
+            .as_table_mut()
+            .expect("should find the document root")
+            .remove("demand");
         let config_text =
             toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
@@ -702,18 +709,35 @@ mod tests {
 
     #[test]
     fn lint_reports_configured_slot_count_and_auction_state() {
-        // Insert the alphabetically earlier provider after pbs-main in source
-        // order, so the output must sort identifiers rather than preserve input.
-        let config_text = format!(
-            "{}\n[auction.providers.aps-main]\n\
-             protocol = \"openrtb-2.6\"\n\
-             profile = \"aps\"\n\
-             endpoint = \"https://aps.example.com/e/pb/bid\"\n\
-             routing = \"all_eligible\"\n\
-             [auction.providers.aps-main.profile_config]\n\
-             account_id = \"example-aps-account-id\"\n",
-            config_with_slots()
-        );
+        // The example config selects `pbs_main`. Naming the alphabetically
+        // earlier `aps_main` after it means the output must sort the names
+        // rather than preserve the order they were selected in.
+        let mut config_value: toml::Value =
+            toml::from_str(&config_with_slots()).expect("should parse the fixture config");
+        let root = config_value
+            .as_table_mut()
+            .expect("should find the document root");
+        let demand = root
+            .get_mut("demand")
+            .and_then(toml::Value::as_table_mut)
+            .expect("should find the demand table");
+        demand
+            .get_mut("provider")
+            .and_then(toml::Value::as_array_mut)
+            .expect("should find the demand selection")
+            .push(toml::Value::String("aps_main".to_string()));
+        let mut aps = toml::value::Table::new();
+        for (key, value) in [
+            ("implementation", "aps"),
+            ("endpoint", "https://aps.example.com/e/pb/bid"),
+            ("routing", "all_eligible"),
+            ("account_id", "example-aps-account-id"),
+        ] {
+            aps.insert(key.to_string(), toml::Value::String(value.to_string()));
+        }
+        demand.insert("aps_main".to_string(), toml::Value::Table(aps));
+        let config_text =
+            toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
         let mut out = Vec::new();
 
@@ -735,9 +759,9 @@ mod tests {
         assert_eq!(
             output
                 .lines()
-                .find(|line| line.starts_with("auction.providers:")),
-            Some("auction.providers: aps-main, pbs-main"),
-            "should report provider identifiers in deterministic order: {output}"
+                .find(|line| line.starts_with("demand.provider:")),
+            Some("demand.provider: aps_main, pbs_main"),
+            "should report demand names in deterministic order: {output}"
         );
         assert!(!output.contains("legacy fallback"));
     }
@@ -750,8 +774,11 @@ mod tests {
             .as_table_mut()
             .expect("should find auction table");
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
-        auction.remove("providers");
         auction.remove("bidders");
+        config_value
+            .as_table_mut()
+            .expect("should find the document root")
+            .remove("demand");
         let config_text =
             toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
@@ -767,14 +794,14 @@ mod tests {
         assert_eq!(
             output
                 .lines()
-                .find(|line| line.starts_with("auction.providers:")),
-            Some("auction.providers: (none)"),
-            "should report no providers"
+                .find(|line| line.starts_with("demand.provider:")),
+            Some("demand.provider: (none)"),
+            "should report no demand sources"
         );
         assert!(
-            output.lines().any(
-                |line| line == "status: slots are configured, but [auction].providers is empty"
-            ),
+            output
+                .lines()
+                .any(|line| line == "status: slots are configured, but [demand] provider is empty"),
             "should explain why configured slots are ineligible: {output}"
         );
     }

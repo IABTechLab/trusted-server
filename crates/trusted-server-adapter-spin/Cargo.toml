@@ -32,6 +32,10 @@ futures = { workspace = true }
 http-body-util = { workspace = true }
 log = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-permission-signal-gpc = { workspace = true }
+trusted-server-permission-signal-gpp = { workspace = true }
+trusted-server-permission-signal-tcf = { workspace = true }
+trusted-server-permission-signal-us-privacy = { workspace = true }
 trusted-server-js = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -41,4 +45,5 @@ spin-sdk = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

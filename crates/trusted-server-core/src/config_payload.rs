@@ -20,6 +20,9 @@ pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 /// Default config-store key containing the Trusted Server app-config blob.
 pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
 
+/// Id of the one integration whose blocks carry secret references.
+const DATADOME_INTEGRATION_ID: &str = "datadome";
+
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///
 /// Secret references are resolved after envelope verification and before
@@ -87,15 +90,26 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         }
     }
 
+    // An integration runs when `[integration] provider` names it, so that list
+    // decides whether DataDome's secrets are live. A block for an integration
+    // the list does not name is refused once the settings are deserialized,
+    // and clearing its references here means that refusal is what an operator
+    // sees rather than a secret lookup failing first.
+    let datadome_runs = data
+        .pointer("/integration/provider")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|provider| {
+            provider
+                .iter()
+                .any(|id| id.as_str() == Some(DATADOME_INTEGRATION_ID))
+        });
     let Some(datadome) = data
-        .pointer_mut("/integrations/datadome")
+        .pointer_mut("/integration/datadome")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return;
     };
-    let integration_enabled =
-        datadome.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
-    let protection_enabled = integration_enabled
+    let protection_enabled = datadome_runs
         && datadome
             .get("enable_protection")
             .and_then(serde_json::Value::as_bool)
@@ -128,13 +142,17 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::provider::{HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::{
+        crate_test_settings_str, hmac_passphrase, select_hmac_provider,
+        select_host_signals_provider,
+    };
 
     fn test_settings() -> Settings {
         let mut settings =
@@ -195,6 +213,8 @@ mod tests {
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
+                "host-signals-passphrase-key" => "resolved-host-signals-passphrase-32-bytes-ok",
+                "labeled-passphrase-key" => "resolved-labeled-passphrase-32-bytes",
                 _ => key,
             };
             Ok(value.as_bytes().to_vec())
@@ -248,7 +268,7 @@ mod tests {
         let mut settings = test_settings();
         settings.proxy.allowed_domains = vec!["*.example".to_string()];
         settings.auction.enabled = auction_enabled;
-        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.demand = crate::auction::test_support::demand_named(&["pbs"]);
         settings.auction.bidders.insert(
             "exampleBidder"
                 .parse()
@@ -263,7 +283,7 @@ mod tests {
             .expect("should have enabled Prebid config");
         prebid.client_side_bidders = vec!["exampleBidder".to_string()];
         settings
-            .integrations
+            .integration
             .insert_config("prebid", &prebid)
             .expect("should replace Prebid config");
         settings
@@ -294,11 +314,10 @@ mod tests {
     fn didomi_geo_query_parameters_survive_blob_round_trip() {
         let mut original = test_settings();
         original
-            .integrations
+            .integration
             .insert_config(
                 "didomi",
                 &DidomiIntegrationConfig {
-                    enabled: true,
                     geo_query_parameters: true,
                     proxy_path: None,
                     sdk_origin: "https://sdk.example.com".to_string(),
@@ -328,11 +347,10 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("tinybird-token-key".to_string()));
         original
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "enable_protection": true,
                     "server_side_key_secret_name": "datadome-server-key",
                     "protection_test_bypass": {
@@ -492,6 +510,38 @@ mod tests {
     }
 
     #[test]
+    fn a_labeled_hmac_block_resolves_its_passphrase_from_the_secret_store() {
+        // `secret_fields` can only list fixed paths, so a block under a label
+        // of the operator's choosing is found by reading the configuration.
+        // Without that, the key name would reach settings as the passphrase.
+        let mut data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        data["ec"] = serde_json::json!({
+            "provider": "primary",
+            "primary": {
+                "implementation": "hmac",
+                "passphrase": "labeled-passphrase-key",
+            },
+        });
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the labeled block's passphrase");
+
+        let written =
+            serde_json::to_value(&reconstructed).expect("should serialize the loaded settings");
+        assert_eq!(
+            written["ec"]["primary"]["passphrase"], "resolved-labeled-passphrase-32-bytes",
+            "should replace the key name with the value from the secret store"
+        );
+    }
+
+    #[test]
     fn omitted_s3_secret_references_resolve_default_store_keys() {
         let mut original = test_settings();
         let mut route = ProxyAssetRoute::new(
@@ -626,11 +676,10 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("unused-tinybird-key".to_string()));
         original
-            .integrations
+            .integration
             .insert_config(
                 "datadome",
                 &serde_json::json!({
-                    "enabled": true,
                     "enable_protection": false,
                     "server_side_key_secret_name": "unused-datadome-key",
                     "protection_test_bypass": {
@@ -667,36 +716,40 @@ mod tests {
         );
     }
 
+    /// A block for an integration `[integration] provider` does not name is
+    /// refused, and its secret references are dropped before resolution, so
+    /// the operator reads the block's own fault rather than a secret-store
+    /// failure that follows from it.
     #[test]
-    fn omitted_datadome_enabled_does_not_resolve_stale_protection_references() {
+    fn an_unnamed_datadome_block_is_refused_without_resolving_its_secrets() {
         let mut original = test_settings();
-        original
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure disabled DataDome references");
+        original.integration.insert(
+            "datadome".to_owned(),
+            serde_json::json!({
+                "enable_protection": true,
+                "server_side_key_secret_name": "unused-datadome-key",
+                "protection_test_bypass": {
+                    "enabled": true,
+                    "credential_secret_name": "unused-bypass-key",
+                },
+            }),
+        );
 
-        let reconstructed = settings_from_config_blob(
+        let error = settings_from_config_blob(
             &envelope_json(&original),
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
         )
-        .expect("should skip stale DataDome protection references");
+        .expect_err("should refuse a block nothing on the provider list names");
+        let rendered = format!("{error:?}");
 
         assert!(
-            reconstructed
-                .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
-                .expect("should parse disabled DataDome config")
-                .is_none()
+            rendered.contains("[integration.datadome]") && rendered.contains("provider"),
+            "should name the block and the list: {rendered}"
+        );
+        assert!(
+            !rendered.contains("unused-datadome-key"),
+            "should not have tried to resolve the stale secret reference: {rendered}"
         );
     }
 
@@ -743,7 +796,11 @@ mod tests {
         let mut original = test_settings();
         original.publisher.proxy_secret =
             Redacted::new("12345678901234567890123456789012".to_string());
-        original.ec.passphrase = Redacted::new("12345678901234567890123456789012".to_string());
+        select_hmac_provider(
+            &mut original.ec,
+            HMAC_PROVIDER_KEY,
+            "12345678901234567890123456789012",
+        );
         original.handlers[0].password = Redacted::new("true".to_string());
 
         let reconstructed =
@@ -755,8 +812,8 @@ mod tests {
             "numeric-looking proxy secret should remain a string"
         );
         assert_eq!(
-            reconstructed.ec.passphrase.expose(),
-            original.ec.passphrase.expose(),
+            hmac_passphrase(&reconstructed.ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&original.ec, HMAC_PROVIDER_KEY),
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(
@@ -798,7 +855,7 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
-        settings.ec.passphrase = Redacted::new("short_key".to_owned());
+        select_hmac_provider(&mut settings.ec, HMAC_PROVIDER_KEY, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved passphrase");
@@ -806,6 +863,47 @@ mod tests {
         assert!(
             err.to_string().contains("short_passphrase") || err.to_string().contains("validation"),
             "error should indicate runtime validation: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("short_key"),
+            "error should not expose the secret value"
+        );
+    }
+
+    #[test]
+    fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
+        let mut original = test_settings();
+        select_host_signals_provider(&mut original.ec, "host-signals-passphrase-key");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the host_signals passphrase from the mapped store");
+
+        assert_eq!(
+            reconstructed
+                .ec
+                .provider_blocks
+                .get(HOST_SIGNALS_PROVIDER_KEY)
+                .and_then(crate::settings::EcProviderBlock::host_signals_settings)
+                .map(|config| config.passphrase.expose().as_str()),
+            Some("resolved-host-signals-passphrase-32-bytes-ok")
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
+        let mut settings = test_settings();
+        select_host_signals_provider(&mut settings.ec, "short_key");
+
+        let err = load_settings(&envelope_json(&settings))
+            .expect_err("should reject a short resolved host_signals passphrase");
+
+        assert!(
+            err.to_string().contains("short_passphrase"),
+            "error should name the passphrase check: {err:?}"
         );
         assert!(
             !err.to_string().contains("short_key"),

@@ -298,13 +298,14 @@ publisher-specific settings, then run:
 ts config validate
 ```
 
-The draft also fills `[integrations.js_asset_proxy]` with disabled third-party
-script candidates from the audit. These entries are inventory only: they do not
-register routes or rewrite HTML until you set
-`integrations.js_asset_proxy.enabled = true` and change individual
-`assets[].proxy` values to `"enabled"` or `"blocked"`. Some candidates may be
-runtime-injected scripts; JS Asset Proxy only rewrites matching script `src` URLs
-present in HTML processed by Trusted Server.
+The draft also names in `[integration] provider` the integrations it can
+configure from what it found, and writes their blocks. Where it found
+third-party scripts it writes `[integration.js_asset_proxy]` with each one
+`proxy = "disabled"`, so they are inventory only, and nothing is served or
+rewritten until you review a candidate and change its `proxy` value to
+`"enabled"` or `"blocked"`. Some candidates may be runtime-injected scripts,
+and JS Asset Proxy only rewrites matching script `src` URLs present in HTML
+processed by Trusted Server.
 
 If a config already exists, avoid overwriting it:
 
@@ -665,7 +666,10 @@ APIs.
 `trusted-server.toml`.
 
 ```toml
-[integrations.prebid.bundle.modules]
+[integration]
+provider = ["prebid"]
+
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["atsAnalyticsAdapter"]
@@ -687,7 +691,7 @@ ts prebid bundle
 By default, generated artifacts are written to `dist/prebid/`. The versioned
 manifest records effective module selections, bidder and analytics runtime
 codes, the content-addressed filename, SHA-256, and SRI. The command copies the
-hash and SRI into `integrations.prebid` only after the generator and manifest
+hash and SRI into `integration.prebid` only after the generator and manifest
 both pass validation.
 
 Upload the generated JavaScript file yourself, set `external_bundle_url` to its

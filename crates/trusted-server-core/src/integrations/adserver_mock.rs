@@ -1,8 +1,8 @@
-//! Mock Ad Server Integration
+//! The demonstration ad server implementation, `adserver_mock`.
 //!
-//! Provides a mock ad server mediator that calls mocktioneer's mediation endpoint.
-//! This integration acts as a mediator in the auction flow, selecting winning bids
-//! based on price (highest price wins).
+//! It calls mocktioneer's decision endpoint, which picks the winning bid by
+//! price, so a deployment can exercise the ad server seam without a real ad
+//! server.
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -16,6 +16,7 @@ use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
+use crate::auction::demand::AdServerImplementation;
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
@@ -26,20 +27,43 @@ use crate::integrations::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
-use crate::settings::{IntegrationConfig, Settings};
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Configuration for mock ad server integration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
-pub struct AdServerMockConfig {
-    /// Whether this integration is enabled
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
+/// The implementation id `[adserver]` names.
+pub const ADSERVER_MOCK_ID: &str = "adserver_mock";
 
-    /// Mediation endpoint URL
+/// The demonstration ad server implementation.
+pub static ADSERVER: AdServerImplementation = AdServerImplementation {
+    id: ADSERVER_MOCK_ID,
+    build,
+};
+
+fn build(
+    name: &str,
+    settings: &serde_json::Map<String, Json>,
+) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
+    let settings: AdServerMockSettings = serde_json::from_value(Json::Object(settings.clone()))
+        .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
+            })
+        })?;
+    settings.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
+        })
+    })?;
+    Ok(Arc::new(AdServerMockProvider::new(name, settings)))
+}
+
+/// The settings one `[adserver.<name>]` table holds for this implementation.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct AdServerMockSettings {
+    /// The decision endpoint URL.
     #[validate(url)]
     pub endpoint: String,
 
@@ -54,39 +78,28 @@ pub struct AdServerMockConfig {
 
     /// Mapping from auction-request context keys to query-parameter names.
     /// Allows forwarding integration-supplied data (e.g. audience segments)
-    /// to the mediation endpoint without hard-coding integration knowledge.
+    /// to the ad server decision endpoint without hard-coding integration knowledge.
     ///
     /// ```toml
-    /// [integrations.adserver_mock.context_query_params]
+    /// [adserver.adserver_mock.context_query_params]
     /// permutive_segments = "permutive"
     /// ```
     #[serde(default)]
     pub context_query_params: ContextQueryParams,
 }
 
-fn default_enabled() -> bool {
-    false
-}
-
 fn default_timeout_ms() -> u32 {
     500
 }
 
-impl Default for AdServerMockConfig {
+impl Default for AdServerMockSettings {
     fn default() -> Self {
         Self {
-            enabled: default_enabled(),
-            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+            endpoint: "http://127.0.0.1:6767/mediate".to_string(),
             timeout_ms: default_timeout_ms(),
             price_floor: None,
             context_query_params: BTreeMap::new(),
         }
-    }
-}
-
-impl IntegrationConfig for AdServerMockConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
     }
 }
 
@@ -95,8 +108,8 @@ impl IntegrationConfig for AdServerMockConfig {
 // ============================================================================
 
 /// Lookup index built from the original SSP bids, used while parsing the
-/// mediation response to restore render/accounting fields that the mock
-/// mediator endpoint does not echo back.
+/// ad server decision response to restore render/accounting fields that the mock
+/// ad server endpoint does not echo back.
 ///
 /// Keyed by `(provider_name, slot_id, bidder_name)`.
 type BidIndex = HashMap<(String, String, String), Bid>;
@@ -115,8 +128,8 @@ fn build_bid_index(bidder_responses: &[AuctionResponse]) -> BidIndex {
             // OpenRTB permits a seat to return multiple bids per imp. This index
             // is last-write-wins, so a collision means an earlier bid's
             // nurl/burl/cache_* are dropped and win/billing-URL restoration can
-            // be mis-attributed during mediation. Low severity for the mock
-            // mediator, but log it so the collision is visible.
+            // be mis-attributed during ad server decision. Low severity for the mock
+            // ad server, but log it so the collision is visible.
             if index.insert(key, bid.clone()).is_some() {
                 log::warn!(
                     "adserver_mock: duplicate bid for (provider '{}', slot '{}', bidder '{}'); keeping the last — win/billing URL restoration may be mis-attributed",
@@ -130,19 +143,23 @@ fn build_bid_index(bidder_responses: &[AuctionResponse]) -> BidIndex {
     index
 }
 
-/// Mock ad server mediator provider.
+/// The demonstration ad server, under the name its table gave it.
 pub struct AdServerMockProvider {
-    config: AdServerMockConfig,
+    name: String,
+    config: AdServerMockSettings,
 }
 
 impl AdServerMockProvider {
-    /// Create a new mock ad server provider.
+    /// Create one ad server under the name `[adserver] provider` selected.
     #[must_use]
-    pub fn new(config: AdServerMockConfig) -> Self {
-        Self { config }
+    pub fn new(name: &str, config: AdServerMockSettings) -> Self {
+        Self {
+            name: name.to_owned(),
+            config,
+        }
     }
 
-    /// Build the mediation endpoint URL, appending context values as query
+    /// Build the ad server decision endpoint URL, appending context values as query
     /// parameters according to the `context_query_params` config mapping.
     ///
     /// For example, with `context_query_params = { permutive_segments = "permutive" }`
@@ -156,15 +173,15 @@ impl AdServerMockProvider {
         )
     }
 
-    /// Build mediation request from auction request and bidder responses.
+    /// Build ad server decision request from auction request and bidder responses.
     ///
-    /// Only bids with decoded numeric prices are eligible for mediation.
-    fn build_mediation_request(
+    /// Only bids with decoded numeric prices are eligible for ad server decision.
+    fn build_adserver_request(
         &self,
         request: &AuctionRequest,
         bidder_responses: &[AuctionResponse],
     ) -> Result<Json, Report<TrustedServerError>> {
-        // Convert bidder responses to mediation format
+        // Convert bidder responses to ad server decision format
         let bidder_responses_json: Vec<Json> = bidder_responses
             .iter()
             .filter(|r| r.status == BidStatus::Success)
@@ -219,7 +236,7 @@ impl AdServerMockProvider {
             })
             .collect();
 
-        // Build mediation config
+        // Build ad server decision config
         let config_json = if self.config.price_floor.is_some() {
             json!({
                 "price_floor": self.config.price_floor,
@@ -239,7 +256,7 @@ impl AdServerMockProvider {
             })
         });
 
-        // Build full mediation request
+        // Build full ad server decision request
         Ok(json!({
             "id": request.id,
             "imp": imps,
@@ -251,15 +268,15 @@ impl AdServerMockProvider {
         }))
     }
 
-    /// Parse `OpenRTB` response from mediation endpoint.
-    /// Mediation returns decoded prices for all selected bids.
+    /// Parse `OpenRTB` response from ad server decision endpoint.
+    /// Ad server decision returns decoded prices for all selected bids.
     ///
     /// `bid_index` is the SSP-bid lookup built from the auction context's
-    /// bidder responses. The mock mediator does not echo render/accounting
+    /// bidder responses. The mock ad server does not echo render/accounting
     /// fields back, so they are restored from the index using
     /// `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
     /// field (`"{bidder}-creative"` format set during request construction).
-    fn parse_mediation_response(
+    fn parse_adserver_response(
         &self,
         json: &Json,
         response_time_ms: u64,
@@ -279,7 +296,7 @@ impl AdServerMockProvider {
                 let slot_id = bid["impid"].as_str().unwrap_or("").to_string();
 
                 // Recover bidder name from crid ("{bidder}-creative") to look up the
-                // original SSP bid and restore render/accounting fields the mediator drops.
+                // original SSP bid and restore render/accounting fields the ad server drops.
                 let crid = bid["crid"].as_str().unwrap_or("");
                 let bidder = crid.strip_suffix("-creative").unwrap_or_else(|| {
                     log::debug!(
@@ -321,10 +338,10 @@ impl AdServerMockProvider {
                     }),
                     nurl: original.and_then(|b| b.nurl.clone()),
                     burl: original.and_then(|b| b.burl.clone()),
-                    // The mediation response is itself `OpenRTB`, so the mediated
+                    // The ad server decision response is itself `OpenRTB`, so the decided
                     // bid's own `id` is this bid's identifier. Fall back to the
-                    // original SSP bid's id when the mediator omits one. Without
-                    // either, a mediated bid whose only `hb_adid` source is the bid
+                    // original SSP bid's id when the ad server omits one. Without
+                    // either, a decided bid whose only `hb_adid` source is the bid
                     // id would lose it and never render — including APS bids, which
                     // carry no `ad_id` or `cache_id` for the restore to recover.
                     bid_id: bid["id"]
@@ -354,7 +371,7 @@ impl AdServerMockProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error when the mediation response body is not valid JSON.
+    /// Returns an error when the ad server decision response body is not valid JSON.
     async fn parse_response_inner(
         &self,
         response: PlatformResponse,
@@ -380,13 +397,13 @@ impl AdServerMockProvider {
         })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-                message: "Failed to parse mediation response".to_string(),
+                message: "Failed to parse the ad server response".to_string(),
             })?;
 
         log::trace!("AdServer Mock response: {:?}", response_json);
 
         let auction_response =
-            self.parse_mediation_response(&response_json, response_time_ms, bid_index);
+            self.parse_adserver_response(&response_json, response_time_ms, bid_index);
 
         log::info!(
             "AdServer Mock returned {} bids in {}ms",
@@ -401,7 +418,7 @@ impl AdServerMockProvider {
 #[async_trait(?Send)]
 impl AuctionProvider for AdServerMockProvider {
     fn provider_name(&self) -> &str {
-        "adserver_mock"
+        &self.name
     }
 
     async fn request_bids(
@@ -409,39 +426,39 @@ impl AuctionProvider for AdServerMockProvider {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-        // Get bidder responses from context (passed by orchestrator for mediation)
+        // Get bidder responses from context (passed by orchestrator for ad server decision)
         let bidder_responses = context.provider_responses.unwrap_or(&[]);
 
         log::info!(
-            "AdServer Mock: mediating {} slots with {} bidder responses",
+            "AdServer Mock: deciding on {} slots with {} bidder responses",
             request.slots.len(),
             bidder_responses.len()
         );
 
-        // Build mediation request
-        let mediation_req = self
-            .build_mediation_request(request, bidder_responses)
+        // Build ad server decision request
+        let adserver_req = self
+            .build_adserver_request(request, bidder_responses)
             .change_context(TrustedServerError::Auction {
-                message: "Failed to build mediation request".to_string(),
+                message: "Failed to build the ad server request".to_string(),
             })?;
 
-        log::trace!("AdServer Mock: mediation request: {:?}", mediation_req);
+        log::trace!("AdServer Mock: request: {:?}", adserver_req);
 
         // Build endpoint URL with context-driven query parameters
         let endpoint_url = self.build_endpoint_url(request);
 
         // Create HTTP POST request
-        let mediation_body =
-            serde_json::to_vec(&mediation_req).change_context(TrustedServerError::Auction {
-                message: "Failed to serialize mediation request".to_string(),
+        let adserver_body =
+            serde_json::to_vec(&adserver_req).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize the ad server request".to_string(),
             })?;
         let mut req = http::Request::builder()
             .method(Method::POST)
             .uri(&endpoint_url)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(mediation_body))
+            .body(EdgeBody::from(adserver_body))
             .change_context(TrustedServerError::Auction {
-                message: "Failed to build mediation request".to_string(),
+                message: "Failed to build the ad server request".to_string(),
             })?;
 
         // Set Host header with port to ensure mocktioneer generates correct iframe URLs
@@ -478,7 +495,7 @@ impl AuctionProvider for AdServerMockProvider {
         )
         .change_context(TrustedServerError::Auction {
             message: format!(
-                "Failed to resolve backend for mediation endpoint: {}",
+                "Failed to resolve backend for decision endpoint: {}",
                 self.config.endpoint
             ),
         })?;
@@ -489,7 +506,7 @@ impl AuctionProvider for AdServerMockProvider {
             .send_async(PlatformHttpRequest::new(req, backend_name))
             .await
             .change_context(TrustedServerError::Auction {
-                message: "Failed to send mediation request".to_string(),
+                message: "Failed to send ad server request".to_string(),
             })?;
 
         Ok(ProviderRequestOutcome::pending(pending))
@@ -517,7 +534,7 @@ impl AuctionProvider for AdServerMockProvider {
         context: &AuctionContext<'_>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Rebuild the SSP-bid lookup from the orchestrator-provided bidder
-        // responses so nurl/burl/ad_id survive mediation. Request-scoped data
+        // responses so nurl/burl/ad_id survive ad server decision. Request-scoped data
         // travels on the context instead of provider-instance state.
         let bid_index = build_bid_index(context.provider_responses.unwrap_or(&[]));
         self.parse_response_inner(response, response_time_ms, &bid_index)
@@ -530,10 +547,6 @@ impl AuctionProvider for AdServerMockProvider {
 
     fn timeout_ms(&self) -> u32 {
         self.config.timeout_ms
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.config.enabled
     }
 
     fn backend_name(
@@ -555,40 +568,6 @@ impl AuctionProvider for AdServerMockProvider {
         })
         .ok()
     }
-}
-
-// ============================================================================
-// Auto-Registration
-// ============================================================================
-
-/// Auto-register ad server mock provider based on settings configuration.
-///
-/// # Errors
-///
-/// Returns an error when the ad server mock provider is enabled with invalid
-/// configuration.
-pub fn register_providers(
-    settings: &Settings,
-) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
-
-    match settings.integration_config::<AdServerMockConfig>("adserver_mock") {
-        Ok(Some(config)) => {
-            log::info!(
-                "Registering AdServer Mock mediator (endpoint: {})",
-                config.endpoint
-            );
-            providers.push(Arc::new(AdServerMockProvider::new(config)));
-        }
-        Ok(None) => {
-            log::debug!("AdServer Mock config found but is disabled");
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
-
-    Ok(providers)
 }
 
 // ============================================================================
@@ -650,17 +629,27 @@ mod tests {
             bid_id: Some(bid_id.to_string()),
             ad_id: None,
             creative_id: Some(format!("creative-{bid_id}")),
-            renderer: Some(BidRenderer::Aps(ApsRendererV1 {
-                version: 1,
-                account_id: "example-account".to_string(),
-                bid_id: bid_id.to_string(),
-                creative_id: Some(format!("creative-{bid_id}")),
-                tag_type: ApsTagType::Iframe,
-                creative_url: format!("https://creative.example/{bid_id}"),
-                aax_response: format!("fictional-{bid_id}-base64"),
-                width: 728,
-                height: 90,
-            })),
+            // The mock is not APS, so it builds the neutral descriptor from
+            // the wire keys rather than from the APS descriptor type. The "aps"
+            // tag is used on purpose: these fixtures mimic an APS bid arriving
+            // at the ad server.
+            renderer: Some(
+                BidRenderer::new(
+                    "aps",
+                    json!({
+                        "version": 1,
+                        "accountId": "example-account",
+                        "bidId": bid_id,
+                        "creativeId": format!("creative-{bid_id}"),
+                        "tagType": "iframe",
+                        "creativeUrl": format!("https://creative.example/{bid_id}"),
+                        "aaxResponse": format!("fictional-{bid_id}-base64"),
+                        "width": 728,
+                        "height": 90
+                    }),
+                )
+                .expect("should build renderer descriptor"),
+            ),
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -669,16 +658,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_mediation_request() {
-        let config = AdServerMockConfig {
-            enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+    fn test_build_adserver_request() {
+        let config = AdServerMockSettings {
+            endpoint: "http://localhost:6767/mediate".to_string(),
             timeout_ms: 500,
             price_floor: Some(1.00),
             context_query_params: BTreeMap::new(),
         };
 
-        let provider = AdServerMockProvider::new(config);
+        let provider = AdServerMockProvider::new("adserver_mock", config);
         let auction_request = create_test_auction_request();
 
         let bidder_responses = vec![
@@ -738,35 +726,35 @@ mod tests {
             },
         ];
 
-        let mediation_req = provider
-            .build_mediation_request(&auction_request, &bidder_responses)
-            .expect("should build mediation request");
+        let adserver_req = provider
+            .build_adserver_request(&auction_request, &bidder_responses)
+            .expect("should build ad server request");
 
         // Verify structure
-        assert_eq!(mediation_req["id"], "test-auction-123");
+        assert_eq!(adserver_req["id"], "test-auction-123");
         assert_eq!(
-            mediation_req["imp"]
+            adserver_req["imp"]
                 .as_array()
                 .expect("imp should be array")
                 .len(),
             1
         );
         assert_eq!(
-            mediation_req["ext"]["bidder_responses"]
+            adserver_req["ext"]["bidder_responses"]
                 .as_array()
                 .expect("bidder_responses should be array")
                 .len(),
             2
         );
-        assert_eq!(mediation_req["ext"]["config"]["price_floor"], 1.00);
+        assert_eq!(adserver_req["ext"]["config"]["price_floor"], 1.00);
     }
 
     #[test]
-    fn test_parse_mediation_response() {
-        let config = AdServerMockConfig::default();
-        let provider = AdServerMockProvider::new(config);
+    fn test_parse_adserver_response() {
+        let config = AdServerMockSettings::default();
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
-        let mediation_response = json!({
+        let adserver_response = json!({
             "id": "test-auction-123",
             "seatbid": [
                 {
@@ -789,7 +777,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_adserver_response(&adserver_response, 200, &BidIndex::new());
 
         assert_eq!(auction_response.provider, "adserver_mock");
         assert_eq!(auction_response.status, BidStatus::Success);
@@ -805,9 +793,9 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_mediator_seats_do_not_become_upstream_returned_seats() {
-        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
-        let mediation_response = json!({
+    fn unmatched_adserver_seats_do_not_become_upstream_returned_seats() {
+        let provider = AdServerMockProvider::new("adserver_mock", AdServerMockSettings::default());
+        let adserver_response = json!({
             "seatbid": [
                 {
                     "seat": "provider-instance",
@@ -836,28 +824,28 @@ mod tests {
             ]
         });
 
-        let response = provider.parse_mediation_response(&mediation_response, 10, &BidIndex::new());
+        let response = provider.parse_adserver_response(&adserver_response, 10, &BidIndex::new());
 
         assert_eq!(response.bids.len(), 2);
         assert_eq!(response.bids[0].bidder, "provider-instance");
         assert_eq!(response.bids[1].bidder, "unknown");
         assert!(
             response.bids.iter().all(|bid| bid.returned_seat.is_none()),
-            "an unmatched mediator seat is provider correlation identity, not an upstream seat"
+            "an unmatched ad server seat is provider correlation identity, not an upstream seat"
         );
     }
 
     #[test]
-    fn parse_mediation_response_restores_original_bid_render_fields() {
-        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
-        let mediation_response = json!({
+    fn parse_adserver_response_restores_original_bid_render_fields() {
+        let provider = AdServerMockProvider::new("adserver_mock", AdServerMockSettings::default());
+        let adserver_response = json!({
             "id": "test-auction-123",
             "seatbid": [
                 {
                     "seat": "prebid",
                     "bid": [
                         {
-                            "id": "mediated-bid-001",
+                            "id": "decided-bid-001",
                             "impid": "header-banner",
                             "price": 0.20,
                             "adm": "<div>Mediated Ad</div>",
@@ -893,17 +881,25 @@ mod tests {
                 bid_id: Some("source-bid-id".to_string()),
                 ad_id: Some("bid-impression-id".to_string()),
                 creative_id: Some("source-creative-id".to_string()),
-                renderer: Some(BidRenderer::Aps(ApsRendererV1 {
-                    version: 1,
-                    account_id: "example-account".to_string(),
-                    bid_id: "source-bid-id".to_string(),
-                    creative_id: Some("source-creative-id".to_string()),
-                    tag_type: ApsTagType::Iframe,
-                    creative_url: "https://creative.example/render".to_string(),
-                    aax_response: "fictional-base64".to_string(),
-                    width: 728,
-                    height: 90,
-                })),
+                // Neutral descriptor with the "aps" tag: the mock mimics an
+                // APS bid here without depending on the APS descriptor type.
+                renderer: Some(
+                    BidRenderer::new(
+                        "aps",
+                        json!({
+                            "version": 1,
+                            "accountId": "example-account",
+                            "bidId": "source-bid-id",
+                            "creativeId": "source-creative-id",
+                            "tagType": "iframe",
+                            "creativeUrl": "https://creative.example/render",
+                            "aaxResponse": "fictional-base64",
+                            "width": 728,
+                            "height": 90
+                        }),
+                    )
+                    .expect("should build renderer descriptor"),
+                ),
                 cache_id: Some("cache-uuid".to_string()),
                 cache_host: Some("cache.example".to_string()),
                 cache_path: Some("/cache".to_string()),
@@ -911,8 +907,7 @@ mod tests {
             },
         );
 
-        let auction_response =
-            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+        let auction_response = provider.parse_adserver_response(&adserver_response, 42, &bid_index);
 
         assert_eq!(auction_response.status, BidStatus::Success);
         assert_eq!(auction_response.bids.len(), 1);
@@ -933,8 +928,8 @@ mod tests {
         );
         assert_eq!(
             bid.bid_id.as_deref(),
-            Some("mediated-bid-001"),
-            "should carry the mediated OpenRTB bid id so hb_adid always has a source"
+            Some("decided-bid-001"),
+            "should carry the decided OpenRTB bid id so hb_adid always has a source"
         );
         assert_eq!(
             bid.ad_id.as_deref(),
@@ -966,11 +961,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_mediation_response_falls_back_to_original_bid_id() {
-        // A mediator that omits the per-bid `id` must not strand a pass-through
+    fn parse_adserver_response_falls_back_to_original_bid_id() {
+        // An ad server that omits the per-bid `id` must not strand a pass-through
         // bid whose only hb_adid source is its OpenRTB bid id.
-        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
-        let mediation_response = json!({
+        let provider = AdServerMockProvider::new("adserver_mock", AdServerMockSettings::default());
+        let adserver_response = json!({
             "id": "test-auction-123",
             "seatbid": [{
                 "seat": "prebid",
@@ -1015,21 +1010,20 @@ mod tests {
             },
         );
 
-        let auction_response =
-            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+        let auction_response = provider.parse_adserver_response(&adserver_response, 42, &bid_index);
 
         assert_eq!(
             auction_response.bids[0].bid_id.as_deref(),
             Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
-            "should restore the original SSP bid id when the mediator omits one"
+            "should restore the original SSP bid id when the ad server omits one"
         );
     }
 
     #[test]
-    fn reduced_aps_bid_avoids_mediation_index_renderer_collision() {
-        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+    fn reduced_aps_bid_avoids_adserver_index_renderer_collision() {
+        let provider = AdServerMockProvider::new("adserver_mock", AdServerMockSettings::default());
 
-        // Document why APS must reduce before mediation: the mediator index is
+        // Document why APS must reduce before the ad server decision, because the ad server index is
         // intentionally last-write-wins for identical provider/slot/bidder keys.
         let unreduced = AuctionResponse::success(
             "aps",
@@ -1051,21 +1045,21 @@ mod tests {
         );
 
         let reduced = AuctionResponse::success("aps", vec![aps_bid("selected", 2.0)], 1);
-        let mediation_request = provider
-            .build_mediation_request(
+        let adserver_request = provider
+            .build_adserver_request(
                 &create_test_auction_request(),
                 std::slice::from_ref(&reduced),
             )
-            .expect("should build mediation request from reduced APS response");
+            .expect("should build ad server request from reduced APS response");
         assert_eq!(
-            mediation_request["ext"]["bidder_responses"][0]["bids"]
+            adserver_request["ext"]["bidder_responses"][0]["bids"]
                 .as_array()
                 .map(Vec::len),
             Some(1)
         );
 
         let reduced_index = build_bid_index(&[reduced]);
-        let mediated = provider.parse_mediation_response(
+        let decided = provider.parse_adserver_response(
             &json!({
                 "seatbid": [{
                     "seat": "aps",
@@ -1081,47 +1075,44 @@ mod tests {
             2,
             &reduced_index,
         );
-        let winner = mediated
+        let winner = decided
             .bids
             .first()
-            .expect("should restore mediated APS winner");
+            .expect("should restore decided APS winner");
         assert_eq!(winner.bid_id.as_deref(), Some("selected"));
-        assert_eq!(
-            winner
-                .renderer
-                .as_ref()
-                .expect("should restore APS renderer")
-                .as_aps()
-                .expect("should be APS renderer")
-                .bid_id,
-            "selected"
-        );
+        let renderer = winner
+            .renderer
+            .as_ref()
+            .expect("should restore APS renderer")
+            .payload_as::<serde_json::Value>("aps")
+            .expect("should carry an APS-tagged payload");
+        assert_eq!(renderer["bidId"], "selected");
         assert!(winner.creative.is_none());
     }
 
     #[test]
-    fn test_parse_empty_mediation_response() {
-        let config = AdServerMockConfig::default();
-        let provider = AdServerMockProvider::new(config);
+    fn test_parse_empty_adserver_response() {
+        let config = AdServerMockSettings::default();
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
-        let mediation_response = json!({
+        let adserver_response = json!({
             "id": "test-auction-123",
             "seatbid": [],
             "cur": "USD"
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 100, &BidIndex::new());
+            provider.parse_adserver_response(&adserver_response, 100, &BidIndex::new());
 
         assert_eq!(auction_response.status, BidStatus::NoBid);
         assert_eq!(auction_response.bids.len(), 0);
     }
 
     #[test]
-    fn test_mediation_request_handles_decoded_bid_without_creative() {
-        // Typed-renderer bids retain their decoded price when sent to mediation.
-        let config = AdServerMockConfig::default();
-        let provider = AdServerMockProvider::new(config);
+    fn test_adserver_request_handles_decoded_bid_without_creative() {
+        // Typed-renderer bids retain their decoded price when sent to ad server decision.
+        let config = AdServerMockSettings::default();
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let auction_request = AuctionRequest {
             id: "test-auction".to_string(),
@@ -1178,14 +1169,14 @@ mod tests {
             metadata: HashMap::new(),
         }];
 
-        let mediation_req = provider
-            .build_mediation_request(&auction_request, &bidder_responses)
+        let adserver_req = provider
+            .build_adserver_request(&auction_request, &bidder_responses)
             .expect("should build request");
 
-        // Verify the mediation request structure
-        assert_eq!(mediation_req["id"], "test-auction");
+        // Verify the ad server decision request structure
+        assert_eq!(adserver_req["id"], "test-auction");
 
-        let bidder_resp = &mediation_req["ext"]["bidder_responses"][0];
+        let bidder_resp = &adserver_req["ext"]["bidder_responses"][0];
         assert_eq!(bidder_resp["bidder"], "aps");
 
         let bid = &bidder_resp["bids"][0];
@@ -1206,11 +1197,10 @@ mod tests {
 
     #[test]
     fn test_provider_metadata() {
-        let config = AdServerMockConfig::default();
-        let provider = AdServerMockProvider::new(config);
+        let config = AdServerMockSettings::default();
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         assert_eq!(provider.provider_name(), "adserver_mock");
-        assert!(!provider.is_enabled()); // Default is disabled
         assert_eq!(provider.timeout_ms(), 500);
         assert!(provider.supports_media_type(&MediaType::Banner));
         assert!(!provider.supports_media_type(&MediaType::Video));
@@ -1218,18 +1208,17 @@ mod tests {
     }
 
     #[test]
-    fn test_mediation_request_includes_consent() {
+    fn test_adserver_request_includes_consent() {
         use crate::consent::ConsentContext;
 
-        let config = AdServerMockConfig {
-            enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+        let config = AdServerMockSettings {
+            endpoint: "http://localhost:6767/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::new(),
         };
 
-        let provider = AdServerMockProvider::new(config);
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let mut request = create_test_auction_request();
         request.user.consent = Some(ConsentContext {
@@ -1241,11 +1230,11 @@ mod tests {
             ..Default::default()
         });
 
-        let mediation_req = provider
-            .build_mediation_request(&request, &[])
+        let adserver_req = provider
+            .build_adserver_request(&request, &[])
             .expect("should build request");
 
-        let consent = &mediation_req["ext"]["consent"];
+        let consent = &adserver_req["ext"]["consent"];
         assert_eq!(consent["gdpr"], 1);
         assert_eq!(consent["consent"], "BOEFEAyO");
         assert_eq!(consent["us_privacy"], "1YNN");
@@ -1254,28 +1243,28 @@ mod tests {
     }
 
     #[test]
-    fn test_mediation_request_no_consent() {
-        let config = AdServerMockConfig::default();
-        let provider = AdServerMockProvider::new(config);
+    fn test_adserver_request_no_consent() {
+        let config = AdServerMockSettings::default();
+        let provider = AdServerMockProvider::new("adserver_mock", config);
         let request = create_test_auction_request(); // consent is None
 
-        let mediation_req = provider
-            .build_mediation_request(&request, &[])
+        let adserver_req = provider
+            .build_adserver_request(&request, &[])
             .expect("should build request");
 
         assert!(
-            mediation_req["ext"]["consent"].is_null(),
+            adserver_req["ext"]["consent"].is_null(),
             "consent should be null when no consent context"
         );
     }
 
     #[test]
-    fn test_parse_mediation_response_with_missing_prices() {
-        // A malformed mediator response can still omit a selected bid price.
-        let config = AdServerMockConfig::default();
-        let provider = AdServerMockProvider::new(config);
+    fn test_parse_adserver_response_with_missing_prices() {
+        // A malformed ad server response can still omit a selected bid price.
+        let config = AdServerMockSettings::default();
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
-        let mediation_response = json!({
+        let adserver_response = json!({
             "id": "test-auction-123",
             "seatbid": [
                 {
@@ -1292,7 +1281,7 @@ mod tests {
                         {
                             "id": "bid-002",
                             "impid": "sidebar",
-                            // Note: No "price" field - mediation failed to decode
+                            // Note: No "price" field - ad server decision failed to decode
                             "adm": "<div>Failed decode</div>",
                             "w": 300,
                             "h": 250,
@@ -1304,7 +1293,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_adserver_response(&adserver_response, 200, &BidIndex::new());
 
         assert_eq!(auction_response.status, BidStatus::Success);
         assert_eq!(auction_response.bids.len(), 2);
@@ -1325,9 +1314,8 @@ mod tests {
 
     #[test]
     fn test_build_endpoint_url_with_context_query_params() {
-        let config = AdServerMockConfig {
-            enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+        let config = AdServerMockSettings {
+            endpoint: "http://localhost:6767/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::from([(
@@ -1335,7 +1323,7 @@ mod tests {
                 "permutive".to_string(),
             )]),
         };
-        let provider = AdServerMockProvider::new(config);
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let mut request = create_test_auction_request();
         request.context.insert(
@@ -1351,7 +1339,7 @@ mod tests {
         let url = provider.build_endpoint_url(&request);
         assert_eq!(
             url,
-            "http://localhost:6767/adserver/mediate?permutive=10000001%2C10000003%2Cadv%2Cbhgp"
+            "http://localhost:6767/mediate?permutive=10000001%2C10000003%2Cadv%2Cbhgp"
         );
     }
 
@@ -1359,14 +1347,13 @@ mod tests {
     fn test_build_endpoint_url_no_mapping_no_params() {
         // With an empty context_query_params, no query params are appended
         // even if context contains data.
-        let config = AdServerMockConfig {
-            enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
+        let config = AdServerMockSettings {
+            endpoint: "http://localhost:6767/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::new(),
         };
-        let provider = AdServerMockProvider::new(config);
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let mut request = create_test_auction_request();
         request.context.insert(
@@ -1375,19 +1362,19 @@ mod tests {
         );
 
         let url = provider.build_endpoint_url(&request);
-        assert_eq!(url, "http://localhost:6767/adserver/mediate");
+        assert_eq!(url, "http://localhost:6767/mediate");
     }
 
     #[test]
     fn test_build_endpoint_url_empty_array_skipped() {
-        let config = AdServerMockConfig {
+        let config = AdServerMockSettings {
             context_query_params: BTreeMap::from([(
                 "permutive_segments".to_string(),
                 "permutive".to_string(),
             )]),
             ..Default::default()
         };
-        let provider = AdServerMockProvider::new(config);
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let mut request = create_test_auction_request();
         request.context.insert(
@@ -1404,8 +1391,7 @@ mod tests {
 
     #[test]
     fn test_build_endpoint_url_preserves_existing_query_params() {
-        let config = AdServerMockConfig {
-            enabled: true,
+        let config = AdServerMockSettings {
             endpoint: "http://localhost:6767/adserver/mediate?debug=true".to_string(),
             timeout_ms: 500,
             price_floor: None,
@@ -1414,7 +1400,7 @@ mod tests {
                 "permutive".to_string(),
             )]),
         };
-        let provider = AdServerMockProvider::new(config);
+        let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let mut request = create_test_auction_request();
         request.context.insert(

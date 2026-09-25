@@ -213,7 +213,6 @@ mod tests {
 
     fn test_config() -> Arc<NextJsIntegrationConfig> {
         Arc::new(NextJsIntegrationConfig {
-            enabled: true,
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
             max_combined_payload_bytes: 10 * 1024 * 1024,
         })

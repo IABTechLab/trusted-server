@@ -23,9 +23,8 @@ use rsc_stream::NextJsRscStreamProcessorFactory;
 use script_rewriter::NextJsNextDataRewriter;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct NextJsIntegrationConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     #[serde(
         default = "default_rewrite_attributes",
         deserialize_with = "crate::settings::vec_from_seq_or_map"
@@ -36,15 +35,7 @@ pub struct NextJsIntegrationConfig {
     pub max_combined_payload_bytes: usize,
 }
 
-impl IntegrationConfig for NextJsIntegrationConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-fn default_enabled() -> bool {
-    false
-}
+impl IntegrationConfig for NextJsIntegrationConfig {}
 
 fn default_rewrite_attributes() -> Vec<String> {
     vec!["href".to_owned(), "link".to_owned(), "url".to_owned()]
@@ -63,25 +54,37 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
     })
 }
 
-/// Register the Next.js integration when enabled.
+/// Validates the Next.js configuration for deployment and reports whether
+/// `[integration] provider` names the integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the Next.js integration is enabled with invalid
+/// Returns an error when the Next.js configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
+/// Register the Next.js integration when `[integration] provider` names it.
+///
+/// # Errors
+///
+/// Returns an error when the Next.js integration runs with invalid
 /// configuration.
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
     let config = if let Some(config) = build(settings)? {
         log::info!(
-            "NextJS integration registered: enabled={}, rewrite_attributes={:?}, max_combined_payload_bytes={}",
-            config.enabled,
+            "NextJS integration registered: rewrite_attributes={:?}, max_combined_payload_bytes={}",
             config.rewrite_attributes,
             config.max_combined_payload_bytes
         );
         config
     } else {
-        log::info!("NextJS integration not registered (disabled or missing config)");
+        log::info!("NextJS integration not registered ([integration] provider does not name it)");
         return Ok(None);
     };
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.
@@ -143,11 +146,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -230,11 +232,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": [
                         "href",
                         "link",
@@ -313,11 +314,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -366,11 +366,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "url"],
                 }),
             )
@@ -421,11 +420,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                     "max_combined_payload_bytes": 1,
                 }),
@@ -491,11 +489,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["url"],
                 }),
             )
@@ -568,11 +565,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["url"],
                 }),
             )
@@ -636,11 +632,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -698,11 +693,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -762,11 +756,10 @@ mod tests {
     fn stream_nextjs_html(html: &str, chunk_size: usize) -> String {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -874,11 +867,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                     // Fits either script alone, not both payloads together.
                     "max_combined_payload_bytes": 80,

@@ -173,7 +173,7 @@ settings; sanitization is opt-in and rewriting is enabled by default.
 
 Configured provider IDs appear in response metadata and provider responses.
 Consumers that previously matched the literal provider name `prebid` must use
-the configured provider ID, such as `pbs-main`.
+the configured demand source name, such as `pbs_main`.
 
 **Contract:** Auth: none. The buffered JSON body is limited to 256 KiB. A
 successful auction and an intentional no-bid both return `200` JSON; disabling
@@ -337,6 +337,18 @@ or CORS headers. It is Fastly-only and requires the EC KV store.
 **Example:** `curl -X POST https://edge.example.com/_ts/api/v1/batch-sync -H
 'Authorization: Bearer <partner-api-key>' -H 'Content-Type: application/json'
 --data @mappings.json`.
+
+---
+
+### POST /\_ts/api/v1/ec/resolve
+
+Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client_fixed` demonstration provider). Server-side providers such as HMAC do not use it.
+
+**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
+
+**Request Body:** the provider's value, opaque to the core. For `client_fixed` this is the fixed known word sent as `text/plain`.
+
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
 
 ---
 
@@ -779,13 +791,13 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the provider this deployment selects, such as the built-in HMAC provider's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC provider also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no provider selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 
 **Response fields:**
 
-- `ec_id`, `store`, and `generation` identify the raw KV lookup.
+- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
@@ -963,7 +975,7 @@ compiled integration registry, not an arbitrary filename lookup.
 ```
 
 **Module Selection:**
-All integration modules are built at compile time. At runtime, the server concatenates only the modules whose integrations are enabled in `trusted-server.toml` (or env vars). No rebuild is required to change the module set.
+All integration modules are built at compile time. At runtime, the server concatenates only the modules of the integrations `[integration] provider` names in `trusted-server.toml`. No rebuild is required to change the module set.
 
 ---
 
@@ -1019,7 +1031,7 @@ rewriter, injector, post-processor, request filter, or auction mediator.
 | `permutive`          | `enabled=true`                                                   | `POST /integrations/permutive/secure-signal/*`    |
 | `permutive`          | `enabled=true`                                                   | `POST /integrations/permutive/sync/*`             |
 | `prebid`             | `enabled=true;script_patterns=config-derived`                    | `GET /integrations/prebid/bundle.js`              |
-| `prebid`             | `enabled=true;script_patterns=config-derived`                    | `GET <integrations.prebid.script_patterns[]>`     |
+| `prebid`             | `enabled=true;script_patterns=config-derived`                    | `GET <integration.prebid.script_patterns[]>`      |
 | `sourcepoint`        | `enabled=true`                                                   | `GET /integrations/sourcepoint/cdn/*`             |
 | `sourcepoint`        | `enabled=true`                                                   | `HEAD /integrations/sourcepoint/cdn/*`            |
 | `sourcepoint`        | `enabled=true`                                                   | `OPTIONS /integrations/sourcepoint/cdn/*`         |
@@ -1043,7 +1055,7 @@ available when a deployment needs either.
 | Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                   | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |
 | GTM/gtag scripts  | `GET` the generated `gtm.js`, `gtag.js`, or `gtag/js` paths; query forwarded or configured container ID supplied; successful script is rewritten                       | Non-success upstream status preserved; rewritten scripts use `cache_max_age`; oversized rewritten upstream bodies use shared integration errors                                               | `curl -i 'https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXX'`                                                   |
 | Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; stream-read failure returns `502`; upstream response otherwise preserved                            | Browser beacon; body schema belongs to Google Analytics                                                                                   |
-| JS asset proxy    | `GET` each configured `[[integrations.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
+| JS asset proxy    | `GET` each configured `[[integration.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                 | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
 | GPT               | `GET` `/script`, `/pagead/*`, or `/tag/*`; path/query proxy to the configured GPT origins and script content can be rewritten                                          | Upstream status is preserved; successful scripts/assets apply integration cache rules; selected upstream CORS is preserved                                                                    | `curl -i https://edge.example.com/integrations/gpt/script`                                                                                |
 | Lockr SDK         | `GET /integrations/lockr/sdk`; no body; fetches and returns the configured SDK as JavaScript                                                                           | Successful SDK uses `cache_ttl_seconds`; upstream/transport failures follow integration mapping; no added CORS policy                                                                         | `curl -i https://edge.example.com/integrations/lockr/sdk`                                                                                 |
 | Lockr API         | `GET` or `POST /integrations/lockr/api/*`; path, query, selected headers, and bounded body proxy to `api_endpoint`; publisher credentials are stripped                 | Upstream status/body preserved; no local cache/CORS policy                                                                                                                                    | Payload is Lockr-specific; use the SDK for normal calls                                                                                   |

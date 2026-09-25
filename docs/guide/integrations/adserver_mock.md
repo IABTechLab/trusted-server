@@ -4,7 +4,8 @@
 is not an ordinary bidder provider and does not expose an integration proxy
 route.
 
-Enable `[integrations.adserver_mock]` and set
+Name `adserver_mock` in `[integration] provider`, give it an
+`[integration.adserver_mock]` table, and set
 `auction.mediator = "adserver_mock"`. Startup registers the mediator only
 when both conditions hold. The orchestrator first gathers responses from the
 configured auction providers, then passes successful bids to the mediator's

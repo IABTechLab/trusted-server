@@ -11,7 +11,7 @@
  * The prebid integration builds here as the tsjs shim only — Prebid.js itself
  * is never bundled into tsjs. Use build-prebid-external.mjs to generate the
  * pure Prebid.js external bundle (core + adapters + user ID modules) that the
- * shim requires at runtime via integrations.prebid.external_bundle_url.
+ * shim requires at runtime via integration.prebid.external_bundle_url.
  */
 
 import fs from 'node:fs';

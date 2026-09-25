@@ -43,10 +43,13 @@ impl DataDomeIntegration {
     ) -> RequestFilterDecision {
         let test_bypass_matched = self.take_protection_test_bypass_header(input.request);
         if test_bypass_matched {
-            input
-                .request
-                .extensions_mut()
-                .insert(super::DataDomeClientTagSuppressed);
+            // Both markers travel together. The first is DataDome's own
+            // tag-suppression signal, read by its head injector. The second tells
+            // core the response is personalized to this request and cannot be
+            // shared through a cache or a template.
+            let extensions = input.request.extensions_mut();
+            extensions.insert(super::DataDomeClientTagSuppressed);
+            extensions.insert(crate::response_privacy::PersonalizedResponse);
             log_protection_test_bypass(&input);
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
@@ -159,10 +162,13 @@ impl DataDomeIntegration {
                 suppress_client_tag,
             } => {
                 if suppress_client_tag {
-                    input
-                        .request
-                        .extensions_mut()
-                        .insert(super::DataDomeClientTagSuppressed);
+                    // Both markers travel together. The first is DataDome's own
+                    // tag-suppression signal, read by its head injector. The second
+                    // tells core the response is personalized to this request and
+                    // cannot be shared through a cache or a template.
+                    let extensions = input.request.extensions_mut();
+                    extensions.insert(super::DataDomeClientTagSuppressed);
+                    extensions.insert(crate::response_privacy::PersonalizedResponse);
                 }
                 log_protection_skip(input, &rule_id, reason, suppress_client_tag);
                 return false;
@@ -832,7 +838,6 @@ mod tests {
 
     fn protection_config() -> DataDomeConfig {
         DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             server_side_key_secret_name: Some(Redacted::new("server-side-key".to_string())),
             ..DataDomeConfig::default()
@@ -866,6 +871,7 @@ mod tests {
                 services,
                 request,
                 geo_info: None,
+                permissions: None,
                 is_integration_route: false,
             }))
         })
@@ -906,6 +912,7 @@ mod tests {
                 services,
                 request: &mut request,
                 geo_info,
+                permissions: None,
                 is_integration_route: false,
             },
         ));
@@ -923,10 +930,20 @@ mod tests {
             .is_some()
     }
 
+    /// The filter sets this alongside the `DataDome` marker at every site. The
+    /// two are asserted together everywhere below, so dropping either insert
+    /// fails a test rather than silently making a personalized HTML response
+    /// shareable through a cache or a template.
+    fn has_personalized_response_marker(request: &Request<EdgeBody>) -> bool {
+        request
+            .extensions()
+            .get::<crate::response_privacy::PersonalizedResponse>()
+            .is_some()
+    }
+
     #[test]
     fn protection_test_bypass_skips_api_suppresses_tag_and_strips_header() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -966,6 +983,10 @@ mod tests {
             "the bypass should suppress the automatic DataDome client tag"
         );
         assert!(
+            has_personalized_response_marker(&request),
+            "the bypass should mark the response personalized to this request"
+        );
+        assert!(
             request
                 .headers()
                 .get(super::super::HEADER_DATADOME_TEST_BYPASS)
@@ -991,7 +1012,6 @@ mod tests {
             }),
         ] {
             let config = DataDomeConfig {
-                enabled: true,
                 enable_protection: true,
                 protection_test_bypass,
                 ..protection_config()
@@ -1037,6 +1057,10 @@ mod tests {
                 !has_client_tag_suppression_marker(&request),
                 "an inactive bypass must not suppress the DataDome client tag"
             );
+            assert!(
+                !has_personalized_response_marker(&request),
+                "an inactive bypass must not mark the response personalized"
+            );
             assert_eq!(
                 http_client.recorded_backend_names().len(),
                 1,
@@ -1048,7 +1072,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_is_inactive_outside_staging() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1099,6 +1122,7 @@ mod tests {
                         services: &services,
                         request: &mut request,
                         geo_info: None,
+                        permissions: None,
                         is_integration_route: false,
                     },
                 ))
@@ -1120,6 +1144,10 @@ mod tests {
             !has_client_tag_suppression_marker(&request),
             "the bypass must not suppress the DataDome client tag outside staging"
         );
+        assert!(
+            !has_personalized_response_marker(&request),
+            "the bypass must not mark the response personalized outside staging"
+        );
         assert_eq!(
             http_client.recorded_backend_names().len(),
             1,
@@ -1130,7 +1158,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_wins_over_other_exclusions() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                 id: "staging-page-exclusion".to_string(),
@@ -1178,6 +1205,10 @@ mod tests {
             "a matching test credential should suppress the tag even on an excluded path"
         );
         assert!(
+            has_personalized_response_marker(&request),
+            "a matching test credential should mark the response personalized even on an excluded path"
+        );
+        assert!(
             http_client.recorded_backend_names().is_empty(),
             "a matching test credential must not call the Protection API"
         );
@@ -1186,7 +1217,6 @@ mod tests {
     #[test]
     fn protection_test_bypass_strips_invalid_credential_without_bypassing() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1235,6 +1265,10 @@ mod tests {
             "a non-matching credential must not suppress the DataDome client tag"
         );
         assert!(
+            !has_personalized_response_marker(&request),
+            "a non-matching credential must not mark the response personalized"
+        );
+        assert!(
             request
                 .headers()
                 .get(super::super::HEADER_DATADOME_TEST_BYPASS)
@@ -1251,7 +1285,6 @@ mod tests {
     #[test]
     fn duplicate_test_bypass_headers_fail_closed_and_are_all_stripped() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_test_bypass: Some(ProtectionTestBypassConfig {
                 enabled: true,
@@ -1305,6 +1338,7 @@ mod tests {
             "all duplicate bypass values should be stripped"
         );
         assert!(!has_client_tag_suppression_marker(&request));
+        assert!(!has_personalized_response_marker(&request));
         assert_eq!(http_client.recorded_backend_names().len(), 1);
     }
 
@@ -1387,7 +1421,6 @@ mod tests {
     fn ip_exclusions_mark_requests_for_client_tag_suppression() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let mut inline = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
             ..protection_config()
@@ -1397,6 +1430,10 @@ mod tests {
         assert!(
             has_client_tag_suppression_marker(&inline_request),
             "inline IP exclusions should mark the request"
+        );
+        assert!(
+            has_personalized_response_marker(&inline_request),
+            "inline IP exclusions should mark the response personalized"
         );
 
         inline.protection_excluded_ip_cidrs.clear();
@@ -1417,9 +1454,12 @@ mod tests {
             has_client_tag_suppression_marker(&source_request),
             "Config Store IP exclusions should mark the request"
         );
+        assert!(
+            has_personalized_response_marker(&source_request),
+            "Config Store IP exclusions should mark the response personalized"
+        );
 
         let structured_ip = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                 id: "structured-ip".to_string(),
@@ -1437,9 +1477,12 @@ mod tests {
             has_client_tag_suppression_marker(&structured_request),
             "structured IP exclusions should mark the request"
         );
+        assert!(
+            has_personalized_response_marker(&structured_request),
+            "structured IP exclusions should mark the response personalized"
+        );
 
         let structured_source = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                 id: "structured-ip-source".to_string(),
@@ -1464,6 +1507,10 @@ mod tests {
         assert!(
             has_client_tag_suppression_marker(&structured_source_request),
             "structured Config Store IP exclusions should mark the request"
+        );
+        assert!(
+            has_personalized_response_marker(&structured_source_request),
+            "structured Config Store IP exclusions should mark the response personalized"
         );
     }
 
@@ -1499,7 +1546,6 @@ mod tests {
 
         for (matcher, uri) in cases {
             let config = DataDomeConfig {
-                enabled: true,
                 enable_protection: true,
                 protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
                     id: "non-ip".to_string(),
@@ -1515,6 +1561,10 @@ mod tests {
                 !has_client_tag_suppression_marker(&request),
                 "matching non-IP exclusion should not mark {uri}"
             );
+            assert!(
+                !has_personalized_response_marker(&request),
+                "matching non-IP exclusion should not mark {uri} as personalized"
+            );
         }
     }
 
@@ -1522,7 +1572,6 @@ mod tests {
     fn overlapping_path_and_ip_exclusions_still_mark_request() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_exclusion_rules: vec![
                 ProtectionExclusionRuleConfig {
@@ -1551,12 +1600,15 @@ mod tests {
             has_client_tag_suppression_marker(&request),
             "overlapping IP exclusion should suppress even when path remains the primary reason"
         );
+        assert!(
+            has_personalized_response_marker(&request),
+            "overlapping IP exclusion should mark the response personalized even when path remains the primary reason"
+        );
     }
 
     #[test]
     fn asn_exclusions_do_not_mark_requests_for_client_tag_suppression() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_excluded_asns: vec![64500],
             ..protection_config()
@@ -1580,12 +1632,15 @@ mod tests {
             !has_client_tag_suppression_marker(&request),
             "ASN exclusions should not mark the request"
         );
+        assert!(
+            !has_personalized_response_marker(&request),
+            "ASN exclusions should not mark the response personalized"
+        );
     }
 
     #[test]
     fn non_matching_ip_does_not_mark_request_for_client_tag_suppression() {
         let config = DataDomeConfig {
-            enabled: true,
             enable_protection: true,
             protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
             ..protection_config()
@@ -1597,6 +1652,10 @@ mod tests {
         assert!(
             !has_client_tag_suppression_marker(&request),
             "a non-matching IP should not mark the request"
+        );
+        assert!(
+            !has_personalized_response_marker(&request),
+            "a non-matching IP should not mark the response personalized"
         );
     }
 
@@ -1685,6 +1744,7 @@ mod tests {
                 services: &services,
                 request: &mut request,
                 geo_info: None,
+                permissions: None,
                 is_integration_route: false,
             },
         ));
