@@ -804,6 +804,9 @@ mod tests {
             // These tests exercise the Edge Cookie provider path, and a
             // request with no signal provider resolves at the place baseline.
             permission_signal_providers: Arc::default(),
+            // This test drives the per-request path, which builds its services
+            // from the request context.
+            services: None,
         }
     }
 
