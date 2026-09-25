@@ -700,7 +700,7 @@ authority**, and a second step canonicalises it.
 text of a negated class:
 
 ```
-/?\#\s"`{}[]<>|\
+/?\#\s"'`{}[]<>|\
 ```
 
 This is a _delimiter_ list, not an allow-list. An allow-list of
@@ -714,7 +714,7 @@ is that **matching never stops early inside a host**.
 
 For the same reason the class holds only characters that end an
 authority for _every_ reader of the line. `!`, `$`, `&`, `=`, `*`, `;`,
-`,`, `(`, `)` and `'` are not among them: WHATWG host parsing accepts
+`,`, `(` and `)` are not among them: WHATWG host parsing accepts
 all of them inside a hostname, so
 `https://github.com!unapproved.internal/` and
 `https://example.com;unapproved.internal/` name hosts a browser really
@@ -733,6 +733,17 @@ bracket and brace pairs:
   turned every `format!("https://{host}{path}")` in the workspace into
   a violation — 115 new false positives across a full-repo scan,
   against 3 real hosts recovered.
+- `'` stays even though a hostname may legally contain one, because a
+  match that does not stop there can run past the end of its own string
+  and consume the next URL's scheme:
+  `['https://example.com','https://unapproved.internal']` captured
+  `example.com','https:` as a single authority. Trimming at the quote
+  afterwards recovered `example.com`, but `captures_iter` cannot revisit
+  input an earlier match already consumed, so the second host was never
+  examined and the linter exited 0 on a disallowed host. A silent false
+  negative is the one outcome this linter must not have, and a URL inside
+  a quoted string cannot contain the quote anyway. Measured cost of
+  terminating there: zero change across a full-repo scan.
 
 **Trimming instead of terminating.** The characters removed from the
 class are handled after capture, which is where source punctuation
@@ -740,12 +751,7 @@ lands. This keeps an embedded occurrence in the host (so
 `example.com;unapproved.internal` is reported whole and the prefix
 bypass stays closed) while excluding a trailing one:
 
-- Everything from a `'` onwards is cut, since a quote inside a captured
-  authority marks where the source string closed and the rest is code:
-  `expect(new URL('https://pub.example.com').href)` captured
-  `pub.example.com').href` and now yields `pub.example.com`. A URL
-  inside a quoted string cannot contain the quote anyway.
-- A trailing `$`, `#`, `*`, `(`, `)`, `,`, `;`, `!`, `&` or `=` is then
+- A trailing `$`, `#`, `*`, `(`, `)`, `,`, `;`, `!`, `&` or `=` is
   trimmed. `$` and `#` are the position where a `${...}` interpolation
   opened, since the capture stops at the `{`: without this,
   `http://127.0.0.1:${PORT}` reported `127.0.0.1:$` instead of the

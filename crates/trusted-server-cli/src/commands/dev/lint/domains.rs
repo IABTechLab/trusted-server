@@ -344,12 +344,24 @@ mod allow_check_tests {
 ///
 /// For the same reason the class holds only characters that end an
 /// authority for *every* reader of the line. `!`, `$`, `&`, `=`, `*`,
-/// `;`, `,`, `(`, `)`, and `'` are not among them: the WHATWG parser
-/// accepts all of them inside a hostname, so
+/// `;`, `,`, `(`, and `)` are not among them: the WHATWG parser accepts
+/// all of them inside a hostname, so
 /// `https://github.com!unapproved.internal/` and
 /// `https://example.com;unapproved.internal/` name hosts a browser will
 /// really resolve. Terminating on them handed the allowlist the
 /// `github.com` / `example.com` prefix and passed the URL.
+///
+/// `'` is the exception, and it is a terminator despite being legal in a
+/// hostname. Leaving it out of the class let one match run past the end
+/// of its own string and consume the *next* URL's scheme:
+/// `['https://example.com','https://unapproved.internal']` captured
+/// `example.com','https:` as a single authority. Trimming at the quote
+/// afterwards recovered `example.com`, but `captures_iter` cannot
+/// revisit input an earlier match already consumed, so the second host
+/// was never examined at all -- a silent false negative, which is the
+/// one outcome this linter must not have. A URL inside a quoted string
+/// cannot contain the quote anyway, so terminating there loses nothing
+/// real.
 ///
 /// What remains are the characters that genuinely cannot be in a host
 /// (`/`, `?`, `#`, whitespace, `<`, `>`, `|`, `\`, `"`, backtick) plus
@@ -368,7 +380,7 @@ mod allow_check_tests {
 ///
 /// The inner text of that class (no enclosing brackets), so callers can
 /// splice it into either a negated or a positive character class.
-const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#\s"`{}\[\]<>|\\"#;
+const AUTHORITY_TERMINATOR_INNER: &str = r#"/?\#\s"'`{}\[\]<>|\\"#;
 
 /// Optional RFC 3986 `userinfo@` prefix, as an inner regex fragment.
 ///
@@ -462,19 +474,12 @@ const TRAILING_SOURCE_PUNCTUATION: &[char] = &['$', '#', '*', '(', ')', ',', ';'
 /// admitted into the capture and then removed here rather than being
 /// treated as a terminator.
 ///
-/// A `'` is handled before that trim, because it is the one admitted
-/// character that reliably marks where the *source string* ended rather
-/// than merely trailing the URL. Everything from it onwards is code, not
-/// host: `expect(u('https://pub.example.com').href)` captured
-/// `pub.example.com').href`. Cutting at the quote leaves
-/// `pub.example.com`, while a quote inside a real authority is not
-/// something a URL in a quoted string can contain anyway -- it would
-/// have closed the string.
+/// `'` needs no handling here: it is an [`AUTHORITY_TERMINATOR_INNER`]
+/// character, so a capture never contains one. An earlier revision cut
+/// the authority at the first quote instead of terminating there, which
+/// left the regex free to run past the end of its own string and swallow
+/// the next URL's scheme.
 fn trim_trailing_source_punctuation(authority: &str) -> &str {
-    let authority = match authority.find('\'') {
-        Some(i) => &authority[..i],
-        None => authority,
-    };
     authority.trim_end_matches(TRAILING_SOURCE_PUNCTUATION)
 }
 
@@ -705,10 +710,47 @@ mod absolute_url_tests {
         );
     }
 
-    /// Regression: `;`, `,`, `(`, `)` and `'` are accepted inside a
-    /// hostname by the WHATWG parser, so terminating the authority on
-    /// them handed the allowlist an `example.com` prefix and passed a
-    /// URL naming a host a browser really resolves.
+    /// Regression: a match must not run past the end of its own source
+    /// string. With `'` outside the terminator class the first capture
+    /// swallowed the next URL's scheme
+    /// (`example.com','https:`), and because `captures_iter` cannot
+    /// revisit consumed input the second host was never examined -- the
+    /// linter exited 0 on a disallowed host.
+    #[test]
+    fn consecutive_single_quoted_urls_are_all_examined() {
+        assert_eq!(
+            extract_absolute_hosts(
+                "const urls = ['https://example.com','https://unapproved.internal'];"
+            ),
+            vec!["example.com", "unapproved.internal"]
+        );
+        // Every host in the list must be reported, not just the first.
+        assert_eq!(
+            extract_absolute_hosts(
+                "const a = ['https://one.internal','https://two.internal','https://three.internal'];"
+            ),
+            vec!["one.internal", "two.internal", "three.internal"]
+        );
+        // Double quotes were already safe; keep them that way.
+        assert_eq!(
+            extract_absolute_hosts(
+                "const b = [\"https://one.internal\",\"https://two.internal\"];"
+            ),
+            vec!["one.internal", "two.internal"]
+        );
+        // Mixed quoting styles on one line.
+        assert_eq!(
+            extract_absolute_hosts("const c = ['https://one.internal', \"https://two.internal\"];"),
+            vec!["one.internal", "two.internal"]
+        );
+    }
+
+    /// Regression: `;`, `,`, `(` and `)` are accepted inside a hostname
+    /// by the WHATWG parser, so terminating the authority on them handed
+    /// the allowlist an `example.com` prefix and passed a URL naming a
+    /// host a browser really resolves. (`'` is excluded from this set on
+    /// purpose; see
+    /// [`consecutive_single_quoted_urls_are_all_examined`].)
     #[test]
     fn source_punctuation_does_not_truncate_to_allowlisted_prefix() {
         for (input, expected) in [
@@ -737,10 +779,12 @@ mod absolute_url_tests {
         }
     }
 
-    /// The quote cut slices by byte index, so a multi-byte host must
-    /// not panic. IDNA hosts make this reachable rather than theoretical.
+    /// A multi-byte host must survive extraction and canonicalisation
+    /// intact, whether or not the URL sits in a quoted string. IDNA makes
+    /// multi-byte authorities reachable rather than theoretical, and the
+    /// trimming and stripping helpers operate on byte slices.
     #[test]
-    fn quote_cut_is_safe_on_multibyte_hosts() {
+    fn multibyte_hosts_survive_extraction() {
         assert_eq!(
             extract_absolute_hosts("u('https://service.\u{6d4b}\u{8bd5}').href"),
             vec!["service.xn--0zwm56d"]

@@ -830,6 +830,31 @@ fn staged_reports_punctuation_and_idna_hosts() {
         ));
 }
 
+/// Regression for a silent false negative in staged mode: a match that
+/// ran past its own closing quote consumed the next URL's scheme, and
+/// `captures_iter` cannot revisit consumed input, so the disallowed host
+/// in a list of single-quoted URLs was never examined and the commit
+/// passed.
+#[test]
+fn staged_reports_every_host_in_consecutive_single_quoted_urls() {
+    let temp = repo_with_initial_commit();
+    let repo = gix::open(temp.path()).expect("should reopen repo");
+    std::fs::write(
+        temp.path().join("bad.js"),
+        "const urls = ['https://github.com','https://unapproved.internal'];\n",
+    )
+    .expect("should write bad.js");
+    common::stage_all(&repo);
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "--staged"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "disallowed host unapproved.internal",
+        ));
+}
+
 /// The mirror: trailing source punctuation must not be reported as part
 /// of a host, so an allowlisted URL in ordinary source stays clean.
 #[test]
