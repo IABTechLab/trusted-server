@@ -278,7 +278,10 @@ Trusted Server keeps static app-config credentials under logical store ID
 as `ts_secrets`. Request-signing private keys remain in their separate,
 runtime-managed store.
 
-Set the physical mapping before provisioning:
+Create or select the service before provisioning a non-default mapping. Set its
+ID in `fastly.toml` or `FASTLY_SERVICE_ID`; if both are set, they must agree.
+Provisioning rejects non-default mappings without a service ID. Set the physical
+mapping before provisioning, alongside any config-store or KV-store overrides:
 
 ```bash
 export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
@@ -299,6 +302,12 @@ custom streaming entry point reads the service-scoped mapping before loading
 app config, so every startup and reload resolves static credentials from
 `ts_secrets` while the portable manifest continues to declare
 `trusted_server_secrets`.
+
+The same runtime mapping mechanism applies to app-config stores. See
+[Fastly runtime config stores](/guide/configuration#fastly-runtime-config-store)
+for the initial provisioning and linking sequence, subsequent CLI pushes, and
+precautions when changing a live mapping. A process-environment override alone
+does not configure the Fastly runtime.
 
 Create the separate request-signing store when that feature is enabled:
 
