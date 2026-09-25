@@ -2361,6 +2361,8 @@ keep that local name and the pushed key aligned with them. Review the generated
 diff and do not commit deployment-specific app-config entries. Credentials belong
 in secret stores; the app-config blob contains their key references.
 
+### Rollback
+
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
 version if that is required.

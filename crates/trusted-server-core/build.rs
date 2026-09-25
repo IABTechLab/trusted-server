@@ -7,11 +7,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     // Keep every adapter's compiled default synchronized with the repository manifest.
-    let manifest_path = PathBuf::from(
+    let crate_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("should receive CARGO_MANIFEST_DIR from Cargo"),
-    )
-    .join("../..")
-    .join("edgezero.toml");
+    );
+    let manifest_path = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("should resolve the workspace root from CARGO_MANIFEST_DIR")
+        .join("edgezero.toml");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
 
     let manifest = match ManifestLoader::from_path(&manifest_path) {

@@ -162,7 +162,11 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn cloudflare_config_envelope(
     value: &serde_json::Value,
 ) -> Result<&str, CloudflareConfigEnvelopeError> {
-    match value.get(CONFIG_BLOB_KEY) {
+    match value.get(CONFIG_BLOB_KEY).filter(|envelope| {
+        // Treat a blank placeholder as absent so a populated legacy property
+        // remains usable during migration.
+        envelope.as_str() != Some("")
+    }) {
         Some(envelope) => envelope
             .as_str()
             .ok_or(CloudflareConfigEnvelopeError::NonString {
@@ -873,6 +877,20 @@ mod tests {
             cloudflare_config_envelope(&value),
             Ok("legacy-envelope"),
             "legacy app_config key should remain compatible"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_treats_blank_primary_as_absent() {
+        let value = serde_json::json!({
+            CONFIG_BLOB_KEY: "",
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("legacy-envelope"),
+            "blank primary should not shadow a populated legacy property"
         );
     }
 
