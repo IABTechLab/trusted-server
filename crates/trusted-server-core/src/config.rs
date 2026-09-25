@@ -1446,6 +1446,31 @@ password = "production-admin-password-32-bytes"
         }
     }
 
+    /// A selected Prebid block that names bundle modules has to name where the
+    /// bundle is served from as well, and deploy validation says so. Selection
+    /// is what makes Prebid run here, so it stands in for the `enabled` flag
+    /// this branch took off the config.
+    #[test]
+    fn deploy_validation_requires_external_bundle_url_for_selected_prebid() {
+        let mut settings = valid_settings();
+        settings.integration.select("prebid");
+        settings
+            .integration
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "bundle": {
+                        "modules": { "bidder": ["exampleBidderBidAdapter"] }
+                    }
+                }),
+            )
+            .expect("should insert the Prebid config");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should require enabled Prebid external bundle URL");
+        assert!(error.to_string().contains("external_bundle_url"));
+    }
+
     /// Every built-in page integration refuses a setting it does not know, so
     /// a misspelt key in its block fails deploy validation naming the
     /// integration and the key, rather than being ignored.

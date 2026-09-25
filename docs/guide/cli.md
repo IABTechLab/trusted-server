@@ -3,6 +3,52 @@
 The Trusted Server CLI binary is `ts`. It is a host-target operator tool for
 configuration, page audits, and EdgeZero-backed lifecycle commands.
 
+## Command index
+
+The table summarizes native `--help` output on Linux and macOS. Platform-only
+commands are shown explicitly.
+
+| Command                          | Availability  | Summary                                                                                          | Usage                                                                                                          |
+| -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `ts`                             | Linux + macOS | Trusted Server CLI                                                                               | `ts <COMMAND>`                                                                                                 |
+| `ts active-version`              | Linux + macOS | Print the currently active deployment version for a target adapter                               | `ts active-version --adapter <ADAPTER> --service-id <SERVICE_ID>`                                              |
+| `ts audit`                       | Linux + macOS | Browser-backed page and ad-template audits                                                       | `ts audit [COMMAND]`                                                                                           |
+| `ts audit ad-templates`          | Linux + macOS | Verify configured ad-template slots against live page evidence                                   | `ts audit ad-templates <COMMAND>`                                                                              |
+| `ts audit ad-templates generate` | Linux + macOS | Scrape a live page's GPT slots and update the config's `[creative_opportunities]` slots in place | `ts audit ad-templates generate [OPTIONS] <URL>`                                                               |
+| `ts audit ad-templates verify`   | Linux + macOS | Verify ad-template slots for one or more live URLs                                               | `ts audit ad-templates verify [OPTIONS] <URLS>...`                                                             |
+| `ts audit generate`              | Linux + macOS | Bootstrap a draft Trusted Server config + JS asset audit from a live page                        | `ts audit generate [OPTIONS] <URL>`                                                                            |
+| `ts audit page`                  | Linux + macOS | Audit a single page and print a read-only summary                                                | `ts audit page [OPTIONS] <URL>`                                                                                |
+| `ts auth`                        | Linux + macOS | Sign in / out / status against an `EdgeZero` adapter                                             | `ts auth <COMMAND>`                                                                                            |
+| `ts auth login`                  | Linux + macOS | Sign in (`wrangler login` / `fastly profile create` / `spin cloud login`)                        | `ts auth login --adapter <ADAPTER>`                                                                            |
+| `ts auth logout`                 | Linux + macOS | Sign out (`wrangler logout` / `fastly profile delete` / `spin cloud logout`)                     | `ts auth logout --adapter <ADAPTER>`                                                                           |
+| `ts auth status`                 | Linux + macOS | Show the current session (`wrangler whoami` / `fastly profile list` / `spin cloud info`)         | `ts auth status --adapter <ADAPTER>`                                                                           |
+| `ts build`                       | Linux + macOS | Build the project for a target adapter                                                           | `ts build --adapter <ADAPTER> [ADAPTER_ARGS]...`                                                               |
+| `ts config`                      | Linux + macOS | Trusted Server app-config commands                                                               | `ts config <COMMAND>`                                                                                          |
+| `ts config ad-templates`         | Linux + macOS | Diagnose server-side ad-template configuration and path matching                                 | `ts config ad-templates <COMMAND>`                                                                             |
+| `ts config ad-templates check`   | Linux + macOS | Assert that a page path or URL matches the expected slot set                                     | `ts config ad-templates check [OPTIONS] <--expected-slot <ID>\|--expect-no-slots> <PATH_OR_URL>`               |
+| `ts config ad-templates explain` | Linux + macOS | Explain why a page path or URL would or would not run the ad stack                               | `ts config ad-templates explain [OPTIONS] <PATH_OR_URL>`                                                       |
+| `ts config ad-templates lint`    | Linux + macOS | Validate ad-template config and summarize deploy-time implications                               | `ts config ad-templates lint [OPTIONS]`                                                                        |
+| `ts config ad-templates match`   | Linux + macOS | Show creative opportunity slots matching a page path or URL                                      | `ts config ad-templates match [OPTIONS] <PATH_OR_URL>`                                                         |
+| `ts config diff`                 | Linux + macOS | Diff `trusted-server.toml` against the live `EdgeZero` config                                    | `ts config diff [OPTIONS] --adapter <ADAPTER>`                                                                 |
+| `ts config gc`                   | Linux + macOS | Reclaim orphaned chunk entries leaked from prior oversized pushes                                | `ts config gc [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts config init`                 | Linux + macOS | Initialize a Trusted Server config file from the example template                                | `ts config init [OPTIONS]`                                                                                     |
+| `ts config push`                 | Linux + macOS | Push `trusted-server.toml` as a blob envelope through `EdgeZero`                                 | `ts config push [OPTIONS] --adapter <ADAPTER>`                                                                 |
+| `ts config validate`             | Linux + macOS | Validate `edgezero.toml` and the typed Trusted Server config                                     | `ts config validate [OPTIONS]`                                                                                 |
+| `ts deploy`                      | Linux + macOS | Deploy the project through a target adapter                                                      | `ts deploy [OPTIONS] --adapter <ADAPTER> [-- <ADAPTER_ARGS>...]`                                               |
+| `ts dev`                         | Linux + macOS | Local developer tools (e.g. the macOS-only production-hostname proxy)                            | `ts dev`                                                                                                       |
+| `ts dev proxy`                   | macOS only    | Run the local production-hostname dev proxy (macOS only)                                         | `ts dev proxy [OPTIONS] [COMMAND]`                                                                             |
+| `ts dev proxy ca`                | macOS only    | Manage the per-machine dev CA                                                                    | `ts dev proxy ca <COMMAND>`                                                                                    |
+| `ts dev proxy ca install`        | macOS only    | Add the CA to the OS trust store (macOS login keychain)                                          | `ts dev proxy ca install`                                                                                      |
+| `ts dev proxy ca path`           | macOS only    | Print the per-machine CA certificate path                                                        | `ts dev proxy ca path`                                                                                         |
+| `ts dev proxy ca regenerate`     | macOS only    | Regenerate the per-machine CA (invalidates prior trust)                                          | `ts dev proxy ca regenerate`                                                                                   |
+| `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                            | `ts dev proxy ca uninstall`                                                                                    |
+| `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
+| `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                   | `ts prebid <COMMAND>`                                                                                          |
+| `ts prebid bundle`               | Linux + macOS | Generate a local external Prebid bundle and update config metadata                               | `ts prebid bundle [OPTIONS]`                                                                                   |
+| `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                            | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                    | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
+| `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
+
 ## Install from source
 
 From the repository root, install the `ts` binary with the workspace Cargo alias:
@@ -71,6 +117,13 @@ fields to existing configs before relying on their overrides. Pass `--no-env`
 for file-only operation. See [Configuration](/guide/configuration#environment-variable-overrides-typed-cli)
 for migration and rollback guidance.
 
+`config diff`, `config push --dry-run`, and the confirmation preview shown by
+`config push` render resolved app-config values. Store-backed secret fields are
+key names at this stage, but deliberately inline values such as
+`trusted_client_ip.shared_secret` can appear verbatim. Use `--no-diff` for a
+push when terminal output or CI logs are not an approved place for inline
+configuration secrets; `--no-diff` does not change validation or publication.
+
 `config push` publishes a single EdgeZero `BlobEnvelope` containing the validated
 Trusted Server settings JSON. This blob model is intentional because full
 Trusted Server configs can exceed Fastly limits when split into one config-store
@@ -99,6 +152,44 @@ window and no writer is targeting it. Unlike the other `config` subcommands,
 sweep, and `--store <id>` overrides the manifest's config-store id outright.
 Both change which store gets swept, so on a destructive run check the store id
 `gc` reports before passing `--yes`.
+
+### Diagnose ad-template configuration
+
+The static `ts config ad-templates` commands evaluate local configuration
+without launching a browser:
+
+| Command                                  | Purpose                                                                   |
+| ---------------------------------------- | ------------------------------------------------------------------------- |
+| `lint`                                   | Summarize configuration and report invalid slot page patterns.            |
+| `match <path-or-url> [--details]`        | List matching slots; `--details` includes divs, paths, formats/providers. |
+| `check <path-or-url> --expected-slot ID` | Assert the exact matching slot set; repeat `--expected-slot`.             |
+| `check <path-or-url> --expect-no-slots`  | Assert that no slots match.                                               |
+| `explain <path-or-url>`                  | Print every runtime ad-stack gate and its final yes/no verdict.           |
+
+`check --allow-extra-slots` permits matches beyond the repeated
+`--expected-slot` values. It conflicts with `--expect-no-slots`.
+
+`explain` models a GET navigation with consent allowed by default. Use
+`--method <METHOD>`, `--non-navigation`, `--prefetch`, `--bot`, or
+`--consent-denied` to model another request. Provider configuration is printed
+as a separate advisory; it does not change the runtime gate verdict.
+
+Every `ts config ad-templates ...` and `ts audit ad-templates ...` command
+accepts the same config-location flags:
+
+| Flag                  | Behavior                                                                      |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `--app-config <PATH>` | Read this app config instead of deriving `<app.name>.toml` from the manifest. |
+| `--manifest <PATH>`   | Read this manifest; defaults to `edgezero.toml`.                              |
+| `--no-env`            | Disable `TRUSTED_SERVER__...` overlays for read-only commands.                |
+
+The mutating audit generator always edits file-backed values and never writes
+environment-only overlays into TOML, including during `--dry-run`.
+
+For CI-oriented assertions, exit code 0 means the assertion passed, 1 means the
+command ran and found drift (`config ad-templates check` or audit verification
+with `--strict`), and 2 means argument parsing, configuration, browser launch,
+or another tool operation failed.
 
 ## Lifecycle commands
 
@@ -190,7 +281,7 @@ Chrome or Chromium must be installed locally. The command checks common PATH
 names and standard macOS/Linux install locations.
 
 ```bash
-ts audit https://publisher.example
+ts audit generate https://publisher.example
 ```
 
 By default, the command writes:
@@ -219,13 +310,13 @@ processed by Trusted Server.
 If a config already exists, avoid overwriting it:
 
 ```bash
-ts audit https://publisher.example --no-config
+ts audit generate https://publisher.example --no-config
 ```
 
 Use custom output paths when reviewing artifacts first:
 
 ```bash
-ts audit https://publisher.example \
+ts audit generate https://publisher.example \
   --js-assets audit/js-assets.toml \
   --config audit/trusted-server.toml
 ```
@@ -233,8 +324,337 @@ ts audit https://publisher.example \
 Use `--force` only when replacing existing output files is intentional:
 
 ```bash
-ts audit https://publisher.example --force
+ts audit generate https://publisher.example --force
 ```
+
+The legacy `ts audit <url>` form remains a compatibility alias for artifact
+generation. New automation should use `ts audit generate <url>`.
+
+## Generate ad-template slots from a live site
+
+`ts audit ad-templates generate <url>` discovers the publisher's ad slots and
+rewrites the `[creative_opportunities]` slot array in `trusted-server.toml` in
+place, preserving every other section and comment.
+
+```bash
+ts audit ad-templates generate https://publisher.example/
+```
+
+It samples the site rather than a single page. Ad slots repeat per site
+section, so the crawl is sized by the publisher's taxonomy — a dozen sections —
+not its catalogue:
+
+1. Load the requested page and read its links and, from `robots.txt`, its
+   sitemap.
+2. Group both into candidate sections, keeping one landing page and one article
+   per section.
+3. Load those pages, recording each slot's div, sizes, and GAM ad-unit path.
+4. Reconcile every slot across the pages it appeared on.
+5. Infer a `{section}` ad-unit template if the evidence proves one.
+6. Verify the result loads, then write it.
+
+### What it writes
+
+Given a site whose ad units track the section, the run produces:
+
+```toml
+[creative_opportunities]
+gam_network_id = "99999"
+section_root = "homepage"
+section_segment = 0
+
+[[creative_opportunities.slot]]
+id = "ad-header-0"
+div_id = "ad-header-0"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/", "/deals", "/deals/*", "/news", "/news/*"]
+formats = [{ width = 728, height = 90 }]
+```
+
+Each section contributes **two** patterns. `*` crosses `/` in this glob
+dialect, so `/news/*` matches `/news/a/b` but not the bare `/news` landing
+page; emitting only the star form would drop the landing page from the slot.
+
+Sizes are unioned across pages, so a format that renders only on articles
+survives alongside the homepage's.
+
+### When it keeps literal paths, and when it refuses
+
+A wrong ad-unit template makes the publisher bid against inventory that does not
+exist, so the command prefers a narrow literal path over a plausible guess.
+
+| Situation                                                                               | Result                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Only one page was crawled                                                               | Literal path. One observation cannot distinguish a literal from a template.                                                                                                                                                   |
+| The ad unit never varied by section                                                     | Literal path.                                                                                                                                                                                                                 |
+| A section's slug is not derivable from its URL (`/site-news` requesting `.../sitenews`) | The slot is omitted; the note lists the ad-unit paths it used and says none generalized.                                                                                                                                      |
+| No crawled page lacked a section segment, so `section_root` is unwitnessed              | No template is written and the reason names the crawl gap. A slot that merely never appears on the root (a sidebar, an in-article unit) still templates, borrowing the `section_root` another slot witnessed; a note says so. |
+| Two path segments could both be the section                                             | No template; the ambiguity is reported.                                                                                                                                                                                       |
+| The ad unit varies by device, geo, or anything the URL cannot supply                    | The refused slot is omitted and the reason is written as a note.                                                                                                                                                              |
+| Crawled pages report different GAM network ids                                          | The run fails; the pages are not one property.                                                                                                                                                                                |
+| More than a quarter of crawled pages return no slots                                    | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set.                                                                                       |
+| Several live elements normalize onto one div-id prefix                                  | The whole group is omitted, on every page of the crawl. A prefix resolves to at most one element and the exact ids change per render; the prefix is named in a note.                                                          |
+| A per-render token sits before the placement part of a div id                           | The slot is omitted from a single observation and the family prefix is named in a note; no stable prefix identifies one element.                                                                                              |
+| A crawled page redirects off the audited origin                                         | The page is skipped on that profile, its path is named in a note, and it stops counting toward profile coverage. There is no override for generation; another site's evidence is never folded into the config.                |
+
+Every run checks that the config it produced still loads before replacing the
+file, and `--dry-run` runs the same check — a clean preview is evidence the
+config loads, not just that it parses. Dry-run stdout is a zero-context unified
+diff containing only the managed creative-opportunity fields; notes and refusal
+reasons go to stderr, so unrelated config and secrets are not printed. Crawl
+progress also goes to stderr, one line per phase and page — for example
+`Auditing desktop [2/17]: /news`. Progress renders the path only, never the
+origin, userinfo, query, or fragment, and there is no flag to suppress it. A
+`--dry-run` that changes nothing says so on stderr too, leaving stdout an empty
+diff.
+
+### Bounding and steering the crawl
+
+```bash
+# Cover more of a large site.
+ts audit ad-templates generate https://publisher.example/ --max-sections 20 --max-pages 41
+
+# Audit exactly one page, as earlier releases did.
+ts audit ad-templates generate https://publisher.example/ --max-pages 1
+
+# Trigger lazy-loaded inventory on every crawled page.
+ts audit ad-templates generate https://publisher.example/ --scroll
+
+# Set the patterns yourself; this disables pattern inference entirely, and the
+# run fails outright if any slot's template had to borrow section_root.
+ts audit ad-templates generate https://publisher.example/ \
+  --page-pattern '/' --page-pattern '/news' --page-pattern '/news/*'
+
+# Preview without writing.
+ts audit ad-templates generate https://publisher.example/ --dry-run
+```
+
+Re-running merges into the existing slots: a slot seen again keeps its
+hand-tuned fields and gains this run's patterns and newly observed formats, and
+a hand-written `gam_unit_path` template is preserved. A configured `div_id` is
+matched exactly when the crawl observed that exact id; it is treated as a
+runtime prefix only when it was never observed as a literal element, so a
+configured `ad-sidebar-1` no longer absorbs a discovered `ad-sidebar-10` — the
+sibling is appended as its own slot, and when the parent carried a floor price,
+targeting, or provider settings, a stderr note names the split because the new
+slot does not inherit them. A prefix that does claim several
+discovered divs is named in a stderr note, because the runtime resolves a
+prefix to at most one element. `--replace` discards existing slots instead,
+which also discards any template you wrote by hand.
+
+`--scroll` performs the same deterministic stepped scroll on every page and
+device profile after the initial settle, then waits for the page to settle again
+before collecting evidence. It is opt-in because it increases crawl time, ad
+requests, and publisher-page side effects.
+
+During a normal merge, configured slots missing from the current crawl are
+preserved and named in a stderr note. Absence is not proof that a slot is stale:
+the crawl may have missed a page type, device target, or lazy-loaded placement.
+Review coverage and re-run with `--scroll` when appropriate. Only use
+`--replace` when intentionally pruning every slot the run did not rediscover.
+
+A slot that never appeared without a section segment can borrow a
+`section_root` witnessed by another slot only while its patterns are derived
+from the paths where it was observed. If `--page-pattern` would override those
+patterns, generation fails and names the affected div ids; remove the explicit
+patterns so the safe per-slot patterns can be derived.
+
+A merge refuses to change the section policy that preserved `{section}` slots
+were written against. If the config has a non-empty `section_root`, an inferred
+root or segment mismatch fails and asks for `--replace` as an explicit
+migration. An explicitly configured `section_segment` is preserved even when
+`section_root` is unset. When the root is unset and the segment is either unset
+or agrees with inference, the first merge adopts the inferred root and makes
+the otherwise unloadable `{section}` config valid.
+
+Locale-prefixed sites are inferred at their observed section depth. Only real
+ISO 639-1 language codes are read as a locale prefix, so a two-letter _section_
+root such as `/tv` or `/us` keeps sections at the first segment. For
+example, `/en/news/story` can produce `section_segment = 1`; generated patterns
+retain the locale prefix (`/en/news` and `/en/news/*`). The crawler never
+invents an unwitnessed locale or section.
+
+Behind bot protection, pass a valid clearance cookie. The crawl reuses one
+browser session, so clearance earned on the first page carries to the rest, and
+`--page-delay-ms` spaces the requests — an unpaced crawl is both discourteous to
+the origin and likelier to be challenged partway through:
+
+```bash
+ts audit ad-templates generate https://publisher.example/ \
+  --cookie '<NAME>=<VALUE>' --page-delay-ms 1500
+```
+
+Some origins refuse a headless browser outright regardless of the cookie.
+`--headful` runs a visible one, which is also the quickest way to _see_ whether
+a challenge is being shown:
+
+```bash
+ts audit ad-templates generate https://publisher.example/ --headful
+```
+
+### Sites behind a consent platform
+
+Publishers gate slot definition behind their consent platform, and the audit
+runs in a throwaway browser profile with no consent cookie. Left alone, such a
+site defines no slots at all and looks identical to a site with no ad stack.
+
+The crawl therefore answers the two IAB interfaces every compliant platform
+exposes — TCF v2 and US Privacy — as a consenting, out-of-scope reader, before
+any page script runs. This changes only what the audit browser sees; it does not
+affect the publisher's own readers. Pass `--no-assume-consent` to observe the
+un-consented page instead.
+
+When a page still yields no slots, the run reports GPT's observable state —
+whether the library reached `apiReady`, how many queued commands never drained,
+how many scripts ran. An empty slot registry has several very different causes,
+and that line distinguishes them.
+
+### Auditing a production hostname served locally
+
+`ts dev proxy` serves a production hostname from a local Trusted Server.
+Auditing through it keeps the page's origin, cookie scope, and any origin checks
+in the ad stack matching production rather than `localhost`:
+
+```bash
+ts dev proxy --map www.publisher.example=127.0.0.1:7676 --upstream-plaintext --rewrite-host
+
+ts audit ad-templates generate https://www.publisher.example/ \
+  --browser-proxy 127.0.0.1:18080 --danger-accept-invalid-certs
+```
+
+`--danger-accept-invalid-certs` covers the proxy's MITM certificate when the
+throwaway browser profile does not trust its CA; installing that CA
+(`ts dev proxy ca`) is preferable. Against a real origin the flag is dangerous —
+the audit sends any `--cookie` session upstream and treats the response as
+evidence, so an invalid certificate could mean an impersonator is both
+harvesting the session and fabricating the result.
+
+Note that a local Trusted Server injects its own configured slots into the page,
+so a run through the proxy can rediscover config it already has. Slot ids that
+are absent from the current config are the publisher's own.
+
+### Slots that change div id on every render
+
+Some ad stacks build div ids from a per-render token, so one placement arrives
+under a new id on every page. Those ids match nothing at runtime, so the run
+declines to write them and reports the group instead:
+
+```text
+note: skipped 3 slot(s) that look like one placement under a per-render div id
+      on `/123456789/publisher/overlay` (ex_slot_a1_overlay_1, …);
+      they share the prefix `ex_slot`. Add it once by hand with a div_id prefix
+      that is stable across renders
+```
+
+This particular group is detected by evidence, not by recognising token shapes:
+candidates share an ad-unit path and formats, and what separates a fragmented
+placement from two legitimate siblings on one unit is co-occurrence — real
+siblings appear together on a page, fragments never do. (A single id whose
+per-render token sits _before_ the placement part is refused on shape alone,
+from one observation, as the table above notes.) The suggested prefix is a
+starting point only, not written as a `div_id`, because it reaches only as far
+as the observed tokens happen to agree.
+
+### Checking for a device split
+
+Publishers often serve a different ad unit per device
+(`/network/desktop/news` against `/network/mobile/news`). A desktop-only crawl
+cannot see that — it infers a template correct for desktop and silently wrong
+for every mobile impression.
+
+```bash
+ts audit ad-templates generate https://publisher.example/ --profiles desktop,mobile
+```
+
+Each page is loaded once per profile. Where the profiles disagree, the slot is
+omitted and the diagnostic explains the conflicting paths. The generator does
+not fall back to a fabricated default ad unit.
+
+### Deploy ordering for templated config
+
+> **A config containing `section_root` or `section_segment` is not
+> rollback-safe.** These keys are rejected outright by a Trusted Server binary
+> that predates ad-unit templating, and the rejection fails the _entire_
+> configuration load — not just the ad-template section — so every route serves
+> an error. This is a full-site outage, not a degraded ad stack.
+
+When a run reports that it wrote a `{section}` template:
+
+1. Deploy the template-aware binary **first**.
+2. Then `ts config push`.
+3. Do **not** roll that binary back while the config is live.
+
+A run that did not template writes neither key, and leaves the config exactly as
+rollback-safe as it was.
+
+### Audit safety defaults
+
+Every `ts audit` browser session validates TLS certificates. This matters
+because `--cookie` sends a real session to the origin and the page's own
+response becomes the audit's evidence, so a certificate-invalid host could both
+harvest the session and fabricate what the audit reports. Override only for a
+host you control with a known self-signed certificate:
+
+```bash
+ts audit page https://staging.publisher.example --danger-accept-invalid-certs
+```
+
+`ts audit ad-templates verify` matches configured slots against the
+**post-redirect** path, so it refuses a redirect that leaves the requested
+origin rather than accepting another site's evidence as verification. Allow it
+for a known redirect between your own properties (for example apex to `www`):
+
+```bash
+ts audit ad-templates verify https://publisher.example/ --allow-cross-origin-redirect
+```
+
+Verification accepts multiple URLs and reuses one browser/profile. Add
+`--strict` to return exit 1 when a confirmable slot is missing or partially
+confirmed, and `--json` for the stable machine-readable report. Video- and
+native-only slots are reported as `unconfirmable`; that records a checker
+limitation and does not fail strict mode. A live out-of-page slot with no sizes
+against banner-configured formats is reported `partial` and does fail strict
+mode. `--scroll` enables the optional second evidence phase and labels evidence
+first seen after the deterministic scroll.
+
+Browser-backed ad-template generation and verification share `--chrome`,
+`--headful`, `--browser-proxy`, `--no-assume-consent`, `--scroll`,
+`--settle-quiet-ms`, `--settle-max-ms`, and `--danger-accept-invalid-certs`;
+`--scroll` runs the same deterministic scroll pass in both, and in verification
+it additionally labels the second evidence phase. Verification also accepts
+`--browser-profile desktop|mobile`; generation uses `--profiles desktop,mobile`
+to compare both profiles. `--cookie NAME=VALUE` is repeatable and creates
+host-only, root-path cookies; HTTPS targets also mark them Secure. Verification
+refuses cookies when URLs span multiple origins. The quiet settle window must
+not exceed the maximum.
+
+Generation shares one `--settle-max-ms` budget across the initial settle,
+optional post-scroll settle, and GPT registry wait. The clock starts after
+navigation, immediately before the initial settle; scrolling also consumes the
+remaining budget. GPT polling receives the remaining budget or a minimum of
+`--settle-quiet-ms` plus two 250ms poll intervals, whichever is greater. One
+interval lets an already-stable registry establish a repeated reading; the
+other leaves time to confirm the completed dwell before the deadline. Later
+slot batches or slow browser reads can still prevent a full dwell, in which
+case generation returns the latest non-empty registry with a partial-evidence
+warning. The minimum allowance adds at most the quiet window plus 500ms to the
+shared settle allowance.
+
+GPT polling precedes metadata extraction, so those reads cannot consume its
+budget. DOM and network evidence reflect the page after the GPT wait. If the
+budget is spent before post-scroll settling, generation reports that the wait
+was skipped and post-scroll evidence may be missing. Navigation and browser
+operations have their own timeouts, and scrolling or an in-flight operation can
+finish after the settle budget, so this is not a total page deadline. Two
+consecutive empty GPT polls end the wait early regardless of the budget; slots
+registered later may be missed. Increasing `--settle-max-ms` can help when a
+non-empty registry does not stabilize, but on continuously busy pages initial
+settling can still consume the entire shared budget, leaving GPT only its
+minimum polling allowance.
+
+Verification applies `--settle-max-ms` separately to its initial and optional
+post-scroll settle phases. It performs no GPT wait: its evidence collector is
+injected ahead of publisher scripts and records each slot as it is defined.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform
@@ -249,10 +669,16 @@ APIs.
 [integration]
 provider = ["prebid"]
 
-[integration.prebid.bundle]
-adapters = ["rubicon", "kargo"]
-user_id_modules = ["sharedIdSystem"]
+[integration.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
 ```
+
+Module values are exact upstream Prebid filename stems without `.js`. The
+`bidder` list is required and cannot be empty. Omit `user_id` to use the curated
+default preset, or set it to `[]` to select none. Omitted and empty `analytics`
+lists both select no analytics adapters.
 
 Run the command after installing JS dependencies:
 
@@ -262,11 +688,14 @@ cd ../../..
 ts prebid bundle
 ```
 
-By default, generated artifacts are written to `dist/prebid/`, and the command
-updates `integration.prebid.external_bundle_sha256` and
-`integration.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
-generated JavaScript file yourself, set `external_bundle_url` to its HTTPS
-asset URL, and include that host (plus any redirect targets) in
+By default, generated artifacts are written to `dist/prebid/`. The versioned
+manifest records effective module selections, bidder and analytics runtime
+codes, the content-addressed filename, SHA-256, and SRI. The command copies the
+hash and SRI into `integration.prebid` only after the generator and manifest
+both pass validation.
+
+Upload the generated JavaScript file yourself, set `external_bundle_url` to its
+HTTPS asset URL, and include that host plus any redirect targets in
 `proxy.allowed_domains` before running `ts config validate` or `ts config push`.
 
 Use custom paths when needed:

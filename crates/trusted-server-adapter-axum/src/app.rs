@@ -65,6 +65,9 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_providers:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    /// Services a caller supplied for every request, rather than services built
+    /// from the request context. `None` in a deployment.
+    services: Option<RuntimeServices>,
 }
 
 /// The permission signal providers this adapter links, in the order they run
@@ -137,6 +140,23 @@ pub fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations_and_services(settings, integrations, None)
+}
+
+/// Build the application state with the services every request will use,
+/// rather than services built per request from the request context.
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations_and_services(settings, &[], services)
+}
+
+fn build_state_with_registrations_and_services(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
@@ -145,8 +165,10 @@ pub fn build_state_with_registrations(
     // Composition root: reject a provider selection this adapter can never
     // supply, once, before any request is served. The registry is built first
     // because a module can supply the Edge Cookie provider the selector names,
-    // and `build_per_request_services` hands that provider to every request, so
-    // the check is given the provider the request path sees.
+    // and `services_for_request` hands that provider to every request, so the
+    // check is given the provider the request path sees. A caller supplying its
+    // own `RuntimeServices` may have resolved one already, and that one comes
+    // first because it is what `EcContext` will see.
     //
     // This adapter checks rather than keeps what the check resolved, unlike the
     // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
@@ -154,7 +176,14 @@ pub fn build_state_with_registrations(
     // for every request, so `EcContext` resolves the selection on every
     // request. It supplies no host signals, so the host-signals argument is
     // `None`.
-    ensure_provider_available(&settings.ec, None, registry.ec_provider())?;
+    ensure_provider_available(
+        &settings.ec,
+        None,
+        services
+            .as_ref()
+            .and_then(RuntimeServices::resolved_ec_provider)
+            .or_else(|| registry.ec_provider()),
+    )?;
     let permission_signal_providers =
         trusted_server_core::permission_signal::build_permission_signal_providers(
             &settings,
@@ -166,6 +195,7 @@ pub fn build_state_with_registrations(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         permission_signal_providers,
+        services,
     }))
 }
 
@@ -173,27 +203,31 @@ pub fn build_state_with_registrations(
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
 
-/// Build per-request [`RuntimeServices`], applying the module-supplied geo,
-/// Edge Cookie and device providers selected by `[geo]`, `[ec]` and
-/// `[device] provider`.
-///
-/// Unset and `"none"` both resolve nothing for geo, so no client IP reaches a
-/// host geo service. `"platform"` opts in to this adapter's own lookup, and any
-/// other key names an integration module that declares a geo provider. Identity
-/// and device are applied the same way when a module supplies them.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let mut services =
-        build_runtime_services(ctx, &state.settings, &state.permission_signal_providers);
-    if let Some(provider) = state.registry.geo_provider() {
-        services = services.with_geo(provider);
+impl AppState {
+    /// Build per-request [`RuntimeServices`], applying the module-supplied geo,
+    /// Edge Cookie and device providers selected by `[geo]`, `[ec]` and
+    /// `[device] provider`.
+    ///
+    /// Unset and `"none"` both resolve nothing for geo, so no client IP reaches
+    /// a host geo service. `"platform"` opts in to this adapter's own lookup,
+    /// and any other key names an integration module that declares a geo
+    /// provider. Identity and device are applied the same way when a module
+    /// supplies them.
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        let mut services = self.services.clone().unwrap_or_else(|| {
+            build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+        });
+        if let Some(provider) = self.registry.geo_provider() {
+            services = services.with_geo(provider);
+        }
+        if let Some(provider) = self.registry.ec_provider() {
+            services = services.with_ec_provider(provider);
+        }
+        if let Some(provider) = self.registry.device_provider() {
+            services = services.with_device_provider(provider);
+        }
+        services
     }
-    if let Some(provider) = state.registry.ec_provider() {
-        services = services.with_ec_provider(provider);
-    }
-    if let Some(provider) = state.registry.device_provider() {
-        services = services.with_device_provider(provider);
-    }
-    services
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +279,7 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = build_per_request_services(&state, &ctx);
+    let services = state.services_for_request(&ctx);
     let mut req = ctx.into_request();
     // The single preparation point for the adapter. Every route in the table
     // except `/health` is registered to `named_route_handler` or
@@ -743,6 +777,30 @@ impl TrustedServerApp {
         integrations: &[IntegrationBuilder],
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_registrations(settings, integrations)?;
+        Ok(build_router(&state))
+    }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
         Ok(build_router(&state))
     }
 }

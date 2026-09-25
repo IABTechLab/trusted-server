@@ -31,13 +31,15 @@ provider = ["nextjs"]
 
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url"]
+max_combined_payload_bytes = 10485760
 ```
 
 ### Configuration Options
 
-| Field                | Type  | Default                   | Description                           |
-| -------------------- | ----- | ------------------------- | ------------------------------------- |
-| `rewrite_attributes` | array | `["href", "link", "url"]` | Attributes to rewrite in Next.js data |
+| Field                        | Type    | Default                   | Description                                     |
+| ---------------------------- | ------- | ------------------------- | ----------------------------------------------- |
+| `rewrite_attributes`         | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data           |
+| `max_combined_payload_bytes` | integer | `10485760`                | Maximum bytes retained for one unresolved group |
 
 ## How It Works
 
@@ -110,9 +112,12 @@ Targets the Next.js data script for rewriting.
 
 **RSC Stream Processing**:
 
-- Parses React Server Component streaming format
-- Rewrites URLs in streaming chunks
-- Preserves component structure
+- Emits ordinary HTML as soon as the HTML parser produces it
+- Retains only an unresolved cross-script `T` chunk group
+- Rewrites URLs and recalculates `T` chunk byte lengths before releasing a complete group
+- Restores invalid, incomplete, or over-limit groups unchanged
+- Applies `max_combined_payload_bytes` independently to captured payloads and held output
+- Preserves script order and React hydration data
 
 ## Use Cases
 
@@ -167,7 +172,7 @@ Verify React Server Components hydrate correctly:
 
 ### 4. Monitor Performance
 
-Next.js integration adds minimal overhead (<10ms), but monitor:
+Monitor:
 
 - Time to First Byte (TTFB)
 - First Contentful Paint (FCP)
@@ -206,12 +211,6 @@ Next.js integration adds minimal overhead (<10ms), but monitor:
 - Review proxy exclusion rules
 
 ## Performance
-
-### Overhead
-
-- RSC parsing: ~5-10ms
-- URL rewriting: ~2-5ms
-- Total: <15ms per request
 
 ### Optimization
 

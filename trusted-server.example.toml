@@ -298,7 +298,7 @@ pull_sync_concurrency = 3
 # documented in crates/trusted-server-core/src/permission_signal/README.md
 # and in the Permission Signals guide.
 
-# Page integrations. [integration] provider lists the ones that run, and each
+# Page integration. [integration] provider lists the ones that run, and each
 # one that has settings gets its own [integration.<name>] table. An
 # integration that is not on the list does not run, and a settings table the
 # list does not name refuses startup. The built-in names are datadome,
@@ -506,7 +506,7 @@ auction_timeout_ms = 500
 # Initial-page delivery mode (spike/experimental). `inline` is the default and
 # current production behaviour; `esi` is an opt-in Fastly Core Cache experiment
 # storing an inert comment in a shared, reader-neutral template cache. See
-# docs/guide/configuration.md before enabling. This and the three cache-safety
+# docs/guide/configuration.md before enabling. This and the cache-safety
 # keys below belong in this [creative_opportunities] table.
 # assembly_mode = "inline"
 # Request headers (besides Accept-Encoding) the origin may name in Vary. Every
@@ -521,10 +521,24 @@ auction_timeout_ms = 500
 # Safety ceiling (seconds) for one shared template; TS uses the smaller of this
 # and the origin-authorized remaining edge freshness. Default 60; range 1-86400.
 # template_cache_max_age_seconds = 1200
-# Unsafe unless independently verified: excludes cookie-bearing requests from the
-# template cache by default. Set true only when origin HTML is byte-independent
-# of Cookie; an origin `Vary: Cookie` is still refused.
+# Optional exact, case-sensitive cookie names; omitted and empty lists are equal.
+# Key bounded variants only, never account, session, or TS identity IDs.
+# Absent and empty values select different variants. No cardinality limit exists.
+# template_cache_key_cookies = ["ab_bucket"]
+# Presence, including session=, bypasses template lookup and storage.
+# template_cache_bypass_cookies = ["session"]
+# With either list nonempty, false bypasses unlisted cookies; true asserts those
+# cookies do not change origin HTML. No identity or consent cookie is exempt.
+# With both lists empty, false bypasses all Cookie headers, as before.
+# An origin `Vary: Cookie` is always refused, regardless of these settings.
 # origin_is_cookie_independent = false
+# Invalid names, duplicates, cross-list overlap, and TS identity cookies in the
+# key list reject configuration. Named policies bypass ambiguous/nonconforming
+# Cookie fields, including duplicate key cookies.
+# If a downstream CDN maps ab_bucket to X-Exp-Variant, also add x-exp-variant to
+# template_cache_vary; that header alone cannot separate arms at TS.
+# Rollback: older binaries reject both new fields even as empty lists. Remove
+# both fields AND restore independence=false or disable ESI when HTML uses cookies.
 #
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id
@@ -627,10 +641,41 @@ auction_timeout_ms = 500
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-# Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
-# [integration.prebid.bundle]
-# adapters = ["rubicon"]
-# user_id_modules = ["sharedIdSystem"]
+# Bundle build inputs consumed by `ts prebid bundle`, not by the edge runtime.
+# Values are exact upstream module stems without `.js`.
+# [integration.prebid.bundle.modules]
+# bidder = ["rubiconBidAdapter"]
+# Omit user_id for the curated default preset; use [] to select none.
+# user_id = ["sharedIdSystem"]
+# Omitted or empty analytics selects no analytics adapters.
+# analytics = ["atsAnalyticsAdapter"]
+
+# Prebid User ID modules that Trusted Server installs and keeps installed, so
+# operators can manage identity centrally without publisher JavaScript changes.
+# Each entry is forwarded to Prebid.js verbatim: `name` is a
+# `userSync.userIds` entry name, `params` and `storage` are whatever that module
+# documents. Trusted Server does not interpret them; supported names come from
+# the checked-in User ID registry. Each `name` must appear only once.
+#
+# The module must be present in the built bundle: name it under
+# [integration.prebid.bundle.modules].user_id, or omit that list to take the
+# generator's default preset. `ts prebid bundle` resolves every managed name
+# through the checked-in User ID registry and fails if the generated manifest
+# omits its required module without updating the configured hash or SRI.
+#
+# Persisting a resolved ID into the EC identity graph additionally needs a
+# matching partner under [[ec.partners]] whose source_domain equals the module's
+# OpenRTB EID source; without one the ID still reaches the auction but is never
+# written to KV.
+#
+# [[integration.prebid.managed_user_ids]]
+# name = "sharedId"
+#
+# [integration.prebid.managed_user_ids.storage]
+# type = "cookie"            # or "html5"
+# name = "_sharedid"
+# expires = 15               # days; omit to keep Prebid's default
+# refresh_in_seconds = 1800  # omit to keep Prebid's default
 
 # Next.js first-party rewriting for App Router / RSC payloads.
 # [integration.nextjs]

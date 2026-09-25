@@ -96,6 +96,9 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_providers:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    /// Services a caller supplied for every request, rather than services built
+    /// from the request context. `None` in a deployment.
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -189,6 +192,23 @@ pub fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations_and_services(settings, integrations, None)
+}
+
+/// Build the application state with the services every request will use,
+/// rather than services built per request from the request context.
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations_and_services(settings, &[], services)
+}
+
+fn build_state_with_registrations_and_services(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
@@ -200,9 +220,18 @@ pub fn build_state_with_registrations(
     // stops the request path resolving the same settings again. The registry is
     // built first because a module can supply the vendor Edge Cookie provider
     // the selector names, and resolving without it would reject a selection
-    // this deployment can in fact satisfy. This adapter supplies no host
-    // signals, so that argument stays `None` until it does.
-    let resolved_ec_provider = build_reusable_provider(&settings.ec, None, registry.ec_provider())?;
+    // this deployment can in fact satisfy. A caller supplying its own
+    // `RuntimeServices` may have resolved one already, and that one comes first
+    // because it is what the request path will see. This adapter supplies no
+    // host signals, so that argument stays `None` until it does.
+    let resolved_ec_provider = build_reusable_provider(
+        &settings.ec,
+        None,
+        services
+            .as_ref()
+            .and_then(RuntimeServices::resolved_ec_provider)
+            .or_else(|| registry.ec_provider()),
+    )?;
     let permission_signal_providers =
         trusted_server_core::permission_signal::build_permission_signal_providers(
             &settings,
@@ -215,6 +244,7 @@ pub fn build_state_with_registrations(
         registry: Arc::new(registry),
         resolved_ec_provider,
         permission_signal_providers,
+        services,
     }))
 }
 
@@ -237,37 +267,45 @@ fn shipped_signal_providers()
     ]
 }
 
+impl AppState {
+    /// Build per-request [`RuntimeServices`], carrying the Edge Cookie provider
+    /// the composition root already resolved and applying the module-supplied
+    /// geo, Edge Cookie and device providers selected by `[geo]`, `[ec]` and
+    /// `[device] provider`.
+    ///
+    /// No Edge Cookie provider is carried when the composition root found
+    /// nothing safe to keep, so the request path resolves the selection for
+    /// itself.
+    ///
+    /// For geo, unset and `"none"` both resolve nothing, so no client IP
+    /// reaches a host geo service. `"platform"` opts in to this adapter's own
+    /// lookup, and any other key names an integration module that declares a
+    /// geo provider. Identity and device are applied the same way when a module
+    /// supplies them.
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        let mut services = self
+            .services
+            .clone()
+            .unwrap_or_else(|| {
+                build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+            })
+            .with_resolved_ec_provider(self.resolved_ec_provider.clone());
+        if let Some(provider) = self.registry.geo_provider() {
+            services = services.with_geo(provider);
+        }
+        if let Some(provider) = self.registry.ec_provider() {
+            services = services.with_ec_provider(provider);
+        }
+        if let Some(provider) = self.registry.device_provider() {
+            services = services.with_device_provider(provider);
+        }
+        services
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
-
-/// Build per-request [`RuntimeServices`], carrying the Edge Cookie provider the
-/// composition root already resolved and applying the module-supplied geo,
-/// Edge Cookie and device providers selected by `[geo]`, `[ec]` and
-/// `[device] provider`.
-///
-/// No Edge Cookie provider is carried when the composition root found nothing
-/// safe to keep, so the request path resolves the selection for itself.
-///
-/// For geo, unset and `"none"` both resolve nothing, so no client IP reaches a
-/// host geo service. `"platform"` opts in to this adapter's own lookup, and any
-/// other key names an integration module that declares a geo provider. Identity
-/// and device are applied the same way when a module supplies them.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let mut services =
-        build_runtime_services(ctx, &state.settings, &state.permission_signal_providers)
-            .with_resolved_ec_provider(state.resolved_ec_provider.clone());
-    if let Some(provider) = state.registry.geo_provider() {
-        services = services.with_geo(provider);
-    }
-    if let Some(provider) = state.registry.ec_provider() {
-        services = services.with_ec_provider(provider);
-    }
-    if let Some(provider) = state.registry.device_provider() {
-        services = services.with_device_provider(provider);
-    }
-    services
-}
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
@@ -322,7 +360,7 @@ where
         let s = Arc::clone(&state);
         let f = f.clone();
         Box::pin(async move {
-            let services = build_per_request_services(&s, &ctx);
+            let services = s.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                 return Ok(http_error(&error));
@@ -528,6 +566,30 @@ impl TrustedServerApp {
         let state = build_state_with_registrations(settings, integrations)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -539,7 +601,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&state, &ctx);
+            let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
