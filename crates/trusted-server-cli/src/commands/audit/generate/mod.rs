@@ -726,55 +726,6 @@ fn is_valid_generated_asset_path(path: &str) -> bool {
             .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
 }
 
-fn replace_js_asset_proxy_section(document: &str, replacement: &str) -> CliResult<String> {
-    let lines = document.lines().collect::<Vec<_>>();
-    let start = lines
-        .iter()
-        .position(|line| line.trim() == "[integration.js_asset_proxy]")
-        .ok_or_else(|| {
-            report_error(
-                "failed to update starter config because section `[integration.js_asset_proxy]` was not found",
-            )
-        })?;
-    let mut end = start + 1;
-
-    while end < lines.len() {
-        let trimmed = lines[end].trim();
-        if trimmed.starts_with('[')
-            && trimmed.ends_with(']')
-            && trimmed != "[[integration.js_asset_proxy.assets]]"
-        {
-            break;
-        }
-        end += 1;
-    }
-
-    // Blank lines and comments directly above the next section header document
-    // that section, not this one, so leave them in the draft.
-    while end > start + 1 {
-        let trimmed = lines[end - 1].trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            end -= 1;
-        } else {
-            break;
-        }
-    }
-
-    let mut output_lines = Vec::new();
-    output_lines.extend_from_slice(&lines[..start]);
-    output_lines.extend(replacement.trim_end_matches('\n').lines());
-    if end < lines.len() && !lines[end].trim().is_empty() {
-        output_lines.push("");
-    }
-    output_lines.extend_from_slice(&lines[end..]);
-
-    let mut output = output_lines.join("\n");
-    if document.ends_with('\n') {
-        output.push('\n');
-    }
-    Ok(output)
-}
-
 fn append_js_asset_proxy_skip_comments(toml: &mut String, skipped: &JsAssetProxySkipCounts) {
     if skipped.first_party == 0
         && skipped.malformed_url == 0
