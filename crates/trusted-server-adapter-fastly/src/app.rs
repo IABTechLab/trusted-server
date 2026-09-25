@@ -1600,7 +1600,7 @@ mod tests {
         AppContext, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture,
         NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
         TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
-        build_state_from_settings, compile_auction_plan, handle_publisher_request,
+        build_state_from_settings, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
