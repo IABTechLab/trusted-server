@@ -211,26 +211,33 @@ pub mod nextjs_auction {
         )
         .expect("should parse Next.js auction fixture settings");
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
-            .expect("should enable the fixture Next.js integration");
+            .expect("should select the fixture Next.js integration");
         settings.auction.enabled = true;
-        settings.auction.mediator = None;
-        settings.auction.providers = serde_json::from_value(serde_json::json!({
-            "fixture": {
-                "protocol": "openrtb-2.6",
-                "endpoint": "https://auction.example.com/bid",
-                "routing": "all_eligible",
-                "timeout_ms": 5000
-            }
-        }))
-        .expect("should configure the fixture auction provider");
+        // One `[demand.fixture]` source, which is where an auction provider is
+        // configured now that `[auction.providers]` is gone. `implementation`
+        // states the wire format, so there is no separate `protocol`.
+        settings.demand = crate::provider_table::ProviderTable::new(
+            vec!["fixture".to_owned()],
+            std::collections::BTreeMap::from([(
+                "fixture".to_owned(),
+                serde_json::Map::from_iter([
+                    ("implementation".to_owned(), serde_json::json!("openrtb")),
+                    (
+                        "endpoint".to_owned(),
+                        serde_json::json!("https://auction.example.com/bid"),
+                    ),
+                    ("routing".to_owned(), serde_json::json!("all_eligible")),
+                    ("timeout_ms".to_owned(), serde_json::json!(5000)),
+                ]),
+            )]),
+        );
         settings.creative_opportunities = Some(
             toml::from_str(
                 r#"
@@ -374,10 +381,12 @@ pub mod nextjs_auction {
 
     struct FixtureGeo;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformGeo for FixtureGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<IpAddr>,
+            _services: &RuntimeServices,
         ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
             Ok(Some(GeoInfo {
                 country: "AU".to_owned(),
