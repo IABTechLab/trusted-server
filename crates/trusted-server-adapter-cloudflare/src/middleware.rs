@@ -146,6 +146,8 @@ pub(crate) fn apply_finalize_headers(
         HeaderValue::from_static(if geo_available { "true" } else { "false" }),
     );
 
+    trusted_server_core::version_header::apply_git_version_header(response);
+
     // Cloudflare is a real shared cache: cookie-bearing responses must stay
     // private and operator headers must not re-enable caching for uncacheable
     // per-user payloads.
@@ -318,6 +320,24 @@ mod tests {
             *observed.lock().expect("should lock observation"),
             Some((false, false)),
             "should remove both configured trust headers before the handler"
+        );
+    }
+
+    #[test]
+    fn emits_git_version_header() {
+        let mut response = empty_response();
+        apply_finalize_headers(
+            &settings_with_response_headers(vec![]),
+            false,
+            &mut response,
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|v| v.to_str().ok()),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should report the compiled-in git version as x-ts-version"
         );
     }
 }

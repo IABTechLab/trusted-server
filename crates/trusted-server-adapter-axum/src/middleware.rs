@@ -53,8 +53,9 @@ impl Middleware for SanitizeRequestMiddleware {
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
 /// Geo lookup is unavailable in the Axum dev server — `X-Geo-Info-Available: false`
-/// is always emitted. Fastly-specific headers (`X-TS-Version`, `X-TS-ENV`) are
-/// skipped because the corresponding env vars are not set in a local dev context.
+/// is always emitted. `X-TS-Version` carries the compiled-in git version. The
+/// Fastly-specific headers (`X-TS-Fastly-Version`, `X-TS-ENV`) are skipped
+/// because the corresponding env vars are not set in a local dev context.
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`] and ahead of
 /// [`AuthMiddleware`] so that every outgoing response — including auth-rejected
@@ -125,7 +126,8 @@ impl Middleware for AuthMiddleware {
 /// Applies standard Trusted Server response headers to the given response.
 ///
 /// Unlike the Fastly variant, geo is always unavailable so `X-Geo-Info-Available: false`
-/// is unconditionally emitted. Fastly-specific headers are omitted.
+/// is unconditionally emitted, followed by the compiled-in `X-TS-Version`.
+/// Fastly-specific headers are omitted.
 /// Operator-configured `settings.response_headers` are applied last (with the
 /// shared cookie cache-privacy hardening) and can override any managed header.
 pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
@@ -133,6 +135,8 @@ pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Respons
         HEADER_X_GEO_INFO_AVAILABLE,
         HeaderValue::from_static("false"),
     );
+
+    trusted_server_core::version_header::apply_git_version_header(response);
 
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
@@ -285,6 +289,20 @@ mod tests {
             *observed.lock().expect("should lock observation"),
             Some((false, false)),
             "should remove both configured trust headers before the handler"
+        );
+    }
+
+    #[test]
+    fn emits_git_version_header() {
+        let mut response = empty_response();
+        apply_finalize_headers(&settings_with_response_headers(vec![]), &mut response);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|v| v.to_str().ok()),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should report the compiled-in git version as x-ts-version"
         );
     }
 }

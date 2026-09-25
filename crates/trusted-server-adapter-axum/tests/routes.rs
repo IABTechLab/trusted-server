@@ -938,3 +938,35 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         "should not leak generated placeholders: {html}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_reports_git_version() {
+    let mut service = make_service();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(AxumBody::empty())
+        .expect("should build health request");
+
+    let response = service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should serve health");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "should return 200 on /health"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-ts-version")
+            .and_then(|v| v.to_str().ok()),
+        trusted_server_core::constants::TS_GIT_VERSION,
+        "should report the compiled-in git version on /health"
+    );
+}

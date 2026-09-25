@@ -716,7 +716,7 @@ Add custom headers for debugging:
 ```toml
 [response_headers]
 X-Proxy-Mode = "rewrite"
-X-TS-Version = "1.0"
+X-Debug-Build = "canary"
 ```
 
 ### Metrics to Track
