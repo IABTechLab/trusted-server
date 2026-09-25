@@ -84,6 +84,9 @@ pub struct AppState {
     /// than the first request, and handed to every request's services.
     permission_signal_providers:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    /// Services a caller supplied for every request, rather than services built
+    /// from the request context. `None` in a deployment.
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -149,14 +152,27 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     // Composition root: resolve the provider selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. This adapter
-    // supplies no host signals and injects no vendor Edge Cookie provider, so
-    // both arguments are `None`, and each is passed here once this adapter
-    // supplies it.
-    let ec_provider = build_reusable_provider(&settings.ec, None, None)?;
+    // supplies no host signals, so that argument is `None`, and injects no
+    // vendor Edge Cookie provider of its own, so the only injected provider is
+    // one a caller put into the services it supplied.
+    let ec_provider = build_reusable_provider(
+        &settings.ec,
+        None,
+        services
+            .as_ref()
+            .and_then(RuntimeServices::resolved_ec_provider),
+    )?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -173,6 +189,7 @@ fn build_state_with_settings(
         registry: Arc::new(registry),
         ec_provider,
         permission_signal_providers,
+        services,
     }))
 }
 
@@ -193,6 +210,22 @@ fn shipped_signal_providers()
         Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
         Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
     ]
+}
+
+impl AppState {
+    /// Builds the per-request services, carrying the Edge Cookie provider the
+    /// composition root already resolved so the request path does not resolve
+    /// `[ec] provider` a second time. Nothing is carried when the composition
+    /// root found nothing safe to keep, and the request path resolves for
+    /// itself.
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| {
+                build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+            })
+            .with_resolved_ec_provider(self.ec_provider.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,14 +647,30 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
-}
 
-/// Builds the per-request services, carrying the Edge Cookie provider the
-/// composition root already resolved so the request path does not resolve
-/// `[ec] provider` a second time.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx, &state.settings, &state.permission_signal_providers)
-        .with_resolved_ec_provider(state.ec_provider.clone())
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -633,7 +682,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -645,7 +694,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -678,7 +727,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 // Request normalization (forwarded-header stripping, trusted
                 // Host/scheme/client-IP derivation) is applied centrally by
                 // `NormalizeMiddleware` before this handler runs, so the signed
@@ -721,7 +770,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let mut req = ctx.into_request();
                 if let Err(error) =
                     trusted_server_core::integrations::gpt_diagnostics::prepare_request(
@@ -762,7 +811,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
@@ -775,7 +824,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
@@ -788,7 +837,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_sign_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -805,7 +854,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&s, &ctx);
+                let services = s.services_for_request(&ctx);
                 let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -821,7 +870,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&state, &ctx);
+            let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
