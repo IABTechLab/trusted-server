@@ -83,6 +83,9 @@ pub struct AppState {
     /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
     /// `None` for a deployment that selects no provider.
     ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// Services a caller supplied for every request, rather than services built
+    /// from the request context. `None` in a deployment.
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -154,13 +157,25 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     // Composition root: resolve the provider selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. This adapter
-    // injects no vendor Edge Cookie provider, so `None` is the injected
-    // argument, and one is passed here once this adapter supplies it.
-    let ec_provider = build_shared_provider(&settings.ec, None)?;
+    // injects no vendor Edge Cookie provider of its own, so the only injected
+    // provider is one a caller put into the services it supplied.
+    let ec_provider = build_shared_provider(
+        &settings.ec,
+        services
+            .as_ref()
+            .and_then(RuntimeServices::resolved_ec_provider),
+    )?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -171,19 +186,25 @@ fn build_state_with_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         ec_provider,
+        services,
     }))
+}
+
+impl AppState {
+    /// Builds the per-request services, carrying the Edge Cookie provider the
+    /// composition root already resolved so the request path does not resolve
+    /// `[ec] provider` a second time.
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| build_runtime_services(ctx))
+            .with_resolved_ec_provider(self.ec_provider.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
-
-/// Builds the per-request services, carrying the Edge Cookie provider the
-/// composition root already resolved so the request path does not resolve
-/// `[ec] provider` a second time.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx).with_resolved_ec_provider(state.ec_provider.clone())
-}
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
@@ -241,7 +262,7 @@ where
         let s = Arc::clone(&state);
         let f = f.clone();
         Box::pin(async move {
-            let services = build_per_request_services(&s, &ctx);
+            let services = s.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
@@ -428,6 +449,30 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -439,7 +484,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&state, &ctx);
+            let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);

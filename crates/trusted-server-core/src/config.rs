@@ -1458,7 +1458,9 @@ password = "production-admin-password-32-bytes"
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "bundle": { "adapters": ["exampleBidder"] }
+                    "bundle": {
+                        "modules": { "bidder": ["exampleBidderBidAdapter"] }
+                    }
                 }),
             )
             .expect("should insert enabled Prebid config");

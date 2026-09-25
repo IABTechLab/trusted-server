@@ -2517,6 +2517,7 @@ mod tests {
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: true,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &doc_state,
         };
 
@@ -3436,6 +3437,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
@@ -3489,6 +3491,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
@@ -3531,6 +3534,7 @@ container_id = "GTM-DEFAULT"
             request_scheme: "https",
             origin_host: "origin.example.com",
             is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
             document_state: &document_state,
         };
         let ctx_last = IntegrationScriptContext {
