@@ -260,6 +260,11 @@ certificate before import. Remove the first CA using its original `--ca-dir`, or
 resolve an existing manual import, before installing a CA from another directory.
 Reinstalling the identical certificate is supported.
 
+A manual NSS nickname equal to the CA certificate's absolute path takes precedence
+over the filename query. The CLI rejects that unrelated certificate without changing
+trust. Remove the manual entry or reimport it under a different nickname before
+retrying.
+
 A manual nickname that visually imitates a managed `ts-dev-proxy-<hash>` entry,
 for example by adding a trailing space, can still make NSS's padded listing
 ambiguous. Such a collision stops the operation even if the exact managed nickname
@@ -428,3 +433,12 @@ missing trust fails, installed trust loads, revoked trust fails after restart,
 and plain HTTP bypasses a stopped proxy. It never disables the browser sandbox or
 bypasses certificate errors. This check does not prove Firefox or packaged-browser
 support.
+
+### Linux NSS trust regression tests
+
+The real-NSS tests require `certutil` and OpenSSL. They use disposable HOME, CA,
+and NSS paths and do not read or change the user's NSS database.
+
+```bash
+cargo test_cli_linux --test proxy_trust_linux -- --include-ignored
+```

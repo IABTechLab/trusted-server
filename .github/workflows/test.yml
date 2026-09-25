@@ -234,6 +234,15 @@ jobs:
         run: |
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
 
+      - name: Install tools for real NSS trust tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libnss3-tools openssl
+
+      - name: cargo test (real NSS trust)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_trust_linux -- --ignored
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
