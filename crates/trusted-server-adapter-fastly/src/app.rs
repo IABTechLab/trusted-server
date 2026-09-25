@@ -1603,10 +1603,6 @@ mod tests {
         build_state_from_settings, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
     };
-    // These fixtures supply no integration builders, so they compile the plan
-    // without them rather than through the module-aware compiler the adapter
-    // itself uses.
-    use trusted_server_core::auction::compile_auction_plan;
     use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
@@ -1618,6 +1614,10 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
+    // These fixtures supply no integration builders, so they compile the plan
+    // without them rather than through the module-aware compiler the adapter
+    // itself uses.
+    use trusted_server_core::auction::compile_auction_plan;
 
     use error_stack::Report;
     use futures::executor::block_on;
