@@ -2427,19 +2427,21 @@ mod tests {
                 .contains("Native integration may be preferable: [integration.gpt]")
         );
         assert!(
-            !draft.toml.contains("example-vendor-loader"),
-            "should remove starter-template placeholder asset"
+            draft
+                .toml
+                .contains("# path = \"/assets/example-vendor-loader.js\""),
+            "should leave the template's commented example as a comment"
         );
         assert!(
             draft.toml.contains(
                 "# Proxy behavior and first-party asset routing. Kept active with defaults.\n[proxy]"
             ),
-            "should preserve documentation for the section following the replaced block"
+            "should leave the documentation of the sections it appends below"
         );
         let parsed =
             toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
         assert!(
-            parsed["integrations"]["js_asset_proxy"]
+            parsed["integration"]["js_asset_proxy"]
                 .get("cache_ttl_seconds")
                 .is_none(),
             "generated config should inherit upstream cache headers by default"
@@ -2531,9 +2533,14 @@ mod tests {
 
         assert_eq!(draft.js_asset_proxy_candidate_count, 1);
         assert_eq!(
+            // The template's own example is a comment, so only an entry at the
+            // start of a line is one the audit wrote.
             draft
                 .toml
-                .matches("[[integration.js_asset_proxy.assets]]")
+                .matches(
+                    "
+[[integration.js_asset_proxy.assets]]"
+                )
                 .count(),
             1,
             "should only emit one candidate entry"
@@ -2623,12 +2630,16 @@ mod tests {
                 .contains("No eligible third-party HTTPS script assets")
         );
         assert!(
-            !draft.toml.contains("[[integration.js_asset_proxy.assets]]"),
+            !draft
+                .toml
+                .contains("\n[[integration.js_asset_proxy.assets]]"),
             "should not emit asset array entries without candidates"
         );
         assert!(
-            !draft.toml.contains("example-vendor-loader"),
-            "should remove starter-template placeholder asset"
+            draft
+                .toml
+                .contains("# path = \"/assets/example-vendor-loader.js\""),
+            "should leave the template's commented example as a comment"
         );
         toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
     }

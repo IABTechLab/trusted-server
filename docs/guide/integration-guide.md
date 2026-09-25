@@ -130,10 +130,12 @@ impl PlatformBackend for FixtureBackend {
 
 struct FixtureGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for FixtureGeo {
-    fn lookup(
+    async fn lookup(
         &self,
         _client_ip: Option<IpAddr>,
+        _services: &RuntimeServices,
     ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }

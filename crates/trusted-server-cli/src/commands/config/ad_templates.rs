@@ -187,14 +187,17 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         if loaded.settings.demand.selected().is_empty() {
             "(none)".to_string()
         } else {
-            loaded
+            // Sorted rather than in selection order, so the report reads the
+            // same however the document happens to be written.
+            let mut names = loaded
                 .settings
                 .demand
                 .selected()
                 .into_iter()
                 .map(|name| escape_terminal_text(name).into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            names.join(", ")
         }
     )
     .map_err(output_error)?;
@@ -666,10 +669,14 @@ mod tests {
             .as_table_mut()
             .expect("should find the auction table");
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
-        // Remove the provider map and its bidder references structurally to
-        // isolate the runtime verdict from the provider advisory.
-        auction.remove("providers");
+        // Remove the bidder references, and the demand sources the auction
+        // would route to, structurally, to isolate the runtime verdict from the
+        // provider advisory.
         auction.remove("bidders");
+        config_value
+            .as_table_mut()
+            .expect("should find the document root")
+            .remove("demand");
         let config_text =
             toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
@@ -702,19 +709,35 @@ mod tests {
 
     #[test]
     fn lint_reports_configured_slot_count_and_auction_state() {
-        // The example config selects `pbs_main`, and this names the
-        // alphabetically earlier `aps_main` after it, so the output must sort
-        // the names rather than preserve the order they were selected in.
-        let config_text = format!(
-            "{}\n[demand]\n\
-             provider = [\"pbs_main\", \"aps_main\"]\n\
-             [demand.aps_main]\n\
-             implementation = \"aps\"\n\
-             endpoint = \"https://aps.example.com/e/pb/bid\"\n\
-             routing = \"all_eligible\"\n\
-             account_id = \"example-aps-account-id\"\n",
-            config_with_slots()
-        );
+        // The example config selects `pbs_main`. Naming the alphabetically
+        // earlier `aps_main` after it means the output must sort the names
+        // rather than preserve the order they were selected in.
+        let mut config_value: toml::Value =
+            toml::from_str(&config_with_slots()).expect("should parse the fixture config");
+        let root = config_value
+            .as_table_mut()
+            .expect("should find the document root");
+        let demand = root
+            .get_mut("demand")
+            .and_then(toml::Value::as_table_mut)
+            .expect("should find the demand table");
+        demand
+            .get_mut("provider")
+            .and_then(toml::Value::as_array_mut)
+            .expect("should find the demand selection")
+            .push(toml::Value::String("aps_main".to_string()));
+        let mut aps = toml::value::Table::new();
+        for (key, value) in [
+            ("implementation", "aps"),
+            ("endpoint", "https://aps.example.com/e/pb/bid"),
+            ("routing", "all_eligible"),
+            ("account_id", "example-aps-account-id"),
+        ] {
+            aps.insert(key.to_string(), toml::Value::String(value.to_string()));
+        }
+        demand.insert("aps_main".to_string(), toml::Value::Table(aps));
+        let config_text =
+            toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
         let mut out = Vec::new();
 
@@ -751,8 +774,11 @@ mod tests {
             .as_table_mut()
             .expect("should find auction table");
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
-        auction.remove("providers");
         auction.remove("bidders");
+        config_value
+            .as_table_mut()
+            .expect("should find the document root")
+            .remove("demand");
         let config_text =
             toml::to_string(&config_value).expect("should serialize the fixture config");
         let (_temp, config) = project_with_config(&config_text);
