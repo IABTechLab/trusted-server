@@ -766,6 +766,9 @@ mod tests {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
+            // This test drives the per-request path, which builds its services
+            // from the request context.
+            services: None,
         }
     }
 
