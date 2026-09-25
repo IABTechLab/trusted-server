@@ -3073,6 +3073,9 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
@@ -3106,6 +3109,9 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
