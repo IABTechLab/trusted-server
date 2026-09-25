@@ -203,10 +203,12 @@ pub mod nextjs_auction {
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
-            # The fixture serves one publisher in one place, so it says so
-            # rather than selecting a geo provider it has no use for.
+            # The fixture supplies its own geo provider through the runtime
+            # services, so it selects the host lookup to reach it. Without a
+            # selection the jurisdiction is unknown, and a server-side auction
+            # fails closed on an unknown jurisdiction.
             [geo]
-            assume_single_jurisdiction = true
+            provider = "platform"
             "#,
         )
         .expect("should parse Next.js auction fixture settings");

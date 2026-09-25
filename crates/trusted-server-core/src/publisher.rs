@@ -12656,8 +12656,12 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut ec_context =
                 EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+            let registry = test_registry(&settings);
             let error = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -12846,14 +12850,17 @@ mod tests {
             let first = cookie_policy_settings(None, None, true);
             let second = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
             let third = cookie_policy_settings(Some(&["ab_bucket"]), Some(&["session"]), true);
+            // The registry is held constant, so the only thing the
+            // fingerprints differ on is the cookie policy.
+            let registry = test_registry(&first);
             assert_ne!(
-                template_fingerprint(&first),
-                template_fingerprint(&second),
+                template_fingerprint(&first, &registry),
+                template_fingerprint(&second, &registry),
                 "should fingerprint the key policy"
             );
             assert_ne!(
-                template_fingerprint(&second),
-                template_fingerprint(&third),
+                template_fingerprint(&second, &registry),
+                template_fingerprint(&third, &registry),
                 "should fingerprint the bypass policy"
             );
             let stub = Arc::new(StubHttpClient::new());
@@ -12982,10 +12989,8 @@ mod tests {
         async fn template_cookie_publisher_warm_variant_finalizes_ec_withdrawal() {
             for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
                 let mut settings = cookie_policy_settings(Some(&["ab_bucket"]), None, true);
-                Arc::make_mut(&mut settings).auction.providers =
-                    crate::auction_config_types::AuctionConfig::legacy_provider_map(&[
-                        SCHEDULING_PROVIDER,
-                    ]);
+                Arc::make_mut(&mut settings).auction.provider_names =
+                    vec![SCHEDULING_PROVIDER.to_owned()];
                 let stub = Arc::new(StubHttpClient::new());
                 let cache = Arc::new(MemoryTemplateCache::default());
                 let services = services(Arc::clone(&stub), Arc::clone(&cache));
@@ -13063,7 +13068,10 @@ mod tests {
                     let orchestrator = Arc::new(orchestrator);
                     let cookies = format!("ab_bucket=A; ts-ec={identity}");
                     let response = handle_publisher_request(
-                        &settings,
+                        AppContext {
+                            settings: &settings,
+                            integration_registry: &registry,
+                        },
                         &services,
                         Some(&graph),
                         &mut ec_context,
@@ -13098,7 +13106,9 @@ mod tests {
                         None,
                         None,
                         &mut response,
-                    );
+                        &services,
+                    )
+                    .await;
                     assert_eq!(
                         response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
                         if index == 0 { "miss-stored" } else { "hit" },
@@ -20085,11 +20095,10 @@ mod tests {
         let page = br#"<html><head></head><body><script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","text":"</body>"}'])</script><article>still streaming</article>"#;
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -20216,7 +20225,9 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for GatedAuctionProvider {
         fn provider_name(&self) -> &'static str {
-            "seam-test"
+            // A demand name is snake_case, and it has to match the
+            // `[demand]` entry the test selects for the auction to route to it.
+            "seam_test"
         }
 
         async fn request_bids(
@@ -20263,20 +20274,17 @@ mod tests {
         for encoding in ["", "gzip", "deflate", "br"] {
             let mut settings = create_test_settings();
             settings.auction.enabled = true;
-            settings.auction.providers =
-                crate::auction::AuctionConfig::legacy_provider_map(&["seam-test"]);
+            settings.auction.provider_names = vec!["seam_test".to_owned()];
             settings.auction.timeout_ms = 60_000;
-            settings.auction.mediator = None;
             settings
-                .integrations
+                .integration
                 .insert_config(
                     "nextjs",
                     &serde_json::json!({
-                        "enabled": true,
                         "rewrite_attributes": ["href", "link", "url"],
                     }),
                 )
-                .expect("should enable Next.js");
+                .expect("should select Next.js");
             let client = Arc::new(GatedAuctionHttpClient {
                 inner: StubHttpClient::new(),
                 released: std::sync::atomic::AtomicBool::new(false),

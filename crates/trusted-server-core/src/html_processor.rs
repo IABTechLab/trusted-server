@@ -1996,10 +1996,10 @@ mod tests {
     #[test]
     fn nextjs_output_overflow_restores_in_progress_script_at_every_split() {
         let mut settings = create_test_settings();
-        settings.integrations.insert(
-            "nextjs".to_owned(),
-            json!({"enabled": true, "max_combined_payload_bytes": 128}),
-        );
+        settings
+            .integration
+            .insert_config("nextjs", &json!({"max_combined_payload_bytes": 128}))
+            .expect("should select the nextjs integration");
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),

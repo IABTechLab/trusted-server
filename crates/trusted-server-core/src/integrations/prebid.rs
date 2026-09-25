@@ -3991,10 +3991,9 @@ assume_single_jurisdiction = true
     fn browser_config_accepts_strict_nested_bundle_modules() {
         let config = parse_browser_prebid_toml_result(
             r#"
-[integrations.prebid]
-enabled = true
+[integration.prebid]
 
-[integrations.prebid.bundle.modules]
+[integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["atsAnalyticsAdapter"]
@@ -4019,30 +4018,29 @@ analytics = ["atsAnalyticsAdapter"]
 
     #[test]
     fn browser_config_rejects_removed_and_unknown_bundle_fields() {
-        for enabled in [true, false] {
-            for (section, field, value) in [
-                ("bundle", "adapters", "[\"rubicon\"]"),
-                ("bundle", "user_id_modules", "[\"sharedIdSystem\"]"),
-                ("bundle", "analytics_adapters", "[\"atsAnalyticsAdapter\"]"),
-                ("bundle.modules", "unsupported_kind", "[]"),
-            ] {
-                let error = parse_browser_prebid_toml_result(&format!(
-                    r#"
-[integrations.prebid]
-enabled = {enabled}
+        // There is no `enabled` flag to vary, because an integration runs when
+        // `[integration] provider` names it, so each field is checked once.
+        for (section, field, value) in [
+            ("bundle", "adapters", "[\"rubicon\"]"),
+            ("bundle", "user_id_modules", "[\"sharedIdSystem\"]"),
+            ("bundle", "analytics_adapters", "[\"atsAnalyticsAdapter\"]"),
+            ("bundle.modules", "unsupported_kind", "[]"),
+        ] {
+            let error = parse_browser_prebid_toml_result(&format!(
+                r#"
+[integration.prebid]
 
-[integrations.prebid.{section}]
+[integration.prebid.{section}]
 {field} = {value}
 "#
-                ))
-                .expect_err("should reject a removed or unknown Prebid bundle field");
+            ))
+            .expect_err("should reject a removed or unknown Prebid bundle field");
 
-                let error = format!("{error:?}");
-                assert!(
-                    error.contains(field),
-                    "should identify rejected field {field:?} when enabled is {enabled}: {error}"
-                );
-            }
+            let error = format!("{error:?}");
+            assert!(
+                error.contains(field),
+                "should identify rejected field {field:?}: {error}"
+            );
         }
     }
 
@@ -4137,14 +4135,14 @@ server_url = "https://prebid.example/openrtb2/auction"
     fn managed_user_ids_parse_with_opaque_params() {
         let config = parse_prebid_toml(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 params = { pid = "999", notUse3P = false, nested = { depth = 2 } }
 
-[integrations.prebid.managed_user_ids.storage]
+[integration.prebid.managed_user_ids.storage]
 type = "html5"
 name = "example_env"
 expires = 30
@@ -4181,13 +4179,13 @@ refresh_in_seconds = 3600
     fn managed_user_ids_leave_prebid_defaults_in_place_when_unset() {
         let config = parse_prebid_toml(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 
-[integrations.prebid.managed_user_ids.storage]
+[integration.prebid.managed_user_ids.storage]
 name = "example_env"
 "#,
         );
@@ -4220,10 +4218,10 @@ name = "example_env"
     fn managed_user_ids_allow_an_entry_without_storage() {
         let config = parse_prebid_toml(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 "#,
         );
@@ -4250,35 +4248,35 @@ name = "exampleId"
             ),
             (
                 "empty storage name",
-                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"\"",
+                "name = \"exampleId\"\n\n[integration.prebid.managed_user_ids.storage]\nname = \"\"",
             ),
             (
                 "missing storage name",
-                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\ntype = \"cookie\"",
+                "name = \"exampleId\"\n\n[integration.prebid.managed_user_ids.storage]\ntype = \"cookie\"",
             ),
             (
                 "zero expiry",
-                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\nexpires = 0",
+                "name = \"exampleId\"\n\n[integration.prebid.managed_user_ids.storage]\nname = \"example_env\"\nexpires = 0",
             ),
             (
                 "zero refresh",
-                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\nrefresh_in_seconds = 0",
+                "name = \"exampleId\"\n\n[integration.prebid.managed_user_ids.storage]\nname = \"example_env\"\nrefresh_in_seconds = 0",
             ),
             (
                 "unknown storage mechanism",
-                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\ntype = \"session\"",
+                "name = \"exampleId\"\n\n[integration.prebid.managed_user_ids.storage]\nname = \"example_env\"\ntype = \"session\"",
             ),
             (
                 "unknown storage field",
-                "name = \"exampleId\"\n\n[integrations.prebid.managed_user_ids.storage]\nname = \"example_env\"\nunsupported = true",
+                "name = \"exampleId\"\n\n[integration.prebid.managed_user_ids.storage]\nname = \"example_env\"\nunsupported = true",
             ),
         ] {
             let result = parse_prebid_toml_result(&format!(
                 r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 {entry_section}
 "#
             ));
@@ -4291,14 +4289,14 @@ server_url = "https://prebid.example/openrtb2/auction"
     fn managed_user_ids_reject_a_repeated_module_name() {
         let result = parse_prebid_toml_result(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 params = { pid = "1" }
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 params = { pid = "2" }
 "#,
@@ -4314,14 +4312,14 @@ params = { pid = "2" }
     fn managed_user_ids_reject_a_case_variant_module_name() {
         let result = parse_prebid_toml_result(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 params = { pid = "1" }
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleid"
 params = { pid = "2" }
 "#,
@@ -4337,13 +4335,13 @@ params = { pid = "2" }
     fn managed_user_ids_accept_distinct_module_names() {
         let config = parse_prebid_toml(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "exampleId"
 
-[[integrations.prebid.managed_user_ids]]
+[[integration.prebid.managed_user_ids]]
 name = "otherExampleId"
 "#,
         );
@@ -4359,7 +4357,7 @@ name = "otherExampleId"
     fn managed_user_ids_default_to_none_configured() {
         let config = parse_prebid_toml(
             r#"
-[integrations.prebid]
+[integration.prebid]
 server_url = "https://prebid.example/openrtb2/auction"
 "#,
         );
@@ -5298,11 +5296,10 @@ external_bundle_sri = "sha384-AAAA"
     fn planned_registration_injects_managed_user_ids() {
         let mut settings = make_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "prebid",
                 &json!({
-                    "enabled": true,
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "managed_user_ids": [{
                         "name": "exampleId",

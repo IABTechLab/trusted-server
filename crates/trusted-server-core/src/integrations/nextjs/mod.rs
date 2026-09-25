@@ -756,11 +756,10 @@ mod tests {
     fn stream_nextjs_html(html: &str, chunk_size: usize) -> String {
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
@@ -868,11 +867,10 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integrations
+            .integration
             .insert_config(
                 "nextjs",
                 &json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                     // Fits either script alone, not both payloads together.
                     "max_combined_payload_bytes": 80,
