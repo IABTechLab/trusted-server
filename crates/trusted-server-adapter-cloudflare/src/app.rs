@@ -10,7 +10,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{
-    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(target_arch = "wasm32")]
@@ -209,7 +209,11 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let plan = Arc::new(compile_auction_plan(&settings)?);
+    // The plan is compiled with the integrations this adapter was given, so an
+    // `[adserver]` or `[demand]` name one of their builders supplies resolves
+    // here. Compiling without them would drop the implementation and report the
+    // name as one no builder registers.
+    let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
