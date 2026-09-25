@@ -10,9 +10,12 @@ origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration_proxy_secret"
 
 [ec]
-passphrase = "integration_ec_passphrase"
+provider = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
+
+[ec.hmac]
+passphrase = "integration_ec_passphrase"
 
 [[ec.partners]]
 name = "Integration Test Partner"

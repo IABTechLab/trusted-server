@@ -219,6 +219,9 @@ mod tests {
                 proxy_secret = "unit-test-proxy-secret"
 
                 [ec]
+                provider = "hmac"
+
+                [ec.hmac]
                 passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )

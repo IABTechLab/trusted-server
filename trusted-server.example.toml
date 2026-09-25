@@ -6,10 +6,13 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only three sections are REQUIRED for the server to start and pass validation:
+# Only two sections are REQUIRED for the server to start and pass validation:
 #   1. [[handlers]] covering /_ts/admin  (admin authentication)
 #   2. [publisher]                       (domain + origin)
-#   3. [ec] passphrase                   (Edge Cookie identity secret)
+#
+# Edge Cookie identity is optional and stays off until an [ec] provider is
+# selected, so no identity secret is needed to start. See the Edge Cookie
+# section below.
 #
 # Everything below those is OPTIONAL. Most optional blocks are commented out —
 # uncomment and edit one to enable it — but a few integrations are kept as active
@@ -70,11 +73,20 @@ proxy_secret = "publisher_proxy_secret"
 
 
 # -----------------------------------------------------------------------------
-# REQUIRED — Edge Cookie (EC) identity
+# OPTIONAL — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Secret Store key for the secret used to derive EC identifiers.
-passphrase = "ec_passphrase"
+# Edge Cookie identity is OFF by default. With no provider selected, Trusted
+# Server runs statelessly and generates no Edge Cookie. Activate one by
+# uncommenting the selector below, together with that provider's own
+# [ec.<name>] block when it has settings (a block the selector does not name
+# is rejected at startup). Deployment tooling can merge a
+# TRUSTED_SERVER__EC__PROVIDER environment value into the published
+# configuration before it is loaded, and the running server itself reads its
+# settings from the platform config store rather than the environment. The
+# built-in hmac provider is host-neutral, and a vendor provider ships in its
+# own crate that the adapter composes in.
+# provider = "hmac"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
@@ -84,6 +96,23 @@ pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Built-in HMAC provider block. Uncomment it together with the
+# `provider = "hmac"` selector above. `passphrase` names the Secret Store key
+# holding the secret used to derive EC identifiers. That secret must be
+# >= 32 bytes and non-placeholder in production. Provision referenced keys in
+# trusted_server_secrets before validating/pushing.
+# [ec.hmac]
+# passphrase = "ec_passphrase"
+
+# A block can name the implementation it configures, which makes the block's
+# own name a label of your choosing. The same provider could therefore be
+# selected as `provider = "primary"` and configured in the block below
+# instead, which is how a deployment gives a provider a name that means
+# something to the people running it.
+# [ec.primary]
+# implementation = "hmac"
+# passphrase = "ec_passphrase"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
