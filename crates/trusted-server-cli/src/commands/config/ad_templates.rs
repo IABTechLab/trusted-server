@@ -183,16 +183,16 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
     .map_err(output_error)?;
     writeln!(
         out,
-        "auction.providers: {}",
-        if loaded.settings.auction.providers.is_empty() {
+        "demand.provider: {}",
+        if loaded.settings.demand.selected().is_empty() {
             "(none)".to_string()
         } else {
             loaded
                 .settings
-                .auction
-                .providers
-                .keys()
-                .map(|id| escape_terminal_text(id.as_str()).into_owned())
+                .demand
+                .selected()
+                .into_iter()
+                .map(|name| escape_terminal_text(name).into_owned())
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -213,10 +213,10 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
             "status: slots are configured, but [auction].enabled is false"
         )
         .map_err(output_error)?;
-    } else if loaded.settings.auction.providers.is_empty() {
+    } else if loaded.settings.demand.selected().is_empty() {
         writeln!(
             out,
-            "status: slots are configured, but [auction].providers is empty"
+            "status: slots are configured, but [demand] provider is empty"
         )
         .map_err(output_error)?;
     } else {
@@ -351,7 +351,7 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         .creative_opportunities
         .as_ref()
         .is_some_and(|config| config.enabled);
-    let providers_configured = !loaded.settings.auction.providers.is_empty();
+    let providers_configured = !loaded.settings.demand.selected().is_empty();
 
     let gate = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: method_pass,
@@ -702,15 +702,16 @@ mod tests {
 
     #[test]
     fn lint_reports_configured_slot_count_and_auction_state() {
-        // Insert the alphabetically earlier provider after pbs-main in source
-        // order, so the output must sort identifiers rather than preserve input.
+        // The example config selects `pbs_main`, and this names the
+        // alphabetically earlier `aps_main` after it, so the output must sort
+        // the names rather than preserve the order they were selected in.
         let config_text = format!(
-            "{}\n[auction.providers.aps-main]\n\
-             protocol = \"openrtb-2.6\"\n\
-             profile = \"aps\"\n\
+            "{}\n[demand]\n\
+             provider = [\"pbs_main\", \"aps_main\"]\n\
+             [demand.aps_main]\n\
+             implementation = \"aps\"\n\
              endpoint = \"https://aps.example.com/e/pb/bid\"\n\
              routing = \"all_eligible\"\n\
-             [auction.providers.aps-main.profile_config]\n\
              account_id = \"example-aps-account-id\"\n",
             config_with_slots()
         );
@@ -735,9 +736,9 @@ mod tests {
         assert_eq!(
             output
                 .lines()
-                .find(|line| line.starts_with("auction.providers:")),
-            Some("auction.providers: aps-main, pbs-main"),
-            "should report provider identifiers in deterministic order: {output}"
+                .find(|line| line.starts_with("demand.provider:")),
+            Some("demand.provider: aps_main, pbs_main"),
+            "should report demand names in deterministic order: {output}"
         );
         assert!(!output.contains("legacy fallback"));
     }
@@ -767,14 +768,14 @@ mod tests {
         assert_eq!(
             output
                 .lines()
-                .find(|line| line.starts_with("auction.providers:")),
-            Some("auction.providers: (none)"),
-            "should report no providers"
+                .find(|line| line.starts_with("demand.provider:")),
+            Some("demand.provider: (none)"),
+            "should report no demand sources"
         );
         assert!(
-            output.lines().any(
-                |line| line == "status: slots are configured, but [auction].providers is empty"
-            ),
+            output
+                .lines()
+                .any(|line| line == "status: slots are configured, but [demand] provider is empty"),
             "should explain why configured slots are ineligible: {output}"
         );
     }

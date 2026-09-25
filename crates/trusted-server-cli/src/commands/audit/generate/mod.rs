@@ -158,10 +158,10 @@ struct DraftConfig {
     js_asset_proxy_candidate_count: usize,
 }
 
-#[derive(Debug, Clone)]
 /// Id of the integration the audit writes its discovered assets for.
 const JS_ASSET_PROXY_ID: &str = "js_asset_proxy";
 
+#[derive(Debug, Clone)]
 struct JsAssetProxySection {
     /// The block to write when the audit found at least one asset.
     toml: String,
@@ -398,10 +398,10 @@ fn write_success_summary(
         outputs.artifact.js_asset_count,
         outputs.artifact.third_party_asset_count,
         outputs.ad_slot_count,
-        if integration.is_empty() {
+        if integrations.is_empty() {
             "none".to_string()
         } else {
-            integration.join(", ")
+            integrations.join(", ")
         },
         asset_proxy_note,
         if written.is_empty() {
@@ -1232,7 +1232,7 @@ const INTERSTITIAL_SCRIPT_CEILING: usize = 3;
 /// different in each case.
 fn looks_like_an_interstitial(artifact: &AuditArtifact) -> Option<String> {
     if artifact.js_asset_count > INTERSTITIAL_SCRIPT_CEILING
-        || !artifact.detected_integration.is_empty()
+        || !artifact.detected_integrations.is_empty()
     {
         return None;
     }
