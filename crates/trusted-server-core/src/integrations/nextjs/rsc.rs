@@ -20,7 +20,7 @@ pub(crate) const DEFAULT_MAX_COMBINED_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum reasonable T-chunk length to prevent `DoS` from malformed input (100 MB).
 /// A `T-chunk` larger than this is almost certainly malformed and would cause excessive
 /// memory allocation or iteration.
-const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
+pub(super) const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
 
 // =============================================================================
 // Escape Sequence Parsing
@@ -86,6 +86,44 @@ impl<'a> EscapeSequenceIter<'a> {
     fn position(&self) -> usize {
         self.pos
     }
+
+    /// Whether appending bytes could change how the next escape is decoded.
+    fn has_partial_escape(&self) -> bool {
+        let remaining = &self.bytes[self.pos..];
+        if remaining.first() != Some(&b'\\') {
+            return false;
+        }
+        match remaining.get(1) {
+            None => true,
+            Some(b'x') => remaining.len() < 4,
+            Some(b'u') => {
+                if remaining.len() < 6 {
+                    return remaining[2..].iter().all(u8::is_ascii_hexdigit);
+                }
+                let Some(code_unit) = self
+                    .str_ref
+                    .get(self.pos + 2..self.pos + 6)
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                else {
+                    return false;
+                };
+                if !(0xD800..=0xDBFF).contains(&code_unit) || remaining.len() >= 12 {
+                    return false;
+                }
+                // A high surrogate can still join a low surrogate. Retain only
+                // prefixes that can grow into `\uDC00` through `\uDFFF`.
+                let tail = &remaining[6..];
+                tail.iter().enumerate().all(|(index, byte)| match index {
+                    0 => *byte == b'\\',
+                    1 => *byte == b'u',
+                    2 => matches!(byte, b'd' | b'D'),
+                    3 => matches!(byte, b'c'..=b'f' | b'C'..=b'F'),
+                    _ => byte.is_ascii_hexdigit(),
+                })
+            }
+            Some(_) => false,
+        }
+    }
 }
 
 impl Iterator for EscapeSequenceIter<'_> {
@@ -115,51 +153,68 @@ impl Iterator for EscapeSequenceIter<'_> {
                 return Some(EscapeElement { byte_count: 1 });
             }
 
-            if esc == b'x' && self.pos + 3 < self.bytes.len() {
+            // Only the boundary is checked, not the hex digits: validating the
+            // digits would change the unescaped byte count of malformed but
+            // previously scannable input such as `\xZZ`, and that count drives
+            // T-chunk length recomputation. Inputs that are rejected here are
+            // exactly the ones that used to advance into a character and panic.
+            if esc == b'x'
+                && self.pos + 3 < self.bytes.len()
+                && self.str_ref.is_char_boundary(self.pos + 4)
+            {
                 self.pos += 4;
                 return Some(EscapeElement { byte_count: 1 });
             }
 
-            if esc == b'u' && self.pos + 5 < self.bytes.len() {
-                let hex = &self.str_ref[self.pos + 2..self.pos + 6];
-                if hex.chars().all(|c| c.is_ascii_hexdigit())
-                    && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+            // `str::get` yields `None` when the escape body straddles a character,
+            // which falls through to literal handling exactly as invalid hex does.
+            if esc == b'u'
+                && self.pos + 5 < self.bytes.len()
+                && let Some(hex) = self.str_ref.get(self.pos + 2..self.pos + 6)
+                && hex.chars().all(|c| c.is_ascii_hexdigit())
+                && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+            {
+                if (0xD800..=0xDBFF).contains(&code_unit)
+                    && self.pos + 11 < self.bytes.len()
+                    && self.bytes[self.pos + 6] == b'\\'
+                    && self.bytes[self.pos + 7] == b'u'
                 {
-                    if (0xD800..=0xDBFF).contains(&code_unit)
-                        && self.pos + 11 < self.bytes.len()
-                        && self.bytes[self.pos + 6] == b'\\'
-                        && self.bytes[self.pos + 7] == b'u'
+                    let hex2 = self.str_ref.get(self.pos + 8..self.pos + 12);
+                    if let Some(hex2) = hex2
+                        && hex2.chars().all(|c| c.is_ascii_hexdigit())
+                        && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
+                        && (0xDC00..=0xDFFF).contains(&code_unit2)
                     {
-                        let hex2 = &self.str_ref[self.pos + 8..self.pos + 12];
-                        if hex2.chars().all(|c| c.is_ascii_hexdigit())
-                            && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
-                            && (0xDC00..=0xDFFF).contains(&code_unit2)
-                        {
-                            self.pos += 12;
-                            return Some(EscapeElement { byte_count: 4 });
-                        }
+                        self.pos += 12;
+                        return Some(EscapeElement { byte_count: 4 });
                     }
-
-                    let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
-                    self.pos += 6;
-                    return Some(EscapeElement {
-                        byte_count: c.len_utf8(),
-                    });
                 }
+
+                let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
+                self.pos += 6;
+                return Some(EscapeElement {
+                    byte_count: c.len_utf8(),
+                });
             }
         }
 
         if self.bytes[self.pos] < 0x80 {
             self.pos += 1;
             Some(EscapeElement { byte_count: 1 })
-        } else {
-            let c = self.str_ref[self.pos..]
-                .chars()
-                .next()
-                .unwrap_or('\u{FFFD}');
+        } else if let Some(c) = self
+            .str_ref
+            .get(self.pos..)
+            .and_then(|remainder| remainder.chars().next())
+        {
             let len = c.len_utf8();
             self.pos += len;
             Some(EscapeElement { byte_count: len })
+        } else {
+            // Defensive: the escape guards above keep `pos` on a character
+            // boundary, so a continuation byte here is unreachable. Advance one
+            // byte rather than slicing so the iterator cannot panic or stall.
+            self.pos += 1;
+            Some(EscapeElement { byte_count: 1 })
         }
     }
 }
@@ -189,83 +244,154 @@ fn consume_unescaped_bytes(s: &str, start_pos: usize, byte_count: usize) -> (usi
 // =============================================================================
 
 /// Information about a T-chunk found in the combined RSC content.
-struct TChunkInfo {
+pub(super) struct TChunkInfo {
     /// Position where the T-chunk header starts (e.g., position of "1a:T...").
-    match_start: usize,
+    pub(super) match_start: usize,
     /// Position right after the chunk ID (position of ":T").
-    id_end: usize,
+    pub(super) id_end: usize,
     /// Position right after the comma (where content begins).
-    header_end: usize,
+    pub(super) header_end: usize,
     /// Position where the content ends.
-    content_end: usize,
+    pub(super) content_end: usize,
+}
+
+pub(super) enum TChunkScan {
+    Complete(Vec<TChunkInfo>),
+    NeedMore,
+    Invalid,
+}
+
+/// A T-chunk whose header has been parsed but whose content has not fully arrived.
+pub(super) struct PendingTChunk {
+    match_start: usize,
+    id_end: usize,
+    header_end: usize,
+    declared_length: usize,
+    consumed: usize,
+    pos: usize,
+}
+
+/// Outcome of advancing a T-chunk scan by one chunk.
+pub(super) enum TChunkStep {
+    /// A chunk's declared content is fully present.
+    Found(TChunkInfo),
+    /// The text ends inside this chunk's content; resume with more text.
+    Pending(PendingTChunk),
+    /// No further chunk header begins in the text.
+    Exhausted,
+    Invalid,
+}
+
+/// Advance a T-chunk scan by one chunk.
+///
+/// Passing the [`TChunkStep::Pending`] chunk back resumes content consumption
+/// where it stopped, so growing text is walked once rather than re-walked from
+/// the chunk header on every call.
+///
+/// `hold_back_partial_escape` stops the scan at a trailing backslash that could
+/// still grow into a longer escape sequence. A resumed scan would otherwise
+/// commit to reading that backslash as a literal byte.
+pub(super) fn next_tchunk(
+    content: &str,
+    search_pos: usize,
+    pending: Option<PendingTChunk>,
+    marker: Option<&[u8]>,
+    hold_back_partial_escape: bool,
+) -> TChunkStep {
+    let mut chunk = match pending {
+        Some(chunk) => chunk,
+        None => {
+            if search_pos >= content.len() {
+                return TChunkStep::Exhausted;
+            }
+            let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) else {
+                return TChunkStep::Exhausted;
+            };
+            let call = cap.get(0).expect("T-chunk match should exist");
+            let id_match = cap.get(1).expect("T-chunk id should exist");
+            let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
+            let Some(declared_length) = usize::from_str_radix(length_hex, 16)
+                .ok()
+                .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)
+            else {
+                return TChunkStep::Invalid;
+            };
+            let header_end = search_pos + call.end();
+            PendingTChunk {
+                match_start: search_pos + call.start(),
+                id_end: search_pos + id_match.end(),
+                header_end,
+                declared_length,
+                consumed: 0,
+                pos: header_end,
+            }
+        }
+    };
+
+    let mut iter = match marker {
+        Some(marker) => EscapeSequenceIter::from_position_with_marker(content, chunk.pos, marker),
+        None => EscapeSequenceIter::from_position(content, chunk.pos),
+    };
+    while chunk.consumed < chunk.declared_length {
+        if hold_back_partial_escape && iter.has_partial_escape() {
+            break;
+        }
+        match iter.next() {
+            Some(element) => chunk.consumed += element.byte_count,
+            None => break,
+        }
+    }
+    chunk.pos = iter.position();
+
+    if chunk.consumed > chunk.declared_length {
+        return TChunkStep::Invalid;
+    }
+    if chunk.consumed < chunk.declared_length {
+        return TChunkStep::Pending(chunk);
+    }
+    TChunkStep::Found(TChunkInfo {
+        match_start: chunk.match_start,
+        id_end: chunk.id_end,
+        header_end: chunk.header_end,
+        content_end: chunk.pos,
+    })
 }
 
 /// Find all T-chunks in content, optionally skipping markers.
-fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo>> {
+fn scan_tchunks_impl(content: &str, skip_markers: bool) -> TChunkScan {
+    let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
     let mut chunks = Vec::new();
     let mut search_pos = 0;
-    let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
 
-    while search_pos < content.len() {
-        if let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) {
-            let m = cap.get(0).expect("T-chunk match should exist");
-            let match_start = search_pos + m.start();
-            let header_end = search_pos + m.end();
-
-            let id_match = cap.get(1).expect("T-chunk id should exist");
-            let id_end = search_pos + id_match.end();
-            let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
-            let declared_length = usize::from_str_radix(length_hex, 16)
-                .ok()
-                .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)?;
-
-            let content_end = if let Some(marker_bytes) = marker {
-                let mut iter = EscapeSequenceIter::from_position_with_marker(
-                    content,
-                    header_end,
-                    marker_bytes,
-                );
-                let mut consumed = 0;
-                while consumed < declared_length {
-                    match iter.next() {
-                        Some(elem) => consumed += elem.byte_count,
-                        None => break,
-                    }
-                }
-                if consumed < declared_length {
-                    return None;
-                }
-                iter.position()
-            } else {
-                let (pos, consumed) = consume_unescaped_bytes(content, header_end, declared_length);
-                if consumed < declared_length {
-                    return None;
-                }
-                pos
-            };
-
-            chunks.push(TChunkInfo {
-                match_start,
-                id_end,
-                header_end,
-                content_end,
-            });
-
-            search_pos = content_end;
-        } else {
-            break;
+    loop {
+        match next_tchunk(content, search_pos, None, marker, false) {
+            TChunkStep::Found(chunk) => {
+                search_pos = chunk.content_end;
+                chunks.push(chunk);
+            }
+            TChunkStep::Pending(_) => return TChunkScan::NeedMore,
+            TChunkStep::Exhausted => return TChunkScan::Complete(chunks),
+            TChunkStep::Invalid => return TChunkScan::Invalid,
         }
     }
+}
 
-    Some(chunks)
+pub(super) fn scan_tchunks(content: &str) -> TChunkScan {
+    scan_tchunks_impl(content, false)
 }
 
 fn find_tchunks(content: &str) -> Option<Vec<TChunkInfo>> {
-    find_tchunks_impl(content, false)
+    match scan_tchunks(content) {
+        TChunkScan::Complete(chunks) => Some(chunks),
+        TChunkScan::NeedMore | TChunkScan::Invalid => None,
+    }
 }
 
 fn find_tchunks_with_markers(content: &str) -> Option<Vec<TChunkInfo>> {
-    find_tchunks_impl(content, true)
+    match scan_tchunks_impl(content, true) {
+        TChunkScan::Complete(chunks) => Some(chunks),
+        TChunkScan::NeedMore | TChunkScan::Invalid => None,
+    }
 }
 
 // =============================================================================
@@ -394,9 +520,9 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     request_scheme: &str,
     max_combined_payload_bytes: usize,
 ) -> Vec<String> {
-    if payloads.is_empty() {
+    let Some((_, preceding_payloads)) = payloads.split_last() else {
         return Vec::new();
-    }
+    };
 
     // Early exit if no payload contains the origin host - avoids regex compilation
     if !payloads.iter().any(|p| p.contains(origin_host)) {
@@ -420,8 +546,8 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     };
 
     // Check total size before allocating combined buffer
-    let total_size: usize =
-        payloads.iter().map(|p| p.len()).sum::<usize>() + (payloads.len() - 1) * RSC_MARKER.len();
+    let total_size: usize = payloads.iter().map(|p| p.len()).sum::<usize>()
+        + preceding_payloads.len() * RSC_MARKER.len();
 
     if total_size > max_combined_payload_bytes {
         // Avoid allocating a large combined buffer. If the payloads contain cross-script T-chunks,
@@ -453,6 +579,24 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
                 )
             })
             .collect();
+    }
+
+    // Markers preserve script boundaries, but inserting one inside an escape
+    // changes its decoded length. Preserve this group rather than emitting a
+    // header counted differently by the classifier and the marker-aware scan.
+    for payload in preceding_payloads {
+        let mut iter = EscapeSequenceIter::new(payload);
+        loop {
+            if iter.has_partial_escape() {
+                return payloads
+                    .iter()
+                    .map(|payload| (*payload).to_owned())
+                    .collect();
+            }
+            if iter.next().is_none() {
+                break;
+            }
+        }
     }
 
     let mut combined = String::with_capacity(total_size);
@@ -517,6 +661,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tchunk_boundary_preserves_partial_scheme_colon() {
+        let rewriter = RscUrlRewriter::new();
+        for slashes in ["//", r"\/\/"] {
+            let content = format!(r#"{{"u":"https:{slashes}origin.example.com/a"}}"#);
+            // Cover every boundary within the scheme, including the reported T7 case.
+            for length in 7..=12 {
+                let payload = format!("1:T{length:x},{content}");
+                for request_host in [
+                    "origin.example.com",
+                    "short.example.com",
+                    "longer.proxy.example.com",
+                ] {
+                    let expected = payload.replace("origin.example.com", request_host);
+                    for payloads in [vec![payload.as_str()], vec![payload.as_str(), "2:T4,done"]] {
+                        let result = rewrite_rsc_scripts_combined_with_limit(
+                            &payloads,
+                            &rewriter,
+                            "origin.example.com",
+                            request_host,
+                            "https",
+                            DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
+                        );
+
+                        assert_eq!(
+                            result[0], expected,
+                            "should preserve the URL and T-length for {payload}"
+                        );
+                        assert_eq!(
+                            result.len(),
+                            payloads.len(),
+                            "should preserve script boundaries"
+                        );
+                        if result.len() == 2 {
+                            assert_eq!(
+                                result[1], "2:T4,done",
+                                "should preserve the following T-chunk"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tchunk_length_recalculation() {
         let content = r#"1a:T29,{"url":"https://origin.example.com/path"}"#;
         let rewriter = RscUrlRewriter::new();
@@ -561,6 +750,100 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_waits_only_for_incomplete_escapes() {
+        for (escape, length) in [
+            (r"\n", 1),
+            (r#"\""#, 1),
+            (r"\\", 1),
+            (r"\x41", 1),
+            (r"\u0041", 1),
+            (r"\ud83d\ude00", 4),
+        ] {
+            let header = format!("1:T{length:x},");
+            for split in 0..escape.len() {
+                let incomplete = format!("{header}{}", &escape[..split]);
+                let TChunkStep::Pending(pending) = next_tchunk(&incomplete, 0, None, None, true)
+                else {
+                    panic!("should retain incomplete escape {escape} at byte {split}");
+                };
+                let complete = format!("{header}{escape}");
+                assert!(
+                    matches!(
+                        next_tchunk(&complete, 0, Some(pending), None, true),
+                        TChunkStep::Found(_)
+                    ),
+                    "should resume and release complete escape {escape} at byte {split}"
+                );
+            }
+        }
+        for content in [
+            r"1:T3,\ud83d!",
+            r"1:T3,\ud83d\u0041",
+            r"1:T6,\uZZZZ",
+            r"1:T2,\q",
+        ] {
+            assert!(
+                matches!(
+                    next_tchunk(content, 0, None, None, true),
+                    TChunkStep::Found(_)
+                ),
+                "should not hold a disproved escape or surrogate pair: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn escapes_split_between_scripts_preserve_the_group_unchanged() {
+        for escape in [r"\n", r"\x41", r"\u0041", r"\ud83d\ude00"] {
+            let length = calculate_unescaped_byte_length(escape);
+            for split in 1..escape.len() {
+                let first = format!("1:T{length:x},{}", &escape[..split]);
+                let second = format!("{}\nhttps://origin.example.com/path/", &escape[split..]);
+                let payloads = [first.as_str(), second.as_str()];
+                let rewritten = rewrite_rsc_scripts_combined(
+                    &payloads,
+                    "origin.example.com",
+                    "proxy.example.com",
+                    "https",
+                );
+                assert_eq!(
+                    rewritten, payloads,
+                    "should preserve the group when a marker would split {escape} at byte {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_payload_escape_splits_preserve_declared_lengths() {
+        for body in [
+            r"\x41\x42",
+            r"a\nb",
+            r#"{\"a\":\"b\"}"#,
+            r"\ud83d\ude00",
+            r"\\\x41",
+        ] {
+            let length = calculate_unescaped_byte_length(body);
+            let header = format!("1:T{length:x},");
+            let document = format!("{header}{body}\nhttps://origin.example.com/path/");
+            for split in header.len()..header.len() + body.len() {
+                let payloads = [&document[..split], &document[split..]];
+                let rewritten = rewrite_rsc_scripts_combined(
+                    &payloads,
+                    "origin.example.com",
+                    "origin.example.com",
+                    "https",
+                );
+                assert_eq!(
+                    rewritten.concat(),
+                    document,
+                    "should preserve lengths for an identity rewrite at split {split} of {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn calculate_unescaped_byte_length_handles_common_escapes() {
         assert_eq!(calculate_unescaped_byte_length("hello"), 5);
         assert_eq!(calculate_unescaped_byte_length(r"\n"), 1);
@@ -570,6 +853,20 @@ mod tests {
         assert_eq!(calculate_unescaped_byte_length(r"\x41"), 1);
         assert_eq!(calculate_unescaped_byte_length(r"\u0041"), 1);
         assert_eq!(calculate_unescaped_byte_length(r"\u00e9"), 2);
+    }
+
+    #[test]
+    fn rejects_tchunk_lengths_that_split_a_decoded_character() {
+        for content in ["1:T1,€", r"1:T1,\ud83d\ude00"] {
+            assert!(
+                matches!(scan_tchunks(content), TChunkScan::Invalid),
+                "plain scanner should reject a split decoded character: {content}"
+            );
+            assert!(
+                matches!(scan_tchunks_impl(content, true), TChunkScan::Invalid),
+                "marker-aware scanner should reject a split decoded character: {content}"
+            );
+        }
     }
 
     #[test]
