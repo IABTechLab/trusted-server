@@ -96,8 +96,9 @@ struct Bundle {
     user_id_modules: Vec<String>,
 }
 
-/// Mirror the private core list deserializer without expanding runtime defaults.
-/// Parity tests compare these accepted representations with `PrebidIntegrationConfig`.
+/// Accept the same encodings as the private core list deserializer without expanding defaults.
+/// Unparseable escapes instead reach identifier validation for a sanitized error.
+/// Parity tests compare accepted representations with `PrebidIntegrationConfig`.
 ///
 /// # Errors
 /// Rejects malformed lists, invalid numeric indexes, and non-string items.
@@ -144,10 +145,9 @@ fn bidder_list<'de, D: Deserializer<'de>>(
                 .into_iter()
                 .map(|part| {
                     let json = format!("\"{}\"", part.replace('"', "\\\""));
-                    match serde_json::from_str(&json) {
-                        Ok(value) => value,
-                        Err(_) => part.to_owned(),
-                    }
+                    // Core propagates this error; keep raw text here so identifier validation
+                    // rejects it without a serde snippet that could echo source contents.
+                    serde_json::from_str(&json).unwrap_or_else(|_| part.to_owned())
                 })
                 .collect())
         }

@@ -1,10 +1,6 @@
 mock_provider "aws" {
-  mock_resource "aws_instance" {
-    override_during = plan
-
-    defaults = {
-      id = "i-0123456789abcdef0"
-    }
+  mock_data "aws_partition" {
+    defaults = { partition = "aws" }
   }
 
   mock_resource "aws_eip" {
@@ -32,12 +28,8 @@ mock_provider "aws" {
 mock_provider "aws" {
   alias = "west"
 
-  mock_resource "aws_instance" {
-    override_during = plan
-
-    defaults = {
-      id = "i-0fedcba9876543210"
-    }
+  mock_data "aws_partition" {
+    defaults = { partition = "aws" }
   }
 
   mock_resource "aws_eip" {
@@ -62,6 +54,30 @@ mock_provider "aws" {
   }
 }
 
+override_resource {
+  target          = module.east.aws_instance.pbs["us-east-1a"]
+  override_during = plan
+  values          = { id = "i-00000000000000001" }
+}
+
+override_resource {
+  target          = module.east.aws_instance.pbs["us-east-1b"]
+  override_during = plan
+  values          = { id = "i-00000000000000002" }
+}
+
+override_resource {
+  target          = module.west.aws_instance.pbs["us-west-2a"]
+  override_during = plan
+  values          = { id = "i-00000000000000003" }
+}
+
+override_resource {
+  target          = module.west.aws_instance.pbs["us-west-2b"]
+  override_during = plan
+  values          = { id = "i-00000000000000004" }
+}
+
 variables {
   aws_account_id       = "123456789012"
   aws_profile          = "pbs-example"
@@ -76,18 +92,21 @@ run "plans_both_regional_provider_mappings" {
   command = plan
 
   assert {
-    condition     = length(module.east.instance_ids) == 2
+    condition     = length(distinct(values(module.east.instance_ids))) == 2
     error_message = "The east provider mapping should plan two PBS instances."
   }
 
   assert {
-    condition     = length(module.west.instance_ids) == 2
+    condition     = length(distinct(values(module.west.instance_ids))) == 2
     error_message = "The west provider mapping should plan two PBS instances."
   }
 
   assert {
-    condition     = length(local.deployment_descriptor.regions) == 2
-    error_message = "The generated deployment descriptor should include both regions."
+    condition = (
+      length(local.deployment_descriptor.regions) == 2 &&
+      alltrue([for region in local.deployment_descriptor.regions : length(distinct(region.instance_ids)) == 2])
+    )
+    error_message = "The generated deployment descriptor should include two distinct instance IDs in each region."
   }
 
   assert {

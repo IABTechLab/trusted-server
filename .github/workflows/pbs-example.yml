@@ -1,0 +1,68 @@
+name: PBS example checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/pbs-example/**'
+      - '.tool-versions'
+      - '.github/workflows/pbs-example.yml'
+  pull_request:
+    paths:
+      - 'deploy/pbs-example/**'
+      - '.tool-versions'
+      - '.github/workflows/pbs-example.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-checks:
+    name: PBS Terraform and Compose checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TF_IN_AUTOMATION: 'true'
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Terraform version
+        id: terraform
+        shell: bash
+        run: echo "version=$(awk '$1 == "terraform" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.terraform.outputs.version }}
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Check Docker Compose prerequisite
+        run: docker compose version
+
+      # These suites use mocked providers and plan mode. No AWS credentials,
+      # Terraform apply, image pulls, or container startup are needed.
+      - name: Format and test Terraform root
+        run: |
+          terraform fmt -check -recursive deploy/pbs-example
+          terraform -chdir=deploy/pbs-example init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/pbs-example validate
+          terraform -chdir=deploy/pbs-example test -filter=tests/root_unit_test.tftest.hcl
+
+      - name: Validate and test regional module
+        run: |
+          terraform -chdir=deploy/pbs-example/modules/regional init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=deploy/pbs-example/modules/regional validate
+          terraform -chdir=deploy/pbs-example/modules/regional test -filter=tests/security_unit_test.tftest.hcl
+          git diff --exit-code -- deploy/pbs-example/.terraform.lock.hcl deploy/pbs-example/modules/regional/.terraform.lock.hcl
+
+      - name: Check runtime inputs and smoke wiring without starting containers
+        run: |
+          python3 -m json.tool deploy/pbs-example/runtime/secret-bindings.example.json > /dev/null
+          bash -n deploy/pbs-example/scripts/smoke-runtime.sh
+          python3 -I deploy/pbs-example/scripts/test-smoke-runtime.py

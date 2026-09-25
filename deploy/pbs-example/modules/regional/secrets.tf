@@ -39,9 +39,11 @@ resource "aws_iam_instance_profile" "pbs" {
   })
 }
 
+data "aws_partition" "current" {}
+
 resource "aws_iam_role_policy_attachment" "ssm" {
   role       = aws_iam_role.pbs.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_role_policy" "runtime" {

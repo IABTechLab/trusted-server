@@ -15,7 +15,7 @@ cargo run_cli_linux prebid server inspect --config trusted-server.example.toml -
 cargo run_cli_linux prebid server check --deployment crates/trusted-server-cli/examples/pbs/deployment.yaml
 ```
 
-On macOS use `build_cli_macos` and `run_cli_macos`. The examples contain fictional resource identifiers, a fictional image digest, and a fictional adapter binding. They exercise local checks only and must not be used as real deployment settings.
+On Apple Silicon macOS use `build_cli_macos` and `run_cli_macos`. Other hosts can run `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" -- prebid server --help`. The examples contain fictional resource identifiers, a fictional image digest, and a fictional adapter binding. They exercise local checks only and must not be used as real deployment settings.
 
 ## Commands and current limits
 
@@ -86,7 +86,7 @@ The command above is an interface example, not authorization to run it. Generate
 
 File and stdin inputs are mutually exclusive. `--stdin` requires `--yes` and `--request-token`. Input must contain only declared keys, include all required nonempty string values, and fit the Secrets Manager size limit. Optional keys may be omitted. Duplicate keys and non-string values are rejected. Quotes, dollar signs, newlines, and backslashes are encoded as JSON, never shell expressions.
 
-Secret values never enter command arguments or reports. The AWS CLI receives JSON through a tool-owned temporary file, owner-only on Unix, which is removed on normal success and error paths. Operator-provided input files are not changed or deleted. Run on a trusted host with protected temporary storage; abrupt process termination can leave temporary files requiring cleanup. Windows temporary-file ACL behavior has not been validated.
+Secret values never enter command arguments or reports. The AWS CLI receives JSON through a tool-owned temporary file, owner-only on Unix, which is removed on normal success and error paths. Operator-provided input files are not changed or deleted. Input-file errors print the full escaped path to stderr, including under `--json`; directory layouts and partner names in paths can enter logs even though credential contents are withheld. Run on a trusted host with protected temporary storage; abrupt process termination can leave temporary files requiring cleanup. Windows temporary-file ACL behavior has not been validated.
 
 A successful write reports its version identifier. It does not create secret metadata, change infrastructure, replace containers, or rotate the bidder's credential. Check regional replication, separately replace consumers, and verify them before revoking old partner credentials. A failed or unverifiable response means the write is not confirmed; the outcome may be uncertain. Retain the displayed request token and reuse it only for the original identical payload. Use a new token only for separately intended changed values. Provider error details are withheld, so the CLI cannot distinguish a rejected write from a lost response.
 
@@ -104,4 +104,6 @@ cargo fmt --all -- --check
 cargo clippy --package trusted-server-cli --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 ```
 
-Unit tests cover local discovery, rendering, binding conflicts, account checks, confirmation, payload validation, retries, and status limitations. Unix process-level tests run the actual `ts` binary with a fake `aws` executable and require Python 3. They verify no AWS execution for local commands, private temporary requests, absence of credentials in arguments/output, cleanup, history/account refusal, and partial-report exit codes. They never contact AWS.
+Unit tests cover local discovery, rendering, binding conflicts, account checks, confirmation, payload validation, retries, and status limitations. Unix process-level tests run the actual `ts` binary with a fake `aws` executable and require Python 3. They verify no AWS execution for local commands, private temporary requests, absence of credentials in arguments/output, cleanup, history/account refusal, and partial-report exit codes. They never contact AWS. The unset-history case covers exit 1 with empty stdout, but this fake response does not establish the real AWS CLI contract. An authorized runtime owner must verify real secret-write version IDs and retry behavior against a throwaway secret before operational use.
+
+Process tests also send deeply nested flow sequences, flow mappings, and block mappings through `check`. The pinned `serde_yaml_ng` parser rejects them with sanitized errors before the recursive configuration walkers run. These tests guard the parser's depth-limit behavior; they are not proof against every possible YAML resource-exhaustion input.

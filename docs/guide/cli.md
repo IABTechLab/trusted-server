@@ -611,6 +611,10 @@ APIs.
 `ts prebid client` builds the local external Prebid browser bundle configured in
 `trusted-server.toml`.
 
+> This command was previously `ts prebid bundle`. Update scripts and runbooks to
+> use `ts prebid client` with the same arguments. The old spelling is retired and
+> is not accepted as an alias.
+
 ```toml
 [integrations.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
@@ -664,7 +668,102 @@ AWS. Add `--json` anywhere under `ts prebid server` for machine-readable output.
 Failures use exit code 2, including incomplete `status` reports that still write
 partial JSON to stdout.
 
+### Deployment descriptor and bindings
+
+Pass an explicit `--deployment <file>`; there is no automatic discovery or
+production default. This fictional descriptor is suitable only for local checks:
+
+```yaml
+schema_version: 1
+environment: sandbox
+runtime: ec2-compose
+aws:
+  account_id: '123456789012'
+  profile: pbs-sandbox
+pbs:
+  config: pbs.yaml
+  image: registry.example.com/pbs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  bindings: bindings.json
+regions:
+  us-east-1:
+    instance_ids:
+      - i-0123456789abcdef0
+    overrides: east.yaml
+```
+
+Version 1 requires an explicit environment, `ec2-compose` runtime, 12-digit AWS
+account ID, AWS CLI profile, digest-pinned image, baseline YAML path, and nonempty
+region map. Environment and bidder identifiers use letters, digits, underscores,
+and hyphens; profile names may also contain periods. Instance IDs are optional,
+but `status` needs explicitly listed instances to report infrastructure health.
+Regional override paths and `pbs.bindings` are optional. Omit bindings when no
+host secrets are needed.
+
+Paths resolve relative to the descriptor. Unknown schema fields, duplicate YAML
+keys, tags, and implicit YAML merge keys are rejected. Regional mappings merge
+recursively over the baseline; sequences and scalars replace whole values. The
+CLI validates in memory and writes no rendered files.
+
+The binding file is a JSON or YAML mapping keyed by bidder identifier. Each
+entry requires:
+
+- `verified_image`, exactly matching the descriptor's image.
+- `source`, an HTTPS reference used by the operator to verify the mapping.
+- `secrets`, a complete Secrets Manager ARN for each descriptor region, matching
+  its account and region. Each secret must belong to only one bidder binding.
+- `keys`, mapping credential names to an environment variable `env`, a YAML path
+  array `pbs_path`, and optional `required`, which defaults to true.
+
+For example, a key mapping can be:
+
+```json
+{
+  "api_key": {
+    "env": "PBS_ADAPTERS_EXAMPLEBIDDER_API_KEY",
+    "pbs_path": ["adapters", "examplebidder", "api_key"],
+    "required": true
+  }
+}
+```
+
+Bindings support string-valued credentials. Environment variables and YAML
+destinations must not conflict across bindings or with values already present in
+the resolved YAML. These are operator-supplied mappings, not a verified adapter
+catalog. `check` does not validate the complete upstream PBS schema, verify
+bidder authorization, retrieve secrets, pull images, or prove application health.
+
+### Secret-write safeguards
+
+`secrets set` replaces the complete JSON value of an existing declared secret.
+It does not create secret metadata, deploy PBS, refresh a container, or rotate a
+bidder's credential. Use a trusted host and short-lived AWS credentials. Obtain
+separate approval for each target and value write.
+
+Before writing, the CLI verifies the account through STS, describes the declared
+secret, rejects replicas and secrets scheduled for deletion, and checks both the
+selected profile's and default AWS CLI history settings. History must be disabled
+or unset. Provider stderr is withheld and configured API endpoint overrides are
+disabled.
+
+Interactive use reads JSON in a hidden terminal prompt and requires typing
+`yes`. For approved automation, use `--file <path>` or `--stdin` with `--yes` and
+an explicit `--request-token <UUID>`. The payload must contain only declared keys,
+include required nonempty string values, and fit the Secrets Manager size limit.
+Duplicate keys and non-string values are rejected.
+
+Secret contents do not enter arguments or reports. The AWS request goes through a
+tool-owned temporary file, owner-only on Unix, removed on normal success and
+error paths. Abrupt termination can leave that file behind; Windows temporary-file
+ACLs have not been verified. Operator-provided input files are never deleted.
+Input-file errors print the full escaped path to stderr, including under `--json`.
+Keep sensitive directory and partner names out of public logs.
+
+A successful write reports its version identifier, not runtime readiness. A failed
+or unverifiable response means the outcome may be uncertain. Preserve the request
+UUID and input. Reuse that UUID only with the original identical payload; use a
+new UUID only for a separately intended update. Do not retry changed values under
+the same UUID. `--yes` authorizes only this write, not deployment or future writes.
+
 See the
 [experimental PBS command reference](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-cli/README.md)
-for the deployment descriptor schema, secret-write safeguards, and current
-limitations.
+for complete binding fixtures, command examples, and remaining runtime limits.

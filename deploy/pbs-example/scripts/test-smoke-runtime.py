@@ -6,8 +6,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
+
+if not __debug__:
+    sys.exit("Run this check without python -O or PYTHONOPTIMIZE; assertions are required.")
 
 EXAMPLE = Path(__file__).resolve().parent.parent
 DOCKER = shutil.which("docker")
@@ -23,7 +27,7 @@ def render_production():
     )
     service = json.loads(result.stdout)["services"]["pbs"]
     port = service["ports"][0]
-    assert port.get("host_ip", "0.0.0.0") == "0.0.0.0", port
+    assert port["host_ip"] == "0.0.0.0", port
     assert port["published"] == "8000" and port["target"] == 8000, port
     assert service["env_file"][0]["path"] == "/run/pbs/secrets/examplebidder.env"
 

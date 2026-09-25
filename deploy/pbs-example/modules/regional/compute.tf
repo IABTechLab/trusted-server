@@ -1,3 +1,7 @@
+# No user_data by design. Host bootstrap, PBS YAML rendering, secret-file
+# materialization, and Compose startup require a separately approved runtime
+# loader. Applied hosts stay ALB-unhealthy until it runs. See ../../README.md,
+# "Stop boundary".
 resource "aws_instance" "pbs" {
   for_each = local.availability_zone_index
 

@@ -23,8 +23,8 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_pbs" {
   description                  = "Forward requests to private PBS hosts"
   security_group_id            = aws_security_group.alb.id
   referenced_security_group_id = aws_security_group.pbs.id
-  from_port                    = var.pbs_port
-  to_port                      = var.pbs_port
+  from_port                    = local.pbs_port
+  to_port                      = local.pbs_port
   ip_protocol                  = "tcp"
 }
 
@@ -35,8 +35,8 @@ resource "aws_security_group" "pbs" {
 
   ingress {
     description     = "PBS HTTP from the regional ALB"
-    from_port       = var.pbs_port
-    to_port         = var.pbs_port
+    from_port       = local.pbs_port
+    to_port         = local.pbs_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }

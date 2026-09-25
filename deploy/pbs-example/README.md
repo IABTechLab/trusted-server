@@ -23,14 +23,15 @@ Each region has two AZs, one EC2 host per AZ, a public ALB, and one NAT gateway 
 
 ## Safe local walkthrough
 
-These commands do not contact AWS:
+These commands do not contact AWS. They require the pinned Terraform and Rust toolchains, Python 3, and Docker with the Compose plugin. On Apple Silicon macOS, replace `cargo run_cli_linux` with `cargo run_cli_macos`. Other hosts can use `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --`.
 
 ```bash
 terraform fmt -check -recursive deploy/pbs-example
-terraform -chdir=deploy/pbs-example init -backend=false -input=false
+terraform -chdir=deploy/pbs-example init -backend=false -input=false -lockfile=readonly
 terraform -chdir=deploy/pbs-example validate
 terraform -chdir=deploy/pbs-example test -filter=tests/root_unit_test.tftest.hcl
-terraform -chdir=deploy/pbs-example/modules/regional init -backend=false -input=false
+terraform -chdir=deploy/pbs-example/modules/regional init -backend=false -input=false -lockfile=readonly
+terraform -chdir=deploy/pbs-example/modules/regional validate
 terraform -chdir=deploy/pbs-example/modules/regional test -filter=tests/security_unit_test.tftest.hcl
 cargo run_cli_linux prebid server check \
   --deployment deploy/pbs-example/deployment.example.yaml \
@@ -44,6 +45,8 @@ docker compose \
 bash -n deploy/pbs-example/scripts/smoke-runtime.sh
 deploy/pbs-example/scripts/test-smoke-runtime.py
 ```
+
+The `PBS example checks` GitHub Actions workflow runs Terraform formatting, both readonly-lock initializations, validation, and both mocked test suites. It also checks JSON, shell syntax, and Compose wiring. Changes to this example, `.tool-versions`, or the workflow trigger it. CI sets up Python 3.13 and checks Docker Compose availability. Run the wiring test without Python optimization, which disables assertions. The CLI descriptor command above is a separate local check; the example owner must rerun it when changing or adapting inputs.
 
 The Terraform tests use mocked AWS providers and explicit plan mode. The deployment descriptor and binding file contain fictional identifiers for local validation only. The wiring test renders Compose JSON and exercises the smoke script with fake lifecycle and health commands. It verifies the deployment all-interface binding, smoke-only loopback binding, and forced dummy input selectors without starting containers.
 

@@ -29,18 +29,12 @@ variable "instance_type" {
 }
 
 variable "name" {
-  description = "Stable name prefix for regional resources."
+  description = "Stable name prefix for regional resources, leaving room for the ALB and target-group suffixes."
   type        = string
-}
-
-variable "pbs_port" {
-  description = "Host port used by the PBS Compose service."
-  type        = number
-  default     = 8000
 
   validation {
-    condition     = var.pbs_port >= 1 && var.pbs_port <= 65535
-    error_message = "pbs_port must be a valid TCP port."
+    condition     = can(regex("^[a-zA-Z0-9]([a-zA-Z0-9-]{0,26}[a-zA-Z0-9])?$", var.name)) && !startswith(var.name, "internal-")
+    error_message = "name must be 1-28 alphanumeric/hyphen characters, must not start or end with a hyphen, and must not use the reserved ALB prefix internal-."
   }
 }
 

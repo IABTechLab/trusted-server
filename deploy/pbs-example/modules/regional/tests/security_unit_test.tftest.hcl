@@ -1,4 +1,8 @@
 mock_provider "aws" {
+  mock_data "aws_partition" {
+    defaults = { partition = "aws" }
+  }
+
   mock_resource "aws_instance" {
     defaults = {
       id = "i-0123456789abcdef0"
@@ -129,8 +133,8 @@ run "plans_private_hosts_and_scoped_ingress" {
       aws_vpc_security_group_egress_rule.alb_to_pbs.security_group_id == aws_security_group.alb.id &&
       aws_vpc_security_group_egress_rule.alb_to_pbs.referenced_security_group_id == aws_security_group.pbs.id &&
       aws_vpc_security_group_egress_rule.alb_to_pbs.ip_protocol == "tcp" &&
-      aws_vpc_security_group_egress_rule.alb_to_pbs.from_port == var.pbs_port &&
-      aws_vpc_security_group_egress_rule.alb_to_pbs.to_port == var.pbs_port &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.from_port == 8000 &&
+      aws_vpc_security_group_egress_rule.alb_to_pbs.to_port == 8000 &&
       aws_vpc_security_group_egress_rule.alb_to_pbs.cidr_ipv4 == null &&
       aws_vpc_security_group_egress_rule.alb_to_pbs.cidr_ipv6 == null &&
       aws_vpc_security_group_egress_rule.alb_to_pbs.prefix_list_id == null
@@ -154,6 +158,20 @@ run "plans_private_hosts_and_scoped_ingress" {
   }
 
   assert {
+    condition = (
+      aws_lb_target_group.pbs.port == 8000 &&
+      alltrue([for attachment in aws_lb_target_group_attachment.pbs : attachment.port == 8000]) &&
+      alltrue([for rule in aws_security_group.pbs.ingress : rule.from_port == 8000 && rule.to_port == 8000])
+    )
+    error_message = "ALB targets and PBS ingress must match the runtime's fixed port 8000."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy_attachment.ssm.policy_arn == "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    error_message = "Commercial-region hosts should attach the commercial SSM managed policy."
+  }
+
+  assert {
     condition     = length(aws_secretsmanager_secret.bidder) == 1
     error_message = "The example should create metadata for only the declared example bidder secret."
   }
@@ -169,6 +187,76 @@ run "plans_private_hosts_and_scoped_ingress" {
   assert {
     condition     = length(jsondecode(aws_iam_role_policy.runtime.policy).Statement[0].Resource) == length(aws_secretsmanager_secret.bidder)
     error_message = "The runtime role should read only the declared bidder secrets."
+  }
+}
+
+run "rejects_overlong_resource_names" {
+  command = plan
+
+  variables {
+    name = "abcdefghijklmnopqrstuvwxyzabc"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_invalid_resource_names" {
+  command = plan
+
+  variables {
+    name = "-pbs-example"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_reserved_alb_prefix" {
+  command = plan
+
+  variables {
+    name = "internal-pbs"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "accepts_maximum_resource_name" {
+  command = plan
+
+  variables {
+    name = "abcdefghijklmnopqrstuvwxyzab"
+  }
+
+  assert {
+    condition     = aws_lb.main.name == "${var.name}-alb" && aws_lb_target_group.pbs.name == "${var.name}-pbs"
+    error_message = "Names should preserve the full prefix and resource suffix."
+  }
+}
+
+run "accepts_single_character_resource_name" {
+  command = plan
+
+  variables {
+    name = "a"
+  }
+
+  assert {
+    condition     = aws_lb.main.name == "a-alb" && aws_lb_target_group.pbs.name == "a-pbs"
+    error_message = "A single alphanumeric character is a valid name prefix."
+  }
+}
+
+run "uses_current_partition_for_ssm_policy" {
+  command = plan
+
+  override_data {
+    target = data.aws_partition.current
+    values = { partition = "aws-us-gov" }
+  }
+
+  assert {
+    condition     = aws_iam_role_policy_attachment.ssm.policy_arn == "arn:aws-us-gov:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    error_message = "The SSM managed policy ARN should follow the provider's AWS partition."
   }
 }
 

@@ -1,5 +1,5 @@
 resource "aws_lb" "main" {
-  name                       = substr("${var.name}-alb", 0, 32)
+  name                       = "${var.name}-alb"
   internal                   = false
   load_balancer_type         = "application"
   security_groups            = [aws_security_group.alb.id]
@@ -13,8 +13,8 @@ resource "aws_lb" "main" {
 }
 
 resource "aws_lb_target_group" "pbs" {
-  name                 = substr("${var.name}-pbs", 0, 32)
-  port                 = var.pbs_port
+  name                 = "${var.name}-pbs"
+  port                 = local.pbs_port
   protocol             = "HTTP"
   target_type          = "instance"
   vpc_id               = aws_vpc.main.id
@@ -42,7 +42,7 @@ resource "aws_lb_target_group_attachment" "pbs" {
 
   target_group_arn = aws_lb_target_group.pbs.arn
   target_id        = each.value.id
-  port             = var.pbs_port
+  port             = local.pbs_port
 }
 
 resource "aws_lb_listener" "https" {

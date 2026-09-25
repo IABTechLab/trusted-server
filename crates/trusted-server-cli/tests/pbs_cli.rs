@@ -32,6 +32,8 @@ with (root / 'calls').open('a') as log:
     log.write(json.dumps(args) + '\n')
 assert '--profile' in args and args[args.index('--profile')+1] == 'pbs-sandbox'
 if 'configure' in args:
+    if os.environ.get('PBS_FAKE_HISTORY') == 'unset':
+        sys.exit(1)
     if os.environ.get('PBS_FAKE_HISTORY') == 'enabled':
         print('enabled')
     else:
@@ -177,6 +179,49 @@ fn local_commands_never_execute_aws_and_preserve_the_source() {
 }
 
 #[test]
+fn deeply_nested_yaml_is_rejected_without_aborting_or_echoing_input() {
+    let flow_sequence = format!(
+        "nested: {}NEVER_PRINT_ME{}",
+        "[".repeat(1000),
+        "]".repeat(1000)
+    );
+    let flow_mapping = format!(
+        "{}\"NEVER_PRINT_ME\"{}",
+        "{\"nested\":".repeat(1000),
+        "}".repeat(1000)
+    );
+    let mut block_mapping = (0..256)
+        .map(|depth| format!("{}nested:\n", "  ".repeat(depth)))
+        .collect::<String>();
+    block_mapping.push_str(&format!("{}value: NEVER_PRINT_ME\n", "  ".repeat(256)));
+    for yaml in [flow_sequence, flow_mapping, block_mapping] {
+        let dir = fixture();
+        fs::write(dir.path().join("pbs.yaml"), yaml).expect("should write nested input");
+        let output = command(dir.path())
+            .args([
+                "prebid",
+                "server",
+                "check",
+                "--deployment",
+                "deployment.yaml",
+                "--json",
+            ])
+            .output()
+            .expect("should run CLI");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "should reject input without a signal"
+        );
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cannot parse YAML/JSON input; source details withheld"));
+        assert!(!stderr.contains("NEVER_PRINT_ME"));
+        assert!(!dir.path().join("calls").exists(), "should not call AWS");
+    }
+}
+
+#[test]
 fn missing_descriptor_inputs_report_escaped_paths() {
     for missing in ["deployment.yaml", "pbs.yaml", "bindings.json", "east.yaml"] {
         let dir = fixture();
@@ -284,6 +329,49 @@ fn secret_payload_is_private_not_in_argv_and_deleted_after_use() {
     assert_eq!(
         fs::read_to_string(dir.path().join("secret.json")).expect("should preserve input"),
         input
+    );
+    assert_payload_cleanup(dir.path());
+}
+
+#[test]
+fn unset_cli_history_allows_write_after_both_history_probes() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join("secret.json"),
+        "{\"api_key\":\"DUMMY_SECRET\"}",
+    )
+    .expect("should write dummy credential");
+    let output = secret_command(dir.path())
+        .env("PBS_FAKE_HISTORY", "unset")
+        .output()
+        .expect("should run CLI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_secret(&output);
+    let calls = fs::read_to_string(dir.path().join("calls")).expect("should read calls");
+    let calls = calls
+        .lines()
+        .map(|line| serde_json::from_str::<Vec<String>>(line).expect("should parse arguments"))
+        .collect::<Vec<_>>();
+    let probes = calls
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg == "configure"))
+        .map(|args| {
+            args.last()
+                .expect("should have a configuration key")
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(probes, ["cli_history", "default.cli_history"]);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|args| args.iter().any(|arg| arg == "put-secret-value"))
+            .count(),
+        1
     );
     assert_payload_cleanup(dir.path());
 }

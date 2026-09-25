@@ -83,6 +83,7 @@ A controlled load test must measure CPU, memory, connection reuse, outbound band
 - The example uses a fictional bidder binding. The adapter name, credential keys, source authorization, and PBS mapping must be replaced and verified against v4.7.0 before use.
 - A Secrets Manager write does not refresh a running Compose container. The deferred runtime implementation must retrieve a selected version, render an environment file atomically, replace the consumer, and verify health before retiring the old version.
 - Customer-managed KMS keys are regional inputs. East and West accept separate ARNs; null uses each region's Secrets Manager service key.
+- The regional module fixes the PBS host port at `8000`, matching `runtime/compose.yaml` and `runtime/pbs.yaml`. A port change requires coordinated Terraform and runtime edits; it is not a deployment input.
 - The committed descriptor and binding files are fictional local fixtures. After an authorized apply, Terraform renders ignored operator files containing the actual instance IDs and secret ARNs.
 
 ## Deferred security and observability decisions
@@ -99,6 +100,8 @@ No price estimate is claimed. The main drivers are four EC2 instances, four NAT 
 
 ## Generated files and checks
 
+The `PBS example checks` workflow runs Terraform format/validate and both mocked suites, JSON parsing, shell syntax, and Compose wiring checks on changes to this directory, `.tool-versions`, or the workflow. Both provider locks are checked without updates. CI requires Python 3.13 and Docker Compose, but no AWS credentials or container startup. The example maintainer owns these checks. The runtime owner must still run the CLI descriptor check when adapting inputs and obtain separate approval for the real startup smoke and cloud verification. A green mock suite is not deployment evidence.
+
 | Path                                                 | Consumer                          | Local check                                                                                                                                                              |
 | ---------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `README.md`                                          | Example user                      | Safe walkthrough and stop boundary review                                                                                                                                |
@@ -106,6 +109,9 @@ No price estimate is claimed. The main drivers are four EC2 instances, four NAT 
 | `main.tf`, `modules/regional/`                       | Terraform                         | Mocked plan tests for topology, provider mappings, IMDSv2, encrypted root volumes, private subnet/AZ placement, TLS policy, scoped ALB ingress/egress, and secret access |
 | `runtime/pbs.yaml`, `runtime/regions/`               | PBS release process and CLI check | YAML parse and `ts prebid server check`                                                                                                                                  |
 | `runtime/compose.yaml`                               | Deferred EC2 runtime owner        | Compose rendering and fake-command smoke wiring; separately approved pinned-image startup smoke                                                                          |
+| `scripts/smoke-runtime.sh`                           | Runtime owner                     | CI shell syntax and fake-command wiring; real startup smoke requires separate authorization                                                                              |
+| `scripts/test-smoke-runtime.py`                      | Example maintainer                | CI Python 3.13 and Docker Compose rendering; no image pull or containers                                                                                                 |
+| Root and regional `.terraform.lock.hcl`              | Example maintainer                | Readonly initialization and tests; regenerate both locks for the four supported platforms on provider upgrades                                                           |
 | `runtime/secret-bindings.example.json`               | Existing PBS CLI                  | JSON parse and fictional deployment check                                                                                                                                |
 | `deployment.example.yaml`                            | Existing PBS CLI                  | Fictional local `ts prebid server check` only                                                                                                                            |
 | Terraform-rendered generated descriptor and bindings | Authorized operator               | Review actual IDs, then CLI check and status                                                                                                                             |
