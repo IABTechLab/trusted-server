@@ -12837,18 +12837,23 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 {
-                    let consent = if withdrawn {
-                        ConsentContext {
-                            jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
-                                "CA".to_owned(),
-                            ),
-                            gpc: true,
-                            ..Default::default()
-                        }
+                    // A US-style opt-out suppresses use without expiring the
+                    // cookie, so the destructive path this test is about needs
+                    // a request that withdrew device storage outright.
+                    let mut ec_context = if withdrawn {
+                        EcContext::new_for_test_withdrawn(
+                            Some(identity.clone()),
+                            ConsentContext {
+                                jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
+                                    "CA".to_owned(),
+                                ),
+                                gpc: true,
+                                ..Default::default()
+                            },
+                        )
                     } else {
-                        scheduling_consent()
+                        EcContext::new_for_test(Some(identity.clone()), scheduling_consent())
                     };
-                    let mut ec_context = EcContext::new_for_test(Some(identity.clone()), consent);
                     assert_eq!(
                         ec_context.ec_allowed(),
                         !withdrawn,
