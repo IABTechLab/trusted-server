@@ -13,6 +13,7 @@ import { log } from './log';
 import { setConfig, getConfig } from './config';
 import { requestAds } from './request';
 import { installQueue } from './queue';
+import { installPermissions } from './permissions';
 
 const VERSION = '0.1.0';
 
@@ -42,6 +43,10 @@ api.requestAds = requestAds;
 // instead of throwing. Injected scripts overwrite these wholesale.
 api.adSlots ??= [];
 api.bids ??= {};
+// The edge also injects the request's resolved permission state, either at head
+// open (inline mode) or at the </body> seam (shared-template mode). An accessor
+// observes the seam's plain assignment so page code can await it either way.
+installPermissions(api);
 // Point global tsjs
 w.tsjs = api;
 
@@ -68,5 +73,6 @@ log.info('tsjs initialized', {
     'addAdUnits',
     'renderAdUnit',
     'renderAllAdUnits',
+    'whenPermissions',
   ],
 });
