@@ -14,6 +14,7 @@ use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -28,6 +29,7 @@ use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::version_header::git_version_header_value;
 
 mod app;
 mod backend;
@@ -64,7 +66,12 @@ fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandl
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
-        return Some(FastlyResponse::from_status(200).with_body_text_plain("ok"));
+        let mut response = FastlyResponse::from_status(200).with_body_text_plain("ok");
+        // Compiled-in constant: keeps the probe free of settings and app construction.
+        if let Some(version) = git_version_header_value() {
+            response.set_header(HEADER_X_TS_VERSION, version);
+        }
+        return Some(response);
     }
 
     None
@@ -555,6 +562,23 @@ mod tests {
             response.take_body_str(),
             "ok",
             "should return the health body"
+        );
+    }
+
+    #[test]
+    fn health_response_reports_git_version_only() {
+        let req = FastlyRequest::get("https://example.com/health");
+
+        let response = health_response(&req).expect("should build health response");
+
+        assert_eq!(
+            response.get_header_str("x-ts-version"),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should report the compiled-in git version on /health"
+        );
+        assert!(
+            response.get_header("x-ts-fastly-version").is_none(),
+            "should keep x-ts-fastly-version off the /health fast path"
         );
     }
 
