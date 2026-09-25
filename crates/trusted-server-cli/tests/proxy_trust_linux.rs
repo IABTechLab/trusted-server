@@ -50,12 +50,12 @@ impl Fixture {
         assert!(out.status.success(), "{out:?}");
     }
 
-    fn export_certificate(&self, nickname: &str) -> Vec<u8> {
+    fn inspect_certificate(&self, nickname: &str) -> Vec<u8> {
         let out = Command::new("certutil")
-            .args(["-L", "-n", nickname, "-r", "-d"])
+            .args(["-L", "-n", nickname, "-d"])
             .arg(format!("sql:{}", self.db().display()))
             .output()
-            .expect("should export fixture certificate");
+            .expect("should inspect fixture certificate and trust flags");
         assert!(out.status.success(), "{out:?}");
         out.stdout
     }
@@ -113,7 +113,7 @@ impl Fixture {
         bin
     }
 
-    fn assert_rotation_fails_unchanged(&self, path: &Path) {
+    fn assert_rotation_fails_unchanged(&self, path: &Path) -> Output {
         let key = fs::read(self.ca().join("ca-key.pem")).expect("should read key");
         let cert = fs::read(self.ca().join("ca-cert.pem")).expect("should read cert");
         let record = fs::read(self.journal()).expect("should read journal");
@@ -135,6 +135,7 @@ impl Fixture {
             record,
             fs::read(self.journal()).expect("should retain journal")
         );
+        out
     }
 }
 
@@ -575,14 +576,14 @@ fn real_nss_preflight_preserves_leaf_intermediate_and_multicert_exports() {
 
 fn assert_foreign_nickname_does_not_block_lifecycle(fixture: &Fixture, nickname: &str) {
     fixture.import_certificate(nickname, &fixture.unrelated_certificate());
-    let unrelated = fixture.export_certificate(nickname);
+    let unrelated = fixture.inspect_certificate(nickname);
     for action in ["install", "install", "uninstall", "uninstall", "install"] {
         let out = fixture.run(action);
         assert!(
             out.status.success(),
             "nickname={nickname:?}; {action}: {out:?}"
         );
-        assert_eq!(fixture.export_certificate(nickname), unrelated);
+        assert_eq!(fixture.inspect_certificate(nickname), unrelated);
     }
     let key = fs::read(fixture.ca().join("ca-key.pem")).expect("should read original key");
     let out = fixture.run("regenerate");
@@ -594,7 +595,7 @@ fn assert_foreign_nickname_does_not_block_lifecycle(fixture: &Fixture, nickname:
         fs::read(fixture.ca().join("ca-key.pem")).expect("should read rotated key"),
         key
     );
-    assert_eq!(fixture.export_certificate(nickname), unrelated);
+    assert_eq!(fixture.inspect_certificate(nickname), unrelated);
     assert_eq!(
         fs::read_to_string(fixture.journal()).expect("should read cleared journal"),
         "[]"
@@ -646,8 +647,8 @@ fn real_nss_trailing_space_alias_cannot_hide_same_subject_conflict() {
     let conflicting_nickname = "Foreign example.com CA ";
     first.import_certificate(nickname, &first.unrelated_certificate());
     first.import_certificate(conflicting_nickname, &first.ca().join("ca-cert.pem"));
-    let unrelated = first.export_certificate(nickname);
-    let conflicting = first.export_certificate(conflicting_nickname);
+    let unrelated = first.inspect_certificate(nickname);
+    let conflicting = first.inspect_certificate(conflicting_nickname);
     let before = fs::read(first.db().join("cert9.db")).expect("should snapshot NSS database");
     let out = second
         .command("install")
@@ -665,8 +666,8 @@ fn real_nss_trailing_space_alias_cannot_hide_same_subject_conflict() {
         "{out:?}"
     );
     assert!(!second.journal().exists());
-    assert_eq!(first.export_certificate(nickname), unrelated);
-    assert_eq!(first.export_certificate(conflicting_nickname), conflicting);
+    assert_eq!(first.inspect_certificate(nickname), unrelated);
+    assert_eq!(first.inspect_certificate(conflicting_nickname), conflicting);
 }
 
 #[test]
@@ -681,18 +682,30 @@ fn real_nss_ambiguous_managed_nickname_preserves_material_and_trust() {
         fixture.record();
         fixture.initialize_nss();
         fixture.import_certificate(&foreign, &fixture.unrelated_certificate());
-        let before = fs::read(fixture.db().join("cert9.db")).expect("should snapshot NSS database");
+        let foreign_before = fixture.inspect_certificate(&foreign);
+        let database_before =
+            fs::read(fixture.db().join("cert9.db")).expect("should snapshot NSS database");
         let tool = which::which("certutil").expect("should have NSS tools");
         // Display padding or embedded newlines can imitate an actual managed row.
         // A failed exact lookup must not authorize deletion or rotation.
-        fixture.assert_rotation_fails_unchanged(tool.parent().expect("should have tool directory"));
+        let out = fixture
+            .assert_rotation_fails_unchanged(tool.parent().expect("should have tool directory"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("PR_FILE_NOT_FOUND_ERROR"),
+            "{foreign:?}; regenerate: {out:?}"
+        );
         for action in ["install", "uninstall"] {
             let out = fixture.run(action);
             assert!(!out.status.success(), "{foreign:?}; {action}: {out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("PR_FILE_NOT_FOUND_ERROR"),
+                "{foreign:?}; {action}: {out:?}"
+            );
         }
-        assert!(
-            fs::read(fixture.db().join("cert9.db")).expect("should read unchanged NSS database")
-                == before
+        assert_eq!(fixture.inspect_certificate(&foreign), foreign_before);
+        assert_eq!(
+            fs::read(fixture.db().join("cert9.db")).expect("should read unchanged NSS database"),
+            database_before
         );
     }
 }
