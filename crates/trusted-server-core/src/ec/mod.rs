@@ -1104,6 +1104,21 @@ impl EcContext {
         }
     }
 
+    /// Creates a test-only `EcContext` whose request explicitly withdrew
+    /// device storage, rather than merely not setting it.
+    ///
+    /// Withdrawal is destructive, expiring the browser cookie, where
+    /// suppression is not, so a test of the destructive path has to say which
+    /// of the two it means. [`new_for_test_gated`](Self::new_for_test_gated)
+    /// with `false` gives suppression.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_for_test_withdrawn(ec_value: Option<String>, consent: ConsentContext) -> Self {
+        let mut context = Self::new_for_test_gated(ec_value, consent, false);
+        context.permissions = PermissionState::default().with_storage_withdrawn(true);
+        context
+    }
+
     /// Creates a test-only [`EcContext`] with explicit client IP.
     #[cfg(test)]
     #[must_use]
