@@ -68,7 +68,7 @@ Fermyon Spin adapter (`wasm32-wasip1` component):
 - Production-capable deployment target for the Spin runtime
 - Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
 - Outbound HTTP via `spin_sdk::http::send` — no configurable per-request timeout (see rustdoc)
-- Single auction provider only; multi-provider fan-out requires the Fastly adapter
+- Single auction provider only; enabled multi-provider plans fail target validation at startup
 
 ```bash
 # Check (native)
@@ -90,22 +90,30 @@ cargo clippy-spin-wasm
 
 ## Design Patterns
 
-### RequestWrapper Trait
+### Platform services
 
-Abstracts HTTP request handling to support different backends:
+Core request and response values use the standard `http` types with
+`edgezero_core::body::Body`. Runtime-specific capabilities are supplied through
+`RuntimeServices`, which holds trait objects for configuration and secret
+stores, KV access, dynamic backends, outbound HTTP, geographic lookup, template
+assembly, and template caching.
 
-```rust
-// Placeholder example
-pub trait RequestWrapper {
-    fn get_header(&self, name: &str) -> Option<String>;
-    fn get_cookie(&self, name: &str) -> Option<String>;
-    // ...
-}
-```
+The contracts live under `trusted_server_core::platform`, including
+`PlatformConfigStore`, `PlatformSecretStore`, `PlatformBackend`,
+`PlatformHttpClient`, `PlatformGeo`, `PlatformTemplateAssembler`, and
+`PlatformTemplateCache`. Each adapter constructs the services it supports;
+unavailable capabilities fail through explicit unavailable implementations.
 
 ### Settings-Driven Configuration
 
 External configuration via `trusted-server.toml` allows deployment-time customization without code changes.
+
+Server-side auctions are configuration-first. `[auction.providers.<id>]` declares
+provider instances and `[auction.bidders.<id>]` maps browser-visible bidders to
+exactly one provider. Startup compiles these maps into one immutable
+`AuctionPlan` shared by orchestration and integration registration. Provider IDs
+remain distinct from upstream returned seats and browser delivery bidder codes.
+The optional mediator is selected separately by `[auction].mediator`.
 
 ### Consent-Aware Design
 
@@ -159,6 +167,12 @@ Page content and request bodies are processed in-flight and are not persisted. E
 | `trusted-server-adapter-axum`       | native                    | Local development and integration testing (see limitations above) |
 
 The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-matched clippy aliases (`cargo clippy-fastly`, `cargo clippy-spin-native`, etc.) rather than broad `--all-features` workspace clippy — the latter is not a reliable gate across adapters.
+
+Fastly and Axum support concurrent auction provider fan-out. Cloudflare and Spin
+currently accept at most one provider in an enabled auction. Every adapter runs
+target-aware fan-out and backend-name checks at startup. No current adapter
+claims an abortable provider-wide total-request deadline, so configured auction
+and provider timeouts are logical budgets rather than hard wall-clock ceilings.
 
 ## Next Steps
 

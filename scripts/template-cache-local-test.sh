@@ -24,6 +24,7 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
+BID_PORT="${BID_PORT:-9100}"
 TS_PORT="${TS_PORT:-7788}"
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
@@ -31,6 +32,7 @@ HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 # observable in the timings: with an instant auction, buffered and streaming
 # assembly are indistinguishable.
 BID_DELAY="${BID_DELAY:-1.5}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-30}"
 
 PASS=0
 FAIL=0
@@ -45,8 +47,16 @@ check() { # check <description> <actual> <expected>
 
 cleanup() {
   local status=$?
-  [ -n "${VICEROY_PID:-}" ] && kill "$VICEROY_PID" 2>/dev/null || true
-  [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
+  if [ -n "${VICEROY_PID:-}" ]; then
+    kill "$VICEROY_PID" 2>/dev/null || true
+    wait "$VICEROY_PID" 2>/dev/null || true
+  fi
+  if [ -n "${ORIGIN_PID:-}" ]; then
+    # macOS may launch the framework Python process as a child of the shim.
+    pkill -TERM -P "$ORIGIN_PID" 2>/dev/null || true
+    kill "$ORIGIN_PID" 2>/dev/null || true
+    wait "$ORIGIN_PID" 2>/dev/null || true
+  fi
   rm -rf "$WORK"
   exit $status
 }
@@ -60,13 +70,17 @@ command -v node >/dev/null || {
   echo "node not found. The harness executes the real GPT bundle to verify slot setup." >&2
   exit 1
 }
+command -v openssl >/dev/null || {
+  echo "openssl not found. The harness needs it for the local HTTPS bid endpoint." >&2
+  exit 1
+}
 
 # A port already in use means requests would go to something else entirely — most
 # likely a leftover run, whose warm cache and stale config would read as a result.
-for port in "$ORIGIN_PORT" "$TS_PORT"; do
+for port in "$ORIGIN_PORT" "$BID_PORT" "$TS_PORT"; do
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "Port $port is already in use. Stop the process, or set" >&2
-    echo "ORIGIN_PORT / TS_PORT to something free." >&2
+    echo "ORIGIN_PORT / BID_PORT / TS_PORT to something free." >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
     exit 1
   fi
@@ -78,19 +92,35 @@ cargo build -p trusted-server-cli --target "$HOST_TRIPLE" >/dev/null
 WASM="$REPO_ROOT/target/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm"
 TS="$REPO_ROOT/target/$HOST_TRIPLE/debug/ts"
 
-info "Starting stub origin on :$ORIGIN_PORT"
+info "Generating a local CA and HTTPS bid certificate"
+openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+  -subj "/CN=Trusted Server local harness CA" \
+  -keyout "$WORK/ca-key.pem" -out "$WORK/ca-cert.pem" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -sha256 -nodes -subj "/CN=localhost" \
+  -keyout "$WORK/server-key.pem" -out "$WORK/server.csr" >/dev/null 2>&1
+cat > "$WORK/server.ext" <<'EOF'
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+EOF
+openssl x509 -req -sha256 -days 1 -in "$WORK/server.csr" \
+  -CA "$WORK/ca-cert.pem" -CAkey "$WORK/ca-key.pem" -CAcreateserial \
+  -extfile "$WORK/server.ext" -out "$WORK/server-cert.pem" >/dev/null 2>&1
+
+info "Starting stub origin on :$ORIGIN_PORT and HTTPS bidder on :$BID_PORT"
 cat > "$WORK/origin.py" <<PYEOF
-"""Stub publisher origin: one shareable page, plus a deliberately slow bid endpoint.
+"""Stub publisher origin and deliberately slow HTTPS bid endpoint.
 
 The page uses the real Fastly policy that exposed #1009's response-side bypass: no
 Set-Cookie, a public Cache-Control, Surrogate-Control with stale windows, and a Vary the
 cache key covers. A bypass therefore means a real bug rather than a fixture problem.
 
 The bid endpoint returns a real winning bid. It used to return an empty seatbid, which made
-every assertion below measure a page with no ads on it — and that is how a seam that
-silently discarded every non-empty bid map passed this harness for weeks.
+every assertion below measure a page with no ads on it. That is how a seam that silently
+discarded every non-empty bid map passed this harness for weeks.
 """
-import gzip, json, time
+import gzip, json, ssl, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The impid must be the configured slot id: that is what the auction request sends and
@@ -149,13 +179,29 @@ class H(BaseHTTPRequestHandler):
             ("Surrogate-Control", "max-age=1200, stale-while-revalidate=21600, stale-if-error=604800"),
             ("Vary", "Accept-Encoding"),
         ]
+        page = PAGE
+        if self.path.startswith("/article/cookie-policy"):
+            # Model a downstream CDN selecting HTML after TS has selected its key.
+            # Clients deliberately send no X-Exp-Variant header.
+            assert self.headers.get("X-Exp-Variant") is None
+            cookies = {}
+            for field in self.headers.get_all("Cookie", []):
+                for pair in field.split(";"):
+                    name, separator, value = pair.strip().partition("=")
+                    if separator:
+                        cookies[name] = value
+            variant = cookies.get("ab_bucket", "absent") or "empty"
+            session = "session" in cookies
+            marker = f"<p>variant={variant};session={str(session).lower()}</p>"
+            page = PAGE.replace(b"<p>Body copy.</p>", marker.encode())
+            base.append(("Vary", "X-Exp-Variant"))
         if "gzip" in (self.headers.get("Accept-Encoding") or ""):
             print("origin: served COMPRESSED", flush=True)
-            self._send(gzip.compress(PAGE), "text/html; charset=utf-8",
+            self._send(gzip.compress(page), "text/html; charset=utf-8",
                        base + [("Content-Encoding", "gzip")])
         else:
             print("origin: served PLAINTEXT", flush=True)
-            self._send(PAGE, "text/html; charset=utf-8", base)
+            self._send(page, "text/html; charset=utf-8", base)
 
     def do_POST(self):
         print(f"origin: received POST {self.path}", flush=True)
@@ -168,48 +214,106 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("origin: " + fmt % args, flush=True)
 
-ThreadingHTTPServer(("127.0.0.1", $ORIGIN_PORT), H).serve_forever()
+
+class BidH(H):
+    def do_GET(self):
+        print(f"bidder: received health check {self.path}", flush=True)
+        self._send(b"ok", "text/plain")
+
+
+origin = ThreadingHTTPServer(("127.0.0.1", $ORIGIN_PORT), H)
+threading.Thread(target=origin.serve_forever, daemon=True).start()
+
+bidder = ThreadingHTTPServer(("127.0.0.1", $BID_PORT), BidH)
+tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls.load_cert_chain("$WORK/server-cert.pem", "$WORK/server-key.pem")
+bidder.socket = tls.wrap_socket(bidder.socket, server_side=True)
+bidder.serve_forever()
 PYEOF
 python3 "$WORK/origin.py" > "$WORK/origin.log" 2>&1 &
 ORIGIN_PID=$!
 sleep 1
 
 info "Generating stub config (mode: $MODE)"
-python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" "$ORIGIN_PORT" <<'PYEOF'
-import sys, re
-src, out, mode, port = sys.argv[1:5]
+python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" \
+  "$ORIGIN_PORT" "$BID_PORT" <<'PYEOF'
+import sys
+
+src, out, mode, origin_port, bid_port = sys.argv[1:6]
 s = open(src).read()
 
-s = s.replace('origin_url = "https://origin.example.com"', f'origin_url = "http://127.0.0.1:{port}"', 1)
-# The example config ships placeholders that validation rejects outright,
-# including the reserved publisher domain/cookie_domain.
-s = s.replace('domain = "example.com"', 'domain = "local-harness.example"', 1)
-s = s.replace('cookie_domain = ".example.com"', 'cookie_domain = ".local-harness.example"', 1)
-s = s.replace('password = "replace-with-admin-password-32-bytes"',
-              'password = "local-harness-admin-password-not-a-real-one"', 1)
-s = s.replace('proxy_secret = "change-me-proxy-secret"',
-              'proxy_secret = "local-harness-proxy-secret-not-a-real-one"', 1)
-s = re.sub(r'passphrase = "[^"]*"',
-           'passphrase = "local-harness-ec-passphrase-not-a-real-one"', s, count=1)
+def replace_once(content, old, new, description):
+    if content.count(old) != 1:
+        raise SystemExit(f"expected one {description} replacement target")
+    return content.replace(old, new, 1)
 
-# A real auction, pointed at the stub's slow endpoint, so the timings mean something.
-s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://prebid.example.com/openrtb2/auction"',
-              f'[integrations.prebid]\nenabled = true\nserver_url = "http://127.0.0.1:{port}/bid"\n'
-              'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"', 1)
-s = s.replace('providers = []', 'providers = ["prebid"]', 1)
-s = s.replace('\n[proxy]\n', '\n[proxy]\nallowed_domains = ["assets.example.com", "127.0.0.1"]\n', 1)
-s = s.replace('[auction]\nenabled = false', '[auction]\nenabled = true', 1)
-s = s.replace('auction_timeout_ms = 500', 'auction_timeout_ms = 5000', 1)
-# Both the overall auction and provider transport budgets must exceed the
-# harness's deliberate three-second bid delay.
-s = s.replace('timeout_ms = 2000', 'timeout_ms = 5000', 1)
-s = s.replace('timeout_ms = 1000', 'timeout_ms = 5000', 1)
+
+s = replace_once(
+    s,
+    'origin_url = "https://origin.example.com"',
+    f'origin_url = "http://127.0.0.1:{origin_port}"',
+    "publisher origin",
+)
+s = replace_once(
+    s,
+    'domain = "example.com"',
+    'domain = "local-harness.example"',
+    "publisher domain",
+)
+s = replace_once(
+    s,
+    'cookie_domain = ".example.com"',
+    'cookie_domain = ".local-harness.example"',
+    "publisher cookie domain",
+)
+# A real auction points at the slow HTTPS stub so the timings mean something.
+s = replace_once(
+    s,
+    '[integrations.prebid]\nenabled = false',
+    '[integrations.prebid]\nenabled = true\n'
+    'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"',
+    "Prebid integration",
+)
+s = replace_once(
+    s,
+    'endpoint = "https://prebid.example.com/openrtb2/auction"',
+    f'endpoint = "https://localhost:{bid_port}/bid"\ntimeout_ms = 5000',
+    "Prebid provider endpoint",
+)
+s = replace_once(
+    s,
+    '\n[proxy]\n',
+    '\n[proxy]\nallowed_domains = ["assets.example.com", "127.0.0.1"]\n',
+    "proxy table",
+)
+s = replace_once(
+    s,
+    '[auction]\n# Keep disabled until provider endpoints, routes, and profile values below are\n'
+    '# replaced with deployment-specific settings.\nenabled = false',
+    '[auction]\n# Keep disabled until provider endpoints, routes, and profile values below are\n'
+    '# replaced with deployment-specific settings.\nenabled = true',
+    "auction enablement",
+)
+s = replace_once(
+    s,
+    'sanitize_creatives = false\ntimeout_ms = 2000',
+    'sanitize_creatives = false\ntimeout_ms = 10000',
+    "auction timeout",
+)
+s = replace_once(
+    s,
+    'auction_timeout_ms = 500',
+    'auction_timeout_ms = 10000',
+    "creative opportunity auction timeout",
+)
 
 # The template-cache keys go directly under the table header. The slot is a table of its own
 # and must go at the end: inserted here it would swallow every scalar key that
 # follows into `[[creative_opportunities.slot]]`.
 scalars = f'''assembly_mode = "{mode}"
-template_cache_vary = []
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
 origin_is_cookie_independent = true'''
 lines = s.split("\n")
 lines.insert(lines.index("[creative_opportunities]") + 1, scalars)
@@ -217,7 +321,7 @@ lines.append('''
 [[creative_opportunities.slot]]
 id = "ts-slot-header"
 div_id = "ts-slot-header"
-page_patterns = ["/article"]
+page_patterns = ["/article", "/article/cookie-policy*"]
 formats = [{ width = 728, height = 90 }]
 ''')
 open(out, "w").write("\n".join(lines))
@@ -233,6 +337,70 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
+
+# The application registers provider backends dynamically. Pre-register the exact
+# deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
+python3 - "$WORK/fastly.toml" "$WORK/ca-cert.pem" "$BID_PORT" <<'PYEOF'
+import hashlib
+import json
+import sys
+
+manifest, ca_certificate, port = sys.argv[1:4]
+provider_id = "pbs-main"
+timeout_ms = "5000"
+
+
+def field(value):
+    return f"{len(value)}:{value}"
+
+
+canonical = "".join([
+    field("https"),
+    field("localhost"),
+    field(port),
+    field("1"),
+    "n",
+    "s",
+    field(provider_id),
+    field(timeout_ms),
+    field(timeout_ms),
+])
+digest = hashlib.sha256(canonical.encode()).hexdigest()[:32]
+readable = f"https_localhost_{port}_p_{provider_id}_fb{timeout_ms}_bb{timeout_ms}"
+backend_name = f"backend_{readable}_{digest}"
+backend = f'''[local_server.backends.{backend_name}]
+url = "https://localhost:{port}"
+cert_host = "localhost"
+ca_certificate.file = {json.dumps(ca_certificate)}
+'''
+
+content = open(manifest).read()
+marker = "[local_server.backends]\n\n"
+if content.count(marker) != 1:
+    raise SystemExit("expected one local backend insertion target")
+content = content.replace(marker, f"{marker}{backend}\n", 1)
+open(manifest, "w").write(content)
+PYEOF
+
+python3 - "$WORK/fastly.toml" <<'PYEOF'
+import sys
+
+with open(sys.argv[1], "a") as manifest:
+    manifest.write('''
+[[local_server.secret_stores.ts_secrets]]
+key = "publisher_proxy_secret"
+data = "fictional-local-publisher-proxy-secret-value"
+
+[[local_server.secret_stores.ts_secrets]]
+key = "ec_passphrase"
+data = "fictional-local-ec-passphrase-secret-value"
+
+[[local_server.secret_stores.ts_secrets]]
+key = "handler_password"
+data = "fictional-local-handler-password-secret-value"
+''')
+PYEOF
+
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
@@ -259,7 +427,7 @@ fi
 
 req() { # req <output-file> [extra curl args...]
   local out="$1"; shift
-  curl -sS -D "$out.headers" -o "$out" \
+  curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -D "$out.headers" -o "$out" \
     -w '%{time_starttransfer} %{time_total} %{http_code}' \
     -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
@@ -329,7 +497,8 @@ assembly_state() {
 # Shared by the ESI assertions below.
 check_hit_is_private() {
   local hdrs
-  hdrs=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
+  hdrs=$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -D- -o /dev/null \
+    -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
     "http://127.0.0.1:$TS_PORT/article")
@@ -340,7 +509,8 @@ check_hit_is_private() {
 check_post_reaches_origin() {
   local before
   before=$(grep -cF "origin: received POST /article" "$WORK/origin.log" || true)
-  curl -s -o /dev/null -X POST -d 'x=1' -H "Host: ts.example.com" \
+  curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null \
+    -X POST -d 'x=1' -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     "http://127.0.0.1:$TS_PORT/article"
   check "a POST still reaches the origin" \
@@ -526,16 +696,17 @@ first chunk looks identical to one that does not.
 import socket, sys, time
 
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-extra = sys.argv[4] if len(sys.argv) > 4 else ""
+timeout = float(sys.argv[4])
 
 req = (
     f"GET {path} HTTP/1.1\r\nHost: ts.example.com\r\n"
     "sec-fetch-dest: document\r\nsec-fetch-mode: navigate\r\n"
     "accept-encoding: gzip\r\n"
-    f"{extra}Connection: close\r\n\r\n"
+    "Connection: close\r\n\r\n"
 ).encode()
 
-s = socket.create_connection((host, port))
+s = socket.create_connection((host, port), timeout=timeout)
+s.settimeout(timeout)
 t0 = time.time()
 s.sendall(req)
 
@@ -572,7 +743,9 @@ cat <<'EOF'
   one that does not.
 EOF
 echo
-probe_body_ms() { python3 "$WORK/probe.py" 127.0.0.1 "$TS_PORT" /article; }
+probe_body_ms() {
+  python3 "$WORK/probe.py" 127.0.0.1 "$TS_PORT" /article "$REQUEST_TIMEOUT_SECONDS"
+}
 echo "  request A: $(probe_body_ms)"
 B_LINE="$(probe_body_ms)"
 echo "  request B: $B_LINE"
@@ -605,6 +778,90 @@ if [ "$MODE" != "inline" ]; then
   # cache still stores identity; that does not require changing what this reader accepts.
   check "the origin fetch stays compressed" \
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
+fi
+
+info "Cookie variant isolation and session bypass (mode: $MODE)"
+if python3 - "$TS_PORT" "$MODE" "$WORK/origin.log" "$REQUEST_TIMEOUT_SECONDS" <<'PYEOF'
+import gzip
+import sys
+import urllib.request
+from pathlib import Path
+
+port, mode, origin_log, timeout = sys.argv[1:]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def origin_gets(path):
+    return Path(origin_log).read_text().splitlines().count(f"origin: received GET {path}")
+
+
+def request(path, cookie, variant, state, fetches, session=False):
+    before = origin_gets(path)
+    headers = {
+        "Host": "ts.example.com",
+        "Accept-Encoding": "gzip",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    with opener.open(req, timeout=float(timeout)) as response:
+        body = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        html = body.decode()
+        assert response.status == 200, response.status
+        marker = f"<p>variant={variant};session={str(session).lower()}</p>"
+        assert marker in html, f"wrong cookie-selected HTML: expected {marker}"
+        assert html.count("<p>variant=") == 1, "should contain only this reader's variant"
+        assert "<!--ts-ad-seam-->" not in html, "unresolved assembly seam"
+        assert '\\"hb_pb\\":\\"4.25\\"' in html, "missing assembled winning bid"
+        policy = response.headers.get("Cache-Control", "").lower()
+        assert "private" in policy and "no-store" in policy, policy
+        actual = response.headers.get("X-TS-Template-Cache")
+        if mode == "esi":
+            assert actual == state, f"{cookie!r}: expected {state}, got {actual}"
+            if state == "hit":
+                assert response.headers.get("X-TS-Assembly") == "byte-seam"
+        else:
+            assert actual not in ("hit", "miss-stored", "miss-reserved"), actual
+    expected_fetches = fetches if mode == "esi" else 1
+    actual_fetches = origin_gets(path) - before
+    assert actual_fetches == expected_fetches, (
+        f"{cookie!r}: expected {expected_fetches} origin fetches, got {actual_fetches}"
+    )
+    print(f"  PASS {path} {cookie!r}: correct HTML, cache state, assembly and origin count")
+
+
+path = "/article/cookie-policy"
+for arm, state in [("A", "miss-stored"), ("B", "miss-stored"), ("A", "hit"), ("B", "hit")]:
+    request(path, f"ab_bucket={arm}", arm, state, int(state != "hit"))
+
+# Presence is a key dimension: neither missing nor empty may reuse A, B, or each other.
+for state in ["miss-stored", "hit"]:
+    request(path, None, "absent", state, int(state != "hit"))
+    request(path, "ab_bucket=", "empty", state, int(state != "hit"))
+
+# Unlisted opaque values must not fragment a warmed experiment arm.
+request(path, 'g_state={"i_l":0}; ab_bucket=A', "A", "hit", 0)
+request(path, "ab_bucket=A; metadata=one,two", "A", "hit", 0)
+
+# Bypass applies even when the anonymous arm is already warm, including empty sessions.
+for cookie in ["ab_bucket=A; session=test", "ab_bucket=A; session=test", "ab_bucket=A; session="]:
+    request(path, cookie, "A", "bypass-request", 1, session=True)
+request(path, "ab_bucket=A", "A", "hit", 0)
+
+# A cold session request must neither populate nor reserve an anonymous template.
+cold_path = "/article/cookie-policy-cold-session"
+request(cold_path, "ab_bucket=B; session=test", "B", "bypass-request", 1, session=True)
+request(cold_path, "ab_bucket=B", "B", "miss-stored", 1)
+request(cold_path, "ab_bucket=B", "B", "hit", 0)
+PYEOF
+then
+  ok "cookie runtime matrix"
+else
+  bad "cookie runtime matrix"
 fi
 
 info "Result"

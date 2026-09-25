@@ -18,8 +18,8 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-fn test_router() -> edgezero_core::router::RouterService {
-    let settings = trusted_server_core::settings::Settings::from_toml(
+fn test_settings() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -36,9 +36,11 @@ fn test_router() -> edgezero_core::router::RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+fn test_router() -> edgezero_core::router::RouterService {
+    TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
 }
 
@@ -60,6 +62,42 @@ fn assert_route_registered(method: &str, path: &str) {
         routes.iter().any(|(m, p)| m == method && p == path),
         "{method} {path} must be explicitly registered; registered routes: {routes:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aps_profile_serves_renderer_through_adapter_fallback() {
+    let mut settings = test_settings();
+    settings.auction.providers.insert(
+        "aps-main".parse().expect("should parse APS provider ID"),
+        trusted_server_core::auction::ProviderConfig {
+            protocol: "openrtb-2.6".to_string(),
+            profile: "aps".to_string(),
+            endpoint: "https://aps.example/e/pb/bid".to_string(),
+            timeout_ms: None,
+            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+            notifications: trusted_server_core::auction::NotificationConfig::default(),
+            profile_config: "{\"account_id\":\"example-account\"}"
+                .parse()
+                .expect("should parse APS profile config"),
+        },
+    );
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router with APS profile");
+    let mut service = EdgeZeroAxumService::new(router);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/integrations/aps/renderer")
+        .body(AxumBody::empty())
+        .expect("should build APS renderer request");
+
+    let response = service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should serve APS renderer");
+    assert_eq!(response.status().as_u16(), 200);
 }
 
 /// Verify that every expected explicit route is registered in the route table.
@@ -827,5 +865,76 @@ async fn first_party_proxy_rebuild_is_routed() {
         resp.status().as_u16(),
         404,
         "/first-party/proxy-rebuild must be routed"
+    );
+}
+
+/// Regression test: a Next.js navigation with a pending auction must buffer to
+/// the structural body close. The Flight payload carries a literal `</body>`, so
+/// a parser-blind seam would inject bids early and split the RSC data.
+///
+/// This covers the buffered path only. This adapter routes navigations through
+/// `buffer_publisher_response_async`, which resolves the body close without the
+/// deferred inline seam marker, so the streaming seam token is exercised by the
+/// Fastly adapter alone and not by this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_auction_output_holds_until_the_structural_body_close() {
+    use std::sync::Arc;
+
+    use trusted_server_core::test_support::nextjs_auction;
+
+    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        nextjs_auction::settings(),
+        nextjs_auction::services(Arc::clone(&client)),
+    )
+    .expect("should build router with fixture services");
+
+    let request = edgezero_core::http::request_builder()
+        .method("GET")
+        .uri("https://test-publisher.example.com/article")
+        .header("host", "test-publisher.example.com")
+        .header("accept", "text/html")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build publisher navigation");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("should serve publisher navigation");
+    assert_eq!(response.status(), 200, "should serve fixture HTML");
+    let body = response
+        .into_body()
+        .into_bytes()
+        .expect("should buffer adapter output");
+    let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
+
+    assert_eq!(
+        client.auction_requests(),
+        1,
+        "should dispatch exactly one auction"
+    );
+    let bids = html
+        .find("var b=JSON.parse(")
+        .unwrap_or_else(|| panic!("should inject auction bids: {html}"));
+    let close = html
+        .rfind("</body>")
+        .unwrap_or_else(|| panic!("should retain structural close: {html}"));
+    assert!(
+        bids < close && html[bids..].ends_with("</script></body></html>"),
+        "should inject bids immediately before the structural body close: {html}"
+    );
+    // The fixture splits the URL across two scripts, so the rewritten payload
+    // never appears contiguously. Assert on the recomputed `T` length instead:
+    // it shrinks only when the origin URL was actually replaced.
+    assert!(
+        html.contains(&nextjs_auction::expected_rewritten_flight_header()),
+        "should recompute the Flight T length after rewriting the URL: {html}"
+    );
+    assert!(
+        !html.contains(nextjs_auction::ORIGIN_HOST),
+        "should leave no origin host in the rewritten payload: {html}"
+    );
+    assert!(
+        !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
+        "should not leak generated placeholders: {html}"
     );
 }

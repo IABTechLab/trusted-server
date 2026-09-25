@@ -165,6 +165,28 @@ pub fn ingest_eid_cookies(
     ingest_eid_cookies_with_writer(eids_cookie, sharedid_cookie, ec_id, kv, registry);
 }
 
+/// Collects validated request-local partner updates without performing KV I/O.
+pub(crate) fn collect_eid_cookie_updates(
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+    registry: &PartnerRegistry,
+) -> Vec<PartnerIdUpdate> {
+    if registry.is_empty() {
+        return Vec::new();
+    }
+
+    let mut updates = Vec::new();
+    if let Some(cookie) = eids_cookie {
+        updates.extend(collect_prebid_eid_updates(cookie, registry));
+    }
+    if let Some(cookie) = sharedid_cookie
+        && let Some(update) = collect_sharedid_update(cookie, registry)
+    {
+        updates.push(update);
+    }
+    dedupe_partner_updates(updates)
+}
+
 /// Parses a `ts-eids` cookie value and writes matched partner UIDs to KV.
 ///
 /// `cookie_value` is the raw base64-encoded cookie value, already extracted
@@ -188,21 +210,7 @@ fn ingest_eid_cookies_with_writer(
     writer: &dyn PartnerIdBulkWriter,
     registry: &PartnerRegistry,
 ) {
-    if registry.is_empty() {
-        return;
-    }
-
-    let mut updates = Vec::new();
-    if let Some(cookie) = eids_cookie {
-        updates.extend(collect_prebid_eid_updates(cookie, registry));
-    }
-    if let Some(cookie) = sharedid_cookie
-        && let Some(update) = collect_sharedid_update(cookie, registry)
-    {
-        updates.push(update);
-    }
-
-    let updates = dedupe_partner_updates(updates);
+    let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
     if updates.is_empty() {
         return;
     }
@@ -451,7 +459,9 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("token-{source_domain}-32-bytes-minimum-value")),
+            api_token: Some(Redacted::new(format!(
+                "token-{source_domain}-32-bytes-minimum-value"
+            ))),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
@@ -705,6 +715,39 @@ mod tests {
     }
 
     #[test]
+    fn collect_eid_cookie_updates_merges_prebid_and_sharedid_without_kv() {
+        let registry = make_registry(vec![("id5", "id5-sync.com"), ("sharedid", "sharedid.org")]);
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
+        ]));
+
+        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some(" shared-1 "), &registry);
+
+        assert_eq!(
+            updates.len(),
+            2,
+            "should collect prebid and sharedId matches"
+        );
+        assert!(updates.contains(&PartnerIdUpdate::new("id5-sync.com", "ID5_abc")));
+        assert!(updates.contains(&PartnerIdUpdate::new("sharedid.org", "shared-1")));
+    }
+
+    #[test]
+    fn collect_eid_cookie_updates_empty_registry_returns_no_updates() {
+        let registry = PartnerRegistry::empty();
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
+        ]));
+
+        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some("shared-1"), &registry);
+
+        assert!(
+            updates.is_empty(),
+            "an empty registry matches no partners and touches no KV"
+        );
+    }
+
+    #[test]
     fn dedupe_partner_updates_uses_last_partner_value() {
         let updates = vec![
             PartnerIdUpdate::new("sharedid.org", "prebid-shared"),
@@ -754,6 +797,29 @@ mod tests {
         assert_eq!(
             calls[0][2],
             PartnerIdUpdate::new("sharedid.org", "shared-cookie-id")
+        );
+    }
+
+    #[test]
+    fn ingest_liveramp_eid_cookie_preserves_the_opaque_envelope() {
+        let registry = make_registry(vec![("liveramp", "liveramp.com")]);
+        let cookie = encode_json(&json!([
+            {
+                "source": "liveramp.com",
+                "uids": [{"id": "opaque-test-envelope", "atype": 3}]
+            }
+        ]));
+        let writer = RecordingWriter::default();
+
+        ingest_eid_cookies_with_writer(Some(&cookie), None, "ec-id", &writer, &registry);
+
+        let calls = writer.calls.borrow();
+        assert_eq!(calls.len(), 1, "should perform one bulk writer call");
+        assert_eq!(calls[0].len(), 1, "should write one LiveRamp partner ID");
+        assert_eq!(
+            calls[0][0],
+            PartnerIdUpdate::new("liveramp.com", "opaque-test-envelope"),
+            "should preserve the opaque envelope without decoding it"
         );
     }
 
