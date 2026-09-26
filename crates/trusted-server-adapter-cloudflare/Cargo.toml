@@ -39,6 +39,7 @@ js-sys = { workspace = true }
 worker = { workspace = true }
 
 [dev-dependencies]
+trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
