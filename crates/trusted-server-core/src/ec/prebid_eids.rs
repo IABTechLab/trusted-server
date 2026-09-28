@@ -689,10 +689,7 @@ mod tests {
 
         assert_eq!(
             updates,
-            vec![PartnerIdUpdate::new(
-                "liveramp.com",
-                "opaque-test-envelope"
-            )],
+            vec![PartnerIdUpdate::new("liveramp.com", "opaque-test-envelope")],
             "should preserve the opaque envelope without decoding it"
         );
     }
