@@ -72,12 +72,8 @@ impl Middleware for FinalizeResponseMiddleware {
             || FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
             |info| info.client_ip,
         );
-        let timings = ctx
-            .request()
-            .extensions()
-            .get::<RequestTimings>()
-            .cloned()
-            .unwrap_or_default();
+        let timings =
+            RequestTimings::from_extensions(ctx.request().extensions()).unwrap_or_default();
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,

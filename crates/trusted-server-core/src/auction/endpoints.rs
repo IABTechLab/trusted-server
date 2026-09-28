@@ -151,11 +151,7 @@ pub async fn handle_auction(
     // fetch, and the commit mark lands once the OpenRTB response carrying the
     // targeting has been built. A defaulted handle records into nothing that
     // is ever read, so direct-handler tests are unaffected.
-    let timings = parts
-        .extensions
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    let timings = RequestTimings::from_extensions(&parts.extensions).unwrap_or_default();
     let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()

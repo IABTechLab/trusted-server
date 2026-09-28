@@ -1,20 +1,16 @@
 //! Per-request phase timing collection and Server-Timing rendering.
 //!
-//! Collection is always-on and infallible: saturating math, no panics. A
-//! contended lock drops the one sample; a poisoned lock recovers (the
-//! guarded data are plain counters), so a panic elsewhere cannot silence
-//! the rest of the request's timing. See the design spec
+//! Collection delegates to `EdgeZero` with saturating math and nonblocking
+//! updates. Contention drops the whole sample; poisoned locks recover
+//! best-effort without rollback. TS callbacks only assign plain optional facts
+//! under the shared clock and mutex. Rendering and exposure remain TS policy.
+//! See the design spec
 //! `docs/superpowers/specs/2026-08-24-request-phase-timing-design.md`.
 
-use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
-use http::{HeaderName, HeaderValue, Response};
+use http::{Extensions, HeaderName, HeaderValue, Response};
 use uuid::Uuid;
-// `std::time::Instant::now()` panics on `wasm32-unknown-unknown` (the
-// Cloudflare adapter's target); `web_time` re-exports std's `Instant` on
-// every other target.
-use web_time::Instant;
 
 use crate::cache_policy::cache_control_headers_are_private_or_no_store;
 
@@ -25,7 +21,7 @@ use crate::cache_policy::cache_control_headers_are_private_or_no_store;
 const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
 /// Number of [`Phase`] variants; sizes the fixed-slot duration array in
-/// [`Inner`].
+/// the shared `EdgeZero` collector.
 const PHASE_COUNT: usize = 8;
 
 /// A distinct stage of request handling that duration can be attributed to.
@@ -55,7 +51,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Maps this variant to its fixed slot in the [`Inner::phases`] array.
+    /// Maps this variant to its fixed slot in the generic phase array.
     fn index(self) -> usize {
         match self {
             Self::AppBuild => 0,
@@ -92,71 +88,52 @@ pub enum AuctionWaitPlacement {
     InStream,
 }
 
-/// Mutable state behind [`RequestTimings`], guarded by a [`Mutex`].
-struct Inner {
-    /// Instant the collector was constructed; the reference point for
-    /// elapsed marks. Adapters construct the collector after their own
-    /// prologue (client-request acquisition, logger init, and any
-    /// short-circuit routes on Fastly), so `ts-total` and
-    /// `time_elapsed_ms` exclude that prologue rather than measuring
-    /// wall-clock-from-accept.
-    t0: Instant,
-    /// Accumulated duration per [`Phase`], indexed by [`Phase::index`].
-    phases: [Option<Duration>; PHASE_COUNT],
-    /// Elapsed time at the first [`RequestTimings::mark_headers_ready`] call.
-    headers_ready_total: Option<Duration>,
-    /// Elapsed time at the first [`RequestTimings::mark_request_elapsed`]
-    /// call.
-    request_elapsed: Option<Duration>,
-    /// Placement recorded by the most recent
-    /// [`RequestTimings::record_auction_wait`] call.
+/// Auction facts sharing the generic collector's origin and mutex.
+///
+/// Updates only assign plain optional facts, preserving validity on unwind.
+#[derive(Default)]
+pub struct AuctionTimingData {
     auction_wait_placement: Option<AuctionWaitPlacement>,
-    /// Response body size in bytes, set via
-    /// [`RequestTimings::set_resp_bytes`].
-    resp_bytes: Option<u64>,
-    /// Elapsed time at the first
-    /// [`RequestTimings::mark_auction_dispatched`] call.
     auction_dispatched: Option<Duration>,
-    /// Elapsed time at the first
-    /// [`RequestTimings::mark_auction_resolved`] call.
     auction_resolved: Option<Duration>,
-    /// Elapsed time at the first
-    /// [`RequestTimings::mark_auction_committed`] call.
     auction_committed: Option<Duration>,
-    /// Telemetry auction UUID recorded by the first
-    /// [`RequestTimings::set_auction_id`] call; joins the access row to the
-    /// per-bidder auction dataset. Set when the auction observation is
-    /// built, so it is present even for an auction that was skipped or
-    /// failed to dispatch, matching the row those outcomes emit to
-    /// `auction_events_raw`.
     auction_id: Option<Uuid>,
 }
 
-/// Per-request phase timing collector.
+/// The sole timing type installed in request extensions on every adapter.
+pub type RequestTimingHandle =
+    edgezero_core::request_timing::RequestTimings<PHASE_COUNT, AuctionTimingData>;
+
+/// Shared attachment middleware specialized to Trusted Server's timing payload.
+/// Exclusion policy belongs at each adapter's registration site.
+pub type RequestTimingMiddleware =
+    edgezero_core::middleware::RequestTimingMiddleware<PHASE_COUNT, AuctionTimingData>;
+
+/// Typed application facade over the installed `EdgeZero` handle, not an extension.
 ///
-/// Cheap to clone (an [`Arc`] handle) and safe to share across threads and
-/// async tasks handling the same request. Every method is infallible:
-/// contention silently drops the one sample rather than blocking, and a
-/// poisoned lock is recovered rather than treated as permanent loss.
+/// Clones share one origin and mutex. Contention drops samples or yields missing
+/// facts. `EdgeZero` recovers poisoned locks best-effort, without rollback; the
+/// callbacks here only update plain optional facts and cannot invalidate payloads.
 #[derive(Clone)]
-pub struct RequestTimings(Arc<Mutex<Inner>>);
+pub struct RequestTimings(RequestTimingHandle);
 
 impl RequestTimings {
     /// Starts a new collector with its clock reference (`t0`) set to now.
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(Inner {
-            t0: Instant::now(),
-            phases: [None; PHASE_COUNT],
-            headers_ready_total: None,
-            request_elapsed: None,
-            auction_wait_placement: None,
-            resp_bytes: None,
-            auction_dispatched: None,
-            auction_resolved: None,
-            auction_committed: None,
-            auction_id: None,
-        })))
+        Self(RequestTimingHandle::new())
+    }
+
+    /// Wraps the installed generic handle without creating a clock or copying facts.
+    #[must_use]
+    pub fn from_extensions(extensions: &Extensions) -> Option<Self> {
+        extensions.get::<RequestTimingHandle>().cloned().map(Self)
+    }
+
+    /// Returns the shared generic handle for insertion into request extensions.
+    #[must_use]
+    pub fn handle(&self) -> &RequestTimingHandle {
+        &self.0
     }
 
     /// Accumulates `dur` into `phase`'s running total.
@@ -164,20 +141,7 @@ impl RequestTimings {
     /// Repeated calls for the same phase saturate-add rather than overwrite.
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record(&self, phase: Phase, dur: Duration) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        let index = phase.index();
-        let accumulated = inner.phases[index]
-            .unwrap_or(Duration::ZERO)
-            .saturating_add(dur);
-        inner.phases[index] = Some(accumulated);
+        let _ = self.0.record(phase.index(), dur);
     }
 
     /// Records an auction wait duration under [`Phase::AuctionWait`] and
@@ -185,71 +149,39 @@ impl RequestTimings {
     ///
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record_auction_wait(&self, placement: AuctionWaitPlacement, dur: Duration) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        let index = Phase::AuctionWait.index();
-        let accumulated = inner.phases[index]
-            .unwrap_or(Duration::ZERO)
-            .saturating_add(dur);
-        inner.phases[index] = Some(accumulated);
-        inner.auction_wait_placement = Some(placement);
+        let _ = self
+            .0
+            .record_with(Phase::AuctionWait.index(), dur, |data, _| {
+                data.auction_wait_placement = Some(placement);
+            });
     }
 
     /// Starts a guard that records elapsed time into `phase` when dropped.
-    #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if the internal exhaustive phase-to-slot mapping is invalid.
     pub fn span(&self, phase: Phase) -> PhaseSpan {
-        PhaseSpan {
-            timings: self.clone(),
-            phase,
-            started: Instant::now(),
-        }
+        self.0
+            .span(phase.index())
+            .expect("should map every Phase to a valid slot")
     }
 
     /// Stamps the elapsed time since `t0` as `headers_ready_total`, the
     /// first time this is called.
     ///
     /// Subsequent calls are no-ops (first call wins). Drops the sample
-    /// silently on lock contention or poisoning.
+    /// silently on lock contention; a poisoned lock is recovered.
     pub fn mark_headers_ready(&self) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if inner.headers_ready_total.is_none() {
-            inner.headers_ready_total = Some(inner.t0.elapsed());
-        }
+        let _ = self.0.mark_headers_ready();
     }
 
     /// Stamps the elapsed time since `t0` as `request_elapsed`, the first
     /// time this is called.
     ///
     /// Subsequent calls are no-ops (first call wins). Drops the sample
-    /// silently on lock contention or poisoning.
+    /// silently on lock contention; a poisoned lock is recovered.
     pub fn mark_request_elapsed(&self) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if inner.request_elapsed.is_none() {
-            inner.request_elapsed = Some(inner.t0.elapsed());
-        }
+        let _ = self.0.mark_request_elapsed();
     }
 
     /// Records the telemetry auction id, the first time this is called.
@@ -263,18 +195,9 @@ impl RequestTimings {
     /// (first call wins). Drops the sample silently on lock contention; a
     /// poisoned lock is recovered.
     pub fn set_auction_id(&self, auction_id: Uuid) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if inner.auction_id.is_none() {
-            inner.auction_id = Some(auction_id);
-        }
+        let _ = self.0.update_data(|data, _| {
+            data.auction_id.get_or_insert(auction_id);
+        });
     }
 
     /// Stamps the elapsed time since `t0` as the auction dispatch offset,
@@ -287,18 +210,9 @@ impl RequestTimings {
     /// Drops the sample silently on lock contention; a poisoned lock is
     /// recovered.
     pub fn mark_auction_dispatched(&self) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if inner.auction_dispatched.is_none() {
-            inner.auction_dispatched = Some(inner.t0.elapsed());
-        }
+        let _ = self.0.update_data(|data, elapsed| {
+            data.auction_dispatched.get_or_insert(elapsed);
+        });
     }
 
     /// Stamps the elapsed time since `t0` as the auction resolve offset (the
@@ -312,18 +226,9 @@ impl RequestTimings {
     /// no-ops (first call wins). Drops the sample silently on lock
     /// contention; a poisoned lock is recovered.
     pub fn mark_auction_resolved(&self) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if inner.auction_resolved.is_none() {
-            inner.auction_resolved = Some(inner.t0.elapsed());
-        }
+        let _ = self.0.update_data(|data, elapsed| {
+            data.auction_resolved.get_or_insert(elapsed);
+        });
     }
 
     /// Stamps the elapsed time since `t0` as the auction commit offset
@@ -333,34 +238,16 @@ impl RequestTimings {
     /// Subsequent calls are no-ops (first call wins). Drops the sample
     /// silently on lock contention; a poisoned lock is recovered.
     pub fn mark_auction_committed(&self) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        if inner.auction_committed.is_none() {
-            inner.auction_committed = Some(inner.t0.elapsed());
-        }
+        let _ = self.0.update_data(|data, elapsed| {
+            data.auction_committed.get_or_insert(elapsed);
+        });
     }
 
     /// Records the response body size in bytes.
     ///
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn set_resp_bytes(&self, bytes: u64) {
-        let mut inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            // Poisoning is recoverable here: the guarded data are plain
-            // counters with no invariant a panic can break, so recording
-            // keeps working for the rest of the request instead of going
-            // silently dark. Contention still drops the one sample.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        inner.resp_bytes = Some(bytes);
+        let _ = self.0.set_resp_bytes(bytes);
     }
 
     /// Renders a `Server-Timing` header value, or `None` before
@@ -371,56 +258,53 @@ impl RequestTimings {
     /// `ts-geo`, `ts-kv`, `ts-origin`, `ts-template-cache`) in enum
     /// declaration order. Unrecorded phases are omitted. Durations are
     /// rendered as milliseconds with one decimal place. Drops the sample
-    /// silently (returning `None`) on lock contention or poisoning.
+    /// silently (returning `None`) on lock contention; poison is recovered.
     #[must_use]
     pub fn server_timing_value(&self) -> Option<String> {
-        let inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
-        let total = inner.headers_ready_total?;
-        let mut entries = vec![format_entry("ts-total", total)];
-        for phase in HEADER_PHASES {
-            let Some(name) = phase.header_name() else {
-                continue;
-            };
-            if let Some(dur) = inner.phases[phase.index()] {
-                entries.push(format_entry(name, dur));
-            }
-        }
-        Some(entries.join(", "))
+        self.0
+            .snapshot(|inner| {
+                let total = inner.headers_ready_total?;
+                let mut entries = vec![format_entry("ts-total", total)];
+                for phase in HEADER_PHASES {
+                    let Some(name) = phase.header_name() else {
+                        continue;
+                    };
+                    if let Some(dur) = inner.phases[phase.index()] {
+                        entries.push(format_entry(name, dur));
+                    }
+                }
+                Some(entries.join(", "))
+            })
+            .ok()
+            .flatten()
     }
 
     /// Captures the current state as a [`TimingSnapshot`].
     ///
-    /// Returns an all-`None` snapshot on lock contention or poisoning,
+    /// Returns an all-`None` snapshot on lock contention,
     /// consistent with the infallibility of every other method.
     #[must_use]
     pub fn snapshot(&self) -> TimingSnapshot {
-        let inner = match self.0.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return TimingSnapshot::default(),
-        };
-        TimingSnapshot {
-            time_elapsed_ms: duration_ms(inner.headers_ready_total),
-            request_elapsed_ms: duration_ms(inner.request_elapsed),
-            appbuild_ms: duration_ms(inner.phases[Phase::AppBuild.index()]),
-            filter_ms: duration_ms(inner.phases[Phase::Filter.index()]),
-            geo_ms: duration_ms(inner.phases[Phase::Geo.index()]),
-            kv_ms: duration_ms(inner.phases[Phase::EcKv.index()]),
-            origin_ms: duration_ms(inner.phases[Phase::Origin.index()]),
-            template_cache_ms: duration_ms(inner.phases[Phase::TemplateCacheLookup.index()]),
-            auction_wait_ms: duration_ms(inner.phases[Phase::AuctionWait.index()]),
-            stream_ms: duration_ms(inner.phases[Phase::Stream.index()]),
-            auction_wait_placement: inner.auction_wait_placement,
-            resp_bytes: inner.resp_bytes,
-            auction_dispatched_ms: duration_ms(inner.auction_dispatched),
-            auction_resolved_ms: duration_ms(inner.auction_resolved),
-            auction_committed_ms: duration_ms(inner.auction_committed),
-            auction_id: inner.auction_id,
-        }
+        self.0
+            .snapshot(|inner| TimingSnapshot {
+                time_elapsed_ms: duration_ms(inner.headers_ready_total),
+                request_elapsed_ms: duration_ms(inner.request_elapsed),
+                appbuild_ms: duration_ms(inner.phases[Phase::AppBuild.index()]),
+                filter_ms: duration_ms(inner.phases[Phase::Filter.index()]),
+                geo_ms: duration_ms(inner.phases[Phase::Geo.index()]),
+                kv_ms: duration_ms(inner.phases[Phase::EcKv.index()]),
+                origin_ms: duration_ms(inner.phases[Phase::Origin.index()]),
+                template_cache_ms: duration_ms(inner.phases[Phase::TemplateCacheLookup.index()]),
+                auction_wait_ms: duration_ms(inner.phases[Phase::AuctionWait.index()]),
+                stream_ms: duration_ms(inner.phases[Phase::Stream.index()]),
+                auction_wait_placement: inner.data.auction_wait_placement,
+                resp_bytes: inner.resp_bytes,
+                auction_dispatched_ms: duration_ms(inner.data.auction_dispatched),
+                auction_resolved_ms: duration_ms(inner.data.auction_resolved),
+                auction_committed_ms: duration_ms(inner.data.auction_committed),
+                auction_id: inner.data.auction_id,
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -494,20 +378,7 @@ fn duration_ms(dur: Option<Duration>) -> Option<u32> {
 
 /// RAII guard returned by [`RequestTimings::span`] that records its own
 /// elapsed lifetime into the originating phase when dropped.
-pub struct PhaseSpan {
-    /// The collector this span reports into on drop.
-    timings: RequestTimings,
-    /// The phase this span's elapsed time is recorded under.
-    phase: Phase,
-    /// The instant the span was created.
-    started: Instant,
-}
-
-impl Drop for PhaseSpan {
-    fn drop(&mut self) {
-        self.timings.record(self.phase, self.started.elapsed());
-    }
-}
+pub type PhaseSpan = edgezero_core::request_timing::PhaseSpan<PHASE_COUNT, AuctionTimingData>;
 
 /// A point-in-time, plain-data view of a [`RequestTimings`] collector.
 ///
@@ -566,12 +437,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_and_header_compatibility_fixture() {
+        let timings = RequestTimings::new();
+        let clone = timings.clone();
+        clone.record(Phase::AppBuild, Duration::ZERO);
+        clone.record(Phase::Filter, Duration::from_micros(9_100));
+        clone.record(Phase::Geo, Duration::MAX);
+        clone.record(Phase::Geo, Duration::from_secs(1));
+        clone.record(Phase::EcKv, Duration::from_millis(3));
+        clone.record(Phase::Origin, Duration::from_millis(4));
+        clone.record(Phase::TemplateCacheLookup, Duration::from_millis(5));
+        clone.record_auction_wait(AuctionWaitPlacement::PreHeader, Duration::from_millis(6));
+        clone.record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(7));
+        clone.record(Phase::Stream, Duration::from_millis(8));
+        clone.set_resp_bytes(42);
+        clone.set_resp_bytes(99);
+        let snapshot = timings.snapshot();
+        assert_eq!(snapshot.appbuild_ms, Some(0));
+        assert_eq!(snapshot.filter_ms, Some(9));
+        assert_eq!(snapshot.geo_ms, Some(u32::MAX));
+        assert_eq!(snapshot.auction_wait_ms, Some(13));
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream)
+        );
+        assert_eq!(snapshot.stream_ms, Some(8));
+        assert_eq!(snapshot.resp_bytes, Some(99));
+        assert_eq!(snapshot.request_elapsed_ms, None);
+        assert_eq!(RequestTimings::new().snapshot(), TimingSnapshot::default());
+        timings.mark_headers_ready();
+        let value = timings
+            .server_timing_value()
+            .expect("should render fixture");
+        let entries: Vec<_> = value.split(", ").collect();
+        assert_eq!(entries.len(), 7, "should omit row-only phases");
+        assert!(entries[0].starts_with("ts-total;dur="));
+        assert_eq!(entries[1], "ts-appbuild;dur=0.0");
+        assert_eq!(entries[2], "ts-filter;dur=9.1");
+        assert_eq!(entries[3], format_entry("ts-geo", Duration::MAX));
+        assert_eq!(
+            &entries[4..],
+            &[
+                "ts-kv;dur=3.0",
+                "ts-origin;dur=4.0",
+                "ts-template-cache;dur=5.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn contention_drops_compound_update_and_omits_reads() {
+        let timings = RequestTimings::new();
+        timings.record_auction_wait(AuctionWaitPlacement::PreHeader, Duration::from_millis(3));
+        timings.mark_headers_ready();
+        assert!(timings.server_timing_value().is_some());
+        let before = timings.snapshot();
+        // Deliberately hold the lock while probing unavailable operations in this
+        // test. Production callbacks only assign facts and never reenter.
+        timings
+            .0
+            .update_data(|_, _| {
+                timings
+                    .record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(7));
+                timings.mark_request_elapsed();
+                assert_eq!(timings.snapshot(), TimingSnapshot::default());
+                assert_eq!(timings.server_timing_value(), None);
+            })
+            .expect("should hold collector lock");
+        assert_eq!(
+            timings.snapshot(),
+            before,
+            "should drop entire compound update"
+        );
+    }
+
+    #[test]
+    fn request_completion_is_first_write_and_header_append_preserves_upstream() {
+        let timings = RequestTimings::new();
+        timings.mark_request_elapsed();
+        let first = timings.snapshot().request_elapsed_ms;
+        std::thread::sleep(Duration::from_millis(5));
+        timings.mark_request_elapsed();
+        assert_eq!(timings.snapshot().request_elapsed_ms, first);
+        let mut response = Response::builder()
+            .header("cache-control", "private")
+            .header("server-timing", "upstream;dur=1.0")
+            .body(())
+            .expect("should build private response");
+        append_server_timing_if_private(&mut response, &timings, false);
+        assert!(
+            timings.snapshot().time_elapsed_ms.is_some(),
+            "should mark even when disabled"
+        );
+        assert_eq!(
+            response.headers().get_all("server-timing").iter().count(),
+            1
+        );
+        append_server_timing_if_private(&mut response, &timings, true);
+        let values: Vec<_> = response.headers().get_all("server-timing").iter().collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "upstream;dur=1.0");
+        assert_eq!(response.headers()["cache-control"], "private");
+    }
+
+    #[test]
     fn every_phase_index_is_unique_and_in_bounds() {
         // `PHASE_COUNT` and `Phase::index()` are hand-synced; nothing at
         // compile time ties them together. A new variant whose `index()`
-        // returns `PHASE_COUNT` would panic at runtime on first `record`,
-        // contradicting the module's no-panics claim, so this test fails
-        // first instead. (A variant missing from this list is a compile
+        // returns `PHASE_COUNT` would silently lose records or panic when
+        // starting a span, so this test fails first instead. (A variant missing from this list is a compile
         // error via the exhaustive `match` in `index()` once added there.)
         let phases = [
             Phase::AppBuild,

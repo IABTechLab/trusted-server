@@ -1,9 +1,10 @@
 //! Terminal timing layer for the Axum dev server.
 //!
 //! [`TimingService`](crate::timing::TimingService) wraps the tower `Service`
-//! boundary the Axum dev server's router sits behind: it creates a
+//! boundary the Axum dev server's router sits behind: it reuses the generic
+//! handle in request extensions or creates one, exposing it through the
 //! [`RequestTimings`](trusted_server_core::request_timing::RequestTimings)
-//! collector per request, threads it through request extensions so
+//! facade so
 //! downstream core handlers can record into it, and on the way back stamps
 //! `mark_headers_ready` and appends the `Server-Timing` header via
 //! [`append_server_timing_if_private`](trusted_server_core::request_timing::append_server_timing_if_private).
@@ -21,8 +22,8 @@
 //!
 //! `/health` is excluded by path match before a
 //! [`RequestTimings`](trusted_server_core::request_timing::RequestTimings)
-//! collector is even created: health checks never carry timing data on any
-//! adapter.
+//! collector is even created: this wrapper bypasses timing for every method
+//! on that path, leaving any preinstalled handle unchanged.
 //!
 //! Unlike the Fastly adapter (state built per request, adding
 //! `Phase::AppBuild` to the rendered header), the Axum dev server builds its
@@ -40,7 +41,7 @@ use tower::Service;
 use trusted_server_core::request_timing::{RequestTimings, append_server_timing_if_private};
 
 /// Path excluded from timing collection and `Server-Timing` emission: health
-/// checks never carry timing data on any adapter.
+/// checks bypass this wrapper for every method.
 const HEALTH_PATH: &str = "/health";
 
 /// Wraps an inner Axum tower service with the request-phase timing freeze
@@ -78,15 +79,18 @@ where
     fn call(&mut self, mut req: Request<AxumBody>) -> Self::Future {
         let mut inner = self.inner.clone();
 
-        // Excluded before a collector is even created: `/health` never
-        // carries timing data, on any adapter.
+        // Bypass installation and finalization for `/health`, regardless of method.
+        // A preinstalled collector remains available to the inner service.
         if req.uri().path() == HEALTH_PATH {
             return Box::pin(async move { inner.call(req).await });
         }
 
         let server_timing_enabled = self.server_timing_enabled;
-        let timings = RequestTimings::new();
-        req.extensions_mut().insert(timings.clone());
+        let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_else(|| {
+            let timings = RequestTimings::new();
+            req.extensions_mut().insert(timings.handle().clone());
+            timings
+        });
 
         Box::pin(async move {
             let mut response = inner.call(req).await?;
@@ -130,6 +134,69 @@ mod tests {
             .get(name)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_preserves_preinstalled_collector_and_origin() {
+        let timings = RequestTimings::new();
+        timings.record(
+            trusted_server_core::request_timing::Phase::Filter,
+            std::time::Duration::from_millis(7),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let router = RouterService::builder()
+            .get("/private", |ctx: RequestContext| async move {
+                let timings = RequestTimings::from_extensions(ctx.request().extensions())
+                    .expect("should receive preinstalled collector");
+                assert_eq!(
+                    timings.snapshot().filter_ms,
+                    Some(7),
+                    "should preserve upstream phase"
+                );
+                timings.mark_auction_dispatched();
+                assert!(
+                    timings
+                        .snapshot()
+                        .auction_dispatched_ms
+                        .expect("should mark dispatch")
+                        >= 20,
+                    "should preserve the pre-aged origin"
+                );
+                private_ok_response()
+            })
+            .build();
+        let terminal = TimingService::new(EdgeZeroAxumService::new(router), true);
+        let upstream_timings = timings.clone();
+        let mut upstream = service_fn(move |mut req: Request<AxumBody>| {
+            req.extensions_mut()
+                .insert(upstream_timings.handle().clone());
+            let mut service = terminal.clone();
+            async move { service.call(req).await }
+        });
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = upstream
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should handle request");
+        let value = header(&response, "server-timing").expect("should render private timing");
+        assert!(
+            value.contains("ts-filter;dur=7.0"),
+            "should render upstream phase: {value}"
+        );
+        assert!(
+            timings
+                .snapshot()
+                .time_elapsed_ms
+                .expect("should stamp original handle")
+                >= 20,
+            "terminal rendering should use the original clock"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -201,7 +268,7 @@ mod tests {
         // here instead of silently losing every phase.
         let router = RouterService::builder()
             .get("/private", |ctx: RequestContext| async move {
-                if let Some(timings) = ctx.request().extensions().get::<RequestTimings>() {
+                if let Some(timings) = RequestTimings::from_extensions(ctx.request().extensions()) {
                     timings.record(
                         trusted_server_core::request_timing::Phase::Filter,
                         std::time::Duration::from_millis(7),
@@ -283,28 +350,50 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn axum_health_is_excluded() {
-        let router = RouterService::builder()
-            .get("/health", |_ctx: RequestContext| async {
-                private_ok_response()
-            })
-            .build();
-        let mut service = TimingService::new(EdgeZeroAxumService::new(router), true);
-
-        let request = Request::builder()
-            .uri("/health")
-            .body(AxumBody::empty())
-            .expect("should build request");
-        let response = service
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(request)
-            .await
-            .expect("should not fail");
-
-        assert!(
-            header(&response, "server-timing").is_none(),
-            "/health must never carry a server-timing header"
-        );
+        for method in [axum::http::Method::GET, axum::http::Method::POST] {
+            for path in ["/health", "/health?probe=1"] {
+                for preinstalled in [false, true] {
+                    let timings = RequestTimings::new();
+                    let inner = service_fn(move |req: Request<AxumBody>| async move {
+                        assert_eq!(
+                            RequestTimings::from_extensions(req.extensions()).is_some(),
+                            preinstalled,
+                            "health bypass should not install or remove a handle"
+                        );
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("cache-control", "private")
+                                .body(AxumBody::empty())
+                                .expect("should build private response"),
+                        )
+                    });
+                    let mut service = TimingService::new(inner, true);
+                    let mut request = Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(AxumBody::empty())
+                        .expect("should build request");
+                    if preinstalled {
+                        request.extensions_mut().insert(timings.handle().clone());
+                    }
+                    let response = service
+                        .ready()
+                        .await
+                        .expect("should be ready")
+                        .call(request)
+                        .await
+                        .expect("should not fail");
+                    assert!(
+                        header(&response, "server-timing").is_none(),
+                        "health should not emit timing"
+                    );
+                    assert_eq!(
+                        timings.snapshot().time_elapsed_ms,
+                        None,
+                        "health bypass should not finalize timing"
+                    );
+                }
+            }
+        }
     }
 }
