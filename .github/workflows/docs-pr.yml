@@ -1,0 +1,30 @@
+name: Open docs PR
+
+# Opens a draft documentation pull request for each code merge to main.
+# Documentation-only merges are skipped.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+permissions:
+  contents: read
+
+jobs:
+  open-docs-pr:
+    name: Open draft documentation PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Open draft documentation PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/open-docs-pr.sh "${{ github.event.before }}" "${{ github.sha }}"
