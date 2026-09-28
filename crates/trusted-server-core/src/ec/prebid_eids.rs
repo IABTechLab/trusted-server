@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_liveramp_eid_cookie_preserves_the_opaque_envelope() {
+    fn collect_liveramp_eid_cookie_updates_preserves_the_opaque_envelope() {
         let registry = make_registry(vec![("liveramp", "liveramp.com")]);
         let cookie = encode_json(&json!([
             {
