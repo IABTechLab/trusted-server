@@ -108,7 +108,6 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
@@ -118,6 +117,7 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -645,6 +645,7 @@ async fn run_named_route(
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
+            ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -817,7 +818,11 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        let is_publisher_navigation = ec.is_real_browser && is_navigation_request(&req);
+        let is_navigation = is_navigation_request(&req);
+        if is_navigation {
+            ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        }
+        let is_publisher_navigation = ec.is_real_browser && is_navigation;
         if is_publisher_navigation
             && let Err(err) = ec
                 .ec_context
@@ -1326,8 +1331,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
         TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
         build_state_from_settings, compile_auction_plan, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
@@ -1338,7 +1343,9 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::env_config::EnvConfig;
-    use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
+    use edgezero_core::http::{
+        HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+    };
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
@@ -2214,6 +2221,95 @@ mod tests {
                 .is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
         );
+    }
+
+    fn browser_request(method: Method, path: &str, fetch_destination: &str) -> Request {
+        let mut request = empty_request(method, path);
+        request.headers_mut().insert(
+            "sec-fetch-dest",
+            HeaderValue::from_bytes(fetch_destination.as_bytes())
+                .expect("should parse fetch destination"),
+        );
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        request
+    }
+
+    fn eid_sync_source_of(response: &Response) -> Option<EidSyncSource> {
+        response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("response should carry EC finalization state")
+            .ec_context
+            .eid_sync_source()
+    }
+
+    #[test]
+    fn dispatch_limits_returning_user_eid_sync_to_eligible_routes() {
+        let router = test_router();
+
+        let navigation = route(
+            &router,
+            browser_request(Method::GET, "/article", "document"),
+        );
+        assert_eq!(
+            eid_sync_source_of(&navigation),
+            Some(EidSyncSource::Navigation)
+        );
+
+        let mut navigation_without_browser_signals =
+            browser_request(Method::GET, "/another-article", "document");
+        navigation_without_browser_signals
+            .extensions_mut()
+            .remove::<DeviceSignals>();
+        let navigation_without_browser_signals = route(&router, navigation_without_browser_signals);
+        assert_eq!(
+            eid_sync_source_of(&navigation_without_browser_signals),
+            Some(EidSyncSource::Navigation),
+            "route classification should not depend on EC generation's browser gate"
+        );
+
+        let auction = route(&router, browser_request(Method::POST, "/auction", "empty"));
+        assert_eq!(eid_sync_source_of(&auction), Some(EidSyncSource::Auction));
+
+        let mut page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        let page_bids = route(&router, page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&page_bids),
+            Some(EidSyncSource::PageBids),
+            "an admitted SPA page-bids request should persist returning-user EID cookies"
+        );
+
+        let mut denied_page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        denied_page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        let denied_page_bids = route(&router, denied_page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&denied_page_bids),
+            None,
+            "a denied cross-site page-bids request must not persist EID cookies"
+        );
+
+        for request in [
+            browser_request(Method::GET, "/static/tsjs=prebid", "script"),
+            browser_request(Method::GET, "/analytics.gif", "image"),
+            browser_request(Method::GET, "/integrations/prebid/bundle.js", "script"),
+        ] {
+            let response = route(&router, request);
+            assert_eq!(
+                eid_sync_source_of(&response),
+                None,
+                "static, analytics, and integration requests must not persist EID cookies"
+            );
+        }
     }
 
     #[test]
@@ -3129,21 +3225,39 @@ mod tests {
     }
 
     #[test]
-    fn filter_short_circuit_response_is_not_recovery_eligible() {
+    fn filter_short_circuit_response_is_not_eligible_for_eid_persistence() {
         // A request-filter short circuit (e.g. a DataDome challenge/block) must
-        // not authorize orphan recovery even for a would-be publisher
-        // navigation: no publisher page was served.
+        // not authorize orphan recovery or EID persistence. No publisher page
+        // or auction was served, so the challenged request must not write EIDs.
+        // Explicit consent withdrawal remains independently eligible.
         let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = route(&router, browser_navigation_request("/some-page"));
+        let navigation = route(&router, browser_navigation_request("/some-page"));
 
         assert_eq!(
-            response.status(),
+            navigation.status(),
             StatusCode::FORBIDDEN,
-            "the challenge filter should short-circuit routing"
+            "the challenge filter should short-circuit navigation routing"
         );
         assert!(
-            !recovery_eligible_of(&response),
+            !recovery_eligible_of(&navigation),
             "a short-circuit filter response must not authorize orphan recovery"
+        );
+        assert_eq!(
+            eid_sync_source_of(&navigation),
+            None,
+            "a challenged navigation must not authorize EID persistence"
+        );
+
+        let auction = route(&router, browser_request(Method::POST, "/auction", "empty"));
+        assert_eq!(
+            auction.status(),
+            StatusCode::FORBIDDEN,
+            "the challenge filter should short-circuit auction routing"
+        );
+        assert_eq!(
+            eid_sync_source_of(&auction),
+            None,
+            "a challenged auction must not authorize EID persistence"
         );
     }
 
