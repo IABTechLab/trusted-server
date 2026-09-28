@@ -16,7 +16,10 @@ use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
-use crate::auction::openrtb::parse_optional_bid_dimension;
+use crate::auction::openrtb::{
+    BidDimensionIndex, BidRejectionReason, build_bid_dimension_index_from_slots,
+    parse_optional_bid_dimension, resolve_bid_dimensions,
+};
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
@@ -265,6 +268,7 @@ impl AdServerMockProvider {
         json: &Json,
         response_time_ms: u64,
         bid_index: &BidIndex,
+        dimensions_by_slot: Option<&BidDimensionIndex>,
     ) -> AuctionResponse {
         let empty_array = vec![];
         let seatbid = json["seatbid"].as_array().unwrap_or(&empty_array);
@@ -293,24 +297,31 @@ impl AdServerMockProvider {
                 let restored_bidder =
                     original.map_or_else(|| seat_name.to_string(), |b| b.bidder.clone());
 
-                // Reuse the shared `OpenRTB` dimension parser so integral floats
-                // (`300.0`) are accepted and zero, negative, or oversized values
-                // are rejected, matching the other auction providers. Keep `{:?}`
-                // for the raw upstream values below: Debug escapes newlines and
-                // quotes, which prevents log injection.
-                let Ok(Some(width)) = parse_optional_bid_dimension(bid, "w") else {
-                    log::debug!(
-                        "adserver_mock: bid for slot '{slot_id}' has invalid width {:?}, skipping",
-                        bid["w"]
-                    );
-                    continue;
+                // Reuse the shared `OpenRTB` dimension parser and slot-format
+                // validation so this provider admits the same dimensions as the
+                // other auction providers. Keep `{:?}` for the raw upstream
+                // values below: Debug escapes newlines and quotes, which
+                // prevents log injection.
+                let dimensions = match (
+                    parse_optional_bid_dimension(bid, "w"),
+                    parse_optional_bid_dimension(bid, "h"),
+                ) {
+                    (Ok(width), Ok(height)) => match dimensions_by_slot {
+                        Some(index) => resolve_bid_dimensions(index, &slot_id, width, height),
+                        None => width.zip(height).ok_or(BidRejectionReason::InvalidBid),
+                    },
+                    _ => Err(BidRejectionReason::InvalidBid),
                 };
-                let Ok(Some(height)) = parse_optional_bid_dimension(bid, "h") else {
-                    log::debug!(
-                        "adserver_mock: bid for slot '{slot_id}' has invalid height {:?}, skipping",
-                        bid["h"]
-                    );
-                    continue;
+                let (width, height) = match dimensions {
+                    Ok(dimensions) => dimensions,
+                    Err(reason) => {
+                        log::debug!(
+                            "adserver_mock: bid for slot '{slot_id}' has unusable dimensions {:?}×{:?} ({reason:?}), skipping",
+                            bid["w"],
+                            bid["h"]
+                        );
+                        continue;
+                    }
                 };
 
                 all_bids.push(Bid {
@@ -372,6 +383,7 @@ impl AdServerMockProvider {
         response: PlatformResponse,
         response_time_ms: u64,
         bid_index: &BidIndex,
+        dimensions_by_slot: Option<&BidDimensionIndex>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let response = response.response;
 
@@ -397,8 +409,12 @@ impl AdServerMockProvider {
 
         log::trace!("AdServer Mock response: {:?}", response_json);
 
-        let auction_response =
-            self.parse_mediation_response(&response_json, response_time_ms, bid_index);
+        let auction_response = self.parse_mediation_response(
+            &response_json,
+            response_time_ms,
+            bid_index,
+            dimensions_by_slot,
+        );
 
         log::info!(
             "AdServer Mock returned {} bids in {}ms",
@@ -517,7 +533,7 @@ impl AuctionProvider for AdServerMockProvider {
         // [`parse_response_with_context`], so this path only serves callers
         // outside the orchestration flow.
         log::debug!("adserver_mock: parsing without context — SSP bid metadata unavailable");
-        self.parse_response_inner(response, response_time_ms, &BidIndex::new())
+        self.parse_response_inner(response, response_time_ms, &BidIndex::new(), None)
             .await
     }
 
@@ -525,15 +541,21 @@ impl AuctionProvider for AdServerMockProvider {
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
-        _request: &AuctionRequest,
+        request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Rebuild the SSP-bid lookup from the orchestrator-provided bidder
         // responses so nurl/burl/ad_id survive mediation. Request-scoped data
         // travels on the context instead of provider-instance state.
         let bid_index = build_bid_index(context.provider_responses.unwrap_or(&[]));
-        self.parse_response_inner(response, response_time_ms, &bid_index)
-            .await
+        let dimensions_by_slot = build_bid_dimension_index_from_slots(&request.slots);
+        self.parse_response_inner(
+            response,
+            response_time_ms,
+            &bid_index,
+            Some(&dimensions_by_slot),
+        )
+        .await
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -801,7 +823,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         assert_eq!(auction_response.provider, "adserver_mock");
         assert_eq!(auction_response.status, BidStatus::Success);
@@ -848,7 +870,8 @@ mod tests {
             ]
         });
 
-        let response = provider.parse_mediation_response(&mediation_response, 10, &BidIndex::new());
+        let response =
+            provider.parse_mediation_response(&mediation_response, 10, &BidIndex::new(), None);
 
         assert_eq!(response.bids.len(), 2);
         assert_eq!(response.bids[0].bidder, "provider-instance");
@@ -924,7 +947,7 @@ mod tests {
         );
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+            provider.parse_mediation_response(&mediation_response, 42, &bid_index, None);
 
         assert_eq!(auction_response.status, BidStatus::Success);
         assert_eq!(auction_response.bids.len(), 1);
@@ -1028,7 +1051,7 @@ mod tests {
         );
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+            provider.parse_mediation_response(&mediation_response, 42, &bid_index, None);
 
         assert_eq!(
             auction_response.bids[0].bid_id.as_deref(),
@@ -1092,6 +1115,7 @@ mod tests {
             }),
             2,
             &reduced_index,
+            None,
         );
         let winner = mediated
             .bids
@@ -1123,7 +1147,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 100, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 100, &BidIndex::new(), None);
 
         assert_eq!(auction_response.status, BidStatus::NoBid);
         assert_eq!(auction_response.bids.len(), 0);
@@ -1316,7 +1340,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         assert_eq!(auction_response.status, BidStatus::Success);
         assert_eq!(auction_response.bids.len(), 2);
@@ -1382,7 +1406,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         assert_eq!(
             auction_response.bids.len(),
@@ -1443,7 +1467,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         let slots: Vec<&str> = auction_response
             .bids
@@ -1485,7 +1509,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         assert_eq!(
             auction_response.bids.len(),
@@ -1547,7 +1571,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         let slots: Vec<&str> = auction_response
             .bids
@@ -1597,7 +1621,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new(), None);
 
         assert_eq!(
             auction_response.bids.len(),
@@ -1615,6 +1639,76 @@ mod tests {
             ),
             (300, 250),
             "should convert integral floats to u32 dimensions"
+        );
+    }
+
+    #[test]
+    fn test_parse_mediation_response_validates_dimensions_against_slots() {
+        // With the request slots available, mediated bids must match a
+        // requested format, and missing dimensions are inferred from the
+        // slot's single format, matching the other auction providers.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+        let request = create_test_auction_request();
+        let dimensions_by_slot = build_bid_dimension_index_from_slots(&request.slots);
+
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-exact",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "w": 728,
+                            "h": 90,
+                        },
+                        {
+                            "id": "bid-mismatch",
+                            "impid": "header-banner",
+                            "price": 3.00,
+                            "w": 300,
+                            "h": 250,
+                        },
+                        {
+                            "id": "bid-inferred",
+                            "impid": "header-banner",
+                            "price": 2.50,
+                        },
+                        {
+                            "id": "bid-unrequested",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "w": 728,
+                            "h": 90,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response = provider.parse_mediation_response(
+            &mediation_response,
+            200,
+            &BidIndex::new(),
+            Some(&dimensions_by_slot),
+        );
+
+        let admitted: Vec<(Option<&str>, u32, u32)> = auction_response
+            .bids
+            .iter()
+            .map(|bid| (bid.bid_id.as_deref(), bid.width, bid.height))
+            .collect();
+        assert_eq!(
+            admitted,
+            [
+                (Some("bid-exact"), 728, 90),
+                (Some("bid-inferred"), 728, 90)
+            ],
+            "should keep the exact and inferred bids and drop the mismatched and unrequested ones"
         );
     }
 
