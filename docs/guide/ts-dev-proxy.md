@@ -442,3 +442,6 @@ and NSS paths and do not read or change the user's NSS database.
 ```bash
 cargo test_cli_linux --test proxy_trust_linux -- --include-ignored
 ```
+
+CI runs only the ignored tests with `-- --ignored` because its preceding
+`cargo test` step already covers the other tests in this file.
