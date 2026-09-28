@@ -8,7 +8,6 @@ use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
-use trusted_server_core::request_timing::RequestTimings;
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
@@ -48,40 +47,6 @@ impl Middleware for SanitizeRequestMiddleware {
 }
 
 // ---------------------------------------------------------------------------
-// RequestTimingMiddleware
-// ---------------------------------------------------------------------------
-
-/// Attaches the server request clock consumed by core timing instrumentation.
-///
-/// This adapter does not emit `Server-Timing`; the collector keeps timing
-/// origins consistent for request-scoped consumers such as GPT diagnostics.
-/// Health checks remain outside timing collection on every adapter.
-#[derive(Default)]
-pub struct RequestTimingMiddleware;
-
-impl RequestTimingMiddleware {
-    /// Creates a new [`RequestTimingMiddleware`].
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait(?Send)]
-impl Middleware for RequestTimingMiddleware {
-    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        if ctx.request().uri().path() != "/health"
-            && ctx.request().extensions().get::<RequestTimings>().is_none()
-        {
-            ctx.request_mut()
-                .extensions_mut()
-                .insert(RequestTimings::new());
-        }
-        next.run(ctx).await
-    }
-}
-
-// ---------------------------------------------------------------------------
 // FinalizeResponseMiddleware
 // ---------------------------------------------------------------------------
 
@@ -90,7 +55,7 @@ impl Middleware for RequestTimingMiddleware {
 /// Spin does not expose geo headers to the application, so
 /// `X-Geo-Info-Available: false` is emitted for every response.
 ///
-/// Registered inside [`RequestTimingMiddleware`] and ahead of [`AuthMiddleware`]
+/// Registered inside [`RequestTimingMiddleware`](trusted_server_core::request_timing::RequestTimingMiddleware) and ahead of [`AuthMiddleware`]
 /// so that every outgoing response — including auth-rejected ones — carries a
 /// consistent set of headers.
 pub struct FinalizeResponseMiddleware {
@@ -223,6 +188,8 @@ pub(crate) fn apply_finalize_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::router::RouterService;
+    use trusted_server_core::request_timing::{RequestTimingMiddleware, RequestTimings};
 
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -356,30 +323,73 @@ mod tests {
     }
 
     #[test]
-    fn request_timing_middleware_attaches_a_collector_except_for_health() {
-        for (path, expected) in [("/test", true), ("/health", false)] {
-            let observed = Arc::new(Mutex::new(None));
-            let handler_observed = Arc::clone(&observed);
-            let handler = Arc::new(move |ctx: RequestContext| {
-                let handler_observed = Arc::clone(&handler_observed);
-                async move {
-                    *handler_observed.lock().expect("should lock observation") =
-                        Some(ctx.request().extensions().get::<RequestTimings>().is_some());
-                    Ok::<Response, EdgeError>(empty_response())
+    fn request_timing_middleware_preserves_shared_handle_and_health_policy() {
+        for method in [Method::GET, Method::POST] {
+            for path in ["/test", "/health", "/health?probe=1", "/health/child"] {
+                for preinstalled in [false, true] {
+                    let route_path = path.split('?').next().expect("should have path");
+                    let expected = preinstalled || route_path != "/health";
+                    let timings = RequestTimings::new();
+                    timings.record(
+                        trusted_server_core::request_timing::Phase::Filter,
+                        std::time::Duration::from_millis(7),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let router = RouterService::builder()
+                        .middleware(
+                            RequestTimingMiddleware::default().with_excluded_paths(&["/health"]),
+                        )
+                        .middleware(
+                            RequestTimingMiddleware::default().with_excluded_paths(&["/health"]),
+                        )
+                        .route(route_path, method.clone(), move |ctx: RequestContext| async move {
+                            let installed = RequestTimings::from_extensions(ctx.request().extensions());
+                            assert_eq!(installed.is_some(), expected, "should preserve exact health policy");
+                            if let Some(installed) = installed {
+                                if preinstalled {
+                                    assert_eq!(installed.snapshot().filter_ms, Some(7), "should retain upstream facts");
+                                    installed.mark_auction_dispatched();
+                                    assert!(installed.snapshot().auction_dispatched_ms.expect("should mark dispatch") >= 2,
+                                        "should retain upstream origin");
+                                } else {
+                                    assert_eq!(installed.snapshot(), trusted_server_core::request_timing::TimingSnapshot::default(),
+                                        "should install independent empty facts");
+                                }
+                                installed.record_auction_wait(
+                                    trusted_server_core::request_timing::AuctionWaitPlacement::PreHeader,
+                                    std::time::Duration::from_millis(3));
+                            }
+                            Ok::<Response, EdgeError>(empty_response())
+                        })
+                        .build();
+                    let mut request = request_builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("should build request");
+                    if preinstalled {
+                        request.extensions_mut().insert(timings.handle().clone());
+                    }
+                    let response =
+                        block_on(router.oneshot(request)).expect("should dispatch request");
+                    assert!(
+                        response.headers().get("server-timing").is_none(),
+                        "attachment should not expose timing"
+                    );
+                    if preinstalled {
+                        assert_eq!(
+                            timings.snapshot().auction_wait_ms,
+                            Some(3),
+                            "should share handler updates"
+                        );
+                        assert_eq!(
+                            timings.snapshot().request_elapsed_ms,
+                            None,
+                            "should not fabricate completion"
+                        );
+                    }
                 }
-            });
-
-            block_on(
-                RequestTimingMiddleware::new()
-                    .handle(ctx_for_path(path), Next::new(&[], &*handler)),
-            )
-            .expect("should run timing middleware");
-
-            assert_eq!(
-                *observed.lock().expect("should lock observation"),
-                Some(expected),
-                "collector presence should match timing policy for {path}"
-            );
+            }
         }
     }
 

@@ -4263,11 +4263,7 @@ pub async fn handle_publisher_request(
 
     // A defaulted handle records into nothing that ever renders, so tests
     // that don't populate the request extension are unaffected.
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
     // idempotent call as a direct-handler safety net and for focused tests.
@@ -6685,7 +6681,7 @@ pub async fn handle_page_bids(
     // browser timings from an adapter-attached request clock. Otherwise an
     // adapter that forgets the extension would silently report a different
     // handler-entry timing origin.
-    let request_timings = req.extensions().get::<RequestTimings>().cloned();
+    let request_timings = RequestTimings::from_extensions(req.extensions());
     let has_request_timings = request_timings.is_some();
     let timings = request_timings.unwrap_or_default();
 
@@ -8701,7 +8697,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let timings = RequestTimings::new();
-        request.extensions_mut().insert(timings.clone());
+        request.extensions_mut().insert(timings.handle().clone());
 
         let _response = run_publisher_proxy(&settings, &services, request).await;
 
@@ -8731,7 +8727,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let timings = RequestTimings::new();
-        request.extensions_mut().insert(timings.clone());
+        request.extensions_mut().insert(timings.handle().clone());
 
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let mut ec_context = EcContext::read_from_request(&settings, &request, &services)
@@ -10066,7 +10062,7 @@ mod tests {
             let inline_timings = RequestTimings::new();
             inline_request
                 .extensions_mut()
-                .insert(inline_timings.clone());
+                .insert(inline_timings.handle().clone());
 
             let _inline_response =
                 run_publisher_proxy(&inline_settings, &inline_services, inline_request).await;
@@ -10086,7 +10082,7 @@ mod tests {
             queue_shareable_html(&stub);
             let mut request = navigation_request();
             let timings = RequestTimings::new();
-            request.extensions_mut().insert(timings.clone());
+            request.extensions_mut().insert(timings.handle().clone());
 
             let _response = run(&settings, &services, request).await;
 
@@ -21164,7 +21160,7 @@ mod tests {
             let request_timings = RequestTimings::new();
             winning_page_bids_request
                 .extensions_mut()
-                .insert(request_timings);
+                .insert(request_timings.handle().clone());
             std::thread::sleep(std::time::Duration::from_millis(2));
 
             let winning_response = handle_page_bids(

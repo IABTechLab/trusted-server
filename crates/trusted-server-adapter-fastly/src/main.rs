@@ -215,7 +215,7 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
             core_req.extensions_mut().insert(config_store);
             core_req.extensions_mut().insert(device_signals);
             core_req.extensions_mut().insert(client_info);
-            core_req.extensions_mut().insert(timings.clone());
+            core_req.extensions_mut().insert(timings.handle().clone());
             match futures::executor::block_on(app.router().oneshot(core_req)) {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
@@ -1098,6 +1098,21 @@ mod tests {
             "ok",
             "should return the health body"
         );
+    }
+
+    #[test]
+    fn health_short_circuit_is_get_only_and_ignores_query() {
+        for path in ["/health", "/health?probe=1"] {
+            let url = format!("https://example.com{path}");
+            assert!(
+                health_response(&FastlyRequest::get(&url)).is_some(),
+                "should bypass GET health"
+            );
+            assert!(
+                health_response(&FastlyRequest::post(&url)).is_none(),
+                "should time non-GET health normally"
+            );
+        }
     }
 
     #[test]

@@ -34,11 +34,10 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
+use trusted_server_core::request_timing::RequestTimingMiddleware;
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{
-    AuthMiddleware, FinalizeResponseMiddleware, RequestTimingMiddleware, SanitizeRequestMiddleware,
-};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -469,7 +468,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(RequestTimingMiddleware::new())
+            .middleware(RequestTimingMiddleware::default().with_excluded_paths(&["/health"]))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
