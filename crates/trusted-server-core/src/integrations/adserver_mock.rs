@@ -16,6 +16,7 @@ use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
+use crate::auction::openrtb::parse_optional_bid_dimension;
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
@@ -292,28 +293,25 @@ impl AdServerMockProvider {
                 let restored_bidder =
                     original.map_or_else(|| seat_name.to_string(), |b| b.bidder.clone());
 
-                // Keep `{:?}` for the raw upstream values below: Debug escapes
-                // newlines and quotes, which prevents log injection.
-                let Some(width) = bid["w"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                // Reuse the shared `OpenRTB` dimension parser so integral floats
+                // (`300.0`) are accepted and zero, negative, or oversized values
+                // are rejected, matching the other auction providers. Keep `{:?}`
+                // for the raw upstream values below: Debug escapes newlines and
+                // quotes, which prevents log injection.
+                let Ok(Some(width)) = parse_optional_bid_dimension(bid, "w") else {
                     log::debug!(
                         "adserver_mock: bid for slot '{slot_id}' has invalid width {:?}, skipping",
                         bid["w"]
                     );
                     continue;
                 };
-                let Some(height) = bid["h"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                let Ok(Some(height)) = parse_optional_bid_dimension(bid, "h") else {
                     log::debug!(
                         "adserver_mock: bid for slot '{slot_id}' has invalid height {:?}, skipping",
                         bid["h"]
                     );
                     continue;
                 };
-                if width == 0 || height == 0 {
-                    log::debug!(
-                        "adserver_mock: bid for slot '{slot_id}' has zero dimension ({width}×{height}), skipping"
-                    );
-                    continue;
-                }
 
                 all_bids.push(Bid {
                     slot_id,
@@ -1341,8 +1339,8 @@ mod tests {
     fn test_parse_mediation_response_skips_oversized_dimensions() {
         // A dimension above u32::MAX must be rejected rather than silently
         // wrapped into a small, plausible-looking value. The offset of 101 is
-        // load-bearing: u32::MAX + 1 truncates to 0, which the zero-check
-        // below would already have caught, so it would not pin this fix.
+        // load-bearing: u32::MAX + 1 truncates to 0, which is already rejected
+        // as a zero dimension, so it would not pin this fix.
         let config = AdServerMockConfig::default();
         let provider = AdServerMockProvider::new(config);
 
@@ -1560,6 +1558,63 @@ mod tests {
             slots,
             ["footer"],
             "should drop the negative-width and negative-height bids"
+        );
+    }
+
+    #[test]
+    fn test_parse_mediation_response_accepts_integral_float_dimensions() {
+        // Integral floats (`300.0`) are a legitimate dimension encoding, matching
+        // the shared `OpenRTB` parser; fractional floats are still skipped.
+        let config = AdServerMockConfig::default();
+        let provider = AdServerMockProvider::new(config);
+
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "test-bidder",
+                    "bid": [
+                        {
+                            "id": "bid-float-dimensions",
+                            "impid": "header-banner",
+                            "price": 3.50,
+                            "adm": "<div>Float dimensions</div>",
+                            "w": 300.0,
+                            "h": 250.0,
+                        },
+                        {
+                            "id": "bid-fractional-width",
+                            "impid": "sidebar",
+                            "price": 1.25,
+                            "adm": "<div>Fractional width</div>",
+                            "w": 300.5,
+                            "h": 250,
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+
+        assert_eq!(
+            auction_response.bids.len(),
+            1,
+            "should accept the integral-float bid and skip the fractional one"
+        );
+        assert_eq!(
+            auction_response.bids[0].slot_id, "header-banner",
+            "should keep the integral-float bid"
+        );
+        assert_eq!(
+            (
+                auction_response.bids[0].width,
+                auction_response.bids[0].height
+            ),
+            (300, 250),
+            "should convert integral floats to u32 dimensions"
         );
     }
 
