@@ -1400,6 +1400,11 @@ mod tests {
                     ],
                 );
                 let services = build_services_with_http_client(client.clone());
+                let expected_body: &[u8] = if method == Method::HEAD {
+                    b""
+                } else {
+                    b"unchanged"
+                };
                 let mut request = make_req(
                     method,
                     "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
@@ -1437,8 +1442,8 @@ mod tests {
                         .await
                         .expect("should collect pass-through body")
                         .as_ref(),
-                    b"unchanged",
-                    "should preserve pass-through bytes"
+                    expected_body,
+                    "should preserve pass-through bytes or omit them for HEAD"
                 );
                 assert!(
                     client.stub.recorded_request_headers()[0]
