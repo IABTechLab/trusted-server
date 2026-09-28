@@ -783,7 +783,7 @@ mod tests {
 
         assert_eq!(routed.inputs().len(), 1);
         assert!(
-            routed.inputs()[0].slots()[0].has_trusted_stored_request(),
+            routed.inputs()[0].slots()[0].allows_stored_fallback_without_candidates(),
             "canonical empty bidder map should preserve stored-request intent"
         );
     }

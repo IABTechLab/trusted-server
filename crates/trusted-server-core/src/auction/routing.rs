@@ -187,7 +187,7 @@ impl ProviderSlotInput {
     }
 
     #[cfg(test)]
-    pub(crate) fn has_trusted_stored_request(&self) -> bool {
+    pub(crate) fn allows_stored_fallback_without_candidates(&self) -> bool {
         self.bidder_params.is_empty() && self.allows_stored_fallback()
     }
 
@@ -866,11 +866,11 @@ mod tests {
                 "{name} should fan out to both PBS providers while APS remains all-eligible"
             );
             assert!(
-                input(&routed, "pbs-a").slots()[0].has_trusted_stored_request(),
+                input(&routed, "pbs-a").slots()[0].allows_stored_fallback_without_candidates(),
                 "{name} should create stored intent"
             );
             assert!(
-                input(&routed, "pbs-b").slots()[0].has_trusted_stored_request(),
+                input(&routed, "pbs-b").slots()[0].allows_stored_fallback_without_candidates(),
                 "{name} should create stored intent for every PBS provider"
             );
         }
@@ -885,11 +885,11 @@ mod tests {
             None,
         );
         assert!(
-            input(&routed, "pbs-a").slots()[0].has_trusted_stored_request(),
+            input(&routed, "pbs-a").slots()[0].allows_stored_fallback_without_candidates(),
             "empty canonical demand should preserve stored-request behavior"
         );
         assert!(
-            input(&routed, "pbs-b").slots()[0].has_trusted_stored_request(),
+            input(&routed, "pbs-b").slots()[0].allows_stored_fallback_without_candidates(),
             "empty canonical demand should fan out to same-profile PBS plans"
         );
     }
@@ -1139,13 +1139,13 @@ mod tests {
         let pbs_a = &input(&routed, "pbs-a").slots()[0];
         assert_eq!(pbs_a.bidder_params().len(), 1);
         assert!(
-            !pbs_a.has_trusted_stored_request(),
+            !pbs_a.allows_stored_fallback_without_candidates(),
             "inline params should win for this PBS provider"
         );
         assert_eq!(pbs_a.prebid_zone(), Some("home"));
         let pbs_b = &input(&routed, "pbs-b").slots()[0];
         assert!(pbs_b.bidder_params().is_empty());
-        assert!(pbs_b.has_trusted_stored_request());
+        assert!(pbs_b.allows_stored_fallback_without_candidates());
         let direct = &input(&routed, "standard-direct").slots()[0];
         assert_eq!(direct.bidder_params().len(), 1);
         assert!(direct.prebid_zone().is_none());

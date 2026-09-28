@@ -400,6 +400,10 @@ impl GenericOpenRtbProvider {
                 input: input.clone(),
             },
             CompiledOpenRtbProfile::PrebidServer(_) => {
+                debug_assert!(
+                    request.imp.iter().all(|impression| impression.id.is_some()),
+                    "should populate every PBS impression ID"
+                );
                 let sent_impression_ids = request
                     .imp
                     .iter()

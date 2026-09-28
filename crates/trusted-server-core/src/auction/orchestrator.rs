@@ -265,8 +265,8 @@ fn routing_metadata(unroutable_bidder_count: u32) -> HashMap<String, serde_json:
 /// Attach only the count derived from the routed provider input at dispatch.
 ///
 /// This is intentionally applied after every provider outcome is materialized,
-/// including failures produced before or during parsing. Skipped providers are
-/// routed separately and retain their exclusive skipped diagnostic.
+/// including failures produced before or during parsing. Only providers skipped
+/// with `skipped_no_eligible_slots` retain an exclusive skipped diagnostic.
 fn materialize_planned_response(
     mut response: AuctionResponse,
     unused_bidder_params_count: u32,
