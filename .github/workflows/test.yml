@@ -273,8 +273,18 @@ jobs:
 
       - name: cargo test (real NSS trust)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_trust_linux -- --ignored
+          set -euo pipefail
+          TARGET="$(rustc -vV | sed -n 's/host: //p')"
+          COUNT="$(cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
+            --test proxy_trust_linux -- --ignored --list | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No ignored real-NSS tests matched --test proxy_trust_linux" >&2
+            exit 1
+          fi
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
+            --test proxy_trust_linux -- --ignored
 
   test-typescript:
     name: vitest
