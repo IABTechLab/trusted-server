@@ -119,7 +119,7 @@ flowchart TD
     J -- "Unknown<br/>(no geo data)" --> Deny
 ```
 
-- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented. Writing partner EIDs into the identity graph additionally requires TCF Purpose 4 (personalized ads); see [Partner Sync Channels](#partner-sync-channels).
+- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented. Writing browser-supplied Prebid EIDs into the identity graph additionally requires TCF Purpose 4 (personalized ads); see [Prebid EID Flow](#prebid-eid-flow). Pull sync does not apply the Purpose 4 check yet.
 - **US State**: Opt-out model with three-tier fallback — GPC always blocks, then TCF if a CMP uses it, then US Privacy string, then fail-closed.
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
