@@ -973,3 +973,74 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         "admin/keys/deactivate without credentials must return 401"
     );
 }
+
+/// Regression test: a Next.js navigation with a pending auction must buffer to
+/// the structural body close. The Flight payload carries a literal `</body>`, so
+/// a parser-blind seam would inject bids early and split the RSC data.
+///
+/// This covers the buffered path only. This adapter routes navigations through
+/// `buffer_publisher_response_async`, which resolves the body close without the
+/// deferred inline seam marker, so the streaming seam token is exercised by the
+/// Fastly adapter alone and not by this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_auction_output_holds_until_the_structural_body_close() {
+    use std::sync::Arc;
+
+    use trusted_server_core::test_support::nextjs_auction;
+
+    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        nextjs_auction::settings(),
+        nextjs_auction::services(Arc::clone(&client)),
+    )
+    .expect("should build router with fixture services");
+
+    let request = edgezero_core::http::request_builder()
+        .method("GET")
+        .uri("https://test-publisher.example.com/article")
+        .header("host", "test-publisher.example.com")
+        .header("accept", "text/html")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build publisher navigation");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("should serve publisher navigation");
+    assert_eq!(response.status(), 200, "should serve fixture HTML");
+    let body = response
+        .into_body()
+        .into_bytes()
+        .expect("should buffer adapter output");
+    let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
+
+    assert_eq!(
+        client.auction_requests(),
+        1,
+        "should dispatch exactly one auction"
+    );
+    let bids = html
+        .find("var b=JSON.parse(")
+        .unwrap_or_else(|| panic!("should inject auction bids: {html}"));
+    let close = html
+        .rfind("</body>")
+        .unwrap_or_else(|| panic!("should retain structural close: {html}"));
+    assert!(
+        bids < close && html[bids..].ends_with("</script></body></html>"),
+        "should inject bids immediately before the structural body close: {html}"
+    );
+    // The fixture splits the URL across two scripts, so the rewritten payload
+    // never appears contiguously. Assert on the recomputed `T` length instead:
+    // it shrinks only when the origin URL was actually replaced.
+    assert!(
+        html.contains(&nextjs_auction::expected_rewritten_flight_header()),
+        "should recompute the Flight T length after rewriting the URL: {html}"
+    );
+    assert!(
+        !html.contains(nextjs_auction::ORIGIN_HOST),
+        "should leave no origin host in the rewritten payload: {html}"
+    );
+    assert!(
+        !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
+        "should not leak generated placeholders: {html}"
+    );
+}

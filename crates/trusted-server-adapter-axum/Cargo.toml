@@ -31,6 +31,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 trusted-server-core = { workspace = true }
 
 [dev-dependencies]
+trusted-server-core = { workspace = true, features = ["test-utils"] }
 axum = { workspace = true }
 base64 = { workspace = true }
 temp-env = { workspace = true }
