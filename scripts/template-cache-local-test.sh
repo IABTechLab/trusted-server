@@ -560,7 +560,7 @@ else
       GPT_BUNDLE="$candidate"
     fi
   done < <(find "$REPO_ROOT/target/wasm32-wasip1/debug/build" \
-    -path '*/out/tsjs-gpt.js' -type f -print0)
+    -path '*/out/tsjs-dist/tsjs-gpt.js' -type f -print0)
   if [ -z "$GPT_BUNDLE" ] || [ ! -s "$GPT_BUNDLE" ]; then
     bad "the generated GPT module cannot be found"
   else
