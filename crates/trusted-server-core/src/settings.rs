@@ -5418,12 +5418,16 @@ source_domain = "partner.example.com"
     }
 
     fn test_partner_with_pull_token(ts_pull_token: &str) -> EcPartner {
+        test_partner_with_tokens(None, ts_pull_token)
+    }
+
+    fn test_partner_with_tokens(api_token: Option<&str>, ts_pull_token: &str) -> EcPartner {
         EcPartner {
             name: "Test Partner".to_owned(),
             source_domain: "partner.example.com".to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
-            api_token: None,
+            api_token: api_token.map(|token| Redacted::new(token.to_owned())),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: true,
             pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
@@ -5466,6 +5470,31 @@ source_domain = "partner.example.com"
         settings
             .reject_placeholder_secrets()
             .expect("should accept a realistic partner pull token");
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_reports_both_partner_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_tokens(
+            Some("partner-api-token-32-bytes-minimum"),
+            "replace-with-partner-api-token-32-bytes-minimum",
+        )];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner tokens");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("ec.partners[partner.example.com].api_token"),
+            "error should mention the partner API token field"
+        );
+        assert!(
+            message.contains("ec.partners[partner.example.com].ts_pull_token"),
+            "error should also mention the partner pull token field on the same partner"
+        );
     }
 
     #[test]
