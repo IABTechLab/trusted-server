@@ -30,7 +30,6 @@ fn main() {
         "lib/package.json",
         "lib/package-lock.json",
         "lib/tsconfig.json",
-        "lib/node_modules/.package-lock.json",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -95,8 +94,17 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
 
     install_dependencies_if_missing(&npm, ts_dir);
     ensure_dependencies_fresh(ts_dir);
+    // Watched only once it exists: Cargo reruns a build script on every
+    // invocation while a watched path is missing.
+    println!(
+        "cargo:rerun-if-changed={}",
+        ts_dir.join("node_modules/.package-lock.json").display()
+    );
 
     if env::var(TEST_VAR).is_ok_and(|value| value == "1") {
+        for path in ["test", "vitest.config.ts"] {
+            println!("cargo:rerun-if-changed={}", ts_dir.join(path).display());
+        }
         let status = Command::new(&npm)
             .args(["run", "test", "--", "--run"])
             .current_dir(ts_dir)
