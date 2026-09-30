@@ -13,6 +13,7 @@ const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 mod rsc;
 mod rsc_placeholders;
 mod rsc_stream;
+mod script_lexer;
 mod script_rewriter;
 mod shared;
 
@@ -250,6 +251,103 @@ mod tests {
             decoded = output;
         }
         String::from_utf8(decoded).expect("should emit UTF-8")
+    }
+
+    #[test]
+    fn non_code_flight_spellings_preserve_gtm_and_later_flight_rewrites() {
+        let payload = "0:{\"url\":\"https://origin.example.com/page\"}\n";
+        let flight = flight_html(&[payload]);
+        for prefix in [
+            r#"const demo="self.__next_f.push(";"#,
+            r#"const demo='self.__next_f.push([1,"1:T7,example"])';"#,
+            r#"const demo="escaped\" self.__next_f.push(";"#,
+            "// self.__next_f.push(\n",
+            "/* self.__next_f.push( */",
+            "const demo=/self.__next_f.push()/;",
+            r#"if (ready) {} else /self.__next_f.push([2,"opaque"])/;"#,
+            r#"do /self.__next_f.push([2,"opaque"])/; while (ready);"#,
+            "const demo=`self.__next_f.push(`;",
+            "const demo=`outer ${`inner self.__next_f.push(`}`;",
+            r"const demo=`escaped\` self.__next_f.push( \${self.__next_f.push(}`;",
+        ] {
+            for split in 0..=prefix.len() {
+                let mut processor = create_html_processor(mixed_config(10000, 10000));
+                let first = format!("<script>{}", &prefix[..split]);
+                let last = format!(
+                    "{}const tag='https://www.googletagmanager.com/gtm.js';</script>{flight}",
+                    &prefix[split..]
+                );
+                let mut bytes = processor
+                    .process_chunk(first.as_bytes(), false)
+                    .expect("should accept non-code prefix");
+                bytes.extend(
+                    processor
+                        .process_chunk(last.as_bytes(), true)
+                        .expect("should complete ordinary and Flight scripts"),
+                );
+                let output = String::from_utf8(bytes).expect("should emit UTF-8");
+                assert!(
+                    output.contains(&format!("<script>{prefix}const tag='/integrations/google_tag_manager/gtm.js';</script>")),
+                    "should preserve non-code source and rewrite ordinary GTM at split {split}: {output}"
+                );
+                assert!(
+                    output.contains(r#"\"url\":\"https://test.example.com/page\""#),
+                    "should still rewrite later real Flight at split {split}: {output}"
+                );
+                assert!(
+                    !output.contains("__ts_rsc_"),
+                    "should resolve every placeholder"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_filter_captures_only_executable_pushes_in_the_same_script() {
+        let fake = r#"const demo='self.__next_f.push([1,"0:{\"url\":\"https://origin.example.com/fake\"}\n"])';"#;
+        let push = r#"self.__next_f.push([1,"0:{\"url\":\"https://origin.example.com/page\"}\n"])"#;
+        let rewritten_push = push.replace("origin.example.com", "test.example.com");
+        for (source, expected) in [
+            (
+                format!("{fake}{push};/* self.__next_f.push( */"),
+                format!("{fake}{rewritten_push};/* self.__next_f.push( */"),
+            ),
+            (
+                format!(
+                    "const out=`text self.__next_f.push( ${{ {{a: {push}, b: `nested ${{{push}}}`}} }} tail`;"
+                ),
+                format!(
+                    "const out=`text self.__next_f.push( ${{ {{a: {rewritten_push}, b: `nested ${{{rewritten_push}}}`}} }} tail`;"
+                ),
+            ),
+            (
+                format!(
+                    r#"const re=/["'`/]/;if (ready) /["'`/]/.test(input);const ratio=i++ / 2;const value=obj.return / 2;{push};"#
+                ),
+                format!(
+                    r#"const re=/["'`/]/;if (ready) /["'`/]/.test(input);const ratio=i++ / 2;const value=obj.return / 2;{rewritten_push};"#
+                ),
+            ),
+        ] {
+            for split in 0..=source.len() {
+                let mut processor = create_html_processor(mixed_config(10000, 10000));
+                let first = format!("<script>{}", &source[..split]);
+                let last = format!("{}</script>", &source[split..]);
+                let mut bytes = processor
+                    .process_chunk(first.as_bytes(), false)
+                    .expect("should accept script prefix");
+                bytes.extend(
+                    processor
+                        .process_chunk(last.as_bytes(), true)
+                        .expect("should complete executable Flight"),
+                );
+                assert_eq!(
+                    String::from_utf8(bytes).expect("should emit UTF-8"),
+                    format!("<script>{expected}</script>"),
+                    "should rewrite only executable calls at split {split}"
+                );
+            }
+        }
     }
 
     #[test]

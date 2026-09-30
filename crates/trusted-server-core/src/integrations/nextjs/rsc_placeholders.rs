@@ -13,6 +13,7 @@ use super::rsc_stream::{
     CapturedPayload, FragmentCapture, MAX_UNRESOLVED_RSC_PAYLOADS, RscGroupStatus,
     capture_fragment, classify_rsc_group, document_state, rsc_payload_placeholder,
 };
+use super::script_lexer::ScriptLexer;
 use super::shared::{
     RSC_PUSH_CALL_PATTERN, RSC_PUSH_CALL_PATTERN_TRIMMED, RSC_RECEIVER_CONTEXT_BYTES,
     find_rsc_push_payload_range, find_trimmed_rsc_push_payload_range,
@@ -62,7 +63,8 @@ impl NextJsRscPlaceholderRewriter {
         limit: usize,
         max_queued_payload_bytes: usize,
     ) -> ScriptRewriteAction {
-        if !content.contains("__next_f") {
+        let code = state.rsc_lexical_start.clone().mask(content);
+        if !code.contains("__next_f") {
             return if was_buffered {
                 ScriptRewriteAction::replace(content.to_owned())
             } else {
@@ -76,12 +78,13 @@ impl NextJsRscPlaceholderRewriter {
         let mut cursor = 0;
         let mut trimmed = std::mem::take(&mut state.rsc_receiver_trimmed);
         let mut queued_bytes = state.captured_payload_bytes;
-        while content[cursor..].contains("__next_f") {
+        while code[cursor..].contains("__next_f") {
             let remaining = &content[cursor..];
+            let remaining_code = &code[cursor..];
             let head = if trimmed {
-                TRIMMED_FLIGHT_PUSH_PATTERN.find(remaining)
+                TRIMMED_FLIGHT_PUSH_PATTERN.find(remaining_code)
             } else {
-                first_qualified_flight_push(remaining)
+                first_qualified_flight_push(remaining_code)
             };
             if let Some(head) = head
                 && let Some(arguments) =
@@ -91,20 +94,17 @@ impl NextJsRscPlaceholderRewriter {
                 trimmed = false;
                 continue;
             }
-            let range = if trimmed {
-                find_trimmed_rsc_push_payload_range(remaining)
-            } else {
-                find_rsc_push_payload_range(remaining)
-            };
+            let range = executable_payload_range(remaining, remaining_code, trimmed);
             let call = if trimmed {
-                RSC_PUSH_CALL_PATTERN_TRIMMED.find(remaining)
+                RSC_PUSH_CALL_PATTERN_TRIMMED.find(remaining_code)
             } else {
-                RSC_PUSH_CALL_PATTERN.find(remaining)
+                RSC_PUSH_CALL_PATTERN.find(remaining_code)
             };
             trimmed = false;
             let Some((start, end)) = range.filter(|(start, _)| {
                 call.is_some_and(|call| {
-                    call.end() == *start && !contains_qualified_flight(&remaining[..call.start()])
+                    call.end() == *start
+                        && !contains_qualified_flight(&remaining_code[..call.start()])
                 })
             }) else {
                 // A raw qualified push cannot safely continue a pending T group
@@ -198,14 +198,13 @@ impl NextJsRscPlaceholderRewriter {
                     return ScriptRewriteAction::Keep;
                 }
                 if is_last && content.len() > limit && content.contains("__next_f") {
+                    let code = state.rsc_lexical_start.clone().mask(content);
                     let mut remaining = content;
+                    let mut remaining_code = code.as_str();
                     let mut receiver_trimmed = trimmed;
                     let unsafe_continuation = loop {
-                        let range = if receiver_trimmed {
-                            find_trimmed_rsc_push_payload_range(remaining)
-                        } else {
-                            find_rsc_push_payload_range(remaining)
-                        };
+                        let range =
+                            executable_payload_range(remaining, remaining_code, receiver_trimmed);
                         let Some((start, end)) = range else {
                             break true;
                         };
@@ -219,8 +218,9 @@ impl NextJsRscPlaceholderRewriter {
                         // payload is not classified as another call. Only the
                         // first receiver can have streamed in an earlier fragment.
                         remaining = &remaining[end + 1..];
+                        remaining_code = &remaining_code[end + 1..];
                         receiver_trimmed = false;
-                        if !remaining.contains("__next_f") {
+                        if !remaining_code.contains("__next_f") {
                             break false;
                         }
                     };
@@ -237,6 +237,8 @@ impl NextJsRscPlaceholderRewriter {
     fn rewrite_fragment(
         &self,
         content: &str,
+        code: &str,
+        lexical_start: ScriptLexer,
         ctx: &IntegrationScriptContext<'_>,
         state: &mut super::rsc_stream::NextJsDocumentState,
     ) -> ScriptRewriteAction {
@@ -272,15 +274,15 @@ impl NextJsRscPlaceholderRewriter {
             );
         }
 
-        if state.rsc_probe.is_empty() && !content.contains("__next_f") {
+        if state.rsc_probe.is_empty() && !code.contains("__next_f") {
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
                 return ScriptRewriteAction::Keep;
             }
-            let probe_length = longest_identifier_prefix(content.as_bytes());
+            let probe_length = longest_identifier_prefix(code.as_bytes());
             let ready_length = content.len() - probe_length;
             state.rsc_probe.push_str(&content[ready_length..]);
-            remember_released(&mut state.rsc_receiver_context, &content[..ready_length]);
+            remember_released(&mut state.rsc_receiver_context, &code[..ready_length]);
             return if probe_length == 0 {
                 ScriptRewriteAction::Keep
             } else if ready_length == 0 {
@@ -293,7 +295,8 @@ impl NextJsRscPlaceholderRewriter {
         let prior_probe = std::mem::take(&mut state.rsc_probe);
         let mut combined = prior_probe.clone();
         combined.push_str(content);
-        if !combined.contains("__next_f") {
+        let combined_code = format!("{prior_probe}{code}");
+        if !combined_code.contains("__next_f") {
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
                 return if prior_probe.is_empty() {
@@ -302,10 +305,13 @@ impl NextJsRscPlaceholderRewriter {
                     ScriptRewriteAction::replace(combined)
                 };
             }
-            let probe_length = longest_identifier_prefix(combined.as_bytes());
+            let probe_length = longest_identifier_prefix(combined_code.as_bytes());
             let ready_length = combined.len() - probe_length;
             state.rsc_probe.push_str(&combined[ready_length..]);
-            remember_released(&mut state.rsc_receiver_context, &combined[..ready_length]);
+            remember_released(
+                &mut state.rsc_receiver_context,
+                &combined_code[..ready_length],
+            );
             if prior_probe.is_empty() && probe_length == 0 {
                 return ScriptRewriteAction::Keep;
             }
@@ -316,18 +322,18 @@ impl NextJsRscPlaceholderRewriter {
             };
         }
 
-        let identifier_start = combined
+        let identifier_start = combined_code
             .find("__next_f")
             .expect("should find the identifier that selected this branch");
         let mut context = state.rsc_receiver_context.clone();
-        context.push_str(&combined[..identifier_start]);
+        context.push_str(&combined_code[..identifier_start]);
         if !receiver_context_is_flight_push(&context) {
             // Some other object owns a `__next_f` property. Release the text
             // unchanged rather than claiming an unrelated publisher script.
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
             } else {
-                remember_released(&mut state.rsc_receiver_context, &combined);
+                remember_released(&mut state.rsc_receiver_context, &combined_code);
             }
             return if prior_probe.is_empty() {
                 ScriptRewriteAction::Keep
@@ -340,7 +346,7 @@ impl NextJsRscPlaceholderRewriter {
         // one that already streamed leaves a trimmed claim whose receiver this
         // verified context stands in for.
         state.rsc_receiver_trimmed =
-            !receiver_context_is_flight_push(&combined[..identifier_start]);
+            !receiver_context_is_flight_push(&combined_code[..identifier_start]);
         state.rsc_receiver_context.clear();
         let claimed_start = if state.rsc_receiver_trimmed {
             identifier_start
@@ -349,6 +355,8 @@ impl NextJsRscPlaceholderRewriter {
         };
         let prefix = &combined[..claimed_start];
         let claimed = &combined[claimed_start..];
+        state.rsc_lexical_start = lexical_start;
+        state.rsc_lexical_start.mask(&combined[..claimed_start]);
         let action = self.rewrite_claimed_fragment(
             claimed,
             ctx.is_last_in_text_node,
@@ -389,13 +397,23 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             state.current_fragment_protected = false;
             state.flight_node_owned = false;
             state.flight_qualifier_tail.clear();
+            state.flight_lexical = ScriptLexer::default();
             return ScriptRewriteAction::Keep;
         }
         if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
             state.current_fragment_protected = false;
             return ScriptRewriteAction::Keep;
         }
-        observe_flight_qualifier(&mut state, content);
+        let lexical_start = state.flight_lexical.clone();
+        let code = state.flight_lexical.mask(content);
+        if state.flight_lexical.is_opaque() {
+            // At the lexical nesting limit, retain the existing conservative raw
+            // qualification. Ordinary scripts without a push do not bypass Flight.
+            observe_flight_qualifier(&mut state, content);
+            state.bypass_rsc |= state.flight_node_owned;
+        } else {
+            observe_flight_qualifier(&mut state, &code);
+        }
         // A call head can complete after a tentative property probe overflowed.
         // Once it proves Flight, preserve its entire raw continuation/group.
         if state.flight_node_owned
@@ -407,16 +425,33 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             state.bypass_rsc = true;
         }
         state.current_fragment_protected = state.flight_node_owned;
-        let action = self.rewrite_fragment(content, ctx, &mut state);
+        let action = self.rewrite_fragment(content, &code, lexical_start, ctx, &mut state);
         if ctx.is_last_in_text_node {
             state.flight_node_owned = false;
             state.flight_qualifier_tail.clear();
             state.rsc_probe.clear();
             state.rsc_receiver_context.clear();
             state.rsc_receiver_trimmed = false;
+            state.flight_lexical = ScriptLexer::default();
+            state.rsc_lexical_start = ScriptLexer::default();
         }
         action
     }
+}
+
+/// Match a call head only in executable source, then read its original string.
+fn executable_payload_range(content: &str, code: &str, trimmed: bool) -> Option<(usize, usize)> {
+    if trimmed {
+        RSC_PUSH_CALL_PATTERN_TRIMMED.find(code)?;
+        return find_trimmed_rsc_push_payload_range(content);
+    }
+    let call = RSC_PUSH_CALL_PATTERN.find(code)?;
+    let identifier = call.start() + call.as_str().find("__next_f")?;
+    if !receiver_context_is_flight_push(&code[..identifier]) {
+        return None;
+    }
+    let (start, end) = find_rsc_push_payload_range(&content[call.start()..])?;
+    Some((call.start() + start, call.start() + end))
 }
 
 fn contains_qualified_flight(source: &str) -> bool {
@@ -520,6 +555,16 @@ mod tests {
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
             max_combined_payload_bytes: 10 * 1024 * 1024,
         })
+    }
+
+    #[test]
+    fn quoted_flight_spellings_do_not_claim_ownership() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+        rewriter.rewrite(r#"const demo="self.__next_f.push(";"#, &ctx(false, &state));
+        let shared = document_state(&state);
+        let state = shared.lock().expect("should lock state");
+        assert!(!state.flight_node_owned, "quoted text must not own Flight");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use super::rsc::{
     DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, PendingTChunk, TChunkStep, next_tchunk,
     rewrite_rsc_scripts_combined_with_transform,
 };
+use super::script_lexer::ScriptLexer;
 use super::shared::RscUrlRewriter;
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
@@ -58,6 +59,10 @@ pub(super) struct NextJsDocumentState {
     pub(super) current_fragment_protected: bool,
     /// Bounded qualifier observation remains active even after document bypass.
     pub(super) flight_qualifier_tail: String,
+    /// Lexical context advances with original parser fragments, never replacements.
+    pub(super) flight_lexical: ScriptLexer,
+    /// Snapshot at the beginning of a claimed buffer for source-offset matching.
+    pub(super) rsc_lexical_start: ScriptLexer,
 }
 
 impl Default for NextJsDocumentState {
@@ -77,6 +82,8 @@ impl Default for NextJsDocumentState {
             flight_node_owned: false,
             current_fragment_protected: false,
             flight_qualifier_tail: String::new(),
+            flight_lexical: ScriptLexer::default(),
+            rsc_lexical_start: ScriptLexer::default(),
         }
     }
 }
