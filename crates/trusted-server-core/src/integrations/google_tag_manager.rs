@@ -84,9 +84,9 @@ static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("GTM tag ID regex should compile")
 });
 
-/// Host alternation shared by the URL patterns below.
+/// Host alternation shared by ordinary and Flight URL patterns.
 const GTM_URL_HOSTS: &str =
-    r"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
+    r"(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
 /// The paths this integration routes, plus the empty path.
 ///
 /// A script may hold an origin and build the path later
@@ -102,7 +102,7 @@ const GTM_URL_PATHS: &str = r"(?P<path>/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/c
 /// must be the URL.
 static GTM_WHOLE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<suffix>[?#].*)?$"
+        r"^(?:https?:)?//{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<suffix>[?#].*)?$"
     ))
     .expect("GTM whole-URL regex should compile")
 });
@@ -136,7 +136,7 @@ static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .iter()
     .map(|(open, suffix, close)| {
         Regex::new(&format!(
-            "{open}{GTM_URL_HOSTS}{GTM_URL_PATHS}{suffix}{close}"
+            "{open}(?:https?:)?//{GTM_URL_HOSTS}{GTM_URL_PATHS}{suffix}{close}"
         ))
         .expect("GTM quoted-URL regex should compile")
     })
@@ -146,13 +146,18 @@ static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 // Flight spans are JS string source, not decoded JSON. Match only whole or
 // quoted routed URL tokens and preserve their delimiters, suffix and slash layer.
 static GTM_RSC_WHOLE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(?:https?:)?(?P<slash>\\{0,8}/)(?:\\{0,8}/)(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(?P<path>(?:\\{0,8}/)(?:gtm\.js|gtag(?:\\{0,8}/|\.)js|g(?:\\{0,8}/)collect|collect)|)(?P<suffix>[?#].*)?$"
-    ).expect("should compile whole Flight URL pattern")
+    // Preserve the routed paths while accepting Flight's slash escape layers.
+    let paths = GTM_URL_PATHS.replace('/', r"(?:\\{0,8}/)");
+    Regex::new(&format!(
+        r"^(?:https?:)?(?P<slash>\\{{0,8}}/)(?:\\{{0,8}}/){GTM_URL_HOSTS}{paths}(?P<suffix>[?#].*)?$"
+    ))
+    .expect("should compile whole Flight URL pattern")
 });
 static GTM_RSC_QUOTED_URL_START: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?P<open>\\{0,8}["'`])(?:https?:)?\\{0,8}/\\{0,8}/(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)"#)
-        .expect("should compile quoted Flight URL start")
+    Regex::new(&format!(
+        r#"(?P<open>\\{{0,8}}["'`])(?:https?:)?\\{{0,8}}/\\{{0,8}}/{GTM_URL_HOSTS}"#
+    ))
+    .expect("should compile quoted Flight URL start")
 });
 
 // Match the opening quote's escape layer. Higher-layer instances of that
@@ -3512,6 +3517,57 @@ container_id = "GTM-DEFAULT"
                 assert_eq!(message, "test failure");
             }
             other => panic!("Expected Integration error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ordinary_and_flight_urls_share_routing_policy() {
+        for (host, supported_host) in [
+            ("www.googletagmanager.com", true),
+            ("www.google-analytics.com", true),
+            ("analytics.google.com", true),
+            ("www.googletagmanager.com.evil", false),
+            ("example.com", false),
+        ] {
+            for (path, supported_path) in [
+                ("", true),
+                ("/gtm.js", true),
+                ("/gtag/js", true),
+                ("/gtag.js", true),
+                ("/g/collect", true),
+                ("/collect", true),
+                ("/ns.html", false),
+                ("/gtm.js/path", false),
+                ("/collect;matrix", false),
+            ] {
+                for scheme in ["https:", "http:", ""] {
+                    for suffix in ["", "?id=GTM-MIX1&v=2", "#fragment"] {
+                        let url = format!("{scheme}//{host}{path}{suffix}");
+                        let expected = if supported_host && supported_path {
+                            format!("/integrations/google_tag_manager{path}{suffix}")
+                        } else {
+                            url.clone()
+                        };
+                        for quote in ["", "'", "\"", "`"] {
+                            let source = format!("{quote}{url}{quote}");
+                            let expected = format!("{quote}{expected}{quote}");
+                            assert_eq!(
+                                GoogleTagManagerIntegration::rewrite_gtm_urls(&source),
+                                expected,
+                                "should apply ordinary routing policy: {source}"
+                            );
+                            for slash in ["/", r"\/", r"\\/"] {
+                                let flight_source = source.replace('/', slash);
+                                assert_eq!(
+                                    rewrite_gtm_rsc_span(&flight_source),
+                                    expected.replace('/', slash),
+                                    "should preserve Flight routing policy and escapes: {flight_source}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
