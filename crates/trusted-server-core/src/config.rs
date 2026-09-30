@@ -109,7 +109,9 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         D: Deserializer<'de>,
     {
         let mut settings = Settings::deserialize(deserializer)?;
-        settings.normalize_deserialized();
+        settings
+            .normalize_deserialized()
+            .map_err(serde::de::Error::custom)?;
         Ok(Self { settings })
     }
 }
@@ -797,6 +799,73 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn app_config_image_optimizer_rejects_trimmed_key_collisions() {
+        for (section, first, second) in [
+            (
+                r#"
+                [image_optimizer.profile_sets.default_images]
+                default_profile = "medium"
+                [image_optimizer.profile_sets.default_images.profiles]
+                medium = "width=100"
+                " medium" = "width=200"
+                "#,
+                "medium",
+                " medium",
+            ),
+            (
+                r#"
+                [image_optimizer.profile_sets.default_images.profiles]
+                default = "width=100"
+                [image_optimizer.profile_sets." default_images".profiles]
+                default = "width=200"
+                "#,
+                "default_images",
+                " default_images",
+            ),
+        ] {
+            let toml = crate_test_settings_str() + section;
+            let raw: Settings =
+                toml::from_str(&toml).expect("should deserialize unnormalized settings");
+            let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+            let toml_error = toml::from_str::<TrustedServerAppConfig>(&toml)
+                .expect_err("should reject colliding app-config keys");
+            let json_error = serde_json::from_value::<TrustedServerAppConfig>(value)
+                .expect_err("should reject colliding app-config keys");
+
+            for message in [toml_error.to_string(), json_error.to_string()] {
+                for expected in [
+                    "image_optimizer.profile_sets",
+                    "default_images",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                ] {
+                    assert!(
+                        message.contains(expected),
+                        "should preserve collision context with {expected:?}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn app_config_image_optimizer_normalizes_non_colliding_keys() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." default_images "]
+            default_profile = " medium "
+            [image_optimizer.profile_sets." default_images ".profiles]
+            " medium " = " width=100 "
+            "#;
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize non-colliding app config");
+        let profile_set = &app_config.settings().image_optimizer.profile_sets["default_images"];
+        assert_eq!(profile_set.default_profile, "medium");
+        assert_eq!(profile_set.profiles["medium"], "width=100");
+    }
+
+    #[test]
     fn push_validation_accepts_secret_key_names() {
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
@@ -919,7 +988,9 @@ formats = [{ width = 300, height = 250 }]
         }));
         settings.proxy.asset_routes.push(route);
 
-        settings.normalize_deserialized();
+        settings
+            .normalize_deserialized()
+            .expect("should normalize settings without key collisions");
         let serialized = serde_json::to_string(&settings).expect("should serialize settings");
 
         for legacy_store in [
