@@ -215,6 +215,43 @@ mod tests {
         String::from_utf8(output).expect("should emit UTF-8")
     }
 
+    fn mixed_output_with_compression(
+        html: &str,
+        compression: Compression,
+        chunk_size: usize,
+    ) -> String {
+        let input = if compression == Compression::Gzip {
+            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(html.as_bytes())
+                .expect("should encode gzip input");
+            encoder.finish().expect("should finish gzip input")
+        } else {
+            html.as_bytes().to_vec()
+        };
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: compression,
+                output_compression: compression,
+                chunk_size,
+            },
+            create_html_processor(mixed_config(100000, 100000)),
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(&input), &mut output)
+            .expect("should consume complete mixed response");
+        let mut decoded = Vec::new();
+        if compression == Compression::Gzip {
+            GzDecoder::new(output.as_slice())
+                .read_to_end(&mut decoded)
+                .expect("should decode gzip output");
+        } else {
+            decoded = output;
+        }
+        String::from_utf8(decoded).expect("should emit UTF-8")
+    }
+
     #[test]
     fn mixed_next_data_flight_mentions_do_not_claim_json_or_hide_gtm() {
         for text in [
@@ -447,37 +484,8 @@ mod tests {
             };
             let html = format!("<html><body>{scripts}<p>suffix</p></body></html>");
             for compression in [Compression::None, Compression::Gzip] {
-                let input = if compression == Compression::Gzip {
-                    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-                    encoder
-                        .write_all(html.as_bytes())
-                        .expect("should encode gzip bootstrap document");
-                    encoder.finish().expect("should finish gzip input")
-                } else {
-                    html.as_bytes().to_vec()
-                };
                 for chunk_size in [32, 64, 1000, 8192] {
-                    let mut pipeline = StreamingPipeline::new(
-                        PipelineConfig {
-                            input_compression: compression,
-                            output_compression: compression,
-                            chunk_size,
-                        },
-                        create_html_processor(mixed_config(100000, 100000)),
-                    );
-                    let mut bytes = Vec::new();
-                    pipeline
-                        .process(Cursor::new(&input), &mut bytes)
-                        .expect("should consume bootstrap document");
-                    let mut decoded = Vec::new();
-                    if compression == Compression::Gzip {
-                        GzDecoder::new(bytes.as_slice())
-                            .read_to_end(&mut decoded)
-                            .expect("should decode gzip bootstrap response");
-                    } else {
-                        decoded = bytes;
-                    }
-                    let output = String::from_utf8(decoded).expect("should emit UTF-8");
+                    let output = mixed_output_with_compression(&html, compression, chunk_size);
                     assert!(
                         output.contains(controls),
                         "should preserve inert bootstrap controls"
@@ -695,37 +703,8 @@ mod tests {
             "<html><body><script id=\"__NEXT_DATA__\">{data}</script><p>suffix</p></body></html>"
         );
         for compression in [Compression::None, Compression::Gzip] {
-            let input = if compression == Compression::Gzip {
-                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder
-                    .write_all(html.as_bytes())
-                    .expect("should encode actual gzip input");
-                encoder.finish().expect("should finish gzip input")
-            } else {
-                html.as_bytes().to_vec()
-            };
             for chunk_size in [32, 64, 1000, 8192] {
-                let mut pipeline = StreamingPipeline::new(
-                    PipelineConfig {
-                        input_compression: compression,
-                        output_compression: compression,
-                        chunk_size,
-                    },
-                    create_html_processor(mixed_config(100000, 100000)),
-                );
-                let mut output = Vec::new();
-                pipeline
-                    .process(Cursor::new(&input), &mut output)
-                    .expect("should process complete compressed document");
-                let mut decoded = Vec::new();
-                if compression == Compression::Gzip {
-                    GzDecoder::new(output.as_slice())
-                        .read_to_end(&mut decoded)
-                        .expect("should decode actual gzip output");
-                } else {
-                    decoded = output;
-                }
-                let output = String::from_utf8(decoded).expect("should emit UTF-8");
+                let output = mixed_output_with_compression(&html, compression, chunk_size);
                 let script = output
                     .split("<script id=\"__NEXT_DATA__\">")
                     .nth(1)
