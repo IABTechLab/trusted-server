@@ -1022,7 +1022,26 @@ pub struct ImageOptimizerSettings {
 }
 
 impl ImageOptimizerSettings {
-    fn normalize(&mut self) {
+    /// Normalize image configuration without losing conflicting original keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if retained profile-set or profile keys
+    /// collide after trimming.
+    fn normalize(&mut self) -> Result<(), Report<TrustedServerError>> {
+        validate_trimmed_image_optimizer_keys(
+            self.profile_sets.keys(),
+            "image_optimizer.profile_sets",
+        )?;
+        for (name, profile_set) in &self.profile_sets {
+            if !name.trim().is_empty() {
+                validate_trimmed_image_optimizer_keys(
+                    profile_set.profiles.keys(),
+                    &format!("image_optimizer.profile_sets {name:?}.profiles"),
+                )?;
+            }
+        }
+
         self.profile_sets = self
             .profile_sets
             .drain()
@@ -1032,6 +1051,7 @@ impl ImageOptimizerSettings {
             })
             .filter(|(key, _)| !key.is_empty())
             .collect();
+        Ok(())
     }
 
     /// Eagerly validate configured image profile sets.
@@ -1041,6 +1061,36 @@ impl ImageOptimizerSettings {
         }
         Ok(())
     }
+}
+
+/// Check retained image configuration keys before normalization discards originals.
+///
+/// # Errors
+///
+/// Returns a configuration error naming both original keys when they trim to
+/// the same non-empty name.
+fn validate_trimmed_image_optimizer_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    path: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut names: Vec<_> = keys
+        .map(|key| (key.trim(), key.as_str()))
+        .filter(|(trimmed, _)| !trimmed.is_empty())
+        .collect();
+    names.sort_unstable();
+
+    for pair in names.windows(2) {
+        let (trimmed, first) = pair[0];
+        let (next_trimmed, second) = pair[1];
+        if trimmed == next_trimmed {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "{path} keys {first:?} and {second:?} collide after trimming to {trimmed:?}"
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Named set of profile-table Image Optimizer mappings.
@@ -2957,22 +3007,28 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
-    pub(crate) fn normalize_deserialized(&mut self) {
+    /// Normalize settings after deserialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if image optimizer keys collide after trimming.
+    pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
         self.proxy.normalize();
-        self.image_optimizer.normalize();
+        self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
+        Ok(())
     }
 
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.normalize_deserialized();
+        settings.normalize_deserialized()?;
         settings.prepare_runtime()?;
 
         settings.validate().map_err(|err| {
@@ -6615,6 +6671,189 @@ source_domain = "partner.example.com"
             format!("{err:?}").contains("image_optimizer region `us-east-2` is not supported"),
             "should mention the unsupported Image Optimizer region: {err:?}"
         );
+    }
+
+    #[test]
+    fn image_optimizer_rejects_profile_keys_that_collide_after_trimming() {
+        for (first, second, second_params) in [
+            ("medium", " medium", "width=200"),
+            ("medium ", "\tmedium", "width=200"),
+            (" medium ", "medium", "width=100"),
+        ] {
+            let toml = format!(
+                "{}\n[image_optimizer.profile_sets.default_images]\n\
+                 default_profile = \"medium\"\n\
+                 [image_optimizer.profile_sets.default_images.profiles]\n\
+                 {first:?} = \"width=100\"\n{second:?} = {second_params:?}\n",
+                crate_test_settings_str()
+            );
+            let raw: Settings =
+                toml::from_str(&toml).expect("should deserialize unnormalized settings");
+            let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+            let mut messages = Vec::new();
+
+            for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
+                let error = result.expect_err("should reject colliding profile keys");
+                assert!(
+                    matches!(
+                        error.current_context(),
+                        TrustedServerError::Configuration { .. }
+                    ),
+                    "should return a configuration error"
+                );
+                let message = error.to_string();
+                for expected in [
+                    "image_optimizer.profile_sets",
+                    "default_images",
+                    "profiles",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                    "\"medium\"",
+                ] {
+                    assert!(
+                        message.contains(expected),
+                        "should identify the collision with {expected:?}: {message}"
+                    );
+                }
+                messages.push(message);
+            }
+            assert_eq!(messages[0], messages[1], "should report a stable collision");
+        }
+    }
+
+    #[test]
+    fn image_optimizer_rejects_profile_set_keys_that_collide_after_trimming() {
+        for (first, second, second_params) in [
+            ("default_images", " default_images", "width=200"),
+            ("default_images ", "\tdefault_images", "width=200"),
+            (" default_images ", "default_images", "width=100"),
+        ] {
+            let toml = format!(
+                "{}\n[image_optimizer.profile_sets.{first:?}.profiles]\n\
+                 default = \"width=100\"\n\
+                 [image_optimizer.profile_sets.{second:?}.profiles]\n\
+                 default = {second_params:?}\n",
+                crate_test_settings_str()
+            );
+            let raw: Settings =
+                toml::from_str(&toml).expect("should deserialize unnormalized settings");
+            let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+            let mut messages = Vec::new();
+
+            for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
+                let error = result.expect_err("should reject colliding profile-set keys");
+                assert!(
+                    matches!(
+                        error.current_context(),
+                        TrustedServerError::Configuration { .. }
+                    ),
+                    "should return a configuration error"
+                );
+                let message = error.to_string();
+                for expected in [
+                    "image_optimizer.profile_sets",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                    "\"default_images\"",
+                ] {
+                    assert!(
+                        message.contains(expected),
+                        "should identify the collision with {expected:?}: {message}"
+                    );
+                }
+                messages.push(message);
+            }
+            assert_eq!(messages[0], messages[1], "should report a stable collision");
+        }
+    }
+
+    #[test]
+    fn image_optimizer_normalization_preserves_non_colliding_configuration() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." default_images "]
+            base_params = " quality=70 "
+            default_profile = " medium "
+            profile_param = " profile "
+            aspect_ratio_param = " ratio "
+            debug_param = " debug "
+
+            [image_optimizer.profile_sets." default_images ".profiles]
+            " medium " = " width=100 "
+            large = "width=200"
+            "" = "ignored"
+            " " = "also ignored"
+
+            [image_optimizer.profile_sets." default_images ".aspect_ratios]
+            allowed = [" 1-1 ", ""]
+            profiles = [" medium ", ""]
+
+            [image_optimizer.profile_sets." default_images ".crop_offsets]
+            x_param = " x "
+            y_param = " y "
+            buckets = [90, 10, 10]
+
+            [image_optimizer.profile_sets.other_images.profiles]
+            medium = "width=300"
+            default = "width=400"
+
+            [image_optimizer.profile_sets."".profiles]
+            default = "ignored"
+            " default " = "also ignored"
+
+            [image_optimizer.profile_sets." "]
+
+            [[proxy.asset_routes]]
+            prefix = "/images/"
+            origin_url = "https://assets.example.com"
+
+            [proxy.asset_routes.image_optimizer]
+            region = " us_east "
+            profile_set = " default_images "
+            "#;
+        let raw: Settings =
+            toml::from_str(&toml).expect("should deserialize unnormalized settings");
+        let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+
+        for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
+            let settings = result.expect("should accept non-colliding keys");
+            assert_eq!(settings.image_optimizer.profile_sets.len(), 2);
+            let profile_set = &settings.image_optimizer.profile_sets["default_images"];
+            assert_eq!(profile_set.base_params, "quality=70");
+            assert_eq!(profile_set.default_profile, "medium");
+            assert_eq!(profile_set.profile_param, "profile");
+            assert_eq!(profile_set.aspect_ratio_param, "ratio");
+            assert_eq!(profile_set.debug_param, "debug");
+            assert_eq!(profile_set.profiles.len(), 2);
+            assert_eq!(profile_set.profiles["medium"], "width=100");
+            assert_eq!(profile_set.profiles["large"], "width=200");
+            assert_eq!(
+                settings.image_optimizer.profile_sets["other_images"].profiles["medium"],
+                "width=300",
+                "should allow the same profile name in distinct sets"
+            );
+            let ratios = profile_set
+                .aspect_ratios
+                .as_ref()
+                .expect("should retain ratios");
+            assert_eq!(ratios.allowed, ["1-1"]);
+            assert_eq!(ratios.profiles, ["medium"]);
+            let offsets = profile_set
+                .crop_offsets
+                .as_ref()
+                .expect("should retain offsets");
+            assert_eq!(offsets.x_param, "x");
+            assert_eq!(offsets.y_param, "y");
+            assert_eq!(offsets.buckets, [10, 90]);
+            let route = settings.proxy.asset_routes[0]
+                .image_optimizer
+                .as_ref()
+                .expect("should retain the route's image optimizer");
+            assert_eq!(route.region, "us_east");
+            assert_eq!(route.profile_set, "default_images");
+        }
     }
 
     #[test]
