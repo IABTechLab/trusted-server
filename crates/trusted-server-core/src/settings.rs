@@ -6673,6 +6673,32 @@ source_domain = "partner.example.com"
         );
     }
 
+    fn assert_image_optimizer_key_collision(toml: &str, expected_fragments: &[&str]) {
+        let raw: Settings = toml::from_str(toml).expect("should deserialize unnormalized settings");
+        let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+        let mut messages = Vec::new();
+
+        for result in [Settings::from_toml(toml), Settings::from_json_value(value)] {
+            let error = result.expect_err("should reject colliding image optimizer keys");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::Configuration { .. }
+                ),
+                "should return a configuration error"
+            );
+            let message = error.to_string();
+            for expected in expected_fragments {
+                assert!(
+                    message.contains(expected),
+                    "should identify the collision with {expected:?}: {message}"
+                );
+            }
+            messages.push(message);
+        }
+        assert_eq!(messages[0], messages[1], "should report a stable collision");
+    }
+
     #[test]
     fn image_optimizer_rejects_profile_keys_that_collide_after_trimming() {
         for (first, second, second_params) in [
@@ -6687,22 +6713,9 @@ source_domain = "partner.example.com"
                  {first:?} = \"width=100\"\n{second:?} = {second_params:?}\n",
                 crate_test_settings_str()
             );
-            let raw: Settings =
-                toml::from_str(&toml).expect("should deserialize unnormalized settings");
-            let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
-            let mut messages = Vec::new();
-
-            for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
-                let error = result.expect_err("should reject colliding profile keys");
-                assert!(
-                    matches!(
-                        error.current_context(),
-                        TrustedServerError::Configuration { .. }
-                    ),
-                    "should return a configuration error"
-                );
-                let message = error.to_string();
-                for expected in [
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
                     "image_optimizer.profile_sets",
                     "default_images",
                     "profiles",
@@ -6710,15 +6723,8 @@ source_domain = "partner.example.com"
                     &format!("{first:?}"),
                     &format!("{second:?}"),
                     "\"medium\"",
-                ] {
-                    assert!(
-                        message.contains(expected),
-                        "should identify the collision with {expected:?}: {message}"
-                    );
-                }
-                messages.push(message);
-            }
-            assert_eq!(messages[0], messages[1], "should report a stable collision");
+                ],
+            );
         }
     }
 
@@ -6736,36 +6742,16 @@ source_domain = "partner.example.com"
                  default = {second_params:?}\n",
                 crate_test_settings_str()
             );
-            let raw: Settings =
-                toml::from_str(&toml).expect("should deserialize unnormalized settings");
-            let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
-            let mut messages = Vec::new();
-
-            for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
-                let error = result.expect_err("should reject colliding profile-set keys");
-                assert!(
-                    matches!(
-                        error.current_context(),
-                        TrustedServerError::Configuration { .. }
-                    ),
-                    "should return a configuration error"
-                );
-                let message = error.to_string();
-                for expected in [
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
                     "image_optimizer.profile_sets",
                     "collide after trimming",
                     &format!("{first:?}"),
                     &format!("{second:?}"),
                     "\"default_images\"",
-                ] {
-                    assert!(
-                        message.contains(expected),
-                        "should identify the collision with {expected:?}: {message}"
-                    );
-                }
-                messages.push(message);
-            }
-            assert_eq!(messages[0], messages[1], "should report a stable collision");
+                ],
+            );
         }
     }
 
