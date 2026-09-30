@@ -7,8 +7,10 @@
 use axum::body::Body as AxumBody;
 use axum::http::Request;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
+use std::sync::Arc;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -937,4 +939,47 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
         "should not leak generated placeholders: {html}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_html_response_is_complete() {
+    for gzip in [false, true] {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            gzip,
+            false,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build mixed integration router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/article")
+            .header("host", nextjs_auction::PUBLISHER_HOST)
+            .header("accept", "text/html")
+            .body(AxumBody::empty())
+            .expect("should build navigation");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should serve HTML");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().expect("should have ASCII coding")),
+            gzip.then_some("gzip")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should consume entire adapter body");
+        nextjs_auction::assert_script_composition_response(&body, gzip);
+    }
 }

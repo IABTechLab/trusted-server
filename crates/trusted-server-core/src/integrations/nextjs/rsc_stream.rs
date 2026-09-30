@@ -9,7 +9,7 @@ use crate::streaming_processor::StreamProcessor;
 
 use super::rsc::{
     DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, PendingTChunk, TChunkStep, next_tchunk,
-    rewrite_rsc_scripts_combined_with_limit,
+    rewrite_rsc_scripts_combined_with_transform,
 };
 use super::shared::RscUrlRewriter;
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
@@ -36,6 +36,9 @@ pub(super) struct CapturedPayload {
 pub(super) struct NextJsDocumentState {
     pub(super) namespace: String,
     pub(super) next_data: FragmentState,
+    /// One-shot discriminator set by the matched Pages stage and consumed by
+    /// the immediately following Flight stage, including empty/pass-through text.
+    pub(super) next_data_fragment: bool,
     pub(super) rsc_script: FragmentState,
     pub(super) rsc_probe: String,
     /// Tail of script text already released for the current text node, kept so a
@@ -49,6 +52,12 @@ pub(super) struct NextJsDocumentState {
     pub(super) captured_payload_bytes: usize,
     pub(super) next_placeholder_index: usize,
     pub(super) bypass_rsc: bool,
+    /// Qualified Flight ownership lasts only for the current script text node.
+    pub(super) flight_node_owned: bool,
+    /// Snapshot consumed by downstream GTM, including the final raw fragment.
+    pub(super) current_fragment_protected: bool,
+    /// Bounded qualifier observation remains active even after document bypass.
+    pub(super) flight_qualifier_tail: String,
 }
 
 impl Default for NextJsDocumentState {
@@ -56,6 +65,7 @@ impl Default for NextJsDocumentState {
         Self {
             namespace: uuid::Uuid::new_v4().simple().to_string(),
             next_data: FragmentState::Idle,
+            next_data_fragment: false,
             rsc_script: FragmentState::Idle,
             rsc_probe: String::new(),
             rsc_receiver_context: String::new(),
@@ -64,6 +74,9 @@ impl Default for NextJsDocumentState {
             captured_payload_bytes: 0,
             next_placeholder_index: 0,
             bypass_rsc: false,
+            flight_node_owned: false,
+            current_fragment_protected: false,
+            flight_qualifier_tail: String::new(),
         }
     }
 }
@@ -145,11 +158,15 @@ pub(super) fn capture_fragment<'a>(
 
 pub(super) struct NextJsRscStreamProcessorFactory {
     config: Arc<NextJsIntegrationConfig>,
+    transform: Option<fn(&str) -> String>,
 }
 
 impl NextJsRscStreamProcessorFactory {
-    pub(super) fn new(config: Arc<NextJsIntegrationConfig>) -> Self {
-        Self { config }
+    pub(super) fn new(
+        config: Arc<NextJsIntegrationConfig>,
+        transform: Option<fn(&str) -> String>,
+    ) -> Self {
+        Self { config, transform }
     }
 }
 
@@ -170,6 +187,7 @@ impl IntegrationHtmlStreamProcessorFactory for NextJsRscStreamProcessorFactory {
             context.request_host,
             context.request_scheme,
             limit,
+            self.transform,
         ))
     }
 }
@@ -185,6 +203,7 @@ pub(super) struct NextJsRscStreamProcessor {
     group: Vec<CapturedPayload>,
     classifier: RscGroupClassifier,
     rewriter: RscUrlRewriter,
+    transform: Option<fn(&str) -> String>,
 }
 
 impl NextJsRscStreamProcessor {
@@ -194,6 +213,7 @@ impl NextJsRscStreamProcessor {
         request_host: String,
         request_scheme: String,
         limit: usize,
+        transform: Option<fn(&str) -> String>,
     ) -> Self {
         Self {
             state,
@@ -206,6 +226,7 @@ impl NextJsRscStreamProcessor {
             group: Vec::new(),
             classifier: RscGroupClassifier::new(limit),
             rewriter: RscUrlRewriter::new(),
+            transform,
         }
     }
 
@@ -325,13 +346,14 @@ impl NextJsRscStreamProcessor {
                     .iter()
                     .map(|payload| payload.original.as_str())
                     .collect();
-                let rewritten = rewrite_rsc_scripts_combined_with_limit(
+                let rewritten = rewrite_rsc_scripts_combined_with_transform(
                     &payloads,
                     &self.rewriter,
                     &self.origin_host,
                     &self.request_host,
                     &self.request_scheme,
                     self.limit,
+                    self.transform,
                 );
                 if rewritten.len() != self.group.len() {
                     log::warn!(
@@ -1126,9 +1148,58 @@ mod tests {
                 "proxy.example.com".to_owned(),
                 "https".to_owned(),
                 limit,
+                None,
             ),
             placeholders,
         )
+    }
+
+    #[test]
+    fn enabled_gtm_transform_never_mutates_fallback_originals() {
+        let body = "'http://www.googletagmanager.com/gtm.js'";
+        let invalid = format!("1:Tzz,{body}");
+        let incomplete = format!("1:Tffff,{body}");
+        let header_tail = format!("T{:x},{body}", body.len());
+        let escape_tail = format!("41{body}");
+        let marker_tail = format!("c\n\0SPLIT\0{body}");
+        for payloads in [
+            vec![invalid.as_str()],
+            vec![incomplete.as_str()],
+            vec!["1:", header_tail.as_str()],
+            vec![r"1:T2,\u00", escape_tail.as_str()],
+            vec!["1:T3,ab", marker_tail.as_str()],
+        ] {
+            let (mut processor, placeholders) = processor_with_payloads(&payloads, 10000);
+            processor.transform =
+                Some(crate::integrations::google_tag_manager::rewrite_gtm_rsc_span);
+            let output = processor
+                .process_chunk(placeholders.concat().as_bytes(), true)
+                .expect("should restore fallback group");
+            assert_eq!(
+                output,
+                payloads.concat().as_bytes(),
+                "should never transform original fallback bytes"
+            );
+        }
+        let (mut processor, placeholders) = processor_with_payloads(&[&incomplete, body], 120);
+        processor.transform = Some(crate::integrations::google_tag_manager::rewrite_gtm_rsc_span);
+        let interstitial = "x".repeat(100);
+        let input = format!("{}{interstitial}{}", placeholders[0], placeholders[1]);
+        assert_eq!(
+            processor
+                .process_chunk(input.as_bytes(), true)
+                .expect("should restore held-output overflow"),
+            format!("{incomplete}{interstitial}{body}").as_bytes()
+        );
+        let (mut processor, _) = processor_with_payloads(&[body], 1000);
+        processor.transform = Some(crate::integrations::google_tag_manager::rewrite_gtm_rsc_span);
+        assert!(
+            processor
+                .process_chunk(&[], true)
+                .expect_err("should reject missing captured placeholder")
+                .to_string()
+                .contains("not present")
+        );
     }
 
     #[test]
