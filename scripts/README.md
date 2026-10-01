@@ -18,7 +18,19 @@ their documented orchestration handles a probe deliberately.
 | `smoke-common.sh`                         | Sourced by the four smoke scripts                                  | Defines bounded port, process, config, secret, and response assertions. Do not invoke it as a standalone smoke.                                                           |
 | `template-cache-local-test.sh`            | Viceroy, Node, OpenSSL, `curl`, `lsof`; optional ports and mode    | Builds local artifacts, generates certificates and fixtures in a temporary directory, stops owned servers, and removes the directory.                                     |
 | `test-cli.sh`                             | Rustup and the host toolchain; optional host triple                | May install the selected Rust target, then runs native CLI and browser-audit tests. Cargo artifacts persist.                                                              |
+| `docs-proposal/propose.sh`                | Merge SHA on `main`, work dir; Copilot CLI, Node, `npm`            | Runs Copilot CLI to edit `docs/guide/**` or `docs/index.md`, formats docs, and writes a patch, rationale, and evidence into the work dir. Leaves the edits staged.        |
+| `docs-proposal/publish.sh`                | Merge SHA, work dir from `propose.sh`; `gh` with write `GH_TOKEN`  | Applies the patch, runs the docs gates, force-pushes `docs/auto/<sha12>`, opens or edits its PR, and posts a per-hunk review. Never writes `main`.                        |
+| `docs-proposal/test.sh`                   | Git and Node                                                       | Tests the helpers and publish flow against a temporary repository with stubbed `gh` and `npm`; removes it on exit.                                                        |
 
 The four adapter smoke contracts are documented in the
 [deployment guides](../docs/guide/integrations-overview.md#adapter-support).
 Repository-wide verification policy lives in [TESTING.md](../TESTING.md).
+
+The `Documentation proposal` workflow runs both proposal scripts after code
+merges to `main` and opens one pull request per merge on `docs/auto/<sha12>`.
+It needs the organization Copilot policy "Allow use of Copilot CLI billed to
+the organization" and the repository setting "Allow GitHub Actions to create
+and approve pull requests". Pull requests opened with `GITHUB_TOKEN` do not
+trigger other workflows, so the publish job runs the docs gates itself; push to
+the proposal branch to run regular CI. Retry a merge from the workflow's manual
+dispatch with its full commit SHA.

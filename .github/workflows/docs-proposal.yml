@@ -1,0 +1,110 @@
+name: Documentation proposal
+
+# Proposes documentation edits with Copilot CLI after code merges to main and
+# opens one reviewable pull request per merge. See
+# docs/superpowers/specs/2026-10-01-docs-proposal-automation-design.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "trusted-server.example.toml"
+      - "edgezero.toml"
+      - "fastly.toml"
+      - ".cargo/config.toml"
+      - "scripts/**"
+      - "!scripts/docs-proposal/**"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full SHA of a commit on main to propose documentation for
+        required: true
+        type: string
+
+permissions: {}
+
+# Sequential merges are proposed one at a time, in order.
+concurrency:
+  group: docs-proposal
+  cancel-in-progress: false
+
+env:
+  MERGE_SHA: ${{ inputs.sha || github.sha }}
+
+jobs:
+  # Copilot runs here with a read-only token; it cannot push or open PRs.
+  propose:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.MERGE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+          cache: "npm"
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot@1.0.90
+
+      - name: Propose documentation edits
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/docs-proposal/propose.sh "$MERGE_SHA" .docs-proposal
+
+      - name: Upload proposal
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-proposal
+          path: .docs-proposal/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  # Copilot does not run here; this job validates and publishes the patch.
+  publish:
+    needs: propose
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.MERGE_SHA }}
+          fetch-depth: 0
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+          cache: "npm"
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Download proposal
+        uses: actions/download-artifact@v4
+        with:
+          name: docs-proposal
+          path: .docs-proposal
+
+      - name: Publish proposal pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/docs-proposal/publish.sh "$MERGE_SHA" .docs-proposal
