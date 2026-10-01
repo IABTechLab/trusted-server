@@ -9,10 +9,11 @@ use error_stack::{Report, ResultExt as _};
 use rand::rngs::OsRng;
 
 use super::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+    StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -254,7 +255,7 @@ pub(crate) struct StubHttpClient {
     streaming_responses_supported: std::sync::atomic::AtomicBool,
     pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
-    cache_bypass_flags: Mutex<Vec<bool>>,
+    cache_intents: Mutex<Vec<PlatformCacheIntent>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
@@ -286,7 +287,7 @@ impl StubHttpClient {
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
-            cache_bypass_flags: Mutex::new(Vec::new()),
+            cache_intents: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
@@ -446,11 +447,11 @@ impl StubHttpClient {
             .clone()
     }
 
-    /// Return cache-bypass flags captured per `send` or `send_async` call, in order.
-    pub(crate) fn recorded_cache_bypass_flags(&self) -> Vec<bool> {
-        self.cache_bypass_flags
+    /// Return the cache intent captured per `send` or `send_async` call, in order.
+    pub(crate) fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
+        self.cache_intents
             .lock()
-            .expect("should lock cache bypass flags")
+            .expect("should lock cache intents")
             .clone()
     }
 
@@ -528,10 +529,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock image optimizer options")
             .push(request.image_optimizer.clone());
-        self.cache_bypass_flags
+        self.cache_intents
             .lock()
-            .expect("should lock cache bypass flags")
-            .push(request.bypass_cache);
+            .expect("should lock cache intents")
+            .push(request.cache_intent.clone());
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
@@ -627,10 +628,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(backend_name.clone());
-        self.cache_bypass_flags
+        self.cache_intents
             .lock()
-            .expect("should lock cache bypass flags")
-            .push(request.bypass_cache);
+            .expect("should lock cache intents")
+            .push(request.cache_intent.clone());
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
@@ -1113,9 +1114,9 @@ mod tests {
             "should record the backend name"
         );
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![false],
-            "should record the default cache-bypass flag"
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Default],
+            "should record the default cache intent"
         );
     }
 
@@ -1204,9 +1205,9 @@ mod tests {
             "should record both send_async calls in order"
         );
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![false, true],
-            "should record both send_async cache-bypass flags in order"
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Default, PlatformCacheIntent::Bypass],
+            "should record both send_async cache intents in order"
         );
     }
 
