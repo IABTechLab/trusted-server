@@ -42,12 +42,13 @@ pub struct ProbeShareabilityArgs {
     #[arg(skip)]
     pub cookie: Vec<String>,
 
-    /// Request header the origin is configured to vary on, beyond `rsc`. Repeatable.
+    /// Request header and representative value to probe as NAME=VALUE. Repeatable.
     ///
-    /// Mirror `creative_opportunities.template_cache_vary` here. Each additional header
-    /// is compared independently as absent versus `1`, both with and without RSC;
-    /// built-in axes are not repeated.
-    #[arg(long = "vary-header")]
+    /// Mirror `creative_opportunities.template_cache_vary` here and supply each value
+    /// the origin uses, for example x-exp-variant=A and x-exp-variant=B. Values are
+    /// compared against the absent baseline and one another, with and without RSC.
+    /// A bare NAME samples `1`; bare built-in axes are not repeated.
+    #[arg(long = "vary-header", value_name = "NAME[=VALUE]")]
     pub vary_header: Vec<String>,
 
     /// Cookie every request carries to get past a bot wall, read from
