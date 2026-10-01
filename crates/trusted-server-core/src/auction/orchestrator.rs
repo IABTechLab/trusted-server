@@ -2600,7 +2600,7 @@ mod tests {
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -4701,7 +4701,7 @@ mod tests {
                 mediator: None,
                 timeout_ms: 2000,
                 creative_store: "creative_store".to_string(),
-                allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+                allowed_context_keys: BTreeSet::from(["permutive_segments".to_string()]),
             };
 
             let orchestrator = AuctionOrchestrator::new(config);
