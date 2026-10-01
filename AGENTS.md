@@ -102,6 +102,9 @@ cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
 
+# Core build-digest filesystem tests are native-only.
+cargo test -p trusted-server-core --test template_build_digest
+
 # Run host-target CLI tests (workspace default target is wasm32-wasip1)
 # Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
 # or aarch64-apple-darwin on Apple Silicon macOS.
@@ -128,6 +131,9 @@ cargo clippy-spin-wasm
 # `--target` so they reproduce it on any host.
 cargo clippy-cli
 cargo clippy-codegen
+
+# The native-only core build-digest tests are outside the adapter lint aliases.
+cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings
 
 # Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
 cargo check-fastly && cargo check-axum && cargo check-cloudflare
@@ -351,6 +357,7 @@ Every PR must pass:
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
+8. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 
 ---
 

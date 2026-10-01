@@ -24,13 +24,12 @@ use crate::creative_opportunities::AssemblyMode;
 
 /// Version of the cached entry format and assembly contract.
 ///
-/// Bump when the stored metadata layout, seam marker format, or assembly contract
-/// changes. Core implementation edits (including Rust-inlined head programs) are
-/// automatically isolated by the build digest in the template fingerprint; changes
-/// to emitted bytes alone no longer require a manual bump. The build digest covers
-/// core sources, build logic, manifests, and the workspace lockfile when present.
-/// Changes outside those inputs that affect template compatibility still require
-/// a bump unless another fingerprint input already isolates them.
+/// The build digest in the template fingerprint already isolates every core change,
+/// including the metadata encoding, the seam marker, and Rust-inlined head programs,
+/// so those need no bump. Bump this only when code outside that digest changes
+/// template compatibility, such as entry storage in
+/// `trusted-server-adapter-fastly/src/template_cache.rs` or the Rust side of
+/// `trusted-server-js`, unless another fingerprint input already isolates the change.
 ///
 /// | Version | Transform |
 /// | ------- | --------- |

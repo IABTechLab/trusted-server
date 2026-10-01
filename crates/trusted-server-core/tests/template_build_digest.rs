@@ -3,6 +3,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
@@ -25,6 +27,7 @@ impl SourceTree {
         let mut files = vec![
             ("Cargo.toml", "workspace manifest"),
             ("Cargo.lock", "locked dependencies"),
+            ("edgezero.toml", "app manifest"),
             ("crates/trusted-server-core/Cargo.toml", "core manifest"),
             ("crates/trusted-server-core/build.rs", "build script"),
             ("crates/trusted-server-core/src/lib.rs", "mod integrations;"),
@@ -65,12 +68,50 @@ fn identical_sources_ignore_checkout_path_and_creation_order() {
 }
 
 #[test]
+fn editor_and_os_dotfiles_do_not_change_the_digest() {
+    let tree = SourceTree::new(false);
+    let original = tree.digest();
+    fs::write(tree.core.join("src/.DS_Store"), b"finder").expect("should write OS metadata");
+    fs::write(tree.core.join("src/integrations/.gpt.rs.swp"), b"swap")
+        .expect("should write editor swap file");
+    fs::create_dir(tree.core.join("src/.editor")).expect("should create hidden editor directory");
+    fs::write(tree.core.join("src/.editor/state"), b"state")
+        .expect("should write hidden editor state");
+
+    assert_eq!(
+        tree.digest(),
+        original,
+        "should ignore dot-prefixed editor and OS artifacts"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_editor_lock_symlink_does_not_change_the_digest() {
+    let tree = SourceTree::new(false);
+    let original = tree.digest();
+    // Emacs lock files are dangling symlinks while a buffer has unsaved edits.
+    symlink(
+        "user@example.com.1234:1700000000",
+        tree.core.join("src/integrations/.#gpt.rs"),
+    )
+    .expect("should create an editor lock symlink");
+
+    assert_eq!(
+        tree.digest(),
+        original,
+        "should ignore dangling dot-prefixed editor lock symlinks"
+    );
+}
+
+#[test]
 fn every_source_and_build_input_changes_the_digest() {
     let tree = SourceTree::new(false);
     let original = tree.digest();
     for path in [
         "Cargo.toml",
         "Cargo.lock",
+        "edgezero.toml",
         "crates/trusted-server-core/Cargo.toml",
         "crates/trusted-server-core/build.rs",
         "crates/trusted-server-core/src/lib.rs",
@@ -145,5 +186,14 @@ fn path_and_content_boundaries_are_unambiguous() {
 fn missing_required_manifest_fails_the_build() {
     let tree = SourceTree::new(false);
     fs::remove_file(tree.core.join("Cargo.toml")).expect("should remove required manifest");
+    tree.digest();
+}
+
+#[test]
+#[should_panic(expected = "should read template build input")]
+fn missing_required_app_manifest_fails_the_build() {
+    let tree = SourceTree::new(false);
+    fs::remove_file(tree.root.path().join("edgezero.toml"))
+        .expect("should remove required app manifest");
     tree.digest();
 }

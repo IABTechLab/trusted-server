@@ -8,18 +8,22 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use edgezero_core::manifest::ManifestLoader;
 use sha2::{Digest as _, Sha256};
+
+/// Crate-relative build inputs that are both watched and hashed besides `src/`.
+const CRATE_INPUTS: [&str; 2] = ["build.rs", "Cargo.toml"];
+/// Workspace-relative inputs hashed under a `workspace/` logical prefix.
+const WORKSPACE_INPUTS: [&str; 3] = ["Cargo.toml", "Cargo.lock", "edgezero.toml"];
 
 fn main() {
     // Watching the directory also catches newly added and removed source files.
-    for input in [
-        "src",
-        "build.rs",
-        "Cargo.toml",
-        "../../Cargo.toml",
-        "../../Cargo.lock",
-    ] {
+    println!("cargo:rerun-if-changed=src");
+    for input in CRATE_INPUTS {
         println!("cargo:rerun-if-changed={input}");
+    }
+    for input in WORKSPACE_INPUTS {
+        println!("cargo:rerun-if-changed=../../{input}");
     }
 
     let crate_dir = PathBuf::from(
@@ -30,15 +34,41 @@ fn main() {
     let digest = template_build_digest(&crate_dir);
     fs::write(
         out_dir.join("template_build_digest.rs"),
-        format!("pub(crate) const TEMPLATE_BUILD_DIGEST: &str = \"{digest}\";\n"),
+        format!("const TEMPLATE_BUILD_DIGEST: &str = \"{digest}\";\n"),
     )
     .expect("should write the template build digest");
+
+    // Keep every adapter's compiled default synchronized with the repository manifest.
+    let manifest_path = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("should resolve the workspace root from CARGO_MANIFEST_DIR")
+        .join("edgezero.toml");
+    let manifest = match ManifestLoader::from_path(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            println!(
+                "cargo::error=should load EdgeZero manifest at {}: {error}",
+                manifest_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let Some(config_store) = manifest.manifest().stores.config.as_ref() else {
+        println!(
+            "cargo::error=should declare [stores.config] in EdgeZero manifest at {}",
+            manifest_path.display()
+        );
+        std::process::exit(1);
+    };
+    let default_store_id = config_store.default_id();
+    println!("cargo:rustc-env=TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID={default_store_id}");
 }
 
 /// Hash the core implementation and its dependency resolution without checkout paths.
 ///
 /// This private workspace crate lives two levels below the workspace manifest.
-/// All source files are included, including embedded JS and future asset types.
+/// All non-hidden source files are included, including embedded JS and future asset types.
 /// Unrelated edits intentionally invalidate templates rather than risk stale code.
 ///
 /// # Panics
@@ -48,7 +78,7 @@ fn main() {
 pub(crate) fn template_build_digest(crate_dir: &Path) -> String {
     let mut sources = Vec::new();
     collect_sources(crate_dir, Path::new("src"), &mut sources);
-    sources.extend([PathBuf::from("build.rs"), PathBuf::from("Cargo.toml")]);
+    sources.extend(CRATE_INPUTS.map(PathBuf::from));
     let mut inputs: Vec<_> = sources
         .into_iter()
         .map(|path| {
@@ -65,16 +95,14 @@ pub(crate) fn template_build_digest(crate_dir: &Path) -> String {
             (logical_path, bytes)
         })
         .collect();
-    inputs.push((
-        "workspace/Cargo.toml".to_owned(),
-        fs::read(crate_dir.join("../../Cargo.toml")).expect("should read template build input"),
-    ));
-    match fs::read(crate_dir.join("../../Cargo.lock")) {
-        Ok(bytes) => inputs.push(("workspace/Cargo.lock".to_owned(), bytes)),
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        result => {
-            result.expect("should read optional workspace lockfile when present");
-        }
+    for input in WORKSPACE_INPUTS {
+        let bytes = match fs::read(crate_dir.join("../..").join(input)) {
+            Err(error) if input == "Cargo.lock" && error.kind() == ErrorKind::NotFound => {
+                continue;
+            }
+            result => result.expect("should read template build input"),
+        };
+        inputs.push((format!("workspace/{input}"), bytes));
     }
     inputs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
@@ -94,7 +122,12 @@ fn collect_sources(crate_dir: &Path, relative: &Path, sources: &mut Vec<PathBuf>
         fs::read_dir(crate_dir.join(relative)).expect("should read core source directory");
     for entry in entries {
         let entry = entry.expect("should read core source entry");
-        let path = relative.join(entry.file_name());
+        let name = entry.file_name();
+        // Editor lock symlinks, swap files, and OS metadata are not compiled sources.
+        if name.as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        let path = relative.join(name);
         let kind = entry
             .file_type()
             .expect("should read core source file type");
