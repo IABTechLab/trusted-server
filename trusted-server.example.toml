@@ -63,6 +63,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "publisher_proxy_secret"
 # Optional: override the outbound Host header sent to origin_url.
 # origin_host_header_override = "www.example.com"
+# Fastly only: emit processed server-side ad stack HTML as identity and let
+# Fastly dynamically compress it at delivery. Defaults to false.
+# ssat_compression_offload_enabled = true
 # Optional: max bytes buffered when a response is post-processed in full (HTML
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
