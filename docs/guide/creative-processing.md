@@ -812,7 +812,7 @@ accept an arbitrary asset name from an integration registration.
 
 ### Bundle Types
 
-Each integration is built as a separate IIFE at compile time (`crates/trusted-server-js/dist/`):
+Each integration is built as a separate IIFE at compile time (into Cargo's `OUT_DIR`; `npm run build` writes the same files to `crates/trusted-server-js/dist/`):
 
 - `tsjs-core.js` — Core API (always included)
 - `tsjs-creative.js` — Creative click-guard and tracking
