@@ -638,7 +638,8 @@ fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
         .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
 
     trusted_server_js::all_module_ids()
-        .into_iter()
+        .iter()
+        .copied()
         .find(|&id| id == stem)
 }
 
@@ -2109,7 +2110,7 @@ fn template_fingerprint(settings: &Settings) -> String {
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(
-        trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
+        trusted_server_js::concatenated_hash(trusted_server_js::all_module_ids()).as_bytes(),
     );
     // EdgeZero's canonical form sorts object keys itself, so independently deserialized
     // HashMaps hash identically even when a dependency enables `serde_json/preserve_order`.
