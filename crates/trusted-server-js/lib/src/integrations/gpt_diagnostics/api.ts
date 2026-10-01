@@ -1,5 +1,6 @@
 import type {
   GptDiagnosticsApi,
+  GptDiagnosticsAuctionFacts,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsExportV1,
   GptDiagnosticsRecorder,
@@ -18,7 +19,8 @@ interface ApiStore {
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<readonly [number, number]>
+    requestedSlotSizes?: ReadonlyArray<readonly [number, number]>,
+    auctionFacts?: GptDiagnosticsAuctionFacts
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
@@ -67,6 +69,10 @@ function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsEx
         requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
         size: cycle.size ? [...cycle.size] : undefined,
         observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
+        ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+        ...(cycle.serverAuctionTimings
+          ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
+          : {}),
         adManager: cycle.adManager
           ? {
               ...cycle.adManager,
@@ -157,7 +163,8 @@ export class GptDiagnosticsApiController {
         auctionSlotId,
         opportunity,
         trustedServerAuctionId,
-        requestedSlotSizes
+        requestedSlotSizes,
+        auctionFacts
       ) =>
         safelyRecord(() => {
           this.store.recordTrustedServerOpportunity(
@@ -165,7 +172,8 @@ export class GptDiagnosticsApiController {
             auctionSlotId,
             opportunity,
             trustedServerAuctionId,
-            requestedSlotSizes
+            requestedSlotSizes,
+            auctionFacts
           );
         }),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
@@ -200,6 +208,10 @@ export class GptDiagnosticsApiController {
           requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
           size: cycle.size ? [...cycle.size] : undefined,
           observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
+          ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+          ...(cycle.serverAuctionTimings
+            ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
+            : {}),
           adManager: cycle.adManager
             ? {
                 ...cycle.adManager,

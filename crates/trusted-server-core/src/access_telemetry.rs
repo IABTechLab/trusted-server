@@ -220,11 +220,13 @@ pub struct AccessTelemetrySnapshot {
 ///
 /// Column names match spec section 9 exactly. Phase columns come from
 /// `timings` and serialize as JSON `null` for phases that were never
-/// recorded; every dimension column comes from `snapshot` and is a
-/// non-nullable string (callers are expected to substitute an `unknown`
-/// sentinel rather than leave a dimension empty). There is no `event_date`
-/// column: the datasource's sorting key derives the date via
-/// `toDate(event_ts)`.
+/// recorded, as do the auction timeline columns (including `auction_id`,
+/// whose datasource column is `Nullable(UUID)` so it joins natively against
+/// `auction_events_raw.auction_id`). Every dimension column comes from
+/// `snapshot` and is a non-nullable string (callers are expected to
+/// substitute an `unknown` sentinel rather than leave a dimension empty).
+/// There is no `event_date` column: the datasource's sorting key derives the
+/// date via `toDate(event_ts)`.
 #[must_use]
 pub fn access_event_row(
     snapshot: &AccessTelemetrySnapshot,
@@ -260,6 +262,10 @@ pub fn access_event_row(
         "stream_ms": timings.stream_ms,
         "request_elapsed_ms": timings.request_elapsed_ms,
         "resp_bytes": timings.resp_bytes,
+        "auction_dispatched_ms": timings.auction_dispatched_ms,
+        "auction_resolved_ms": timings.auction_resolved_ms,
+        "auction_committed_ms": timings.auction_committed_ms,
+        "auction_id": timings.auction_id.map(|id| id.to_string()),
         "template_cache_state": snapshot.template_cache_state,
         "country": snapshot.country,
         "ts_version": snapshot.ts_version,
@@ -427,6 +433,10 @@ mod tests {
             "stream_ms",
             "request_elapsed_ms",
             "resp_bytes",
+            "auction_dispatched_ms",
+            "auction_resolved_ms",
+            "auction_committed_ms",
+            "auction_id",
         ] {
             assert!(
                 parsed[field].is_null(),
@@ -452,6 +462,10 @@ mod tests {
             );
         }
         assert_eq!(parsed["auction_wait_placement"], "none");
+        assert!(
+            row.contains("\"auction_id\":null"),
+            "auction_id should serialize as an explicit null key, not be omitted: {row}"
+        );
     }
 
     #[test]
@@ -470,6 +484,10 @@ mod tests {
             stream_ms: Some(8),
             auction_wait_placement: Some(AuctionWaitPlacement::InStream),
             resp_bytes: Some(1024),
+            auction_dispatched_ms: Some(9),
+            auction_resolved_ms: Some(10),
+            auction_committed_ms: Some(11),
+            auction_id: Some(uuid::uuid!("33333333-3333-3333-3333-333333333333")),
         };
         let row = access_event_row(&snapshot, &timings, 1_700_000_000_000);
         let parsed: serde_json::Value =
@@ -479,6 +497,10 @@ mod tests {
         assert_eq!(parsed["stream_ms"], 8);
         assert_eq!(parsed["resp_bytes"], 1024);
         assert_eq!(parsed["auction_wait_placement"], "in_stream");
+        assert_eq!(parsed["auction_dispatched_ms"], 9);
+        assert_eq!(parsed["auction_resolved_ms"], 10);
+        assert_eq!(parsed["auction_committed_ms"], 11);
+        assert_eq!(parsed["auction_id"], "33333333-3333-3333-3333-333333333333");
     }
 
     #[test]
