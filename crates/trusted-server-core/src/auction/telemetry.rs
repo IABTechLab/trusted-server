@@ -4,12 +4,12 @@
 //! adapters provide the concrete sink implementation.
 
 use std::collections::HashSet;
-use std::time::Instant;
 
 use chrono::Utc;
 use error_stack::Report;
 use serde::Serialize;
 use uuid::Uuid;
+use web_time::Instant;
 
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::auction::types::{AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType};
