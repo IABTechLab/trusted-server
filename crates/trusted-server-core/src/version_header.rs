@@ -31,11 +31,13 @@ pub fn apply_git_version_header(response: &mut Response) {
     apply_git_version_header_from(TS_GIT_VERSION, response);
 }
 
-/// Sets `x-ts-version` to `version`, or leaves it unset when `version` is
-/// unknown or invalid.
+/// Sets `x-ts-version` to `version`, or removes it when `version` is unknown
+/// or invalid, so an origin's `x-ts-version` is never reported as ours.
 pub fn apply_git_version_header_from(version: Option<&str>, response: &mut Response) {
     if let Some(value) = header_value_from(version) {
         response.headers_mut().insert(HEADER_X_TS_VERSION, value);
+    } else {
+        response.headers_mut().remove(HEADER_X_TS_VERSION);
     }
 }
 
@@ -49,6 +51,13 @@ mod tests {
         response_builder()
             .body(Body::empty())
             .expect("should build empty test response")
+    }
+
+    fn response_with_upstream_version() -> Response {
+        response_builder()
+            .header(HEADER_X_TS_VERSION, "upstream-v1")
+            .body(Body::empty())
+            .expect("should build test response with an upstream x-ts-version")
     }
 
     fn version_of(response: &Response) -> Option<&str> {
@@ -118,6 +127,39 @@ mod tests {
             version_of(&response),
             None,
             "should skip a non-header-safe version"
+        );
+    }
+
+    #[test]
+    fn replaces_upstream_header_with_version() {
+        let mut response = response_with_upstream_version();
+        apply_git_version_header_from(Some("v2.0.0"), &mut response);
+        assert_eq!(
+            version_of(&response),
+            Some("v2.0.0"),
+            "should replace an upstream x-ts-version with ours"
+        );
+    }
+
+    #[test]
+    fn removes_upstream_header_when_version_unknown() {
+        let mut response = response_with_upstream_version();
+        apply_git_version_header_from(None, &mut response);
+        assert_eq!(
+            version_of(&response),
+            None,
+            "should remove an upstream x-ts-version when ours is unknown"
+        );
+    }
+
+    #[test]
+    fn removes_upstream_header_when_version_invalid() {
+        let mut response = response_with_upstream_version();
+        apply_git_version_header_from(Some("bad\nvalue"), &mut response);
+        assert_eq!(
+            version_of(&response),
+            None,
+            "should remove an upstream x-ts-version when ours is invalid"
         );
     }
 

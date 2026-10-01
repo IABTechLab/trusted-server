@@ -178,7 +178,7 @@ Only paths that exist are printed. Cargo treats a missing `rerun-if-changed`
 path as changed, so printing an absent `packed-refs` would re-run the script
 and recompile core on every build. The accepted cost: a `packed-refs` file
 created after the last run is not noticed until something else triggers a
-re-run. Watching the branch ref and `refs/tags` still catches new loose refs. Likewise, if the current branch's ref exists only in `packed-refs` (after `git pack-refs`), the loose ref written by the next commit is not watched. The tag-to-branch switch after committing on a tagged commit then waits for the next re-run.
+re-run. Watching the branch ref and `refs/tags` still catches new loose refs. If the current branch's ref exists only in `packed-refs` (after `git pack-refs`), its nearest existing ancestor below the common dir (usually `refs/heads`) is watched instead, so the loose ref written by the next commit still re-runs the script. The tradeoff: until that loose ref exists, commits on sibling branches also re-run it.
 
 ### 4. Headers
 
@@ -241,6 +241,11 @@ x-ts-version: v1.3.0
 `build.rs` never fails the build over version metadata. If git is missing, the
 directory is not a repository (for example an exported source tree), or git
 fails, the build leaves `TS_GIT_VERSION` unset and `x-ts-version` is omitted.
+The same applies when git's top level (`git rev-parse --show-toplevel`) is not
+the workspace root: git searches parent directories, so an exported tree nested
+in an unrelated repository would otherwise report that repository's tag or
+branch. When the version is unknown, an `x-ts-version` already on the response
+(for example from a proxied origin) is removed rather than passed through.
 Sending a placeholder such as `unknown` was rejected: a missing header is easier
 to tell apart from a real ref.
 
@@ -294,7 +299,9 @@ Unit and integration tests follow red-green-refactor and cover:
   (`v1-été`) and one with an inner space are skipped in favor of local git;
   `None` when nothing is known;
 - `version_header`: value from a version; `None` when unknown; `None` for an
-  invalid value; the header is set, omitted, or skipped accordingly; the
+  invalid value; the header is set, omitted, or skipped accordingly; an
+  upstream `x-ts-version` is replaced by a valid version and removed when the
+  version is unknown or invalid; the
   default path reports the compiled-in `TS_GIT_VERSION`;
 - Fastly `apply_finalize_headers`: `x-ts-version` equals `TS_GIT_VERSION`, and
   `x-ts-fastly-version` equals `FASTLY_SERVICE_VERSION` when set;

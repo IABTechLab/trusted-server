@@ -32,19 +32,41 @@ fn rerun_if_exists(path: &Path) {
 }
 
 /// Resolves the version from local git, watching the paths that move with it.
+///
+/// `None` unless git's top level is this workspace, so an exported tree nested
+/// in an unrelated repository does not report that repository's version.
 fn resolve_from_local_git() -> Option<String> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    // This crate lives at `<workspace>/crates/trusted-server-core`.
+    let workspace_root = Path::new(&manifest_dir).parent()?.parent()?;
+    let repository_root = git(&["rev-parse", "--show-toplevel"])?;
+    if Path::new(&repository_root).canonicalize().ok()? != workspace_root.canonicalize().ok()? {
+        return None;
+    }
+
     // HEAD is per-worktree; refs are shared in the common dir. They differ in a
     // linked worktree and coincide in a plain clone. Only the current branch's
     // ref (its commit decides the exact-tag match) and tags can change the
     // result, so other branches and `refs/remotes` are not watched: a commit
-    // elsewhere or a fetch must not rebuild core.
+    // elsewhere or a fetch must not rebuild core. When the branch ref is only
+    // in `packed-refs`, its nearest existing ancestor (usually `refs/heads`) is
+    // watched instead, so the loose ref the next commit writes is noticed.
     if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
         rerun_if_exists(&Path::new(&git_dir).join("HEAD"));
     }
     if let Some(common_dir) = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
         let common_dir = Path::new(&common_dir);
         if let Some(branch_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-            rerun_if_exists(&common_dir.join(branch_ref));
+            let branch_path = common_dir.join(branch_ref);
+            // Stop below the common dir: watching all of it would rebuild core
+            // on every object write.
+            if let Some(watched_path) = branch_path
+                .ancestors()
+                .take_while(|path| *path != common_dir)
+                .find(|path| path.exists())
+            {
+                rerun_if_exists(watched_path);
+            }
         }
         rerun_if_exists(&common_dir.join("refs/tags"));
         rerun_if_exists(&common_dir.join("packed-refs"));
