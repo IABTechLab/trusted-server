@@ -45,6 +45,18 @@ rewrite its origin URL to the Axum listener, and remove the original URL. The
 exit trap stops the Axum process and stub origin, then removes the temporary
 config, local-push output, bodies, headers, and logs.
 
+## Logging
+
+Axum logs to standard output at `info` by default. Set `RUST_LOG` to a single
+level (`trace`, `debug`, `info`, `warn`, `error`, or `off`) to change it, for
+example `RUST_LOG=debug cargo run -p trusted-server-adapter-axum`.
+Unrecognized values, including per-module filters such as
+`trusted_server=debug`, fall back to `info` and print a warning to standard
+error at startup.
+
+The `trace` level includes full OpenRTB bid request bodies and TCF consent
+strings, so enable it only for short local debugging sessions.
+
 ## Runtime boundaries
 
 Axum implements the read-only `/_ts/admin/eids` diagnostic. EC record lookup
