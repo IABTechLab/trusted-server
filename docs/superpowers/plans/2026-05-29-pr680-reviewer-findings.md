@@ -221,7 +221,7 @@ Move the slots from `creative-opportunities.toml` into `trusted-server.toml` und
 
 ```toml
 [creative_opportunities]
-gam_network_id = "88059007"
+gam_network_id = "12345678"
 auction_timeout_ms = 1500
 price_granularity = "dense"
 
