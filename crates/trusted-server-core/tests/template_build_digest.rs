@@ -105,6 +105,24 @@ fn dangling_editor_lock_symlink_does_not_change_the_digest() {
 }
 
 #[test]
+fn editor_auto_save_and_backup_files_do_not_change_the_digest() {
+    let tree = SourceTree::new(false);
+    let original = tree.digest();
+    for name in ["#gpt.rs#", "gpt.rs~"] {
+        let path = tree.core.join("src/integrations").join(name);
+        fs::write(&path, b"unsaved editor content").expect("should write editor artifact");
+
+        assert_eq!(
+            tree.digest(),
+            original,
+            "should ignore editor artifact {name}"
+        );
+
+        fs::remove_file(path).expect("should remove editor artifact");
+    }
+}
+
+#[test]
 fn every_source_and_build_input_changes_the_digest() {
     let tree = SourceTree::new(false);
     let original = tree.digest();

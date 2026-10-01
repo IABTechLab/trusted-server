@@ -123,8 +123,10 @@ fn collect_sources(crate_dir: &Path, relative: &Path, sources: &mut Vec<PathBuf>
     for entry in entries {
         let entry = entry.expect("should read core source entry");
         let name = entry.file_name();
-        // Editor lock symlinks, swap files, and OS metadata are not compiled sources.
-        if name.as_encoded_bytes().starts_with(b".") {
+        let bytes = name.as_encoded_bytes();
+        // Editor lock symlinks, swap/auto-save/backup files, and OS metadata are
+        // not compiled sources.
+        if bytes.starts_with(b".") || bytes.starts_with(b"#") || bytes.ends_with(b"~") {
             continue;
         }
         let path = relative.join(name);

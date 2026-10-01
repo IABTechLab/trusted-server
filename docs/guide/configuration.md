@@ -2359,19 +2359,20 @@ stored as a shared template.
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, core build
 inputs, and schema version all participate in an opaque SHA-256 cache key. The
-build digest covers every non-hidden core source file (including Rust-inlined head
-scripts), the core build script, core and workspace manifests, `edgezero.toml`, and
-the workspace lockfile when present. Any change to these inputs causes a cold template fill per URL
-variant after deployment, even if the change does not affect rendered HTML.
-Core-owned formats (cached metadata, the seam marker, and the assembly contract)
-are covered by the same digest. A manual `TEMPLATE_SCHEMA_VERSION` bump is needed
-only for template-compatibility changes outside those inputs, such as the Fastly
-adapter's template storage or the Rust side of `trusted-server-js`, unless another
-fingerprint input already isolates the change.
+build digest covers every non-hidden core source file (including Rust-inlined
+head scripts), the core build script, core and workspace manifests,
+`edgezero.toml`, and the workspace lockfile when present. Any change to these
+inputs causes a cold template fill per URL variant after deployment, even if the
+change does not affect rendered HTML. Core-owned formats (cached metadata, the
+seam marker, and the assembly contract) are covered by the same digest. A manual
+`TEMPLATE_SCHEMA_VERSION` bump is needed only for template-compatibility changes
+outside those inputs, such as the Fastly adapter's template storage or the Rust
+side of `trusted-server-js`, unless another fingerprint input already isolates
+the change.
 
-`Accept-Encoding` does not participate in the key: the stored template is decoded
-identity and the assembled result is encoded
-for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+`Accept-Encoding` does not participate in the key: the stored template is
+decoded identity and the assembled result is encoded for each reader with
+`Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
 document's meaning based on `Accept-Encoding`. Never put `Cookie` or
