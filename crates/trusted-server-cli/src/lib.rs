@@ -8,6 +8,10 @@ mod error;
 mod prebid_bundle;
 #[cfg(not(target_arch = "wasm32"))]
 mod run;
+#[cfg(not(target_arch = "wasm32"))]
+mod tls;
+#[cfg(not(target_arch = "wasm32"))]
+mod url_guard;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use run::{RunOutcome, run_from_env};
