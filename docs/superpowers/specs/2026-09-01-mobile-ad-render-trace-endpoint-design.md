@@ -252,6 +252,15 @@ second GPT attribution engine. The existing recorder emits an exact-token
 cycle. The server-auction, correlation, and GPT projections are separate sibling
 contracts in `TraceReportV1`; none is treated as a substitute for another.
 
+The deferred object-URL cleanup in section 12.3 deliberately diverges from TS
+Console's existing export, which revokes synchronously in a `finally` block
+immediately after `anchor.click()`
+(`crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts`,
+reachable through the console's `export()` action). That older path keeps the
+truncation risk this design avoids. Version one does not change it; correcting
+it belongs to TS Console under #1081, and until then the two download paths
+intentionally differ.
+
 ## 6. User experience
 
 ### 6.1 First visit: no captured report
@@ -1513,6 +1522,12 @@ shell or actions.
   before trace handling, including on disabled routes.
 - Disabled route after authentication: local privacy-safe `404`.
 - Unsupported method: local `405`; never publisher fallback.
+- Reserved-namespace path that is a trailing slash, extra segment, unsupported
+  asset name, repeated separator, or lookalike: local `404`; an encoded
+  separator or ambiguous dot segment: local `400`. Never publisher fallback.
+- Non-empty or unreadable activation/end body: local `413` for any body bytes,
+  positive/invalid `Content-Length`, or `Transfer-Encoding`, and local `400`
+  for a stream read error, both with no cookie mutation.
 - Rejected activation/end POST: local `403` with no state mutation.
 - Optional platform fact unavailable: omit the field and continue.
 - Bounded cookie inspection failure: report the contract-defined invalid or
