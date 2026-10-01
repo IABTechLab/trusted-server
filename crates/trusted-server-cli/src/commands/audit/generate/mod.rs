@@ -2699,6 +2699,39 @@ mod tests {
     }
 
     #[test]
+    fn build_draft_config_extracts_gtm_container_id_from_url_evidence() {
+        let url = Url::parse("https://example.com").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 0,
+            third_party_asset_count: 0,
+            detected_integrations: vec![DetectedIntegration {
+                id: "google_tag_manager".to_string(),
+                evidence: "https://tags.example.com/gtm.js?id=GTM-ABC123&l=dataLayer".to_string(),
+            }],
+            assets: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let draft = build_draft_config(&url, &artifact, &gpt_slots::DiscoveredSlots::default())
+            .expect("should build draft config");
+        let config = toml::from_str::<toml::Value>(&draft).expect("should parse draft config");
+        let gtm = &config["integrations"]["google_tag_manager"];
+
+        assert_eq!(
+            gtm["enabled"].as_bool(),
+            Some(true),
+            "should enable GTM when URL evidence contains a container ID"
+        );
+        assert_eq!(
+            gtm["container_id"].as_str(),
+            Some("GTM-ABC123"),
+            "should write only the container ID rather than the evidence URL"
+        );
+    }
+
+    #[test]
     fn build_draft_config_does_not_enable_gtm_without_container_id() {
         let url = Url::parse("https://publisher.example/path").expect("should parse URL");
         let artifact = AuditArtifact {

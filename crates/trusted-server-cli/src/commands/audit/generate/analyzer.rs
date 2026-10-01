@@ -239,8 +239,10 @@ pub(crate) fn detect_integrations_from_inline_script(script: &str) -> Vec<(Strin
 
 pub(crate) fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<String> {
     for integration in &artifact.detected_integrations {
-        if integration.id == "google_tag_manager" && GTM_REGEX.is_match(&integration.evidence) {
-            return Some(integration.evidence.clone());
+        if integration.id == "google_tag_manager"
+            && let Some(matched) = GTM_REGEX.find(&integration.evidence)
+        {
+            return Some(matched.as_str().to_string());
         }
     }
 
@@ -547,6 +549,34 @@ mod tests {
                 detect_integration_from_url(&parsed).as_deref(),
                 Some(expected),
                 "should detect {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_gtm_container_id_from_integration_evidence() {
+        for evidence in [
+            "GTM-ABC123",
+            "https://tags.example.com/gtm.js?id=GTM-ABC123",
+            "https://tags.example.com/gtm.js?id=GTM-ABC123&l=dataLayer",
+        ] {
+            let artifact = AuditArtifact {
+                audited_url: "https://example.com".to_string(),
+                page_title: None,
+                js_asset_count: 0,
+                third_party_asset_count: 0,
+                detected_integrations: vec![DetectedIntegration {
+                    id: "google_tag_manager".to_string(),
+                    evidence: evidence.to_string(),
+                }],
+                assets: Vec::new(),
+                warnings: Vec::new(),
+            };
+
+            assert_eq!(
+                extract_gtm_container_id(&artifact).as_deref(),
+                Some("GTM-ABC123"),
+                "should extract only the container ID from evidence {evidence}"
             );
         }
     }
