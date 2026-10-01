@@ -756,4 +756,32 @@ describe('build-prebid-external rendering and orchestration', () => {
       fs.rmSync(outputDirectory, { recursive: true, force: true });
     }
   }, 120_000);
+
+  it('builds and stamps identityLinkIdSystem when explicitly selected', async () => {
+    const outputDirectory = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'trusted-server-liveramp-prebid-build-test-')
+    );
+
+    try {
+      await main([
+        '--modules-json',
+        JSON.stringify({
+          bidder: ['rubiconBidAdapter'],
+          userId: ['identityLinkIdSystem'],
+        }),
+        '--out',
+        outputDirectory,
+      ]);
+
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(outputDirectory, 'manifest.json'), 'utf8')
+      );
+      const bundle = fs.readFileSync(path.join(outputDirectory, manifest.filename), 'utf8');
+
+      expect(manifest.modules.userId).toEqual(['identityLinkIdSystem']);
+      expect(bundle).toContain('identityLinkIdSystem');
+    } finally {
+      fs.rmSync(outputDirectory, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

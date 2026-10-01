@@ -1,24 +1,20 @@
 //! Fastly-backed implementations of the platform traits defined in
 //! `trusted-server-core::platform`.
 
-use std::io::Read as _;
-use std::net::IpAddr;
-use std::sync::Arc;
-
 use bytes::Bytes;
-use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{Geo, geo_lookup};
 use fastly::{ConfigStore, Request, SecretStore};
+use std::io::Read as _;
+use std::net::IpAddr;
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
-    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformKvStore,
+    PlatformCacheIntent, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
+    PlatformHttpRequest, PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode,
+    PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
     PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
     StoreName,
 };
@@ -442,9 +438,37 @@ fn fastly_response_to_platform(
 // FastlyPlatformHttpClient
 // ---------------------------------------------------------------------------
 
-fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) {
-    if bypass_cache {
-        request.set_pass(true);
+/// Apply the caller's cache intent to a Fastly request.
+///
+/// The two branches are mutually exclusive by construction, which is the point of
+/// [`PlatformCacheIntent`]: `set_surrogate_key` "overrides any previous
+/// `Request::set_pass` call" (`fastly-0.12.1/src/http/request.rs:2462`), so calling both
+/// would silently cancel the bypass.
+///
+/// Readthrough is enabled by *omitting* `set_pass`, never by adding a TTL. `set_ttl`
+/// carries the same override note and additionally overrides the origin's own
+/// `Cache-Control`, including `private` and `no-store` — it would turn the hazard this
+/// gate exists to avoid into an API.
+fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCacheIntent) {
+    match intent {
+        PlatformCacheIntent::Bypass => request.set_pass(true),
+        PlatformCacheIntent::Shared { surrogate_key } => {
+            match fastly::http::HeaderValue::from_str(surrogate_key) {
+                Ok(value) => request.set_surrogate_key(value),
+                Err(error) => {
+                    // Fail closed. Caching without the key would store an object no purge
+                    // can reach, which is worse than not caching it: the whole rollback
+                    // story for readthrough is "purge the key".
+                    log::error!(
+                        "Surrogate key {surrogate_key:?} is not a valid header value \
+                         ({error}); bypassing the cache rather than storing an \
+                         unpurgeable object"
+                    );
+                    request.set_pass(true);
+                }
+            }
+        }
+        PlatformCacheIntent::Default => {}
     }
 }
 
@@ -487,13 +511,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
-        let bypass_cache = request.bypass_cache;
+        let cache_intent = request.cache_intent.clone();
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
         }
-        apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
+        apply_fastly_cache_intent(&mut fastly_req, &cache_intent);
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -511,9 +535,9 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         }
         let stream_response = request.stream_response;
         let request_method = request.request.method().clone();
-        let bypass_cache = request.bypass_cache;
+        let cache_intent = request.cache_intent.clone();
         let mut fastly_req = edge_request_to_fastly(request.request)?;
-        apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
+        apply_fastly_cache_intent(&mut fastly_req, &cache_intent);
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -727,16 +751,6 @@ pub fn client_info_from_request(req: &Request, client_ip: Option<IpAddr>) -> Cli
         server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
         server_region: std::env::var("FASTLY_REGION").ok(),
     }
-}
-
-/// Open a named KV store as a [`PlatformKvStore`] implementation.
-///
-/// # Errors
-///
-/// Returns [`KvError::Unavailable`] when the store does not exist, or
-/// [`KvError::Internal`] when the Fastly SDK fails to open it.
-pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
-    FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,22 +1218,62 @@ mod tests {
     }
 
     #[test]
-    fn apply_fastly_cache_bypass_sets_pass_when_enabled() {
+    fn apply_fastly_cache_intent_sets_pass_for_bypass() {
         let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_bypass(&mut request, true);
+        apply_fastly_cache_intent(&mut request, &PlatformCacheIntent::Bypass);
         assert!(
             format!("{request:?}").contains("cache_override: Pass"),
-            "enabled bypass should select Fastly pass mode"
+            "bypass should select Fastly pass mode"
         );
     }
 
     #[test]
-    fn apply_fastly_cache_bypass_preserves_default_when_disabled() {
+    fn apply_fastly_cache_intent_leaves_default_alone() {
         let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_bypass(&mut request, false);
+        apply_fastly_cache_intent(&mut request, &PlatformCacheIntent::Default);
         assert!(
             format!("{request:?}").contains("cache_override: None"),
-            "disabled bypass should preserve Fastly read-through caching"
+            "the default intent should preserve Fastly read-through caching"
+        );
+    }
+
+    #[test]
+    fn apply_fastly_cache_intent_never_passes_on_the_shared_branch() {
+        // Readthrough is enabled by *omitting* set_pass. If this branch ever set pass as
+        // well, the surrogate key would reverse it — and the resulting behavior would
+        // depend on call order rather than on what the code says.
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_intent(
+            &mut request,
+            &PlatformCacheIntent::Shared {
+                surrogate_key: "ts-origin".to_owned(),
+            },
+        );
+        let rendered = format!("{request:?}");
+        assert!(
+            !rendered.contains("cache_override: Pass"),
+            "the shared branch must not bypass, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("ts-origin"),
+            "the shared branch must attach the surrogate key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_surrogate_key_that_cannot_be_a_header_value_falls_back_to_bypass() {
+        // Fail closed: caching without the key would store an object no purge can reach,
+        // and "purge the key" is the entire rollback story for readthrough.
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_intent(
+            &mut request,
+            &PlatformCacheIntent::Shared {
+                surrogate_key: "bad\nkey".to_owned(),
+            },
+        );
+        assert!(
+            format!("{request:?}").contains("cache_override: Pass"),
+            "an unusable key must bypass rather than store something unpurgeable"
         );
     }
 

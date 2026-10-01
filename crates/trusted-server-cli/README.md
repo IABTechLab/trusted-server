@@ -1,10 +1,34 @@
-# Trusted Server CLI: experimental PBS commands
+# trusted-server-cli
+
+Host-target operator CLI for Trusted Server. The installed binary is `ts`.
+
+The CLI validates and publishes application configuration through EdgeZero,
+delegates platform lifecycle commands, audits public pages and ad-template
+configuration, and builds external Prebid artifacts. It is not part of any
+adapter WASM artifact. Most commands support Linux and macOS; the production-
+hostname development proxy and local CA commands are macOS-only.
+
+Install and test from the repository root:
+
+```bash
+cargo install-cli
+./scripts/test-cli.sh
+```
+
+The test script selects and, when necessary, installs the host Rust target,
+runs the CLI suite, and executes the ignored browser-backed audit fixtures
+serially. See the [CLI guide](../../docs/guide/cli.md) for the generated
+two-platform command inventory and the
+[EdgeZero guide](../../docs/guide/edgezero.md) for configuration lifecycle and
+store semantics.
+
+## Experimental PBS commands
 
 `ts prebid server` manages local configuration inputs and a small set of AWS operations for self-hosted Prebid Server Go. It sits beside `ts prebid client`, which builds browser JavaScript, and remains separate from the existing Trusted Server `ts config` and `ts deploy` commands.
 
 The namespace is experimental; its interface may change without a deprecation cycle. There is no separate binary or crate.
 
-## Build and try locally
+### Build and try locally
 
 Use this branch's executable, not an older installed `ts`:
 
@@ -17,7 +41,7 @@ cargo run_cli_linux prebid server check --deployment crates/trusted-server-cli/e
 
 On Apple Silicon macOS use `build_cli_macos` and `run_cli_macos`. Other hosts can run `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" -- prebid server --help`. The examples contain fictional resource identifiers, a fictional image digest, and a fictional adapter binding. They exercise local checks only and must not be used as real deployment settings.
 
-## Commands and current limits
+### Commands and current limits
 
 | Command                                                                       | What it does                                                                                                                         | Access                        |
 | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- |
@@ -32,13 +56,13 @@ Not implemented: container deployment, rollback, runtime secret injection, calle
 
 `check` does not validate every PBS configuration field against the upstream Go schema, independently verify adapter documentation, retrieve secrets, pull images, start PBS, or prove a deployment ready. Bindings are operator-supplied metadata, not a bundled bidder catalog. Validate actual adapter mappings and startup against the pinned PBS release before use.
 
-## Discovering requirements
+### Discovering requirements
 
 `inspect` reads exactly the chosen file and never rewrites or publishes it. It discovers server demand from `[auction.providers.*]` entries using the `prebid-server` profile and bidders routed through `[auction.bidders.*]`. The JSON report groups routed bidders under each provider. Browser settings still come from `[integrations.prebid]`, including the runtime's array, indexed-map, and string encodings for `client_side_bidders`. The command reports explicitly supplied values only; it does not expand defaults, environment overrides, remote configuration, or request-time inputs. Confirm which source and environment are authoritative before relying on the report.
 
 Account identifiers, endpoint values, and bid-parameter values are withheld. Parser errors also withhold source snippets. Server-side bidders, client-side bidders, and browser bundle adapters remain separate; listing a bidder does not establish partner authorization or a host-secret requirement. Disabled auctions and integrations remain disabled.
 
-## Deployment descriptor
+### Deployment descriptor
 
 See [deployment.yaml](examples/pbs/deployment.yaml), [PBS YAML](examples/pbs/pbs.yaml), [regional overrides](examples/pbs/east.yaml), and [bindings.json](examples/pbs/bindings.json).
 
@@ -54,7 +78,7 @@ Paths resolve relative to the descriptor, not the working directory. No automati
 
 Mappings merge recursively with regional values taking precedence; sequences and scalars replace whole values. Rendering happens in memory and writes no generated files. The command does not read arbitrary operator `PBS_*` environment overrides.
 
-### Binding schema
+#### Binding schema
 
 The binding file is a JSON or YAML mapping keyed by bidder identifier. Each entry declares:
 
@@ -65,7 +89,7 @@ The binding file is a JSON or YAML mapping keyed by bidder identifier. Each entr
 
 Version 1 supports string-valued credentials and one binding set across all selected regions. Each secret ARN must belong to exactly one bidder binding because updates replace the complete JSON object. A PBS destination cannot overlap another binding or a value already present in the resolved YAML, including a non-mapping parent. Names alone do not prove that PBS supports the mapping; the metadata records an operator decision.
 
-## Setting a secret
+### Setting a secret
 
 Prerequisites: AWS CLI v2 on PATH, a trusted local AWS profile using short-lived credentials, and a previously provisioned secret with approved permissions. AWS CLI command history must be disabled; the tool checks both the selected profile and default history settings before submitting a value. It suppresses AWS stderr and disables configured endpoint URL overrides for API calls.
 
@@ -90,13 +114,13 @@ Secret values never enter command arguments or reports. The AWS CLI receives JSO
 
 A successful write reports its version identifier. It does not create secret metadata, change infrastructure, replace containers, or rotate the bidder's credential. Check regional replication, separately replace consumers, and verify them before revoking old partner credentials. A failed or unverifiable response means the write is not confirmed; the outcome may be uncertain. Retain the displayed request token and reuse it only for the original identical payload. Use a new token only for separately intended changed values. Provider error details are withheld, so the CLI cannot distinguish a rejected write from a lost response.
 
-## Ownership and sandbox compatibility
+### Ownership and sandbox compatibility
 
 These commands do not adopt the existing sandbox's Terraform state, edit its files, or change its IAM roles. A descriptor must reference resources the operator has explicitly approved. The sandbox currently bootstraps runtime files through Terraform user data and has no runtime secret loader. Writing a secret therefore does not make that sandbox consume it.
 
 Deployment and rollback require a separately approved move to versioned runtime releases. Until that exists, `ts prebid server` has no deployment or rollback subcommands and the skill must not promise them.
 
-## Verification
+### Verification
 
 ```bash
 ./scripts/test-cli.sh
