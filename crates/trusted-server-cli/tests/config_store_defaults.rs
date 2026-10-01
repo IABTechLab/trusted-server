@@ -133,8 +133,10 @@ fn config_push_resolves_the_physical_name_and_explicit_key() {
     );
 }
 
+// EdgeZero's pinned store-selector revision makes the runtime key override
+// redirect Axum config pushes even without `--key`. This differs from v0.0.8.
 #[test]
-fn config_push_does_not_use_the_runtime_key_override_without_the_key_flag() {
+fn config_push_follows_the_runtime_key_override_without_the_key_flag() {
     let project = project();
     let key_var = format!(
         "EDGEZERO__STORES__CONFIG__{}__KEY",
@@ -145,7 +147,8 @@ fn config_push_does_not_use_the_runtime_key_override_without_the_key_flag() {
     let entries = stored_entries(&project);
     assert_eq!(entries.len(), 1);
     assert!(
-        entries.contains_key(CONFIG_BLOB_KEY),
-        "runtime-only key override should not move the CLI's write destination"
+        entries.contains_key("active_config"),
+        "runtime key override should move the CLI's write destination; got keys: {:?}",
+        entries.keys().collect::<Vec<_>>()
     );
 }
