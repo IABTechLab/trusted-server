@@ -360,6 +360,33 @@
     );
   }
 
+  // Defines a slot and, where the page data gives viewport bands, the sizes
+  // it asks for at each width. Each band is a viewport and the sizes asked
+  // for from that width up to the next band's, widest first. A slot with no
+  // bands asks for every format at every width.
+  function defineWithViewportSizes(api, slot, elementId) {
+    var definedSlot = api.defineSlot(
+      slot.gam_unit_path,
+      slot.formats,
+      elementId,
+    );
+    var bands = slot.viewport_sizes;
+    if (
+      definedSlot &&
+      bands &&
+      bands.length &&
+      api.sizeMapping &&
+      definedSlot.defineSizeMapping
+    ) {
+      var builder = api.sizeMapping();
+      bands.forEach(function (band) {
+        builder.addSize(band[0], band[1]);
+      });
+      definedSlot.defineSizeMapping(builder.build());
+    }
+    return definedSlot;
+  }
+
   function normalizedGptFormats(formats) {
     return formats.length === 2 &&
       formats.every(function (format) {
@@ -682,11 +709,7 @@
         var tsOwned = false;
         if (!gptSlot) {
           gptSlot = runHandoffInternal(function () {
-            return window.googletag.defineSlot(
-              slot.gam_unit_path,
-              slot.formats,
-              element.id,
-            );
+            return defineWithViewportSizes(window.googletag, slot, element.id);
           });
           if (!gptSlot) {
             releaseTrustedServerFirstImpressionClaim(element, fallbackClaim);
@@ -834,11 +857,7 @@
           // Define TS's fallback on the publisher's actual div. The scoped
           // handoff wrapper returns this slot if the publisher defines it later.
           s = runHandoffInternal(function () {
-            return googletag.defineSlot(
-              slot.gam_unit_path,
-              slot.formats,
-              actualDivId,
-            );
+            return defineWithViewportSizes(googletag, slot, actualDivId);
           });
           if (!s) {
             releaseTrustedServerFirstImpressionClaim(el, tsClaim);

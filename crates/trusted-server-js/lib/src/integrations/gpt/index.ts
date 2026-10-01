@@ -85,6 +85,7 @@ interface GoogleTagSlot {
   clearTargeting?(key?: string): GoogleTagSlot;
   addService(service: GoogleTagPubAdsService): GoogleTagSlot;
   getTargeting?(key: string): string[];
+  defineSizeMapping?(mapping: unknown): GoogleTagSlot;
 }
 
 interface SlotRenderEndedEvent {
@@ -370,7 +371,13 @@ interface GoogleTag {
   display(target: GoogleTagDisplayTarget): void;
   setConfig?(config: GoogleTagConfig): void;
   getConfig?(keys: string | string[]): GoogleTagEffectiveConfig | undefined;
+  sizeMapping?(): ViewportSizeBuilder;
   _loaded_?: boolean;
+}
+
+interface ViewportSizeBuilder {
+  addSize(viewport: number[], sizes: Array<number | number[]>): ViewportSizeBuilder;
+  build(): unknown;
 }
 
 type GptWindow = Window & {
@@ -848,6 +855,32 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
   return (target as Element).id || undefined;
 }
 
+/**
+ * Defines a slot and, where the page data gives viewport bands, the sizes it
+ * asks for at each width. Each band is a viewport and the sizes asked for from
+ * that width up to the next band's, widest first. A slot with no bands asks for
+ * every format at every width.
+ */
+function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown): unknown }>(
+  api: {
+    defineSlot?(adUnitPath: string, size: Array<number | number[]>, elementId?: string): S | null;
+    sizeMapping?(): ViewportSizeBuilder;
+  },
+  slot: AuctionSlot,
+  elementId: string
+): S | null | undefined {
+  const definedSlot = api.defineSlot?.(slot.gam_unit_path, slot.formats, elementId);
+  const bands = slot.viewport_sizes;
+  if (definedSlot && bands?.length && api.sizeMapping && definedSlot.defineSizeMapping) {
+    const builder = api.sizeMapping();
+    for (const [viewport, sizes] of bands) {
+      builder.addSize(viewport, sizes);
+    }
+    definedSlot.defineSizeMapping(builder.build());
+  }
+  return definedSlot;
+}
+
 function normalizedGptFormats(formats: Array<number | number[]>): Array<number | number[]> {
   return formats.length === 2 && formats.every((format) => typeof format === 'number')
     ? [formats as number[]]
@@ -1155,9 +1188,8 @@ function schedulePublisherFirstImpressionFallback(
       let tsOwned = false;
       if (!gptSlot) {
         gptSlot =
-          withGptSlotHandoffInternal(ts, () =>
-            g.defineSlot?.(slot.gam_unit_path, slot.formats, element.id)
-          ) ?? undefined;
+          withGptSlotHandoffInternal(ts, () => defineWithViewportSizes(g, slot, element.id)) ??
+          undefined;
         if (!gptSlot) {
           releaseTrustedServerFirstImpressionClaim(ts, element, claim);
           return;
@@ -1352,7 +1384,7 @@ export function installTsAdInit(): void {
           // defineSlot() for this div is handed the same slot by the scoped GPT
           // wrapper, preventing a competing container-slot request.
           const defined = withGptSlotHandoffInternal(ts, () =>
-            g.defineSlot?.(slot.gam_unit_path, slot.formats, actualDivId)
+            defineWithViewportSizes(g, slot, actualDivId)
           );
           if (!defined) {
             releaseTrustedServerFirstImpressionClaim(ts, el, firstImpression);

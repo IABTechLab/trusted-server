@@ -6722,8 +6722,9 @@ pub(crate) fn build_empty_bids_script() -> String {
 /// [`handle_page_bids`] (SPA navigation) so the slot wire shape has a single
 /// definition and the two paths cannot silently diverge. Property names match
 /// what the client-side TSJS bundle expects: `gam_unit_path`, `div_id`,
-/// `formats`, and `targeting`. Returns `None` when the slot's dynamic GAM unit
-/// path exceeds its rendering limit.
+/// `formats`, and `targeting`, with `viewport_sizes` added when a format names
+/// a viewport bound. Returns `None` when the slot's dynamic GAM unit path
+/// exceeds its rendering limit.
 pub(crate) fn build_slot_json(
     slot: &crate::creative_opportunities::CreativeOpportunitySlot,
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
@@ -6741,13 +6742,22 @@ pub(crate) fn build_slot_json(
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
-    Some(serde_json::json!({
+    let mut json = serde_json::json!({
         "id": slot.id,
         "gam_unit_path": gam_path,
         "div_id": div_id,
         "formats": formats,
         "targeting": targeting,
-    }))
+    });
+    // Each band as the browser takes it, a `[width, 0]` viewport and the
+    // sizes asked for from that width up to the next band's.
+    if let Some(bands) = slot.viewport_sizes() {
+        json["viewport_sizes"] = bands
+            .into_iter()
+            .map(|(width, sizes)| serde_json::json!([[width, 0], sizes]))
+            .collect();
+    }
+    Some(json)
 }
 
 /// Match creative-opportunity slots and omit dynamic GAM paths that cannot be
@@ -8455,6 +8465,8 @@ mod tests {
                 width: 300,
                 height: 250,
                 media_type: MediaType::Banner,
+                min_viewport_width: None,
+                max_viewport_width: None,
             }],
             floor_price: None,
             targeting: Default::default(),
@@ -11370,6 +11382,8 @@ mod tests {
                     width: 728,
                     height: 90,
                     media_type: MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
                 }],
                 floor_price: None,
                 targeting: Default::default(),
@@ -17519,6 +17533,8 @@ mod tests {
                     width: 300,
                     height: 250,
                     media_type: MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
                 }],
                 floor_price: None,
                 targeting: Default::default(),
@@ -18006,6 +18022,8 @@ mod tests {
                     width: 300,
                     height: 250,
                     media_type: MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
                 }],
                 floor_price: None,
                 targeting: Default::default(),
@@ -24698,6 +24716,8 @@ mod tests {
                     width: 300,
                     height: 250,
                     media_type: MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
                 }],
                 floor_price: Some(0.50),
                 targeting: [("pos".to_string(), "atf".to_string())]
@@ -24767,6 +24787,51 @@ mod tests {
             assert_eq!(
                 slot_json["targeting"]["ts"], "operator-value",
                 "should forward operator-provided ts targeting verbatim"
+            );
+        }
+
+        #[test]
+        fn slot_json_carries_viewport_sizes_only_when_a_format_is_bounded() {
+            let config = make_config();
+            let plain = crate::publisher::build_slot_json(&make_slot(), &config, "example")
+                .expect("should build slot JSON");
+            assert!(
+                plain.get("viewport_sizes").is_none(),
+                "a slot without bounds should carry no viewport sizes"
+            );
+
+            let mut slot = make_slot();
+            slot.formats = vec![
+                CreativeOpportunityFormat {
+                    width: 300,
+                    height: 600,
+                    media_type: MediaType::Banner,
+                    min_viewport_width: Some(1040),
+                    max_viewport_width: None,
+                },
+                CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
+                },
+            ];
+            let banded = crate::publisher::build_slot_json(&slot, &config, "example")
+                .expect("should build slot JSON");
+
+            assert_eq!(
+                banded["viewport_sizes"],
+                serde_json::json!([
+                    [[1040, 0], [[300, 600], [300, 250]]],
+                    [[0, 0], [[300, 250]]]
+                ]),
+                "should carry each band as a viewport and its sizes, widest first"
+            );
+            assert_eq!(
+                banded["formats"],
+                serde_json::json!([[300, 600], [300, 250]]),
+                "formats should still list every size"
             );
         }
 
@@ -26500,6 +26565,8 @@ mod tests {
                     width: 300,
                     height: 250,
                     media_type: crate::auction::types::MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
                 }],
                 floor_price: Some(0.50),
                 targeting: Default::default(),
@@ -27522,6 +27589,8 @@ mod tests {
                     width: 300,
                     height: 250,
                     media_type: MediaType::Banner,
+                    min_viewport_width: None,
+                    max_viewport_width: None,
                 }],
                 floor_price: Some(0.50),
                 targeting: Default::default(),

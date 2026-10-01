@@ -27,6 +27,12 @@ export interface AuctionSlot {
   div_id: string;
   formats: Array<[number, number]>;
   targeting?: Record<string, string>;
+  /**
+   * The sizes asked for by viewport width, widest first. Each entry is a
+   * `[width, 0]` viewport and the sizes asked for from that width up to the
+   * next entry's. Absent when no format names a viewport bound.
+   */
+  viewport_sizes?: Array<[[number, number], Array<[number, number]>]>;
 }
 
 /** Debug-only copy of server-side bid fields exposed for pipeline inspection. */

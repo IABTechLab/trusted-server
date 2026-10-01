@@ -689,54 +689,88 @@ describe('installTsAdInit', () => {
     fetchSpy.mockRestore();
   });
 
-  it('displays TS-defined slots and does not include them in refresh', async () => {
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const nativeRefresh = vi.fn();
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      // Publisher has not defined this slot, so TS defines (owns) it.
-      getSlots: vi.fn().mockReturnValue([]),
-      addEventListener: vi.fn(),
-      refresh: nativeRefresh,
-    };
-    const defineSlotMock = vi.fn().mockReturnValue(mockSlot);
-    const displayMock = vi.fn();
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: defineSlotMock,
-      display: displayMock,
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: {},
-        },
-      ],
-      bids: {},
-    };
+  it.each([
+    { name: 'without viewport bands', bands: undefined },
+    {
+      name: 'with viewport bands',
+      bands: [
+        [
+          [1040, 0],
+          [
+            [300, 600],
+            [300, 250],
+          ],
+        ],
+        [[0, 0], [[300, 250]]],
+      ] as Array<[[number, number], Array<[number, number]>]>,
+    },
+  ])(
+    'displays TS-defined slots and does not include them in refresh ($name)',
+    async ({ bands }) => {
+      const builder = {
+        addSize: vi.fn().mockReturnThis(),
+        build: vi.fn().mockReturnValue('built mapping'),
+      };
+      const sizeMapping = vi.fn().mockReturnValue(builder);
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+        defineSizeMapping: vi.fn().mockReturnThis(),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const nativeRefresh = vi.fn();
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        // Publisher has not defined this slot, so TS defines (owns) it.
+        getSlots: vi.fn().mockReturnValue([]),
+        addEventListener: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      const defineSlotMock = vi.fn().mockReturnValue(mockSlot);
+      const displayMock = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: defineSlotMock,
+        display: displayMock,
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+        sizeMapping,
+      };
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'atf_sidebar_ad',
+            gam_unit_path: '/123/atf',
+            div_id: 'div-atf-sidebar',
+            formats: [[300, 250]],
+            ...(bands ? { viewport_sizes: bands } : {}),
+            targeting: {},
+          },
+        ],
+        bids: {},
+      };
 
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    (window as TestWindow).tsjs!.adInit!();
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
 
-    expect(defineSlotMock).toHaveBeenCalled();
-    // GPT requires display() to register/render a freshly-defined slot.
-    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    // TS-owned slots are displayed, not refreshed (refresh() no-ops for a slot
-    // that was never displayed).
-    expect(nativeRefresh).not.toHaveBeenCalled();
-  });
+      expect(defineSlotMock).toHaveBeenCalled();
+      // GPT requires display() to register/render a freshly-defined slot.
+      expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+      // TS-owned slots are displayed, not refreshed (refresh() no-ops for a slot
+      // that was never displayed).
+      expect(nativeRefresh).not.toHaveBeenCalled();
+
+      if (bands) {
+        expect(builder.addSize.mock.calls).toEqual(bands);
+        expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+      } else {
+        expect(sizeMapping).not.toHaveBeenCalled();
+        expect(mockSlot.defineSizeMapping).not.toHaveBeenCalled();
+      }
+    }
+  );
 
   it('hands a late publisher definition the TS inner-div slot without a second request', async () => {
     type FakeSlot = {

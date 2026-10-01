@@ -28,6 +28,7 @@ interface MockGoogleTag {
   enableServices: () => void;
   display: (divId: string) => void;
   setConfig?: (config: Record<string, unknown>) => void;
+  sizeMapping?: () => unknown;
 }
 
 // `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
@@ -822,51 +823,85 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(ts.adSlots).toEqual([liveSlot]);
   });
 
-  it('fallback adInit defines, targets, and displays a TS slot through the command queue', () => {
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-    };
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([]),
-      refresh: vi.fn(),
-    };
-    const defineSlot = vi.fn().mockReturnValue(mockSlot);
-    const display = vi.fn();
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot,
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-      display,
-    };
-    document.body.innerHTML =
-      '<div id="div-atf-sidebar-container"><div id="div-atf-sidebar"></div></div>';
-    runBootstrap();
-    const ts = (window as TestWindow).tsjs!;
-    ts.adSlots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: { ts_route: 'home' },
-      },
-    ];
-    ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
+  it.each([
+    { name: 'without viewport bands', bands: undefined },
+    {
+      name: 'with viewport bands',
+      bands: [
+        [
+          [1040, 0],
+          [
+            [300, 600],
+            [300, 250],
+          ],
+        ],
+        [[0, 0], [[300, 250]]],
+      ] as Array<[[number, number], Array<[number, number]>]>,
+    },
+  ])(
+    'fallback adInit defines, targets, and displays a TS slot through the command queue ($name)',
+    ({ bands }) => {
+      const builder = {
+        addSize: vi.fn().mockReturnThis(),
+        build: vi.fn().mockReturnValue('built mapping'),
+      };
+      const sizeMapping = vi.fn().mockReturnValue(builder);
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+        defineSizeMapping: vi.fn().mockReturnThis(),
+      };
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        refresh: vi.fn(),
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const display = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+        display,
+        sizeMapping,
+      };
+      document.body.innerHTML =
+        '<div id="div-atf-sidebar-container"><div id="div-atf-sidebar"></div></div>';
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      ts.adSlots = [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          ...(bands ? { viewport_sizes: bands } : {}),
+          targeting: { ts_route: 'home' },
+        },
+      ];
+      ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
 
-    ts.adInit!();
+      ts.adInit!();
 
-    expect(defineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], 'div-atf-sidebar');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_route', 'home');
-    expect(ts.prevSlotTargetingKeys).toEqual({ 'div-atf-sidebar': ['ts_route'] });
-    expect(display).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(ts.servicesEnabled).toBe(true);
-  });
+      expect(defineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], 'div-atf-sidebar');
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_route', 'home');
+      expect(ts.prevSlotTargetingKeys).toEqual({ 'div-atf-sidebar': ['ts_route'] });
+      expect(display).toHaveBeenCalledWith('div-atf-sidebar');
+      expect(ts.servicesEnabled).toBe(true);
+
+      if (bands) {
+        expect(builder.addSize.mock.calls).toEqual(bands);
+        expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+      } else {
+        expect(sizeMapping).not.toHaveBeenCalled();
+        expect(mockSlot.defineSizeMapping).not.toHaveBeenCalled();
+      }
+    }
+  );
 
   it('fallback adInit leaves a publisher-rendered slot untouched', () => {
     const mockSlot = {
