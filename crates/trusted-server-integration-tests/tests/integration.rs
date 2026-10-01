@@ -214,6 +214,60 @@ fn test_cloudflare_dynamic_publisher_response_does_not_cross_cookie_boundaries()
     );
 }
 
+/// Exercises an enabled `/auction` request through auction telemetry in workerd.
+///
+/// `std::time::Instant::now()` traps on Cloudflare's `wasm32-unknown-unknown`
+/// target, so this guards the `web_time::Instant` timing in
+/// `AuctionObservationContext`. The auction config has no providers, so the
+/// enabled auction completes as a no-bid without outbound calls.
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn test_cloudflare_enabled_auction_reaches_telemetry() {
+    init_logger();
+    // The readiness probe falls back to the proxied root page.
+    let _origin = common::ec::MinimalOrigin::start(origin_port());
+    let config_json = common::config::cloudflare_auction_config_json(origin_port())
+        .expect("should build auction-enabled Cloudflare config");
+    let process = environments::cloudflare::CloudflareWorkers
+        .spawn_with_config_json(&config_json)
+        .expect("should start Cloudflare Worker");
+    let request_body = serde_json::json!({
+        "adUnits": [{
+            "code": "integration-slot",
+            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+        }]
+    });
+
+    // A non-regulated geo passes the server-side auction consent gate, so the
+    // request runs the enabled orchestration path instead of a consent skip.
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/auction", process.base_url))
+        .header("cf-ipcountry", "US")
+        .json(&request_body)
+        .send()
+        .expect("should send auction request");
+
+    let status = response.status().as_u16();
+    let body = response.text().expect("should read auction response");
+    assert_eq!(
+        status, 200,
+        "enabled auction should complete without a worker exception: {body}"
+    );
+    let auction_response: serde_json::Value =
+        serde_json::from_str(&body).expect("should return an OpenRTB JSON response");
+    assert!(
+        auction_response["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "auction response should carry the auction id: {body}"
+    );
+    assert_eq!(
+        auction_response["ext"]["orchestrator"]["providers"],
+        serde_json::json!(0),
+        "enabled auction without providers should complete as a no-bid: {body}"
+    );
+}
+
 #[test]
 #[ignore = "requires Docker and pre-built trusted-server-axum binary"]
 fn test_wordpress_axum() {
