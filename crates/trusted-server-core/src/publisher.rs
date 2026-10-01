@@ -2077,13 +2077,13 @@ fn template_fingerprint(settings: &Settings) -> String {
     hasher.update(
         trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
     );
-    // `serde_json::Value` uses a sorted object map without `preserve_order`, making
-    // independently deserialized HashMaps canonical before they are serialized again.
+    // EdgeZero's canonical form sorts object keys itself, so independently deserialized
+    // HashMaps hash identically even when a dependency enables `serde_json/preserve_order`.
     // Array order is preserved: set-valued settings must serialize deterministically
     // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
-        .and_then(|value| serde_json::to_vec(&value))
-        .expect("serializing typed settings should be infallible");
+        .map(|value| edgezero_core::canonical_form::canonical_data_sha256(&value))
+        .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
 }

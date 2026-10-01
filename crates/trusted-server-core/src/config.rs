@@ -578,7 +578,7 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn settings_collections_serialize_deterministically_across_parses() {
+    fn settings_collections_produce_stable_envelope_hashes_across_parses() {
         let mut source = serde_json::to_value(valid_settings()).expect("should serialize settings");
         source["response_headers"] = serde_json::json!({"x-example-b": "b", "x-example-a": "a"});
         source["image_optimizer"] = serde_json::json!({"profile_sets": {
@@ -621,20 +621,13 @@ formats = [{ width = 300, height = 250 }]
             serde_json::from_value::<TrustedServerAppConfig>(source.clone())
                 .expect("should parse collection-rich settings")
         };
-        let canonical = |config: &TrustedServerAppConfig| {
+        let serialize = |config: &TrustedServerAppConfig| {
             serde_json::to_value(config).expect("should serialize typed config")
         };
-        let first = canonical(&parse());
-        let expected_bytes =
-            serde_json::to_vec(&first).expect("should serialize canonical settings");
+        let first = serialize(&parse());
         let expected_sha = BlobEnvelope::new(first, "2026-01-01T00:00:00Z".to_owned()).sha256;
         for _ in 0..32 {
-            let value = canonical(&parse());
-            assert_eq!(
-                serde_json::to_vec(&value).expect("should serialize canonical settings"),
-                expected_bytes,
-                "should serialize every settings map and set deterministically"
-            );
+            let value = serialize(&parse());
             assert_eq!(
                 value["auction"]["allowed_context_keys"],
                 serde_json::json!(["alpha", "beta", "delta", "epsilon", "gamma", "zeta"]),

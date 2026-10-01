@@ -72,9 +72,11 @@ pub struct AuctionConfig {
     pub creative_store: String,
 
     /// Keys allowed in the auction request context map.
+    ///
     /// Only config entries from the JS payload whose key appears in this list
     /// are forwarded into the `AuctionRequest.context`. Unrecognised keys are
-    /// silently dropped. An empty list blocks all context keys.
+    /// silently dropped. An empty list blocks all context keys. Keys are
+    /// deduplicated and serialized in sorted order so config hashes are stable.
     #[serde(default = "default_allowed_context_keys")]
     pub allowed_context_keys: BTreeSet<String>,
 }

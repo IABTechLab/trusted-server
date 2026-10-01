@@ -430,17 +430,20 @@ fn pushed_envelope_sha_is_stable_for_one_context_key_allowlist() {
         let diff = run("diff", &["--local", "--exit-code"]);
         assert!(
             diff.status.success(),
-            "should report no config diff: {}",
+            "should report no config diff:\n{}{}",
+            String::from_utf8_lossy(&diff.stdout),
             String::from_utf8_lossy(&diff.stderr)
         );
         assert!(
             String::from_utf8_lossy(&diff.stderr).contains("no changes"),
-            "should report matching envelope hashes"
+            "should report matching envelope hashes: {}",
+            String::from_utf8_lossy(&diff.stderr)
         );
         let push = run("push", &["--yes", "--no-diff"]);
         assert!(
             push.status.success(),
-            "should repeat config push successfully"
+            "should repeat config push successfully: {}",
+            String::from_utf8_lossy(&push.stderr)
         );
         assert!(
             String::from_utf8_lossy(&push.stderr).contains("no changes"),
