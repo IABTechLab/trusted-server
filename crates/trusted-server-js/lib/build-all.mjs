@@ -41,7 +41,7 @@ const integrationModules = fs.existsSync(integrationsDir)
         );
       })
       .sort()
-      : [];
+  : [];
 
 console.log('[build-all] Discovered integrations:', integrationModules);
 
