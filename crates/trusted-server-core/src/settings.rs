@@ -443,7 +443,8 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    /// Known partner API token placeholders that must not be used in deployments.
+    /// Known partner secret placeholders (`api_token` and `ts_pull_token`) that
+    /// must not be used in deployments.
     pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
         "partner-api-token-32-bytes-minimum",
         "replace-with-partner-api-token-32-bytes-minimum",
@@ -1847,9 +1848,20 @@ impl Proxy {
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TinybirdSettings {
-    /// Master enablement for auction telemetry ingestion.
+    /// Master enablement for Tinybird telemetry. Required by both auction and
+    /// access-log emission; each is independently toggled below.
     #[serde(default)]
     pub enabled: bool,
+    /// Emit auction telemetry when `enabled`. Defaults to `true` so existing
+    /// configs preserve their current auction-emission behavior after
+    /// upgrading; set `false` to silence auction events while keeping
+    /// `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
+    /// Serialized only when `false`: older binaries ignore the key rather
+    /// than reject it, so writing the default `true` into every pushed
+    /// config would let a rollback silently resume auction telemetry after
+    /// an operator disabled it.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auction_enabled: bool,
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
@@ -1862,19 +1874,24 @@ pub struct TinybirdSettings {
     /// Secret reference containing the auction datasource APPEND token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_token_secret: Option<Redacted<String>>,
-    /// Reserved for future access-log telemetry.
+    /// Emit access-log telemetry when `enabled`, independent of `auction_enabled`.
     ///
-    /// `true` is rejected until an access-log emitter is wired, so operators
-    /// cannot enable a setting that silently emits nothing.
+    /// `true` requires `enabled`, non-empty `api_host`/
+    /// `access_dataset`/`access_token_secret`, `max_body_bytes > 0`, and
+    /// `access_sample_rate > 0.0`. This prevents an armed-but-silent sampler
+    /// that enables the flag but emits nothing.
     #[serde(default)]
     pub access_enabled: bool,
-    /// Future access-log Events API datasource name.
+    /// Access-log Events API datasource name. Required non-empty when
+    /// `access_enabled`.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Deprecated placeholder for the unwired access-log APPEND token.
-    #[serde(default, skip_serializing)]
+    /// Secret reference containing the access-log datasource APPEND token.
+    /// Required non-empty when `access_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token_secret: Option<Redacted<String>>,
-    /// Future fraction of requests to emit for optional access telemetry.
+    /// Fraction of requests to emit for access telemetry. Must be greater
+    /// than `0.0` when `access_enabled`.
     #[serde(default)]
     pub access_sample_rate: f64,
     /// Defensive maximum NDJSON body size for one Events API request.
@@ -1898,6 +1915,7 @@ impl Default for TinybirdSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            auction_enabled: default_true(),
             api_host: String::new(),
             secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
@@ -1925,9 +1943,18 @@ impl TinybirdSettings {
             (!value.is_empty()).then(|| Redacted::new(value))
         });
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = None;
+        self.access_token_secret = self.access_token_secret.take().and_then(|value| {
+            let value = value.expose().trim().to_owned();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
     }
 
+    /// Validate this settings block, including the access-telemetry matrix:
+    /// `access_enabled` requires `enabled`, a non-empty `api_host`,
+    /// `access_dataset`, and `access_token_secret`, a
+    /// `max_body_bytes` above the defensive floor enforced below, and an
+    /// `access_sample_rate` greater than `0.0`. Auction emission is
+    /// independently gated by `auction_enabled` and validated the same way.
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.normalize();
         if !(0.0..=1.0).contains(&self.access_sample_rate) {
@@ -1940,24 +1967,41 @@ impl TinybirdSettings {
                 message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
             }));
         }
-        if self.access_enabled {
+        if self.access_enabled && !self.enabled {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+                message: "tinybird.access_enabled requires tinybird.enabled".to_owned(),
             }));
         }
         if !self.enabled {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message:
-                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
-                        .to_owned(),
-            })
-        })?;
-        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
+        if self.auction_enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.auction_token_secret is required when auction telemetry is enabled".to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
+        }
+        if self.access_enabled {
+            validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
+            let token = self.access_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message:
+                        "tinybird.access_token_secret is required when access telemetry is enabled"
+                            .to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.access_token_secret")?;
+            if self.access_sample_rate <= 0.0 {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_sample_rate must be > 0 when tinybird.access_enabled is true".to_owned(),
+                }));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2576,6 +2620,14 @@ pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
     "upstream_message_truncated",
 ];
 
+/// `skip_serializing_if` helper: true is the serde default for the fields
+/// that use it, so serializing it would only widen the pushed config's
+/// rollback surface.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2721,6 +2773,36 @@ pub enum AuctionDebugCommentFormat {
     #[default]
     Compact,
     Pretty,
+}
+
+/// Request-observability toggles exposed to operators.
+///
+/// The default table must stay omitted from serialized config blobs: this
+/// struct denies unknown fields, so an older binary loading a config blob
+/// carrying an `[observability]` table it does not know would reject it,
+/// breaking rollback. See [`Settings::observability`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySettings {
+    /// Emit the `Server-Timing` response header with per-phase request
+    /// timing. Defaults to `false` (off).
+    #[serde(default)]
+    pub server_timing_enabled: bool,
+    /// Section names whose publisher paths keep a named route template in
+    /// access telemetry (`/{section}/*`); everything else collapses to
+    /// `/other/*`. Matching is ASCII case-insensitive on the first path
+    /// segment, and a match requires at least one further segment. Defaults
+    /// to empty, which collapses every publisher path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_sections: Vec<String>,
+}
+
+impl ObservabilitySettings {
+    /// True when every field is at its default, i.e. observability is fully
+    /// disabled and the table can be omitted from serialized output.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Tester-cookie endpoint configuration.
@@ -2888,6 +2970,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    /// Request-observability toggles. The default table is omitted from
+    /// serialized config blobs so a config round-tripped without change
+    /// still parses under a prior binary's schema; see
+    /// [`ObservabilitySettings`].
+    #[serde(default, skip_serializing_if = "ObservabilitySettings::is_default")]
+    pub observability: ObservabilitySettings,
 }
 
 impl Settings {
@@ -3088,6 +3176,16 @@ impl Settings {
                 .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
             {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
+            if partner
+                .ts_pull_token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
+                insecure_fields.push(format!(
+                    "ec.partners[{}].ts_pull_token",
+                    partner.source_domain
+                ));
             }
         }
         for handler in &self.handlers {
@@ -3694,6 +3792,14 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
+    /// Parses `extra` appended to the shared test fixture TOML, mirroring the
+    /// `format!("{}\n...", crate_test_settings_str())` pattern used throughout
+    /// this module's other tests.
+    fn settings_from_toml_with(extra: &str) -> Result<Settings, Report<TrustedServerError>> {
+        let toml = format!("{}\n{extra}", crate_test_settings_str());
+        Settings::from_toml(&toml)
+    }
+
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
@@ -3805,6 +3911,167 @@ mod tests {
             !debug.contains("fictional-shared-secret-0123456789"),
             "should not expose trusted client IP shared secret in debug output"
         );
+    }
+
+    // One distinctive canary per `Redacted<String>` field reachable from
+    // `Settings`'s derived `Debug` impl. This is a regression guard over the
+    // field list below, not a completeness guarantee: a new secret field
+    // added without the `Redacted` wrapper has no canary here and will pass
+    // this test while leaking. Adding the canary is a manual step.
+    //
+    // Integration configs are deliberately out of scope. They reach
+    // `Settings` as opaque JSON under `IntegrationSettings`, whose
+    // hand-written `Debug` impl prints only integration IDs, never values.
+    //
+    // Do not use `..Struct::default()` anywhere in this function. A default
+    // spread would let a new secret field be added to `Handler`,
+    // `TinybirdSettings`, or any other struct built here without forcing
+    // anyone to consider it. The compile break is the prompt; the canary
+    // list below is still maintained by hand. List every field explicitly.
+    #[test]
+    fn settings_debug_output_redacts_every_secret_field() {
+        const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
+        const CANARY_EC_PASSPHRASE: &str = "CANARY-EC-PASSPHRASE-0123456789";
+        const CANARY_HANDLER_USERNAME: &str = "CANARY-HANDLER-USERNAME-0123456789";
+        const CANARY_HANDLER_PASSWORD: &str = "CANARY-HANDLER-PASSWORD-0123456789";
+        const CANARY_EC_PARTNER_API_TOKEN: &str = "CANARY-EC-PARTNER-API-TOKEN-0123456789";
+        const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
+        const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
+            "CANARY-TRUSTED-CLIENT-IP-SHARED-SECRET-0123456789";
+        const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
+        const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
+        const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
+        const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
+        const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
+        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
+
+        let mut settings = create_test_settings();
+
+        settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
+        settings.ec.passphrase = Redacted::new(CANARY_EC_PASSPHRASE.to_string());
+
+        settings.handlers = vec![Handler {
+            path: "^/secure".to_string(),
+            username: Redacted::new(CANARY_HANDLER_USERNAME.to_string()),
+            password: Redacted::new(CANARY_HANDLER_PASSWORD.to_string()),
+            regex: OnceLock::new(),
+        }];
+
+        settings.ec.partners = vec![EcPartner {
+            name: "canary-partner".to_string(),
+            source_domain: "canary-partner.example".to_string(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: false,
+            api_token: Some(Redacted::new(CANARY_EC_PARTNER_API_TOKEN.to_string())),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: Vec::new(),
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
+        }];
+
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "fastly-client-ip".to_string(),
+            auth_header: "x-trusted-client-auth".to_string(),
+            shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
+        });
+
+        let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
+        asset_route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new(CANARY_S3_ACCESS_KEY_ID.to_string()),
+            secret_access_key: Redacted::new(CANARY_S3_SECRET_ACCESS_KEY.to_string()),
+            session_token: Some(Redacted::new(CANARY_S3_SESSION_TOKEN.to_string())),
+            origin_query: None,
+        }));
+        settings.proxy.asset_routes = vec![asset_route];
+
+        settings.tinybird = TinybirdSettings {
+            auction_token_secret: Some(Redacted::new(CANARY_TINYBIRD_AUCTION_TOKEN.to_string())),
+            access_token_secret: Some(Redacted::new(CANARY_TINYBIRD_ACCESS_TOKEN.to_string())),
+            enabled: false,
+            auction_enabled: true,
+            api_host: String::new(),
+            secret_store: None,
+            auction_dataset: String::new(),
+            access_enabled: false,
+            access_dataset: String::new(),
+            access_sample_rate: 0.0f64,
+            max_body_bytes: 0,
+        };
+
+        // `IntegrationSettings` stores integration configs as opaque JSON and
+        // relies on a hand-written `Debug` impl to suppress their values. That
+        // impl is the only thing keeping resolved DataDome credentials out of
+        // this output, so pin it here.
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &json!({
+                    "enabled": true,
+                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                }),
+            )
+            .expect("should insert datadome integration config");
+
+        let debug = format!("{settings:?}");
+
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact secret fields in Settings debug output"
+        );
+        assert!(
+            debug.contains("^/secure"),
+            "should leave non-secret handler path visible in debug output"
+        );
+
+        let canaries = [
+            ("publisher.proxy_secret", CANARY_PROXY_SECRET),
+            ("ec.passphrase", CANARY_EC_PASSPHRASE),
+            ("handlers[].username", CANARY_HANDLER_USERNAME),
+            ("handlers[].password", CANARY_HANDLER_PASSWORD),
+            ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
+            (
+                "ec.partners[].ts_pull_token",
+                CANARY_EC_PARTNER_TS_PULL_TOKEN,
+            ),
+            (
+                "trusted_client_ip.shared_secret",
+                CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET,
+            ),
+            (
+                "proxy.asset_routes[].auth.access_key_id",
+                CANARY_S3_ACCESS_KEY_ID,
+            ),
+            (
+                "proxy.asset_routes[].auth.secret_access_key",
+                CANARY_S3_SECRET_ACCESS_KEY,
+            ),
+            (
+                "proxy.asset_routes[].auth.session_token",
+                CANARY_S3_SESSION_TOKEN,
+            ),
+            (
+                "tinybird.auction_token_secret",
+                CANARY_TINYBIRD_AUCTION_TOKEN,
+            ),
+            ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
+            (
+                "integrations.datadome.server_side_key_secret_name",
+                CANARY_DATADOME_SERVER_SIDE_KEY,
+            ),
+        ];
+
+        for (field, canary) in canaries {
+            assert!(
+                !debug.contains(canary),
+                "should redact {field} in Settings debug output"
+            );
+        }
     }
 
     #[test]
@@ -4456,17 +4723,124 @@ mod tests {
     }
 
     #[test]
-    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
-        let toml = format!(
-            "{}\n[tinybird]\naccess_enabled = true\n",
-            crate_test_settings_str()
+    fn tinybird_access_enabled_with_full_config_is_accepted() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"example-auction-token\"\naccess_token_secret = \"example-access-token\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept a fully-specified access telemetry config");
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
         );
+    }
 
-        let err = Settings::from_toml(&toml)
-            .expect_err("should reject access telemetry before emitter exists");
+    #[test]
+    fn access_enabled_requires_tinybird_enabled() {
+        // access_enabled = true with tinybird.enabled omitted (defaults
+        // false) must be rejected: access telemetry cannot run without the
+        // master toggle on.
+        let err = settings_from_toml_with(
+            "[tinybird]\napi_host = \"api.example.com\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect_err("should reject access telemetry without tinybird.enabled");
         assert!(
             format!("{err:?}").contains("tinybird.access_enabled"),
-            "should report unsupported tinybird.access_enabled setting: {err:?}"
+            "should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn access_enabled_requires_positive_sample_rate() {
+        // access_enabled = true with access_sample_rate = 0 is armed-but-silent: an error.
+        let err = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"example-auction-token\"\naccess_token_secret = \"example-access-token\"\naccess_enabled = true\naccess_sample_rate = 0.0\n",
+        )
+        .expect_err("should reject armed-but-silent access telemetry");
+        assert!(
+            format!("{err:?}").contains("access_sample_rate"),
+            "should name the field"
+        );
+    }
+
+    #[test]
+    fn access_and_auction_emission_are_independent() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_token_secret = \"example-access-token\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept access without auction");
+        assert!(
+            !settings.tinybird.auction_enabled,
+            "should disable auction emission"
+        );
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_defaults_true_for_existing_configs() {
+        let settings =
+            settings_from_toml_with("[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"example-auction-token\"\n")
+                .expect("should parse a pre-decoupling config");
+        assert!(
+            settings.tinybird.auction_enabled,
+            "should preserve current behavior"
+        );
+    }
+
+    #[test]
+    fn observability_defaults_off_and_serializes_away() {
+        let settings = create_test_settings();
+        assert!(
+            !settings.observability.server_timing_enabled,
+            "should default off"
+        );
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("[observability]"),
+            "should omit the default table so a prior binary can parse the config"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_serializes_only_when_disabled() {
+        let mut settings = create_test_settings();
+        assert!(settings.tinybird.auction_enabled, "should default on");
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("auction_enabled"),
+            "should omit the default-true key: a rollback must not silently \
+             re-enable auction telemetry an operator disabled"
+        );
+
+        settings.tinybird.auction_enabled = false;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("auction_enabled = false"),
+            "should serialize the operator's explicit disable"
+        );
+    }
+
+    #[test]
+    fn route_sections_serialize_only_when_configured() {
+        let mut settings = create_test_settings();
+        assert!(
+            settings.observability.route_sections.is_empty(),
+            "should default to the collapse-everything allowlist"
+        );
+        settings.observability.server_timing_enabled = true;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("route_sections"),
+            "should omit the empty allowlist so a prior binary can parse the config"
+        );
+
+        settings.observability.route_sections = vec!["news".to_owned()];
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("route_sections"),
+            "should serialize a configured allowlist"
         );
     }
 
@@ -5436,6 +5810,86 @@ source_domain = "partner.example.com"
         assert!(
             format!("{err:?}").contains("handlers"),
             "error should mention handler password field"
+        );
+    }
+
+    fn test_partner_with_pull_token(ts_pull_token: &str) -> EcPartner {
+        test_partner_with_tokens(None, ts_pull_token)
+    }
+
+    fn test_partner_with_tokens(api_token: Option<&str>, ts_pull_token: &str) -> EcPartner {
+        EcPartner {
+            name: "Test Partner".to_owned(),
+            source_domain: "partner.example.com".to_owned(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: false,
+            api_token: api_token.map(|token| Redacted::new(token.to_owned())),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some("https://partner.example.com/sync".to_owned()),
+            pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
+        }
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_partner_pull_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_pull_token(
+            "partner-api-token-32-bytes-minimum",
+        )];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner pull token");
+        assert!(
+            format!("{err:?}").contains("ec.partners[partner.example.com].ts_pull_token"),
+            "error should mention the partner pull token field"
+        );
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_allows_realistic_partner_pull_token() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_pull_token(
+            "unit-test-realistic-pull-sync-token-32-bytes-min",
+        )];
+
+        settings
+            .reject_placeholder_secrets()
+            .expect("should accept a realistic partner pull token");
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_reports_both_partner_tokens() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.partners = vec![test_partner_with_tokens(
+            Some("partner-api-token-32-bytes-minimum"),
+            "replace-with-partner-api-token-32-bytes-minimum",
+        )];
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner tokens");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("ec.partners[partner.example.com].api_token"),
+            "error should mention the partner API token field"
+        );
+        assert!(
+            message.contains("ec.partners[partner.example.com].ts_pull_token"),
+            "error should also mention the partner pull token field on the same partner"
         );
     }
 
