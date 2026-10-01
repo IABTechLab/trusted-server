@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformBackendSpec, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT};
+use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
 pub mod adserver_mock;
@@ -17,6 +17,8 @@ pub mod datadome;
 pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
+pub mod gpt_diagnostics;
+pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
 pub mod osano;
@@ -153,6 +155,10 @@ fn integration_backend_spec(
         certificate_check,
         first_byte_timeout,
         between_bytes_timeout: first_byte_timeout,
+        // Distinguish this integration's backend from any other provider that
+        // targets the same origin, so auction response correlation by backend
+        // name cannot cross providers.
+        discriminator: Some(integration.to_string()),
     })
 }
 
@@ -284,9 +290,10 @@ pub(crate) struct IntegrationBuilder {
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
+        // This must remain first: attribute rewriters chain replacements and short-circuit removals.
         IntegrationBuilder {
-            id: "prebid",
-            build: prebid::register,
+            id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
+            build: js_asset_proxy::register,
         },
         IntegrationBuilder {
             id: "testlight",
@@ -327,6 +334,10 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         IntegrationBuilder {
             id: "gpt",
             build: gpt::register,
+        },
+        IntegrationBuilder {
+            id: "gpt_diagnostics",
+            build: gpt_diagnostics::register,
         },
     ]
 }

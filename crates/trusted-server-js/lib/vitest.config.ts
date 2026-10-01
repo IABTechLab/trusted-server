@@ -1,4 +1,5 @@
 import path from 'node:path';
+
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
@@ -10,6 +11,10 @@ export default defineConfig({
       'prebid.js/src/adapterManager.js': path.resolve(
         __dirname,
         'node_modules/prebid.js/dist/src/src/adapterManager.js'
+      ),
+      'prebid.js/src/adRendering.js': path.resolve(
+        __dirname,
+        'node_modules/prebid.js/dist/src/src/adRendering.js'
       ),
     },
   },
@@ -23,6 +28,17 @@ export default defineConfig({
     // Kept for clarity if threads are re-enabled later.
     pool: 'threads',
     setupFiles: [],
+    // The GPT diagnostics export contract is expressed as `expectTypeOf`
+    // assertions, which `vitest run` alone never evaluates. Scope the type
+    // gate to those files: a package-wide `tsc --noEmit` still fails on
+    // pre-existing errors elsewhere.
+    typecheck: {
+      enabled: true,
+      include: ['test/**/types.test.ts'],
+      // Errors reported from files outside `include` are pre-existing and
+      // unrelated; only the type assertions in the included files gate here.
+      ignoreSourceErrors: true,
+    },
     coverage: {
       provider: 'v8',
     },

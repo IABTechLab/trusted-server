@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
+import type { AdUnit } from '../../src/core/types';
+
 describe('registry', () => {
   beforeEach(async () => {
     await vi.resetModules();
@@ -17,7 +19,7 @@ describe('registry', () => {
           ],
         },
       },
-    } as any;
+    } as AdUnit;
     addAdUnits(unit);
 
     const all = getAllUnits();

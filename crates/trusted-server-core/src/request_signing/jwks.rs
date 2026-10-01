@@ -6,14 +6,14 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use error_stack::{Report, ResultExt as _};
 use jose_jwk::{
-    jose_jwa::{Algorithm, Signing},
     Jwk, Key, Okp, OkpCurves, Parameters,
+    jose_jwa::{Algorithm, Signing},
 };
 use rand::rngs::OsRng;
 
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
-use crate::request_signing::{read_active_kids, JWKS_STORE_NAME};
+use crate::request_signing::{JWKS_STORE_NAME, read_active_kids};
 
 /// An Ed25519 keypair used for request signing.
 pub struct Keypair {
@@ -93,8 +93,8 @@ mod tests {
     use jose_jwk::Key;
 
     use crate::platform::{
-        test_support::build_services_with_config, PlatformConfigStore, PlatformError, StoreId,
-        StoreName,
+        PlatformConfigStore, PlatformError, StoreId, StoreName,
+        test_support::build_services_with_config,
     };
 
     use super::*;

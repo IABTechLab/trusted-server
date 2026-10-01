@@ -16,7 +16,7 @@
 use std::borrow::Cow;
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{header, HeaderValue, Response};
+use http::{HeaderValue, Response, header};
 
 use crate::constants::COOKIE_TS_EC;
 use crate::settings::Settings;

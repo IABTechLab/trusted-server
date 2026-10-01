@@ -8,7 +8,7 @@
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, HeaderValue, Response, StatusCode};
+use http::{HeaderValue, Response, StatusCode, header};
 
 use crate::constants::COOKIE_TS_TESTER;
 use crate::error::TrustedServerError;

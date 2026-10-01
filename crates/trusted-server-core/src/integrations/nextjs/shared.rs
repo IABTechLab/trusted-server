@@ -145,16 +145,10 @@ impl RscUrlRewriter {
         // recompiling the pattern on each call. regex::escape() guarantees validity, but
         // treat compilation failure as non-fatal rather than panic.
         let cached = self.cached_pattern.borrow();
-        if let Some((ref host, ref regex)) = *cached {
-            if host == origin_host {
-                return Self::apply_rewrite(
-                    input,
-                    regex,
-                    origin_host,
-                    request_host,
-                    request_scheme,
-                );
-            }
+        if let Some((ref host, ref regex)) = *cached
+            && host == origin_host
+        {
+            return Self::apply_rewrite(input, regex, origin_host, request_host, request_scheme);
         }
         drop(cached);
 

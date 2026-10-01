@@ -6,9 +6,9 @@
 //!
 //! Run with: `cargo bench -p trusted-server-core`
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use trusted_server_core::consent::tcf::decode_tc_string;
 use trusted_server_core::consent::types::RawConsentSignals;

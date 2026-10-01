@@ -433,7 +433,11 @@ mod tests {
                 replacer: create_url_replacer("test.com", "https://test.com", "new.com", "https"),
                 content: "Some text \u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5} more text with \u{1f389} emoji",
                 chunk_size: 8,
-                expected_fragments: &["Some text", "\u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5}", "\u{1f389} emoji"],
+                expected_fragments: &[
+                    "Some text",
+                    "\u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5}",
+                    "\u{1f389} emoji",
+                ],
             },
         ];
 

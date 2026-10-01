@@ -11,9 +11,38 @@ pub fn tsjs_script_src(module_ids: &[&str]) -> String {
 /// `<script>` tag for injecting the tsjs bundle.
 #[must_use]
 pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
+    tsjs_script_tag_with_attributes(module_ids, &[])
+}
+
+/// Publisher `<script>` tag for the tsjs bundle with trusted static attributes.
+#[must_use]
+pub fn tsjs_script_tag_with_attributes(
+    module_ids: &[&str],
+    attributes: &[(&'static str, &'static str)],
+) -> String {
+    let attributes = attributes
+        .iter()
+        .map(|(name, value)| {
+            debug_assert!(
+                !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+            );
+            debug_assert!(
+                !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>')),
+                "attribute value should not contain HTML-sensitive characters"
+            );
+            format!(" {name}=\"{value}\"")
+        })
+        .collect::<String>();
+
     format!(
-        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
-        tsjs_script_src(module_ids)
+        "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
+        tsjs_script_src(module_ids),
     )
 }
 
@@ -41,11 +70,17 @@ pub fn tsjs_unified_script_tag() -> String {
     )
 }
 
+/// `/static` URL for one module with its own cache-busting hash.
+#[must_use]
+pub fn tsjs_single_module_script_src(module_id: &str) -> String {
+    let hash = single_module_hash(module_id).unwrap_or_default();
+    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+}
+
 /// `/static` URL for a single deferred module with its own cache-busting hash.
 #[must_use]
 pub fn tsjs_deferred_script_src(module_id: &str) -> String {
-    let hash = single_module_hash(module_id).unwrap_or_default();
-    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+    tsjs_single_module_script_src(module_id)
 }
 
 /// `<script defer>` tag for a single deferred module.
@@ -168,6 +203,65 @@ mod tests {
     }
 
     #[test]
+    fn publisher_tsjs_script_tag_renders_static_attributes() {
+        let module_ids = ["gpt"];
+        let src = tsjs_script_src(&module_ids);
+
+        assert_eq!(
+            tsjs_script_tag_with_attributes(&module_ids, &[("data-ts-gam-attribution", "true")]),
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
+            ),
+            "should render trusted static attributes on the publisher bundle tag"
+        );
+        assert_eq!(
+            tsjs_script_tag(&module_ids),
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            "should keep the generic tag byte-for-byte unmarked"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_invalid_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-bad_name", "true")]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_empty_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("", "true")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_double_quote_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad\"value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_ampersand_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad&value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_less_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad<value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_greater_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad>value")]);
+    }
+
+    #[test]
     fn tsjs_unified_helpers_use_unversioned_fallback_without_registry() {
         let src = tsjs_unified_script_src();
 
@@ -183,8 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_formats_known_module_url_with_hash() {
-        let src = tsjs_deferred_script_src("creative");
+    fn tsjs_single_module_script_src_formats_known_module_url_with_hash() {
+        let src = tsjs_single_module_script_src("creative");
 
         assert!(
             src.starts_with("/static/tsjs=tsjs-creative.min.js?v="),
@@ -194,12 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_uses_empty_hash_for_external_or_unknown_module() {
-        assert_eq!(
-            tsjs_deferred_script_src("prebid"),
-            "/static/tsjs=tsjs-prebid.min.js?v=",
-            "prebid now ships as an external bundle and has no local hash"
+    fn tsjs_deferred_script_src_hashes_prebid_shim_and_empties_unknown_module() {
+        let prebid_src = tsjs_deferred_script_src("prebid");
+        assert!(
+            prebid_src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
+            "prebid shim should be served from the deferred tsjs route"
         );
+        assert_sha256_hex_hash(hash_query_value(&prebid_src));
         assert_eq!(
             tsjs_deferred_script_src("unknown-module"),
             "/static/tsjs=tsjs-unknown-module.min.js?v=",

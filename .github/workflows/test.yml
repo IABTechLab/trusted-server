@@ -7,12 +7,12 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, "feature/**"]
 
 jobs:
   test-rust:
     name: cargo test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +26,11 @@ jobs:
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
         run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Set up Rust toolchain
@@ -46,8 +51,19 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
+      - name: Use Node.js for the served-seam contract
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run template cache ESI local harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
+
+      - name: Run inline control harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 
   test-axum:
     name: cargo test (axum native)
@@ -81,6 +97,12 @@ jobs:
 
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
+
+      # The codegen crate is not a default member and no adapter alias builds it,
+      # so its tests only run if invoked explicitly on the host target.
+      - name: Run host-target OpenRTB codegen tests
+        run: |
+          cargo test --package trusted-server-openrtb-codegen --target "$(rustc -vV | sed -n 's/host: //p')"
 
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1

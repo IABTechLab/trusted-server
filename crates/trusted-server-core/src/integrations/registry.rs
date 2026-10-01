@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -8,9 +8,10 @@ use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
 
+use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
-use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
+use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
@@ -82,6 +83,7 @@ impl ScriptRewriteAction {
 #[derive(Debug)]
 pub struct IntegrationAttributeContext<'a> {
     pub attribute_name: &'a str,
+    pub element_name: &'a str,
     pub request_host: &'a str,
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
@@ -98,17 +100,19 @@ pub struct IntegrationScriptContext<'a> {
     pub document_state: &'a IntegrationDocumentState,
 }
 
+type IntegrationDocumentStateMap = BTreeMap<(&'static str, TypeId), Arc<dyn Any + Send + Sync>>;
+
 /// Per-document state shared between HTML/script rewriters and post-processors.
 ///
 /// This exists to support multi-phase HTML processing without requiring a second HTML parse.
 #[derive(Clone, Default)]
 pub struct IntegrationDocumentState {
-    inner: Arc<Mutex<BTreeMap<&'static str, Arc<dyn Any + Send + Sync>>>>,
+    inner: Arc<Mutex<IntegrationDocumentStateMap>>,
 }
 
 impl std::fmt::Debug for IntegrationDocumentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let keys: Vec<&'static str> = {
+        let keys: Vec<(&'static str, TypeId)> = {
             let guard = self
                 .inner
                 .lock()
@@ -136,7 +140,7 @@ impl IntegrationDocumentState {
             .inner
             .lock()
             .expect("should lock integration document state");
-        let value = guard.get(integration_id)?;
+        let value = guard.get(&(integration_id, TypeId::of::<T>()))?;
         let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
         cloned.downcast::<T>().ok()
     }
@@ -159,17 +163,15 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
 
-        if let Some(existing) = guard.get(integration_id) {
-            if let Ok(downcast) = Arc::clone(existing).downcast::<T>() {
-                return downcast;
-            }
+        let key = (integration_id, TypeId::of::<T>());
+        if let Some(existing) = guard.get(&key)
+            && let Ok(downcast) = Arc::clone(existing).downcast::<T>()
+        {
+            return downcast;
         }
 
         let value: Arc<T> = Arc::new(init());
-        guard.insert(
-            integration_id,
-            Arc::clone(&value) as Arc<dyn Any + Send + Sync>,
-        );
+        guard.insert(key, Arc::clone(&value) as Arc<dyn Any + Send + Sync>);
         value
     }
 
@@ -327,7 +329,7 @@ pub trait IntegrationProxy: Send + Sync {
 pub struct RequestFilterInput<'a> {
     pub settings: &'a Settings,
     pub services: &'a RuntimeServices,
-    pub request: &'a Request<EdgeBody>,
+    pub request: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
@@ -575,6 +577,11 @@ pub trait IntegrationHeadInjector: Send + Sync {
     fn integration_id(&self) -> &'static str;
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
+
+    /// Return attributes to add to the publisher TSJS bundle tag.
+    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        Vec::new()
+    }
 }
 
 /// Registration payload returned by integration builders.
@@ -772,9 +779,23 @@ pub struct ProxyDispatchInput<'a> {
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
+    plan: Option<Arc<AuctionPlan>>,
 }
 
 impl IntegrationRegistry {
+    /// Build a registry and auction plan from the provided settings for tests.
+    ///
+    /// Runtime adapters should compile one plan and pass it to [`Self::with_plan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the auction plan or integration registry is invalid.
+    #[cfg(test)]
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        let plan = Arc::new(crate::auction::compile_auction_plan(settings)?);
+        Self::with_plan(settings, plan)
+    }
+
     /// Build a registry from the provided settings.
     ///
     /// # Errors
@@ -784,87 +805,110 @@ impl IntegrationRegistry {
     /// # Panics
     ///
     /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
-    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+    pub fn with_plan(
+        settings: &Settings,
+        plan: Arc<AuctionPlan>,
+    ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-
+        let mut registrations = Vec::new();
+        if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
+        {
+            registrations.push(registration);
+        }
+        if let Some(registration) = crate::integrations::aps::register_for_plan(settings, &plan)? {
+            registrations.push(registration);
+        }
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
                 debug_assert_eq!(
                     registration.integration_id, builder.id,
                     "integration builder ID should match registration ID"
                 );
-                inner
-                    .enabled_integration_ids
-                    .push(registration.integration_id);
+                registrations.push(registration);
+            }
+        }
 
-                for proxy in registration.proxies {
-                    for route in proxy.routes() {
-                        let value = (proxy.clone(), registration.integration_id);
+        for registration in registrations {
+            inner
+                .enabled_integration_ids
+                .push(registration.integration_id);
 
-                        // Convert /* wildcard to matchit's {*rest} syntax
-                        let matchit_path = if route.path.ends_with("/*") {
-                            format!(
-                                "{}/{{*rest}}",
-                                route
-                                    .path
-                                    .strip_suffix("/*")
-                                    .expect("path should end with '/*'")
-                            )
-                        } else {
-                            route.path.clone()
-                        };
+            for proxy in registration.proxies {
+                for route in proxy.routes() {
+                    let value = (proxy.clone(), registration.integration_id);
 
-                        // Select appropriate router and insert
-                        let router = match route.method {
-                            Method::GET => &mut inner.get_router,
-                            Method::POST => &mut inner.post_router,
-                            Method::PUT => &mut inner.put_router,
-                            Method::DELETE => &mut inner.delete_router,
-                            Method::PATCH => &mut inner.patch_router,
-                            Method::HEAD => &mut inner.head_router,
-                            Method::OPTIONS => &mut inner.options_router,
-                            _ => {
-                                log::warn!(
-                                    "Unsupported HTTP method {} for route {}",
-                                    route.method,
-                                    route.path
-                                );
-                                continue;
-                            }
-                        };
+                    // Convert /* wildcard to matchit's {*rest} syntax
+                    let matchit_path = if route.path.ends_with("/*") {
+                        format!(
+                            "{}/{{*rest}}",
+                            route
+                                .path
+                                .strip_suffix("/*")
+                                .expect("path should end with '/*'")
+                        )
+                    } else {
+                        route.path.clone()
+                    };
 
-                        if let Err(e) = router.insert(&matchit_path, value) {
-                            return Err(Report::new(TrustedServerError::Configuration {
-                                message: format!(
-                                    "Integration route registration failed for {} {}: {:?}",
-                                    route.method, route.path, e
-                                ),
-                            }));
+                    // Select appropriate router and insert
+                    let router = match route.method {
+                        Method::GET => &mut inner.get_router,
+                        Method::POST => &mut inner.post_router,
+                        Method::PUT => &mut inner.put_router,
+                        Method::DELETE => &mut inner.delete_router,
+                        Method::PATCH => &mut inner.patch_router,
+                        Method::HEAD => &mut inner.head_router,
+                        Method::OPTIONS => &mut inner.options_router,
+                        _ => {
+                            log::warn!(
+                                "Unsupported HTTP method {} for route {}",
+                                route.method,
+                                route.path
+                            );
+                            continue;
                         }
+                    };
 
-                        inner.routes.push((route, registration.integration_id));
+                    if let Err(e) = router.insert(&matchit_path, value) {
+                        return Err(Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "Integration route registration failed for {} {}: {:?}",
+                                route.method, route.path, e
+                            ),
+                        }));
                     }
+
+                    inner.routes.push((route, registration.integration_id));
                 }
-                inner
-                    .html_rewriters
-                    .extend(registration.attribute_rewriters);
-                inner.script_rewriters.extend(registration.script_rewriters);
-                inner
-                    .html_post_processors
-                    .extend(registration.html_post_processors);
-                inner.head_injectors.extend(registration.head_injectors);
-                inner.request_filters.extend(registration.request_filters);
-                if registration.js_disabled {
-                    inner.disabled_js_ids.push(registration.integration_id);
-                } else if registration.js_deferred {
-                    inner.deferred_js_ids.push(registration.integration_id);
-                }
+            }
+            inner
+                .html_rewriters
+                .extend(registration.attribute_rewriters);
+            inner.script_rewriters.extend(registration.script_rewriters);
+            inner
+                .html_post_processors
+                .extend(registration.html_post_processors);
+            inner.head_injectors.extend(registration.head_injectors);
+            inner.request_filters.extend(registration.request_filters);
+            if registration.js_disabled {
+                inner.disabled_js_ids.push(registration.integration_id);
+            } else if registration.js_deferred {
+                inner.deferred_js_ids.push(registration.integration_id);
             }
         }
 
         Ok(Self {
             inner: Arc::new(inner),
+            plan: Some(plan),
         })
+    }
+
+    /// Return whether this registry and another consumer share the same plan allocation.
+    #[must_use]
+    pub fn shares_plan(&self, plan: &Arc<AuctionPlan>) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, plan))
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -1053,6 +1097,30 @@ impl IntegrationRegistry {
         inserts
     }
 
+    /// Collect static attributes for the publisher TSJS bundle tag.
+    #[must_use]
+    pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        let mut attributes: Vec<(&'static str, &'static str)> = Vec::new();
+        for injector in &self.inner.head_injectors {
+            for attribute in injector.tsjs_script_tag_attributes() {
+                let existing = attributes
+                    .iter()
+                    .find(|(name, _)| *name == attribute.0)
+                    .copied();
+                match existing {
+                    None => attributes.push(attribute),
+                    Some((_, kept_value)) if kept_value != attribute.1 => log::warn!(
+                        "Integration `{}` emits conflicting value for publisher tag attribute `{}`; keeping the first",
+                        injector.integration_id(),
+                        attribute.0
+                    ),
+                    Some(_) => {}
+                }
+            }
+        }
+        attributes
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
@@ -1102,6 +1170,12 @@ impl IntegrationRegistry {
         }
 
         map.into_values().collect()
+    }
+
+    /// Return whether an integration is enabled in this registry.
+    #[must_use]
+    pub fn integration_enabled(&self, integration_id: &str) -> bool {
+        self.inner.enabled_integration_ids.contains(&integration_id)
     }
 
     /// Return JS module IDs that should be included in the tsjs bundle.
@@ -1157,6 +1231,7 @@ impl IntegrationRegistry {
     pub fn empty_for_tests() -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
+            plan: None,
         }
     }
 
@@ -1185,6 +1260,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 
@@ -1214,6 +1290,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 
@@ -1239,6 +1316,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 
@@ -1304,6 +1382,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 }
@@ -1313,7 +1392,80 @@ mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
-    use http::{header, HeaderValue, StatusCode};
+    use http::{HeaderValue, StatusCode, header};
+
+    struct DefaultMetadataHeadInjector;
+
+    impl IntegrationHeadInjector for DefaultMetadataHeadInjector {
+        fn integration_id(&self) -> &'static str {
+            "default-metadata"
+        }
+
+        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    struct StaticMetadataHeadInjector;
+
+    impl IntegrationHeadInjector for StaticMetadataHeadInjector {
+        fn integration_id(&self) -> &'static str {
+            "static-metadata"
+        }
+
+        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("data-ts-gam-attribution", "true"),
+                ("data-test-order", "second"),
+            ]
+        }
+    }
+
+    struct ConflictingMetadataHeadInjector;
+
+    impl IntegrationHeadInjector for ConflictingMetadataHeadInjector {
+        fn integration_id(&self) -> &'static str {
+            "conflicting-metadata"
+        }
+
+        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("data-ts-gam-attribution", "false"),
+                ("data-third-attribute", "third"),
+            ]
+        }
+    }
+
+    #[test]
+    fn tsjs_script_tag_attributes_preserve_registration_order_and_default_empty() {
+        let registry = IntegrationRegistry::from_rewriters_with_head_injectors(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                Arc::new(DefaultMetadataHeadInjector),
+                Arc::new(StaticMetadataHeadInjector),
+                Arc::new(ConflictingMetadataHeadInjector),
+            ],
+        );
+
+        assert_eq!(
+            registry.tsjs_script_tag_attributes(),
+            vec![
+                ("data-ts-gam-attribution", "true"),
+                ("data-test-order", "second"),
+                ("data-third-attribute", "third"),
+            ],
+            "should keep the first value for duplicate names and preserve attribute order"
+        );
+    }
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -1339,6 +1491,8 @@ mod tests {
     }
 
     struct EnrichingRequestFilter;
+    #[derive(Clone, Copy)]
+    struct RequestAnnotation;
 
     #[async_trait(?Send)]
     impl IntegrationRequestFilter for EnrichingRequestFilter {
@@ -1348,8 +1502,9 @@ mod tests {
 
         async fn filter_request(
             &self,
-            _input: RequestFilterInput<'_>,
+            input: RequestFilterInput<'_>,
         ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            input.request.extensions_mut().insert(RequestAnnotation);
             Ok(RequestFilterDecision::Continue(RequestFilterEffects {
                 request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
@@ -1394,6 +1549,37 @@ mod tests {
                 .expect("should build echo response");
             Ok(response)
         }
+    }
+
+    #[test]
+    fn document_state_keeps_multiple_types_for_one_integration() {
+        let state = IntegrationDocumentState::default();
+        let number = state.get_or_insert_with("test", || 7_u32);
+        let label = state.get_or_insert_with("test", || "first".to_string());
+        let repeated_number = state.get_or_insert_with("test", || 99_u32);
+
+        assert!(
+            Arc::ptr_eq(&number, &repeated_number),
+            "repeated insertion should preserve the original typed state"
+        );
+        assert_eq!(
+            *state.get::<u32>("test").expect("should retrieve number"),
+            7,
+            "should retain numeric state"
+        );
+        assert_eq!(
+            state
+                .get::<String>("test")
+                .expect("should retrieve label")
+                .as_str(),
+            "first",
+            "should retain string state under the same integration ID"
+        );
+        assert_eq!(
+            label.as_str(),
+            "first",
+            "should return inserted string state"
+        );
     }
 
     #[test]
@@ -1480,6 +1666,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
             "should apply DataDome-style request enrichment before routing"
+        );
+        assert!(
+            req.extensions().get::<RequestAnnotation>().is_some(),
+            "should preserve private request annotations for downstream routing"
         );
         match outcome {
             RequestFilterRegistryOutcome::Continue(effects) => {
@@ -1949,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_prebid_and_include_core_js_only_modules() {
+    fn js_module_ids_defer_prebid_and_include_core_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1958,25 +2148,29 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
                     "debug": false
                 }),
             )
             .expect("should insert prebid config");
 
-        let registry =
-            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings_with_prebid,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings_with_prebid)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         let all = registry.js_module_ids();
         let immediate = registry.js_module_ids_immediate();
         let deferred = registry.js_module_ids_deferred();
 
         assert!(
-            !all.contains(&"prebid"),
-            "should not include prebid in embedded TSJS module IDs"
+            all.contains(&"prebid"),
+            "should include the prebid shim in embedded TSJS module IDs"
         );
         assert!(
             immediate.contains(&"creative"),
@@ -1991,8 +2185,8 @@ mod tests {
             "should not include prebid in immediate IDs"
         );
         assert!(
-            !deferred.contains(&"prebid"),
-            "should not include prebid in deferred IDs"
+            deferred.contains(&"prebid"),
+            "should serve the prebid shim as a deferred module"
         );
     }
 
@@ -2004,7 +2198,14 @@ mod tests {
             .insert_config("nextjs", &serde_json::json!({ "enabled": true }))
             .expect("should insert nextjs config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let all = registry.js_module_ids();
 
         assert!(
@@ -2033,7 +2234,14 @@ mod tests {
             .insert_config("osano", &serde_json::json!({ "enabled": true }))
             .expect("should insert osano config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let immediate = registry.js_module_ids_immediate();
 
         assert!(
@@ -2061,13 +2269,19 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": false,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should update prebid config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         let deferred = registry.js_module_ids_deferred();
         assert!(
@@ -2077,7 +2291,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_prebid_when_external_bundle_is_configured() {
+    fn js_module_ids_defer_prebid_shim_when_external_bundle_is_configured() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2085,25 +2299,31 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
                 }),
             )
             .expect("should update prebid config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         assert!(
-            !registry.js_module_ids().contains(&"prebid"),
-            "external bundle mode should not include prebid in embedded TSJS modules"
+            registry.js_module_ids().contains(&"prebid"),
+            "external bundle mode should include the prebid shim in embedded TSJS modules"
         );
         assert!(
             !registry.js_module_ids_immediate().contains(&"prebid"),
-            "external bundle mode should not include prebid in immediate TSJS modules"
+            "the prebid shim should not load in the immediate TSJS bundle"
         );
         assert!(
-            !registry.js_module_ids_deferred().contains(&"prebid"),
-            "external bundle mode should not include prebid in deferred TSJS modules"
+            registry.js_module_ids_deferred().contains(&"prebid"),
+            "the prebid shim should load as a deferred TSJS module"
         );
         assert!(
             registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
@@ -2121,17 +2341,21 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
                     "debug": false
                 }),
             )
             .expect("should insert prebid config");
 
-        let registry =
-            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings_with_prebid,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings_with_prebid)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         let all = registry.js_module_ids();
         let mut recombined = registry.js_module_ids_immediate();

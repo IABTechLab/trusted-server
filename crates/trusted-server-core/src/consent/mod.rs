@@ -124,16 +124,15 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 
     // Read fallback: when the request carries no consent signals, fall back
     // to consent persisted in KV for this EC ID (when persistence is wired).
-    if signals.is_empty() {
-        if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
-            if let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id) {
-                // Jurisdiction is request-local: derive it from the current
-                // geo rather than the value stored with the persisted entry.
-                ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
-                log_consent_context(&ctx);
-                return ctx;
-            }
-        }
+    if signals.is_empty()
+        && let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store)
+        && let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id)
+    {
+        // Jurisdiction is request-local: derive it from the current
+        // geo rather than the value stored with the persisted entry.
+        ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+        log_consent_context(&ctx);
+        return ctx;
     }
 
     // In proxy mode, skip decoding entirely.
@@ -572,10 +571,10 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
                 return tcf.has_storage_consent();
             }
             // GPP US sale_opt_out=false is an explicit non-opt-out signal.
-            if let Some(gpp) = &ctx.gpp {
-                if let Some(opted_out) = gpp.us_sale_opt_out {
-                    return !opted_out;
-                }
+            if let Some(gpp) = &ctx.gpp
+                && let Some(opted_out) = gpp.us_sale_opt_out
+            {
+                return !opted_out;
             }
             // Check US Privacy string when no TCF decision is present.
             if let Some(usp) = &ctx.us_privacy {
@@ -702,9 +701,9 @@ mod tests {
     use http::Request;
 
     use super::{
-        allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
-        build_consent_context, build_context_from_signals, consent_allows_server_side_auction,
-        has_explicit_ec_withdrawal, ConsentPipelineInput,
+        ConsentPipelineInput, allows_ec_creation, apply_expiration_check,
+        apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
+        consent_allows_server_side_auction, has_explicit_ec_withdrawal,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{

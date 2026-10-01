@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, "feature/**"]
 
 permissions:
   contents: read
@@ -52,6 +51,11 @@ jobs:
 
       - name: Run host-target CLI clippy
         run: cargo clippy --package trusted-server-cli --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
+
+      # The codegen crate is a workspace member but is not a default member and
+      # is not covered by any adapter-scoped alias, so lint it explicitly.
+      - name: Run host-target OpenRTB codegen clippy
+        run: cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 
   format-typescript:
     runs-on: ubuntu-latest
@@ -114,3 +118,6 @@ jobs:
 
       - name: Run Prettier (check)
         run: npm run format
+
+      - name: Build with VitePress (fails on dead links)
+        run: npm run build

@@ -34,10 +34,10 @@ use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
+    collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -368,10 +368,10 @@ impl SourcepointIntegration {
         original_req: &Request<EdgeBody>,
         proxy_req: &mut Request<EdgeBody>,
     ) -> bool {
-        if let Some(client_ip) = client_ip {
-            if let Ok(val) = HeaderValue::from_str(&client_ip.to_string()) {
-                proxy_req.headers_mut().insert("x-forwarded-for", val);
-            }
+        if let Some(client_ip) = client_ip
+            && let Ok(val) = HeaderValue::from_str(&client_ip.to_string())
+        {
+            proxy_req.headers_mut().insert("x-forwarded-for", val);
         }
 
         // Accept-Encoding is deliberately omitted here and handled in the
@@ -659,13 +659,13 @@ impl SourcepointIntegration {
         // from the passthrough path's `apply_cache_headers` (which only sets a
         // default when upstream omitted Cache-Control). Responses that set
         // cookies are kept private.
-        if !Self::apply_cookie_safety(response) {
-            if let Ok(val) = HeaderValue::from_str(&format!(
+        if !Self::apply_cookie_safety(response)
+            && let Ok(val) = HeaderValue::from_str(&format!(
                 "public, max-age={}",
                 self.config.cache_ttl_seconds
-            )) {
-                response.headers_mut().insert(header::CACHE_CONTROL, val);
-            }
+            ))
+        {
+            response.headers_mut().insert(header::CACHE_CONTROL, val);
         }
     }
 
@@ -855,12 +855,12 @@ impl IntegrationProxy for SourcepointIntegration {
                 .insert(header::ACCEPT_ENCODING, ae.clone());
         }
 
-        if method == Method::POST {
-            if let Some(content_type) = source_req.headers().get(header::CONTENT_TYPE) {
-                proxy_req
-                    .headers_mut()
-                    .insert(header::CONTENT_TYPE, content_type.clone());
-            }
+        if method == Method::POST
+            && let Some(content_type) = source_req.headers().get(header::CONTENT_TYPE)
+        {
+            proxy_req
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type.clone());
         }
 
         let backend_name = ensure_integration_backend(
@@ -890,12 +890,11 @@ impl IntegrationProxy for SourcepointIntegration {
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|h| h.to_str().ok())
+                && let Some(rewritten) = Self::rewrite_redirect_location(location, &target_url)
             {
-                if let Some(rewritten) = Self::rewrite_redirect_location(location, &target_url) {
-                    log::info!("Sourcepoint: rewrote redirect Location to {rewritten}");
-                    if let Ok(val) = HeaderValue::from_str(&rewritten) {
-                        response.headers_mut().insert(header::LOCATION, val);
-                    }
+                log::info!("Sourcepoint: rewrote redirect Location to {rewritten}");
+                if let Ok(val) = HeaderValue::from_str(&rewritten) {
+                    response.headers_mut().insert(header::LOCATION, val);
                 }
             }
             // Redirects without Set-Cookie intentionally keep upstream cache
@@ -1123,6 +1122,7 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -1147,6 +1147,7 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -1397,7 +1398,14 @@ mod tests {
             .insert_config(SOURCEPOINT_INTEGRATION_ID, &json!({ "enabled": true }))
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         for method in [Method::GET, Method::POST, Method::HEAD, Method::OPTIONS] {
             assert!(
                 registry.has_route(&method, "/integrations/sourcepoint/cdn/wrapper/v2/messages"),

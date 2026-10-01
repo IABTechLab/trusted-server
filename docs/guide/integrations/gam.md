@@ -14,7 +14,7 @@ The Google Ad Manager (GAM) integration will enable direct integration with Goog
 - **Dynamic Ad Slots**: Programmatic slot management
 - **Programmatic Guaranteed**: Direct deals and PG support
 - **First-Party Reporting**: Ad performance metrics
-- **Secure Signals**: Privacy-preserving audience signals
+- **Secure Signals**: Encoded audience signals shared with publisher-selected partners
 - **Creative Rendering**: First-party creative delivery
 
 ## Expected Configuration

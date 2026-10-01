@@ -44,7 +44,7 @@ impl BidPlaceholder {
     }
 }
 
-/// Tracks which parser insertions actually happened for EOF fallback decisions.
+/// Tracks parser-owned head and bid-placeholder insertions.
 #[derive(Debug, Default)]
 pub struct HtmlInjectionTracker {
     head_injected: AtomicBool,

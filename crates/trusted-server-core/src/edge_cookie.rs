@@ -138,7 +138,7 @@ pub fn get_or_generate_ec_id(
 mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
-    use http::{header, HeaderName};
+    use http::{HeaderName, header};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};

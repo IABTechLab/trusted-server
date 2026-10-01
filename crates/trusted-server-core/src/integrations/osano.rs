@@ -53,7 +53,7 @@ pub fn register(
 mod tests {
     use serde_json::json;
 
-    use super::{register, OsanoConfig};
+    use super::{OsanoConfig, register};
     use crate::test_support::tests::create_test_settings;
 
     #[test]

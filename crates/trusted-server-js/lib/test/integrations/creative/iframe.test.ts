@@ -38,6 +38,25 @@ describe('creative/iframe.ts', () => {
     });
   });
 
+  it('does not apply an iframe src when signing is blocked by policy', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await importCreativeModule({ renderGuard: true });
+
+    const iframe = document.createElement('iframe');
+    iframe.src = 'https://blocked.example.com/rejected.html';
+
+    await waitForExpect(() => {
+      expect(fetchMock).toHaveBeenCalled();
+      expect(iframe.getAttribute('src')).toBeNull();
+      expect(iframe.src).toBe('');
+    });
+  });
+
   it('falls back to raw iframe src when signing fails', async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
     global.fetch = fetchMock as unknown as typeof fetch;

@@ -4,14 +4,14 @@
 //! lifecycle, and storing keys via platform store primitives through
 //! [`RuntimeServices`].
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt as _};
 use jose_jwk::Jwk;
 use uuid::Uuid;
 
-use super::{read_active_kids, Keypair};
+use super::{Keypair, read_active_kids};
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreId};
 use crate::request_signing::JWKS_STORE_NAME;

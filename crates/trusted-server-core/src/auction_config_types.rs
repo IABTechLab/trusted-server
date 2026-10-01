@@ -1,28 +1,70 @@
-//! Auction configuration types (separated to avoid circular deps in build.rs).
+//! Auction configuration types shared by settings and auction planning.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
+use validator::Validate;
+
+const LEGACY_PROVIDER_LIST_MESSAGE: &str = "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration";
+
+pub use crate::auction::plan::{
+    BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
+};
 
 /// Auction orchestration configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct AuctionConfig {
     /// Enable the auction orchestrator
     #[serde(default)]
     pub enabled: bool,
 
-    /// Provider names that participate in bidding
-    /// Simply list the provider names (e.g., ["prebid", "aps"])
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
-    pub providers: Vec<String>,
+    /// Strip executable markup from winning-bid creative HTML before delivery.
+    ///
+    /// Sanitization removes `script`/`object`/`embed`/`form`/etc. **with their inner
+    /// content**, which blanks script-based creatives — the majority of programmatic
+    /// display. It is the primary defence when the creative renders in a context that
+    /// shares the publisher's origin.
+    ///
+    /// Disable only when creatives render in a foreign-origin frame (for example the
+    /// Prebid Universal Creative inside the ad server's iframe), where the markup
+    /// cannot reach the publisher origin. Defaults to disabled.
+    #[serde(
+        default = "default_sanitize_creatives",
+        skip_serializing_if = "is_default_sanitize_creatives"
+    )]
+    pub sanitize_creatives: bool,
 
-    /// Optional mediator provider name (e.g., "gam")
+    /// Rewrite winning-bid creative HTML to first-party endpoints (applied
+    /// after sanitization when [`Self::sanitize_creatives`] is enabled).
+    ///
+    /// The default stays omitted from serialized config blobs to avoid adding
+    /// this field when it has no effect. Any rollback across schema versions
+    /// still requires restoring the matching old-schema blob with the old
+    /// binary.
+    #[serde(
+        default = "default_rewrite_creatives",
+        skip_serializing_if = "is_default_rewrite_creatives"
+    )]
+    pub rewrite_creatives: bool,
+
+    /// Operator-defined bidder-provider instances, keyed by provider ID.
+    #[serde(default, deserialize_with = "deserialize_provider_map")]
+    pub providers: BTreeMap<ProviderId, ProviderConfig>,
+
+    /// Client-visible bidder routes, keyed by bidder code.
+    #[serde(default)]
+    pub bidders: BTreeMap<BidderId, BidderRouteConfig>,
+
+    /// Optional separately registered mediator provider name.
     /// When set, runs parallel mediation strategy (bidders in parallel, then mediator decides)
     /// When omitted, runs parallel only strategy (bidders in parallel, highest CPM wins)
     pub mediator: Option<String>,
 
     /// Timeout in milliseconds
     #[serde(default = "default_timeout")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
 
     /// KV store name for creative storage (deprecated: creatives are now delivered inline)
@@ -41,7 +83,10 @@ impl Default for AuctionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            providers: Vec::new(),
+            sanitize_creatives: default_sanitize_creatives(),
+            rewrite_creatives: default_rewrite_creatives(),
+            providers: BTreeMap::new(),
+            bidders: BTreeMap::new(),
             mediator: None,
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
@@ -50,8 +95,58 @@ impl Default for AuctionConfig {
     }
 }
 
+fn deserialize_provider_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<ProviderId, ProviderConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ProviderMapVisitor;
+
+    impl<'de> Visitor<'de> for ProviderMapVisitor {
+        type Value = BTreeMap<ProviderId, ProviderConfig>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of auction provider IDs to provider configurations")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            Self::Value::deserialize(MapAccessDeserializer::new(map))
+        }
+
+        fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            Err(A::Error::custom(LEGACY_PROVIDER_LIST_MESSAGE))
+        }
+    }
+
+    deserializer.deserialize_any(ProviderMapVisitor)
+}
+
 fn default_timeout() -> u32 {
     2000
+}
+
+fn default_sanitize_creatives() -> bool {
+    false
+}
+
+fn default_rewrite_creatives() -> bool {
+    true
+}
+
+// Omit the default field when it has no effect on the serialized config.
+fn is_default_rewrite_creatives(value: &bool) -> bool {
+    *value == default_rewrite_creatives()
+}
+
+fn is_default_sanitize_creatives(value: &bool) -> bool {
+    *value == default_sanitize_creatives()
 }
 
 fn default_creative_store() -> String {
@@ -62,20 +157,159 @@ fn default_allowed_context_keys() -> HashSet<String> {
     HashSet::new()
 }
 
-#[allow(
-    dead_code,
-    reason = "methods are used by the runtime crate but not by build.rs path inclusion"
-)]
 impl AuctionConfig {
-    /// Get all provider names.
-    #[must_use]
-    pub fn provider_names(&self) -> &[String] {
-        &self.providers
+    #[cfg(test)]
+    pub(crate) fn legacy_provider_map(names: &[&str]) -> BTreeMap<ProviderId, ProviderConfig> {
+        names
+            .iter()
+            .map(|name| {
+                let id = ProviderId::unchecked_for_legacy_test(name);
+                (
+                    id,
+                    ProviderConfig {
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: "standard".to_string(),
+                        endpoint: format!("https://{name}.example/openrtb2/auction"),
+                        timeout_ms: None,
+                        routing: RoutingMode::AllEligible,
+                        notifications: NotificationConfig::default(),
+                        profile_config: serde_json::json!({}),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Check if this config has a mediator configured.
     #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_timeout(timeout_ms: u32) -> AuctionConfig {
+        AuctionConfig {
+            timeout_ms,
+            ..AuctionConfig::default()
+        }
+    }
+
+    #[test]
+    fn timeout_ms_range_is_enforced() {
+        for good in [1, 2000, 60000] {
+            config_with_timeout(good)
+                .validate()
+                .unwrap_or_else(|err| panic!("timeout {good} should be accepted: {err:?}"));
+        }
+        for bad in [0, 60001] {
+            config_with_timeout(bad)
+                .validate()
+                .expect_err(&format!("timeout {bad} should be rejected"));
+        }
+    }
+
+    #[test]
+    fn creative_processing_defaults() {
+        let config: AuctionConfig =
+            serde_json::from_value(serde_json::json!({})).expect("should deserialize defaults");
+
+        assert!(
+            config.rewrite_creatives,
+            "creative rewriting stays enabled by default: existing deployments keep first-party proxying"
+        );
+        assert!(
+            !config.sanitize_creatives,
+            "creative sanitization is opt-in: it strips executable markup with its content"
+        );
+    }
+
+    #[test]
+    fn default_rewrite_creatives_is_not_serialized() {
+        let serialized =
+            serde_json::to_value(AuctionConfig::default()).expect("should serialize defaults");
+
+        assert!(
+            serialized.get("rewrite_creatives").is_none(),
+            "should omit the default rewrite setting"
+        );
+    }
+
+    #[test]
+    fn disabled_rewrite_creatives_is_serialized() {
+        let config = AuctionConfig {
+            rewrite_creatives: false,
+            ..AuctionConfig::default()
+        };
+        let serialized = serde_json::to_value(config).expect("should serialize disabled rewriting");
+
+        assert_eq!(
+            serialized.get("rewrite_creatives"),
+            Some(&serde_json::Value::Bool(false)),
+            "should preserve an explicit rewrite opt-out"
+        );
+    }
+
+    #[test]
+    fn default_sanitize_creatives_is_not_serialized() {
+        let serialized =
+            serde_json::to_value(AuctionConfig::default()).expect("should serialize defaults");
+
+        assert!(
+            serialized.get("sanitize_creatives").is_none(),
+            "should omit the default sanitize setting"
+        );
+    }
+
+    #[test]
+    fn enabled_sanitize_creatives_is_serialized() {
+        let config = AuctionConfig {
+            sanitize_creatives: true,
+            ..AuctionConfig::default()
+        };
+        let serialized =
+            serde_json::to_value(config).expect("should serialize enabled sanitization");
+
+        assert_eq!(
+            serialized.get("sanitize_creatives"),
+            Some(&serde_json::Value::Bool(true)),
+            "should preserve an explicit sanitize opt-in"
+        );
+    }
+
+    #[test]
+    fn provider_list_shape_is_rejected() {
+        let error = serde_json::from_value::<AuctionConfig>(serde_json::json!({
+            "providers": ["prebid"]
+        }))
+        .expect_err("should reject the removed provider-list schema");
+
+        assert!(
+            error.to_string().contains("map") || error.to_string().contains("object"),
+            "should require map-shaped providers: {error}"
+        );
+    }
+
+    #[test]
+    fn map_schema_round_trips_provider_and_bidder_routes() {
+        let config: AuctionConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "pbs-main": {
+                    "protocol": "openrtb-2.6",
+                    "profile": "prebid-server",
+                    "endpoint": "https://prebid.example/openrtb2/auction"
+                }
+            },
+            "bidders": {
+                "example-bidder": { "provider": "pbs-main" }
+            }
+        }))
+        .expect("should parse map-shaped auction config");
+
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.bidders.len(), 1);
     }
 }

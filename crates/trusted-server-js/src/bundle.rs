@@ -36,9 +36,10 @@ pub fn concatenate_modules(ids: &[&str]) -> String {
 /// SHA-256 hash of the concatenated modules, for cache-busting URLs.
 ///
 /// The hash is computed over the same byte sequence as [`concatenate_modules`]
-/// without allocating that concatenated body. Results are cached by ordered
-/// module ID list so HTML injection does not re-hash the full JS payload on
-/// every page view.
+/// without allocating that concatenated body. Results are memoized by ordered
+/// module ID list for reused processes or isolates. Fastly creates a fresh Wasm
+/// instance per request, but still benefits from hashing without materializing
+/// the concatenated body.
 #[must_use]
 #[inline]
 pub fn concatenated_hash(ids: &[&str]) -> String {

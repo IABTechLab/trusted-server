@@ -183,7 +183,16 @@ jobs:
         with:
           node-version: ${{ steps.shared-setup.outputs.node-version }}
           cache: npm
-          cache-dependency-path: crates/trusted-server-integration-tests/browser/package-lock.json
+          cache-dependency-path: |
+            crates/trusted-server-integration-tests/browser/package-lock.json
+            crates/trusted-server-js/lib/package-lock.json
+
+      - name: Build TSJS browser fixtures
+        working-directory: crates/trusted-server-js/lib
+        run: |
+          npm ci
+          npm run build
+          npm run build:prebid-external
 
       - name: Install Playwright
         working-directory: crates/trusted-server-integration-tests/browser
