@@ -38,12 +38,18 @@ afterAll(() => {
   if (outputDirectory) fs.rmSync(outputDirectory, { recursive: true, force: true });
 });
 
-function createPage({ modules = ['core', 'creative', 'permutive'], logLevel, debug = false } = {}) {
+function createPage({
+  modules = ['core', 'creative', 'permutive'],
+  logLevel,
+  debug = false,
+  storedDebug = false,
+} = {}) {
   dom = new JSDOM('<!doctype html><head></head><body><div id="slot1"></div></body>', {
     url: `https://publisher.example.com/${debug ? '?tsdebug=1' : ''}`,
     runScripts: 'outside-only',
   });
   const { window } = dom;
+  if (storedDebug) window.localStorage.setItem('tsdebug', '1');
   // Avoid SDK polling and external requests. Script elements are not fetched
   // with outside-only execution and no resource loader.
   window.permutive = { config: {} };
@@ -159,10 +165,42 @@ describe('shared state across production IIFEs', () => {
     expect(info).not.toHaveBeenCalled();
   });
 
-  it('preserves the explicit creative tsdebug flag', () => {
+  it('enables shared logging with the explicit tsdebug flag', () => {
     const { window, info } = createPage({ debug: true });
     expect(window.tsjs.log.getLevel()).toBe('debug');
     expectPermutiveInfo(window, info, true);
+  });
+
+  it.each([
+    ['query', 'warn'],
+    ['query', 'silent'],
+    ['localStorage', 'warn'],
+    ['localStorage', 'silent'],
+  ])('lets %s tsdebug override an earlier publisher %s level', (source, logLevel) => {
+    const { window, info, debugLog } = createPage({
+      logLevel,
+      debug: source === 'query',
+      storedDebug: source === 'localStorage',
+    });
+    expect(window.tsjs.log.getLevel()).toBe('debug');
+    expectPermutiveInfo(window, info, true);
+    debugLog.mockClear();
+    expect(requestContext(window)).toEqual({ permutive_segments: ['111', '222'] });
+    expect(
+      debugLog.mock.calls.some((args) =>
+        args.some((arg) => String(arg).includes('getPermutiveSegments: found segments'))
+      )
+    ).toBe(true);
+
+    window.tsjs.setConfig({ logLevel });
+    expect(window.tsjs.log.getLevel()).toBe(logLevel);
+    expectPermutiveInfo(window, info, false);
+
+    window.tsjs.log.setLevel('debug');
+    expectPermutiveInfo(window, info, true);
+    window.tsjs.log.setLevel(logLevel);
+    expect(window.tsjs.log.getLevel()).toBe(logLevel);
+    expectPermutiveInfo(window, info, false);
   });
 
   it('adopts context registered by an integration loaded before core', () => {
