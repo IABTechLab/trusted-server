@@ -599,9 +599,9 @@ pub fn handle_admin_eids_lookup(
         },
     };
 
-    // Mirror the ingestion path (`ingest_eid_cookies`): collect matches from
-    // both cookies, then dedupe the same way so the preview reports exactly
-    // what a navigation would store.
+    // Collect matches from both cookies, then dedupe the same way as response
+    // finalization so the preview reports exactly what an eligible request
+    // would store.
     if let Some(value) = &sharedid_cookie
         && let Some(update) = collect_sharedid_update(value, registry)
     {
