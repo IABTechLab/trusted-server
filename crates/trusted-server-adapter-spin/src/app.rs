@@ -33,6 +33,7 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
+use trusted_server_core::request_timing::RequestTimingMiddleware;
 use trusted_server_core::settings::Settings;
 
 use crate::middleware::{
@@ -773,6 +774,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // any middleware registered ahead of it would observe the
             // shared-secret authentication header.
             .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(RequestTimingMiddleware::default().with_excluded_paths(&["/health"]))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip

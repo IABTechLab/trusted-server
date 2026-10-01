@@ -4263,11 +4263,7 @@ pub async fn handle_publisher_request(
 
     // A defaulted handle records into nothing that ever renders, so tests
     // that don't populate the request extension are unaffected.
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
     // idempotent call as a direct-handler safety net and for focused tests.
@@ -6681,13 +6677,13 @@ pub async fn handle_page_bids(
     ec_context: &mut EcContext,
     mut req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Same defaulted-handle rule as `handle_publisher_request`: a request
-    // without the extension records into a collector nothing reads.
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    // Keep a local collector for direct-handler callers, but only expose
+    // browser timings from an adapter-attached request clock. Otherwise an
+    // adapter that forgets the extension would silently report a different
+    // handler-entry timing origin.
+    let request_timings = RequestTimings::from_extensions(req.extensions());
+    let has_request_timings = request_timings.is_some();
+    let timings = request_timings.unwrap_or_default();
 
     // Adapter fallbacks prepare this before routing. Keep this idempotent call as
     // a direct-handler safety net and retain the session decision after the
@@ -6925,7 +6921,7 @@ pub async fn handle_page_bids(
                     // A successful result proves at least one pending or immediate
                     // provider outcome. Failures can occur before any request leaves
                     // the edge, so they must not fabricate dispatch timing evidence.
-                    if gpt_diagnostics.browser_session_active() {
+                    if gpt_diagnostics.browser_session_active() && has_request_timings {
                         let timing_snapshot = timings.snapshot();
                         auction_diagnostics = Some(BrowserAuctionDiagnostics {
                             auction_dispatched_ms: timing_snapshot.auction_dispatched_ms,
@@ -8701,7 +8697,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let timings = RequestTimings::new();
-        request.extensions_mut().insert(timings.clone());
+        request.extensions_mut().insert(timings.handle().clone());
 
         let _response = run_publisher_proxy(&settings, &services, request).await;
 
@@ -8731,7 +8727,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let timings = RequestTimings::new();
-        request.extensions_mut().insert(timings.clone());
+        request.extensions_mut().insert(timings.handle().clone());
 
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let mut ec_context = EcContext::read_from_request(&settings, &request, &services)
@@ -10066,7 +10062,7 @@ mod tests {
             let inline_timings = RequestTimings::new();
             inline_request
                 .extensions_mut()
-                .insert(inline_timings.clone());
+                .insert(inline_timings.handle().clone());
 
             let _inline_response =
                 run_publisher_proxy(&inline_settings, &inline_services, inline_request).await;
@@ -10086,7 +10082,7 @@ mod tests {
             queue_shareable_html(&stub);
             let mut request = navigation_request();
             let timings = RequestTimings::new();
-            request.extensions_mut().insert(timings.clone());
+            request.extensions_mut().insert(timings.handle().clone());
 
             let _response = run(&settings, &services, request).await;
 
@@ -21088,6 +21084,52 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn active_page_bids_omits_timings_without_adapter_collector() {
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let slots = article_slot();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"winner".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::new(Mutex::new(None)), true);
+            let mut ec_context = consent_allowing_ec_context();
+
+            let response = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &mut ec_context,
+                make_active_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return page-bids response");
+            let body: serde_json::Value = serde_json::from_slice(
+                &response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read page-bids response body"),
+            )
+            .expect("should serialize page-bids response as JSON");
+
+            assert!(
+                body.get("auctionDiagnostics").is_none(),
+                "missing adapter timing context must not emit handler-local timing facts"
+            );
+        }
+
+        #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
             settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
@@ -21113,6 +21155,14 @@ mod tests {
                 },
             );
 
+            let mut winning_page_bids_request =
+                make_active_page_bids_request("/2024/01/my-article/");
+            let request_timings = RequestTimings::new();
+            winning_page_bids_request
+                .extensions_mut()
+                .insert(request_timings.handle().clone());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+
             let winning_response = handle_page_bids(
                 &settings,
                 &winning_services,
@@ -21123,7 +21173,7 @@ mod tests {
                     registry: None,
                 },
                 &mut ec_context,
-                make_active_page_bids_request("/2024/01/my-article/"),
+                winning_page_bids_request,
             )
             .await
             .expect("should return winning page-bids response");
@@ -21161,6 +21211,10 @@ mod tests {
             let resolved_ms = timing("auctionResolvedMs");
             let committed_ms = timing("auctionCommittedMs");
             let wait_ms = timing("auctionWaitMs");
+            assert!(
+                dispatched_ms > 0,
+                "page-bids dispatch should include time since adapter request entry"
+            );
             assert!(
                 dispatched_ms <= resolved_ms && resolved_ms <= committed_ms,
                 "page-bids auction milestones should be monotonic"

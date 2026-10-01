@@ -440,11 +440,7 @@ fn build_ec_request_state(
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
     let geo_info = {
         let _span = timings.span(Phase::Geo);
         services
@@ -529,11 +525,7 @@ async fn run_pre_route_filters(
 ) -> PreRoute {
     // Only recorded when a filter is actually registered, so unconfigured
     // deployments omit ts-filter from the Server-Timing header entirely.
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
     let _span = state
         .registry
         .has_request_filters()
@@ -609,11 +601,8 @@ async fn execute_named(
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
-                    let timings = req
-                        .extensions()
-                        .get::<RequestTimings>()
-                        .cloned()
-                        .unwrap_or_default();
+                    let timings =
+                        RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
                     let kv = crate::identity_graph_with_timing(&state.settings, &timings);
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
                 }
@@ -685,11 +674,7 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 cors_preflight_identify(&state.settings, &req)
             } else {
-                let timings = req
-                    .extensions()
-                    .get::<RequestTimings>()
-                    .cloned()
-                    .unwrap_or_default();
+                let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
                 let kv = crate::require_identity_graph_with_timing(&state.settings, &timings)?;
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
@@ -707,11 +692,7 @@ async fn run_named_route(
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
             // cannot be opened, matching legacy behavior.
-            let timings = req
-                .extensions()
-                .get::<RequestTimings>()
-                .cloned()
-                .unwrap_or_default();
+            let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
             let consent_services =
                 runtime_services_for_consent_route(&state.settings, services, &timings)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
@@ -741,11 +722,7 @@ async fn run_named_route(
             // Like the auction, page-bids reads consent data, so the consent KV
             // store must be available — fail closed with 503 when configured but
             // unopenable, matching legacy.
-            let timings = req
-                .extensions()
-                .get::<RequestTimings>()
-                .cloned()
-                .unwrap_or_default();
+            let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
             let consent_services =
                 runtime_services_for_consent_route(&state.settings, services, &timings)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
@@ -792,11 +769,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
-    let timings = req
-        .extensions()
-        .get::<RequestTimings>()
-        .cloned()
-        .unwrap_or_default();
+    let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
 
     let result =
         crate::require_identity_graph_with_timing(&state.settings, &timings).and_then(|kv| {
@@ -962,11 +935,7 @@ async fn dispatch_fallback(
         // Publisher pages read consent data, so the consent KV store must be
         // available — fail closed with 503 when it is configured but cannot
         // be opened, matching legacy behavior.
-        let timings = req
-            .extensions()
-            .get::<RequestTimings>()
-            .cloned()
-            .unwrap_or_default();
+        let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
         match runtime_services_for_consent_route(&state.settings, services, &timings) {
             Ok(publisher_services) => {
                 // Run the server-side auction with the configured creative-
@@ -3558,7 +3527,7 @@ mod tests {
             .build();
         let mut req = empty_request(Method::GET, "/some-page");
         let timings = RequestTimings::new();
-        req.extensions_mut().insert(timings.clone());
+        req.extensions_mut().insert(timings.handle().clone());
 
         let _ = block_on(super::run_pre_route_filters(
             &state, &services, &mut req, None,
@@ -3586,7 +3555,7 @@ mod tests {
             .build();
         let mut req = empty_request(Method::GET, "/some-page");
         let timings = RequestTimings::new();
-        req.extensions_mut().insert(timings.clone());
+        req.extensions_mut().insert(timings.handle().clone());
 
         let _ = block_on(super::run_pre_route_filters(
             &state, &services, &mut req, None,

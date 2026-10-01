@@ -271,7 +271,8 @@ structurally and its emissions are defined accordingly rather than pretending pa
   by path match inside the wrapper.
 - Axum emits the header only; no Tinybird rows in v1 (unchanged).
 
-Cloudflare and Spin: collection compiles, no emission wiring in v1 (unchanged).
+Cloudflare and Spin attach the per-request collector so core request-scoped consumers
+share the adapter clock, but have no header or telemetry emission wiring in v1.
 
 ## 9. Access telemetry row
 
@@ -750,11 +751,11 @@ the auction dataset as the authority on per-bidder duration.
 
 ### Scope
 
-- Fastly emits. Axum attaches a collector and records the marks but does not
-  emit them. Cloudflare and Spin attach no collector at all: `handle_publisher_request`
-  falls back to `RequestTimings::default()`, so the marks land in a throwaway
-  handle and are dropped with it. That is pre-existing for every phase, not new
-  to these marks, and it matches section 8a adapter semantics.
+- Fastly emits. Axum, Cloudflare, and Spin attach a collector and record the marks but
+  do not emit them. Cloudflare and Spin added collection when GPT diagnostics began
+  exposing request-scoped auction offsets; without an adapter collector those offsets
+  silently used a different handler-entry clock. This matches section 8a adapter
+  semantics: collection is portable, while emission remains adapter-specific.
 - No header emission for any of these values: they are post-hoc analysis fields,
   and two of the three are typically unknown at the header freeze point in
   streaming mode.
