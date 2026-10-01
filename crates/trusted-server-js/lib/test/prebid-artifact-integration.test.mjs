@@ -322,10 +322,10 @@ describe('tsjs-prebid production artifacts', () => {
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
     // A value-import of Prebid or a private rendering helper would multiply
     // the shim size. The bound sits just above the normal compact shim output,
-    // which is roughly 40 KB: tight enough that material growth has to be
-    // noticed and re-justified here, and far enough below a multiplication
-    // that one still fails loudly. The bundle beside it is 200 KB and up.
-    expect(shimCode.length).toBeLessThan(41_000);
+    // which is roughly 43 KB with first-impression arbitration and auction
+    // diagnostics. Keep the guard below the separate Prebid bundle, which is
+    // 200 KB and up, so accidentally importing it still fails loudly.
+    expect(shimCode.length).toBeLessThan(43_000);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 

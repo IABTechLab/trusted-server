@@ -66,6 +66,8 @@ function fakeApiStore() {
     subscribe: vi.fn(() => () => undefined),
     recordTrustedServerOpportunity: vi.fn(),
     recordPrebidRefresh: vi.fn(),
+    recordPrebidAuction: vi.fn(),
+    recordPrebidWin: vi.fn(),
     recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string) => 41),
     recordTrustedServerCreativeResponse: vi.fn(),
     recordTrustedServerCreativeFailure: vi.fn(),
@@ -92,7 +94,9 @@ describe('GptDiagnosticsApiController', () => {
       'subscribe',
     ]);
     expect(Object.keys(controller.recorder).sort()).toEqual([
+      'recordPrebidAuction',
       'recordPrebidRefresh',
+      'recordPrebidWin',
       'recordTrustedServerCreativeFailure',
       'recordTrustedServerCreativeRequest',
       'recordTrustedServerCreativeResponse',

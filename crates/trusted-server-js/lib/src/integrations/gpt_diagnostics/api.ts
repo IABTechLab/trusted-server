@@ -1,6 +1,7 @@
 import type {
   GptDiagnosticsApi,
   GptDiagnosticsAuctionFacts,
+  GptDiagnosticsAuctionWinner,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsExportV1,
   GptDiagnosticsRecorder,
@@ -9,6 +10,7 @@ import type {
 } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { clonePrebidAuctionEvidence } from './evidence';
 import type { GptDiagnosticsStoreSnapshot } from './store';
 
 interface ApiStore {
@@ -23,6 +25,16 @@ interface ApiStore {
     auctionFacts?: GptDiagnosticsAuctionFacts
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordPrebidAuction(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    targetingCandidate?: GptDiagnosticsAuctionWinner
+  ): void;
+  recordPrebidWin(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    winner: GptDiagnosticsAuctionWinner
+  ): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
   recordTrustedServerCreativeResponse(attemptId: number): void;
   recordTrustedServerCreativeFailure(
@@ -70,6 +82,9 @@ function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsEx
         size: cycle.size ? [...cycle.size] : undefined,
         observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
         ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+        ...(cycle.prebidAuction
+          ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
+          : {}),
         ...(cycle.serverAuctionTimings
           ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
           : {}),
@@ -177,6 +192,10 @@ export class GptDiagnosticsApiController {
           );
         }),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordPrebidAuction: (slot, auctionId, targetingCandidate) =>
+        safelyRecord(() => this.store.recordPrebidAuction(slot, auctionId, targetingCandidate)),
+      recordPrebidWin: (slot, auctionId, winner) =>
+        safelyRecord(() => this.store.recordPrebidWin(slot, auctionId, winner)),
       recordTrustedServerCreativeRequest: (auctionSlotId) =>
         safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
       recordTrustedServerCreativeResponse: (attemptId) =>
@@ -209,6 +228,9 @@ export class GptDiagnosticsApiController {
           size: cycle.size ? [...cycle.size] : undefined,
           observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
           ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+          ...(cycle.prebidAuction
+            ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
+            : {}),
           ...(cycle.serverAuctionTimings
             ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
             : {}),
