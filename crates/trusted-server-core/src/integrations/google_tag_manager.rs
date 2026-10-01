@@ -3603,7 +3603,11 @@ container_id = "GTM-DEFAULT"
                 "`/integrations/google_tag_manager/gtm.js${id}`",
             ),
         ] {
-            assert_eq!(rewrite_gtm_rsc_span(source), expected);
+            assert_eq!(
+                rewrite_gtm_rsc_span(source),
+                expected,
+                "should preserve query delimiters and template interpolation: {source}"
+            );
         }
     }
 

@@ -540,13 +540,15 @@ pub trait IntegrationAttributeRewriter: Send + Sync {
     ) -> AttributeRewriteAction;
 }
 
-/// Trait for integration-provided inline script/text rewrite hooks.
+/// Trait for integration-provided inline script rewrite hooks.
 pub trait IntegrationScriptRewriter: Send + Sync {
     /// Identifier for logging/diagnostics.
     fn integration_id(&self) -> &'static str;
-    /// CSS selector (e.g. `script#__NEXT_DATA__`) that should trigger this rewriter.
+    /// CSS selector matching `<script>` elements, for example `script#__NEXT_DATA__`.
+    /// Only text inside matched scripts triggers this rewriter; non-script
+    /// elements are not supported.
     fn selector(&self) -> &'static str;
-    /// Attempt to rewrite the inline text content for the selector.
+    /// Attempt to rewrite the inline script content for the selector.
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 

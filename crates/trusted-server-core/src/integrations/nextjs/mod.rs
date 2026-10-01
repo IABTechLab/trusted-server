@@ -111,7 +111,6 @@ pub fn register(
         .integration_config::<crate::integrations::google_tag_manager::GoogleTagManagerConfig>(
             "google_tag_manager",
         )?
-        .filter(|config| config.enabled)
         .map(|_| {
             crate::integrations::google_tag_manager::rewrite_gtm_rsc_span as fn(&str) -> String
         });
@@ -120,6 +119,8 @@ pub fn register(
         gtm_transform,
     ));
 
+    // Pages data must precede Flight capture: it sets the one-shot discriminator
+    // that keeps JSON strings from being treated as executable Flight source.
     let builder = IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
         .with_script_rewriter(structured)
         .with_script_rewriter(placeholders)

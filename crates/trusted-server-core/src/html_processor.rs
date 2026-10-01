@@ -835,7 +835,11 @@ mod tests {
             output.contains("<script>ordinary_</script>"),
             "should reset CSS match state between scripts"
         );
-        assert_eq!(output.matches("flushed-once").count(), 1);
+        assert_eq!(
+            output.matches("flushed-once").count(),
+            1,
+            "should emit the flushed fragment exactly once"
+        );
     }
 
     #[test]
