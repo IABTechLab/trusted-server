@@ -555,7 +555,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ```json
 {
-  "href": "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=abc123...&tsexp=1234567890",
+  "href": "https://ads.publisher.example/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=abc123...&tsexp=1234567890",
   "base": "https://cdn.example.com/pixel.gif"
 }
 ```
@@ -577,7 +577,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ---
 
-### POST /first-party/proxy-rebuild
+### GET/POST /first-party/proxy-rebuild
 
 URL mutation recovery endpoint. Re-signs a click URL after creative JavaScript modifies its query parameters. The original `tstoken` is validated first, and `tsurl`, `tstoken`, and `tsexp` can never be added or removed.
 
@@ -610,7 +610,7 @@ Validation and re-signing depend on `publisher.proxy_secret`.
 
 ```json
 {
-  "href": "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&utm_source=banner&tstoken=new...",
+  "href": "https://ads.publisher.example/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&utm_source=banner&tstoken=new...",
   "base": "https://advertiser.example",
   "added": { "utm_source": "banner" },
   "removed": ["old_param"]

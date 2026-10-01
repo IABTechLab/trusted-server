@@ -16,7 +16,7 @@ describe('creative/image.ts', () => {
 
   it('proxies image src via signer endpoint', async () => {
     const signed =
-      '/first-party/proxy?tsurl=https%3A%2F%2Fimg.example%2Fpixel.gif&tstoken=new&tsexp=1';
+      'https://ads.example.com/first-party/proxy?tsurl=https%3A%2F%2Fimg.example%2Fpixel.gif&tstoken=new&tsexp=1';
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ href: signed }),
@@ -33,7 +33,7 @@ describe('creative/image.ts', () => {
         expect.stringContaining('/first-party/sign'),
         expect.objectContaining({ method: 'POST' })
       );
-      expect(img.src).toContain('/first-party/proxy?');
+      expect(img.src).toContain('https://ads.example.com/first-party/proxy?');
       expect(img.src).toContain('tsexp=');
     });
   });

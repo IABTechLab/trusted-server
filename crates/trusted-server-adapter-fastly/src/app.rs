@@ -1820,6 +1820,20 @@ mod tests {
     }
 
     #[test]
+    fn proxy_rebuild_registers_get_and_post() {
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/first-party/proxy-rebuild")
+            .expect("should register proxy rebuild route");
+        assert!(matches!(
+            route.handler,
+            NamedRouteHandler::FirstPartyProxyRebuild
+        ));
+        assert!(route.primary_methods.contains(&Method::GET));
+        assert!(route.primary_methods.contains(&Method::POST));
+    }
+
+    #[test]
     fn legacy_admin_aliases_route_to_local_deny_not_key_handlers() {
         // Security guard for the legacy non-`/_ts` admin aliases. They must be
         // registered to the local `LegacyAdminDenied` 404 handler — not the

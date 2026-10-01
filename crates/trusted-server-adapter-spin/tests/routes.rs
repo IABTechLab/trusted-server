@@ -805,21 +805,25 @@ async fn first_party_proxy_round_trip_through_spin_router() {
             .to_vec(),
     )
     .expect("sign response body should be UTF-8");
-    let href = json_string_field(&sign_body, "href")
-        .expect("sign response must include a signed href path");
+    let href =
+        json_string_field(&sign_body, "href").expect("sign response must include a signed href");
+    let (_, authority_and_path) = href
+        .split_once("://")
+        .expect("signed href should be absolute");
+    let (_, path_and_query) = authority_and_path
+        .split_once('/')
+        .expect("signed href should include a path");
+    let href_path_and_query = format!("/{path_and_query}");
     assert!(
-        href.starts_with("/first-party/proxy?"),
-        "signed href must target the proxy path, got: {href}"
+        href_path_and_query.starts_with("/first-party/proxy?"),
+        "signed href must target the proxy path"
     );
 
     let router = test_router();
     let proxy_req = request_builder()
         .method("GET")
-        .uri(href.clone())
-        .header(
-            "spin-full-url",
-            format!("https://www.publisher.example{href}"),
-        )
+        .uri(href_path_and_query)
+        .header("spin-full-url", href)
         .body(edgezero_core::body::Body::empty())
         .expect("should build proxy request");
     let proxy_resp = route(router, proxy_req).await;

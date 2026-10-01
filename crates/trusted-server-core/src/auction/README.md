@@ -108,7 +108,8 @@ as `pbs-main`.
 response.
 
 - `sanitize_creatives = true` strips executable markup. It is opt-in.
-- `rewrite_creatives = true` rewrites eligible URLs through first-party routes
+- `rewrite_creatives = true` rewrites eligible URLs through absolute first-party
+  routes on `publisher.public_origin`, falling back to `https://{publisher.domain}`,
   and removes bidder `<base>` elements. It is enabled by default.
 - The publisher inline delivery path uses absolute first-party URLs without
   injecting the direct endpoint's creative runtime.
