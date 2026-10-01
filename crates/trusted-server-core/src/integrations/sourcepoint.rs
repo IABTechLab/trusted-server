@@ -933,9 +933,21 @@ impl IntegrationProxy for SourcepointIntegration {
         // first-party proxy.
         let response_is_javascript = Self::is_javascript_response(&response);
         let response_is_html = Self::is_html_response(&response);
+        // Only rewrite plain text. Unsupported, malformed, or mixed encoding
+        // headers must pass through without collecting or altering the bytes.
+        let response_is_identity_encoded = response
+            .headers()
+            .get_all(header::CONTENT_ENCODING)
+            .iter()
+            .all(|value| {
+                value
+                    .to_str()
+                    .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+            });
         if method == Method::GET
             && response.status() == StatusCode::OK
             && self.config.rewrite_sdk
+            && response_is_identity_encoded
             && (response_is_javascript || response_is_html)
         {
             let kind = if response_is_javascript {
@@ -974,7 +986,14 @@ impl IntegrationProxy for SourcepointIntegration {
                 MAX_REWRITE_BODY_SIZE as usize,
                 SOURCEPOINT_INTEGRATION_ID,
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                log::warn!(
+                    "Sourcepoint: response body collection for {path} failed \
+                     (limit: {MAX_REWRITE_BODY_SIZE} bytes), returning 502 \
+                     (reason: response_collection_failed): {error:?}"
+                );
+            })?;
             let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
 
             let body = match String::from_utf8(body_bytes) {
@@ -1217,6 +1236,151 @@ mod tests {
                 vec![true],
                 "should request streaming before collecting the upstream body"
             );
+        });
+    }
+
+    #[test]
+    fn handle_keeps_encoded_responses_streaming() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for content_type in ["application/javascript", "text/html"] {
+                for encodings in [
+                    vec!["gzip"],
+                    vec!["br"],
+                    vec!["gzip, br"],
+                    vec!["identity, gzip"],
+                    vec![""],
+                    vec!["unsupported"],
+                    vec!["\u{0080}"],
+                    vec!["identity", "gzip"],
+                    vec!["gzip", "identity"],
+                ] {
+                    for oversized in [false, true] {
+                        let client = Arc::new(StreamingHttpClient::new());
+                        // Valid UTF-8 with a rewrite target must still pass through
+                        // when the encoding header does not identify plain text.
+                        let mut bytes =
+                            format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#)
+                                .into_bytes();
+                        if oversized {
+                            bytes.resize(MAX_REWRITE_BODY_SIZE as usize + 1, b' ');
+                        }
+                        let mut headers = vec![
+                            ("content-type", content_type),
+                            ("cache-control", "no-store"),
+                            ("vary", "Accept-Encoding, Origin"),
+                        ];
+                        headers.extend(encodings.iter().map(|value| ("content-encoding", *value)));
+                        client
+                            .stub
+                            .push_response_with_headers(200, bytes.clone(), headers);
+                        let services = build_services_with_http_client(client.clone());
+
+                        let response = integration
+                            .handle(
+                                &settings,
+                                &services,
+                                make_req(
+                                    Method::GET,
+                                    "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
+                                ),
+                            )
+                            .await
+                            .expect("should pass through encoded responses regardless of size");
+
+                        assert!(
+                            matches!(response.body(), EdgeBody::Stream(_)),
+                            "should leave encoded response bodies streaming"
+                        );
+                        assert_eq!(
+                            client.reads.load(Ordering::Relaxed),
+                            0,
+                            "should not read encoded bodies for rewriting"
+                        );
+                        let returned_encodings: Vec<_> = response
+                            .headers()
+                            .get_all(header::CONTENT_ENCODING)
+                            .iter()
+                            .map(HeaderValue::as_bytes)
+                            .collect();
+                        let expected_encodings: Vec<_> =
+                            encodings.iter().map(|value| value.as_bytes()).collect();
+                        assert_eq!(returned_encodings, expected_encodings);
+                        assert_eq!(
+                            get_header_str(&response, header::CACHE_CONTROL),
+                            Some("no-store")
+                        );
+                        assert_eq!(
+                            get_header_str(&response, header::VARY),
+                            Some("Accept-Encoding, Origin")
+                        );
+                        assert_eq!(
+                            response
+                                .into_body()
+                                .into_bytes_bounded(MAX_REWRITE_BODY_SIZE as usize + 1)
+                                .await
+                                .expect("should collect unchanged encoded bytes")
+                                .as_ref(),
+                            bytes,
+                            "should not alter encoded bytes even if they are valid UTF-8"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn handle_rewrites_explicit_identity_encoded_responses() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for content_type in ["application/javascript", "text/html"] {
+                for encoding in ["identity", " IdEnTiTy "] {
+                    let client = Arc::new(StreamingHttpClient::new());
+                    let (input, expected): (Vec<u8>, &[u8]) = if content_type == "text/html" {
+                        (
+                            br#"<script src="/PrivacyManagerUS.js"></script>"#.to_vec(),
+                            br#"<script src="/integrations/sourcepoint/cdn/PrivacyManagerUS.js"></script>"#,
+                        )
+                    } else {
+                        (
+                            format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#)
+                                .into_bytes(),
+                            br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
+                        )
+                    };
+                    client.stub.push_response_with_headers(
+                        200,
+                        input,
+                        vec![
+                            ("content-type", content_type),
+                            ("content-encoding", encoding),
+                        ],
+                    );
+                    let services = build_services_with_http_client(client.clone());
+                    let response = integration
+                        .handle(
+                            &settings,
+                            &services,
+                            make_req(
+                                Method::GET,
+                                "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
+                            ),
+                        )
+                        .await
+                        .expect("should rewrite explicitly identity-encoded responses");
+
+                    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+                    assert!(client.reads.load(Ordering::Relaxed) > 0);
+                    assert_eq!(
+                        take_body_bytes(response),
+                        expected,
+                        "should rewrite identity content regardless of casing and whitespace"
+                    );
+                }
+            }
         });
     }
 
@@ -1599,17 +1763,17 @@ mod tests {
             let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config(true)));
             let client = Arc::new(StreamingHttpClient::new());
-            let bytes = vec![0x1f, 0x8b, 0xff];
+            let bytes = vec![b'a', 0xff, b'b'];
             client.stub.push_response_with_headers(
                 200,
                 bytes.clone(),
                 vec![
                     ("content-type", "application/javascript"),
-                    ("content-encoding", "gzip"),
+                    ("content-encoding", "identity"),
                     ("cache-control", "no-store"),
                 ],
             );
-            let services = build_services_with_http_client(client);
+            let services = build_services_with_http_client(client.clone());
 
             let response = integration
                 .handle(
@@ -1623,9 +1787,14 @@ mod tests {
                 .await
                 .expect("should retain non-UTF-8 content unchanged");
 
+            assert!(
+                client.reads.load(Ordering::Relaxed) > 0,
+                "should exercise UTF-8 fallback after bounded collection"
+            );
+
             assert_eq!(
                 get_header_str(&response, header::CONTENT_ENCODING),
-                Some("gzip"),
+                Some("identity"),
                 "should preserve encoding when no rewrite occurs"
             );
             assert_eq!(

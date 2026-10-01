@@ -62,16 +62,16 @@ If a publisher uses a Content Security Policy, `script-src` must allow the first
 
 ## Response body rewriting
 
-With `rewrite_sdk = true`, successful `GET` responses with status 200 and a JavaScript or HTML content type are eligible for body rewriting. JavaScript CDN URLs and privacy-manager HTML root-relative `src` / `href` assets are routed through the first-party proxy.
+With `rewrite_sdk = true`, successful `GET` responses with status 200 and a JavaScript or HTML content type are eligible for body rewriting when `Content-Encoding` is absent or explicitly `identity`. JavaScript CDN URLs and privacy-manager HTML root-relative `src` / `href` assets are routed through the first-party proxy.
 
 The input body limit is 5 MiB:
 
 - Bodies at or below the limit are rewritten, including chunked or HTTP/2 responses without `Content-Length`.
 - A declared `Content-Length` above the limit skips rewriting and leaves the body unchanged.
 - If collection exceeds the limit, Trusted Server stops reading and returns `502 Bad Gateway`. This also applies when `Content-Length` understates the size. The partial body is discarded, not returned to the browser.
-- Other content types, disabled rewriting, and ineligible methods or statuses do not collect the body for rewriting.
+- Compressed responses, unsupported or malformed encoding headers, other content types, disabled rewriting, and ineligible methods or statuses do not collect the body for rewriting. Their bytes and encoding headers pass through unchanged.
 
-On Fastly, upstream responses remain streaming until the bounded collector reads them. It retains at most 5 MiB of input plus the current transport chunk, with additional bounded allocations for rewriting. Non-rewritten responses remain streaming. Adapters without streaming support still buffer upstream responses before this check; this limit is not an adapter-level memory guarantee on Cloudflare or Spin.
+On Fastly, upstream responses remain streaming until the bounded collector reads them. It retains at most 5 MiB of input plus the current transport chunk, with additional bounded allocations for rewriting. Non-rewritten responses remain streaming. Adapters without streaming support still buffer upstream responses before this check; this limit is not an adapter-level memory guarantee on Axum, Cloudflare, or Spin.
 
 Likely JavaScript and HTML paths, including `/mms/v2/get_site_data`, request `Accept-Encoding: identity`. Rewritten bodies discard the upstream `Content-Length` and `Content-Encoding`, and remove `Accept-Encoding` from `Vary`. Non-UTF-8 bodies pass through unchanged after bounded collection.
 
