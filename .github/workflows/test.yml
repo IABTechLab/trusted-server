@@ -65,6 +65,9 @@ jobs:
       - name: Run inline control harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 
+      - name: Run cache purge harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh purge
+
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest

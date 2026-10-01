@@ -554,6 +554,7 @@ mod tests {
 
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::platform::PlatformCacheIntent;
     use crate::platform::test_support::{
         NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient,
         build_services_with_http_client,
@@ -1057,8 +1058,8 @@ mod tests {
                 .expect("should proxy API request");
 
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![true],
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Bypass],
             "should bypass the platform cache for API requests"
         );
         assert_eq!(
@@ -1116,8 +1117,8 @@ mod tests {
                 .expect("should proxy SDK request");
 
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![false],
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Default],
             "should retain normal platform caching for canonical SDK loaders"
         );
         for (name, expected) in [
