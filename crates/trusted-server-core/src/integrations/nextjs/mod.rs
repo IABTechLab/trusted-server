@@ -264,6 +264,9 @@ mod tests {
             "// self.__next_f.push(\n",
             "/* self.__next_f.push( */",
             "const demo=/self.__next_f.push()/;",
+            "if (ready) { work() } /self.__next_f.push()/;",
+            "function demo() { return 1 } /self.__next_f.push()/;",
+            "if (ready) { if (nested) { work() } } /self.__next_f.push()/;",
             r#"if (ready) {} else /self.__next_f.push([2,"opaque"])/;"#,
             r#"do /self.__next_f.push([2,"opaque"])/; while (ready);"#,
             "const demo=`self.__next_f.push(`;",
@@ -313,6 +316,10 @@ mod tests {
                 format!("{fake}{rewritten_push};/* self.__next_f.push( */"),
             ),
             (
+                format!("if (ready) {{ work() }} /self.__next_f.push()/;{push};"),
+                format!("if (ready) {{ work() }} /self.__next_f.push()/;{rewritten_push};"),
+            ),
+            (
                 format!(
                     "const out=`text self.__next_f.push( ${{ {{a: {push}, b: `nested ${{{push}}}`}} }} tail`;"
                 ),
@@ -346,6 +353,66 @@ mod tests {
                     format!("<script>{expected}</script>"),
                     "should rewrite only executable calls at split {split}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn brace_slash_division_keeps_flight_lengths_and_both_rewrites() {
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js", "text": "é😀"});
+        let body = data.to_string();
+        let payload = format!("1:T{:x},{body}", body.len());
+        let push = format!(
+            "self.__next_f.push([1,{}])",
+            serde_json::to_string(&payload).expect("should encode Flight payload")
+        );
+        let mut expected = data;
+        expected["url"] = json!("https://test.example.com/page");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js");
+        for prefix in [
+            "const n = {} / 2;",
+            "const n = {nested: {}} / 2;",
+            "const n = function() {} / 2;",
+            "const n = function named() { return 1 } / 2;",
+            "const n = class { method() { return 1 } } / 2;",
+        ] {
+            let source = format!("{prefix}{push}");
+            for split in (0..=source.len()).filter(|split| source.is_char_boundary(*split)) {
+                let mut processor = create_html_processor(mixed_config(10000, 10000));
+                let first = format!("<script>{}", &source[..split]);
+                let last = format!("{}</script><script>{push}</script>", &source[split..]);
+                let mut bytes = processor
+                    .process_chunk(first.as_bytes(), false)
+                    .expect("should accept division prefix");
+                bytes.extend(
+                    processor
+                        .process_chunk(last.as_bytes(), true)
+                        .expect("should complete Flight after division"),
+                );
+                let output = String::from_utf8(bytes).expect("should emit UTF-8");
+                assert!(output.starts_with(&format!("<script>{prefix}")));
+                let payloads = flight_payloads(&output);
+                assert_eq!(payloads.len(), 2, "should emit each real Flight push once");
+                for payload in payloads {
+                    assert_mixed_t_model(&payload, &expected);
+                }
+                assert!(!output.contains("__ts_rsc_"));
+            }
+            let html = format!("<script>{source}</script><script>{push}</script>");
+            for compression in [Compression::None, Compression::Gzip] {
+                for chunk_size in [32, 1000, 8192] {
+                    let output = mixed_output_with_compression(&html, compression, chunk_size);
+                    let payloads = flight_payloads(&output);
+                    assert_eq!(
+                        payloads.len(),
+                        2,
+                        "should preserve compressed Flight pushes"
+                    );
+                    for payload in payloads {
+                        assert_mixed_t_model(&payload, &expected);
+                    }
+                    assert!(!output.contains("__ts_rsc_"));
+                }
             }
         }
     }
