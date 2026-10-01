@@ -2420,7 +2420,7 @@ mod tests {
         let routed = route_auction(auction_request, &inbound, &plan, None);
 
         assert_eq!(routed.inputs().len(), 1);
-        assert!(routed.inputs()[0].slots()[0].has_trusted_stored_request());
+        assert!(routed.inputs()[0].slots()[0].allows_stored_fallback_without_candidates());
         assert_eq!(routed.inputs()[0].slots()[0].prebid_zone(), Some("header"));
         assert!(
             routed.inputs()[0].slots().iter().all(|slot| {
