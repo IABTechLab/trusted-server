@@ -4656,6 +4656,146 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     }
   );
 
+  it.each(['replace', 'navigate'])(
+    'bounds completed overflow auctions without refresh until %s',
+    (contextChange) => {
+      const code = 'example-pending-overflow';
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+      const element = document.getElementById(code)!;
+      const claim = claimFirstImpressionForTrustedServer(ts, element)!;
+      observeFirstImpressionGptLifecycle(ts, element, 'requested');
+      mockRequestBids.mockImplementation((opts) =>
+        completePublisherAuction(opts, { applyTargeting: false })
+      );
+      const pbjs = installPrebidNpm();
+      // Observe the retained collection without exposing a runtime API for tests.
+      const mapSet = vi.spyOn(Map.prototype, 'set');
+      const requestPublisher = () =>
+        pbjs.requestBids({
+          adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+          bidsBackHandler: vi.fn(),
+        } as unknown as RequestBidsArg);
+      requestPublisher();
+      const registrationCall = mapSet.mock.calls.findIndex(([key, value]) => {
+        const pending = value as { adUnitCode?: string; retainUntilContextChange?: boolean };
+        return (
+          typeof key === 'number' &&
+          pending?.adUnitCode === code &&
+          pending.retainUntilContextChange === true
+        );
+      });
+      expect(registrationCall).toBeGreaterThanOrEqual(0);
+      const registrations = mapSet.mock.contexts[registrationCall] as Map<number, unknown>;
+      mapSet.mockRestore();
+      for (let index = 1; index < 2200; index++) requestPublisher();
+      expect(registrations.size).toBeLessThanOrEqual(16);
+      expect(Object.keys(claim.publisherAuctions)).toHaveLength(16);
+      expect(originalRefresh).not.toHaveBeenCalled();
+
+      observeFirstImpressionGptLifecycle(ts, element, 'rendered');
+      // Consume the latest overflow delivery, then an evicted bid ID repeatedly.
+      for (const index of [
+        ...Array.from({ length: 15 }, (_, index) => index + 1),
+        2199,
+        ...Array.from({ length: 20 }, () => 16),
+        17,
+      ]) {
+        deliveryAdIds.set(slot, `example-auction-${index}-${code}`);
+        pubads.refresh([slot]);
+        expect(originalRefresh).not.toHaveBeenCalled();
+      }
+      deliveryAdIds.delete(slot);
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => pubads.refresh([slot]),
+      } as unknown as RequestBidsArg);
+      expect(originalRefresh).toHaveBeenCalledOnce();
+
+      if (contextChange === 'navigate') ts.navGeneration = 1;
+      else {
+        const replacement = document.createElement('div');
+        replacement.id = code;
+        element.replaceWith(replacement);
+      }
+      pubads.refresh([slot]);
+      expect(originalRefresh).toHaveBeenCalledTimes(2);
+      expect(registrations.size).toBe(0);
+    },
+    15000
+  );
+
+  it('restores an outer overflow denial after a nested code-only callback', () => {
+    const code = 'example-nested-overflow';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    const element = document.getElementById(code)!;
+    claimFirstImpressionForTrustedServer(ts, element);
+    const auctions: Array<Parameters<typeof completePublisherAuction>[0]> = [];
+    mockRequestBids.mockImplementation((opts) => auctions.push(opts));
+    const pbjs = installPrebidNpm();
+    for (let index = 0; index < 18; index++) {
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler:
+          index === 16
+            ? () => {
+                auctions[17]!.bidsBackHandler?.({}, false, 'example-inner-overflow');
+                pubads.refresh([slot]);
+              }
+            : () => pubads.refresh([slot]),
+      } as unknown as RequestBidsArg);
+    }
+    observeFirstImpressionGptLifecycle(ts, element, 'rendered');
+    auctions[16]!.bidsBackHandler?.({}, false, 'example-outer-overflow');
+    expect(originalRefresh).not.toHaveBeenCalled();
+    expect(mockRequestBids).toHaveBeenCalledTimes(18);
+  });
+
+  it('retires a shared denial after all exact overflow deliveries are consumed', () => {
+    const code = 'example-consumed-overflow';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    const element = document.getElementById(code)!;
+    claimFirstImpressionForTrustedServer(ts, element);
+    mockRequestBids.mockImplementation((opts) =>
+      completePublisherAuction(opts, { applyTargeting: false })
+    );
+    const pbjs = installPrebidNpm();
+    for (let index = 0; index < 17; index++) {
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      } as unknown as RequestBidsArg);
+    }
+    observeFirstImpressionGptLifecycle(ts, element, 'rendered');
+    for (let index = 16; index >= 0; index--) {
+      deliveryAdIds.set(slot, `example-auction-${index}-${code}`);
+      pubads.refresh([slot]);
+      expect(originalRefresh).not.toHaveBeenCalled();
+    }
+    deliveryAdIds.delete(slot);
+    pubads.refresh([slot]);
+    expect(originalRefresh).toHaveBeenCalledOnce();
+  });
+
   it('keeps registration open when a losing publisher callback throws', () => {
     const code = 'example-throwing-overlap';
     const slot = {

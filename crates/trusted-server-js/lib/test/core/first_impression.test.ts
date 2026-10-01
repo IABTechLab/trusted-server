@@ -81,14 +81,7 @@ describe('initial render capacity and diagnostics', () => {
 
   it('records one pending snapshot after a publisher-to-TS fallback transition', () => {
     const debug = vi.fn();
-    const ts: TsjsApi = {
-      version: 'test',
-      que: [],
-      addAdUnits: vi.fn(),
-      renderAdUnit: vi.fn(),
-      renderAllAdUnits: vi.fn(),
-      log: { ...log, debug },
-    };
+    const ts = { log: { ...log, debug } } as unknown as TsjsApi;
     const element = document.getElementById('example-slot')!;
     const token = registerPublisherFirstImpressionAuctions(ts, [element.id]).get(element.id);
     const publisherClaim = ts.firstImpression!.slots[element.id];
