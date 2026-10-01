@@ -265,8 +265,8 @@ fn routing_metadata(unroutable_bidder_count: u32) -> HashMap<String, serde_json:
 /// Attach only the count derived from the routed provider input at dispatch.
 ///
 /// This is intentionally applied after every provider outcome is materialized,
-/// including failures produced before or during parsing. Skipped providers are
-/// routed separately and retain their exclusive skipped diagnostic.
+/// including failures produced before or during parsing. Only providers skipped
+/// with `skipped_no_eligible_slots` retain an exclusive skipped diagnostic.
 fn materialize_planned_response(
     mut response: AuctionResponse,
     unused_bidder_params_count: u32,
@@ -2600,7 +2600,7 @@ mod tests {
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -4702,7 +4702,7 @@ mod tests {
                 mediator: None,
                 timeout_ms: 2000,
                 creative_store: "creative_store".to_string(),
-                allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+                allowed_context_keys: BTreeSet::from(["permutive_segments".to_string()]),
             };
 
             let orchestrator = AuctionOrchestrator::new(config);

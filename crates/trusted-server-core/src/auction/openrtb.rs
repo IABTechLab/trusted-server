@@ -489,6 +489,8 @@ fn apply_prebid(
     _routed: &RoutedAuction,
     plan: &PrebidProfilePlan,
 ) -> Result<(), Report<TrustedServerError>> {
+    // Routing admits only slots with positive banner dimensions that fit in i32,
+    // so build_imp produces one impression per routed slot, in the same order.
     debug_assert_eq!(
         request.imp.len(),
         input.slots().len(),

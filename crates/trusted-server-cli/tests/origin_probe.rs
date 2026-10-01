@@ -1276,3 +1276,171 @@ fn legacy_prefetch_variation_is_exercised() {
         "should detect legacy prefetch variation"
     );
 }
+
+#[test]
+fn representative_header_values_detect_variants_hidden_by_the_default_sample() {
+    for rsc_only in [false, true] {
+        for declared in [false, true] {
+            let server = FixtureServer::start(move |request| {
+                let value = request.header("x-exp-variant").unwrap_or("default");
+                let body = if !rsc_only || request.header("rsc").is_some() {
+                    match value {
+                        "A" => "<html>variant A</html>",
+                        "B" => "<html>variant B</html>",
+                        _ => "<html>default</html>",
+                    }
+                } else {
+                    "<html>default</html>"
+                };
+                let response =
+                    FixtureResponse::html(body).with_header("cache-control", "public, max-age=300");
+                if declared {
+                    response.with_header("vary", "x-exp-variant")
+                } else {
+                    response
+                }
+            });
+            let mut args = json_args(&server);
+            args.vary_header = vec![
+                "x-exp-variant".to_owned(),
+                "X-Exp-Variant=A".to_owned(),
+                "x-exp-variant=B".to_owned(),
+            ];
+
+            let (ok, report) = probe(&server, args);
+
+            assert_eq!(
+                ok, declared,
+                "should require Vary for real categorical values"
+            );
+            assert!(
+                axis(&report, "x-exp-variant").differs(),
+                "should detect A/B despite absent/1 matching"
+            );
+            assert_eq!(
+                verdict(&report, "vary-coverage").passed,
+                declared,
+                "should attribute variation to the custom header"
+            );
+            assert_eq!(
+                server.request_count(),
+                15,
+                "should sample every supplied value with and without RSC"
+            );
+        }
+    }
+}
+
+#[test]
+fn representative_values_for_builtin_headers_are_not_skipped() {
+    let server = FixtureServer::start(|request| {
+        FixtureResponse::html(
+            if request.header("user-agent") == Some("ExampleBrowser/1.0") {
+                "<html>alternate</html>"
+            } else {
+                "<html>default</html>"
+            },
+        )
+        .with_header("cache-control", "public, max-age=300")
+    });
+    let mut args = json_args(&server);
+    args.vary_header = vec!["user-agent=ExampleBrowser/1.0".to_owned()];
+
+    let (ok, report) = probe(&server, args);
+
+    assert!(!ok, "should inspect explicit values even for built-in axes");
+    assert!(
+        axis(&report, "user-agent").differs(),
+        "should merge explicit evidence into the existing axis"
+    );
+}
+
+#[test]
+fn surrogate_freshness_takes_precedence_over_cache_control() {
+    for (surrogate, cache_control, expected) in [
+        ("max-age=0", "public, max-age=300", false),
+        ("max-age=0", "public, s-maxage=300", false),
+        ("max-age=invalid", "public, max-age=300", false),
+        ("MAX-AGE = \"0\"", "public, max-age=300", false),
+        ("max-age=60", "public, max-age=0, s-maxage=0", true),
+        (
+            "stale-while-revalidate=60",
+            "public, s-maxage=60, max-age=0",
+            true,
+        ),
+        ("s-maxage=60", "public, max-age=0", false),
+        ("max-age=60, max-age=0", "public, max-age=300", false),
+    ] {
+        let server = FixtureServer::start(move |_| {
+            FixtureResponse::html("<html>stable</html>")
+                .with_header("cache-control", cache_control)
+                .with_header("surrogate-control", surrogate)
+        });
+
+        let (ok, report) = probe(&server, json_args(&server));
+
+        assert_eq!(
+            ok, expected,
+            "should use authoritative freshness for {surrogate:?} over {cache_control:?}"
+        );
+        assert_eq!(
+            verdict(&report, "freshness").passed,
+            expected,
+            "should report the edge freshness decision"
+        );
+    }
+}
+
+#[test]
+fn every_representative_value_is_checked_after_a_difference_is_found() {
+    let server = FixtureServer::start(|request| {
+        let value = request.header("x-exp-variant").unwrap_or("default");
+        let response = FixtureResponse::html(format!("<html>{value}</html>"))
+            .with_header("cache-control", "public, max-age=300")
+            .with_header("vary", "x-exp-variant");
+        if value == "B" {
+            response.with_header("set-cookie", "session=example")
+        } else {
+            response
+        }
+    });
+    let mut args = json_args(&server);
+    args.vary_header = vec!["x-exp-variant=A".to_owned(), "x-exp-variant=B".to_owned()];
+
+    let (ok, report) = probe(&server, args);
+
+    assert!(!ok, "should reject unsafe headers on later representatives");
+    assert!(
+        !verdict(&report, "set-cookie").passed,
+        "should inspect all values despite an earlier difference"
+    );
+}
+
+#[test]
+fn invalid_representative_headers_are_rejected_before_fetching() {
+    for header in [
+        "bad name=A",
+        "x-layout=bad\nvalue",
+        "bot=A",
+        "prefetch=A",
+        "fetch-profile=A",
+        "self-identity=A",
+    ] {
+        let server = FixtureServer::start(shareable("<html>stable</html>"));
+        let mut args = json_args(&server);
+        args.vary_header = vec![header.to_owned()];
+        let mut out = Vec::new();
+
+        let result = run(OriginCommand::ProbeShareability(args), &mut out);
+
+        assert!(
+            result.is_err(),
+            "should reject malformed or reserved header input"
+        );
+        assert_eq!(
+            server.request_count(),
+            0,
+            "should validate before any network requests"
+        );
+    }
+}

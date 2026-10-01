@@ -979,6 +979,7 @@ type PendingPublisherCode = {
   element: HTMLElement;
   retainUntilContextChange: boolean;
   firstImpressionToken?: string;
+  pendingDeliveryCount?: number;
 };
 type RemoveAdUnit = (adUnitCode?: string | string[]) => unknown;
 type PrebidWithRemoveAdUnit = {
@@ -991,6 +992,7 @@ let pendingPublisherBids = new Map<string, PendingPublisherBid>();
 let pendingPublisherCodes = new Map<string, Map<number, PendingPublisherCode>>();
 let pendingPublisherRegistrationId = 0;
 let activePublisherRegistrationId: number | undefined;
+let activePublisherFirstImpressionTokens: Map<string, string> | undefined;
 let publisherFirstImpressionTokens = new Map<string, Set<string>>();
 let syntheticRefreshAdUnits = new WeakSet<TrustedServerAdUnit>();
 type TrustedServerBidRequest = {
@@ -1601,7 +1603,17 @@ function restoreTrustedServerFirstImpressionTargeting(slot: RefreshGptSlot): voi
       Boolean(candidate && ts && firstImpressionClaim(ts, candidate)?.owner === 'trusted_server')
     );
   const claim = ts && element ? firstImpressionClaim(ts, element) : undefined;
-  if (claim?.owner !== 'trusted_server' || !claim.targeting || !slot.setTargeting) return;
+  // After settlement, a legitimate refresh may already have newer targeting.
+  // Deny the losing request without restoring the initial snapshot over it.
+  // Clearing is unsafe for the same reason: this wrapper cannot distinguish
+  // losing targeting writes from targeting belonging to a newer delivery.
+  if (
+    claim?.owner !== 'trusted_server' ||
+    claim.phase === 'rendered' ||
+    !claim.targeting ||
+    !slot.setTargeting
+  )
+    return;
   clearRefreshTargeting(slot);
   for (const [key, value] of Object.entries(claim.targeting)) slot.setTargeting(key, value);
 }
@@ -1654,10 +1666,28 @@ function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: 
   }
 }
 
-function removeConsumedPublisherRegistration(adUnitCode: string, registrationId: number): void {
+function removeConsumedPublisherRegistration(
+  adUnitCode: string,
+  registrationId: number,
+  pendingBid?: PendingPublisherBid
+): void {
   const registrations = pendingPublisherCodes.get(adUnitCode);
-  const pendingCode = registrations?.get(registrationId);
-  registrations?.delete(registrationId);
+  const pendingCode = pendingBid?.firstImpressionToken
+    ? [...(registrations?.values() ?? [])].find(
+        (pending) =>
+          pending.firstImpressionToken === pendingBid.firstImpressionToken &&
+          pending.element === pendingBid.element &&
+          pending.generation === pendingBid.generation
+      )
+    : registrations?.get(registrationId);
+  if (pendingCode?.pendingDeliveryCount !== undefined) {
+    // Only an exact bid correlation accounts for one entire registration.
+    // Unknown or repeated deliveries must not drain a shared denial.
+    if (pendingBid) pendingCode.pendingDeliveryCount -= 1;
+    if (pendingCode.pendingDeliveryCount === 0) registrations?.delete(pendingCode.registrationId);
+  } else {
+    registrations?.delete(registrationId);
+  }
   if (registrations?.size === 0) pendingPublisherCodes.delete(adUnitCode);
 
   const tokens = new Set<string>();
@@ -1757,6 +1787,21 @@ function prunePendingPublisherBids(now = Date.now()): void {
 /** Store a short-lived pending publisher ad-unit code without erasing overlaps. */
 function storePendingPublisherCode(pendingCode: PendingPublisherCode): void {
   const registrations = pendingPublisherCodes.get(pendingCode.adUnitCode) ?? new Map();
+  if (pendingCode.retainUntilContextChange && pendingCode.firstImpressionToken) {
+    for (const [registrationId, existing] of registrations) {
+      if (
+        existing.retainUntilContextChange &&
+        existing.firstImpressionToken === pendingCode.firstImpressionToken &&
+        existing.element === pendingCode.element &&
+        existing.generation === pendingCode.generation
+      ) {
+        // Overflow auctions share one denial token. Keep one summary rather
+        // than allocating a retained record for every completed auction.
+        pendingCode.pendingDeliveryCount = (existing.pendingDeliveryCount ?? 1) + 1;
+        registrations.delete(registrationId);
+      }
+    }
+  }
   registrations.set(pendingCode.registrationId, pendingCode);
   pendingPublisherCodes.set(pendingCode.adUnitCode, registrations);
 
@@ -1920,7 +1965,10 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliver
             (pending) =>
               pendingPublisherContextMatchesSlot(pending, slot) &&
               (activePublisherRegistrationId === undefined ||
-                pending.registrationId === activePublisherRegistrationId) &&
+                pending.registrationId === activePublisherRegistrationId ||
+                (pending.firstImpressionToken !== undefined &&
+                  pending.firstImpressionToken ===
+                    activePublisherFirstImpressionTokens?.get(pending.adUnitCode))) &&
               (!hasAdId || pending.retainUntilContextChange)
           )
           .map((pending) => [pending.registrationId, pending] as const)
@@ -1939,7 +1987,11 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliver
       pending.firstImpressionToken && window.tsjs
         ? consumePublisherFirstImpressionDelivery(window.tsjs, pending.firstImpressionToken)
         : false;
-    removeConsumedPublisherRegistration(pending.adUnitCode, pending.registrationId);
+    removeConsumedPublisherRegistration(
+      pending.adUnitCode,
+      pendingBid?.registrationId ?? activePublisherRegistrationId ?? pending.registrationId,
+      pendingBid
+    );
     (suppress ? suppressedSlots : deliverySlots).add(slot);
   }
 
@@ -2092,6 +2144,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pendingPublisherCodes = new Map();
   pendingPublisherRegistrationId = 0;
   activePublisherRegistrationId = undefined;
+  activePublisherFirstImpressionTokens = undefined;
   publisherFirstImpressionTokens = new Map();
   syntheticRefreshAdUnits = new WeakSet();
 
@@ -2622,7 +2675,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       if (typeof originalBidsBack !== 'function') return;
 
       const previousRegistrationId = activePublisherRegistrationId;
+      const previousFirstImpressionTokens = activePublisherFirstImpressionTokens;
       activePublisherRegistrationId = registrationId;
+      activePublisherFirstImpressionTokens = firstImpressionTokens;
       try {
         originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
       } catch (error) {
@@ -2638,6 +2693,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         throw error;
       } finally {
         activePublisherRegistrationId = previousRegistrationId;
+        activePublisherFirstImpressionTokens = previousFirstImpressionTokens;
       }
     };
 

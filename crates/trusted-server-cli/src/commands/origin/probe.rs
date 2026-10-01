@@ -116,6 +116,55 @@ struct Arm<'a> {
     headers: &'a [(&'a str, &'a str)],
 }
 
+/// Representative values for one request signal.
+struct HeaderSamples {
+    name: String,
+    values: Vec<String>,
+}
+
+fn parse_header_samples(headers: &[String]) -> CliResult<Vec<HeaderSamples>> {
+    let mut samples: Vec<HeaderSamples> = Vec::new();
+    for header in headers {
+        let (name, value) = header.split_once('=').unwrap_or((header, "1"));
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("invalid --vary-header name: {error}"))?
+            .as_str()
+            .to_owned();
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|error| format!("invalid --vary-header value for {name}: {error}"))?;
+        if matches!(
+            name.as_str(),
+            "self-identity" | "fetch-profile" | "bot" | "prefetch"
+        ) {
+            if header.contains('=') {
+                return cli_error(format!(
+                    "--vary-header {name} conflicts with a reserved probe axis"
+                ));
+            }
+            continue;
+        }
+        if !header.contains('=')
+            && matches!(
+                name.as_str(),
+                "cookie" | "accept-encoding" | "user-agent" | "rsc"
+            )
+        {
+            continue;
+        }
+        if let Some(sample) = samples.iter_mut().find(|sample| sample.name == name) {
+            if !sample.values.iter().any(|existing| existing == value) {
+                sample.values.push(value.to_owned());
+            }
+        } else {
+            samples.push(HeaderSamples {
+                name,
+                values: vec![value.to_owned()],
+            });
+        }
+    }
+    Ok(samples)
+}
+
 /// Probe every URL and return the combined report.
 ///
 /// # Errors
@@ -129,6 +178,7 @@ pub(crate) fn probe_urls(
     vary_headers: &[String],
     admission_cookie: Option<&str>,
 ) -> CliResult<ProbeReport> {
+    let vary_headers = parse_header_samples(vary_headers)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -153,7 +203,7 @@ pub(crate) fn probe_urls(
                     url,
                     repeat,
                     extra_cookies,
-                    vary_headers,
+                    &vary_headers,
                     admission_cookie,
                 )
                 .await?,
@@ -168,7 +218,7 @@ async fn probe_one(
     url: &str,
     repeat: u32,
     extra_cookies: &[String],
-    vary_headers: &[String],
+    vary_headers: &[HeaderSamples],
     admission_cookie: Option<&str>,
 ) -> CliResult<UrlReport> {
     let cookie_jar = cookie_header(extra_cookies, admission_cookie);
@@ -298,50 +348,54 @@ async fn probe_one(
 
     // Each configured signal needs its own comparison and Vary declaration. Combining
     // these with RSC lets Vary: rsc hide a difference caused by an unrelated header.
-    for name in vary_headers {
-        let name = name.to_ascii_lowercase();
-        if axes.iter().any(|axis| axis.name == name) {
-            continue;
+    for header in vary_headers {
+        let mut axis = AxisResult {
+            name: header.name.clone(),
+            description: format!(
+                "absent vs. {} values {:?}, with and without RSC",
+                header.name, header.values
+            ),
+            difference: None,
+            covered_by_vary: false,
+        };
+        for (profile, baseline, rsc) in [
+            (RequestProfile::Navigation, &baseline_canonical, false),
+            (RequestProfile::Fetch, &rsc_canonical, true),
+        ] {
+            let mut previous = vec![baseline.clone()];
+            for value in &header.values {
+                let mut headers = Vec::with_capacity(2);
+                if rsc {
+                    headers.push(("rsc", "1"));
+                }
+                headers.push((header.name.as_str(), value.as_str()));
+                let mut response = fetch(client, url, profile, &headers, admission_cookie).await?;
+                let canonical = response.canonical();
+                for earlier in &previous {
+                    if axis.difference.is_none() {
+                        axis.difference = first_difference(earlier, &canonical);
+                    }
+                }
+                previous.push(canonical);
+                response.body.clear();
+                let label = format!(
+                    "{}: {value:?}{}",
+                    header.name,
+                    if rsc { " with RSC" } else { "" }
+                );
+                samples.push((label, response));
+            }
         }
-        let description = format!("bare vs. {name}: 1");
-        let (mut axis, mut response) = compare_axis(
-            client,
-            url,
-            &baseline_canonical,
-            &name,
-            &description,
-            Arm {
-                profile: RequestProfile::Navigation,
-                headers: &[(name.as_str(), "1")],
-            },
-            admission_cookie,
-        )
-        .await?;
-        response.body = Vec::new();
-        samples.push((name.clone(), response));
-
-        // Some signals only affect flight responses. Hold RSC constant so the
-        // configured header still owns its difference and needs its own Vary entry.
-        let (rsc_axis, mut response) = compare_axis(
-            client,
-            url,
-            &rsc_canonical,
-            &name,
-            &description,
-            Arm {
-                profile: RequestProfile::Fetch,
-                headers: &[("rsc", "1"), (name.as_str(), "1")],
-            },
-            admission_cookie,
-        )
-        .await?;
-        if axis.difference.is_none() && rsc_axis.differs() {
-            axis.difference = rsc_axis.difference;
-            axis.description = format!("RSC request vs. RSC with {name}: 1");
+        if let Some(existing) = axes.iter_mut().find(|existing| existing.name == axis.name) {
+            if existing.difference.is_none() && axis.differs() {
+                existing.difference = axis.difference;
+            }
+            existing
+                .description
+                .push_str(&format!("; {}", axis.description));
+        } else {
+            axes.push(axis);
         }
-        response.body = Vec::new();
-        samples.push((format!("{name} with RSC"), response));
-        axes.push(axis);
     }
 
     let mut baseline = baseline;
@@ -616,9 +670,10 @@ fn freshness_verdict(baseline: &Fetched) -> VerdictResult {
     // the case that matters, and reading only the first line would pass it.
     let cache_control = baseline.all("cache-control").join(", ");
     let surrogate = baseline.all("surrogate-control").join(", ");
-    let positive = [&cache_control, &surrogate]
-        .iter()
-        .any(|value| has_positive_freshness(value));
+    let positive = freshness_seconds(&surrogate, "max-age")
+        .or_else(|| freshness_seconds(&cache_control, "s-maxage"))
+        .or_else(|| freshness_seconds(&cache_control, "max-age"))
+        .is_some_and(|seconds| seconds.is_some_and(|seconds| seconds > 0));
     let pragma = baseline.all("pragma").join(", ");
     let forbids = [&cache_control, &surrogate, &pragma].iter().any(|value| {
         value.split(',').any(|directive| {
@@ -715,21 +770,21 @@ fn vary_coverage_verdict(baseline: &Fetched, axes: &[AxisResult]) -> VerdictResu
     }
 }
 
-fn has_positive_freshness(value: &str) -> bool {
-    // Shared caches obey s-maxage when present, even if max-age is positive.
-    let lowered = value.to_ascii_lowercase();
-    let seconds_for = |prefix: &str| {
-        lowered.split(',').find_map(|directive| {
-            directive
-                .trim()
-                .strip_prefix(prefix)
-                .map(|seconds| seconds.trim_matches('"').parse::<u64>().ok())
-        })
-    };
-    match seconds_for("s-maxage=") {
-        Some(shared) => shared.is_some_and(|seconds| seconds > 0),
-        None => seconds_for("max-age=").is_some_and(|parsed| parsed.is_some_and(|s| s > 0)),
+/// Distinguish an absent directive from an invalid or conflicting authoritative one.
+fn freshness_seconds(value: &str, name: &str) -> Option<Option<u64>> {
+    let mut seconds = None;
+    for directive in value.split(',') {
+        let (field, raw) = directive.split_once('=').unwrap_or((directive, ""));
+        if field.trim().eq_ignore_ascii_case(name) {
+            let parsed = raw.trim().trim_matches('"').parse::<u64>().ok();
+            seconds = Some(match seconds {
+                None => parsed,
+                Some(existing) if existing == parsed => parsed,
+                Some(_) => return Some(None),
+            });
+        }
     }
+    seconds
 }
 
 /// The cookie arm's jar: the admission cookie plus the cookies a repeat visitor carries.
@@ -859,6 +914,35 @@ mod tests {
     }
 
     #[test]
+    fn header_samples_preserve_values_and_deduplicate_case_insensitive_names() {
+        let inputs = [
+            "X-Layout=A=B",
+            "x-layout=A=B",
+            "x-layout=",
+            "x-layout",
+            "user-agent",
+        ]
+        .map(str::to_owned);
+
+        let samples = parse_header_samples(&inputs).expect("should parse representative headers");
+
+        assert_eq!(
+            samples.len(),
+            1,
+            "should group names and skip bare built-in axes"
+        );
+        assert_eq!(
+            samples[0].name, "x-layout",
+            "should normalize only header names"
+        );
+        assert_eq!(
+            samples[0].values,
+            ["A=B", "", "1"],
+            "should preserve empty and equals-containing values and sample bare names as 1"
+        );
+    }
+
+    #[test]
     fn shared_freshness_overrides_browser_freshness() {
         for value in [
             "public, s-maxage=0, max-age=300",
@@ -872,7 +956,10 @@ mod tests {
             );
         }
         for value in ["s-maxage=60, max-age=300", "max-age=300", "s-maxage=\"60\""] {
-            assert!(has_positive_freshness(value), "should accept {value}");
+            assert!(
+                freshness_verdict(&fetched(&[("cache-control", value)])).passed,
+                "should accept {value}"
+            );
         }
     }
 

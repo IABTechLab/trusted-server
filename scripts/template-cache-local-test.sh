@@ -622,6 +622,8 @@ const googletag = {
 };
 const listeners = new Map();
 const windowObject = {
+  setTimeout,
+  clearTimeout,
   addEventListener(type, callback) { listeners.set(type, callback); },
   getComputedStyle: () => ({ display: "block", visibility: "visible" }),
   googletag,

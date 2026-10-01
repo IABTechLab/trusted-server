@@ -2609,9 +2609,13 @@ saying nothing about this setting.
    classification blocks readthrough, so an origin that answers a bot or a prefetch
    with a different document without declaring `Vary` would otherwise have that
    document cross-served to a reader. Any `Age` header, including `Age: 0`, blocks the verdict because a
-   fresh cached response can hide origin personalization. Pass `--vary-header <name>` for each additional request header to test;
-   each is varied independently, both with and without RSC. A declared `Vary` can
-   explain a user-agent, RSC,
+   fresh cached response can hide origin personalization. Pass `--vary-header <name>=<value>`
+   for each representative value of an additional request header, for example
+   `--vary-header x-exp-variant=A --vary-header x-exp-variant=B`. Each value is compared
+   against the absent baseline and the other supplied values, both with and without RSC.
+   Bare `--vary-header <name>` samples `1` for compatibility; it cannot establish safety
+   for categorical values the origin actually uses. Supply every relevant variant.
+   A declared `Vary` can explain a user-agent, RSC,
    or custom-header difference only when every response declares it. Cookie
    differences and different decoded gzip/identity documents always fail, because
    the template cache requires those representations to be identical.

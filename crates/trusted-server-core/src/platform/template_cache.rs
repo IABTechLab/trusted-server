@@ -223,7 +223,9 @@ impl TemplateCacheKey {
 ///
 /// A URL that cannot be parsed is hashed as given. An operator typo then purges nothing,
 /// which is the same outcome as a correct URL that was never cached, and is preferable to
-/// failing the command.
+/// failing the command. The same fallback applies to reader URLs composed during cache
+/// insertion: a malformed Host can produce a raw key that a corrected `--page` URL cannot
+/// target. Such objects remain reachable through `--all` via the `ts-template` tag.
 #[must_use]
 pub fn reader_url_surrogate_key(url: &str) -> String {
     format!(

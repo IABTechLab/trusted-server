@@ -2112,11 +2112,13 @@ fn template_fingerprint(settings: &Settings) -> String {
     hasher.update(
         trusted_server_js::concatenated_hash(trusted_server_js::all_module_ids()).as_bytes(),
     );
-    // `serde_json::Value` uses a sorted object map without `preserve_order`, making
-    // independently deserialized HashMaps canonical before they are serialized again.
+    // EdgeZero's canonical form sorts object keys itself, so independently deserialized
+    // HashMaps hash identically even when a dependency enables `serde_json/preserve_order`.
+    // Array order is preserved: set-valued settings must serialize deterministically
+    // themselves (for example, `allowed_context_keys` uses a `BTreeSet`).
     let canonical = serde_json::to_value(settings)
-        .and_then(|value| serde_json::to_vec(&value))
-        .expect("serializing typed settings should be infallible");
+        .map(|value| edgezero_core::canonical_form::canonical_data_sha256(&value))
+        .expect("should serialize typed settings infallibly");
     hasher.update(canonical);
     hex::encode(hasher.finalize())
 }
@@ -5092,7 +5094,7 @@ pub async fn handle_publisher_request(
         timings.set_auction_id(observation.auction_id);
         // Written on the value, before it is moved into `auction_observation` below. Sites
         // after that move reach it through `auction_observation.as_mut()` instead.
-        observation.set_origin_cache_shareable(origin_response_is_shareable);
+        observation.set_origin_cache_shareable(origin_response_is_shareable && request_is_document);
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -9905,6 +9907,26 @@ mod tests {
         }
 
         #[test]
+        fn a_context_key_allowlist_fingerprints_identically_across_parses() {
+            let source = format!(
+                "{}\n[auction]\nallowed_context_keys = [\"zeta\", \"alpha\", \"gamma\", \"beta\", \"epsilon\", \"delta\"]\n",
+                crate_test_settings_str()
+            );
+            let first = Settings::from_toml(&source).expect("should parse context allowlist");
+            let expected = template_fingerprint(&first);
+
+            for _ in 0..32 {
+                let settings =
+                    Settings::from_toml(&source).expect("should reparse context allowlist");
+                assert_eq!(
+                    template_fingerprint(&settings),
+                    expected,
+                    "should fingerprint independently parsed allowlists identically"
+                );
+            }
+        }
+
+        #[test]
         fn creative_and_origin_configuration_change_the_fingerprint() {
             let base = super::template_neutrality_tests::settings_with_slots();
 
@@ -11454,6 +11476,42 @@ mod tests {
                 Some(1),
                 "a cookieless GET navigation is the population the gate is meant to admit"
             );
+        }
+
+        #[tokio::test]
+        async fn non_document_requests_do_not_count_toward_readthrough_gate_reach() {
+            for fetch_metadata in [true, false] {
+                let stub = Arc::new(StubHttpClient::new());
+                let sink = Arc::new(RecordingTelemetrySink::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::clone(&sink),
+                );
+                let settings = Arc::new(settings_with_mode("esi"));
+                queue_shareable_html(&stub);
+                let mut request = navigation_request();
+                if fetch_metadata {
+                    request
+                        .headers_mut()
+                        .insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+                } else {
+                    request.headers_mut().remove("sec-fetch-dest");
+                    request
+                        .headers_mut()
+                        .insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+                }
+
+                let _ = run(&settings, &services, request).await;
+
+                assert_eq!(
+                    last_summary_row(&sink)
+                        .expect("should emit a summary row")
+                        .origin_cache_shareable,
+                    Some(0),
+                    "should exclude non-document requests from the gate's potential reach"
+                );
+            }
         }
 
         #[tokio::test]
@@ -13022,6 +13080,89 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn nextjs_stored_templates_are_identical_across_request_shapes() {
+            let mut settings = settings_with_mode("esi");
+            settings.publisher.origin_url = "https://origin.example.com".to_owned();
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should enable Next.js processing");
+            let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+            assert!(
+                !registry.html_stream_processor_factories().is_empty(),
+                "should exercise the Next.js stream processor"
+            );
+            let settings = Arc::new(settings);
+            let html = br#"<html><head></head><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script><div id="test-slot"></div></body></html>"#;
+
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let mut templates = Vec::new();
+                for request in [navigation_request(), prefetch_navigation_request()] {
+                    // Independent fills force distinct per-request RSC namespaces.
+                    let stub = Arc::new(StubHttpClient::new());
+                    let cache = Arc::new(MemoryTemplateCache::default());
+                    let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                    stub.push_response_with_headers(
+                        200,
+                        html.to_vec(),
+                        vec![
+                            ("content-type", "text/html"),
+                            ("cache-control", "public, max-age=300"),
+                        ],
+                    );
+
+                    let response = run_via(&settings, &services, request, finalizer).await;
+                    let _ = body_of(response).await;
+
+                    let entries = cache.entries.lock().expect("should lock stored templates");
+                    assert_eq!(
+                        entries.len(),
+                        1,
+                        "should store a Next.js template on every fill"
+                    );
+                    let template = entries
+                        .values()
+                        .next()
+                        .expect("should find stored template")
+                        .body
+                        .clone();
+                    let text = core::str::from_utf8(&template).expect("should store UTF-8 HTML");
+                    assert!(
+                        text.contains("ts.example.com/page"),
+                        "should rewrite the RSC URL"
+                    );
+                    assert!(
+                        text.contains(AD_ASSEMBLY_SEAM),
+                        "should store before per-reader assembly"
+                    );
+                    for marker in [
+                        "__ts_rsc_",
+                        ".adSlots",
+                        ".bids=",
+                        "gpt-diagnostics",
+                        "gpt_history",
+                    ] {
+                        assert!(
+                            !text.contains(marker),
+                            "should exclude request-scoped marker {marker}"
+                        );
+                    }
+                    templates.push(template);
+                }
+                assert_eq!(
+                    templates[0], templates[1],
+                    "should store identical bytes across request shapes and RSC namespaces"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn a_transform_that_overruns_its_buffer_stores_nothing() {
             // The 16 MB cap in production, shrunk here. A partial template in template cache is the
             // worst outcome available: it would be served to every subsequent visitor as
@@ -13433,6 +13574,42 @@ mod tests {
                 stub.recorded_request_uris().len(),
                 1,
                 "the second request must be served from the first's template"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_context_key_allowlist_keys_one_template() {
+            let mut source = serde_json::to_value(settings_with_mode("esi"))
+                .expect("should serialize cache settings");
+            source["auction"]["allowed_context_keys"] =
+                serde_json::json!(["zeta", "alpha", "gamma", "beta", "epsilon", "delta"]);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            for _ in 0..16 {
+                let settings = Arc::new(
+                    serde_json::from_value(source.clone()).expect("should parse cache settings"),
+                );
+                queue_shareable_html(&stub);
+                let _ = run(&settings, &services, navigation_request()).await;
+            }
+
+            let keys = looked_up_cache_keys(&cache);
+            assert_eq!(keys.len(), 16, "should consult the cache for every request");
+            assert!(
+                keys.iter().all(|key| key == &keys[0]),
+                "should reuse one key across independently parsed allowlists"
+            );
+            assert_eq!(
+                stored_cache_keys(&cache).len(),
+                1,
+                "should store one template"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should fetch the origin only for the first request"
             );
         }
 
