@@ -19,8 +19,9 @@ behaviour unchanged.
 ## Scope
 
 In scope: the Fastly adapter entry point and the state it owns, plus one
-`trusted-server-core` change — moving the script rewriters' accumulation
-buffers out of registry-lifetime objects, without which retention is unsafe.
+`trusted-server-core` change — moving GTM's script accumulation buffer out of
+its registry-lifetime object, without which retention is unsafe. Next.js now
+uses the per-document state introduced by #1135.
 See [Retained rewrite buffers](#retained-rewrite-buffers-blocking).
 
 Out of scope: Spin, Cloudflare, and Axum adapters; any other change to routing,
@@ -227,7 +228,7 @@ config-derived and free of request state and native handles.
   `plan`, `planned_providers`, `mediator`. All config-derived. The per-auction
   `PlannedLaunchState` is a local, not a field.
 - `IntegrationRegistry` (`registry.rs:780-783`): `Arc<IntegrationRegistryInner>`
-  plus an optional plan. **Not fully config-derived — see
+  plus an optional plan. **The original audit found request content — see
   [Retained rewrite buffers](#retained-rewrite-buffers-blocking).**
 - `FastlyTinybirdAuctionTelemetrySink` (`tinybird.rs:36-48`): owned strings and
   a backend spec. No handles.
@@ -248,26 +249,42 @@ only these two; everything else is immutable `LazyLock` regexes and sets.
 
 ### Retained rewrite buffers (blocking)
 
-The registry is **not** safe to retain as it stands. Two script rewriters hold
-request content in interior-mutable state on the rewriter object itself:
+At the original design revision (`c56ff745e`), the registry was **not** safe to
+retain. Two script rewriters held request content in interior-mutable state on
+the rewriter object itself:
 
 - `GoogleTagManagerIntegration.accumulated_text: Mutex<String>`
-  (`google_tag_manager.rs:366`, used at `:1031`)
+  (`google_tag_manager.rs:366`, used at `:1033` at that revision)
 - `NextJsNextDataRewriter.accumulated_text: Mutex<String>`
-  (`nextjs/script_rewriter.rs:24`, used at `:77`)
+  (`nextjs/script_rewriter.rs:24`, used at `:78` at that revision; subsequently
+  replaced by per-document `rsc_stream::FragmentState` in #1135)
 
-Both accumulate fragments of an inline `<script>` across `lol_html` callbacks
-and drain only via `std::mem::take` when `ctx.is_last_in_text_node` arrives.
-The registry stores them as `Arc<dyn IntegrationScriptRewriter>`
-(`registry.rs:710`), registered once at build time (`registry.rs:644`), so a
-retained registry shares one buffer across every request the sandbox serves.
+Both accumulated fragments of an inline `<script>` across `lol_html` callbacks
+and drained only via `std::mem::take` when `ctx.is_last_in_text_node` arrived.
+The registry stored them as `Arc<dyn IntegrationScriptRewriter>`, registered
+once at build time, so retaining that registry would share one buffer across
+every request the sandbox serves.
 
 If a document stream ends before the final text fragment — client disconnect,
 origin error, truncated body — the buffer keeps one request's partial script
 content. The next request through the same sandbox prepends that residue to its
 own accumulation, which can corrupt its response or disclose the previous
-request's content. Today each sandbox serves one request, so the buffer is
-destroyed before it can be observed; retention is what makes it reachable.
+request's content. Without reuse, each sandbox serves one request, so the buffer
+is destroyed before it can be observed; retention is what makes it reachable.
+
+After merging #1135, the two integrations use different per-document mechanisms.
+This PR moves GTM's buffer into `ScriptTextAccumulator`, obtained through
+`IntegrationDocumentState::get_or_insert_with` in
+`GoogleTagManagerIntegration::rewrite`. Next.js uses
+`rsc_stream::document_state` to obtain its `NextJsDocumentState` through the same
+per-document store; `NextJsNextDataRewriter::rewrite` passes its `next_data`
+`FragmentState` to `capture_fragment`. Neither buffer is retained on a rewriter
+object.
+
+GTM's per-document accumulation remains unbounded; Next.js enforces
+`IntegrationScriptContext::max_buffered_script_bytes` and restores buffered text
+before passing through on overflow. Bounding GTM is tracked separately in
+[#1224](https://github.com/IABTechLab/trusted-server/issues/1224).
 
 **This lands as its own commit, between the lifecycle and retention commits.**
 It is a `trusted-server-core` change with its own regression test, it is
@@ -537,7 +554,9 @@ scaffolding.
 - Request-scoped extensions do not leak between loop iterations.
 - An HTML stream interrupted mid-text-node leaves no residue in the script
   rewriters: a second document processed through the same retained app contains
-  no fragment of the first. Covers both `accumulated_text` buffers.
+  no fragment of the first. Covers GTM's per-document `ScriptTextAccumulator`
+  and Next.js's per-document `FragmentState` from #1135, rather than two moved
+  `accumulated_text` buffers.
 - Logger installs exactly once across a reused sandbox.
 - Every non-panicking handler path sends exactly once.
 - `IP_CIDR_SOURCE_CACHE` (`protection_scope.rs:200`) key space stays bounded by
