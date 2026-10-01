@@ -2,6 +2,7 @@ mod common;
 mod environments;
 mod frameworks;
 
+use common::ec::CookieVaryingOrigin;
 use common::runtime::{RuntimeEnvironment, TestError, origin_port, wasm_binary_path};
 use environments::{RUNTIME_ENVIRONMENTS, ReadyCheckOptions, wait_for_http_ready};
 use error_stack::ResultExt as _;
@@ -162,6 +163,55 @@ fn test_nextjs_cloudflare() {
     let runtime = environments::cloudflare::CloudflareWorkers;
     let framework = frameworks::nextjs::NextJs;
     test_combination(&runtime, &framework).expect("should pass Next.js on Cloudflare Workers");
+}
+
+#[test]
+#[ignore = "requires the `wrangler` CLI in $PATH and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts wrangler dev automatically"]
+fn test_cloudflare_dynamic_publisher_response_does_not_cross_cookie_boundaries() {
+    init_logger();
+    let _origin = CookieVaryingOrigin::start(origin_port());
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let process = runtime
+        .spawn(&wasm_binary_path())
+        .expect("should start Cloudflare Worker");
+    let client = reqwest::blocking::Client::new();
+
+    let first_response = client
+        .get(format!("{}/cache-regression", process.base_url))
+        .header("cookie", "viewer=first")
+        .send()
+        .expect("should request first dynamic publisher response");
+    assert_eq!(
+        first_response.status().as_u16(),
+        200,
+        "first dynamic publisher response should succeed"
+    );
+    let first_body = first_response
+        .text()
+        .expect("should read first dynamic publisher response");
+
+    let second_response = client
+        .get(format!("{}/cache-regression", process.base_url))
+        .header("cookie", "viewer=second")
+        .send()
+        .expect("should request second dynamic publisher response");
+    assert_eq!(
+        second_response.status().as_u16(),
+        200,
+        "second dynamic publisher response should succeed"
+    );
+    let second_body = second_response
+        .text()
+        .expect("should read second dynamic publisher response");
+
+    assert!(
+        first_body.contains("viewer=first"),
+        "first response must preserve its cookie-specific origin body: {first_body}"
+    );
+    assert!(
+        second_body.contains("viewer=second"),
+        "second response must not reuse the first visitor's body: {second_body}"
+    );
 }
 
 #[test]

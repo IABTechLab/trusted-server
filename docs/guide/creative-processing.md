@@ -1,20 +1,24 @@
 # Creative Processing
 
-Learn how Trusted Server automatically rewrites ad creative HTML and CSS to route all resources through first-party domains.
+Trusted Server rewrites ad creative HTML and CSS to route resources
+through first-party domains.
 
 ## Overview
 
-Creative processing transforms third-party ad creatives by rewriting URLs to go through your first-party domain. This provides:
+Creative processing has separate auction-response and proxied-response
+paths. When rewriting is enabled for a path, it rewrites URLs in
+third-party ad creatives so resources are fetched through the
+publisher's first-party domain. This provides:
 
-- **Privacy Control** - All resources load through your domain
-- **First-Party Context** - Cookies and storage use your domain
-- **EC ID Integration** - Automatic ID forwarding to trackers
-- **Security** - Validated, signed URLs prevent tampering
-- **GDPR Compliance** - Controlled data sharing
+- **First-party delivery**: eligible, non-excluded external resource URLs route through the publisher's domain
+- **First-party context**: cookies and storage use the publisher's domain
+- **EC ID integration**: configurable ID forwarding to downstream endpoints
+- **Tamper resistance**: validated, signed URLs prevent in-flight URL substitution
+- **Configurable data sharing**: forwarding to vendors is per the deployer's configuration
 
 ## Browser-facing first-party origin
 
-Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, for example `https://ads.publisher.example`. Rewritten proxy, click, CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin. When it is omitted, Trusted Server uses `https://{publisher.domain}` for compatibility. Relative creative source URLs and excluded third-party URLs remain unchanged.
+Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, for example `https://ads.publisher.example`. Rewritten proxy, click, CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin. When it is omitted, Trusted Server uses `https://{publisher.domain}` for compatibility. Relative creative source URLs and excluded third-party URLs remain unchanged. The publisher SSAT/page-bids path retains its explicit request-origin override and does not inject the creative bundle.
 
 ## How It Works
 
@@ -27,12 +31,12 @@ Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, 
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
-│  Trusted Server Processing                           │
-│  1. Parse HTML with streaming processor              │
-│  2. Detect absolute/protocol-relative URLs           │
-│  3. Generate signed proxy URLs                       │
-│  4. Rewrite in-place                                 │
-│  5. Inject TSJS library                              │
+│  Trusted Server Processing (rewrite-enabled)         │
+│  1. Sanitize POST /auction adm when opted in         │
+│  2. Parse HTML with streaming processor              │
+│  3. Detect absolute/protocol-relative URLs           │
+│  4. Generate signed proxy URLs                       │
+│  5. Rewrite in-place and inject TSJS                  │
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
@@ -45,15 +49,96 @@ Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, 
 
 ## Processing Triggers
 
-Creative processing is automatically triggered when:
+The creative rewriters are invoked by independent delivery paths:
 
-1. **Content-Type Header**: Response is `text/html` or `text/css`
-2. **Proxy Mode**: Request goes through `/first-party/proxy` (not streaming)
-3. **Integration Response**: Integration returns HTML content
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`, opt-in, default `false`) and rewritten (`[auction].rewrite_creatives`, default `true`).
+2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
+3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
 ::: info Streaming Mode
-When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. Use for binary files, large responses, or when rewriting isn't needed.
+When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. This does not change the `POST /auction` sanitizer or rewrite setting.
 :::
+
+## Auction Rewrite Control
+
+Two independent auction settings control the processing applied to winning-bid
+`adm` returned by `POST /auction` and delivered through the publisher
+SSAT/page-bids path. Sanitization is opt-in (default `false`); rewriting is
+enabled by default:
+
+```toml
+[auction]
+sanitize_creatives = false
+rewrite_creatives = true
+```
+
+Regardless of mode, a creative larger than the 1 MiB per-creative cap is
+rejected and its `adm` is dropped.
+
+| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                                                               |
+| -------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                                                                                                |
+| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                                                               |
+| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                                                                                                     |
+| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits absolute endpoints on the configured public origin and injects creative TSJS exactly once, whether or not the bidder supplied a `<body>`; SSAT/page-bids retains its request-origin override for its foreign-origin renderer and does not inject the bundle. |
+
+::: warning Sanitization blanks script-based creatives
+Sanitization removes `script`/`object`/`embed`/`form` and similar elements
+**together with their inner content**, which destroys script-based creatives —
+the majority of programmatic display. Enable `sanitize_creatives` when creatives
+render in a context that shares the publisher's origin; leave it disabled when
+creatives render in a foreign-origin frame (for example the Prebid Universal
+Creative inside the ad server's iframe), where the markup cannot reach the
+publisher origin. Sanitizer acceptance is not a host allowlist; ordinary
+accepted HTTP(S) URLs may cause the browser to contact external creative hosts
+directly.
+:::
+
+::: info Runtime protections inside the sandboxed creative iframe
+Creatives rendered by Trusted Server's own path run in a sandboxed iframe
+**without** `allow-same-origin`, i.e. an opaque origin. The injected creative
+runtime's click guard recovers mutated clicks there via a GET
+`/first-party/proxy-rebuild` navigation (302 chain).
+
+Two capabilities are unavailable in that context. **CORS-mode subresources** —
+ES modules, `crossorigin` fonts, `fetch`/XHR — cannot load through
+`/first-party/proxy`, because that endpoint deliberately sends no
+`Access-Control-Allow-Origin`: it is a generic signed fetcher that forwards the
+EC ID and client-derived headers, so letting an opaque creative frame read its
+responses would turn it into a readable bidder-controlled proxy. Ordinary
+subresources (`<img>`, `<script src>`, stylesheets, media) are unaffected. A
+separately constrained asset capability is tracked in
+[#982](https://github.com/IABTechLab/trusted-server/issues/982).
+
+The second is **dynamic** resource signing,
+which rewrites URLs on elements a creative inserts at runtime. It is installed
+only when `renderGuard` is enabled in `tsCreativeConfig`, and that is `false`
+by default — deployments using the default configuration are unaffected. Where
+it is enabled, runtime-inserted `<img>`/`<iframe>` URLs cannot be signed from an
+opaque origin (the signing request is blocked by CORS), so they load directly
+from third parties; the sandbox still isolates them from the publisher origin,
+but they are not first-party proxied. A same-origin parent postMessage broker
+restoring dynamic signing is tracked in
+[#982](https://github.com/IABTechLab/trusted-server/issues/982). URLs rewritten
+server-side are unaffected.
+:::
+
+::: warning PBS Cache coordinates and processing
+On the publisher SSAT/page-bids path, `hb_cache_host`/`hb_cache_path` let the
+client fetch and render the **cached** bid, whose `adm` is the bidder's original
+markup and therefore bypasses every server-side processing policy. They are
+emitted only for bids that supplied no creative of their own, where the cache is
+the sole render source. A bid that supplied a creative — whether processing
+accepted it, or rejected it as empty, unparseable, or over the size limit —
+ships without them, so a processed or refused creative can never be re-fetched
+raw.
+:::
+
+Neither setting affects HTML/CSS response rewriting under
+`/first-party/proxy`. The publisher SSAT/page-bids path is a production creative
+path and follows both settings. `[debug].inject_adm_for_testing` controls only the
+additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
+it does not control whether the processed `adm` is present.
 
 ## Rewritten Elements
 
@@ -710,41 +795,24 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 
 ```html
 <script
-  async
-  src="/static/tsjs-core.min.js"
-  data-tsjs-integration="core"
+  src="/static/tsjs=tsjs-unified.min.js?v=<hash>"
+  id="trustedserver-js"
 ></script>
 ```
 
 **Timing**: Injected **once per HTML response** before any other scripts.
 
-### Integration Bundles
+### Integration bundles
 
-Integrations can request additional bundles:
+The integration registry selects TSJS modules by enabled integration ID. A
+registered ID with a compiled module is included in the immediate unified
+bundle unless its builder calls `.with_deferred_js()`; deferred modules are
+served separately as `/static/tsjs=tsjs-<id>.min.js`. Builders can call
+`.without_js()` when the Rust integration must not select a TSJS module.
 
-```rust
-IntegrationRegistration::builder("my_integration")
-    .with_asset("my_integration")  // Requests tsjs-my_integration.min.js
-    .build()
-```
-
-**Result**:
-
-```html
-<head>
-  <script
-    async
-    src="/static/tsjs-core.min.js"
-    data-tsjs-integration="core"
-  ></script>
-  <script
-    async
-    src="/static/tsjs-my_integration.min.js"
-    data-tsjs-integration="my_integration"
-  ></script>
-  <!-- Rest of head content -->
-</head>
-```
+The always-present `creative` module and all immediate integration modules are
+served through `/static/tsjs=tsjs-unified.min.js`. Trusted Server does not
+accept an arbitrary asset name from an integration registration.
 
 ### Bundle Types
 

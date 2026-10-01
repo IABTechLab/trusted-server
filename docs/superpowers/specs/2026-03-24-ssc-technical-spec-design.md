@@ -10,6 +10,12 @@
 > Current runtime behavior interprets live consent from request cookies, headers,
 > geolocation, and policy defaults. `ec_identity_store` is the only KV-backed EC
 > lifecycle store and holds identity graph state plus withdrawal tombstones.
+>
+> **Completion-marker namespace (issue #881):** The same store also holds
+> `__ts_ec_withdrawal_complete__:{ec_id}:{valid_until}` keys, separate from EC
+> roots and excluded from hash-prefix cluster counts. Strong prefix listing
+> validates the encoded expiry; an expired/malformed marker or unusable clock
+> cannot suppress the existing-key-only withdrawal fallback.
 
 ---
 
@@ -602,8 +608,8 @@ Partners are defined in config (`[[ec.partners]]` in TOML) and loaded into an in
     "known_browser": true
   },
   "pub_properties": {
-    "origin_domain": "autoblog.com",
-    "seen_domains": ["autoblog.com"]
+    "origin_domain": "example.com",
+    "seen_domains": ["example.com"]
   },
   "network": {
     "cluster_size": 2

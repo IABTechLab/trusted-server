@@ -10,8 +10,15 @@ use edgezero_core::http::{
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
@@ -19,8 +26,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, buffer_publisher_response_async,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -32,8 +39,8 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::RuntimeServices;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
+use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -44,6 +51,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -55,8 +63,13 @@ pub struct AppState {
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
-    let settings =
-        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+    let settings = get_settings_from_config_store(
+        &AxumPlatformConfigStore,
+        &AxumPlatformSecretStore,
+        &store_name,
+        &config_key,
+        &trusted_server_core::settings_data::default_secret_store_name(),
+    )?;
     build_state_with_settings(settings)
 }
 
@@ -69,14 +82,32 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        services,
     }))
+}
+
+impl AppState {
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| build_runtime_services(ctx))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +159,14 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = build_runtime_services(&ctx);
-    let req = ctx.into_request();
+    let services = state.services_for_request(&ctx);
+    let mut req = ctx.into_request();
+    if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return Ok(http_error(&error));
+    }
     Ok(handler(state, services, req)
         .await
         .unwrap_or_else(|e| http_error(&e)))
@@ -140,7 +177,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/__ts/page-bids`, and the publisher fallback).
+/// `/_ts/page-bids`, and the publisher fallback).
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
@@ -170,13 +207,18 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
 async fn dispatch_fallback(
     state: &AppState,
     services: &RuntimeServices,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+        return Ok(response);
+    }
+
+    trusted_server_core::integrations::gpt_diagnostics::prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
     if method == Method::GET && path.starts_with("/static/tsjs=") {
-        return handle_tsjs_dynamic(&req, &state.registry);
+        return handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback);
     }
 
     if state.registry.has_route(&method, &path) {
@@ -215,6 +257,7 @@ async fn dispatch_fallback(
         &mut ec_context,
         auction,
         req,
+        EdgeCacheHeader::SMaxageFallback,
     )
     .await?;
     // Async finalize so the dispatched auction is collected and its bids are
@@ -252,6 +295,9 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
+    CachePurgeNotSupported,
+    AdminEcNotSupported,
+    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -279,7 +325,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 12] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -303,6 +349,34 @@ fn named_routes() -> [NamedRoute; 12] {
             path: "/_ts/admin/keys/deactivate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Every method, for the same reason as the Fastly adapter: a method this route
+        // does not claim falls through to the publisher with the caller's `Authorization`
+        // header still attached.
+        NamedRoute {
+            path: "/_ts/admin/cache/purge",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::CachePurgeNotSupported,
+        },
+        // Admin EC lookup routes. Registered explicitly (like the key routes
+        // above) so they never fall through to the publisher fallback, and
+        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
+        NamedRoute {
+            path: "/_ts/admin/ec",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        NamedRoute {
+            path: "/_ts/admin/ec/{id}",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        // Admin EIDs echo: pure request inspection (no KV), so the dev
+        // server serves the real handler.
+        NamedRoute {
+            path: "/_ts/admin/eids",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEidsLookup,
         },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
@@ -328,7 +402,15 @@ fn named_routes() -> [NamedRoute; 12] {
         // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
         // preflight guard for this side-effecting endpoint.
         NamedRoute {
-            path: "/__ts/page-bids",
+            path: PAGE_BIDS_PATH,
+            primary_methods: &[Method::GET, Method::OPTIONS],
+            handler: NamedRouteHandler::PageBids,
+        },
+        // Deprecated double-underscore alias, kept so tsjs bundles served before
+        // the `/_ts/page-bids` rename keep getting ads on SPA navigations until
+        // they age out of browser caches. See `PAGE_BIDS_LEGACY_PATH`.
+        NamedRoute {
+            path: PAGE_BIDS_LEGACY_PATH,
             primary_methods: &[Method::GET, Method::OPTIONS],
             handler: NamedRouteHandler::PageBids,
         },
@@ -349,6 +431,10 @@ fn named_routes() -> [NamedRoute; 12] {
         },
         NamedRoute {
             path: "/first-party/proxy-rebuild",
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
             primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
@@ -372,6 +458,22 @@ fn named_route_handler(
                     NamedRouteHandler::VerifySignature => {
                         handle_verify_signature(&state.settings, &services, req)
                     }
+                    NamedRouteHandler::CachePurgeNotSupported => {
+                        // The Axum dev server has no template cache to purge. 501 rather
+                        // than a fallthrough 404, so a CMS webhook can tell "not supported
+                        // here" from "endpoint does not exist".
+                        let body = edgezero_core::body::Body::from(
+                            "Template cache purge is not supported on the Axum dev server.\n\
+                             Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+                        );
+                        let mut resp = Response::new(body);
+                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        Ok(resp)
+                    }
                     NamedRouteHandler::AdminNotSupported => {
                         // Config/secret-store writes are backed by read-only env vars on the
                         // Axum dev server. Returning 501 is clearer than failing on the first
@@ -388,18 +490,28 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
+                    NamedRouteHandler::AdminEcNotSupported => {
+                        // The EC identity graph is Fastly KV backed; the Axum
+                        // dev server has no store to read.
+                        Ok(admin_ec_lookup_not_supported())
+                    }
+                    NamedRouteHandler::AdminEidsLookup => {
+                        let partner_registry =
+                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                        handle_admin_eids_lookup(&partner_registry, &req)
+                    }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
-                        let ec_context = build_ec_context(&state, &services, &req);
+                        let mut ec_context = build_ec_context(&state, &services, &req);
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
                             None,
                             None,
-                            &ec_context,
+                            &mut ec_context,
                             &services,
                             req,
                         )
@@ -412,7 +524,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let ec_context = build_ec_context(&state, &services, &req);
+                            let mut ec_context = build_ec_context(&state, &services, &req);
                             let auction = AuctionDispatch {
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
@@ -423,7 +535,7 @@ fn named_route_handler(
                                 &services,
                                 None,
                                 auction,
-                                &ec_context,
+                                &mut ec_context,
                                 req,
                             )
                             .await
@@ -533,12 +645,41 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
     let fallback = fallback_handler(Arc::clone(state));
 
     let mut router = RouterService::builder()
+        // Outermost middleware: strips the configured trusted-client-IP
+        // headers before anything else sees the request. Must stay first —
+        // any middleware registered ahead of it would observe the
+        // shared-secret authentication header.
+        .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
         .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
         .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 

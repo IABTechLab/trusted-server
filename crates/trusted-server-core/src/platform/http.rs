@@ -1,11 +1,52 @@
 use std::any::Any;
 use std::fmt;
 
-use edgezero_core::http::{Request as EdgeRequest, Response as EdgeResponse};
+use edgezero_core::http::{Method, Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
 
 use super::PlatformError;
 use super::image_optimizer::PlatformImageOptimizerOptions;
+
+/// What the caller wants the platform's intermediary cache to do with this request.
+///
+/// One enum rather than independent flags because on Fastly they are *not* independent:
+/// `set_surrogate_key` and `set_ttl` each "override any previous `Request::set_pass` call"
+/// (`fastly-0.12.1/src/http/request.rs:2462`, `:2381`). A pair of booleans could express
+/// "bypass the cache, and tag it for purge", which on Fastly silently means "do not
+/// bypass" — the opposite of how it reads. This type makes that combination unspellable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlatformCacheIntent {
+    /// Let the platform apply its default behavior, honoring origin freshness.
+    #[default]
+    Default,
+    /// Do not use the intermediary cache for this request.
+    Bypass,
+    /// Allow caching, tagged with a surrogate key so it can be purged.
+    Shared {
+        /// Key attached to the stored object.
+        surrogate_key: String,
+    },
+}
+
+impl PlatformCacheIntent {
+    /// Whether this intent asks the platform to skip its cache entirely.
+    #[must_use]
+    pub fn is_bypass(&self) -> bool {
+        matches!(self, Self::Bypass)
+    }
+
+    /// The surrogate key to tag the stored object with, when there is one.
+    ///
+    /// `None` for both [`Self::Default`] and [`Self::Bypass`]: attaching a key to a
+    /// bypassed request would reverse the bypass on Fastly.
+    #[must_use]
+    pub fn surrogate_key(&self) -> Option<&str> {
+        match self {
+            Self::Shared { surrogate_key } => Some(surrogate_key),
+            Self::Default | Self::Bypass => None,
+        }
+    }
+}
 
 /// Outbound HTTP request paired with a pre-resolved backend name.
 ///
@@ -23,6 +64,11 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot attach this metadata to their send path should
     /// return an error rather than silently dropping transformations.
     pub image_optimizer: Option<PlatformImageOptimizerOptions>,
+    /// What the platform's intermediary response cache should do with this request.
+    ///
+    /// Adapters without an intermediary outbound cache may ignore it. Defaults to
+    /// [`PlatformCacheIntent::Default`] so existing call sites preserve their behavior.
+    pub cache_intent: PlatformCacheIntent,
     /// Whether the response body should stay streaming in the platform response.
     ///
     /// Adapters that cannot preserve streaming response bodies should return an
@@ -38,6 +84,7 @@ impl PlatformHttpRequest {
             request,
             backend_name: backend_name.into(),
             image_optimizer: None,
+            cache_intent: PlatformCacheIntent::Default,
             stream_response: false,
         }
     }
@@ -50,6 +97,25 @@ impl PlatformHttpRequest {
     #[must_use]
     pub fn with_image_optimizer(mut self, options: PlatformImageOptimizerOptions) -> Self {
         self.image_optimizer = Some(options);
+        self
+    }
+
+    /// Bypass the platform's intermediary response cache for this request.
+    #[must_use]
+    pub fn with_cache_bypass(mut self) -> Self {
+        self.cache_intent = PlatformCacheIntent::Bypass;
+        self
+    }
+
+    /// Allow the platform to cache this response, tagged for purge.
+    ///
+    /// Replaces any prior bypass rather than combining with it, because the two cannot
+    /// both hold: see [`PlatformCacheIntent`].
+    #[must_use]
+    pub fn with_shared_cache(mut self, surrogate_key: impl Into<String>) -> Self {
+        self.cache_intent = PlatformCacheIntent::Shared {
+            surrogate_key: surrogate_key.into(),
+        };
         self
     }
 
@@ -112,6 +178,8 @@ impl PlatformResponse {
 pub struct PlatformPendingRequest {
     inner: Box<dyn Any>,
     backend_name: Option<String>,
+    stream_response: bool,
+    request_method: Option<Method>,
 }
 
 impl PlatformPendingRequest {
@@ -124,6 +192,8 @@ impl PlatformPendingRequest {
         Self {
             inner: Box::new(inner),
             backend_name: None,
+            stream_response: false,
+            request_method: None,
         }
     }
 
@@ -140,6 +210,26 @@ impl PlatformPendingRequest {
         self.backend_name.as_deref()
     }
 
+    /// Retain response-conversion metadata for direct single-handle waits.
+    #[must_use]
+    pub fn with_response_handling(mut self, stream_response: bool, request_method: Method) -> Self {
+        self.stream_response = stream_response;
+        self.request_method = Some(request_method);
+        self
+    }
+
+    /// Whether completion must preserve the response body as a stream.
+    #[must_use]
+    pub fn stream_response(&self) -> bool {
+        self.stream_response
+    }
+
+    /// Method of the originating request, when retained by the adapter.
+    #[must_use]
+    pub fn request_method(&self) -> Option<&Method> {
+        self.request_method.as_ref()
+    }
+
     /// Recover the adapter-specific pending request type.
     ///
     /// # Errors
@@ -153,6 +243,8 @@ impl PlatformPendingRequest {
         let Self {
             inner,
             backend_name,
+            stream_response,
+            request_method,
         } = self;
 
         match inner.downcast::<T>() {
@@ -160,6 +252,8 @@ impl PlatformPendingRequest {
             Err(inner) => Err(Self {
                 inner,
                 backend_name,
+                stream_response,
+                request_method,
             }),
         }
     }
@@ -169,6 +263,8 @@ impl fmt::Debug for PlatformPendingRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlatformPendingRequest")
             .field("backend_name", &self.backend_name)
+            .field("stream_response", &self.stream_response)
+            .field("request_method", &self.request_method)
             .finish()
     }
 }
@@ -276,6 +372,38 @@ pub trait PlatformHttpClient: Send + Sync {
         true
     }
 
+    /// Whether the adapter enforces a hard total deadline for each request.
+    ///
+    /// First-byte and between-byte timers do not qualify: connection setup or a
+    /// byte-trickling response can still overrun the logical auction budget. The
+    /// auction collector uses this explicit capability to decide whether an
+    /// already-completed late response remains eligible.
+    fn has_enforceable_total_request_deadline(&self) -> bool {
+        false
+    }
+
+    /// Whether [`send`](Self::send) can preserve upstream response bodies as
+    /// [`Body::Stream`](edgezero_core::body::Body::Stream) when requested via
+    /// [`PlatformHttpRequest::with_stream_response`].
+    ///
+    /// Adapters that cannot preserve streaming response bodies must keep the
+    /// default `false` so callers do not request a contract the adapter will
+    /// reject or silently buffer.
+    fn supports_streaming_responses(&self) -> bool {
+        false
+    }
+
+    /// Whether a request started by [`send_async`](Self::send_async) can be
+    /// completed directly by [`wait`](Self::wait) while preserving a streamed
+    /// response body.
+    ///
+    /// Supporting adapters must override `wait` with direct single-handle
+    /// completion. A pending request marked for streaming must never be passed
+    /// to [`select`](Self::select), whose fan-out contract remains buffered.
+    fn supports_pending_streaming_responses(&self) -> bool {
+        false
+    }
+
     /// Wait for one of the in-flight requests to complete.
     ///
     /// # Errors
@@ -306,7 +434,91 @@ pub trait PlatformHttpClient: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+
     use super::*;
+
+    #[test]
+    fn platform_http_request_cache_bypass_defaults_to_false() {
+        let request = PlatformHttpRequest::new(
+            request_builder()
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        );
+
+        assert_eq!(
+            request.cache_intent,
+            PlatformCacheIntent::Default,
+            "should preserve existing cache behavior by default"
+        );
+    }
+
+    #[test]
+    fn platform_http_request_cache_bypass_builder_enables_bypass() {
+        let request = PlatformHttpRequest::new(
+            request_builder()
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_cache_bypass();
+
+        assert_eq!(
+            request.cache_intent,
+            PlatformCacheIntent::Bypass,
+            "should enable intermediary cache bypass"
+        );
+    }
+
+    #[test]
+    fn cache_intent_cannot_request_bypass_and_a_surrogate_key_at_once() {
+        // The whole reason this is an enum. On Fastly a surrogate key reverses a prior
+        // set_pass, so "bypass, and tag for purge" would silently mean "do not bypass".
+        let bypass = PlatformCacheIntent::Bypass;
+        let shared = PlatformCacheIntent::Shared {
+            surrogate_key: "ts-origin".to_owned(),
+        };
+
+        assert!(bypass.is_bypass());
+        assert!(bypass.surrogate_key().is_none());
+        assert!(!shared.is_bypass());
+        assert_eq!(shared.surrogate_key(), Some("ts-origin"));
+        assert!(PlatformCacheIntent::Default.surrogate_key().is_none());
+        assert!(!PlatformCacheIntent::Default.is_bypass());
+    }
+
+    #[test]
+    fn the_last_cache_builder_call_wins_rather_than_combining() {
+        // Builders replace rather than accumulate: a request cannot end up asking for
+        // both, whichever order a caller writes them in.
+        let base = || {
+            PlatformHttpRequest::new(
+                request_builder()
+                    .body(Body::empty())
+                    .expect("should build request"),
+                "stub-backend",
+            )
+        };
+
+        assert_eq!(
+            base()
+                .with_cache_bypass()
+                .with_shared_cache("ts-origin")
+                .cache_intent,
+            PlatformCacheIntent::Shared {
+                surrogate_key: "ts-origin".to_owned()
+            }
+        );
+        assert_eq!(
+            base()
+                .with_shared_cache("ts-origin")
+                .with_cache_bypass()
+                .cache_intent,
+            PlatformCacheIntent::Bypass
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // Error-correlation interim scope (before EdgeZero #213)

@@ -1,5 +1,11 @@
 # 🎯 Auction Orchestration Flow
 
+> [!WARNING]
+> The APS portions of this historical design are superseded by
+> [APS OpenRTB First-Class Integration](./2026-07-15-aps-openrtb-first-class-integration-design.md).
+> The legacy `/e/dtb/bid` contextual flow and encoded-price mediation described below
+> are not current runtime behavior.
+
 ## 🔄 System Flow Diagram
 
 ```mermaid

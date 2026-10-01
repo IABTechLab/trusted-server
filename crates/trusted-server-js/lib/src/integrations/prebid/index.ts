@@ -11,31 +11,148 @@
 // The shim on requestBids injects "trustedServer" into every ad unit so all
 // bids flow through the orchestrator.
 
-import pbjs from 'prebid.js';
-import adapterManager from 'prebid.js/src/adapterManager.js';
-import 'prebid.js/modules/consentManagementTcf.js';
-import 'prebid.js/modules/consentManagementGpp.js';
-import 'prebid.js/modules/consentManagementUsp.js';
-import 'prebid.js/modules/userId.js';
+import type _pbjsDefault from 'prebid.js';
 
-// Client-side bid adapters — self-register with prebid.js on import.
-// The external bundle generator aliases these placeholder modules to temporary
-// modules built from its --adapters and --user-id-modules options. When a bidder
-// is listed in `client_side_bidders` in trusted-server.toml, the requestBids
-// shim leaves its bids untouched and the corresponding adapter handles them
-// natively in the browser.
-import './_adapters.generated';
-import './_user_ids.generated';
-
+import {
+  consumePublisherFirstImpressionDelivery,
+  FIRST_IMPRESSION_LEASE_MS,
+  firstImpressionClaim,
+  markPublisherFirstImpressionDeliveryPending,
+  registerPublisherFirstImpressionAuctions,
+  releasePublisherFirstImpressionAuction,
+  resolveFirstImpressionElement,
+} from '../../core/first_impression';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AuctionSlot, TsjsApi } from '../../core/types';
 
-import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
+import {
+  PREBID_USER_ID_MODULE_REGISTRY,
+  userIdConfigNameAliases,
+  userIdSubmoduleKey,
+} from './user_id_modules';
+
+/**
+ * Prebid.js public API surface (type-only; erased at build time).
+ *
+ * `getUserIdsAsEids` is added by the userId module at runtime, which the base
+ * package typing does not model.
+ */
+type PbjsGlobal = typeof _pbjsDefault & {
+  getUserIdsAsEids?: () => unknown[];
+};
+
+// Prebid.js itself is NOT bundled into this module. It is served as the
+// external bundle configured via `integrations.prebid.external_bundle_url`
+// (required whenever the prebid integration is enabled) and owns the
+// `window.pbjs` global. The Rust head injector emits a stub
+// (`window.pbjs = window.pbjs || {que:[],cmd:[]}`) before any script runs and
+// Prebid.js installs its API onto that same object, so capturing the reference
+// at module scope is safe regardless of evaluation order.
+const pbjs: PbjsGlobal = (
+  typeof window !== 'undefined'
+    ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ((window as any).pbjs ??= { que: [], cmd: [] })
+    : { que: [], cmd: [] }
+) as PbjsGlobal;
+
+/**
+ * Manifest stamped on `window.__tsjs_prebid_bundle` by the external Prebid.js
+ * bundle. Module stems and runtime codes remain separate because values such as
+ * `rubiconBidAdapter` and `rubicon` are not interchangeable.
+ */
+interface ExternalPrebidBundleManifest {
+  schemaVersion: 1;
+  modules: {
+    bidder?: string[];
+    userId?: string[];
+    analytics?: string[];
+  };
+  runtimeCodes: {
+    bidder?: string[];
+    analytics?: string[];
+  };
+}
+
+function parseManifestList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+    return undefined;
+  }
+  return [...value];
+}
+
+function isManifestContainer(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+
+  // Page code can replace this global. Validate each nested list instead of
+  // trusting the generated TypeScript shape.
+  const raw = (window as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle;
+  if (!isManifestContainer(raw) || raw.schemaVersion !== 1) {
+    return undefined;
+  }
+
+  const modules = isManifestContainer(raw.modules) ? raw.modules : {};
+  const runtimeCodes = isManifestContainer(raw.runtimeCodes) ? raw.runtimeCodes : {};
+  return {
+    schemaVersion: 1,
+    modules: {
+      bidder: parseManifestList(modules.bidder),
+      userId: parseManifestList(modules.userId),
+      analytics: parseManifestList(modules.analytics),
+    },
+    runtimeCodes: {
+      bidder: parseManifestList(runtimeCodes.bidder),
+      analytics: parseManifestList(runtimeCodes.analytics),
+    },
+  };
+}
+
+/**
+ * Whether the captured `window.pbjs` carries the real Prebid.js API rather
+ * than the head-injected `{ que, cmd }` stub left behind when the external
+ * bundle fails to load.
+ */
+function hasPrebidJsApi(): boolean {
+  return typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter === 'function';
+}
+
+function hasApsRendererApi(): boolean {
+  return typeof (pbjs as { markWinningBidAsUsed?: unknown }).markWinningBidAsUsed === 'function';
+}
 
 const ADAPTER_CODE = 'trustedServer';
+const APS_BIDDER_CODE = 'aps';
+// Carrier field for the APS bid-by-reference renderer descriptor: set by
+// `auctionBidsToPrebidBids` (interpretResponse), consumed and scrubbed by the
+// registry listener installed in `installApsBidResponseRegistry`.
+//
+// The descriptor is deliberately carried twice on each built bid — as this
+// custom top-level field and as `meta[APS_RENDERER_FIELD]`:
+// - `meta` is a first-class Prebid bid field (bidderFactory assigns
+//   `bid.meta = bidResponse.meta` onto the normalized bid, the same guarantee
+//   `requestId` has), so it survives builds whose normalization drops unknown
+//   top-level fields (observed in production: the top-level field was absent
+//   as early as `bidAccepted`).
+// - The top-level copy is kept as belt-and-braces for builds that preserve it
+//   (the vendored prebid.js does) against a future build filtering `meta`
+//   sub-keys instead.
+// The listener registers whichever copy it finds and unconditionally scrubs
+// both after the registration attempt.
+const APS_RENDERER_FIELD = 'trustedServerRenderer';
+const APS_BID_RESPONSE_LISTENER_SENTINEL = '__tsApsBidResponseListenerInstalled';
+// OpenRTB permits vendor-specific agent types; PAIR uses 571187.
+// Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
+const MAX_OPENRTB_ATYPE = 2_147_483_647;
 const BIDDER_PARAMS_KEY = 'bidderParams';
+const STORED_REQUEST_KEY = 'storedRequest';
 const ZONE_KEY = 'zone';
 const TS_REFRESH_TARGETING_KEYS = [
   'ts_initial',
@@ -45,6 +162,10 @@ const TS_REFRESH_TARGETING_KEYS = [
   'hb_cache_host',
   'hb_cache_path',
 ] as const;
+const MAX_PUBLISHER_AD_UNIT_SNAPSHOTS = 256;
+const MAX_PENDING_PUBLISHER_BIDS = 2048;
+const PENDING_PUBLISHER_DELIVERY_TTL_MS = FIRST_IMPRESSION_LEASE_MS;
+const MANAGED_USER_IDS_SET_CONFIG_SENTINEL = '__tsManagedUserIdsSetConfigInstalled';
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -64,10 +185,37 @@ interface InjectedPrebidConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
-  bidders?: string[];
+  /** Validated browser bidder route codes owned by the server auction plan. */
+  serverSideBidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
+  /** GAM ad-unit-path suffixes excluded from refresh auctions. */
+  excludedGamAdUnitPathSuffixes?: string[];
+  /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
+  managedUserIds?: InjectedManagedUserId[];
 }
+
+/**
+ * One operator-owned Prebid `userSync.userIds` entry.
+ *
+ * The server does not interpret these: `name`, `params`, and `storage` are
+ * whatever the operator configured, passed straight to Prebid.js. Which
+ * identity vendor an entry selects is a configuration choice.
+ */
+interface InjectedManagedUserId {
+  name: string;
+  params?: Record<string, unknown>;
+  storage?: InjectedManagedUserIdStorage;
+}
+
+interface InjectedManagedUserIdStorage {
+  type: 'cookie' | 'html5';
+  name: string;
+  expires?: number;
+  refreshInSeconds?: number;
+}
+
+type PrebidUserIdConfigEntry = Record<string, unknown> & { name: string };
 
 interface PrebidUserIdDiagnostics {
   includedModules: string[];
@@ -82,6 +230,10 @@ export function getInjectedConfig(): InjectedPrebidConfig | undefined {
     return (window as any).__tsjs_prebid as InjectedPrebidConfig | undefined;
   }
   return undefined;
+}
+
+function injectedServerSideBidderCodes(config = getInjectedConfig()): string[] {
+  return config?.serverSideBidders ?? [];
 }
 
 /** Collect all unique bidder codes from the provided ad units. */
@@ -99,29 +251,129 @@ export function collectBidders(adUnits: Array<{ bids?: Array<{ bidder?: string }
   return [...bidders];
 }
 
-function configuredUserIdNamesFromConfig(config: unknown): string[] {
-  const userIds = Array.isArray(config)
-    ? config
-    : config && typeof config === 'object'
-      ? ((
-          config as {
-            userSync?: { userIds?: Array<{ name?: unknown }> };
-            userIds?: Array<{ name?: unknown }>;
-          }
-        ).userSync?.userIds ?? (config as { userIds?: Array<{ name?: unknown }> }).userIds)
-      : undefined;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
-  if (!Array.isArray(userIds)) {
-    return [];
+function configuredUserIdEntries(config: unknown): PrebidUserIdConfigEntry[] {
+  let userIds: unknown;
+  if (Array.isArray(config)) {
+    userIds = config;
+  } else if (isRecord(config)) {
+    userIds = isRecord(config.userSync) ? config.userSync.userIds : undefined;
+    if (!Array.isArray(userIds)) {
+      userIds = config.userIds;
+    }
   }
 
-  return [
-    ...new Set(
-      userIds
-        .map((entry) => entry?.name)
-        .filter((name): name is string => typeof name === 'string' && name.length > 0)
-    ),
-  ].sort();
+  if (!Array.isArray(userIds)) return [];
+
+  return userIds.filter(
+    (entry): entry is PrebidUserIdConfigEntry =>
+      isRecord(entry) && typeof entry.name === 'string' && entry.name.length > 0
+  );
+}
+
+function hasUserIdsPath(config: unknown): config is Record<string, unknown> & {
+  userSync: Record<string, unknown> & { userIds: unknown };
+} {
+  return (
+    isRecord(config) &&
+    isRecord(config.userSync) &&
+    Object.prototype.hasOwnProperty.call(config.userSync, 'userIds')
+  );
+}
+
+function configuredUserIdNamesFromConfig(config: unknown): string[] {
+  const userIds = configuredUserIdEntries(config);
+
+  return [...new Set(userIds.map((entry) => entry.name))].sort();
+}
+
+/**
+ * Deep-copies a value the server injected as JSON.
+ *
+ * A spread would copy only the top level, leaving nested objects shared with
+ * `window.__tsjs_prebid` and with every entry built from it. `params` accepts
+ * arbitrary operator-authored tables, so nesting is expected. The injected
+ * config is serialized JSON by construction, which makes a round-trip total
+ * here and avoids depending on `structuredClone` availability.
+ */
+function cloneInjectedJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function managedUserIdEntry(managed: InjectedManagedUserId): PrebidUserIdConfigEntry {
+  // Rebuild the entry per call rather than sharing one object. Prebid retains
+  // whatever it receives as `submodule.config` for the life of the page, so a
+  // shared instance would let any mutation there leak into later builds.
+  const entry: PrebidUserIdConfigEntry = { name: managed.name };
+  if (managed.params) {
+    entry.params = cloneInjectedJson(managed.params);
+  }
+  if (managed.storage) {
+    entry.storage = cloneInjectedJson(managed.storage);
+  }
+  return entry;
+}
+
+/**
+ * Drops managed User ID entries that address a submodule an earlier entry
+ * already claimed.
+ *
+ * `ts prebid bundle` rejects such a pair, but an operator running a prebuilt
+ * external bundle never invokes it, and core's duplicate check compares names
+ * rather than the submodules they resolve to. Prebid registers one submodule
+ * for a module's name and each of its aliases and reads only the first matching
+ * entry, so appending both would silently discard one operator configuration.
+ * Dropping the later entry keeps the configuration Prebid sees equal to the one
+ * that takes effect, and names the loss in the log.
+ */
+function dedupeManagedUserIdsBySubmodule(
+  managedUserIds: InjectedManagedUserId[]
+): InjectedManagedUserId[] {
+  const claimedBy = new Map<string, string>();
+  const kept: InjectedManagedUserId[] = [];
+  for (const managed of managedUserIds) {
+    const submodule = userIdSubmoduleKey(managed.name);
+    const owner = claimedBy.get(submodule);
+    if (owner !== undefined) {
+      log.error(
+        `[tsjs-prebid] managed User ID "${managed.name}" addresses the same Prebid submodule as ` +
+          `"${owner}"; dropping it because Prebid would read only the first entry`
+      );
+      continue;
+    }
+    claimedBy.set(submodule, managed.name);
+    kept.push(managed);
+  }
+  return kept;
+}
+
+function withManagedUserIds(
+  config: PbjsConfig,
+  managedUserIds: InjectedManagedUserId[]
+): PbjsConfig {
+  if (!hasUserIdsPath(config)) return config;
+
+  // Prebid resolves a `userSync.userIds` entry to a submodule on either its
+  // name or its alias, case-insensitively, and takes the first matching entry.
+  // A retained publisher entry sits ahead of the managed one, so it must be
+  // filtered on any spelling Prebid would resolve to the same submodule —
+  // otherwise the publisher's configuration silently wins.
+  const managedNames = new Set(
+    managedUserIds.flatMap((managed) => userIdConfigNameAliases(managed.name))
+  );
+  const retained = configuredUserIdEntries(config.userSync.userIds).filter(
+    (entry) => !managedNames.has(entry.name.toLowerCase())
+  );
+  return {
+    ...config,
+    userSync: {
+      ...config.userSync,
+      userIds: [...retained, ...managedUserIds.map(managedUserIdEntry)],
+    },
+  } as PbjsConfig;
 }
 
 function readConfiguredUserIdNames(): string[] {
@@ -130,32 +382,61 @@ function readConfiguredUserIdNames(): string[] {
     return [];
   }
 
-  return configuredUserIdNamesFromConfig(getConfig('userSync.userIds')).concat(
-    configuredUserIdNamesFromConfig(getConfig())
-  );
+  try {
+    return configuredUserIdNamesFromConfig(getConfig('userSync.userIds')).concat(
+      configuredUserIdNamesFromConfig(getConfig())
+    );
+  } catch (error) {
+    log.error('[tsjs-prebid] effective User ID configuration could not be read', error);
+    return [];
+  }
 }
 
+/** Warn-once flag for an unstamped User ID manifest; reset by installPrebidNpm. */
+let warnedMissingUserIdManifest = false;
+
 function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
+  const manifestUserIdModules = getExternalBundleManifest()?.modules.userId;
+  const includedUserIdModules = manifestUserIdModules ?? [];
   const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
   const coveredConfigNames = new Set(
     PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
-      DEFAULT_PREBID_USER_ID_MODULES.includes(entry.moduleName)
+      includedUserIdModules.includes(entry.moduleName)
     ).flatMap((entry) => entry.configNames)
   );
-  const missingConfiguredUserIdNames = configuredUserIdNames.filter(
-    (name) => !coveredConfigNames.has(name)
-  );
+  // An absent, unsupported, or malformed manifest must not make every
+  // configured module look absent. Warn once instead of once per module.
+  const missingConfiguredUserIdNames =
+    manifestUserIdModules === undefined
+      ? []
+      : configuredUserIdNames.filter((name) => !coveredConfigNames.has(name));
+  if (
+    manifestUserIdModules === undefined &&
+    configuredUserIdNames.length > 0 &&
+    !warnedMissingUserIdManifest
+  ) {
+    warnedMissingUserIdManifest = true;
+    log.warn(
+      '[tsjs-prebid] external Prebid bundle did not stamp a User ID module manifest; ' +
+        'cannot verify configured User ID modules'
+    );
+  }
 
   const diagnostics: PrebidUserIdDiagnostics = {
-    includedModules: [...DEFAULT_PREBID_USER_ID_MODULES],
+    includedModules: [...includedUserIdModules],
     configuredUserIdNames,
     missingConfiguredUserIdNames,
   };
 
+  const previouslyMissingConfiguredUserIdNames = new Set<string>();
   if (typeof window !== 'undefined') {
     const tsjsWindow = window as typeof window & {
       __tsjs_prebid_diagnostics?: { userIdModules?: PrebidUserIdDiagnostics };
     };
+    for (const name of tsjsWindow.__tsjs_prebid_diagnostics?.userIdModules
+      ?.missingConfiguredUserIdNames ?? []) {
+      previouslyMissingConfiguredUserIdNames.add(name);
+    }
     tsjsWindow.__tsjs_prebid_diagnostics = {
       ...(tsjsWindow.__tsjs_prebid_diagnostics ?? {}),
       userIdModules: diagnostics,
@@ -163,9 +444,11 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
   }
 
   for (const name of missingConfiguredUserIdNames) {
-    log.warn(
-      `[tsjs-prebid] configured User ID module "${name}" is not included in the external bundle`
-    );
+    if (!previouslyMissingConfiguredUserIdNames.has(name)) {
+      log.warn(
+        `[tsjs-prebid] configured User ID module "${name}" is not included in the external bundle`
+      );
+    }
   }
 
   return diagnostics;
@@ -182,11 +465,13 @@ let auctionEndpoint = '/auction';
  * Convert parsed {@link AuctionBid}s into Prebid bid response objects,
  * linking each bid back to the original BidRequest via `requestId`.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: any[]): any[] {
+export function auctionBidsToPrebidBids(
+  auctionBids: AuctionBid[],
+  bidRequests: Array<{ adUnitCode?: string; code?: string; bidId?: string }>,
+  apsRendererSupported: boolean
+) {
   // Build a lookup from impid (adUnitCode) → original bidRequest
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const requestsByCode = new Map<string, any>();
+  const requestsByCode = new Map<string, (typeof bidRequests)[number]>();
   for (const br of bidRequests) {
     const code = br.adUnitCode ?? br.code ?? '';
     if (!requestsByCode.has(code)) {
@@ -194,23 +479,43 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
     }
   }
 
-  return auctionBids.map((bid) => {
+  return auctionBids.flatMap((bid) => {
+    // A renderer bid cannot be delivered safely without Prebid's public
+    // lifecycle API. Ordinary Trusted Server bids remain eligible.
+    if (bid.renderer && !apsRendererSupported) {
+      return [];
+    }
+
+    // Prebid admission is the last point before the descriptor becomes a bid
+    // capability. Drop malformed APS bids rather than letting them participate
+    // in the auction without a render path.
+    const renderer = bid.renderer ? validateApsRenderer(bid.renderer) : undefined;
+    if (bid.renderer && !renderer) {
+      log.warn(`[tsjs-prebid] dropped invalid APS renderer bid for '${bid.impid}'`);
+      return [];
+    }
+
     const origReq = requestsByCode.get(bid.impid);
-    return {
-      requestId: origReq?.bidId ?? bid.impid,
-      cpm: bid.price,
-      width: bid.width,
-      height: bid.height,
-      ad: bid.adm,
-      ttl: 300,
-      creativeId: bid.creativeId,
-      netRevenue: true,
-      currency: 'USD',
-      bidderCode: bid.seat,
-      meta: {
-        advertiserDomains: bid.adomain,
+    return [
+      {
+        requestId: origReq?.bidId ?? bid.impid,
+        cpm: bid.price,
+        width: bid.width,
+        height: bid.height,
+        ad: renderer ? '' : bid.adm,
+        ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
+        ttl: 300,
+        creativeId: bid.creativeId,
+        netRevenue: true,
+        currency: 'USD',
+        bidderCode: bid.seat,
+        meta: {
+          advertiserDomains: bid.adomain,
+          // Second descriptor carrier. See APS_RENDERER_FIELD for the rationale.
+          ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
+        },
       },
-    };
+    ];
   });
 }
 
@@ -219,6 +524,428 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
 // ---------------------------------------------------------------------------
 
 type PbjsConfig = Parameters<typeof pbjs.setConfig>[0];
+type PrebidGetConfig = (key?: string) => unknown;
+type ManagedTcfConsentActivation = { acceptCmpEvents: boolean };
+type TcfApi = (
+  command: string,
+  version: number,
+  callback: ((result: unknown, success: boolean) => void) | undefined,
+  parameter?: unknown
+) => unknown;
+
+/**
+ * Consent namespaces that select Prebid's namespaced `consentManagement` shape.
+ *
+ * `modules/consentManagementTcf.ts` reads the TCF configuration as
+ * `config.gdpr || config.usp || config.gpp ? config.gdpr : config`, so a
+ * truthy value under any of these keys switches Prebid from the legacy
+ * top-level shape to the namespaced one.
+ */
+const CONSENT_MANAGEMENT_NAMESPACES = ['gdpr', 'usp', 'gpp'] as const;
+
+/**
+ * Reports whether Prebid would read `consentManagement` as a legacy top-level
+ * TCF configuration, such as `{ cmpApi: 'static', consentData: ... }`.
+ *
+ * Appending a `gdpr` namespace to such an object flips Prebid to the
+ * namespaced shape and silently discards every legacy key the publisher set.
+ */
+function isLegacyTcfConsentManagement(consentManagement: unknown): boolean {
+  return (
+    isRecord(consentManagement) &&
+    !hasNamespacedConsentManagement(consentManagement) &&
+    Object.keys(consentManagement).length > 0
+  );
+}
+
+/**
+ * Reports whether `consentManagement` carries a truthy own consent namespace.
+ *
+ * Own-property probing is deliberate: a configuration object whose descriptors
+ * cannot be read is one this shim must not rewrite, and letting the throw
+ * propagate keeps the caller's fail-safe path in charge.
+ */
+function hasNamespacedConsentManagement(consentManagement: Record<string, unknown>): boolean {
+  return CONSENT_MANAGEMENT_NAMESPACES.some(
+    (namespace) =>
+      Object.prototype.hasOwnProperty.call(consentManagement, namespace) &&
+      Boolean(consentManagement[namespace])
+  );
+}
+
+/**
+ * Reports whether a `consentManagement` value is a publisher-owned TCF
+ * configuration that the automatic managed-ID activation must not touch.
+ *
+ * Recognizing only an own `gdpr` property would miss the legacy shape, so this
+ * mirrors Prebid's own selection rule instead.
+ */
+function publisherOwnsTcfConsentManagement(consentManagement: unknown): boolean {
+  if (!isRecord(consentManagement)) {
+    // An unreadable value is still a publisher decision; `undefined` alone
+    // means nothing is configured.
+    return consentManagement !== undefined;
+  }
+  if (hasNamespacedConsentManagement(consentManagement)) {
+    return Boolean(consentManagement.gdpr);
+  }
+  return Object.keys(consentManagement).length > 0;
+}
+
+/**
+ * Watches `window.__tcfapi` for a CMP that installs itself after this shim runs.
+ *
+ * TCF activation is a one-time read, so an asynchronous CMP that appears later
+ * would leave managed User ID modules seeded with Prebid's GDPR handler
+ * disabled — the module fires its vendor request with no TCF parameters and no
+ * later reconfiguration can recall it. Watching the property lets managed-ID
+ * seeding wait until CMP discovery resolves.
+ *
+ * Returns a settle function that restores the plain property and reports
+ * discovery, or `undefined` when the property cannot be watched.
+ */
+function watchForLateTcfApi(onDiscovered: () => void): (() => void) | undefined {
+  if (typeof window === 'undefined') return undefined;
+
+  const tcfWindow = window as Window & { __tcfapi?: unknown };
+  // The accessor pair below starts with no stored value, so installing it over
+  // a CMP that is already present would hide that CMP from every later reader.
+  // Discovery has already resolved in that case; there is nothing to watch for.
+  if (typeof tcfWindow.__tcfapi === 'function') return undefined;
+  let stored: unknown;
+  let settled = false;
+  const read = () => stored;
+
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    try {
+      // A CMP that redefined the property outright owns it now; leave it be.
+      if (Object.getOwnPropertyDescriptor(tcfWindow, '__tcfapi')?.get === read) {
+        if (stored === undefined) {
+          delete tcfWindow.__tcfapi;
+        } else {
+          Object.defineProperty(tcfWindow, '__tcfapi', {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value: stored,
+          });
+        }
+      }
+    } catch (error) {
+      log.error('[tsjs-prebid] watched window.__tcfapi could not be restored', error);
+    }
+    onDiscovered();
+  };
+
+  try {
+    Object.defineProperty(tcfWindow, '__tcfapi', {
+      configurable: true,
+      enumerable: true,
+      get: read,
+      set: (value: unknown) => {
+        stored = value;
+        if (typeof value === 'function') settle();
+      },
+    });
+  } catch (error) {
+    log.error('[tsjs-prebid] window.__tcfapi could not be watched for a late CMP', error);
+    return undefined;
+  }
+
+  return settle;
+}
+
+/** TCF v2 event statuses that report a settled consent decision. */
+const TERMINAL_TCF_EVENT_STATUSES = ['tcloaded', 'useractioncomplete'];
+
+/**
+ * Reports whether a TCF event payload settles GDPR applicability for this page.
+ *
+ * `cmpuishown` and a missing status both mean the CMP is still deciding. Only
+ * an out-of-scope result or a loaded/completed consent string is terminal.
+ */
+function isTerminalTcfResult(result: unknown): boolean {
+  if (!isRecord(result)) return false;
+  if (result.gdprApplies === false) return true;
+  return (
+    typeof result.eventStatus === 'string' &&
+    TERMINAL_TCF_EVENT_STATUSES.includes(result.eventStatus)
+  );
+}
+
+/** Handle over one outstanding terminal-consent subscription. */
+interface TerminalTcfConsentWatch {
+  /** The `__tcfapi` function this subscription was actually made against. */
+  tcfApi: unknown;
+  /** Whether the CMP has answered this subscription at least once. */
+  hasAnswered: () => boolean;
+  /** Removes the subscription. */
+  retire: () => void;
+}
+
+/**
+ * Waits for the CMP to settle GDPR applicability and consent, then reports once.
+ *
+ * A callable `__tcfapi` is not a consent decision. Prebid's GDPR handler times
+ * out after its default ten seconds and then proceeds with null consent and
+ * `gdprApplies: false`, which is indistinguishable from a user outside GDPR
+ * scope — an operator-managed User ID module seeded on that result would call
+ * its vendor and write storage with no jurisdiction or consent behind it.
+ * Automatic TCF activation is Trusted Server's own configuration, so it fails
+ * closed here and managed seeding waits for a terminal result. A publisher's
+ * own GDPR configuration keeps Prebid's timeout semantics untouched.
+ *
+ * Returns a handle over the subscription, or `undefined` when no subscription
+ * could be made. Retiring before the CMP has answered cannot send the removal
+ * yet — the listener id arrives only with a callback — so the subscription is
+ * removed on the CMP's first event instead.
+ */
+function awaitTerminalTcfConsent(
+  onSettled: () => void,
+  onRefused: () => void
+): TerminalTcfConsentWatch | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const tcfApi = (window as { __tcfapi?: unknown }).__tcfapi;
+  if (typeof tcfApi !== 'function') return undefined;
+
+  let settled = false;
+  let retired = false;
+  let answered = false;
+  let listenerId: unknown;
+
+  const removeListener = () => {
+    if (listenerId === undefined || listenerId === null) return;
+    const pendingId = listenerId;
+    listenerId = undefined;
+    try {
+      // Listener ids belong to the API that accepted the subscription. A
+      // replacement may use the same id for an unrelated consumer. Keep using
+      // the original API, including when a retired listener answers late;
+      // bootstrap stubs must forward cleanup to their own backing CMP.
+      (tcfApi as TcfApi).call(window, 'removeEventListener', 2, () => {}, pendingId);
+    } catch (error) {
+      log.error('[tsjs-prebid] terminal TCF consent listener could not be removed', error);
+    }
+  };
+
+  const onCmpEvent = (result: unknown, success: boolean) => {
+    // Any callback at all, terminal or not, proves this CMP is reachable and
+    // still answering on this subscription.
+    answered = true;
+    // Capture the id before any early return. It only ever arrives with a
+    // callback, and without it the subscription can never be removed — so a
+    // retirement that happened before the CMP first answered has to wait for
+    // this moment to do the real removal.
+    if (isRecord(result)) listenerId = result.listenerId;
+    if (retired) {
+      removeListener();
+      return;
+    }
+    if (settled) return;
+    if (success === false) {
+      // A refusal is not an absence of GDPR, so managed IDs stay deferred. It
+      // is not final either: report it so a later call can subscribe again.
+      log.warn('[tsjs-prebid] CMP rejected the TCF consent subscription; managed IDs deferred');
+      onRefused();
+      return;
+    }
+    if (!isTerminalTcfResult(result)) return;
+    settled = true;
+    removeListener();
+    onSettled();
+  };
+
+  try {
+    (tcfApi as TcfApi).call(window, 'addEventListener', 2, onCmpEvent);
+  } catch (error) {
+    log.error('[tsjs-prebid] CMP consent result could not be awaited', error);
+    return undefined;
+  }
+
+  return {
+    tcfApi,
+    hasAnswered: () => answered,
+    retire: () => {
+      retired = true;
+      settled = true;
+      removeListener();
+    },
+  };
+}
+
+function activateManagedUserIdTcfConsent(
+  managedUserIds: InjectedManagedUserId[] | undefined,
+  setConfig: typeof pbjs.setConfig,
+  getConfig: PrebidGetConfig | undefined
+): ManagedTcfConsentActivation | undefined {
+  const tcfApi =
+    typeof window === 'undefined' ? undefined : (window as { __tcfapi?: unknown }).__tcfapi;
+  if (
+    !managedUserIds?.length ||
+    typeof window === 'undefined' ||
+    typeof tcfApi !== 'function' ||
+    typeof getConfig !== 'function'
+  ) {
+    return undefined;
+  }
+
+  let effectiveConsentManagement: unknown;
+  try {
+    effectiveConsentManagement = getConfig.call(pbjs, 'consentManagement');
+  } catch (error) {
+    log.error('[tsjs-prebid] effective consentManagement configuration could not be read', error);
+    return undefined;
+  }
+
+  if (effectiveConsentManagement !== undefined && !isRecord(effectiveConsentManagement)) {
+    log.error('[tsjs-prebid] effective consentManagement configuration is not mergeable');
+    return undefined;
+  }
+
+  const activation: ManagedTcfConsentActivation = { acceptCmpEvents: true };
+  try {
+    const effectiveConsent = effectiveConsentManagement ?? {};
+    if (publisherOwnsTcfConsentManagement(effectiveConsentManagement)) {
+      return undefined;
+    }
+
+    const originalTcfApi = tcfApi as TcfApi;
+    // Prebid owns the callback once it subscribes. Guard only the subscription
+    // created by this automatic activation so a delayed first CMP response
+    // cannot overwrite consent after publisher ownership transfers.
+    const guardedTcfApi: TcfApi = function (command, version, callback, parameter) {
+      if (command !== 'addEventListener' || typeof callback !== 'function') {
+        return originalTcfApi.call(window, command, version, callback, parameter);
+      }
+
+      const guardedCallback = (result: unknown, success: boolean) => {
+        if (activation.acceptCmpEvents) {
+          callback(result, success);
+          return;
+        }
+
+        try {
+          const listenerId = isRecord(result) ? result.listenerId : undefined;
+          if (listenerId !== undefined && listenerId !== null) {
+            // Cleanup belongs to the API that accepted this subscription,
+            // even if another CMP now occupies the global with its own ids.
+            originalTcfApi.call(window, 'removeEventListener', version, () => {}, listenerId);
+          }
+        } catch (error) {
+          log.error(
+            '[tsjs-prebid] stale automatic IAB consent listener could not be removed',
+            error
+          );
+        }
+      };
+
+      return originalTcfApi.call(window, command, version, guardedCallback, parameter);
+    };
+
+    const tcfWindow = window as typeof window & { __tcfapi: TcfApi };
+    tcfWindow.__tcfapi = guardedTcfApi;
+    try {
+      setConfig({
+        consentManagement: {
+          ...effectiveConsent,
+          gdpr: { cmpApi: 'iab' },
+        },
+      } as PbjsConfig);
+    } finally {
+      if (tcfWindow.__tcfapi === guardedTcfApi) tcfWindow.__tcfapi = originalTcfApi;
+    }
+  } catch (error) {
+    activation.acceptCmpEvents = false;
+    log.error(
+      '[tsjs-prebid] effective consentManagement configuration could not be inspected',
+      error
+    );
+    return undefined;
+  }
+
+  return activation;
+}
+
+function publisherClaimsGdprOwnership(publisherConfig: PbjsConfig): boolean {
+  if (
+    !isRecord(publisherConfig) ||
+    !Object.prototype.hasOwnProperty.call(publisherConfig, 'consentManagement')
+  ) {
+    return false;
+  }
+
+  const consentManagement = publisherConfig.consentManagement;
+  if (consentManagement === undefined) {
+    // Clearing `consentManagement` outright is a publisher decision too.
+    return true;
+  }
+  return publisherOwnsTcfConsentManagement(consentManagement);
+}
+
+/**
+ * Removes the automatic `consentManagement.gdpr` namespace from Prebid's
+ * effective configuration.
+ *
+ * `mergeConfig` deep-merges onto the current configuration, so retiring the
+ * automatic activation with `gdpr: { enabled: false }` would survive a
+ * publisher merge that uses the legacy top-level TCF shape and leave Prebid's
+ * TCF module disabled. `setConfig` replaces a topic outright, which is the only
+ * way to drop the key again.
+ */
+function removeAutomaticGdprNamespace(
+  setConfig: typeof pbjs.setConfig,
+  getConfig: PrebidGetConfig | undefined
+): void {
+  if (typeof getConfig !== 'function') return;
+
+  let effectiveConsentManagement: unknown;
+  try {
+    effectiveConsentManagement = getConfig.call(pbjs, 'consentManagement');
+  } catch (error) {
+    log.error('[tsjs-prebid] effective consentManagement configuration could not be read', error);
+    return;
+  }
+
+  if (
+    !isRecord(effectiveConsentManagement) ||
+    !Object.prototype.hasOwnProperty.call(effectiveConsentManagement, 'gdpr')
+  ) {
+    return;
+  }
+
+  const withoutGdpr: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(effectiveConsentManagement)) {
+    if (key !== 'gdpr') withoutGdpr[key] = entry;
+  }
+
+  try {
+    setConfig({ consentManagement: withoutGdpr } as PbjsConfig);
+  } catch (error) {
+    log.error('[tsjs-prebid] automatic IAB consent namespace could not be removed', error);
+  }
+}
+
+function enableMergedPublisherGdpr(publisherConfig: PbjsConfig): PbjsConfig {
+  if (!isRecord(publisherConfig)) return publisherConfig;
+
+  const consentManagement = publisherConfig.consentManagement;
+  if (!isRecord(consentManagement)) return publisherConfig;
+
+  const gdpr = consentManagement.gdpr;
+  if (!isRecord(gdpr) || gdpr.enabled !== undefined) {
+    return publisherConfig;
+  }
+
+  return {
+    ...publisherConfig,
+    consentManagement: {
+      ...consentManagement,
+      gdpr: { ...gdpr, enabled: true },
+    },
+  } as PbjsConfig;
+}
 
 type TrustedServerBid = { bidder?: string; params?: Record<string, unknown> };
 type BannerSize = [number, number];
@@ -228,6 +955,46 @@ type TrustedServerAdUnit = {
   mediaTypes?: { banner?: TrustedServerBanner };
   bids?: TrustedServerBid[];
 };
+type ClientSideBidSnapshot = { bidder: string; params: Record<string, unknown> };
+type PublisherAdUnitSnapshot = {
+  storedRequest?: unknown;
+  bidderParams: Record<string, Record<string, unknown>>;
+  clientSideBids: ClientSideBidSnapshot[];
+  zone?: string;
+};
+type PendingPublisherBid = {
+  adUnitCode: string;
+  expiresAt: number;
+  registrationId: number;
+  generation: number;
+  element: HTMLElement;
+  retainUntilContextChange: boolean;
+  firstImpressionToken?: string;
+};
+type PendingPublisherCode = {
+  adUnitCode: string;
+  expiresAt: number;
+  registrationId: number;
+  generation: number;
+  element: HTMLElement;
+  retainUntilContextChange: boolean;
+  firstImpressionToken?: string;
+  pendingDeliveryCount?: number;
+};
+type RemoveAdUnit = (adUnitCode?: string | string[]) => unknown;
+type PrebidWithRemoveAdUnit = {
+  removeAdUnit?: RemoveAdUnit;
+  __tsRemoveAdUnitWrapped?: boolean;
+};
+
+let publisherAdUnitSnapshots = new Map<string, PublisherAdUnitSnapshot>();
+let pendingPublisherBids = new Map<string, PendingPublisherBid>();
+let pendingPublisherCodes = new Map<string, Map<number, PendingPublisherCode>>();
+let pendingPublisherRegistrationId = 0;
+let activePublisherRegistrationId: number | undefined;
+let activePublisherFirstImpressionTokens: Map<string, string> | undefined;
+let publisherFirstImpressionTokens = new Map<string, Set<string>>();
+let syntheticRefreshAdUnits = new WeakSet<TrustedServerAdUnit>();
 type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
@@ -249,10 +1016,57 @@ type PrebidUserIdEid = {
 
 type RefreshGptSlot = {
   getSlotElementId?: () => string;
+  getAdUnitPath?: () => string;
   getTargeting?: (key: string) => string[];
+  setTargeting?: (key: string, value: string | string[]) => RefreshGptSlot;
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
 };
+
+function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordPrebidRefresh(slots);
+  } catch {
+    // Diagnostics must not suppress the GAM request.
+  }
+}
+
+function dispatchPrebidRefresh<T>(
+  refresh: (slots?: unknown[], opts?: unknown) => T,
+  slots: unknown[] | undefined,
+  opts: unknown
+): T {
+  let tsjs: TsjsApi | undefined;
+  let hadOwnContext = false;
+  let previousContext: boolean | undefined;
+  let shouldRestoreContext = false;
+  try {
+    tsjs = window.tsjs;
+    if (tsjs) {
+      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      previousContext = tsjs.prebidRefreshDispatchInProgress;
+      shouldRestoreContext = true;
+      tsjs.prebidRefreshDispatchInProgress = true;
+    }
+  } catch {
+    // Diagnostics context must not affect refresh delegation.
+  }
+  try {
+    return refresh(slots, opts);
+  } finally {
+    if (shouldRestoreContext && tsjs) {
+      try {
+        if (hadOwnContext) {
+          tsjs.prebidRefreshDispatchInProgress = previousContext;
+        } else {
+          delete tsjs.prebidRefreshDispatchInProgress;
+        }
+      } catch {
+        // Diagnostics context restoration must not mask a refresh result or throw.
+      }
+    }
+  }
+}
 
 const DEFAULT_REFRESH_SIZES: BannerSize[] = [
   [728, 90],
@@ -274,7 +1088,7 @@ function sanitizeAuctionUid(uid: {
     typeof uid.atype === 'number' &&
     Number.isInteger(uid.atype) &&
     uid.atype >= 0 &&
-    uid.atype <= 255
+    uid.atype <= MAX_OPENRTB_ATYPE
   ) {
     sanitizedUid.atype = uid.atype;
   }
@@ -329,6 +1143,15 @@ function refreshSlotElementId(slot: RefreshGptSlot): string | undefined {
   return elementId && elementId.length > 0 ? elementId : undefined;
 }
 
+function refreshSlotAdUnitPath(slot: RefreshGptSlot): string | undefined {
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return typeof adUnitPath === 'string' && adUnitPath.length > 0 ? adUnitPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefined {
   const elementId = refreshSlotElementId(slot);
   if (!elementId) {
@@ -354,8 +1177,34 @@ function firstTargetingValue(values: string[] | undefined): string | undefined {
   return values?.find((value) => value.length > 0);
 }
 
+/** Store a snapshot and evict the least-recently used entry when capacity is exceeded. */
+function storePublisherAdUnitSnapshot(code: string, snapshot: PublisherAdUnitSnapshot): void {
+  publisherAdUnitSnapshots.delete(code);
+  publisherAdUnitSnapshots.set(code, snapshot);
+
+  if (publisherAdUnitSnapshots.size > MAX_PUBLISHER_AD_UNIT_SNAPSHOTS) {
+    const oldestCode = publisherAdUnitSnapshots.keys().next().value;
+    if (oldestCode !== undefined) publisherAdUnitSnapshots.delete(oldestCode);
+  }
+}
+
+/** Find and touch a request-scoped publisher snapshot by candidate code. */
+function findRefreshSnapshot(
+  candidateCodes: Array<string | undefined>
+): PublisherAdUnitSnapshot | undefined {
+  for (const code of candidateCodes) {
+    if (!code) continue;
+    const snapshot = publisherAdUnitSnapshots.get(code);
+    if (!snapshot) continue;
+    publisherAdUnitSnapshots.delete(code);
+    publisherAdUnitSnapshots.set(code, snapshot);
+    return snapshot;
+  }
+  return undefined;
+}
+
 /**
- * Find the publisher's original `pbjs.adUnits` entry for a refreshing slot.
+ * Find the publisher's live `pbjs.adUnits` entry for a refreshing slot.
  *
  * A TS-owned GPT slot may be defined on `${div_id}-container`, so the GPT
  * element id used as the synthetic refresh ad unit code can differ from the
@@ -375,33 +1224,139 @@ function findRefreshAdUnit(
   return undefined;
 }
 
+/** Deep-copy plain publisher params while preserving cycles and non-plain values. */
+function copyParamValue(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+  if (Array.isArray(value)) {
+    const existing = seen.get(value);
+    if (existing) return existing;
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    value.forEach((entry) => copy.push(copyParamValue(entry, seen)));
+    return copy;
+  }
+
+  if (value && typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return value;
+
+    const existing = seen.get(value);
+    if (existing) return existing;
+    const copy = Object.create(prototype) as Record<string, unknown>;
+    seen.set(value, copy);
+    for (const [key, entry] of Object.entries(value)) {
+      Object.defineProperty(copy, key, {
+        value: copyParamValue(entry, seen),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return copy;
+  }
+
+  return value;
+}
+
+function copyParams(params: Record<string, unknown> | undefined): Record<string, unknown> {
+  return copyParamValue(params ?? {}) as Record<string, unknown>;
+}
+
+/** Copy only plan-owned bidder params previously folded into a `trustedServer` bid. */
+function foldedBidderParams(
+  bid: TrustedServerBid | undefined,
+  serverSideBidders: Set<string>
+): Record<string, Record<string, unknown>> {
+  const folded = (bid?.params?.[BIDDER_PARAMS_KEY] ?? {}) as Record<
+    string,
+    Record<string, unknown>
+  >;
+  return Object.fromEntries(
+    Object.entries(folded)
+      .filter(([bidder]) => serverSideBidders.has(bidder))
+      .map(([bidder, params]) => [bidder, copyParams(params)])
+  );
+}
+
+/** Preserve authored presence and values, including invalid values for server validation. */
+function storedRequestParams(bid: TrustedServerBid | undefined): { storedRequest?: unknown } {
+  if (!bid) return { storedRequest: false };
+  return Object.prototype.hasOwnProperty.call(bid.params ?? {}, STORED_REQUEST_KEY)
+    ? { storedRequest: copyParamValue(bid.params?.[STORED_REQUEST_KEY]) }
+    : {};
+}
+
+/** Capture immutable request-scoped demand and zone data before the shim mutates an ad unit. */
+function capturePublisherAdUnitSnapshot(
+  unit: TrustedServerAdUnit,
+  serverSideBidders: Set<string>
+): PublisherAdUnitSnapshot | undefined {
+  if (typeof unit.code !== 'string' || unit.code.length === 0) return undefined;
+
+  const rawBidderParams = Object.create(null) as Record<string, Record<string, unknown>>;
+  const clientSideBids: ClientSideBidSnapshot[] = [];
+  let existingTsBid: TrustedServerBid | undefined;
+
+  const bids = Array.isArray(unit.bids) ? unit.bids : [];
+  for (const bid of bids) {
+    if (!bid?.bidder) continue;
+    if (bid.bidder === ADAPTER_CODE) {
+      existingTsBid ??= bid;
+      continue;
+    }
+    if (!serverSideBidders.has(bid.bidder)) {
+      clientSideBids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
+      continue;
+    }
+    rawBidderParams[bid.bidder] = copyParams(bid.params);
+  }
+
+  const bidderParams =
+    Object.keys(rawBidderParams).length > 0
+      ? rawBidderParams
+      : foldedBidderParams(existingTsBid, serverSideBidders);
+  const zone = unit.mediaTypes?.banner?.name;
+
+  return {
+    ...storedRequestParams(existingTsBid),
+    bidderParams,
+    clientSideBids,
+    ...(zone ? { zone } : {}),
+  };
+}
+
 /**
- * Collect the configured client-side bidder entries for a refreshing slot.
+ * Collect browser-owned bidder entries for a refreshing slot.
  *
  * Synthetic refresh ad units carry only the `trustedServer` bid. The
- * `requestBids` shim preserves a client-side bidder only when its bid entry is
- * already present on the ad unit, so without re-attaching them here publishers
- * that split demand between server-side and native Prebid adapters would lose
- * all client-side demand on refresh/scroll impressions. Bids are sourced from
- * the matching `pbjs.adUnits` entry (by candidate ad unit code) so the
- * publisher's configured params are preserved.
+ * `requestBids` shim preserves every bidder not owned by the server plan when
+ * its bid entry is already present on the ad unit, so re-attach those bidders
+ * here. A live exact `pbjs.adUnits` match is authoritative; request-scoped
+ * snapshots are used only when no live unit exists.
  */
 function clientSideBidsForRefresh(
   candidateCodes: Array<string | undefined>
 ): Array<{ bidder: string; params: Record<string, unknown> }> {
-  const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
-  if (clientSideBidders.size === 0) return [];
-
+  const serverSideBidders = new Set(injectedServerSideBidderCodes());
   const match = findRefreshAdUnit(candidateCodes);
-  if (!match?.bids) return [];
+  if (match) {
+    if (!Array.isArray(match.bids)) return [];
 
-  const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
-  for (const bid of match.bids) {
-    if (bid?.bidder && clientSideBidders.has(bid.bidder)) {
-      bids.push({ bidder: bid.bidder, params: bid.params ?? {} });
+    const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
+    for (const bid of match.bids) {
+      if (bid?.bidder && bid.bidder !== ADAPTER_CODE && !serverSideBidders.has(bid.bidder)) {
+        bids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
+      }
     }
+    return bids;
   }
-  return bids;
+
+  const snapshot = findRefreshSnapshot(candidateCodes);
+  return (
+    snapshot?.clientSideBids.map((bid) => ({
+      bidder: bid.bidder,
+      params: copyParams(bid.params),
+    })) ?? []
+  );
 }
 
 /**
@@ -410,42 +1365,94 @@ function clientSideBidsForRefresh(
  * The synthetic refresh ad unit carries only the `trustedServer` bid, so the
  * `requestBids` shim has no original server-side bidder entries to collect into
  * `bidderParams` — without this, refresh/scroll `/auction` requests send `{}`
- * and lose demand the publisher configured only on the initial ad unit. Source
- * the params from the matching `pbjs.adUnits` entry by candidate code, covering
- * both states the initial auction can leave that entry in:
- *   - raw server-side bidder entries (`{ bidder, params }`) not yet folded, and
- *   - params already folded into that unit's `trustedServer` bid `bidderParams`
- *     by a prior `requestBids` call.
+ * and lose demand the publisher configured only on the initial ad unit. A live
+ * exact `pbjs.adUnits` match is authoritative and covers both raw bidder entries
+ * and params already folded into a `trustedServer` bid. A request-scoped
+ * snapshot is used only when no live unit exists.
  */
 function serverSideBidderParamsForRefresh(
   candidateCodes: Array<string | undefined>
 ): Record<string, Record<string, unknown>> {
   const match = findRefreshAdUnit(candidateCodes);
-  if (!match?.bids) return {};
+  if (match) {
+    if (!Array.isArray(match.bids)) return {};
 
-  const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
-  const params: Record<string, Record<string, unknown>> = {};
+    const serverSideBidders = new Set(injectedServerSideBidderCodes());
+    const params = Object.create(null) as Record<string, Record<string, unknown>>;
 
-  for (const bid of match.bids) {
-    if (!bid?.bidder) continue;
-    if (bid.bidder === ADAPTER_CODE) {
-      // Params captured and folded onto the trustedServer bid by an earlier
-      // requestBids call.
-      const folded = (bid.params?.[BIDDER_PARAMS_KEY] ?? {}) as Record<
-        string,
-        Record<string, unknown>
-      >;
-      for (const [bidder, bidderParams] of Object.entries(folded)) {
-        params[bidder] = bidderParams;
+    for (const bid of match.bids) {
+      if (!bid?.bidder) continue;
+      if (bid.bidder === ADAPTER_CODE) {
+        Object.assign(params, foldedBidderParams(bid, serverSideBidders));
+        continue;
       }
-      continue;
+      if (!serverSideBidders.has(bid.bidder)) continue;
+      params[bid.bidder] = copyParams(bid.params);
     }
-    if (clientSideBidders.has(bid.bidder)) continue;
-    // Raw server-side bidder entry not yet folded by the shim.
-    params[bid.bidder] = bid.params ?? {};
+
+    return params;
   }
 
-  return params;
+  const snapshot = findRefreshSnapshot(candidateCodes);
+  return snapshot
+    ? Object.fromEntries(
+        Object.entries(snapshot.bidderParams).map(([bidder, params]) => [
+          bidder,
+          copyParams(params),
+        ])
+      )
+    : {};
+}
+
+/** Use the same live-unit authority and snapshot fallback as refresh bidder params. */
+function storedRequestParamsForRefresh(candidateCodes: Array<string | undefined>): {
+  storedRequest?: unknown;
+} {
+  const match = findRefreshAdUnit(candidateCodes);
+  if (match) {
+    const bid = Array.isArray(match.bids)
+      ? match.bids.find((bid) => bid?.bidder === ADAPTER_CODE)
+      : undefined;
+    return storedRequestParams(bid);
+  }
+  const snapshot = findRefreshSnapshot(candidateCodes);
+  if (!snapshot) return { storedRequest: false };
+  return Object.prototype.hasOwnProperty.call(snapshot, STORED_REQUEST_KEY)
+    ? { storedRequest: copyParamValue(snapshot[STORED_REQUEST_KEY]) }
+    : {};
+}
+
+/** Return a live publisher zone, falling back to a request-scoped snapshot. */
+function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): string | undefined {
+  const match = findRefreshAdUnit(candidateCodes);
+  return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
+}
+
+function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
+  return typeof suffix === 'string' && suffix.startsWith('/') && suffix.length > 1;
+}
+
+function refreshAuctionExclusionSuffixes(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isUsableRefreshAuctionExclusionSuffix) : [];
+}
+
+function isExcludedFromRefreshAuction(
+  slot: RefreshGptSlot,
+  excludedGamAdUnitPathSuffixes: readonly string[]
+): boolean {
+  if (excludedGamAdUnitPathSuffixes.length === 0) return false;
+
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return (
+      typeof adUnitPath === 'string' &&
+      excludedGamAdUnitPathSuffixes.some((suffix) => adUnitPath.endsWith(suffix))
+    );
+  } catch {
+    // GPT path metadata is optional for this optimization. If it is unavailable,
+    // preserve normal refresh-auction behavior rather than suppressing demand.
+    return false;
+  }
 }
 
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
@@ -453,6 +1460,431 @@ function clearRefreshTargeting(slot: RefreshGptSlot): void {
 
   for (const key of TS_REFRESH_TARGETING_KEYS) {
     slot.clearTargeting(key);
+  }
+}
+
+function restoreTrustedServerFirstImpressionTargeting(slot: RefreshGptSlot): void {
+  const ts = window.tsjs;
+  const injectedSlot = findInjectedSlotForRefresh(slot);
+  const element = [refreshSlotElementId(slot), injectedSlot?.div_id]
+    .filter((elementId): elementId is string => Boolean(elementId))
+    .map((elementId) => document.getElementById(elementId))
+    .find((candidate): candidate is HTMLElement =>
+      Boolean(candidate && ts && firstImpressionClaim(ts, candidate)?.owner === 'trusted_server')
+    );
+  const claim = ts && element ? firstImpressionClaim(ts, element) : undefined;
+  // After settlement, a legitimate refresh may already have newer targeting.
+  // Deny the losing request without restoring the initial snapshot over it.
+  // Clearing is unsafe for the same reason: this wrapper cannot distinguish
+  // losing targeting writes from targeting belonging to a newer delivery.
+  if (
+    claim?.owner !== 'trusted_server' ||
+    claim.phase === 'rendered' ||
+    !claim.targeting ||
+    !slot.setTargeting
+  )
+    return;
+  clearRefreshTargeting(slot);
+  for (const [key, value] of Object.entries(claim.targeting)) slot.setTargeting(key, value);
+}
+
+/** Track a first-impression token until its exact auction is consumed or abandoned. */
+function trackPublisherFirstImpressionToken(adUnitCode: string, token: string): void {
+  const tokens = publisherFirstImpressionTokens.get(adUnitCode) ?? new Set<string>();
+  tokens.add(token);
+  publisherFirstImpressionTokens.set(adUnitCode, tokens);
+}
+
+function forgetPublisherFirstImpressionToken(adUnitCode: string, token?: string): void {
+  const tokens = publisherFirstImpressionTokens.get(adUnitCode);
+  if (!tokens) return;
+  if (token === undefined) {
+    if (window.tsjs) {
+      for (const current of tokens) releasePublisherFirstImpressionAuction(window.tsjs, current);
+    }
+    publisherFirstImpressionTokens.delete(adUnitCode);
+    return;
+  }
+  tokens.delete(token);
+  if (tokens.size === 0) publisherFirstImpressionTokens.delete(adUnitCode);
+}
+
+/** Remove pending delivery state for an ad unit, optionally from one registration only. */
+function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: number): void {
+  const registrations = pendingPublisherCodes.get(adUnitCode);
+  if (registrations) {
+    if (registrationId === undefined) {
+      pendingPublisherCodes.delete(adUnitCode);
+    } else {
+      const pending = registrations.get(registrationId);
+      if (!pending?.retainUntilContextChange) registrations.delete(registrationId);
+      if (registrations.size === 0) pendingPublisherCodes.delete(adUnitCode);
+    }
+  }
+
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (
+      pendingBid.adUnitCode === adUnitCode &&
+      (registrationId === undefined || pendingBid.registrationId === registrationId) &&
+      (registrationId === undefined || !pendingBid.retainUntilContextChange)
+    ) {
+      pendingPublisherBids.delete(adId);
+      if (pendingBid.firstImpressionToken) {
+        forgetPublisherFirstImpressionToken(adUnitCode, pendingBid.firstImpressionToken);
+      }
+    }
+  }
+}
+
+function removeConsumedPublisherRegistration(
+  adUnitCode: string,
+  registrationId: number,
+  pendingBid?: PendingPublisherBid
+): void {
+  const registrations = pendingPublisherCodes.get(adUnitCode);
+  const pendingCode = pendingBid?.firstImpressionToken
+    ? [...(registrations?.values() ?? [])].find(
+        (pending) =>
+          pending.firstImpressionToken === pendingBid.firstImpressionToken &&
+          pending.element === pendingBid.element &&
+          pending.generation === pendingBid.generation
+      )
+    : registrations?.get(registrationId);
+  if (pendingCode?.pendingDeliveryCount !== undefined) {
+    // Only an exact bid correlation accounts for one entire registration.
+    // Unknown or repeated deliveries must not drain a shared denial.
+    if (pendingBid) pendingCode.pendingDeliveryCount -= 1;
+    if (pendingCode.pendingDeliveryCount === 0) registrations?.delete(pendingCode.registrationId);
+  } else {
+    registrations?.delete(registrationId);
+  }
+  if (registrations?.size === 0) pendingPublisherCodes.delete(adUnitCode);
+
+  const tokens = new Set<string>();
+  if (pendingCode?.firstImpressionToken) tokens.add(pendingCode.firstImpressionToken);
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (pendingBid.adUnitCode !== adUnitCode || pendingBid.registrationId !== registrationId) {
+      continue;
+    }
+    pendingPublisherBids.delete(adId);
+    if (pendingBid.firstImpressionToken) tokens.add(pendingBid.firstImpressionToken);
+  }
+  for (const token of tokens) forgetPublisherFirstImpressionToken(adUnitCode, token);
+}
+
+function pendingPublisherContextIsCurrent(
+  pending: PendingPublisherBid | PendingPublisherCode
+): boolean {
+  return (
+    pending.generation === (window.tsjs?.navGeneration ?? 0) &&
+    pending.element.isConnected &&
+    document.getElementById(pending.element.id) === pending.element
+  );
+}
+
+function resolvePublisherDeliveryElement(adUnitCode: string): HTMLElement | undefined {
+  const matches = new Set<HTMLElement>();
+  const direct = resolveFirstImpressionElement(adUnitCode);
+  if (direct) matches.add(direct);
+
+  const gpt = (
+    window as unknown as {
+      googletag?: { pubads?(): { getSlots?(): RefreshGptSlot[] } };
+    }
+  ).googletag;
+  for (const slot of gpt?.pubads?.().getSlots?.() ?? []) {
+    try {
+      const injectedSlot = findInjectedSlotForRefresh(slot);
+      if (
+        refreshSlotElementId(slot) !== adUnitCode &&
+        slot.getAdUnitPath?.() !== adUnitCode &&
+        injectedSlot?.div_id !== adUnitCode
+      ) {
+        continue;
+      }
+      const elementId = refreshSlotElementId(slot);
+      const element = elementId ? document.getElementById(elementId) : null;
+      if (element?.isConnected) matches.add(element);
+    } catch {
+      // Optional GPT metadata must not make an ambiguous publisher code look exact.
+    }
+  }
+  return matches.size === 1 ? matches.values().next().value : undefined;
+}
+
+function pendingPublisherContextMatchesSlot(
+  pending: PendingPublisherBid | PendingPublisherCode,
+  slot: RefreshGptSlot
+): boolean {
+  if (!pendingPublisherContextIsCurrent(pending)) return false;
+  const injectedSlot = findInjectedSlotForRefresh(slot);
+  return [refreshSlotElementId(slot), injectedSlot?.div_id]
+    .filter((code): code is string => typeof code === 'string' && code.length > 0)
+    .some((code) => {
+      const exact = document.getElementById(code);
+      return (
+        exact === pending.element ||
+        Boolean(exact && (pending.element.contains(exact) || exact.contains(pending.element))) ||
+        resolvePublisherDeliveryElement(code) === pending.element
+      );
+    });
+}
+
+/** Discard delivery state that outlived the publisher auction which created it. */
+function prunePendingPublisherBids(now = Date.now()): void {
+  for (const [adUnitCode, registrations] of pendingPublisherCodes) {
+    for (const [registrationId, pendingCode] of registrations) {
+      if (
+        !pendingPublisherContextIsCurrent(pendingCode) ||
+        (pendingCode.expiresAt <= now && !pendingCode.retainUntilContextChange)
+      ) {
+        registrations.delete(registrationId);
+      }
+    }
+    if (registrations.size === 0) pendingPublisherCodes.delete(adUnitCode);
+  }
+
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (
+      !pendingPublisherContextIsCurrent(pendingBid) ||
+      (pendingBid.expiresAt <= now && !pendingBid.retainUntilContextChange)
+    ) {
+      pendingPublisherBids.delete(adId);
+    }
+  }
+}
+
+/** Store a short-lived pending publisher ad-unit code without erasing overlaps. */
+function storePendingPublisherCode(pendingCode: PendingPublisherCode): void {
+  const registrations = pendingPublisherCodes.get(pendingCode.adUnitCode) ?? new Map();
+  if (pendingCode.retainUntilContextChange && pendingCode.firstImpressionToken) {
+    for (const [registrationId, existing] of registrations) {
+      if (
+        existing.retainUntilContextChange &&
+        existing.firstImpressionToken === pendingCode.firstImpressionToken &&
+        existing.element === pendingCode.element &&
+        existing.generation === pendingCode.generation
+      ) {
+        // Overflow auctions share one denial token. Keep one summary rather
+        // than allocating a retained record for every completed auction.
+        pendingCode.pendingDeliveryCount = (existing.pendingDeliveryCount ?? 1) + 1;
+        registrations.delete(registrationId);
+      }
+    }
+  }
+  registrations.set(pendingCode.registrationId, pendingCode);
+  pendingPublisherCodes.set(pendingCode.adUnitCode, registrations);
+
+  let registrationCount = 0;
+  for (const pending of pendingPublisherCodes.values()) registrationCount += pending.size;
+  if (registrationCount > MAX_PENDING_PUBLISHER_BIDS) {
+    for (const [adUnitCode, pendingRegistrations] of pendingPublisherCodes) {
+      const evictable = [...pendingRegistrations.values()].find(
+        (pending) => !pending.retainUntilContextChange
+      );
+      if (!evictable) continue;
+      removePendingPublisherBidsForCode(adUnitCode, evictable.registrationId);
+      break;
+    }
+  }
+}
+
+/** Store an auction-local bid ID for precise one-shot GPT delivery correlation. */
+function storePendingPublisherBid(adId: string, pendingBid: PendingPublisherBid): void {
+  pendingPublisherBids.delete(adId);
+  pendingPublisherBids.set(adId, pendingBid);
+
+  if (pendingPublisherBids.size > MAX_PENDING_PUBLISHER_BIDS) {
+    const oldestAdId = pendingPublisherBids.keys().next().value;
+    if (oldestAdId !== undefined) pendingPublisherBids.delete(oldestAdId);
+  }
+}
+
+function publisherResponseAdIds(
+  publisherAdUnitCodes: Set<string>,
+  bidResponses: unknown
+): Map<string, string[]> {
+  const adIds = new Map<string, string[]>();
+  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses))
+    return adIds;
+
+  for (const [responseCode, responseGroup] of Object.entries(bidResponses)) {
+    if (!responseGroup || typeof responseGroup !== 'object') continue;
+    const bids = (responseGroup as { bids?: unknown }).bids;
+    if (!Array.isArray(bids)) continue;
+    for (const bid of bids) {
+      if (!bid || typeof bid !== 'object') continue;
+      const response = bid as { adId?: unknown; adUnitCode?: unknown };
+      const adId = typeof response.adId === 'string' ? response.adId : undefined;
+      const adUnitCode =
+        typeof response.adUnitCode === 'string' ? response.adUnitCode : responseCode;
+      if (!adId || !adUnitCode || !publisherAdUnitCodes.has(adUnitCode)) continue;
+      adIds.set(adUnitCode, [...(adIds.get(adUnitCode) ?? []), adId]);
+    }
+  }
+  return adIds;
+}
+
+/** Register every requested publisher code and any bid IDs returned for that auction. */
+function registerPendingPublisherBids(
+  publisherAdUnitCodes: Set<string>,
+  bidResponses: unknown,
+  firstImpressionTokens: Map<string, string>
+): number {
+  prunePendingPublisherBids();
+  const registrationId = ++pendingPublisherRegistrationId;
+  const expiresAt = Date.now() + PENDING_PUBLISHER_DELIVERY_TTL_MS;
+  const responseAdIds = publisherResponseAdIds(publisherAdUnitCodes, bidResponses);
+
+  for (const adUnitCode of publisherAdUnitCodes) {
+    const element = resolvePublisherDeliveryElement(adUnitCode);
+    if (!element) continue;
+    const firstImpressionToken = firstImpressionTokens.get(adUnitCode);
+    const retainUntilContextChange = Boolean(
+      firstImpressionToken &&
+      window.tsjs &&
+      firstImpressionClaim(window.tsjs, element)?.owner === 'trusted_server'
+    );
+    storePendingPublisherCode({
+      adUnitCode,
+      expiresAt,
+      registrationId,
+      generation: window.tsjs?.navGeneration ?? 0,
+      element,
+      retainUntilContextChange,
+      firstImpressionToken,
+    });
+    if (firstImpressionToken && window.tsjs) {
+      markPublisherFirstImpressionDeliveryPending(
+        window.tsjs,
+        firstImpressionToken,
+        responseAdIds.get(adUnitCode) ?? []
+      );
+    }
+  }
+
+  for (const [adUnitCode, adIds] of responseAdIds) {
+    const element = resolvePublisherDeliveryElement(adUnitCode);
+    if (!element) continue;
+    const firstImpressionToken = firstImpressionTokens.get(adUnitCode);
+    const retainUntilContextChange = Boolean(
+      firstImpressionToken &&
+      window.tsjs &&
+      firstImpressionClaim(window.tsjs, element)?.owner === 'trusted_server'
+    );
+    for (const adId of adIds) {
+      storePendingPublisherBid(adId, {
+        adUnitCode,
+        expiresAt,
+        registrationId,
+        generation: window.tsjs?.navGeneration ?? 0,
+        element,
+        retainUntilContextChange,
+        firstImpressionToken,
+      });
+    }
+  }
+
+  return registrationId;
+}
+
+interface PublisherDeliveryPartition {
+  deliverySlots: Set<RefreshGptSlot>;
+  suppressedSlots: Set<RefreshGptSlot>;
+}
+
+/** Consume the equivalent one-shot suppression owned by the inner GPT wrapper. */
+function consumeGptPublisherRefreshSuppression(slot: RefreshGptSlot): void {
+  const elementId = refreshSlotElementId(slot);
+  const handoff = elementId ? window.tsjs?.gptSlotHandoffs?.[elementId] : undefined;
+  if (handoff?.suppressPublisherRefresh) handoff.suppressPublisherRefresh = false;
+}
+
+/** Restore TS targeting and consume any equivalent GPT-wrapper handoff. */
+function prepareSuppressedPublisherSlot(slot: RefreshGptSlot): void {
+  restoreTrustedServerFirstImpressionTargeting(slot);
+  consumeGptPublisherRefreshSuppression(slot);
+}
+
+/** Partition correlated publisher deliveries from one losing first-impression delivery. */
+function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliveryPartition {
+  prunePendingPublisherBids();
+  const deliverySlots = new Set<RefreshGptSlot>();
+  const suppressedSlots = new Set<RefreshGptSlot>();
+
+  for (const slot of targetSlots) {
+    const adIds = slot.getTargeting?.('hb_adid');
+    const pendingBid = Array.isArray(adIds)
+      ? adIds
+          .filter((adId): adId is string => typeof adId === 'string' && adId.length > 0)
+          .map((adId) => pendingPublisherBids.get(adId))
+          .find(
+            (bid): bid is PendingPublisherBid =>
+              bid !== undefined && pendingPublisherContextMatchesSlot(bid, slot)
+          )
+      : undefined;
+    const hasAdId =
+      Array.isArray(adIds) && adIds.some((adId) => typeof adId === 'string' && adId.length > 0);
+    const injectedSlot = findInjectedSlotForRefresh(slot);
+    const pendingCodeCandidates = [
+      ...new Map(
+        [refreshSlotElementId(slot), refreshSlotAdUnitPath(slot), injectedSlot?.div_id]
+          .filter((code): code is string => typeof code === 'string' && code.length > 0)
+          .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
+          .filter(
+            (pending) =>
+              pendingPublisherContextMatchesSlot(pending, slot) &&
+              (activePublisherRegistrationId === undefined ||
+                pending.registrationId === activePublisherRegistrationId ||
+                (pending.firstImpressionToken !== undefined &&
+                  pending.firstImpressionToken ===
+                    activePublisherFirstImpressionTokens?.get(pending.adUnitCode))) &&
+              (!hasAdId || pending.retainUntilContextChange)
+          )
+          .map((pending) => [pending.registrationId, pending] as const)
+      ).values(),
+    ].sort((left, right) => left.registrationId - right.registrationId);
+    const pendingCode = pendingCodeCandidates.length === 1 ? pendingCodeCandidates[0] : undefined;
+    const pending = pendingBid ?? pendingCode;
+    if (!pending) {
+      if (pendingCodeCandidates.some((candidate) => candidate.retainUntilContextChange)) {
+        suppressedSlots.add(slot);
+      }
+      continue;
+    }
+
+    const suppress =
+      pending.firstImpressionToken && window.tsjs
+        ? consumePublisherFirstImpressionDelivery(window.tsjs, pending.firstImpressionToken)
+        : false;
+    removeConsumedPublisherRegistration(
+      pending.adUnitCode,
+      pendingBid?.registrationId ?? activePublisherRegistrationId ?? pending.registrationId,
+      pendingBid
+    );
+    (suppress ? suppressedSlots : deliverySlots).add(slot);
+  }
+
+  return { deliverySlots, suppressedSlots };
+}
+
+/** Evict publisher state after Prebid removes one or more ad units. */
+function removePublisherState(adUnitCode?: string | string[]): void {
+  if (!adUnitCode) {
+    publisherAdUnitSnapshots.clear();
+    pendingPublisherBids.clear();
+    pendingPublisherCodes.clear();
+    for (const code of publisherFirstImpressionTokens.keys()) {
+      forgetPublisherFirstImpressionToken(code);
+    }
+    return;
+  }
+
+  const adUnitCodes = Array.isArray(adUnitCode) ? adUnitCode : [adUnitCode];
+  for (const code of adUnitCodes) {
+    publisherAdUnitSnapshots.delete(code);
+    removePendingPublisherBidsForCode(code);
+    forgetPublisherFirstImpressionToken(code);
   }
 }
 
@@ -490,8 +1922,115 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  * Config resolution (values from later sources override earlier ones):
  * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
  * 2. `config` argument — explicit overrides from the publisher's JS
+ *
+ * Idempotent per page: a `window.__tsjsPrebidShimInstalled` sentinel makes
+ * repeat calls (double script inclusion, a bundle that still carries a
+ * baked-in shim) a no-op instead of a double adapter registration.
  */
+function apsRendererCarrier(bid: Record<string, unknown>): unknown {
+  const renderer = bid[APS_RENDERER_FIELD];
+  if (renderer != null) return renderer;
+  const meta = bid['meta'];
+  if (meta !== null && typeof meta === 'object') {
+    return (meta as Record<string, unknown>)[APS_RENDERER_FIELD];
+  }
+  return undefined;
+}
+
+function scrubApsRendererCarrier(bid: Record<string, unknown>): void {
+  delete bid[APS_RENDERER_FIELD];
+  const meta = bid['meta'];
+  if (meta !== null && typeof meta === 'object') {
+    delete (meta as Record<string, unknown>)[APS_RENDERER_FIELD];
+  }
+}
+
+function installApsBidResponseRegistry(): void {
+  const prebid = pbjs as typeof pbjs & Record<string, unknown>;
+  if (prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] === true) return;
+
+  const registerRenderer = (rawBid: unknown): void => {
+    const bid = rawBid as Record<string, unknown>;
+    if (bid['adapterCode'] !== ADAPTER_CODE || bid['bidderCode'] !== APS_BIDDER_CODE) {
+      return;
+    }
+    const renderer = apsRendererCarrier(bid);
+    const adId = bid['adId'];
+    if (renderer === undefined || typeof adId !== 'string') {
+      return;
+    }
+
+    const registered = registerApsPrebidRenderer(adId, bid['adUnitCode'], renderer, bid['ttl'], {
+      // Prebid exposes only a public combined winner/rendered API. Keep it
+      // at the existing rendered lifecycle point so the bid is not reported
+      // rendered before Universal Creative receives its response.
+      markUsed: () => pbjs.markWinningBidAsUsed({ adId, events: true }),
+    });
+    // Keep the executable capability only in the bounded, one-time registry. Prebid
+    // still owns the generated ad ID and ordinary GAM targeting on this bid object.
+    scrubApsRendererCarrier(bid);
+    if (!registered) {
+      // Prebid can admit zero-CPM bids when `allowZeroCpmBids` is enabled.
+      // Its targeting selection rejects every negative CPM, so this bid cannot
+      // displace a renderable GAM candidate after registration fails.
+      bid['cpm'] = -1;
+      log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
+    }
+  };
+
+  // Register on `bidAccepted`, the first event after Prebid assigns `adId`, so
+  // later event consumers cannot observe the executable descriptor. The
+  // `bidResponse` pass is a compatibility fallback.
+  pbjs.onEvent('bidAccepted', registerRenderer);
+  pbjs.onEvent('bidResponse', registerRenderer);
+  prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
+}
+
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
+  // The prebid integration requires the external Prebid.js bundle
+  // (integrations.prebid.external_bundle_url). When it failed to load (network
+  // error, SRI mismatch) window.pbjs is still the head-injected stub with no
+  // API — installing the adapter is impossible, so bail out loudly.
+  if (!hasPrebidJsApi()) {
+    log.error(
+      '[tsjs-prebid] window.pbjs is missing the required Prebid.js API — the external ' +
+        'bundle failed to load or is incompatible. Prebid integration disabled.'
+    );
+    return pbjs;
+  }
+
+  const sentinelWindow =
+    typeof window === 'undefined' ? undefined : (window as { __tsjsPrebidShimInstalled?: boolean });
+  if (sentinelWindow?.__tsjsPrebidShimInstalled) {
+    return pbjs;
+  }
+  if (sentinelWindow) {
+    sentinelWindow.__tsjsPrebidShimInstalled = true;
+  }
+
+  warnedMissingUserIdManifest = false;
+  publisherAdUnitSnapshots = new Map();
+  pendingPublisherBids = new Map();
+  pendingPublisherCodes = new Map();
+  pendingPublisherRegistrationId = 0;
+  activePublisherRegistrationId = undefined;
+  activePublisherFirstImpressionTokens = undefined;
+  publisherFirstImpressionTokens = new Map();
+  syntheticRefreshAdUnits = new WeakSet();
+
+  const prebidWithRemoveAdUnit = pbjs as unknown as PrebidWithRemoveAdUnit;
+  if (!prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped) {
+    const originalRemoveAdUnit = prebidWithRemoveAdUnit.removeAdUnit;
+    if (typeof originalRemoveAdUnit === 'function') {
+      prebidWithRemoveAdUnit.removeAdUnit = function (adUnitCode?: string | string[]) {
+        const result = originalRemoveAdUnit.call(this, adUnitCode);
+        removePublisherState(adUnitCode);
+        return result;
+      };
+      prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped = true;
+    }
+  }
+
   const injected = getInjectedConfig();
   const merged: PrebidNpmConfig = {
     endpoint: config?.endpoint,
@@ -499,7 +2038,311 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     debug: config?.debug ?? injected?.debug,
   };
 
+  const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
+  const injectedManagedUserIds = injected?.managedUserIds;
+  let trySeedManagedUserIds: (() => void) | undefined;
+  if (
+    injectedManagedUserIds &&
+    injectedManagedUserIds.length > 0 &&
+    managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] !== true
+  ) {
+    // Resolve submodule ownership once, before any consumer reads the list, so
+    // a dropped entry is reported a single time rather than on every seed.
+    const managedUserIds = dedupeManagedUserIdsBySubmodule(injectedManagedUserIds);
+    const originalSetConfig = pbjs.setConfig.bind(pbjs);
+    const prebidConfigApi = pbjs as typeof pbjs & {
+      mergeConfig?: typeof pbjs.setConfig;
+    };
+    const originalMergeConfig = prebidConfigApi.mergeConfig?.bind(pbjs);
+    const getConfig = (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig;
+
+    let automaticTcfConsentActivation: ManagedTcfConsentActivation | undefined;
+    // Until CMP discovery resolves, managed entries stay out of every
+    // configuration Prebid sees: a module seeded before the CMP is discoverable
+    // would call its vendor with the GDPR handler disabled.
+    let managedUserIdsDeferred = true;
+    let awaitingLateConsent = false;
+    let retireLateTcfWatch: (() => void) | undefined;
+    let awaitingTerminalTcfConsent = false;
+    let terminalTcfConsentSettled = false;
+    let terminalTcfWatch: TerminalTcfConsentWatch | undefined;
+
+    const retireAutomaticTcfConsent = (
+      publisherConfig: PbjsConfig,
+      cleanupAllowed = true
+    ): boolean => {
+      if (!automaticTcfConsentActivation) return false;
+
+      let claimsOwnership: boolean;
+      try {
+        claimsOwnership = publisherClaimsGdprOwnership(publisherConfig);
+      } catch (error) {
+        log.error(
+          '[tsjs-prebid] publisher consentManagement configuration could not be inspected',
+          error
+        );
+        return false;
+      }
+      if (!claimsOwnership) return false;
+
+      automaticTcfConsentActivation.acceptCmpEvents = false;
+      if (!cleanupAllowed) {
+        automaticTcfConsentActivation = undefined;
+        return false;
+      }
+
+      let effectiveConsentManagement: unknown;
+      try {
+        effectiveConsentManagement = getConfig?.call(pbjs, 'consentManagement');
+      } catch (error) {
+        log.error(
+          '[tsjs-prebid] effective consentManagement configuration could not be read',
+          error
+        );
+        automaticTcfConsentActivation = undefined;
+        return false;
+      }
+
+      if (effectiveConsentManagement !== undefined && !isRecord(effectiveConsentManagement)) {
+        log.error('[tsjs-prebid] effective consentManagement configuration is not mergeable');
+        automaticTcfConsentActivation = undefined;
+        return false;
+      }
+
+      let disabledConsentManagement: Record<string, unknown>;
+      try {
+        disabledConsentManagement = {
+          ...(effectiveConsentManagement ?? {}),
+          gdpr: { enabled: false },
+        };
+      } catch (error) {
+        log.error(
+          '[tsjs-prebid] effective consentManagement configuration could not be inspected',
+          error
+        );
+        automaticTcfConsentActivation = undefined;
+        return false;
+      }
+
+      try {
+        originalSetConfig({
+          consentManagement: disabledConsentManagement,
+        } as PbjsConfig);
+        automaticTcfConsentActivation = undefined;
+        return true;
+      } catch (error) {
+        // Prebid writes topical config before synchronously notifying
+        // subscribers, so a throw here may still mean cleanup took effect.
+        // Complete the one-way ownership transfer and use the publisher merge
+        // that was prepared before this cleanup attempt.
+        automaticTcfConsentActivation = undefined;
+        log.error('[tsjs-prebid] automatic IAB consent listener could not be retired', error);
+        return true;
+      }
+    };
+
+    const normalizePublisherConfig = (publisherConfig: PbjsConfig): PbjsConfig => {
+      if (managedUserIdsDeferred) return publisherConfig;
+      try {
+        return withManagedUserIds(publisherConfig, managedUserIds);
+      } catch (error) {
+        // Publisher configuration is arbitrary page data: a throwing accessor
+        // must not break the publisher's own setConfig call.
+        log.error('[tsjs-prebid] managed User ID entries could not be normalized', error);
+        return publisherConfig;
+      }
+    };
+
+    pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
+      retireAutomaticTcfConsent(publisherConfig);
+      const result = originalSetConfig(normalizePublisherConfig(publisherConfig));
+      trySeedManagedUserIds?.();
+      return result;
+    }) as typeof pbjs.setConfig;
+    if (originalMergeConfig) {
+      prebidConfigApi.mergeConfig = ((publisherConfig: PbjsConfig) => {
+        const normalizedConfig = normalizePublisherConfig(publisherConfig);
+        let mergedConfig = normalizedConfig;
+        let cleanupAllowed = true;
+        let publisherUsesLegacyTcfShape = false;
+        if (automaticTcfConsentActivation) {
+          try {
+            if (publisherClaimsGdprOwnership(normalizedConfig)) {
+              mergedConfig = enableMergedPublisherGdpr(normalizedConfig);
+              publisherUsesLegacyTcfShape =
+                isRecord(normalizedConfig) &&
+                isLegacyTcfConsentManagement(normalizedConfig.consentManagement);
+            }
+          } catch (error) {
+            cleanupAllowed = false;
+            log.error(
+              '[tsjs-prebid] publisher consentManagement merge could not be normalized',
+              error
+            );
+          }
+        }
+        const retiredAutomaticConsent = retireAutomaticTcfConsent(publisherConfig, cleanupAllowed);
+        const result = originalMergeConfig(
+          retiredAutomaticConsent ? mergedConfig : normalizedConfig
+        );
+        if (retiredAutomaticConsent && publisherUsesLegacyTcfShape) {
+          // The deep merge carried the retired `gdpr` namespace forward, which
+          // would demote the publisher's legacy TCF configuration.
+          removeAutomaticGdprNamespace(originalSetConfig, getConfig);
+        }
+        trySeedManagedUserIds?.();
+        return result;
+      }) as typeof pbjs.setConfig;
+    }
+    managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] = true;
+
+    const activateAndSeedManagedUserIds = () => {
+      if (!managedUserIdsDeferred) return;
+      managedUserIdsDeferred = false;
+      // Seeding can also resolve through publisher consent configuration with
+      // no CMP ever appearing. Restore the plain `window.__tcfapi` property
+      // rather than leaving an accessor pair installed for the page lifetime.
+      // The restorer is idempotent, and the callback it fires re-enters a
+      // `trySeedManagedUserIds` that now returns on the flag above.
+      retireLateTcfWatch?.();
+      retireLateTcfWatch = undefined;
+      terminalTcfWatch?.retire();
+      terminalTcfWatch = undefined;
+      automaticTcfConsentActivation = activateManagedUserIdTcfConsent(
+        managedUserIds,
+        originalSetConfig,
+        getConfig
+      );
+
+      if (typeof getConfig !== 'function') {
+        // Without getConfig the effective User ID entries cannot be read, and
+        // seeding the managed entries alone would silently drop every publisher
+        // module already configured. Leave the wrappers installed so the next
+        // publisher userIds call still gets the managed entries.
+        log.error(
+          '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed User ID entries not seeded'
+        );
+        return;
+      }
+
+      let effectiveUserIds: PrebidUserIdConfigEntry[] | undefined;
+      try {
+        effectiveUserIds = configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'));
+      } catch (error) {
+        log.error(
+          '[tsjs-prebid] effective User ID entries could not be read; managed User ID entries not seeded',
+          error
+        );
+      }
+      if (effectiveUserIds) {
+        const effectiveUserSync = getConfig.call(pbjs, 'userSync');
+        const seed = withManagedUserIds(
+          {
+            userSync: {
+              ...(isRecord(effectiveUserSync) ? effectiveUserSync : {}),
+              userIds: effectiveUserIds,
+            },
+          } as PbjsConfig,
+          managedUserIds
+        );
+        if (awaitingLateConsent && seed.userSync.autoRefresh !== true) {
+          // Let Prebid initialize newly added modules even if its initial pass
+          // already finished. Preserve the publisher's policy after this seed.
+          originalSetConfig({
+            ...seed,
+            userSync: { ...seed.userSync, autoRefresh: true },
+          } as PbjsConfig);
+        }
+        originalSetConfig(seed);
+      }
+    };
+
+    trySeedManagedUserIds = () => {
+      if (!managedUserIdsDeferred) return;
+      let publisherConsentConfigured = false;
+      try {
+        const consent = getConfig?.call(pbjs, 'consentManagement');
+        publisherConsentConfigured =
+          isRecord(consent) && publisherOwnsTcfConsentManagement(consent);
+      } catch (error) {
+        log.error('[tsjs-prebid] publisher consent configuration could not be read', error);
+      }
+      // A publisher-owned GDPR configuration carries the publisher's own
+      // timeout posture, so seeding under it leaves Prebid's semantics alone.
+      if (publisherConsentConfigured || terminalTcfConsentSettled) {
+        activateAndSeedManagedUserIds();
+        return;
+      }
+      // Automatic TCF activation is ours, so it fails closed: subscribe once
+      // and wait for a settled CMP result rather than for a callable API.
+      if (awaitingTerminalTcfConsent) {
+        const outstanding = terminalTcfWatch;
+        // A CMP that has answered may still have its dialog open. Keep its
+        // subscription when the global changes so its eventual decision is
+        // not swallowed. A discarded CMP that answered once stays fail-closed.
+        if (!outstanding || outstanding.hasAnswered()) return;
+        const currentTcfApi =
+          typeof window === 'undefined' ? undefined : (window as { __tcfapi?: unknown }).__tcfapi;
+        // A silent, replaced API may be a stub that never replays its queue.
+        // Ask the replacement rather than defer IDs for the page lifetime.
+        // An unchanged API is the same wait, so do not pile up listeners.
+        if (currentTcfApi === outstanding.tcfApi) return;
+        awaitingTerminalTcfConsent = false;
+      }
+      // A previous attempt the CMP refused, or one stranded on a stub since
+      // replaced, leaves its subscription behind. Retire it before subscribing
+      // again so only one can settle the wait. The retired callback may still
+      // arrive later; it ignores consent and cleans up through its own API.
+      terminalTcfWatch?.retire();
+      terminalTcfWatch = undefined;
+      awaitingTerminalTcfConsent = true;
+      const watch = awaitTerminalTcfConsent(
+        () => {
+          terminalTcfConsentSettled = true;
+          trySeedManagedUserIds?.();
+        },
+        () => {
+          // Reopen the wait. A CMP that refuses one subscription may accept a
+          // later one — a TCF stub commonly gives way to the real CMP — and
+          // leaving the flag set would defer managed IDs for the page lifetime
+          // with no path back.
+          awaitingTerminalTcfConsent = false;
+        }
+      );
+      if (!watch) {
+        // No CMP to subscribe to yet; a later call retries once one appears.
+        awaitingTerminalTcfConsent = false;
+        return;
+      }
+      if (managedUserIdsDeferred) {
+        terminalTcfWatch = watch;
+      } else {
+        // A synchronous terminal result already seeded; retire the subscription
+        // the seeding path could not yet see.
+        watch.retire();
+      }
+    };
+    trySeedManagedUserIds();
+    if (managedUserIdsDeferred) {
+      awaitingLateConsent = true;
+      // Auctions may run before an asynchronous CMP arrives. Watching the
+      // property catches one that installs itself later; it is a no-op when a
+      // CMP is already present and the wait is for its result instead. When a
+      // present CMP rejects the subscription outright neither watch arms, and
+      // recovery is by recheck alone. Either way managed IDs stay deferred, and
+      // later configuration and auction calls recheck without treating absence
+      // as consent.
+      retireLateTcfWatch = watchForLateTcfApi(trySeedManagedUserIds);
+    }
+  }
+
   auctionEndpoint = merged.endpoint ?? '/auction';
+  const apsRendererSupported = hasApsRendererApi();
+  if (apsRendererSupported) {
+    installApsBidResponseRegistry();
+  } else {
+    log.warn('[tsjs-prebid] Prebid bundle lacks markWinningBidAsUsed; APS renderer bids disabled');
+  }
 
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -541,53 +2384,102 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
-      return auctionBidsToPrebidBids(auctionBids, bidRequests);
+      return auctionBidsToPrebidBids(auctionBids, bidRequests, apsRendererSupported);
     },
   });
 
   const originalRequestBids = pbjs.requestBids.bind(pbjs);
 
-  // Bidders that should run client-side via their native Prebid.js adapters.
-  // Read once from the server-injected config.
+  // Browser demand ownership is explicit. Only validated auction-plan route
+  // codes are folded; every other publisher bidder entry remains in Prebid.js.
   const clientSideBidders = new Set(injected?.clientSideBidders ?? []);
+  const serverSideBidders = new Set(injectedServerSideBidderCodes(injected));
   if (clientSideBidders.size > 0) {
     log.info('[tsjs-prebid] client-side bidders:', [...clientSideBidders]);
   }
+  if (serverSideBidders.size > 0) {
+    log.info('[tsjs-prebid] server-side bidders:', [...serverSideBidders]);
+  }
 
   // Shim requestBids to inject the trustedServer bidder into every ad unit
-  // so server-side bids flow through the /auction orchestrator while
-  // client-side bidders are left untouched.
+  // so plan-owned server-side bids flow through the /auction orchestrator while
+  // every unowned bidder is left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
+    trySeedManagedUserIds?.();
+    recordUserIdModuleDiagnostics();
 
-    const opts = requestObj || {};
+    const opts = { ...(requestObj ?? {}) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const adUnits = ((opts as any).adUnits || pbjs.adUnits || []) as TrustedServerAdUnit[];
+    const explicitAdUnits = (opts as any).adUnits as TrustedServerAdUnit[] | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const requestedAdUnitCodes = Array.isArray((opts as any).adUnitCodes)
+      ? new Set(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ((opts as any).adUnitCodes as unknown[]).filter(
+            (code): code is string => typeof code === 'string'
+          )
+        )
+      : undefined;
+    const adUnits = (explicitAdUnits ?? (pbjs.adUnits as TrustedServerAdUnit[]) ?? []).filter(
+      (unit) =>
+        explicitAdUnits !== undefined ||
+        requestedAdUnitCodes === undefined ||
+        requestedAdUnitCodes.has(unit.code ?? '')
+    );
+    const isSyntheticRefresh =
+      adUnits.length > 0 && adUnits.every((unit) => syntheticRefreshAdUnits.has(unit));
+    const publisherAdUnitCodes = new Set(
+      adUnits
+        .filter((unit) => !syntheticRefreshAdUnits.has(unit))
+        .map((unit) => unit.code)
+        .filter((code): code is string => typeof code === 'string' && code.length > 0)
+    );
+    const firstImpressionTokens =
+      !isSyntheticRefresh && !window.tsjs?.adInitRefreshInProgress
+        ? registerPublisherFirstImpressionAuctions(
+            (window.tsjs ??= {} as TsjsApi),
+            publisherAdUnitCodes,
+            Date.now(),
+            resolvePublisherDeliveryElement
+          )
+        : new Map<string, string>();
+    for (const [adUnitCode, token] of firstImpressionTokens) {
+      trackPublisherFirstImpressionToken(adUnitCode, token);
+      window.setTimeout(
+        () => forgetPublisherFirstImpressionToken(adUnitCode, token),
+        PENDING_PUBLISHER_DELIVERY_TTL_MS
+      );
+    }
 
     // Ensure every ad unit has a trustedServer bid entry
     for (const unit of adUnits) {
+      if (!syntheticRefreshAdUnits.has(unit)) {
+        const snapshot = capturePublisherAdUnitSnapshot(unit, serverSideBidders);
+        if (snapshot && unit.code) {
+          storePublisherAdUnitSnapshot(unit.code, snapshot);
+        }
+      }
+
       if (!Array.isArray(unit.bids)) {
         unit.bids = [];
       }
 
-      // Preserve per-bidder params for server-side expansion.
-      // Skip client-side bidders — they remain as standalone bids and run
-      // via their native Prebid.js adapters in the browser.
-      const bidderParams: Record<string, Record<string, unknown>> = {};
+      // Preserve params only for bidder codes owned by the validated auction
+      // plan. Provider IDs, returned seat aliases, APS renderer identity, and
+      // ordinary browser demand cannot enter the trustedServer envelope.
+      const bidderParams = Object.create(null) as Record<string, Record<string, unknown>>;
       for (const bid of unit.bids) {
-        if (!bid?.bidder || bid.bidder === ADAPTER_CODE) {
-          continue;
-        }
-        if (clientSideBidders.has(bid.bidder)) {
+        if (!bid?.bidder || !serverSideBidders.has(bid.bidder)) {
           continue;
         }
         bidderParams[bid.bidder] = bid.params ?? {};
       }
 
-      // Keep only bids that should still execute in the browser. All other
-      // bidders are routed through the trustedServer adapter.
+      // Keep every unowned bid in browser demand, including configured native
+      // adapters and standard entries not claimed by the plan.
       unit.bids = unit.bids.filter(
-        (bid) => bid?.bidder === ADAPTER_CODE || clientSideBidders.has(bid?.bidder ?? '')
+        (bid) => bid?.bidder === ADAPTER_CODE || !serverSideBidders.has(bid?.bidder ?? '')
       );
 
       // WORKAROUND: Read the zone from mediaTypes.banner.name. This is NOT a
@@ -608,10 +2500,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         // by the prior call, so `bidderParams` is now empty. Retain the
         // params captured on the first call instead of overwriting them with
         // `{}`, which would drop the publisher's inline PBS params on refresh.
-        const prevBidderParams = (prevParams[BIDDER_PARAMS_KEY] ?? {}) as Record<
-          string,
-          Record<string, unknown>
-        >;
+        const prevBidderParams = foldedBidderParams(existingTsBid, serverSideBidders);
         const effectiveBidderParams =
           Object.keys(bidderParams).length > 0 ? bidderParams : prevBidderParams;
 
@@ -625,6 +2514,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           bidder: ADAPTER_CODE,
           params: {
             [BIDDER_PARAMS_KEY]: bidderParams,
+            [STORED_REQUEST_KEY]: false,
             ...(zone ? { [ZONE_KEY]: zone } : {}),
           },
         });
@@ -649,12 +2539,43 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     const originalBidsBack = opts.bidsBackHandler;
     opts.bidsBackHandler = function (...args: unknown[]) {
       syncPrebidEidsCookie();
-      if (typeof originalBidsBack === 'function') {
-        originalBidsBack.apply(this, args);
+      const registrationId = isSyntheticRefresh
+        ? undefined
+        : registerPendingPublisherBids(publisherAdUnitCodes, args[0], firstImpressionTokens);
+      if (typeof originalBidsBack !== 'function') return;
+
+      const previousRegistrationId = activePublisherRegistrationId;
+      const previousFirstImpressionTokens = activePublisherFirstImpressionTokens;
+      activePublisherRegistrationId = registrationId;
+      activePublisherFirstImpressionTokens = firstImpressionTokens;
+      try {
+        originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
+      } catch (error) {
+        if (registrationId !== undefined) {
+          publisherAdUnitCodes.forEach((code) =>
+            removePendingPublisherBidsForCode(code, registrationId)
+          );
+        }
+        for (const [adUnitCode, token] of firstImpressionTokens) {
+          releasePublisherFirstImpressionAuction(window.tsjs!, token);
+          forgetPublisherFirstImpressionToken(adUnitCode, token);
+        }
+        throw error;
+      } finally {
+        activePublisherRegistrationId = previousRegistrationId;
+        activePublisherFirstImpressionTokens = previousFirstImpressionTokens;
       }
     };
 
-    return originalRequestBids(opts);
+    try {
+      return originalRequestBids(opts);
+    } catch (error) {
+      for (const [adUnitCode, token] of firstImpressionTokens) {
+        releasePublisherFirstImpressionAuction(window.tsjs!, token);
+        forgetPublisherFirstImpressionToken(adUnitCode, token);
+      }
+      throw error;
+    }
   };
 
   // Apply initial configuration
@@ -671,24 +2592,27 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pbjs.processQueue();
   recordUserIdModuleDiagnostics();
 
-  // Validate that every client-side bidder has its adapter registered.
-  // Adapters self-register on import, so a missing adapter means the bidder
-  // was listed in client_side_bidders but not included in the generated
-  // external Prebid bundle. Without the adapter the bidder is silently dropped
-  // from both server-side and client-side auctions.
-  for (const bidder of clientSideBidders) {
-    try {
-      if (!adapterManager.getBidAdapter(bidder)) {
+  // Validate runtime bidder codes, including aliases such as adform and
+  // adformOpenRTB for the adf module. Module stems are retained separately and
+  // must never be used as bidder codes.
+  const bundledBidderCodes = getExternalBundleManifest()?.runtimeCodes.bidder;
+  if (bundledBidderCodes === undefined) {
+    if (clientSideBidders.size > 0) {
+      log.warn(
+        '[tsjs-prebid] external Prebid bundle did not stamp a supported bidder runtime-code manifest; ' +
+          'cannot verify client_side_bidders adapters'
+      );
+    }
+  } else {
+    for (const bidder of clientSideBidders) {
+      if (!bundledBidderCodes.includes(bidder)) {
         log.error(
-          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-            `Add it to build-prebid-external.mjs --adapters.`
+          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
+            'Prebid bundle. Add its exact Prebid module stem to ' +
+            '[integrations.prebid.bundle.modules].bidder in trusted-server.toml and ' +
+            'rebuild it with `ts prebid bundle`.'
         );
       }
-    } catch {
-      log.error(
-        `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-          `Add it to build-prebid-external.mjs --adapters.`
-      );
     }
   }
 
@@ -734,6 +2658,14 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 
     const originalRefresh = pubads.refresh.bind(pubads);
     pubads.refresh = function (slots?: unknown[], opts?: unknown) {
+      // For bare refresh() calls (no slots arg), get all registered slots from GPT
+      // so we can auction the same concrete slot list and avoid stale targeting.
+      const targetSlots = (
+        slots ??
+        (pubads as { getSlots?: () => unknown[] }).getSlots?.() ??
+        []
+      ).filter((slot): slot is RefreshGptSlot => typeof slot === 'object' && slot !== null);
+
       // One-shot bypass for adInit()'s internal refresh: that refresh delivers
       // freshly applied server-side targeting to GAM and must not be turned
       // into a client-side auction (which would clear the TS targeting).
@@ -743,24 +2675,69 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         return originalRefresh(slots, opts);
       }
 
-      // For bare refresh() calls (no slots arg), get all registered slots from GPT
-      // so we can auction the same concrete slot list and avoid stale targeting.
-      const targetSlots = (
-        slots ??
-        (pubads as { getSlots?: () => unknown[] }).getSlots?.() ??
-        []
-      ).filter((slot): slot is RefreshGptSlot => typeof slot === 'object' && slot !== null);
-
-      if (!targetSlots.length) {
+      if (!targetSlots.length || (slots !== undefined && targetSlots.length !== slots.length)) {
         return originalRefresh(slots, opts);
       }
 
-      targetSlots.forEach(clearRefreshTargeting);
+      const { deliverySlots, suppressedSlots } = publisherDeliverySlots(targetSlots);
+      suppressedSlots.forEach(prepareSuppressedPublisherSlot);
+      const remainingSlots = targetSlots.filter((slot) => !suppressedSlots.has(slot));
+      if (remainingSlots.length === 0) return;
+      const forwardedSlots = suppressedSlots.size > 0 ? remainingSlots : slots;
+      const independentSlots = remainingSlots.filter((slot) => !deliverySlots.has(slot));
+      if (independentSlots.length === 0) {
+        remainingSlots.forEach(consumeGptPublisherRefreshSuppression);
+        recordPrebidRefreshForDiagnostics(remainingSlots);
+        return dispatchPrebidRefresh(originalRefresh, forwardedSlots, opts);
+      }
 
-      const adUnits = targetSlots.map((slot) => {
+      // Clear stale Trusted Server/Prebid targeting from independent slots before
+      // filtering so excluded slots still receive a clean GAM refresh.
+      independentSlots.forEach(clearRefreshTargeting);
+
+      const excludedGamAdUnitPathSuffixes = refreshAuctionExclusionSuffixes(
+        getInjectedConfig()?.excludedGamAdUnitPathSuffixes
+      );
+      const auctionSlots = independentSlots.filter(
+        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+      );
+      if (!auctionSlots.length) {
+        const immediateSlotCodes = new Map<RefreshGptSlot, string>();
+        remainingSlots.forEach((slot) => {
+          const elementId = refreshSlotElementId(slot);
+          if (elementId) immediateSlotCodes.set(slot, elementId);
+        });
+        const immediateTokens = registerPublisherFirstImpressionAuctions(
+          (window.tsjs ??= {} as TsjsApi),
+          immediateSlotCodes.values()
+        );
+        const immediateSuppressedSlots = new Set<RefreshGptSlot>();
+        for (const [slot, elementId] of immediateSlotCodes) {
+          const token = immediateTokens.get(elementId);
+          if (token && window.tsjs && consumePublisherFirstImpressionDelivery(window.tsjs, token)) {
+            immediateSuppressedSlots.add(slot);
+          }
+        }
+        immediateSuppressedSlots.forEach(prepareSuppressedPublisherSlot);
+        const immediateSlots = remainingSlots.filter((slot) => !immediateSuppressedSlots.has(slot));
+        if (immediateSlots.length === 0) return;
+        immediateSlots.forEach(consumeGptPublisherRefreshSuppression);
+        const immediateForwardedSlots =
+          immediateSuppressedSlots.size > 0 ? immediateSlots : forwardedSlots;
+        return originalRefresh(immediateForwardedSlots, opts);
+      }
+
+      const adUnits = auctionSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);
+        const code = refreshSlotElementId(slot) ?? 'refresh-slot';
+        // A TS-owned slot may be defined on `${div_id}-container`, so the GPT
+        // element id used as the synthetic refresh code can differ from the
+        // inner `div_id` the publisher keyed their ad unit by. Recover from both.
+        const candidateCodes = [code, injectedSlot?.div_id];
         const zone =
-          injectedSlot?.targeting?.[ZONE_KEY] ?? firstTargetingValue(slot.getTargeting?.(ZONE_KEY));
+          injectedSlot?.targeting?.[ZONE_KEY] ??
+          firstTargetingValue(slot.getTargeting?.(ZONE_KEY)) ??
+          publisherZoneForRefresh(candidateCodes);
         const banner: TrustedServerBanner = {
           sizes:
             bannerSizesFromInjectedSlot(injectedSlot) ??
@@ -768,13 +2745,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             DEFAULT_REFRESH_SIZES,
           ...(zone ? { name: zone } : {}),
         };
-
-        const code = refreshSlotElementId(slot) ?? 'refresh-slot';
-        // A TS-owned slot may be defined on `${div_id}-container`, so the GPT
-        // element id used as the synthetic refresh code can differ from the
-        // inner `div_id` the publisher keyed their ad unit by. Recover from both.
-        const candidateCodes = [code, injectedSlot?.div_id];
-        const tsParams: Record<string, unknown> = zone ? { [ZONE_KEY]: zone } : {};
+        const tsParams: Record<string, unknown> = {
+          ...storedRequestParamsForRefresh(candidateCodes),
+          ...(zone ? { [ZONE_KEY]: zone } : {}),
+        };
         // Carry the publisher's inline server-side (PBS) bidder params captured
         // on the initial ad unit so refresh/scroll auctions don't drop them.
         const serverSideParams = serverSideBidderParamsForRefresh(candidateCodes);
@@ -796,14 +2770,101 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // unrelated GPT slots whose targeting this wrapper only cleared for
       // `targetSlots` — leaving their next request dependent on stale state.
       const refreshAdUnitCodes = adUnits.map((unit) => unit.code);
-      pbjs.requestBids({
-        adUnits,
-        bidsBackHandler: () => {
-          pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
-          originalRefresh(targetSlots, opts);
-        },
-        timeout: timeoutMs,
+      const refreshTs = (window.tsjs ??= {} as TsjsApi);
+      const refreshGeneration = refreshTs.navGeneration ?? 0;
+      const delayedRefreshCodes = new Map<RefreshGptSlot, string>();
+      const delayedRefreshElements = new Map<RefreshGptSlot, HTMLElement>();
+      remainingSlots.forEach((slot) => {
+        const elementId = refreshSlotElementId(slot);
+        if (elementId) delayedRefreshCodes.set(slot, elementId);
+        const element = elementId ? resolveFirstImpressionElement(elementId) : undefined;
+        if (element) delayedRefreshElements.set(slot, element);
       });
+      const refreshFirstImpressionTokens = registerPublisherFirstImpressionAuctions(
+        refreshTs,
+        delayedRefreshCodes.values()
+      );
+      adUnits.forEach((unit) => syntheticRefreshAdUnits.add(unit));
+
+      // Preserve GPT Single Request Architecture: when a publisher refresh
+      // includes both already-targeted delivery slots and independent slots,
+      // delay the whole original list until the independent auction completes.
+      // A one-shot fallback prevents a failed Prebid callback from dropping any
+      // slots, and a late callback cannot issue a second GAM request.
+      let completed = false;
+      let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+      function completeRefresh(applyTargeting: boolean): void {
+        if (completed) return;
+        completed = true;
+        if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+
+        // The publisher refresh itself started before this asynchronous auction.
+        // Reconcile its per-slot token only when the callback is ready to issue
+        // GPT: TS may have won an already-overlapping first impression while the
+        // auction was pending, while a publisher-first token prevents TS from
+        // claiming the slot midway through the same refresh.
+        const callbackFilteredSlots = new Set<RefreshGptSlot>();
+        const callbackSuppressedSlots = new Set<RefreshGptSlot>();
+        for (const slot of remainingSlots) {
+          const elementId = delayedRefreshCodes.get(slot);
+          const token = elementId ? refreshFirstImpressionTokens.get(elementId) : undefined;
+          const element = delayedRefreshElements.get(slot);
+          const contextIsStale = Boolean(
+            element &&
+            ((window.tsjs?.navGeneration ?? 0) !== refreshGeneration ||
+              !element.isConnected ||
+              document.getElementById(element.id) !== element)
+          );
+          const suppress = Boolean(
+            token && window.tsjs && consumePublisherFirstImpressionDelivery(window.tsjs, token)
+          );
+          if (contextIsStale) {
+            callbackFilteredSlots.add(slot);
+          } else if (suppress) {
+            callbackFilteredSlots.add(slot);
+            callbackSuppressedSlots.add(slot);
+          }
+        }
+        callbackSuppressedSlots.forEach(prepareSuppressedPublisherSlot);
+
+        const completedSlots = remainingSlots.filter((slot) => !callbackFilteredSlots.has(slot));
+        if (completedSlots.length === 0) return;
+        const completedAdUnitCodes = refreshAdUnitCodes.filter(
+          (_code, index) => !callbackFilteredSlots.has(auctionSlots[index])
+        );
+        if (applyTargeting) {
+          try {
+            pbjs.setTargetingForGPTAsync?.(completedAdUnitCodes);
+          } catch (error) {
+            log.error('[tsjs-prebid] refresh targeting failed', error);
+          }
+        }
+        completedSlots.forEach(consumeGptPublisherRefreshSuppression);
+        recordPrebidRefreshForDiagnostics(completedSlots);
+        // Preserve the publisher's original refresh form unless one losing
+        // first-impression slot was filtered. A delayed bare call must also
+        // become explicit so slots added after the auction snapshot cannot join.
+        const completedForwardedSlots =
+          slots === undefined || callbackFilteredSlots.size > 0 ? completedSlots : forwardedSlots;
+        dispatchPrebidRefresh(originalRefresh, completedForwardedSlots, opts);
+      }
+
+      try {
+        pbjs.requestBids({
+          adUnits,
+          bidsBackHandler: () => completeRefresh(true),
+          timeout: timeoutMs,
+        });
+        // A one-shot watchdog completes the GAM request even if Prebid never
+        // invokes its callback. Apply any bids available at that point before
+        // refreshing because Prebid's own timeout completion may run later.
+        if (!completed) {
+          fallbackTimer = setTimeout(() => completeRefresh(true), timeoutMs);
+        }
+      } catch (error) {
+        log.error('[tsjs-prebid] refresh auction failed', error);
+        completeRefresh(false);
+      }
     };
 
     log.info('[tsjs-prebid] GPT refresh handler installed');
@@ -811,25 +2872,13 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 }
 
 /**
- * Configure Prebid.js userID modules for identity warm-up.
+ * Configure identity sync behavior for the generated Prebid User ID modules.
  *
- * Runs post-window.load (called from installPrebidNpm after setup).
- * Writes identity tokens to 1P cookies so the next server-side request
- * can harvest them for EC graph enrichment.
- *
- * **Current state:** This function only configures `pbjs.userSync` settings.
- * It does NOT import or register any userID modules. Actual module imports
- * (ID5, sharedID, LiveRamp ATS, Lockr) must be added to this bundle explicitly
- * — there is currently no `_userIdModules.generated.ts` build step.
- * Track as Phase B follow-up: add `TSJS_PREBID_USER_ID_MODULES` handling to
- * `build-all.mjs` (similar to `TSJS_PREBID_ADAPTERS`) and import generated file.
+ * The external bundle generator statically imports the selected modules into
+ * its generated entry. This post-window-load configuration controls when
+ * those modules synchronize identities; it does not select or register modules.
  */
 export function installUserIdModules(): void {
-  // NOTE: No userID module imports exist yet. `_userIdModules.generated.ts` and
-  // `TSJS_PREBID_USER_ID_MODULES` handling in `build-all.mjs` are not implemented.
-  // This function only configures pbjs.userSync settings; actual module registration
-  // requires the Phase B follow-up described in the docblock above.
-  // Configure sync behavior so modules will run post-window.load when added.
   try {
     pbjs.setConfig({
       userSync: {
@@ -924,20 +2973,26 @@ function syncPrebidEidsCookie(): void {
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
-  installRefreshHandler();
-  // The slim-Prebid lazy loader appends this bundle from a window.load
-  // handler, so `load` may already have fired by the time this code runs —
-  // waiting for it again would skip user ID setup entirely on that path.
-  if (document.readyState === 'complete') {
-    installUserIdModules();
-  } else {
-    window.addEventListener(
-      'load',
-      () => {
-        installUserIdModules();
-      },
-      { once: true }
-    );
+  // When the external bundle failed to load, installPrebidNpm bailed out and
+  // pbjs.requestBids is undefined. Installing the refresh handler anyway
+  // would clear TS-applied GPT targeting on every publisher refresh and then
+  // fail to run the replacement auction — leave GPT untouched instead.
+  if (hasPrebidJsApi()) {
+    installRefreshHandler();
+    // The slim-Prebid lazy loader appends this bundle from a window.load
+    // handler, so `load` may already have fired by the time this code runs —
+    // waiting for it again would skip user ID setup entirely on that path.
+    if (document.readyState === 'complete') {
+      installUserIdModules();
+    } else {
+      window.addEventListener(
+        'load',
+        () => {
+          installUserIdModules();
+        },
+        { once: true }
+      );
+    }
   }
 }
 

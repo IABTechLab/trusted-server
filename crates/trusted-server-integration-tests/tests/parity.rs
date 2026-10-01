@@ -8,6 +8,8 @@
 
 // Both adapters define `TrustedServerApp` — alias both to avoid name collision.
 // axum::http re-exports from the `http` crate, so HeaderMap types are identical.
+use std::sync::Arc;
+
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
@@ -19,6 +21,7 @@ use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::nextjs_auction;
 
 /// Shared test settings for all adapters.
 ///
@@ -722,28 +725,34 @@ async fn auction_not_challenged_by_auth_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_bids_options_preflight_denied_parity() {
-    // OPTIONS /__ts/page-bids is a CORS preflight to a side-effecting endpoint.
+    // OPTIONS /_ts/page-bids is a CORS preflight to a side-effecting endpoint.
     // Every adapter must refuse it with 403 rather than proxy it to the origin:
     // a permissive origin preflight would let a cross-site page defeat the GET
     // handler's `X-TSJS-Page-Bids` gate and trigger real auctions in a visitor's
     // browser. The denial is unconditional (independent of creative-opportunity
     // configuration), so all adapters must agree on 403.
-    let (axum_status, _) = axum_options("/__ts/page-bids").await;
-    let (cf_status, _) = cf_options("/__ts/page-bids").await;
-    let (spin_status, _) = spin_options("/__ts/page-bids").await;
+    //
+    // The deprecated `/__ts/page-bids` alias routes to the same handler, so it
+    // must deny the preflight identically — an alias that fell through to the
+    // origin would reopen the hole the canonical path closes.
+    for path in ["/_ts/page-bids", "/__ts/page-bids"] {
+        let (axum_status, _) = axum_options(path).await;
+        let (cf_status, _) = cf_options(path).await;
+        let (spin_status, _) = spin_options(path).await;
 
-    assert_eq!(
-        axum_status, 403,
-        "Axum OPTIONS /__ts/page-bids must be denied with 403, got {axum_status}"
-    );
-    assert_eq!(
-        cf_status, 403,
-        "Cloudflare OPTIONS /__ts/page-bids must be denied with 403, got {cf_status}"
-    );
-    assert_eq!(
-        spin_status, 403,
-        "Spin OPTIONS /__ts/page-bids must be denied with 403, got {spin_status}"
-    );
+        assert_eq!(
+            axum_status, 403,
+            "Axum OPTIONS {path} must be denied with 403, got {axum_status}"
+        );
+        assert_eq!(
+            cf_status, 403,
+            "Cloudflare OPTIONS {path} must be denied with 403, got {cf_status}"
+        );
+        assert_eq!(
+            spin_status, 403,
+            "Spin OPTIONS {path} must be denied with 403, got {spin_status}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -936,6 +945,203 @@ async fn legacy_admin_aliases_are_denied_locally_not_proxied() {
                 !spin_headers.contains_key("www-authenticate"),
                 "Spin legacy {method} {alias} must not issue an admin auth challenge"
             );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cache_purge_not_implemented_parity() {
+    // The template cache is Fastly-backed, so the other three adapters answer 501 rather
+    // than letting the path fall through to the publisher origin and 404 — a CMS purge
+    // webhook needs to tell "not supported here" from "no such endpoint".
+    let body = r#"{"scope":"all"}"#;
+
+    let (axum_status, _) = axum_authorized_json("POST", "/_ts/admin/cache/purge", body).await;
+    let (cf_status, _) = cf_authorized_json("POST", "/_ts/admin/cache/purge", body).await;
+    let (spin_status, _) = spin_authorized_json("POST", "/_ts/admin/cache/purge", body).await;
+
+    assert_eq!(axum_status, 501, "Axum must answer cache purge with 501");
+    assert_eq!(
+        cf_status, 501,
+        "Cloudflare must answer cache purge with 501"
+    );
+    assert_eq!(spin_status, 501, "Spin must answer cache purge with 501");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cache_purge_unauthenticated_parity() {
+    // Guards the test above from passing for the wrong reason. Without credentials the
+    // path must 401, which proves the 501s were reached through auth rather than being
+    // the 401s of a probe that never arrived at a handler.
+    let body = r#"{"scope":"all"}"#;
+
+    let (axum_status, _) = axum_post_headers("/_ts/admin/cache/purge", body).await;
+    let (cf_status, _) = cf_post_headers("/_ts/admin/cache/purge", body).await;
+    let (spin_status, _) = spin_post_headers("/_ts/admin/cache/purge", body).await;
+
+    for (adapter, status) in [
+        ("Axum", axum_status),
+        ("Cloudflare", cf_status),
+        ("Spin", spin_status),
+    ] {
+        assert_eq!(
+            status, 401,
+            "{adapter} must require auth on the cache purge path"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_cache_purge_rejects_credential_forwarding_methods() {
+    // The guard the Fastly route exists for, asserted cross-adapter: a method the route
+    // does not claim falls through to the publisher with the Authorization header still
+    // attached. Every method must be answered locally, never forwarded.
+    for method in ["GET", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"] {
+        let (axum_status, _) = axum_authorized_json(method, "/_ts/admin/cache/purge", "").await;
+        let (cf_status, _) = cf_authorized_json(method, "/_ts/admin/cache/purge", "").await;
+        let (spin_status, _) = spin_authorized_json(method, "/_ts/admin/cache/purge", "").await;
+
+        for (adapter, status) in [
+            ("Axum", axum_status),
+            ("Cloudflare", cf_status),
+            ("Spin", spin_status),
+        ] {
+            assert_eq!(
+                status, 501,
+                "{adapter} must answer {method} locally; a fallthrough would ship the \
+                 admin credential to the origin"
+            );
+        }
+    }
+}
+
+/// A known non-regulated location permits the fixture's server-side auction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_buffers_nextjs_auction_output() {
+    let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
+    let settings = nextjs_auction::settings();
+    let services = nextjs_auction::services(Arc::clone(&client));
+    let routers = [
+        (
+            "Axum",
+            AxumApp::routes_with_settings_and_services(settings.clone(), services.clone()),
+        ),
+        (
+            "Cloudflare",
+            CloudflareApp::routes_with_settings_and_services(settings.clone(), services.clone()),
+        ),
+        (
+            "Spin",
+            SpinApp::routes_with_settings_and_services(settings, services),
+        ),
+    ];
+    let mut expected_html = None;
+    for (adapter, router) in routers {
+        // Reset per adapter so each count is independently meaningful rather
+        // than a running total that a positional assertion cannot distinguish.
+        client.reset_auction_requests();
+        let request = request_builder()
+            .method("GET")
+            .uri("https://test-publisher.example.com/article")
+            .header("host", "test-publisher.example.com")
+            .header("accept", "text/html")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build publisher navigation");
+        let response = router
+            .expect("should build router with fixed services")
+            .oneshot(request)
+            .await
+            .expect("should serve publisher navigation");
+        assert_eq!(
+            response.status(),
+            200,
+            "{adapter} should serve fixture HTML"
+        );
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should buffer adapter output");
+        let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
+        assert_eq!(
+            client.auction_requests(),
+            1,
+            "{adapter} should dispatch exactly one auction"
+        );
+        let document = scraper::Html::parse_document(&html);
+        let scripts = scraper::Selector::parse("script").expect("should parse script selector");
+        let payload: String = document
+            .select(&scripts)
+            .filter_map(|script| {
+                let text: String = script.text().collect();
+                let array = text
+                    .strip_prefix("self.__next_f.push(")?
+                    .strip_suffix(')')?;
+                let push: serde_json::Value =
+                    serde_json::from_str(array).expect("should retain valid Flight push JSON");
+                Some(
+                    push[1]
+                        .as_str()
+                        .expect("should retain Flight string payload")
+                        .to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            payload,
+            nextjs_auction::expected_rewritten_flight_payload(),
+            "{adapter} should rewrite the URL and T length while preserving complete payload bytes"
+        );
+        assert!(
+            !html.contains("origin.test-publisher.example.com/app"),
+            "{adapter} should remove the origin URL"
+        );
+        let first = html
+            .find("self.__next_f.push")
+            .expect("should retain first RSC script");
+        let between = html
+            .find("window.between=true")
+            .expect("should retain intervening script");
+        let last = html
+            .rfind("self.__next_f.push")
+            .expect("should retain last RSC script");
+        assert!(
+            first < between && between < last,
+            "{adapter} should preserve script order"
+        );
+        let bids = html
+            .find("var b=JSON.parse(")
+            .expect("should inject auction bids");
+        let suffix = html.find("<p>suffix</p>").expect("should retain suffix");
+        let close = html
+            .rfind("</body>")
+            .expect("should retain structural close");
+        assert!(
+            suffix < bids && bids < close,
+            "{adapter} should inject bids at the structural body close"
+        );
+        assert!(
+            html.contains("fixture-creative"),
+            "{adapter} should include deterministic auction creative"
+        );
+        assert!(
+            html[bids..].ends_with("</script></body></html>"),
+            "{adapter} should place bid markup immediately before the body close"
+        );
+        assert!(
+            !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
+            "{adapter} should not leak placeholders: {html}"
+        );
+        // Cross-adapter agreement only. The bytes that matter — the reconstructed
+        // Flight payload with its recomputed T length, script order, and the
+        // body-close tail — are pinned absolutely above, so a shared-core
+        // regression is caught there rather than here.
+        if let Some(expected) = &expected_html {
+            assert_eq!(
+                &html, expected,
+                "{adapter} should match the complete buffered Axum HTML"
+            );
+        } else {
+            expected_html = Some(html);
         }
     }
 }

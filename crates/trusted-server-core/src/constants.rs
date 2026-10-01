@@ -1,6 +1,8 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
+/// Short-lived signed proof that the current EC row has every pull-partner UID.
+pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
@@ -12,6 +14,8 @@ pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
 pub const HEADER_X_TS_EIDS: HeaderName = HeaderName::from_static("x-ts-eids");
 pub const HEADER_X_TS_EC_CONSENT: HeaderName = HeaderName::from_static("x-ts-ec-consent");
 pub const HEADER_X_TS_EIDS_TRUNCATED: HeaderName = HeaderName::from_static("x-ts-eids-truncated");
+pub const HEADER_X_TS_ERROR: HeaderName = HeaderName::from_static("x-ts-error");
+pub const HEADER_X_TS_JS_ASSET_PROXY: HeaderName = HeaderName::from_static("x-ts-js-asset-proxy");
 pub const HEADER_X_CONSENT_ADVERTISING: HeaderName =
     HeaderName::from_static("x-consent-advertising");
 pub const HEADER_X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -44,9 +48,9 @@ pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");
 
 /// TS-internal header names that must NOT be forwarded to downstream third-party services.
 ///
-/// These headers are used internally by Trusted Server for identity, geo-enrichment,
+/// These headers are used internally by Trusted Server for identification, geo-enrichment,
 /// debugging, and compression hints. Leaking them to external origins could expose
-/// user tracking data and internal implementation details.
+/// data and internal implementation details.
 ///
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.

@@ -22,6 +22,9 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
+//! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
+//! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
+//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -32,7 +35,8 @@
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
 //! | GET | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
-//! | GET, POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
+//! | GET | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
+//! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
 //! | GET | `/` and `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | `/` and `/{*rest}` | integration proxy or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | named paths above | publisher fallback (legacy parity for non-primary methods) |
@@ -48,7 +52,8 @@
 //! `route_request` (tracked in issue #495):
 //!
 //! - [`build_ec_request_state`] runs before every dispatched route (except
-//!   batch-sync, which uses Bearer auth) and reproduces the legacy
+//!   batch-sync, which uses Bearer auth, and the read-only admin diagnostics)
+//!   and reproduces the legacy
 //!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
 //!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
 //! - `handle_auction` and integration proxy dispatch receive the same
@@ -65,10 +70,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Publisher responses** are buffered (bounded by
-//!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
-//!   Asset responses are streamed straight to the client (see
-//!   [`dispatch_asset_fallback`]), matching legacy.
+//! - **Publisher responses** keep Fastly origin bodies streaming through the
+//!   `EdgeZero` response body when the body is processable or pass-through.
+//!   Adapters without streaming-body support still use the bounded buffered
+//!   finalizer.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -85,8 +90,10 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_adapter_fastly::runtime_env_config;
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -95,49 +102,74 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
+};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+};
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore, open_kv_store,
+    FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeStoreConfig {
+    pub(crate) config_store_name: StoreName,
+    pub(crate) config_key: String,
+    pub(crate) secret_store_name: StoreName,
+}
+
+impl RuntimeStoreConfig {
+    pub(crate) fn from_env(env: &EnvConfig) -> Self {
+        Self {
+            config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
+            config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
+            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
+        }
+    }
+}
 
 /// Application state built once per Wasm instance and shared for its lifetime.
 ///
@@ -157,14 +189,22 @@ pub(crate) struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
-pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store()?)
+pub(crate) fn build_state(
+    stores: &RuntimeStoreConfig,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_from_settings(load_settings_from_config_store(stores)?)
 }
 
-pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+pub(crate) fn load_settings_from_config_store(
+    stores: &RuntimeStoreConfig,
+) -> Result<Settings, Report<TrustedServerError>> {
+    get_settings_from_config_store(
+        &FastlyPlatformConfigStore,
+        &FastlyPlatformSecretStore,
+        &stores.config_store_name,
+        &stores.config_key,
+        &stores.secret_store_name,
+    )
 }
 
 pub(crate) fn build_state_from_settings(
@@ -172,8 +212,10 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -193,36 +235,6 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
             "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
         );
     }
-}
-
-/// Resolves per-request consent KV store services for routes that read consent data.
-///
-/// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
-/// intentional hardening over the legacy `route_request` path, which builds
-/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
-/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
-/// routes unavailable rather than proceeding without consent.
-///
-/// # Errors
-///
-/// Returns an error when the configured consent store cannot be opened.
-pub(crate) fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +267,11 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
+        // Constructed unconditionally, but only read when the assembly mode is a
+        // shared-template one — which defaults to Inline, so this is inert until an
+        // operator opts in.
+        .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
+        .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -407,6 +424,13 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
+                // Orphan-recovery eligibility is intentionally left false here.
+                // Authorizing it during generic pre-routing would let named
+                // routes and request-filter short circuits (e.g. a DataDome
+                // challenge) reach EC finalization and rotate an identity off a
+                // non-publisher response. It is granted only inside the
+                // publisher fallback, after filters pass and the origin start
+                // succeeds — see `dispatch_fallback`.
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
@@ -523,6 +547,50 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
+    // An operator cache purge is not a reader request: running the EC lifecycle would
+    // attach finalization state and could ingest the operator's cookies into KV.
+    if matches!(handler, NamedRouteHandler::AdminCachePurge) {
+        let principal = trusted_server_core::auth::authenticated_username(&req);
+        let response = trusted_server_core::cache_purge::handle_cache_purge(
+            &services,
+            req,
+            principal.as_deref(),
+        )
+        .await
+        .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
+    // These diagnostics are read-only. Running the normal EC lifecycle would
+    // attach finalization state and could ingest request cookies into KV after
+    // the handler returns, violating that contract.
+    if matches!(
+        handler,
+        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
+    ) {
+        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
+            .and_then(|registry| match handler {
+                NamedRouteHandler::AdminEcLookup => {
+                    // Deliberately do not use an EC request-state graph: that
+                    // copy is bot-gated, while operators use curl for this
+                    // authenticated diagnostic.
+                    let kv = crate::maybe_identity_graph(&state.settings);
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                }
+                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
+                _ => unreachable!("admin diagnostics should use early dispatch"),
+            })
+            .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
+    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return Ok(http_error(&report));
+    }
+
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -565,6 +633,12 @@ async fn run_named_route(
         }
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
+            unreachable!("admin diagnostics should be handled before EC setup")
+        }
+        NamedRouteHandler::AdminCachePurge => {
+            unreachable!("cache purge should be handled before EC setup")
+        }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
@@ -588,10 +662,7 @@ async fn run_named_route(
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
-            // The auction reads consent data, so the consent KV store must be
-            // available — fail closed with 503 when it is configured but
-            // cannot be opened, matching legacy behavior.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            ec.ec_context.set_eid_sync_source(EidSyncSource::Auction);
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -603,8 +674,8 @@ async fn run_named_route(
                 &state.orchestrator,
                 ec.kv_graph.as_ref(),
                 registry_ref,
-                &ec.ec_context,
-                &consent_services,
+                &mut ec.ec_context,
+                services,
                 req,
             )
             .await
@@ -616,10 +687,6 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            // Like the auction, page-bids reads consent data, so the consent KV
-            // store must be available — fail closed with 503 when configured but
-            // unopenable, matching legacy.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -633,10 +700,10 @@ async fn run_named_route(
             };
             handle_page_bids(
                 &state.settings,
-                &consent_services,
+                services,
                 ec.kv_graph.as_ref(),
                 auction,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 req,
             )
             .await
@@ -699,8 +766,19 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Response {
+    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+        return response;
+    }
+
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+
+    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return http_error(&report);
+    }
 
     let mut ec = build_ec_request_state(&state.settings, services, &req);
     if let Some(report) = ec.setup_error.take() {
@@ -719,12 +797,11 @@ async fn dispatch_fallback(
     };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
-        handle_tsjs_dynamic(&req, &state.registry)
+        handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
     } else if state.registry.has_route(&method, &path) {
-        // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
-        // Only the handle_publisher_request branch below routes through
-        // buffer_publisher_response_async. Integration responses are small in practice
-        // and the EdgeZero flag is off by default; extend the cap here if that changes.
+        // Integration-proxy responses are not bounded by
+        // publisher.max_buffered_body_bytes. Publisher fallback below uses the
+        // publisher-specific streaming finalizer instead.
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -758,8 +835,12 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        if ec.is_real_browser
-            && is_navigation_request(&req)
+        let is_navigation = is_navigation_request(&req);
+        if is_navigation {
+            ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
+        }
+        let is_publisher_navigation = ec.is_real_browser && is_navigation;
+        if is_publisher_navigation
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -767,49 +848,47 @@ async fn dispatch_fallback(
             log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
 
-        // Publisher pages read consent data, so the consent KV store must be
-        // available — fail closed with 503 when it is configured but cannot
-        // be opened, matching legacy behavior.
-        match runtime_services_for_consent_route(&state.settings, services) {
-            Ok(publisher_services) => {
-                // Run the server-side auction with the configured creative-
-                // opportunity slots and collect the dispatched bids in the
-                // buffered finalize (`buffer_publisher_response_async`), matching
-                // the legacy streaming path. `handle_publisher_request` matches the
-                // slots against the request path. The partner registry plus the
-                // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
-                // server-side EIDs, same as the legacy auction.
-                let slots = state.settings.creative_opportunity_slots();
-                match PartnerRegistry::from_config(&state.settings.ec.partners) {
-                    Ok(partner_registry) => {
-                        let auction = AuctionDispatch {
-                            orchestrator: &state.orchestrator,
-                            slots,
-                            registry: Some(&partner_registry),
-                        };
-                        match handle_publisher_request(
-                            &state.settings,
-                            &publisher_services,
-                            ec.kv_graph.as_ref(),
-                            &mut ec.ec_context,
-                            auction,
-                            req,
+        // Run the server-side auction with the configured creative-
+        // opportunity slots and collect dispatched bids from the lazy
+        // publisher body stream. `handle_publisher_request` matches the
+        // slots against the request path. The partner registry plus the
+        // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
+        // server-side EIDs, same as the legacy auction.
+        let slots = state.settings.creative_opportunity_slots();
+        match PartnerRegistry::from_config(&state.settings.ec.partners) {
+            Ok(partner_registry) => {
+                let auction = AuctionDispatch {
+                    orchestrator: &state.orchestrator,
+                    slots,
+                    registry: Some(&partner_registry),
+                };
+                match handle_publisher_request(
+                    &state.settings,
+                    services,
+                    ec.kv_graph.as_ref(),
+                    &mut ec.ec_context,
+                    auction,
+                    req,
+                    EdgeCacheHeader::SurrogateControl,
+                )
+                .await
+                {
+                    Ok(pub_response) => {
+                        // Origin start succeeded on the sole publisher-page
+                        // path. Authorize orphan recovery only for real-browser
+                        // document navigations so named routes, integration
+                        // proxies, and filter short circuits cannot rotate an
+                        // identity.
+                        ec.ec_context.set_recovery_eligible(is_publisher_navigation);
+                        publisher_response_into_streaming_response(
+                            pub_response,
+                            &method,
+                            Arc::clone(&state.settings),
+                            state.registry.as_ref(),
+                            Arc::clone(&state.orchestrator),
+                            services.clone(),
                         )
                         .await
-                        {
-                            Ok(pub_response) => {
-                                buffer_publisher_response_async(
-                                    pub_response,
-                                    &method,
-                                    &state.settings,
-                                    &state.registry,
-                                    &state.orchestrator,
-                                    &publisher_services,
-                                )
-                                .await
-                            }
-                            Err(e) => Err(e),
-                        }
                     }
                     Err(e) => Err(e),
                 }
@@ -987,6 +1066,9 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
+    AdminEcLookup,
+    AdminEidsLookup,
+    AdminCachePurge,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -1008,6 +1090,11 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
+/// Every method an admin route must claim to keep non-primary methods from falling
+/// through to the publisher with the `Authorization` header still attached.
+///
+/// Named for the legacy `/admin/*` aliases it was introduced for, and reused by every
+/// route with the same requirement here and in the Axum and Spin adapters.
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::GET,
     Method::POST,
@@ -1038,6 +1125,34 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/keys/deactivate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
+    },
+    // Every method is claimed, not just POST. A method this route did not claim would
+    // fall through to the publisher, and `enforce_basic_auth` leaves the `Authorization`
+    // header in place, so a GET would ship the shared admin credential to the origin.
+    // The handler answers the non-POST methods with 405 itself.
+    NamedRoute {
+        path: "/_ts/admin/cache/purge",
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
+        handler: NamedRouteHandler::AdminCachePurge,
+    },
+    // Admin EC lookup: the bare route reads the EC ID from the caller's
+    // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
+    NamedRoute {
+        path: "/_ts/admin/ec",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEcLookup,
+    },
+    NamedRoute {
+        path: "/_ts/admin/ec/{id}",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEcLookup,
+    },
+    // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
+    // an ingestion preview. Pure request inspection — no KV access.
+    NamedRoute {
+        path: "/_ts/admin/eids",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEidsLookup,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1083,7 +1198,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
     // preflight guard for this side-effecting endpoint.
     NamedRoute {
-        path: "/__ts/page-bids",
+        path: PAGE_BIDS_PATH,
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::PageBids,
+    },
+    // Deprecated double-underscore alias. tsjs bundles served before the
+    // `/_ts/page-bids` rename keep requesting this path from already-loaded
+    // pages and browser caches; dropping it would strand SPA navigations
+    // without ads until those bundles age out. See `PAGE_BIDS_LEGACY_PATH`;
+    // removal is tracked by IABTechLab/trusted-server#970.
+    NamedRoute {
+        path: PAGE_BIDS_LEGACY_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
     },
@@ -1104,6 +1229,9 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     },
     NamedRoute {
         path: "/first-party/proxy-rebuild",
+        // GET serves the click guard's navigation fallback: the creative iframe
+        // is an opaque origin (sandbox without `allow-same-origin`), so its JSON
+        // POST is blocked by CORS and the guard navigates here for a 302 instead.
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
     },
@@ -1136,15 +1264,17 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state();
+    pub(crate) fn build_app_with_state(
+        stores: &RuntimeStoreConfig,
+    ) -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state(stores);
         let mut app = App::with_name(router, Self::name());
         Self::configure(&mut app);
         (app, state)
     }
 
-    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state() {
+    fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state(stores) {
             Ok(state) => state,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
@@ -1202,29 +1332,59 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        Self::router_with_state().0
+        let runtime_env = runtime_env_config(Self::stores());
+        let stores = RuntimeStoreConfig::from_env(&runtime_env);
+        Self::router_with_state(&stores).0
+    }
+
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            kv: Some(StoreMetadata {
+                default: "trusted_server_kv",
+                ids: &["trusted_server_kv"],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, TrustedServerApp, build_state_from_settings,
-        startup_error_router,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
+        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
+        build_state_from_settings, compile_auction_plan, handle_publisher_request,
+        publisher_response_into_streaming_response, startup_error_router,
     };
+    use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
-    use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::env_config::EnvConfig;
+    use edgezero_core::http::{
+        HeaderValue, Method, Request, Response, StatusCode, header, request_builder,
+    };
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
 
     use error_stack::Report;
     use futures::executor::block_on;
-    use serde_json::json;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
@@ -1235,53 +1395,86 @@ mod tests {
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
         PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
+        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
+        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
 
-    fn settings_with_missing_consent_store() -> Settings {
-        Settings::from_toml(
-            r#"
-                [[handlers]]
-                path = "^/(_ts/)?admin"
-                username = "admin"
-                password = "admin-pass"
+    #[test]
+    fn hooks_store_metadata_matches_edgezero_manifest() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../../edgezero.toml"))
+            .expect("should parse edgezero manifest");
+        let manifest_stores = manifest
+            .get("stores")
+            .and_then(toml::Value::as_table)
+            .expect("manifest should declare stores");
+        let metadata = TrustedServerApp::stores();
 
-                [publisher]
-                domain = "test-publisher.com"
-                cookie_domain = ".test-publisher.com"
-                origin_url = "https://origin.test-publisher.com"
-                proxy_secret = "unit-test-proxy-secret"
+        for (kind, runtime_store) in [
+            (
+                "config",
+                metadata.config.expect("should declare config stores"),
+            ),
+            ("kv", metadata.kv.expect("should declare KV stores")),
+            (
+                "secrets",
+                metadata.secrets.expect("should declare secret stores"),
+            ),
+        ] {
+            let manifest_store = manifest_stores
+                .get(kind)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("manifest should declare {kind} stores"));
+            let manifest_default = manifest_store
+                .get("default")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare a default"));
+            let manifest_ids = manifest_store
+                .get("ids")
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare ids"))
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_else(|| panic!("manifest {kind} store ids should be strings"));
 
-                [proxy]
-                allowed_domains = ["*.example", "*.example.com"]
+            assert_eq!(runtime_store.default, manifest_default);
+            assert_eq!(runtime_store.ids, manifest_ids);
+        }
+    }
 
-                [ec]
-                passphrase = "test-passphrase-at-least-32-bytes!!"
+    #[test]
+    fn runtime_store_config_maps_logical_store_names_and_config_key() {
+        let env = EnvConfig::from_vars([
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                "physical_config",
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+                "active_config",
+            ),
+            (
+                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                "ts_secrets",
+            ),
+        ]);
 
-                [request_signing]
-                enabled = false
-                config_store_id = "test-config-store-id"
-                secret_store_id = "test-secret-store-id"
+        let stores = RuntimeStoreConfig::from_env(&env);
 
-                [consent]
-                consent_store = "missing-consent-store"
+        assert_eq!(stores.config_store_name.as_ref(), "physical_config");
+        assert_eq!(stores.config_key, "active_config");
+        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
+    }
 
-                [integrations.prebid]
-                enabled = true
-                server_url = "https://test-prebid.com/openrtb2/auction"
-                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+    #[test]
+    fn runtime_store_config_uses_logical_defaults_without_overrides() {
+        let stores = RuntimeStoreConfig::from_env(&EnvConfig::default());
 
-                [integrations.datadome]
-                enabled = true
-
-                [auction]
-                enabled = true
-                providers = ["prebid"]
-                timeout_ms = 2000
-            "#,
-        )
-        .expect("should parse EdgeZero app test settings")
+        assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
+        assert_eq!(stores.config_key, "trusted_server_config");
+        assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
@@ -1335,12 +1528,14 @@ mod tests {
 
             [integrations.prebid]
             enabled = true
-            server_url = "https://test-prebid.com/openrtb2/auction"
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true
-            providers = ["prebid"]
+            [auction.providers.prebid]
+            protocol = "openrtb-2.6"
+            profile = "prebid-server"
+            endpoint = "https://test-prebid.com/openrtb2/auction"
             timeout_ms = 2000
             "#,
         )
@@ -1352,6 +1547,36 @@ mod tests {
         TrustedServerApp::routes_for_state(&state)
     }
 
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+        let template = format!(
+            "<html><body>article{}</body></html>",
+            trusted_server_core::publisher::AD_ASSEMBLY_SEAM
+        );
+        let fragment = b"<script>reader state</script>";
+        let assembled = services
+            .template_assembler()
+            .assemble(template.as_bytes(), fragment)
+            .expect("Fastly services should provide ESI assembly");
+
+        assert_eq!(
+            assembled,
+            template
+                .replace(
+                    trusted_server_core::publisher::AD_ASSEMBLY_SEAM,
+                    std::str::from_utf8(fragment).expect("fragment should be UTF-8")
+                )
+                .into_bytes()
+        );
+    }
+
     /// Builds a router whose `AppState` uses a registry containing the given
     /// request filters (and no routes), so dispatch-level request-filter
     /// behavior can be exercised without a real integration.
@@ -1359,8 +1584,13 @@ mod tests {
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> RouterService {
         let settings = test_settings();
-        let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
-            .expect("should build orchestrator");
+        let plan = Arc::new(
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
+        );
+        let orchestrator =
+            trusted_server_core::auction::build_orchestrator_with_plan(plan, &settings)
+                .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
@@ -1444,6 +1674,34 @@ mod tests {
                 response_headers: Vec::new(),
             }))
         }
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let mut settings = test_settings();
+        settings.auction.providers.clear();
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        );
+
+        let state = build_state_from_settings(settings)
+            .expect("Fastly startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Fastly startup registry should expose the APS renderer"
+        );
     }
 
     #[test]
@@ -1639,6 +1897,120 @@ mod tests {
     }
 
     #[test]
+    fn cache_purge_claims_every_method_that_could_reach_the_publisher() {
+        // The guard this route exists behind. `enforce_basic_auth` authenticates on the raw
+        // path and leaves the `Authorization` header attached, so any method this route does
+        // not claim falls through to the publisher fallback carrying the shared admin
+        // credential to the origin. Asserted against the fallback list itself rather than a
+        // copy of it, so a method added there cannot quietly open a hole here.
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/cache/purge")
+            .expect("cache purge must be a named route");
+
+        for method in super::publisher_fallback_methods() {
+            assert!(
+                route.primary_methods.contains(&method),
+                "{method} /_ts/admin/cache/purge must be claimed, or it reaches the publisher \
+                 with the admin credential attached"
+            );
+        }
+        assert!(matches!(route.handler, NamedRouteHandler::AdminCachePurge));
+    }
+
+    #[test]
+    fn cache_purge_has_no_legacy_unauthenticated_alias() {
+        // The production basic-auth regex is `^/_ts/admin`. An `/admin/...` spelling would
+        // not match it, so it must not exist at all.
+        assert!(
+            !NAMED_ROUTES
+                .iter()
+                .any(|route| route.path == "/admin/cache/purge"),
+            "an /admin-prefixed alias would sit outside the basic-auth regex"
+        );
+    }
+
+    #[test]
+    fn admin_ec_lookup_routes_are_registered() {
+        // Both lookup shapes must be explicitly routed to the admin EC
+        // handler: the bare cookie-based route and the parameterized route.
+        // Leaving either unrouted would fall through to the publisher
+        // fallback, forwarding the caller's `Authorization` header to the
+        // origin.
+        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}"] {
+            let route = NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("{path} must be a named route"));
+            assert!(
+                matches!(route.handler, NamedRouteHandler::AdminEcLookup),
+                "{path} must map to the admin EC lookup handler"
+            );
+            assert_eq!(
+                route.primary_methods,
+                &[Method::GET],
+                "{path} must have GET as its only primary method"
+            );
+        }
+
+        let eids_route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/eids")
+            .expect("should register /_ts/admin/eids as a named route");
+        assert!(
+            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
+            "/_ts/admin/eids must map to the admin EIDs lookup handler"
+        );
+        assert_eq!(
+            eids_route.primary_methods,
+            &[Method::GET],
+            "/_ts/admin/eids must have GET as its only primary method"
+        );
+    }
+
+    #[test]
+    fn page_bids_serves_canonical_path_and_deprecated_alias() {
+        // The SPA re-auction endpoint lives at the canonical single-underscore
+        // `/_ts/page-bids`, matching every other internal route. The deprecated
+        // `/__ts/page-bids` alias must stay registered to the same handler with
+        // the same methods until pre-rename tsjs bundles age out of browser
+        // caches — dropping it would leave those clients without ads on SPA
+        // navigations.
+        //
+        // The paths are literals, not `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`.
+        // Looking a route up by the same const it was registered with is
+        // tautological: it keeps passing if the const's value changes, which is
+        // exactly the break that would silently desync the server from the tsjs
+        // client's hardcoded fetch path. Pin the consts to their literals too so
+        // a rename has to be deliberate.
+        assert_eq!(
+            PAGE_BIDS_PATH, "/_ts/page-bids",
+            "canonical page-bids path must match the path tsjs fetches"
+        );
+        assert_eq!(
+            PAGE_BIDS_LEGACY_PATH, "/__ts/page-bids",
+            "legacy alias must match the path pre-rename tsjs bundles fetch"
+        );
+
+        for path in ["/_ts/page-bids", "/__ts/page-bids"] {
+            let route = NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("{path} should be registered"));
+
+            assert!(
+                matches!(route.handler, NamedRouteHandler::PageBids),
+                "{path} must map to the page-bids handler"
+            );
+            assert_eq!(
+                route.primary_methods,
+                &[Method::GET, Method::OPTIONS],
+                "{path} must handle GET and OPTIONS directly, not fall through to the publisher"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
         // Regression for the credential-leak finding: with a production-shaped
         // config (only `^/_ts/admin` is auth-gated, so `/admin/keys/*` is NOT
@@ -1684,6 +2056,93 @@ mod tests {
                     response.status(),
                     StatusCode::NOT_FOUND,
                     "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let valid_paths = [
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}"),
+            "/_ts/admin/eids".to_owned(),
+        ];
+
+        for path in valid_paths {
+            for method in [
+                Method::POST,
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ] {
+                let request = request_builder()
+                    .method(method.clone())
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("sensitive-admin-body"))
+                    .expect("should build authenticated admin request");
+                let response = route(&router, request);
+
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ALLOW)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("GET")
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-store")
+                );
+            }
+        }
+
+        for path in [
+            "/_ts/admin/ec/".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}/extra"),
+            "/_ts/admin/eids/".to_owned(),
+            "/_ts/admin/eids/extra".to_owned(),
+            "/_ts/admin/eids.json".to_owned(),
+            "/_ts/admin/ec;foo".to_owned(),
+            format!("/_ts/admin/ec%2F{ec_id}"),
+            // Percent-encoded separators match the `^/_ts/admin` basic-auth
+            // handler but not a literal-slash namespace check, so they must be
+            // reserved before publisher fallback forwards credentials upstream.
+            "/_ts/admin%2Fec".to_owned(),
+            "/_ts/admin%2fec".to_owned(),
+            // Retired non-`/_ts` alias namespace: only the two exact paths are
+            // routed to a local deny, so descendants and encoded separators must
+            // be reserved at the shared fallback boundary.
+            "/admin/keys".to_owned(),
+            "/admin/keys/rotate/extra".to_owned(),
+            "/admin/keys%2Frotate".to_owned(),
+            "/admin%2fkeys/rotate".to_owned(),
+        ] {
+            for method in [Method::GET, Method::POST] {
+                let request = request_builder()
+                    .method(method)
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("sensitive-admin-body"))
+                    .expect("should build malformed admin request");
+                let response = route(&router, request);
+
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-store")
                 );
             }
         }
@@ -1844,6 +2303,95 @@ mod tests {
         );
     }
 
+    fn browser_request(method: Method, path: &str, fetch_destination: &str) -> Request {
+        let mut request = empty_request(method, path);
+        request.headers_mut().insert(
+            "sec-fetch-dest",
+            HeaderValue::from_bytes(fetch_destination.as_bytes())
+                .expect("should parse fetch destination"),
+        );
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        request
+    }
+
+    fn eid_sync_source_of(response: &Response) -> Option<EidSyncSource> {
+        response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("response should carry EC finalization state")
+            .ec_context
+            .eid_sync_source()
+    }
+
+    #[test]
+    fn dispatch_limits_returning_user_eid_sync_to_eligible_routes() {
+        let router = test_router();
+
+        let navigation = route(
+            &router,
+            browser_request(Method::GET, "/article", "document"),
+        );
+        assert_eq!(
+            eid_sync_source_of(&navigation),
+            Some(EidSyncSource::Navigation)
+        );
+
+        let mut navigation_without_browser_signals =
+            browser_request(Method::GET, "/another-article", "document");
+        navigation_without_browser_signals
+            .extensions_mut()
+            .remove::<DeviceSignals>();
+        let navigation_without_browser_signals = route(&router, navigation_without_browser_signals);
+        assert_eq!(
+            eid_sync_source_of(&navigation_without_browser_signals),
+            Some(EidSyncSource::Navigation),
+            "route classification should not depend on EC generation's browser gate"
+        );
+
+        let auction = route(&router, browser_request(Method::POST, "/auction", "empty"));
+        assert_eq!(eid_sync_source_of(&auction), Some(EidSyncSource::Auction));
+
+        let mut page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        let page_bids = route(&router, page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&page_bids),
+            Some(EidSyncSource::PageBids),
+            "an admitted SPA page-bids request should persist returning-user EID cookies"
+        );
+
+        let mut denied_page_bids_request = browser_request(Method::GET, "/_ts/page-bids", "empty");
+        denied_page_bids_request
+            .headers_mut()
+            .insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        let denied_page_bids = route(&router, denied_page_bids_request);
+        assert_eq!(
+            eid_sync_source_of(&denied_page_bids),
+            None,
+            "a denied cross-site page-bids request must not persist EID cookies"
+        );
+
+        for request in [
+            browser_request(Method::GET, "/static/tsjs=prebid", "script"),
+            browser_request(Method::GET, "/analytics.gif", "image"),
+            browser_request(Method::GET, "/integrations/prebid/bundle.js", "script"),
+        ] {
+            let response = route(&router, request);
+            assert_eq!(
+                eid_sync_source_of(&response),
+                None,
+                "static, analytics, and integration requests must not persist EID cookies"
+            );
+        }
+    }
+
     #[test]
     fn browser_device_signals_from_extension_reach_ec_finalize_state() {
         // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
@@ -1916,13 +2464,27 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = route(&router, req);
+        let response = route(&router, req);
 
         let observed = captured
             .lock()
             .expect("should lock captured client info")
             .clone()
             .expect("request filter should have observed the entry-point ClientInfo");
+        assert_eq!(
+            observed.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "request-scoped services should preserve the resolved client IP used by EC"
+        );
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EC finalization state");
+        assert_eq!(
+            finalize.ec_context.client_ip(),
+            Some("203.0.113.7"),
+            "EC should capture the resolved client IP from request-scoped services"
+        );
         assert_eq!(
             observed.tls_protocol.as_deref(),
             Some("TLSv1.3"),
@@ -1975,6 +2537,103 @@ mod tests {
     }
 
     #[test]
+    fn admin_eids_diagnostic_skips_ec_finalization() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/_ts/admin/eids")
+            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
+            )
+            .body(Body::empty())
+            .expect("should build authenticated EIDs diagnostic request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = route(&router, request);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "admin EIDs diagnostics should not attach EC finalization state"
+        );
+    }
+
+    #[test]
+    fn admin_ec_diagnostic_skips_ec_finalization() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("https://test-publisher.com/_ts/admin/ec/{ec_id}"))
+            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
+            )
+            .body(Body::empty())
+            .expect("should build authenticated EC diagnostic request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = route(&router, request);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "configured admin EC handler should run and report the unavailable test KV graph"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "admin EC diagnostics should not attach EC finalization state"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "admin EC diagnostics should not mutate the EC cookie"
+        );
+    }
+
+    #[test]
+    fn admin_ec_route_without_credentials_returns_401() {
+        let router = test_router();
+
+        let response = route(&router, empty_request(Method::GET, "/_ts/admin/ec"));
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers().contains_key(header::WWW_AUTHENTICATE),
+            "admin EC 401 should include the Basic authentication challenge"
+        );
+    }
+
+    #[test]
     fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
         // Regression guard: HEAD /first-party/proxy must reach the publisher
         // fallback, not return a router-level 405. Legacy route_request proxies
@@ -1992,27 +2651,6 @@ mod tests {
             response.status(),
             StatusCode::METHOD_NOT_ALLOWED,
             "HEAD on a named GET path should reach the publisher fallback, not return 405"
-        );
-    }
-
-    #[test]
-    fn dispatch_auction_with_missing_consent_store_returns_503() {
-        let state = app_state_for_settings(settings_with_missing_consent_store());
-        let router = TrustedServerApp::routes_for_state(&state);
-        let body = json!({ "adUnits": [] }).to_string();
-        let req = request_builder()
-            .method(Method::POST)
-            .uri("/auction")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .expect("should build auction request");
-
-        let response = route(&router, req);
-
-        assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "auction route should fail closed when configured consent store cannot be opened"
         );
     }
 
@@ -2044,54 +2682,6 @@ mod tests {
                 .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .is_none(),
             "router-level 405 bypasses FinalizeResponseMiddleware; main.rs entry-point covers this"
-        );
-    }
-
-    #[test]
-    fn edgezero_missing_consent_store_breaks_only_consent_routes() {
-        let state = app_state_for_settings(settings_with_missing_consent_store());
-        let router = TrustedServerApp::routes_for_state(&state);
-
-        let admin_response = route(
-            &router,
-            empty_request(Method::POST, "/_ts/admin/keys/rotate"),
-        );
-        assert_eq!(
-            admin_response.status(),
-            StatusCode::UNAUTHORIZED,
-            "admin auth behavior should not depend on consent KV availability"
-        );
-
-        let auction_request = request_builder()
-            .method(Method::POST)
-            .uri("/auction")
-            .body(Body::from(r#"{"adUnits":[]}"#))
-            .expect("should build auction request");
-        let auction_response = route(&router, auction_request);
-        assert_eq!(
-            auction_response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "auction should fail closed when configured consent KV cannot be opened"
-        );
-
-        let publisher_response = route(&router, empty_request(Method::GET, "/articles/example"));
-        assert_eq!(
-            publisher_response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "publisher fallback should fail closed when configured consent KV cannot be opened"
-        );
-
-        // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
-        // is wired only into the publisher and auction branches of dispatch_fallback, not into
-        // the integration proxy branch. A missing consent store must not 503 integration routes.
-        let integration_response = route(
-            &router,
-            empty_request(Method::GET, "/integrations/datadome/tags.js"),
-        );
-        assert_ne!(
-            integration_response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "integration routes should be unaffected by a missing consent KV store"
         );
     }
 
@@ -2156,6 +2746,10 @@ mod tests {
     struct FixedBackend;
 
     impl PlatformBackend for FixedBackend {
+        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
+            trusted_server_core::platform::BackendNamingPolicy::Fastly
+        }
+
         fn predict_name(
             &self,
             spec: &PlatformBackendSpec,
@@ -2172,6 +2766,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for StreamingHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
         async fn send(
             &self,
             request: PlatformHttpRequest,
@@ -2215,6 +2813,304 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    #[derive(Default)]
+    struct DispatchTemplateCache {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+    }
+
+    struct DispatchTemplateReservation {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+        key: TemplateCacheKey,
+    }
+
+    impl PlatformTemplateCacheReservation for DispatchTemplateReservation {
+        fn insert(
+            self: Box<Self>,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                self.key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformTemplateCache for DispatchTemplateCache {
+        async fn lookup_or_reserve(
+            &self,
+            key: &TemplateCacheKey,
+        ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+            if let Some(entry) = self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+            {
+                return Ok(TemplateCacheLookup::Hit(entry));
+            }
+            Ok(TemplateCacheLookup::Reserved(
+                TemplateCacheReservation::new(Box::new(DispatchTemplateReservation {
+                    entries: Arc::clone(&self.entries),
+                    key: key.clone(),
+                })),
+            ))
+        }
+
+        async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+                .ok_or(TemplateCacheMiss::NotFound)
+        }
+
+        async fn put(
+            &self,
+            key: &TemplateCacheKey,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(&key.to_cache_key());
+            Ok(())
+        }
+
+        /// A no-op beyond succeeding: this double stores by cache key, so it cannot
+        /// resolve a surrogate key to entries the way the platform does.
+        async fn purge_url_surrogate_key(&self, _key: &str) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+
+        async fn purge_all(&self) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").clear();
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DispatchOriginClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for DispatchOriginClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(Body::from(
+                    b"<html><head></head><body>origin</body></html>".as_ref(),
+                ))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    #[test]
+    fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
+        let settings = Arc::new(
+            Settings::from_toml(
+                r#"
+                    [[handlers]]
+                    path = "^/secure"
+                    username = "user"
+                    password = "pass"
+
+                    [[handlers]]
+                    path = "^/_ts/admin"
+                    username = "admin"
+                    password = "admin-pass"
+
+                    [publisher]
+                    domain = "test-publisher.com"
+                    cookie_domain = ".test-publisher.com"
+                    origin_url = "https://origin.test-publisher.com"
+                    proxy_secret = "unit-test-proxy-secret"
+
+                    [ec]
+                    passphrase = "test-secret-key-32-bytes-minimum"
+
+                    [auction]
+                    enabled = true
+                    providers = {}
+
+                    [creative_opportunities]
+                    gam_network_id = "99999"
+                    assembly_mode = "esi"
+
+                    [[creative_opportunities.slot]]
+                    id = "test-slot"
+                    page_patterns = ["/secure/article"]
+                    formats = [{ width = 728, height = 90 }]
+                "#,
+            )
+            .expect("should parse dispatch cache settings"),
+        );
+        let cache = Arc::new(DispatchTemplateCache::default());
+        let origin = Arc::new(DispatchOriginClient::default());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
+            .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let registry = Arc::new(
+            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+                .expect("should build integration registry"),
+        );
+        let orchestrator = Arc::new(
+            build_orchestrator_with_plan(plan, &settings)
+                .expect("should build auction orchestrator"),
+        );
+
+        let handler = {
+            let settings = Arc::clone(&settings);
+            let services = services.clone();
+            let registry = Arc::clone(&registry);
+            let orchestrator = Arc::clone(&orchestrator);
+            move |ctx: RequestContext| {
+                let settings = Arc::clone(&settings);
+                let services = services.clone();
+                let registry = Arc::clone(&registry);
+                let orchestrator = Arc::clone(&orchestrator);
+                Box::pin(async move {
+                    let request = ctx.into_request();
+                    let method = request.method().clone();
+                    let mut ec_context =
+                        match EcContext::read_from_request(&settings, &request, &services) {
+                            Ok(context) => context,
+                            Err(report) => return Ok(super::http_error(&report)),
+                        };
+                    let response = match handle_publisher_request(
+                        &settings,
+                        &services,
+                        None,
+                        &mut ec_context,
+                        AuctionDispatch {
+                            orchestrator: &orchestrator,
+                            slots: settings.creative_opportunity_slots(),
+                            registry: None,
+                        },
+                        request,
+                        EdgeCacheHeader::SurrogateControl,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(report) => return Ok(super::http_error(&report)),
+                    };
+                    match publisher_response_into_streaming_response(
+                        response,
+                        &method,
+                        Arc::clone(&settings),
+                        &registry,
+                        orchestrator,
+                        services,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(report) => Ok(super::http_error(&report)),
+                    }
+                }) as HandlerFuture
+            }
+        };
+        let router = RouterService::builder()
+            .middleware(crate::middleware::AuthMiddleware::new(Arc::clone(
+                &settings,
+            )))
+            .route("/secure/article", Method::GET, handler)
+            .build();
+        let authorized_request = || {
+            request_builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/secure/article")
+                .header(header::HOST, "test-publisher.com")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .body(Body::empty())
+                .expect("should build authorized navigation")
+        };
+
+        let cold = route(&router, authorized_request());
+        assert_eq!(
+            cold.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("miss-stored")
+        );
+        block_on(cold.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain cold response");
+
+        let warm = route(&router, authorized_request());
+        assert_eq!(
+            warm.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("hit")
+        );
+        block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain warm response");
+        assert_eq!(
+            origin.calls.load(Ordering::Relaxed),
+            1,
+            "the warm dispatch must not fetch the publisher origin"
+        );
     }
 
     #[test]
@@ -2283,6 +3179,36 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_fallback_streams_publisher_body_without_buffering() {
+        // Regression guard for the publisher streaming cutover (#849): a
+        // successful publisher origin fetch must hand `edgezero_main` a lazy
+        // streaming body (`Body::Stream`) so headers commit at origin first
+        // byte, rather than draining the processed page into a buffered
+        // `Body::Once`. Core tests cover the rewrite pipeline itself; this
+        // guards the adapter wiring that could silently re-buffer.
+        let settings = test_settings();
+        let state = build_state_from_settings(settings).expect("should build state");
+        let services = streaming_runtime_services();
+        let req = empty_request(Method::GET, "/article");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "publisher proxy should succeed against the streaming origin stub"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "EdgeZero publisher dispatch must attach the lazy streaming body, not buffer it"
+        );
+        assert!(
+            !response.headers().contains_key(header::CONTENT_LENGTH),
+            "processed streaming publisher responses must not carry a stale Content-Length"
+        );
+    }
+
+    #[test]
     fn dispatch_runs_request_filter_and_threads_response_effects() {
         // Regression guard for the EdgeZero request-filter bypass: the publisher
         // fallback must run the integration request-filter pipeline (DataDome
@@ -2338,6 +3264,100 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "x-challenge"),
             "the filter's response-header effect must be threaded out"
+        );
+    }
+
+    fn recovery_eligible_of(response: &Response) -> bool {
+        response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("response should carry EcFinalizeState")
+            .ec_context
+            .recovery_eligible()
+    }
+
+    fn browser_navigation_request(path: &str) -> edgezero_core::http::Request {
+        let uri = format!("https://test-publisher.com{path}");
+        let mut req = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .expect("should build request");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        req
+    }
+
+    #[test]
+    fn named_route_response_is_not_recovery_eligible() {
+        // Orphan recovery must never be authorized on a named route: it is not a
+        // publisher-page navigation, so a missing KV row must not rotate the
+        // identity there.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "named-route responses must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
+    fn filter_short_circuit_response_is_not_eligible_for_eid_persistence() {
+        // A request-filter short circuit (e.g. a DataDome challenge/block) must
+        // not authorize orphan recovery or EID persistence. No publisher page
+        // or auction was served, so the challenged request must not write EIDs.
+        // Explicit consent withdrawal remains independently eligible.
+        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
+        let navigation = route(&router, browser_navigation_request("/some-page"));
+
+        assert_eq!(
+            navigation.status(),
+            StatusCode::FORBIDDEN,
+            "the challenge filter should short-circuit navigation routing"
+        );
+        assert!(
+            !recovery_eligible_of(&navigation),
+            "a short-circuit filter response must not authorize orphan recovery"
+        );
+        assert_eq!(
+            eid_sync_source_of(&navigation),
+            None,
+            "a challenged navigation must not authorize EID persistence"
+        );
+
+        let auction = route(&router, browser_request(Method::POST, "/auction", "empty"));
+        assert_eq!(
+            auction.status(),
+            StatusCode::FORBIDDEN,
+            "the challenge filter should short-circuit auction routing"
+        );
+        assert_eq!(
+            eid_sync_source_of(&auction),
+            None,
+            "a challenged auction must not authorize EID persistence"
+        );
+    }
+
+    #[test]
+    fn publisher_navigation_origin_start_failure_is_not_recovery_eligible() {
+        // Recovery is authorized only after a successful origin start. With no
+        // live backend the publisher origin fails, so even a real-browser
+        // document navigation must leave recovery unauthorized.
+        let router = test_router();
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "an origin-start failure must not authorize orphan recovery"
         );
     }
 }

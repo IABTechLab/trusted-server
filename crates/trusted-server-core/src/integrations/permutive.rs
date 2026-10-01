@@ -1,7 +1,7 @@
 //! Permutive integration for first-party data collection and audience management.
 //!
 //! This module provides transparent proxying for Permutive's API and SDK,
-//! enabling first-party data collection while maintaining privacy controls.
+//! enabling first-party data collection.
 
 use std::sync::Arc;
 
@@ -541,6 +541,7 @@ mod tests {
 
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -574,6 +575,7 @@ mod tests {
 
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",

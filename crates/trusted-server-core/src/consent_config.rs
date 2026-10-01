@@ -73,11 +73,6 @@ pub struct ConsentConfig {
     /// but disagree on consent status.
     #[serde(default)]
     pub conflict_resolution: ConflictResolutionConfig,
-    /// When set, consent data is persisted per Edge Cookie (EC) ID so that
-    /// returning users without consent cookies can still have their
-    /// consent preferences applied. Set to `None` to disable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consent_store: Option<String>,
 }
 
 impl Default for ConsentConfig {
@@ -90,7 +85,6 @@ impl Default for ConsentConfig {
             us_states: UsStatesConfig::default(),
             us_privacy_defaults: UsPrivacyDefaultsConfig::default(),
             conflict_resolution: ConflictResolutionConfig::default(),
-            consent_store: None,
         }
     }
 }
@@ -174,7 +168,7 @@ impl ConsentForwardingMode {
 /// The `applies_in` list is used for **observability and logging only** — it
 /// does NOT cause consent to be synthesized. When a user's country appears in
 /// this list, the system logs that GDPR applies, enabling publishers to
-/// monitor compliance coverage.
+/// monitor jurisdiction coverage.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GdprConfig {
@@ -283,11 +277,11 @@ impl Default for ConflictResolutionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConflictMode {
-    /// Deny consent when signals disagree (most privacy-safe).
+    /// Deny consent when signals disagree (most restrictive).
     Restrictive,
     /// Use the newer signal based on timestamps.
     Newest,
-    /// Grant consent when signals disagree (requires legal review).
+    /// Grant consent when signals disagree (least restrictive).
     Permissive,
 }
 

@@ -41,6 +41,6 @@ describe('creative/click.ts captured first-party fallback', () => {
 
     const fallback = anchor.getAttribute('href') ?? '';
     expect(fallback).toMatch(/^https:\/\/ads\.example\.com:8443\/first-party\/proxy-rebuild\?/);
-    expect(anchor.getAttribute('data-tsclick')).toBe(fallback);
+    expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
   });
 });

@@ -6,7 +6,7 @@
 
 ## Overview
 
-The GPT integration enables first-party delivery of Google Publisher Tags by proxying GPT's entire script cascade through the publisher's domain. This eliminates third-party script loads, improving performance and reducing exposure to ad blockers and browser privacy restrictions.
+The GPT integration delivers Google Publisher Tags via the publisher's domain by proxying GPT's script cascade in first-party context. This avoids cross-origin script loads, improving performance and reducing friction with ad blockers and Intelligent Tracking Prevention.
 
 ## What is GPT?
 
@@ -53,6 +53,7 @@ Add GPT configuration to `trusted-server.toml`:
 ```toml
 [integrations.gpt]
 enabled = true
+gam_attribution_enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
@@ -60,12 +61,18 @@ rewrite_script = true
 
 ### Configuration Options
 
-| Field               | Type    | Required | Default                                                | Description                                |
-| ------------------- | ------- | -------- | ------------------------------------------------------ | ------------------------------------------ |
-| `enabled`           | boolean | No       | `true`                                                 | Enable/disable the integration             |
-| `script_url`        | string  | No       | `https://securepubads.g.doubleclick.net/tag/js/gpt.js` | URL for the GPT bootstrap script           |
-| `cache_ttl_seconds` | integer | No       | `3600`                                                 | Cache TTL for proxied scripts (60--86400s) |
-| `rewrite_script`    | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML |
+| Field                     | Type    | Required | Default                                                | Description                                                       |
+| ------------------------- | ------- | -------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
+| `enabled`                 | boolean | No       | `true`                                                 | Enable/disable the integration                                    |
+| `gam_attribution_enabled` | boolean | No       | `false`                                                | Add fixed page-level `ts=true` targeting for GAM cohort reporting |
+| `script_url`              | string  | No       | `https://securepubads.g.doubleclick.net/tag/js/gpt.js` | URL for the GPT bootstrap script                                  |
+| `cache_ttl_seconds`       | integer | No       | `3600`                                                 | Cache TTL for proxied scripts (60--86400s)                        |
+| `rewrite_script`          | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML                        |
+
+The environment override
+`TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED` works only when
+`gam_attribution_enabled` is already present under `[integrations.gpt]` in the
+TOML file. The environment overlay cannot create a missing configuration leaf.
 
 ## Endpoints
 
@@ -109,6 +116,97 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 - Consent gating of ad requests
 - Ad-unit path rewriting for A/B testing
 
+### Server slot handoff
+
+For the initial server-rendered auction, the head bootstrap installs
+`window.tsjs.adInit` before the compiled bundle arrives. It reads the
+server-injected slot and bid state synchronously, defines a fallback GPT slot
+on the actual inner div, and records the slot in `gptSlotHandoffs`. It never
+defines a competing slot on an outer `-container` element. When publisher code
+later calls `googletag.defineSlot` for the same placement, the idempotent wrapper
+hands the existing inner-div binding back to GPT.
+
+The bootstrap observes modern `googletag.setConfig({ disableInitialLoad: ... })`
+and the legacy `pubads().disableInitialLoad()` call. If initial load is
+disabled, it refreshes only the newly defined Trusted Server slots. It never
+calls an unbounded `refresh()` that could refresh publisher-owned inventory.
+
+`adInit` owns the initial document only. Server-side targeting and the Trusted
+Server render bridge own the initial bid handoff and proven win/billing beacon
+path. After load, the slim Prebid module owns scroll-triggered and refresh
+auctions. SPA navigation obtains page bids through `GET /_ts/page-bids` (the
+legacy `GET /__ts/page-bids` alias remains available); it does not use
+`POST /auction` for that navigation flow.
+
+### Shared script-guard dispatcher
+
+GPT's six interception layers register with the shared DOM insertion
+dispatcher used by integration guards. Installation is idempotent. A candidate
+URL is rewritten only when it matches GPT's accepted host/path rules; an
+unmatched URL continues through the native DOM operation. If a descriptor or
+prototype hook cannot be installed, the remaining layers still run, but the
+integration does not claim complete interception for browser behavior outside
+those guarded seams.
+
+### GAM Treatment Attribution
+
+Setting `gam_attribution_enabled = true` adds the fixed page-level GPT targeting
+value `ts=true`. It is applied before publisher GPT initialization and remains
+for the browser document's lifetime, so initial, lazy, refresh, publisher-owned,
+and SPA-route requests inherit it unless another targeting consumer clears or
+overrides the key. The attribution switch is independently controlled and
+defaults to `false`, but the GPT integration's `enabled` master switch must also
+be `true`.
+
+This key is distinct from the existing slot-level `ts_initial=1` value.
+`ts_initial` retains its current cleanup lifecycle; Trusted Server does not
+clear the page-level `ts` value during Prebid refresh or SPA cleanup.
+
+For an eligible publisher document whose activation script was not cloned,
+`ts=true` means Trusted Server emitted the rewritten document head before the
+GPT request. It does not prove that the response body completed, that a Trusted
+Server bid won, or that an impression was caused by treatment. A publisher can
+copy the activation script with `srcdoc` or `document.write`; treat any marker
+on an unrewritten nested document as contamination, not attribution proof.
+
+Before enabling attribution in a cohort:
+
+1. Complete privacy and CSP review, create the reportable predefined `true`
+   value in the target GAM network, and verify the chosen GAM reporting surface
+   and billing approval.
+2. Audit the short `ts` key across publisher GPT code, effective Prebid
+   `bidderSettings[*].adserverTargeting` output (including
+   `setTargetingForGPTAsync`), the effective creative-opportunity targeting map,
+   and every GAM consumer that can affect eligibility, pricing, protection, or
+   routing. Trusted Server accepts and forwards operator targeting verbatim; it
+   does not reserve, filter, or intercept a slot-level `ts` key at runtime.
+3. With treatment routing stopped, deploy attribution enabled and validate
+   initial, lazy, refresh, publisher-owned, and SPA requests. Confirm every
+   excluded path reports zero marked requests, then save a short paired-report
+   dry run that satisfies the invariants below before starting the cohort.
+
+For reporting, save one exact eligible universe: GAM network, inventory units,
+routes, formats, time zone, date window, metrics, and all exclusions. Report A
+is the nonduplicated total for that universe. Report B uses identical filters
+and metrics plus exactly `ts=true`. If Enhanced Key-Value reporting is
+unavailable, unapproved, or incompatible, use an exactly filtered legacy
+key-value report and never sum its repeated key-value rows. Derive control as
+`A - B`, and require `0 <= B <= A` for every metric. A violation invalidates the
+whole report pair; never clamp a negative result. Use the same reporting-latency
+and invalid-traffic maturation window for both reports.
+
+GAM results are descriptive delivery attribution, not a causal treatment
+effect. Aggregate monitoring and synthetic/manual samples can detect obvious
+failures but cannot prove marker completeness on every production request
+without request-correlated telemetry.
+
+For a normal rollback, first stop and verify new treatment assignment at the
+router, record a clean reporting boundary, and let already-open documents drain.
+Exclude the drain interval, then set `gam_attribution_enabled = false` after
+marked traffic reaches zero for the agreed interval. An emergency kill may flip
+the setting immediately, but the affected interval and subsequent drain must be
+treated as invalid for experiment reporting.
+
 ## Use Cases
 
 ### First-Party Ad Delivery
@@ -144,6 +242,7 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 - Check the proxy responses have `200` status (look for `X-GPT-Proxy: true` header)
 - Verify the `script_url` config points to the correct GPT endpoint
 - Review server logs for upstream fetch failures
+- Open [GPT Runtime Diagnostics](./gpt-diagnostics.md) with `?ts_console=1` to see the observed request, render, load, and delivery evidence per slot
 
 ## Implementation
 
@@ -152,7 +251,7 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 
 ## Next Steps
 
+- Use [GPT Runtime Diagnostics](/guide/integrations/gpt-diagnostics) to inspect GPT lifecycle and Trusted Server delivery evidence in the browser
 - Review [Integrations Overview](/guide/integrations-overview) for comparison with other integrations
 - Check [Configuration Reference](/guide/configuration) for advanced options
 - Learn about [First-Party Proxy](/guide/first-party-proxy) architecture
-- See [Google Ad Manager](/guide/integrations/gam) for the planned direct GAM integration

@@ -17,17 +17,42 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
+derive_more = { workspace = true }
 edgezero-cli = { workspace = true }
+edgezero-core = { workspace = true }
 futures = { workspace = true }
+glob = { workspace = true }
+http = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
+# Also in the macOS block for the dev proxy; needed on every host so the probe can install
+# the process-level crypto provider its `-no-provider` reqwest build expects.
+rustls = { workspace = true }
+# Declared directly rather than inherited from the workspace, to control the rustls
+# crypto provider. `reqwest`'s plain `rustls-tls` forces `ring`, and this crate already
+# links `aws-lc-rs` through `reqwest` 0.13 (via `chromiumoxide` and `edgezero-cli`).
+# Compiling both providers makes rustls's process-level default ambiguous, and it then
+# panics on first use — which broke the dev-proxy tests. The `-no-provider` variant uses
+# whichever provider is already present instead of adding a second.
+#
+# `gzip` so the probe's Accept-Encoding axis compares decoded bytes: reqwest transparently
+# decodes a gzip response, which is what "differ only by content coding" must be tested
+# against.
+reqwest = { version = "0.12", default-features = false, features = [
+    "gzip",
+    "json",
+    "rustls-tls-webpki-roots-no-provider",
+] }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+similar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
+tracing = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
@@ -41,7 +66,6 @@ which = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
-derive_more = { workspace = true }
 directories = { workspace = true }
 error-stack = { workspace = true }
 http-body-util = { workspace = true }
@@ -58,8 +82,10 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+flate2 = { workspace = true }
+temp-env = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

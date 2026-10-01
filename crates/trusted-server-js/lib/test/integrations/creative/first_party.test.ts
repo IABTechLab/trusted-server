@@ -12,6 +12,7 @@ function setCurrentScript(src?: string): void {
 
 afterEach(() => {
   vi.resetModules();
+  vi.unstubAllGlobals();
   if (currentScriptDescriptor) {
     Object.defineProperty(document, 'currentScript', currentScriptDescriptor);
   } else {
@@ -36,6 +37,20 @@ describe('creative/first_party.ts', () => {
       false
     );
     expect(isFirstPartyProxyUrl('https://foreign.example/first-party/proxy')).toBe(false);
+  });
+
+  it('captures an absolute script URL inside a srcdoc document', async () => {
+    vi.resetModules();
+    vi.stubGlobal('location', { href: 'about:srcdoc', origin: 'null' });
+    expect(location.href).toBe('about:srcdoc');
+    setCurrentScript('https://ads.example.com:8443/static/tsjs=tsjs-unified.min.js?v=hash');
+    const { firstPartyOrigin, resolveFirstPartyPath } =
+      await import('../../../src/integrations/creative/first_party');
+
+    expect(firstPartyOrigin()).toBe('https://ads.example.com:8443');
+    expect(resolveFirstPartyPath('/first-party/proxy-rebuild')).toBe(
+      'https://ads.example.com:8443/first-party/proxy-rebuild'
+    );
   });
 
   it('falls back to the document origin when currentScript is unavailable', async () => {

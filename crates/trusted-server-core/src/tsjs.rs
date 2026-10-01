@@ -1,4 +1,4 @@
-use trusted_server_js::{all_module_ids, concatenated_hash, single_module_hash};
+use trusted_server_js::{concatenated_hash, single_module_hash};
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on
 /// the concatenated content of the given module set.
@@ -11,38 +11,76 @@ pub fn tsjs_script_src(module_ids: &[&str]) -> String {
 /// `<script>` tag for injecting the tsjs bundle.
 #[must_use]
 pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
+    tsjs_script_tag_with_attributes(module_ids, &[])
+}
+
+/// Publisher `<script>` tag for the tsjs bundle with trusted static attributes.
+#[must_use]
+pub fn tsjs_script_tag_with_attributes(
+    module_ids: &[&str],
+    attributes: &[(&'static str, &'static str)],
+) -> String {
+    let attributes = attributes
+        .iter()
+        .map(|(name, value)| {
+            debug_assert!(
+                !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+            );
+            debug_assert!(
+                !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>')),
+                "attribute value should not contain HTML-sensitive characters"
+            );
+            format!(" {name}=\"{value}\"")
+        })
+        .collect::<String>();
+
     format!(
-        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
-        tsjs_script_src(module_ids)
+        "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
+        tsjs_script_src(module_ids),
     )
 }
 
-/// `/static` URL for the unified bundle with a conservative cache-busting hash.
+/// `/static` URL for the unified bundle when exact module IDs are unavailable.
 ///
-/// Hashes all compiled module IDs so the cache invalidates whenever any module
-/// changes. Over-invalidates slightly (includes deferred modules in the hash)
-/// but never serves stale content. Use [`tsjs_script_src`] with exact module
-/// IDs when `IntegrationRegistry` is available.
+/// This intentionally omits `?v=` because the serving path can only mark a URL
+/// immutable when the hash matches the exact enabled module set. Use
+/// [`tsjs_script_src`] with exact module IDs when [`IntegrationRegistry`] is
+/// available.
+///
+/// [`IntegrationRegistry`]: crate::integrations::IntegrationRegistry
 #[must_use]
 pub fn tsjs_unified_script_src() -> String {
-    let ids = all_module_ids();
-    tsjs_script_src(&ids)
+    "/static/tsjs=tsjs-unified.min.js".to_string()
 }
 
-/// `<script>` tag for the unified bundle with a conservative cache-busting hash.
+/// `<script>` tag for the unified bundle when exact module IDs are unavailable.
 ///
 /// See [`tsjs_unified_script_src`] for details.
 #[must_use]
 pub fn tsjs_unified_script_tag() -> String {
-    let ids = all_module_ids();
-    tsjs_script_tag(&ids)
+    format!(
+        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
+        tsjs_unified_script_src()
+    )
+}
+
+/// `/static` URL for one module with its own cache-busting hash.
+#[must_use]
+pub fn tsjs_single_module_script_src(module_id: &str) -> String {
+    let hash = single_module_hash(module_id).unwrap_or_default();
+    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
 }
 
 /// `/static` URL for a single deferred module with its own cache-busting hash.
 #[must_use]
 pub fn tsjs_deferred_script_src(module_id: &str) -> String {
-    let hash = single_module_hash(module_id).unwrap_or_default();
-    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+    tsjs_single_module_script_src(module_id)
 }
 
 /// `<script defer>` tag for a single deferred module.
@@ -165,24 +203,82 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_unified_helpers_use_all_module_ids() {
-        let ids = all_module_ids();
+    fn publisher_tsjs_script_tag_renders_static_attributes() {
+        let module_ids = ["gpt"];
+        let src = tsjs_script_src(&module_ids);
 
         assert_eq!(
-            tsjs_unified_script_src(),
-            tsjs_script_src(&ids),
-            "should hash all module IDs for the unified script source"
+            tsjs_script_tag_with_attributes(&module_ids, &[("data-ts-gam-attribution", "true")]),
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
+            ),
+            "should render trusted static attributes on the publisher bundle tag"
         );
         assert_eq!(
-            tsjs_unified_script_tag(),
-            tsjs_script_tag(&ids),
-            "should wrap the all-module unified script source"
+            tsjs_script_tag(&module_ids),
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            "should keep the generic tag byte-for-byte unmarked"
         );
     }
 
     #[test]
-    fn tsjs_deferred_script_src_formats_known_module_url_with_hash() {
-        let src = tsjs_deferred_script_src("creative");
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_invalid_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-bad_name", "true")]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_empty_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("", "true")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_double_quote_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad\"value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_ampersand_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad&value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_less_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad<value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_greater_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad>value")]);
+    }
+
+    #[test]
+    fn tsjs_unified_helpers_use_unversioned_fallback_without_registry() {
+        let src = tsjs_unified_script_src();
+
+        assert_eq!(
+            src, "/static/tsjs=tsjs-unified.min.js",
+            "registry-free unified helper should not emit an unverifiable hash"
+        );
+        assert_eq!(
+            tsjs_unified_script_tag(),
+            format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),
+            "should wrap the registry-free unified source"
+        );
+    }
+
+    #[test]
+    fn tsjs_single_module_script_src_formats_known_module_url_with_hash() {
+        let src = tsjs_single_module_script_src("creative");
 
         assert!(
             src.starts_with("/static/tsjs=tsjs-creative.min.js?v="),
@@ -192,12 +288,13 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_uses_empty_hash_for_external_or_unknown_module() {
-        assert_eq!(
-            tsjs_deferred_script_src("prebid"),
-            "/static/tsjs=tsjs-prebid.min.js?v=",
-            "prebid now ships as an external bundle and has no local hash"
+    fn tsjs_deferred_script_src_hashes_prebid_shim_and_empties_unknown_module() {
+        let prebid_src = tsjs_deferred_script_src("prebid");
+        assert!(
+            prebid_src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
+            "prebid shim should be served from the deferred tsjs route"
         );
+        assert_sha256_hex_hash(hash_query_value(&prebid_src));
         assert_eq!(
             tsjs_deferred_script_src("unknown-module"),
             "/static/tsjs=tsjs-unknown-module.min.js?v=",
@@ -239,14 +336,13 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_unified_script_src_and_tag_include_cache_busting_hash() {
+    fn tsjs_unified_script_src_and_tag_omit_unverifiable_cache_busting_hash() {
         let src = tsjs_unified_script_src();
 
-        assert!(
-            src.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
-            "should include unified script URL prefix"
+        assert_eq!(
+            src, "/static/tsjs=tsjs-unified.min.js",
+            "should use the unified script URL without an unverifiable hash"
         );
-        assert_sha256_hex_hash(hash_query_value(&src));
         assert_eq!(
             tsjs_unified_script_tag(),
             format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),

@@ -12,6 +12,7 @@ SCHEMA >
   `region` Nullable(String),
   `is_mobile` UInt8,
   `is_known_browser` UInt8,
+  `user_agent` Nullable(String),
   `gdpr_applies` UInt8,
   `consent_present` UInt8,
   `terminal_status` LowCardinality(Nullable(String)),
@@ -34,6 +35,7 @@ SCHEMA >
   `is_win` Nullable(UInt8),
   `ad_domain` Nullable(String),
   `ad_id` Nullable(String),
+  `origin_cache_shareable` Nullable(UInt8),
   `event_date` Date DEFAULT toDate(event_ts)
 
 ENGINE "MergeTree"

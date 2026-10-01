@@ -7,7 +7,7 @@
 //! `trusted-server-adapter-fastly`).
 //!
 //! This trait is intentionally narrow: lookup with a generation marker,
-//! conditional insert, prefix counting, and delete. Conditional writes are
+//! conditional insert, strong prefix listing, and delete. Conditional writes are
 //! expressed through [`EcKvWriteMode`] so compare-and-swap loops stay in
 //! core while the platform supplies the actual precondition mechanics.
 
@@ -83,6 +83,33 @@ pub trait EcKvStore {
     /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
     fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>>;
 
+    /// Checks exact-key existence against strongly consistent store state.
+    ///
+    /// A completed issuance must be visible even when [`Self::lookup`] lags.
+    /// Prefix matches are insufficient and an inconclusive check is an error.
+    ///
+    /// # Implementing this method
+    ///
+    /// Strong consistency is a contract this signature cannot express, so a
+    /// new backend has to establish it deliberately. An implementation whose
+    /// listing or point read is eventually consistent must not answer from it:
+    /// doing so reintroduces the bug this check exists to prevent, where a
+    /// replication lag reports a recently issued identity as absent and its
+    /// withdrawal is silently discarded while the identity stays live for
+    /// batch sync. If the platform offers no strongly consistent read, return
+    /// an error rather than a `false` the caller will trust.
+    ///
+    /// The in-memory double used across the core tests is trivially strong, so
+    /// those tests cannot catch a backend that breaks this. Cover a new backend
+    /// against its own platform.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store failure or when a
+    /// bounded check cannot determine existence. Never falls back to an
+    /// eventually consistent read.
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>>;
+
     /// Writes an entry according to the requested precondition mode.
     ///
     /// # Errors
@@ -96,7 +123,32 @@ pub trait EcKvStore {
         write: EcKvWrite<'_>,
     ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>>;
 
-    /// Counts keys sharing the given prefix, up to `limit`.
+    /// Lists keys sharing the given prefix from strongly consistent state.
+    ///
+    /// Returns one bounded page of at most `limit` keys, not an exhaustive scan.
+    /// Results may be truncated; a full page does not prove that all matching
+    /// keys were returned. Callers must handle truncation conservatively (for
+    /// example, reject a saturated cleanup) and validate the complete key shape
+    /// before using key contents for a correctness decision.
+    ///
+    /// Completed writes must be visible even when [`Self::lookup`] lags. If the
+    /// backend cannot provide strong listing, it must return an error rather
+    /// than substitute eventually consistent results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store open or list failure.
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>>;
+
+    /// Counts keys in one strongly consistent prefix-list page, up to `limit`.
+    ///
+    /// Delegates to [`Self::list_keys_with_prefix`] and inherits its bounded,
+    /// potentially truncated result. This is a capped count, not an exhaustive
+    /// total; callers needing completeness must account for truncation.
     ///
     /// # Errors
     ///
@@ -105,7 +157,11 @@ pub trait EcKvStore {
         &self,
         prefix: &str,
         limit: u32,
-    ) -> Result<u32, Report<TrustedServerError>>;
+    ) -> Result<u32, Report<TrustedServerError>> {
+        let count = self.list_keys_with_prefix(prefix, limit)?.len();
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(count as u32)
+    }
 
     /// Hard-deletes a key.
     ///
@@ -121,6 +177,140 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
+    /// so tests can prove exactly how many reads a flow performs.
+    pub(crate) struct CountingEcKv {
+        inner: InMemoryEcKv,
+        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingEcKv {
+        pub(crate) fn new(
+            name: impl Into<String>,
+            lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner: InMemoryEcKv::new(name),
+                lookups,
+            }
+        }
+    }
+
+    impl EcKvStore for CountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+
+        fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// [`EcKvStore`] wrapper that models an eventually-consistent point read.
+    ///
+    /// The first `stale_lookups` calls to [`EcKvStore::lookup`] report the key
+    /// absent while [`EcKvStore::list_keys_with_prefix`] — the list API, which
+    /// reads the primary data source — still sees it. Writes reach the inner
+    /// store, so a test can assert what actually persisted.
+    ///
+    /// With `list_fails` set, the list API errors instead, modelling a store
+    /// that can neither find the key nor prove it absent.
+    pub(crate) struct StaleLookupEcKv {
+        inner: InMemoryEcKv,
+        stale_lookups_remaining: Mutex<u32>,
+        list_fails: bool,
+    }
+
+    impl StaleLookupEcKv {
+        pub(crate) fn new(name: impl Into<String>, stale_lookups: u32, list_fails: bool) -> Self {
+            Self {
+                inner: InMemoryEcKv::new(name),
+                stale_lookups_remaining: Mutex::new(stale_lookups),
+                list_fails,
+            }
+        }
+    }
+
+    impl EcKvStore for StaleLookupEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            let mut remaining = self
+                .stale_lookups_remaining
+                .lock()
+                .expect("should lock stale-lookup counter");
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(None);
+            }
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            if self.list_fails {
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.inner.store_name().to_owned(),
+                    message: "existence check unavailable".to_owned(),
+                }));
+            }
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+
+        fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            if self.list_fails {
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.inner.store_name().to_owned(),
+                    message: "list unavailable".to_owned(),
+                }));
+            }
+            self.inner.list_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
 
     /// In-memory [`EcKvStore`] with generation tracking for CAS tests.
     pub(crate) struct InMemoryEcKv {
@@ -157,6 +347,11 @@ pub(crate) mod test_support {
             }))
         }
 
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            let entries = self.entries.lock().expect("should lock in-memory store");
+            Ok(entries.contains_key(key))
+        }
+
         fn insert(
             &self,
             key: &str,
@@ -190,19 +385,18 @@ pub(crate) mod test_support {
             Ok(EcKvWriteOutcome::Written)
         }
 
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
             let entries = self.entries.lock().expect("should lock in-memory store");
-            let count = entries
+            Ok(entries
                 .keys()
                 .filter(|key| key.starts_with(prefix))
                 .take(limit as usize)
-                .count();
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(count as u32)
+                .cloned()
+                .collect())
         }
 
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
@@ -240,6 +434,11 @@ pub(crate) mod test_support {
             Err(self.error("lookup"))
         }
 
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            let _ = key;
+            Err(self.error("key_exists"))
+        }
+
         fn insert(
             &self,
             _key: &str,
@@ -248,11 +447,11 @@ pub(crate) mod test_support {
             Err(self.error("insert"))
         }
 
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             _prefix: &str,
             _limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
             Err(self.error("list"))
         }
 

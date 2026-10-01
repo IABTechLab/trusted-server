@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,7 +26,9 @@ fn normalize_env_segment(s: &str) -> String {
     s.to_uppercase().replace(['-', '.', ' '], "_")
 }
 
-fn config_env_var(store_name: &str, key: &str) -> String {
+/// Returns the environment-variable name for a config store entry.
+#[must_use]
+pub fn config_env_var(store_name: &str, key: &str) -> String {
     format!(
         "TRUSTED_SERVER_CONFIG_{}_{}",
         normalize_env_segment(store_name),
@@ -154,16 +157,15 @@ impl PlatformSecretStore for AxumPlatformSecretStore {
 pub struct AxumPlatformBackend;
 
 impl PlatformBackend for AxumPlatformBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Axum
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        let port = spec
-            .port
-            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
-        Ok(format!(
-            "{}_{}_{}",
-            normalize_env_segment(&spec.scheme),
-            normalize_env_segment(&spec.host),
-            port,
-        ))
+        self.naming_policy()
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -522,16 +524,13 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 ///
 /// # Degraded features in dev
 ///
-/// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
-/// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
+/// The generic runtime KV slot uses
+/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
 /// emitted once per process.
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
-        log::warn!(
-            "Axum dev server: KV store is unavailable (UnavailableKvStore). \
-             Routes that depend on synthetic-ID or consent KV will degrade gracefully."
-        );
+        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
@@ -594,6 +593,30 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let client = AxumPlatformHttpClient::new();
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Axum
+            .descriptor()
+            .capabilities();
+        assert!(client.supports_concurrent_fanout());
+        assert!(capabilities.supports_concurrent_provider_fanout());
+        assert!(!client.has_enforceable_total_request_deadline());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[test]
+    fn config_env_var_normalizes_store_and_key() {
+        assert_eq!(
+            config_env_var("my-store.name", "my key"),
+            "TRUSTED_SERVER_CONFIG_MY_STORE_NAME_MY_KEY",
+            "should normalize environment-variable segments"
+        );
+    }
+
+    #[test]
     fn config_store_reads_from_env_var() {
         temp_env::with_var(
             "TRUSTED_SERVER_CONFIG_MY_STORE_MY_KEY",
@@ -644,6 +667,7 @@ mod tests {
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
             host_header_override: None,
+            discriminator: None,
         };
         let name1 = backend.predict_name(&spec).expect("should return a name");
         let name2 = backend
@@ -664,6 +688,7 @@ mod tests {
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
             host_header_override: None,
+            discriminator: None,
         };
         assert_eq!(
             backend.predict_name(&spec).expect("should return name"),
@@ -681,6 +706,33 @@ mod tests {
             .lookup(Some("127.0.0.1".parse().expect("should parse IP")))
             .expect("should not error");
         assert!(with_ip.is_none(), "should return None for any IP");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_surfaces_redirect_without_following() {
+        let url = serve_raw_response(
+            b"HTTP/1.1 302 Found\r\nLocation: https://redirect.example/next\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let response = AxumPlatformHttpClient::new()
+            .send(PlatformHttpRequest::new(request, "test_backend"))
+            .await
+            .expect("should surface redirect")
+            .response;
+
+        assert_eq!(response.status().as_u16(), 302);
+        assert_eq!(
+            response
+                .headers()
+                .get(edgezero_core::http::header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://redirect.example/next")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

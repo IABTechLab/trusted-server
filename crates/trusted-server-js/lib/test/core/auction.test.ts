@@ -1,5 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
 import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
+import envelope from '../fixtures/aps-renderer-v1.json';
+
+function apsRenderer(creativeId?: string) {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    ...(creativeId ? { creativeId } : {}),
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 describe('auction/buildAdRequest', () => {
   it('builds from tsjs AdUnit objects', () => {
@@ -70,6 +88,32 @@ describe('auction/buildAdRequest', () => {
     expect(unit2).toBeDefined();
     expect(unit2!.bids).toHaveLength(1);
     expect(unit2!.bids[0].bidder).toBe('openx');
+  });
+
+  it.each([{}, { storedRequest: false }, { storedRequest: true }, { storedRequest: null }])(
+    'passes bid params through verbatim in serialized shared requests: %j',
+    (intent) => {
+      const params = { bidderParams: {}, ...intent };
+      for (const input of [
+        [{ code: 'example-slot', bids: [{ bidder: 'trustedServer', params }] }],
+        [{ adUnitCode: 'example-slot', bidder: 'trustedServer', params }],
+      ]) {
+        const wire = JSON.parse(JSON.stringify(buildAdRequest(input)));
+        expect(wire.adUnits[0].bids[0].params).toEqual(params);
+      }
+    }
+  );
+
+  it('omits explicitly undefined bid params from serialized shared requests', () => {
+    const params = { bidderParams: {}, storedRequest: undefined };
+    for (const input of [
+      [{ code: 'example-slot', bids: [{ bidder: 'trustedServer', params }] }],
+      [{ adUnitCode: 'example-slot', bidder: 'trustedServer', params }],
+    ]) {
+      const wire = JSON.parse(JSON.stringify(buildAdRequest(input)));
+      expect(wire.adUnits[0].bids[0].params).toEqual({ bidderParams: {} });
+      expect(wire.adUnits[0].bids[0].params).not.toHaveProperty('storedRequest');
+    }
   });
 
   it('handles empty units array', () => {
@@ -174,6 +218,83 @@ describe('auction/parseAuctionResponse', () => {
     });
   });
 
+  it('parses an APS typed renderer without requiring adm', () => {
+    const renderer = apsRenderer('fictional-creative-id');
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'aps',
+          bid: [
+            {
+              id: renderer.bidId,
+              impid: 'fictional-slot',
+              price: 1.23,
+              crid: renderer.creativeId,
+              w: 300,
+              h: 250,
+              ext: { trusted_server: { renderer } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids).toHaveLength(1);
+    expect(bids[0]).toEqual(
+      expect.objectContaining({
+        impid: 'fictional-slot',
+        adm: '',
+        renderer,
+        width: 300,
+        height: 250,
+        creativeId: 'fictional-creative-id',
+      })
+    );
+  });
+
+  it('parses an APS renderer with optional creativeId omitted', () => {
+    const renderer = apsRenderer();
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'aps',
+          bid: [
+            {
+              impid: 'fictional-slot',
+              price: 1.23,
+              w: 300,
+              h: 250,
+              ext: { trusted_server: { renderer } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids[0].renderer).toEqual(renderer);
+    expect(bids[0].creativeId).toBe('aps-fictional-slot');
+  });
+
+  it('ignores unrelated or malformed renderer extensions while retaining ordinary adm', () => {
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'ordinary',
+          bid: [
+            {
+              impid: 'slot-1',
+              adm: '<div>ordinary</div>',
+              ext: { trusted_server: { renderer: { type: 'aps', version: 99 } } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids[0].renderer).toBeUndefined();
+    expect(bids[0].adm).toBe('<div>ordinary</div>');
+  });
+
   it('handles multiple seatbids with multiple bids', () => {
     const body = {
       seatbid: [
@@ -247,7 +368,7 @@ describe('auction/sendAuction', () => {
         ],
       }),
     };
-    globalThis.fetch = vi.fn().mockResolvedValue(mockResponse) as any;
+    globalThis.fetch = vi.fn().mockResolvedValue(mockResponse) as unknown as typeof fetch;
 
     const request = {
       adUnits: [
@@ -274,7 +395,9 @@ describe('auction/sendAuction', () => {
   });
 
   it('returns empty array on network error', async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network error')) as any;
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new Error('network error')) as unknown as typeof fetch;
 
     const bids = await sendAuction('/auction', { adUnits: [] });
     expect(bids).toEqual([]);
@@ -286,7 +409,7 @@ describe('auction/sendAuction', () => {
       status: 200,
       headers: { get: () => 'text/html' },
       json: async () => ({}),
-    }) as any;
+    }) as unknown as typeof fetch;
 
     const bids = await sendAuction('/auction', { adUnits: [] });
     expect(bids).toEqual([]);
@@ -298,7 +421,7 @@ describe('auction/sendAuction', () => {
       status: 500,
       headers: { get: () => 'application/json' },
       json: async () => ({}),
-    }) as any;
+    }) as unknown as typeof fetch;
 
     const bids = await sendAuction('/auction', { adUnits: [] });
     expect(bids).toEqual([]);
