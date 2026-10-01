@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod prefixed_io;
 pub mod rewrite;
 pub mod server;
+mod trust;
 pub mod upstream;
 
 use std::sync::Arc;
@@ -167,9 +168,9 @@ pub enum ProxySub {
 pub enum CaCommand {
     /// Print the per-machine CA certificate path.
     Path,
-    /// Add the CA to the OS trust store (macOS login keychain).
+    /// Trust the CA in the macOS login keychain or Linux user NSS database.
     Install,
-    /// Remove the CA from the OS trust store.
+    /// Remove managed browser trust for the CA.
     Uninstall,
     /// Regenerate the per-machine CA (invalidates prior trust).
     Regenerate,
@@ -185,41 +186,29 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
     // CA subcommands need only the CA directory — handle them before rule resolution.
     if let Some(ProxySub::Ca { action }) = &args.command {
         let ca_dir = config::ca_dir(args);
+        let _lock = trust::lock(&ca_dir).change_context(ProxyError::CertAuthority)?;
         let cert_path = ca::CertAuthority::cert_path(&ca_dir);
         match action {
             CaCommand::Path => {
                 // Ensure the CA exists so the printed path points at a real file.
+                trust::ensure_can_generate(&ca_dir).change_context(ProxyError::CertAuthority)?;
                 ca::CertAuthority::load_or_generate(&ca_dir)
                     .change_context(ProxyError::CertAuthority)?;
                 output::info(&cert_path.display().to_string());
             }
             CaCommand::Install => {
                 // A fresh machine has no CA yet — generate before trusting it.
+                trust::ensure_can_generate(&ca_dir).change_context(ProxyError::CertAuthority)?;
                 ca::CertAuthority::load_or_generate(&ca_dir)
                     .change_context(ProxyError::CertAuthority)?;
-                browser::ca_install(&cert_path);
+                trust::install(&ca_dir, &cert_path).change_context(ProxyError::CertAuthority)?;
             }
             CaCommand::Uninstall => {
-                // `ca_uninstall` warns loudly on a failed removal; for the
-                // explicit `ca uninstall` command that warning is the signal, so
-                // the boolean result is intentionally not escalated to an error.
-                let _ = browser::ca_uninstall();
+                trust::uninstall(&ca_dir).change_context(ProxyError::CertAuthority)?;
             }
             CaCommand::Regenerate => {
-                // Revoke OS trust for the OLD CA first. The old and new CA share
-                // CA_COMMON_NAME, so `ca_uninstall` (delete-by-CN, a no-op when
-                // absent) removes the soon-to-be-stale cert from the keychain
-                // before we replace the files on disk. If revocation cannot be
-                // confirmed, ABORT — rotating the local key while the old CA
-                // stays trusted would contradict the "invalidates prior trust"
-                // promise and leave an exfiltrated old key usable.
-                if !browser::ca_uninstall() {
-                    return Err(error_stack::Report::new(ProxyError::CertAuthority).attach(
-                        "could not revoke the previously-installed CA from the keychain; \
-                         aborting regenerate so on-disk key material still matches OS trust. \
-                         Remove the old CA manually (Keychain Access), then retry.",
-                    ));
-                }
+                // Fail closed before touching either file if persistent revocation fails.
+                trust::uninstall(&ca_dir).change_context(ProxyError::CertAuthority)?;
                 // Delete the old cert/key BEFORE regenerating. `load_or_generate`
                 // reloads any existing pair, so a silently-ignored delete failure
                 // would leave the old key in use while we print "regenerated" —
@@ -239,6 +228,7 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
                         }
                     }
                 }
+                trust::ensure_can_generate(&ca_dir).change_context(ProxyError::CertAuthority)?;
                 ca::CertAuthority::load_or_generate(&ca_dir)
                     .change_context(ProxyError::CertAuthority)?;
                 output::info("regenerated CA — re-run `ca install` to trust it");
@@ -255,10 +245,14 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
 
     let mut cfg = config::resolve(args).change_context(ProxyError::Config)?;
 
-    let ca = Arc::new(
-        ca::CertAuthority::load_or_generate(&cfg.ca_dir)
-            .change_context(ProxyError::CertAuthority)?,
-    );
+    let ca = {
+        let _lock = trust::lock(&cfg.ca_dir).change_context(ProxyError::CertAuthority)?;
+        trust::ensure_can_generate(&cfg.ca_dir).change_context(ProxyError::CertAuthority)?;
+        Arc::new(
+            ca::CertAuthority::load_or_generate(&cfg.ca_dir)
+                .change_context(ProxyError::CertAuthority)?,
+        )
+    };
 
     // `--insecure` disables all upstream TLS verification — make it loud.
     if cfg.insecure {
