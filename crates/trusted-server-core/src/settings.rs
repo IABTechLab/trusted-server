@@ -3244,6 +3244,7 @@ impl Settings {
         "/_ts/admin/ec",
         "/_ts/admin/ec/{id}",
         "/_ts/admin/eids",
+        "/_ts/admin/cache/purge",
     ];
 
     /// Probes that establish handler coverage for the dynamic
@@ -3709,7 +3710,7 @@ mod tests {
     use super::*;
     use regex::Regex;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     /// `DebugConfig` denies unknown fields, so a binary built before
@@ -6350,7 +6351,7 @@ source_domain = "partner.example.com"
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert_eq!(
             settings.auction.allowed_context_keys,
-            HashSet::from(["permutive_segments".to_string(), "lockr_ids".to_string()])
+            BTreeSet::from(["permutive_segments".to_string(), "lockr_ids".to_string()])
         );
     }
 
@@ -7249,6 +7250,7 @@ source_domain = "partner.example.com"
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
                 "/_ts/admin/eids",
+                "/_ts/admin/cache/purge",
             ],
             "should report every admin endpoint as uncovered"
         );
@@ -7288,6 +7290,7 @@ source_domain = "partner.example.com"
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
                 "/_ts/admin/eids",
+                "/_ts/admin/cache/purge",
             ],
             "should detect the admin endpoints not covered by the narrow handler"
         );
@@ -7299,7 +7302,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7324,7 +7327,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7407,7 +7410,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7433,7 +7436,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
@@ -7458,7 +7461,7 @@ source_domain = "partner.example.com"
             r#"path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass""#,
-            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids|cache/purge)$"
             username = "admin"
             password = "strong-test-password"
 
