@@ -14,13 +14,27 @@ export function displayableGptFillSize(size: Size | undefined): Size | undefined
 export function auctionTypeLabel(type: GptDiagnosticsAuctionType): string {
   switch (type) {
     case 'ssat':
+      return 'SSAT: initial-page server auction';
+    case 'trusted_server':
+      return 'TS auction: SPA server auction';
+    case 'client_side':
+      return 'Client-side Prebid auction';
+    case 'competing':
+      return 'Multiple auction paths observed';
+  }
+}
+
+/** Compact auction classification shared by on-page badges. */
+export function auctionTypeBadgeLabel(type: GptDiagnosticsAuctionType): string {
+  switch (type) {
+    case 'ssat':
       return 'SSAT';
     case 'trusted_server':
       return 'TS auction';
     case 'client_side':
-      return 'Client-side auction';
+      return 'Prebid auction';
     case 'competing':
-      return 'Competing auctions';
+      return 'Multiple paths';
   }
 }
 

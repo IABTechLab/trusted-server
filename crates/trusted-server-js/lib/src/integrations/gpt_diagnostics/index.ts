@@ -60,6 +60,8 @@ export function installGptDiagnosticsRuntime(
     badges = new GptDiagnosticsBadgeManager(store, bindings, {
       window: target,
       document: target.document,
+      onActivate: (runtimeSlotNumber, requestNumber) =>
+        overlay?.selectRequest(runtimeSlotNumber, requestNumber),
     });
     slotSizeObserver = new GptDiagnosticsSlotSizeObserver(store, bindings, { window: target });
     overlay = new GptDiagnosticsOverlay(store, bindings, {
