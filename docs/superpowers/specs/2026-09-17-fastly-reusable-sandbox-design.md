@@ -56,10 +56,17 @@ Two properties of this path block naive reuse.
 
 ## Dependencies
 
-The workspace pins EdgeZero at `c4841b609ec366ebabd3489416e2cb8c1359f61d` on
+The workspace pins EdgeZero at `35a72835322fe0127beb2ce998e4988e95974373` on
 `feat/reusable-app-lifecycle`. (It briefly sat at `277544c4` on the same
 branch; that revision carried the CLI and Cloudflare fixes but no lifecycle
 module.)
+
+The current revision also exposes registry-aware Fastly request conversion
+and uses typed `dispatch_app::<A>` helpers inside the Cloudflare and Spin
+`run_app::<A>` entry points. Those entry points remain compatible with
+Trusted Server. Its custom Fastly path continues to use raw request
+conversion and application-managed stores; it does not opt into the
+framework's additional required KV bindings.
 
 This includes `edgezero_adapter_fastly::lifecycle`, introduced at `76c59b44`, which this adapter
 now uses instead of its own equivalents. The framework owns lazy

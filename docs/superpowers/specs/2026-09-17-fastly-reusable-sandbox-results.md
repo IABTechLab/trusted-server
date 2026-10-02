@@ -507,7 +507,7 @@ streaming failed [instance=…0000 ordinal=2 request=…0001]
   implementation stays until such an API exists; the `TS__SANDBOX__*` suffixes
   and the limit-validation policy remain application-owned regardless.
 - **The pin is an unmerged branch revision.** Move to a release tag once one
-  contains `c4841b60`.
+  contains the current pinned lifecycle revision (`35a72835`).
 
 ## Review follow-up: measurement compatibility
 
