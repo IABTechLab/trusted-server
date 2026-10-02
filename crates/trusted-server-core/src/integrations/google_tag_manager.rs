@@ -84,9 +84,9 @@ static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("GTM tag ID regex should compile")
 });
 
-/// Host alternation shared by the URL patterns below.
+/// Host alternation shared by ordinary and Flight URL patterns.
 const GTM_URL_HOSTS: &str =
-    r"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
+    r"(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
 /// The paths this integration routes, plus the empty path.
 ///
 /// A script may hold an origin and build the path later
@@ -102,7 +102,7 @@ const GTM_URL_PATHS: &str = r"(?P<path>/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/c
 /// must be the URL.
 static GTM_WHOLE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<suffix>[?#].*)?$"
+        r"^(?:https?:)?//{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<suffix>[?#].*)?$"
     ))
     .expect("GTM whole-URL regex should compile")
 });
@@ -136,12 +136,102 @@ static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .iter()
     .map(|(open, suffix, close)| {
         Regex::new(&format!(
-            "{open}{GTM_URL_HOSTS}{GTM_URL_PATHS}{suffix}{close}"
+            "{open}(?:https?:)?//{GTM_URL_HOSTS}{GTM_URL_PATHS}{suffix}{close}"
         ))
         .expect("GTM quoted-URL regex should compile")
     })
     .collect()
 });
+
+// Flight spans are JS string source, not decoded JSON. Match only whole or
+// quoted routed URL tokens and preserve their delimiters, suffix and slash layer.
+static GTM_RSC_WHOLE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    // Preserve the routed paths while accepting Flight's slash escape layers.
+    let paths = GTM_URL_PATHS.replace('/', r"(?:\\{0,8}/)");
+    Regex::new(&format!(
+        r"^(?:https?:)?(?P<slash>\\{{0,8}}/)(?:\\{{0,8}}/){GTM_URL_HOSTS}{paths}(?P<suffix>[?#].*)?$"
+    ))
+    .expect("should compile whole Flight URL pattern")
+});
+static GTM_RSC_QUOTED_URL_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?P<open>\\{{0,8}}["'`])(?:https?:)?\\{{0,8}}/\\{{0,8}}/{GTM_URL_HOSTS}"#
+    ))
+    .expect("should compile quoted Flight URL start")
+});
+
+// Match the opening quote's escape layer. Higher-layer instances of that
+// delimiter belong to the URL (e.g. escaped quotes inside a JSON query).
+fn flight_url_token_end(
+    content: &str,
+    start: usize,
+    delimiter: u8,
+    layer: usize,
+) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut slash_run = 0;
+    for index in start..bytes.len() {
+        let byte = bytes[index];
+        if byte == delimiter {
+            if slash_run == layer {
+                return Some((index - slash_run, index + 1));
+            }
+            if slash_run < layer {
+                return None;
+            }
+        } else if delimiter == b'`' && byte == b'$' {
+            return (bytes.get(index + 1) == Some(&b'{')).then_some((index, index + 2));
+        }
+        slash_run = if byte == b'\\' { slash_run + 1 } else { 0 };
+    }
+    None
+}
+
+/// Rewrite supported GTM/GA tokens in a captured Flight source span.
+///
+/// Call only after original T-record boundaries are known, before lengths are
+/// recomputed. Originals used for fallback must never pass through this function.
+pub(crate) fn rewrite_gtm_rsc_span(content: &str) -> String {
+    fn route(token: &str) -> Option<String> {
+        let captures = GTM_RSC_WHOLE_URL_PATTERN.captures(token)?;
+        let slash = &captures["slash"];
+        let path = &captures["path"];
+        let suffix = captures.name("suffix").map_or("", |value| value.as_str());
+        Some(format!(
+            "{slash}integrations{slash}google_tag_manager{path}{suffix}"
+        ))
+    }
+    if let Some(rewritten) = route(content) {
+        return rewritten;
+    }
+    let mut rewritten = String::with_capacity(content.len());
+    let mut cursor = 0;
+    let mut search = 0;
+    while let Some(captures) = GTM_RSC_QUOTED_URL_START.captures(&content[search..]) {
+        let open = captures.name("open").expect("should capture quote layer");
+        let open_start = search + open.start();
+        let url_start = search + open.end();
+        let delimiter = content.as_bytes()[url_start - 1];
+        let layer = open.len() - 1;
+        search = url_start;
+        // Never accept a suffix of an unsupported, deeper opening layer.
+        if open_start > 0 && content.as_bytes()[open_start - 1] == b'\\' {
+            continue;
+        }
+        let Some((url_end, token_end)) = flight_url_token_end(content, url_start, delimiter, layer)
+        else {
+            continue;
+        };
+        search = token_end;
+        if let Some(url) = route(&content[url_start..url_end]) {
+            rewritten.push_str(&content[cursor..url_start]);
+            rewritten.push_str(&url);
+            cursor = url_end;
+        }
+    }
+    rewritten.push_str(&content[cursor..]);
+    rewritten
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct GoogleTagManagerConfig {
@@ -356,14 +446,12 @@ pub struct GoogleTagManagerIntegration {
     /// allowlist as "any host", so without this a 3xx from the upstream would
     /// let an arbitrary origin's body be re-served as first-party JavaScript.
     proxy_allowed_domains: Vec<String>,
-    /// Accumulates text fragments when `lol_html` splits a text node across
-    /// chunk boundaries. Drained on `is_last_in_text_node`.
-    ///
-    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
-    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
-    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
-    /// per element — the buffer is always empty when a new element's text begins.
-    accumulated_text: Mutex<String>,
+}
+
+#[derive(Default)]
+struct GtmScriptState {
+    held: String,
+    bypass_until_last: bool,
 }
 
 impl GoogleTagManagerIntegration {
@@ -372,7 +460,6 @@ impl GoogleTagManagerIntegration {
         Arc::new(Self {
             config,
             proxy_allowed_domains,
-            accumulated_text: Mutex::new(String::new()),
         })
     }
 
@@ -1029,39 +1116,57 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
     }
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        let mut buf = self
-            .accumulated_text
+        let state = ctx
+            .document_state
+            .get_or_insert_with(GTM_INTEGRATION_ID, || Mutex::new(GtmScriptState::default()));
+        let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Cheap gate: only engage the accumulation path for scripts whose
-        // running text could plausibly contain a GTM/GA domain. Unrelated
-        // scripts (the vast majority) return Keep on every fragment so they
-        // stay visible in `lol_html`'s output unchanged — and, critically,
-        // so a Replace from this rewriter does not clobber a Replace from
-        // another rewriter on the same element (e.g., `NextJsNextDataRewriter`
-        // on `script#__NEXT_DATA__`). See `might_contain_gtm_prefix` for the
-        // boundary-safe substring check.
-        let prior_and_current_might_match =
-            might_contain_gtm_prefix(&buf) || might_contain_gtm_prefix(content);
-
-        if !ctx.is_last_in_text_node {
-            // Intermediate fragment. Only accumulate + suppress when the script
-            // might still resolve to a GTM match. Otherwise return Keep so the
-            // fragment is emitted as-is by `lol_html` and untouched by us.
-            if prior_and_current_might_match {
-                buf.push_str(content);
-                return ScriptRewriteAction::RemoveNode;
+        if crate::integrations::nextjs::protects_current_flight_fragment(ctx.document_state) {
+            if ctx.is_last_in_text_node {
+                state.bypass_until_last = false;
             }
-            return ScriptRewriteAction::keep();
+            if state.held.is_empty() {
+                return ScriptRewriteAction::Keep;
+            }
+            let mut restored = std::mem::take(&mut state.held);
+            restored.push_str(content);
+            return ScriptRewriteAction::Replace(restored);
         }
-
-        // Last fragment. If we accumulated prior fragments, combine them.
-        let full_content: Option<String> = if buf.is_empty() {
+        if state.bypass_until_last {
+            if ctx.is_last_in_text_node {
+                state.bypass_until_last = false;
+            }
+            return ScriptRewriteAction::Keep;
+        }
+        // Once holding begins, retain every following fragment in source order,
+        // even if the tentative hostname prefix turns out not to match.
+        if state.held.is_empty() && !might_contain_gtm_prefix(content) {
+            return ScriptRewriteAction::Keep;
+        }
+        if state
+            .held
+            .len()
+            .checked_add(content.len())
+            .is_none_or(|length| length > ctx.max_buffered_script_bytes)
+        {
+            state.bypass_until_last = !ctx.is_last_in_text_node;
+            if state.held.is_empty() {
+                return ScriptRewriteAction::Keep;
+            }
+            let mut restored = std::mem::take(&mut state.held);
+            restored.push_str(content);
+            return ScriptRewriteAction::Replace(restored);
+        }
+        if !ctx.is_last_in_text_node {
+            state.held.push_str(content);
+            return ScriptRewriteAction::RemoveNode;
+        }
+        let full_content = if state.held.is_empty() {
             None
         } else {
-            buf.push_str(content);
-            Some(std::mem::take(&mut *buf))
+            state.held.push_str(content);
+            Some(std::mem::take(&mut state.held))
         };
         let text = full_content.as_deref().unwrap_or(content);
 
@@ -1098,6 +1203,7 @@ mod tests {
     };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::Settings;
+    use crate::streaming_processor::StreamProcessor as _;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
     #[test]
@@ -3412,6 +3518,271 @@ container_id = "GTM-DEFAULT"
             }
             other => panic!("Expected Integration error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn ordinary_and_flight_urls_share_routing_policy() {
+        for (host, supported_host) in [
+            ("www.googletagmanager.com", true),
+            ("www.google-analytics.com", true),
+            ("analytics.google.com", true),
+            ("www.googletagmanager.com.evil", false),
+            ("example.com", false),
+        ] {
+            for (path, supported_path) in [
+                ("", true),
+                ("/gtm.js", true),
+                ("/gtag/js", true),
+                ("/gtag.js", true),
+                ("/g/collect", true),
+                ("/collect", true),
+                ("/ns.html", false),
+                ("/gtm.js/path", false),
+                ("/collect;matrix", false),
+            ] {
+                for scheme in ["https:", "http:", ""] {
+                    for suffix in ["", "?id=GTM-MIX1&v=2", "#fragment"] {
+                        let url = format!("{scheme}//{host}{path}{suffix}");
+                        let expected = if supported_host && supported_path {
+                            format!("/integrations/google_tag_manager{path}{suffix}")
+                        } else {
+                            url.clone()
+                        };
+                        for quote in ["", "'", "\"", "`"] {
+                            let source = format!("{quote}{url}{quote}");
+                            let expected = format!("{quote}{expected}{quote}");
+                            assert_eq!(
+                                GoogleTagManagerIntegration::rewrite_gtm_urls(&source),
+                                expected,
+                                "should apply ordinary routing policy: {source}"
+                            );
+                            for slash in ["/", r"\/", r"\\/"] {
+                                let flight_source = source.replace('/', slash);
+                                assert_eq!(
+                                    rewrite_gtm_rsc_span(&flight_source),
+                                    expected.replace('/', slash),
+                                    "should preserve Flight routing policy and escapes: {flight_source}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_flight_preserves_quoted_query_delimiters_and_template_interpolation() {
+        for (source, expected) in [
+            (
+                r#"\"http://www.googletagmanager.com/gtm.js?q='text'\""#,
+                r#"\"/integrations/google_tag_manager/gtm.js?q='text'\""#,
+            ),
+            (
+                r#"\"http://www.googletagmanager.com/gtm.js?q=`text`\""#,
+                r#"\"/integrations/google_tag_manager/gtm.js?q=`text`\""#,
+            ),
+            (
+                r#"'http://www.googletagmanager.com/gtm.js?q=\"text\"'"#,
+                r#"'/integrations/google_tag_manager/gtm.js?q=\"text\"'"#,
+            ),
+            (
+                r#"\"http://www.googletagmanager.com/gtm.js?q=\\\"text\\\"\""#,
+                r#"\"/integrations/google_tag_manager/gtm.js?q=\\\"text\\\"\""#,
+            ),
+            (
+                r"'http://www.googletagmanager.com/gtm.js?q=\'text\''",
+                r"'/integrations/google_tag_manager/gtm.js?q=\'text\''",
+            ),
+            (
+                "`http://www.googletagmanager.com/gtm.js?q=$literal`",
+                "`http://www.googletagmanager.com/gtm.js?q=$literal`",
+            ),
+            (
+                "`http://www.googletagmanager.com/gtm.js${id}`",
+                "`/integrations/google_tag_manager/gtm.js${id}`",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_gtm_rsc_span(source),
+                expected,
+                "should preserve query delimiters and template interpolation: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_flight_token_rewrite_preserves_escape_layers_and_allowed_paths() {
+        for slash in ["/", r"\/", r"\\/"] {
+            for quote in ["", "'", "\"", r#"\""#, "`"] {
+                let source = format!(
+                    "{quote}http:{slash}{slash}www.googletagmanager.com{slash}gtm.js{quote}"
+                );
+                let expected = format!(
+                    "{quote}{slash}integrations{slash}google_tag_manager{slash}gtm.js{quote}"
+                );
+                assert_eq!(
+                    rewrite_gtm_rsc_span(&source),
+                    expected,
+                    "should preserve source escape layer: {source}"
+                );
+            }
+        }
+        for source in [
+            r#""https://www.googletagmanager.com/ns.html?id=GTM-MIX1""#,
+            "text http://www.googletagmanager.com/gtm.js text",
+            "'http://www.googletagmanager.com/gtm.js/path'",
+            "'http://www.googletagmanager.com/collect;matrix'",
+            "'http://www.googletagmanager.com.evil/gtm.js'",
+            "'http://www.googletagmanager.com/gtm.js\"",
+        ] {
+            assert_eq!(
+                rewrite_gtm_rsc_span(source),
+                source,
+                "should not route unsupported or unbounded token"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_gtm_split_after_underscore_emits_once() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({"enabled": true, "container_id": "GTM-MIX1"}),
+            )
+            .expect("should enable GTM");
+        settings
+            .integrations
+            .insert_config("nextjs", &serde_json::json!({"enabled": true}))
+            .expect("should enable Next.js");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
+        )
+        .expect("should build registry");
+        let mut processor = create_html_processor(config_from_settings(&settings, &registry));
+        let mut bytes = processor
+            .process_chunk(
+                b"<script>var url='https://www.googletagmanager.com/gtm.js';var tail_",
+                false,
+            )
+            .expect("should accept fragment");
+        bytes.extend(
+            processor
+                .process_chunk(b"=1;</script>", true)
+                .expect("should consume final"),
+        );
+        let html = String::from_utf8(bytes).expect("should emit UTF-8");
+        assert!(html.contains("var url='/integrations/google_tag_manager/gtm.js';var tail_=1;"));
+        assert_eq!(
+            html.matches("var url=").count(),
+            1,
+            "should emit script text once"
+        );
+    }
+
+    #[test]
+    fn sticky_gtm_four_fragments_preserve_order_after_false_google_prefix() {
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-MIX1", &[]));
+        let state = IntegrationDocumentState::default();
+        let fragments = [
+            "var falsePrefix='google",
+            "X';first=1;",
+            "second=2;var tag='http://www.googletagmanager.com/gtm.js",
+            "';last=3;",
+        ];
+        let mut emitted = String::new();
+        for (index, fragment) in fragments.iter().enumerate() {
+            let context = IntegrationScriptContext {
+                selector: "script",
+                request_host: "test.example.com",
+                request_scheme: "https",
+                origin_host: "origin.example.com",
+                is_last_in_text_node: index == 3,
+                max_buffered_script_bytes: 1000,
+                document_state: &state,
+            };
+            match IntegrationScriptRewriter::rewrite(&*integration, fragment, &context) {
+                ScriptRewriteAction::Keep => emitted.push_str(fragment),
+                ScriptRewriteAction::Replace(value) => emitted.push_str(&value),
+                ScriptRewriteAction::RemoveNode => {}
+            }
+        }
+        assert_eq!(
+            emitted,
+            "var falsePrefix='googleX';first=1;second=2;var tag='/integrations/google_tag_manager/gtm.js';last=3;"
+        );
+    }
+
+    #[test]
+    fn sticky_gtm_holding_is_bounded_and_document_local() {
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-MIX1", &[]));
+        let a = IntegrationDocumentState::default();
+        let b = IntegrationDocumentState::default();
+        let context = |last, budget, state| IntegrationScriptContext {
+            selector: "script",
+            request_host: "test.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: last,
+            max_buffered_script_bytes: budget,
+            document_state: state,
+        };
+        let fragments = ["prefix google", "X-middle", "later", "-tail"];
+        let mut emitted = String::new();
+        for (i, fragment) in fragments.iter().enumerate() {
+            let action = IntegrationScriptRewriter::rewrite(
+                &*integration,
+                fragment,
+                &context(i == 3, 100, &a),
+            );
+            match action {
+                ScriptRewriteAction::Keep => emitted.push_str(fragment),
+                ScriptRewriteAction::Replace(value) => emitted.push_str(&value),
+                ScriptRewriteAction::RemoveNode => {}
+            }
+            if i == 0 {
+                assert_eq!(
+                    IntegrationScriptRewriter::rewrite(
+                        &*integration,
+                        "other",
+                        &context(true, 100, &b)
+                    ),
+                    ScriptRewriteAction::Keep,
+                    "should isolate documents"
+                );
+            }
+        }
+        assert_eq!(
+            emitted,
+            fragments.concat(),
+            "should preserve source order after false prefix"
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*integration, "google", &context(false, 6, &a)),
+            ScriptRewriteAction::RemoveNode
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*integration, "X", &context(false, 6, &a)),
+            ScriptRewriteAction::Replace("googleX".into()),
+            "should restore on overflow"
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*integration, "tail", &context(true, 6, &a)),
+            ScriptRewriteAction::Keep
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*integration, "google", &context(false, 6, &a)),
+            ScriptRewriteAction::RemoveNode
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*integration, "", &context(true, 6, &a)),
+            ScriptRewriteAction::Replace("google".into()),
+            "should flush empty final at exact limit"
+        );
     }
 
     #[test]

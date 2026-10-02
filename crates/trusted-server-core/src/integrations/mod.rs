@@ -299,6 +299,8 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             id: "testlight",
             build: testlight::register,
         },
+        // Next.js must precede GTM: GTM reads the Flight-protection snapshot
+        // that the Next.js script stage records for the same fragment.
         IntegrationBuilder {
             id: "nextjs",
             build: nextjs::register,

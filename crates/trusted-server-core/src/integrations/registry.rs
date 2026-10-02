@@ -55,11 +55,18 @@ pub enum AttributeRewriteOutcome {
     RemoveElement,
 }
 
-/// Action returned by inline script rewriters to describe how to mutate the node.
+/// Action on the current working script text fragment, composed in registration order.
+///
+/// Every matching stage receives the previous stage's output, including empty
+/// suppressed text and the original final-fragment flag. Only the composed result
+/// is applied to the parser fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptRewriteAction {
+    /// Preserve the current working text, not the original parser text.
     Keep,
+    /// Pass replacement text to subsequent matching stages.
     Replace(String),
+    /// Suppress this fragment; downstream stages still run and may flush held text.
     RemoveNode,
 }
 
@@ -93,6 +100,7 @@ pub struct IntegrationAttributeContext<'a> {
 /// Context passed to script/text rewriters for inline HTML handling.
 #[derive(Debug)]
 pub struct IntegrationScriptContext<'a> {
+    /// The individual rewriter's CSS selector, matched by `lol_html`.
     pub selector: &'a str,
     pub request_host: &'a str,
     pub request_scheme: &'a str,
@@ -532,13 +540,15 @@ pub trait IntegrationAttributeRewriter: Send + Sync {
     ) -> AttributeRewriteAction;
 }
 
-/// Trait for integration-provided inline script/text rewrite hooks.
+/// Trait for integration-provided inline script rewrite hooks.
 pub trait IntegrationScriptRewriter: Send + Sync {
     /// Identifier for logging/diagnostics.
     fn integration_id(&self) -> &'static str;
-    /// CSS selector (e.g. `script#__NEXT_DATA__`) that should trigger this rewriter.
+    /// CSS selector matching `<script>` elements, for example `script#__NEXT_DATA__`.
+    /// Only text inside matched scripts triggers this rewriter; non-script
+    /// elements are not supported.
     fn selector(&self) -> &'static str;
-    /// Attempt to rewrite the inline text content for the selector.
+    /// Attempt to rewrite the inline script content for the selector.
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction;
 }
 

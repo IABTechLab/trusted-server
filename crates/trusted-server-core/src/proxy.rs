@@ -1621,7 +1621,8 @@ pub async fn handle_first_party_click(
 /// # Errors
 ///
 /// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
-/// unsupported scheme, the URL lacks a host, or the host violates `proxy.allowed_domains`.
+/// unsupported scheme, the URL lacks a host, the host violates `proxy.allowed_domains`,
+/// or request metadata needed to determine the scheme contains a malformed host.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1639,11 +1640,11 @@ pub async fn handle_first_party_proxy_sign(
     // adapter forwards verbatim — have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = req
-        .uri()
-        .scheme_str()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| RequestInfo::from_request(&req, _services.client_info()).scheme);
+    let request_scheme = if let Some(scheme) = req.uri().scheme_str() {
+        scheme.to_ascii_lowercase()
+    } else {
+        RequestInfo::from_request(&req, _services.client_info())?.scheme
+    };
 
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;

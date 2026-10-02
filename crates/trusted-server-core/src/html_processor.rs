@@ -1,7 +1,8 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
-use std::cell::Cell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -661,38 +662,62 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }));
     }
 
-    for script_rewriter in script_rewriters {
-        let selector = script_rewriter.selector();
-        let rewriter = script_rewriter.clone();
-        let patterns = patterns.clone();
-        let document_state = document_state.clone();
-        element_content_handlers.push(text!(selector, {
-            let rewriter = rewriter.clone();
-            let patterns = patterns.clone();
-            let document_state = document_state.clone();
-            move |text| {
-                let ctx = IntegrationScriptContext {
-                    selector,
-                    request_host: &patterns.request_host,
-                    request_scheme: &patterns.request_scheme,
-                    origin_host: &patterns.origin_host,
-                    is_last_in_text_node: text.last_in_text_node(),
-                    max_buffered_script_bytes: config.max_buffered_body_bytes,
-                    document_state: &document_state,
-                };
-                match rewriter.rewrite(text.as_str(), &ctx) {
-                    ScriptRewriteAction::Keep => {}
-                    ScriptRewriteAction::Replace(rewritten) => {
-                        text.replace(&rewritten, ContentType::Text);
-                    }
-                    ScriptRewriteAction::RemoveNode => {
-                        text.remove();
-                    }
-                }
-                Ok(())
-            }
+    // Selector callbacks retain lol_html's CSS matching; only the composed text
+    // callback mutates a fragment. Start each script with fresh match state.
+    let script_matches = Rc::new(RefCell::new(vec![false; script_rewriters.len()]));
+    let reset_matches = script_matches.clone();
+    element_content_handlers.push(element!("script", move |_el| {
+        reset_matches.borrow_mut().fill(false);
+        Ok(())
+    }));
+    for (index, rewriter) in script_rewriters.iter().enumerate() {
+        let matches = script_matches.clone();
+        element_content_handlers.push(element!(rewriter.selector(), move |_el| {
+            matches.borrow_mut()[index] = true;
+            Ok(())
         }));
     }
+    let script_patterns = patterns.clone();
+    let script_document_state = document_state.clone();
+    element_content_handlers.push(text!("script", move |text| {
+        let mut working = Cow::Borrowed(text.as_str());
+        let mut changed = false;
+        for (rewriter, matched) in script_rewriters.iter().zip(script_matches.borrow().iter()) {
+            if !matched {
+                continue;
+            }
+            let ctx = IntegrationScriptContext {
+                selector: rewriter.selector(),
+                request_host: &script_patterns.request_host,
+                request_scheme: &script_patterns.request_scheme,
+                origin_host: &script_patterns.origin_host,
+                is_last_in_text_node: text.last_in_text_node(),
+                max_buffered_script_bytes: config.max_buffered_body_bytes,
+                document_state: &script_document_state,
+            };
+            match rewriter.rewrite(&working, &ctx) {
+                ScriptRewriteAction::Keep => {}
+                ScriptRewriteAction::Replace(rewritten) => {
+                    working = Cow::Owned(rewritten);
+                    changed = true;
+                }
+                ScriptRewriteAction::RemoveNode => {
+                    working = Cow::Borrowed("");
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if working.is_empty() {
+                text.remove();
+            } else if let Cow::Owned(rewritten) = working {
+                // Script is raw text: HTML entities would change JS/JSON data.
+                // Emit composed source verbatim rather than escaping it again.
+                text.replace(&rewritten, ContentType::Html);
+            }
+        }
+        Ok(())
+    }));
 
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
@@ -723,7 +748,7 @@ mod tests {
     use super::*;
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector, IntegrationHtmlContext,
+        IntegrationHeadInjector, IntegrationHtmlContext, IntegrationScriptRewriter,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -750,6 +775,71 @@ mod tests {
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
         }
+    }
+
+    struct SuppressingScript;
+    impl IntegrationScriptRewriter for SuppressingScript {
+        fn integration_id(&self) -> &'static str {
+            "suppress"
+        }
+        fn selector(&self) -> &'static str {
+            "script[data-suppress='yes']"
+        }
+        fn rewrite(&self, _text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+            assert_eq!(ctx.selector, self.selector());
+            ScriptRewriteAction::RemoveNode
+        }
+    }
+
+    struct FlushingScript;
+    impl IntegrationScriptRewriter for FlushingScript {
+        fn integration_id(&self) -> &'static str {
+            "flush"
+        }
+        fn selector(&self) -> &'static str {
+            "script#flush"
+        }
+        fn rewrite(&self, text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+            assert_eq!(ctx.selector, self.selector());
+            assert!(text.is_empty(), "should see upstream suppression");
+            if ctx.is_last_in_text_node {
+                ScriptRewriteAction::Replace("flushed-once".into())
+            } else {
+                ScriptRewriteAction::Keep
+            }
+        }
+    }
+
+    #[test]
+    fn script_actions_compose_with_selector_reset_and_empty_final_flush() {
+        let mut config = create_test_config();
+        config.integrations = IntegrationRegistry::from_rewriters(
+            Vec::new(),
+            vec![Arc::new(SuppressingScript), Arc::new(FlushingScript)],
+        );
+        let mut processor = create_html_processor(config);
+        let mut output = processor
+            .process_chunk(b"<script id='flush' data-suppress='yes'>first_", false)
+            .expect("should accept first fragment");
+        output.extend(
+            processor
+                .process_chunk(b"second</script><script>ordinary_</script>", true)
+                .expect("should finalize all matching stages"),
+        );
+        let output = String::from_utf8(output).expect("should emit UTF-8");
+        assert!(
+            output.contains("<script id='flush' data-suppress='yes'>flushed-once</script>"),
+            "should flush downstream even on suppressed final: {output}"
+        );
+        assert!(
+            output.contains("<script>ordinary_</script>"),
+            "should reset CSS match state between scripts"
+        );
+        assert_eq!(
+            output.matches("flushed-once").count(),
+            1,
+            "should emit the flushed fragment exactly once"
+        );
     }
 
     #[test]

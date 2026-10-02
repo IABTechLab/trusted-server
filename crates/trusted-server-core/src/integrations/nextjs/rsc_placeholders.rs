@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use regex::Regex;
 
 use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
@@ -11,11 +13,38 @@ use super::rsc_stream::{
     CapturedPayload, FragmentCapture, MAX_UNRESOLVED_RSC_PAYLOADS, RscGroupStatus,
     capture_fragment, classify_rsc_group, document_state, rsc_payload_placeholder,
 };
+use super::script_lexer::ScriptLexer;
 use super::shared::{
-    RSC_RECEIVER_CONTEXT_BYTES, find_rsc_push_payload_range, find_trimmed_rsc_push_payload_range,
+    RSC_PUSH_CALL_PATTERN, RSC_PUSH_CALL_PATTERN_TRIMMED, RSC_RECEIVER_CONTEXT_BYTES,
+    find_rsc_push_payload_range, find_trimmed_rsc_push_payload_range,
     receiver_context_is_flight_push,
 };
 use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
+
+// Observe actual qualified push calls, not bare property references. Unlike
+// capture, ownership also covers unsupported channels and whitespace spellings
+// because raw fallback must retain their original T lengths.
+static QUALIFIED_FLIGHT_PUSH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:self|window)\.__next_f\s*(?:\.\s*push\s*\(|=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.\s*push\s*\()")
+        .expect("should compile qualified Flight push observation")
+});
+
+// The receiver may already have streamed, leaving a verified trimmed head.
+static TRIMMED_FLIGHT_PUSH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^__next_f\s*(?:\.\s*push\s*\(|=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.\s*push\s*\()")
+        .expect("should compile trimmed Flight push observation")
+});
+
+// Only completed inert bootstrap controls may be skipped. Opaque channel-2
+// strings and incomplete calls must retain the conservative raw fallback.
+static INERT_FLIGHT_CONTROL_ARGUMENTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*\[\s*(?:0|2\s*,\s*null)\s*\]\s*\)")
+        .expect("should compile inert Flight control arguments")
+});
+
+// Collapsing whitespace runs bounds either supported call head well below this
+// size, while keeping the receiver's preceding boundary for qualification.
+const FLIGHT_QUALIFIER_TAIL_BYTES: usize = 96;
 
 pub(super) struct NextJsRscPlaceholderRewriter {
     config: Arc<NextJsIntegrationConfig>,
@@ -34,7 +63,8 @@ impl NextJsRscPlaceholderRewriter {
         limit: usize,
         max_queued_payload_bytes: usize,
     ) -> ScriptRewriteAction {
-        if !content.contains("__next_f") {
+        let code = state.rsc_lexical_start.clone().mask(content);
+        if !code.contains("__next_f") {
             return if was_buffered {
                 ScriptRewriteAction::replace(content.to_owned())
             } else {
@@ -42,67 +72,103 @@ impl NextJsRscPlaceholderRewriter {
             };
         }
 
-        let range = if state.rsc_receiver_trimmed {
-            find_trimmed_rsc_push_payload_range(content)
-        } else {
-            find_rsc_push_payload_range(content)
-        };
-        state.rsc_receiver_trimmed = false;
-        let Some((payload_start, payload_end)) = range else {
-            return if was_buffered {
-                ScriptRewriteAction::replace(content.to_owned())
+        // Discover all ranges and validate the queue budget before committing any
+        // capture. A malformed or unrecognized remainder stays original/protected.
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        let mut trimmed = std::mem::take(&mut state.rsc_receiver_trimmed);
+        let mut queued_bytes = state.captured_payload_bytes;
+        loop {
+            let remaining = &content[cursor..];
+            let remaining_code = &code[cursor..];
+            let head = if trimmed {
+                TRIMMED_FLIGHT_PUSH_PATTERN.find(remaining_code)
             } else {
-                ScriptRewriteAction::Keep
+                first_qualified_flight_push(remaining_code)
             };
-        };
-
-        if payload_start > payload_end
-            || payload_end > content.len()
-            || !content.is_char_boundary(payload_start)
-            || !content.is_char_boundary(payload_end)
-        {
-            state.bypass_rsc = true;
+            // Property references are ordinary source, including after a push.
+            // Only another qualified call can require capture or raw fallback.
+            let Some(head) = head else {
+                break;
+            };
+            if let Some(arguments) = INERT_FLIGHT_CONTROL_ARGUMENTS.find(&remaining[head.end()..]) {
+                cursor += head.end() + arguments.end();
+                trimmed = false;
+                continue;
+            }
+            let range = executable_payload_range(remaining, remaining_code, trimmed);
+            let call = if trimmed {
+                RSC_PUSH_CALL_PATTERN_TRIMMED.find(remaining_code)
+            } else {
+                RSC_PUSH_CALL_PATTERN.find(remaining_code)
+            };
+            trimmed = false;
+            let Some((start, end)) = range.filter(|(start, _)| {
+                call.is_some_and(|call| {
+                    call.end() == *start
+                        && !contains_qualified_flight(&remaining_code[..call.start()])
+                })
+            }) else {
+                // A raw qualified push cannot safely continue a pending T group
+                // or be skipped by later captures. A bare property reference is
+                // ordinary script text and must not disable later Flight capture.
+                state.bypass_rsc |= state.flight_node_owned;
+                return if was_buffered {
+                    ScriptRewriteAction::replace(content.to_owned())
+                } else {
+                    ScriptRewriteAction::Keep
+                };
+            };
+            let start = cursor + start;
+            let end = cursor + end;
+            let length = end.saturating_sub(start);
+            // Group bytes and queued parser-held bytes have distinct limits:
+            // independent groups parsed in one call must not consume each other's
+            // group allowance before the output processor can release them.
+            let total = queued_bytes.checked_add(length);
+            if start > end
+                || end >= content.len()
+                || !content.is_char_boundary(start)
+                || !content.is_char_boundary(end)
+                || length > limit
+                || state.captured_payloads.len() + ranges.len() >= MAX_UNRESOLVED_RSC_PAYLOADS
+                || total.is_none_or(|bytes| bytes > max_queued_payload_bytes)
+            {
+                state.bypass_rsc = true;
+                return if was_buffered {
+                    ScriptRewriteAction::replace(content.to_owned())
+                } else {
+                    ScriptRewriteAction::Keep
+                };
+            }
+            queued_bytes = total.expect("should have validated queue size");
+            ranges.push((start, end));
+            cursor = end + 1;
+        }
+        if ranges.is_empty() {
             return if was_buffered {
                 ScriptRewriteAction::replace(content.to_owned())
             } else {
                 ScriptRewriteAction::Keep
             };
         }
-
-        let payload = &content[payload_start..payload_end];
-        // `limit` bounds one script here and the downstream unresolved group in
-        // `classify_rsc_group`. It deliberately does not bound this queue in
-        // aggregate: the processor cannot decrement a resolved group until the
-        // whole parser call returns, so a shared `limit` budget would make
-        // independent payloads bypass each other purely because they shared a
-        // source chunk. The queue is parser-held script text, so it is bounded
-        // by the parser's own script-buffer budget instead — the same budget
-        // `NextJsNextDataRewriter` buffers against — plus a payload count.
-        let exceeds_limit = payload.len() > limit
-            || state.captured_payloads.len() >= MAX_UNRESOLVED_RSC_PAYLOADS
-            || state
-                .captured_payload_bytes
-                .checked_add(payload.len())
-                .is_none_or(|queued| queued > max_queued_payload_bytes);
-        if exceeds_limit {
-            state.bypass_rsc = true;
-            return if was_buffered {
-                ScriptRewriteAction::replace(content.to_owned())
-            } else {
-                ScriptRewriteAction::Keep
-            };
+        let mut rewritten = String::with_capacity(content.len());
+        cursor = 0;
+        for (start, end) in ranges {
+            let placeholder =
+                rsc_payload_placeholder(&state.namespace, state.next_placeholder_index);
+            state.next_placeholder_index = state.next_placeholder_index.saturating_add(1);
+            state.captured_payloads.push_back(CapturedPayload {
+                placeholder: placeholder.clone(),
+                original: content[start..end].to_owned(),
+            });
+            rewritten.push_str(&content[cursor..start]);
+            rewritten.push_str(&placeholder);
+            cursor = end;
         }
-
-        let placeholder = rsc_payload_placeholder(&state.namespace, state.next_placeholder_index);
-        state.next_placeholder_index = state.next_placeholder_index.saturating_add(1);
-        state.captured_payload_bytes += payload.len();
-        state.captured_payloads.push_back(CapturedPayload {
-            placeholder: placeholder.clone(),
-            original: payload.to_owned(),
-        });
-
-        let mut rewritten = content.to_owned();
-        rewritten.replace_range(payload_start..payload_end, &placeholder);
+        state.captured_payload_bytes = queued_bytes;
+        rewritten.push_str(&content[cursor..]);
+        state.current_fragment_protected = false;
         ScriptRewriteAction::replace(rewritten)
     }
 
@@ -121,24 +187,32 @@ impl NextJsRscPlaceholderRewriter {
             FragmentCapture::CompleteOwned(complete) => {
                 self.rewrite_complete(&complete, true, state, limit, max_queued_payload_bytes)
             }
-            FragmentCapture::Suppress => ScriptRewriteAction::RemoveNode,
+            FragmentCapture::Suppress => {
+                // Captured Flight bytes are withheld, so downstream stages see
+                // only empty source or a released receiver prefix, never a raw
+                // payload. Let GTM retain and rewrite preceding ordinary source.
+                state.current_fragment_protected = false;
+                ScriptRewriteAction::RemoveNode
+            }
             FragmentCapture::Restore(restored) => {
                 state.rsc_receiver_trimmed = false;
-                state.bypass_rsc = true;
+                state.bypass_rsc |= state.flight_node_owned;
                 ScriptRewriteAction::replace(restored)
             }
             FragmentCapture::PassThrough => {
                 let trimmed = state.rsc_receiver_trimmed;
                 state.rsc_receiver_trimmed = false;
+                if !state.flight_node_owned {
+                    return ScriptRewriteAction::Keep;
+                }
                 if is_last && content.len() > limit && content.contains("__next_f") {
+                    let code = state.rsc_lexical_start.clone().mask(content);
                     let mut remaining = content;
+                    let mut remaining_code = code.as_str();
                     let mut receiver_trimmed = trimmed;
                     let unsafe_continuation = loop {
-                        let range = if receiver_trimmed {
-                            find_trimmed_rsc_push_payload_range(remaining)
-                        } else {
-                            find_rsc_push_payload_range(remaining)
-                        };
+                        let range =
+                            executable_payload_range(remaining, remaining_code, receiver_trimmed);
                         let Some((start, end)) = range else {
                             break true;
                         };
@@ -152,8 +226,9 @@ impl NextJsRscPlaceholderRewriter {
                         // payload is not classified as another call. Only the
                         // first receiver can have streamed in an earlier fragment.
                         remaining = &remaining[end + 1..];
+                        remaining_code = &remaining_code[end + 1..];
                         receiver_trimmed = false;
-                        if !remaining.contains("__next_f") {
+                        if !contains_qualified_flight(remaining_code) {
                             break false;
                         }
                     };
@@ -167,26 +242,14 @@ impl NextJsRscPlaceholderRewriter {
             }
         }
     }
-}
-
-impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
-    fn integration_id(&self) -> &'static str {
-        NEXTJS_INTEGRATION_ID
-    }
-
-    fn selector(&self) -> &'static str {
-        "script"
-    }
-
-    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
-            return ScriptRewriteAction::keep();
-        }
-
-        let state = document_state(ctx.document_state);
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn rewrite_fragment(
+        &self,
+        content: &str,
+        code: &str,
+        lexical_start: ScriptLexer,
+        ctx: &IntegrationScriptContext<'_>,
+        state: &mut super::rsc_stream::NextJsDocumentState,
+    ) -> ScriptRewriteAction {
         if state.bypass_rsc {
             // The downstream processor can enter bypass after the parser has
             // suppressed part of this script. Restore it before passing through
@@ -213,21 +276,21 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             return self.rewrite_claimed_fragment(
                 content,
                 ctx.is_last_in_text_node,
-                &mut state,
+                state,
                 limit,
                 ctx.max_buffered_script_bytes,
             );
         }
 
-        if state.rsc_probe.is_empty() && !content.contains("__next_f") {
+        if state.rsc_probe.is_empty() && !code.contains("__next_f") {
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
                 return ScriptRewriteAction::Keep;
             }
-            let probe_length = longest_identifier_prefix(content.as_bytes());
+            let probe_length = longest_identifier_prefix(code.as_bytes());
             let ready_length = content.len() - probe_length;
             state.rsc_probe.push_str(&content[ready_length..]);
-            remember_released(&mut state.rsc_receiver_context, &content[..ready_length]);
+            remember_released(&mut state.rsc_receiver_context, &code[..ready_length]);
             return if probe_length == 0 {
                 ScriptRewriteAction::Keep
             } else if ready_length == 0 {
@@ -240,7 +303,8 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         let prior_probe = std::mem::take(&mut state.rsc_probe);
         let mut combined = prior_probe.clone();
         combined.push_str(content);
-        if !combined.contains("__next_f") {
+        let combined_code = format!("{prior_probe}{code}");
+        if !combined_code.contains("__next_f") {
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
                 return if prior_probe.is_empty() {
@@ -249,10 +313,13 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
                     ScriptRewriteAction::replace(combined)
                 };
             }
-            let probe_length = longest_identifier_prefix(combined.as_bytes());
+            let probe_length = longest_identifier_prefix(combined_code.as_bytes());
             let ready_length = combined.len() - probe_length;
             state.rsc_probe.push_str(&combined[ready_length..]);
-            remember_released(&mut state.rsc_receiver_context, &combined[..ready_length]);
+            remember_released(
+                &mut state.rsc_receiver_context,
+                &combined_code[..ready_length],
+            );
             if prior_probe.is_empty() && probe_length == 0 {
                 return ScriptRewriteAction::Keep;
             }
@@ -263,18 +330,18 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             };
         }
 
-        let identifier_start = combined
+        let identifier_start = combined_code
             .find("__next_f")
             .expect("should find the identifier that selected this branch");
         let mut context = state.rsc_receiver_context.clone();
-        context.push_str(&combined[..identifier_start]);
+        context.push_str(&combined_code[..identifier_start]);
         if !receiver_context_is_flight_push(&context) {
             // Some other object owns a `__next_f` property. Release the text
             // unchanged rather than claiming an unrelated publisher script.
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
             } else {
-                remember_released(&mut state.rsc_receiver_context, &combined);
+                remember_released(&mut state.rsc_receiver_context, &combined_code);
             }
             return if prior_probe.is_empty() {
                 ScriptRewriteAction::Keep
@@ -287,7 +354,7 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         // one that already streamed leaves a trimmed claim whose receiver this
         // verified context stands in for.
         state.rsc_receiver_trimmed =
-            !receiver_context_is_flight_push(&combined[..identifier_start]);
+            !receiver_context_is_flight_push(&combined_code[..identifier_start]);
         state.rsc_receiver_context.clear();
         let claimed_start = if state.rsc_receiver_trimmed {
             identifier_start
@@ -296,10 +363,12 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         };
         let prefix = &combined[..claimed_start];
         let claimed = &combined[claimed_start..];
+        state.rsc_lexical_start = lexical_start;
+        state.rsc_lexical_start.mask(&combined[..claimed_start]);
         let action = self.rewrite_claimed_fragment(
             claimed,
             ctx.is_last_in_text_node,
-            &mut state,
+            state,
             limit,
             ctx.max_buffered_script_bytes,
         );
@@ -311,6 +380,132 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             }
             ScriptRewriteAction::Keep if prior_probe.is_empty() => ScriptRewriteAction::Keep,
             ScriptRewriteAction::Keep => ScriptRewriteAction::replace(combined),
+        }
+    }
+}
+
+impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
+    fn integration_id(&self) -> &'static str {
+        NEXTJS_INTEGRATION_ID
+    }
+
+    fn selector(&self) -> &'static str {
+        "script"
+    }
+
+    fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+        let shared = document_state(ctx.document_state);
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::mem::take(&mut state.next_data_fragment) {
+            // Pages data is not executable Flight, even when a JSON string
+            // contains a complete push spelling. Clear the downstream snapshot
+            // as well so a prior protected script cannot suppress Pages GTM.
+            state.current_fragment_protected = false;
+            state.flight_node_owned = false;
+            state.flight_qualifier_tail.clear();
+            state.flight_lexical = ScriptLexer::default();
+            return ScriptRewriteAction::Keep;
+        }
+        if !self.config.enabled || self.config.rewrite_attributes.is_empty() {
+            state.current_fragment_protected = false;
+            return ScriptRewriteAction::Keep;
+        }
+        let lexical_start = state.flight_lexical.clone();
+        let code = state.flight_lexical.mask(content);
+        if state.flight_lexical.is_opaque() {
+            // At the lexical nesting limit, retain the existing conservative raw
+            // qualification. Ordinary scripts without a push do not bypass Flight.
+            observe_flight_qualifier(&mut state, content);
+            state.bypass_rsc |= state.flight_node_owned;
+        } else {
+            observe_flight_qualifier(&mut state, &code);
+        }
+        // A call head can complete after a tentative property probe overflowed.
+        // Once it proves Flight, preserve its entire raw continuation/group.
+        if state.flight_node_owned
+            && matches!(
+                state.rsc_script,
+                super::rsc_stream::FragmentState::BypassUntilLast
+            )
+        {
+            state.bypass_rsc = true;
+        }
+        state.current_fragment_protected = state.flight_node_owned;
+        let action = self.rewrite_fragment(content, &code, lexical_start, ctx, &mut state);
+        if ctx.is_last_in_text_node {
+            state.flight_node_owned = false;
+            state.flight_qualifier_tail.clear();
+            state.rsc_probe.clear();
+            state.rsc_receiver_context.clear();
+            state.rsc_receiver_trimmed = false;
+            state.flight_lexical = ScriptLexer::default();
+            state.rsc_lexical_start = ScriptLexer::default();
+        }
+        action
+    }
+}
+
+/// Match a call head only in executable source, then read its original string.
+fn executable_payload_range(content: &str, code: &str, trimmed: bool) -> Option<(usize, usize)> {
+    if trimmed {
+        RSC_PUSH_CALL_PATTERN_TRIMMED.find(code)?;
+        return find_trimmed_rsc_push_payload_range(content);
+    }
+    let call = RSC_PUSH_CALL_PATTERN.find(code)?;
+    let identifier = call.start() + call.as_str().find("__next_f")?;
+    if !receiver_context_is_flight_push(&code[..identifier]) {
+        return None;
+    }
+    let (start, end) = find_rsc_push_payload_range(&content[call.start()..])?;
+    Some((call.start() + start, call.start() + end))
+}
+
+fn contains_qualified_flight(source: &str) -> bool {
+    first_qualified_flight_push(source).is_some()
+}
+
+fn first_qualified_flight_push(source: &str) -> Option<regex::Match<'_>> {
+    QUALIFIED_FLIGHT_PUSH_PATTERN
+        .find_iter(source)
+        .find(|call| {
+            let identifier = call.start()
+                + call
+                    .as_str()
+                    .find("__next_f")
+                    .expect("should find identifier in qualified push pattern");
+            receiver_context_is_flight_push(&source[..identifier])
+        })
+}
+
+/// Observe a bounded whitespace-normalized call head without buffering script
+/// source, including initializer heads split after document bypass.
+fn observe_flight_qualifier(state: &mut super::rsc_stream::NextJsDocumentState, content: &str) {
+    if state.flight_node_owned {
+        return;
+    }
+    for character in content.chars() {
+        let character = if character.is_whitespace() {
+            ' '
+        } else {
+            character
+        };
+        if character == ' ' && state.flight_qualifier_tail.ends_with(' ') {
+            continue;
+        }
+        state.flight_qualifier_tail.push(character);
+        if state.flight_qualifier_tail.len() > FLIGHT_QUALIFIER_TAIL_BYTES {
+            let start = state.flight_qualifier_tail.len() - FLIGHT_QUALIFIER_TAIL_BYTES;
+            let start = (start..state.flight_qualifier_tail.len())
+                .find(|index| state.flight_qualifier_tail.is_char_boundary(*index))
+                .expect("should find bounded qualifier character boundary");
+            state.flight_qualifier_tail.drain(..start);
+        }
+        if character == '(' && contains_qualified_flight(&state.flight_qualifier_tail) {
+            state.flight_node_owned = true;
+            state.flight_qualifier_tail.clear();
+            break;
         }
     }
 }
@@ -368,6 +563,305 @@ mod tests {
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
             max_combined_payload_bytes: 10 * 1024 * 1024,
         })
+    }
+
+    #[test]
+    fn quoted_flight_spellings_do_not_claim_ownership() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+        rewriter.rewrite(r#"const demo="self.__next_f.push(";"#, &ctx(false, &state));
+        let shared = document_state(&state);
+        let state = shared.lock().expect("should lock state");
+        assert!(!state.flight_node_owned, "quoted text must not own Flight");
+    }
+
+    #[test]
+    fn unrecognized_qualified_prefix_makes_the_whole_batch_raw_and_protected() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+        let script = r#"self.__next_f.push([2,"1:T40,'http://www.googletagmanager.com/gtm.js'"]);self.__next_f.push([1,"later"])"#;
+        assert_eq!(
+            rewriter.rewrite(script, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should not partially hide a batch with uncaptured qualified payloads"
+        );
+        let shared = document_state(&state);
+        let state = shared.lock().expect("should lock state");
+        assert!(state.captured_payloads.is_empty());
+        assert!(state.current_fragment_protected);
+    }
+
+    #[test]
+    fn inert_controls_do_not_make_unsafe_batches_partially_capturable() {
+        for unsafe_call in [
+            r#"self.__next_f.push([2,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            "self.__next_f.push([0,1])",
+            "self.__next_f.push([2,null",
+            "self.__next_f.push([0]",
+        ] {
+            for unsafe_first in [false, true] {
+                let state = IntegrationDocumentState::default();
+                let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+                let control = "self.__next_f.push([0]);self.__next_f.push([2,null])";
+                let supported = r#"self.__next_f.push([1,"later"])"#;
+                let script = if unsafe_first {
+                    format!("{control};{unsafe_call};{supported}")
+                } else {
+                    format!("{control};{supported};{unsafe_call}")
+                };
+                assert_eq!(
+                    rewriter.rewrite(&script, &ctx(true, &state)),
+                    ScriptRewriteAction::Keep,
+                    "should preserve unsafe batch: {script}"
+                );
+                let shared = document_state(&state);
+                let state = shared.lock().expect("should lock state");
+                assert!(state.captured_payloads.is_empty());
+                assert!(state.current_fragment_protected);
+                assert!(state.bypass_rsc);
+            }
+        }
+    }
+
+    #[test]
+    fn inert_controls_are_preserved_without_document_bypass() {
+        for script in [
+            "(self.__next_f=self.__next_f||[]).push([0]);self.__next_f.push([2,null])",
+            "window.__next_f . push ( [ 0 ] );window.__next_f.push( [ 2 , null ] )",
+        ] {
+            let state = IntegrationDocumentState::default();
+            let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+            assert_eq!(
+                rewriter.rewrite(script, &ctx(true, &state)),
+                ScriptRewriteAction::Keep
+            );
+            let shared = document_state(&state);
+            let state = shared.lock().expect("should lock state");
+            assert!(state.captured_payloads.is_empty());
+            assert!(state.current_fragment_protected);
+            assert!(!state.bypass_rsc);
+        }
+    }
+
+    #[test]
+    fn batched_capture_is_atomic_at_byte_and_count_limits() {
+        let payload = "x".repeat(40);
+        let push = format!(r#"self.__next_f.push([1,"{payload}"])"#);
+        for (count, budget, captured) in
+            [(2, 80, 2), (2, 79, 0), (256, 20000, 256), (257, 20000, 0)]
+        {
+            let state = IntegrationDocumentState::default();
+            let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+            let script = vec![push.as_str(); count].join(";");
+            let action = rewriter.rewrite(
+                &script,
+                &IntegrationScriptContext {
+                    max_buffered_script_bytes: budget,
+                    ..ctx(true, &state)
+                },
+            );
+            let shared = document_state(&state);
+            let state = shared.lock().expect("should lock state");
+            assert_eq!(
+                state.captured_payloads.len(),
+                captured,
+                "should commit every push or none"
+            );
+            assert_eq!(state.captured_payload_bytes, captured * payload.len());
+            assert_eq!(
+                matches!(action, ScriptRewriteAction::Replace(_)),
+                captured > 0
+            );
+            assert_eq!(
+                state.current_fragment_protected,
+                captured == 0,
+                "should protect rejected raw batch"
+            );
+        }
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+        let script = format!("{push};self.__next_f.push([1,\"unfinished");
+        assert_eq!(
+            rewriter.rewrite(&script, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should leave unsafe remainder original"
+        );
+        assert!(
+            document_state(&state)
+                .lock()
+                .expect("should lock state")
+                .captured_payloads
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bypass_ownership_recognizes_every_split_and_resets_on_empty_final() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({"enabled": true, "container_id": "GTM-MIX1"}),
+            )
+            .expect("should enable GTM");
+        let registry = crate::integrations::IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
+        )
+        .expect("should create registry");
+        let gtm = registry
+            .script_rewriters()
+            .pop()
+            .expect("should register GTM");
+        let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+        let spaced_initializer = format!(
+            r#"(self.__next_f{}={}window.__next_f{}||{}[]{}).{}push{}([1,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            " ".repeat(256),
+            " ".repeat(256),
+            " ".repeat(256),
+            " ".repeat(256),
+            " ".repeat(256),
+            " ".repeat(256),
+            " ".repeat(256)
+        );
+        for script in [
+            r#"self.__next_f.push([1,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            r#"window.__next_f.push([1,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            r#"(self.__next_f=self.__next_f||[]).push([1,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            r#"(window.__next_f=window.__next_f||[]).push([1,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            &spaced_initializer,
+        ] {
+            for split in 1..script.len() {
+                let state = IntegrationDocumentState::default();
+                document_state(&state)
+                    .lock()
+                    .expect("should lock state")
+                    .bypass_rsc = true;
+                for fragment in [&script[..split], &script[split..], ""] {
+                    let final_fragment = fragment.is_empty();
+                    assert_eq!(
+                        rewriter.rewrite(fragment, &ctx(final_fragment, &state)),
+                        ScriptRewriteAction::Keep
+                    );
+                    assert_eq!(
+                        IntegrationScriptRewriter::rewrite(
+                            &*gtm,
+                            fragment,
+                            &ctx(final_fragment, &state)
+                        ),
+                        ScriptRewriteAction::Keep,
+                        "should preserve raw Flight at split {split}"
+                    );
+                    assert!(
+                        document_state(&state)
+                            .lock()
+                            .expect("should lock state")
+                            .flight_qualifier_tail
+                            .len()
+                            <= FLIGHT_QUALIFIER_TAIL_BYTES,
+                        "should bound fallback qualification observation"
+                    );
+                }
+                let ordinary = "var ordinary='http://www.googletagmanager.com/gtm.js';";
+                assert_eq!(
+                    rewriter.rewrite(ordinary, &ctx(true, &state)),
+                    ScriptRewriteAction::Keep
+                );
+                assert!(
+                    matches!(IntegrationScriptRewriter::rewrite(&*gtm, ordinary, &ctx(true, &state)), ScriptRewriteAction::Replace(ref text) if text.contains("/integrations/google_tag_manager/gtm.js"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_flight_fallback_is_protected_but_later_ordinary_gtm_is_not() {
+        let state = IntegrationDocumentState::default();
+        let rewriter = NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+            max_combined_payload_bytes: 24,
+            ..(*test_config()).clone()
+        }));
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({"enabled": true, "container_id": "GTM-MIX1"}),
+            )
+            .expect("should configure GTM");
+        let registry = crate::integrations::IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
+        )
+        .expect("should create registry");
+        let gtm = registry
+            .script_rewriters()
+            .pop()
+            .expect("should register script hook");
+        let raw = r#"self.__next_f.push([1,"1:T2,'http://www.googletagmanager.com/gtm.js?id=GTM-MIX1'"] )"#;
+        assert_eq!(
+            rewriter.rewrite(raw, &ctx(true, &state)),
+            ScriptRewriteAction::Keep
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*gtm, raw, &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should not change original T bytes on overflow"
+        );
+        for part in [
+            "self.__n",
+            "ext_f.push([1,\"",
+            "1:T2,'http://www.googletagmanager.com/gtm.js?id=GTM-MIX1'\"])",
+        ] {
+            let last = part.ends_with(")");
+            assert_eq!(
+                rewriter.rewrite(part, &ctx(last, &state)),
+                ScriptRewriteAction::Keep
+            );
+            assert_eq!(
+                IntegrationScriptRewriter::rewrite(&*gtm, part, &ctx(last, &state)),
+                ScriptRewriteAction::Keep,
+                "should recognize and protect split qualified flight after bypass"
+            );
+        }
+        let prefix = "var before='google";
+        assert_eq!(
+            rewriter.rewrite(prefix, &ctx(false, &state)),
+            ScriptRewriteAction::Keep
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*gtm, prefix, &ctx(false, &state)),
+            ScriptRewriteAction::RemoveNode
+        );
+        let flight = r#"';self.__next_f.push([1,"1:T2,'http://www.googletagmanager.com/gtm.js'"])"#;
+        assert_eq!(
+            rewriter.rewrite(flight, &ctx(false, &state)),
+            ScriptRewriteAction::Keep
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*gtm, flight, &ctx(false, &state)),
+            ScriptRewriteAction::Replace(format!("{prefix}{flight}")),
+            "should drain GTM-held prefix unchanged before protected raw text"
+        );
+        assert_eq!(
+            rewriter.rewrite("", &ctx(true, &state)),
+            ScriptRewriteAction::Keep
+        );
+        assert_eq!(
+            IntegrationScriptRewriter::rewrite(&*gtm, "", &ctx(true, &state)),
+            ScriptRewriteAction::Keep,
+            "should preserve empty final protection"
+        );
+        let ordinary = "var url='http://www.googletagmanager.com/gtm.js';";
+        assert_eq!(
+            rewriter.rewrite(ordinary, &ctx(true, &state)),
+            ScriptRewriteAction::Keep
+        );
+        assert!(
+            matches!(IntegrationScriptRewriter::rewrite(&*gtm, ordinary, &ctx(true, &state)), ScriptRewriteAction::Replace(ref value) if value.contains("/integrations/google_tag_manager/gtm.js")),
+            "should not leak flight ownership to ordinary scripts"
+        );
     }
 
     #[test]
@@ -459,13 +953,13 @@ mod tests {
         }));
 
         assert_eq!(
-            rewriter.rewrite("self.__next_f", &ctx(false, &state)),
+            rewriter.rewrite("self.__next_f.push(", &ctx(false, &state)),
             ScriptRewriteAction::RemoveNode,
             "should initially suppress the script prefix",
         );
         assert_eq!(
             rewriter.rewrite("-payload-overflow", &ctx(false, &state)),
-            ScriptRewriteAction::Replace("self.__next_f-payload-overflow".to_owned()),
+            ScriptRewriteAction::Replace("self.__next_f.push(-payload-overflow".to_owned()),
             "should restore suppressed text before overflow",
         );
         assert_eq!(
@@ -586,6 +1080,54 @@ mod tests {
             ),
             "should capture the next qualified script"
         );
+    }
+
+    #[test]
+    fn oversized_payload_with_trailing_reference_keeps_later_capture() {
+        for trimmed in [false, true] {
+            for reference in ["self.__next_f", "window.__next_f", "foreign.__next_f"] {
+                let state = IntegrationDocumentState::default();
+                let rewriter =
+                    NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+                        max_combined_payload_bytes: 100,
+                        ..(*test_config()).clone()
+                    }));
+                let receiver = if trimmed {
+                    assert_eq!(
+                        rewriter.rewrite("self.", &ctx(false, &state)),
+                        ScriptRewriteAction::Keep,
+                        "should release the qualified receiver"
+                    );
+                    ""
+                } else {
+                    "self."
+                };
+                let script = format!(
+                    r#"{receiver}__next_f.push([1,"1:T50,{}"]);console.log({reference});"#,
+                    "x".repeat(80)
+                );
+                assert_eq!(
+                    rewriter.rewrite(&script, &ctx(true, &state)),
+                    ScriptRewriteAction::Keep,
+                    "should retain oversized script"
+                );
+                assert!(
+                    !document_state(&state)
+                        .lock()
+                        .expect("should lock document state")
+                        .bypass_rsc,
+                    "should not bypass a complete group with a trailing reference"
+                );
+                assert!(
+                    matches!(
+                        rewriter
+                            .rewrite(r#"self.__next_f.push([1,"1:T3,abc"])"#, &ctx(true, &state)),
+                        ScriptRewriteAction::Replace(_)
+                    ),
+                    "should still capture the next script"
+                );
+            }
+        }
     }
 
     #[test]
