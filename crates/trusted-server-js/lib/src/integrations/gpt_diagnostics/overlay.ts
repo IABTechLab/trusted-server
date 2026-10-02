@@ -285,7 +285,9 @@ function timingFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   const timingAnchor =
     cycle.serverAuctionTimingOrigin === 'spa_auction'
       ? 'SPA page-bids request T0'
-      : 'Initial document request T0';
+      : cycle.serverAuctionTimingOrigin === 'navigation'
+        ? 'Initial document request T0'
+        : 'Server request T0';
   const serverTimings = [
     [`${timingAnchor} → auction dispatched`, cycle.serverAuctionTimings?.auctionDispatchedMs],
     [`${timingAnchor} → auction collected`, cycle.serverAuctionTimings?.auctionResolvedMs],

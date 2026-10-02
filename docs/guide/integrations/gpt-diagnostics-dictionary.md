@@ -96,7 +96,7 @@ Path markers live for five seconds, are consumed once, and are keyed by GPT slot
 
 ## Timing
 
-All values are milliseconds. Missing timing that should apply is `Unavailable`, never zero. Server timing is `Not applicable` when no completed server auction was observed. A displayed zero is a valid immediate observation. The three server rows below are rendered with their T0 anchor substituted: `Initial document request T0` for a navigation-origin auction and `SPA page-bids request T0` for an SPA-origin one.
+All values are milliseconds. Missing timing that should apply is `Unavailable`, never zero. Server timing is `Not applicable` when no completed server auction was observed. A displayed zero is a valid immediate observation. The three server rows below are rendered with their T0 anchor substituted: `Initial document request T0` for a navigation-origin auction and `SPA page-bids request T0` for an SPA-origin one. When no server timing origin was observed, the rows use the neutral `Server request T0` prefix with `Not applicable` values; this does not imply that a server clock or auction was observed.
 
 | Label                              | Origin and boundaries                                                            | Raw field                                  |
 | ---------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------ |

@@ -575,6 +575,40 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.destroy();
   });
 
+  it.each(['prebid', 'unattributed'])(
+    'uses neutral server timing labels for a %s request without a server origin',
+    (requestKind) => {
+      const frames: Array<() => void> = [];
+      const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+      const diagnosticSlot = slot(`${requestKind}-without-server-origin`);
+      if (requestKind === 'prebid') {
+        store.recordPrebidRefresh([diagnosticSlot]);
+        store.recordPrebidAuction(diagnosticSlot, 'example-prebid-auction');
+      }
+      store.recordSlotRequested(diagnosticSlot);
+      let root: ShadowRoot | undefined;
+      const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+        scheduleFrame: (callback) => frames.push(callback),
+        onShadowRoot: (createdRoot) => {
+          root = createdRoot;
+        },
+      });
+      runNextFrame(frames);
+      runNextFrame(frames);
+
+      const text = slotArticle(root!, `${requestKind}-without-server-origin`).textContent ?? '';
+      expect(text).toContain(
+        `Auction evidence: ${requestKind === 'prebid' ? 'Client-side Prebid auction' : 'Auction not observed'}`
+      );
+      for (const boundary of ['auction dispatched', 'auction collected', 'bids ready']) {
+        expect(text).toContain(`Server request T0 → ${boundary} Not applicable`);
+      }
+      expect(text).not.toContain('Initial document request T0');
+      expect(text).not.toContain('SPA page-bids request T0');
+      overlay.destroy();
+    }
+  );
+
   it('labels unavailable SPA auction timing with the SPA request clock', () => {
     const frames: Array<() => void> = [];
     const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
