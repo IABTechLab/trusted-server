@@ -209,31 +209,56 @@ deploy. Adapter passthrough arguments must now follow a `--` separator; unknown
 flags before `--` (including the renamed-away `--stage`) are rejected at parse
 time rather than forwarded. This is a change: passthrough args previously
 worked without the separator, so existing runbooks and CI jobs that pass
-adapter flags directly need the `--` added:
+adapter flags directly need the `--` added. Trusted Server declares Config, KV,
+and Secret Stores, so EdgeZero treats every Fastly deploy as managed and
+requires a verified application release root via `--application-release`; a
+bare `ts deploy --adapter fastly` without a release is accepted only for
+store-free applications. The CLI loads `edgezero.toml` from the working
+directory unless `EDGEZERO_MANIFEST` names another file, and it rejects a
+manifest outside the release root, so select the release's own manifest:
 
 ```bash
-ts deploy --adapter fastly --service-id <service-id> --staging
-ts deploy --adapter fastly -- --comment "release"
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>" --staging
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>" -- --comment "release"
 ```
 
-A staged deploy only redirects the staged version's config selector at the
-`<logical-store-id>_staging` key — it does not copy the production config blob
-there. Push the staged config before probing the staged version:
+`<release-root>` is an extracted immutable application release. Build the
+application CLI and Fastly package, then use EdgeZero's
+`package-application-release-fastly` action to assemble the release archive.
+The `deploy-fastly` action consumes that prebuilt archive, verifies and extracts
+it, selects the manifest, and supplies the release root. See EdgeZero's GitHub
+Actions deployment guide (`docs/guide/deploy-github-actions.md` in the EdgeZero
+repository) for the producer and consumer workflow.
+
+A staged deploy selects the physical Config Store from the staging environment
+and links it to the staged version under the logical store ID. The staged
+runtime reads the `<logical-store-id>` key from that store. It does not copy
+the production config blob there. Push the staged config before probing the
+staged version:
 
 ```bash
-ts config push --adapter fastly --staging
-ts config diff --adapter fastly --staging
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
+  ts config push --adapter fastly --staging
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
+  ts config diff --adapter fastly --staging
 ```
 
-The staged version resolves its app-config key through the version-linked
-`edgezero_runtime_env` store. After `ts config push --staging`, the staged
-binary reads `<logical-store-id>_staging` while the active production version
-continues to read the production key.
+The config key is fixed on Fastly: production, staging, and local Viceroy all
+read `<logical-store-id>`. `--staging` does not choose a different store or
+key: the physical store is whatever `EDGEZERO__STORES__CONFIG__<ID>__NAME`
+resolves to in the shell or deploy job that runs the push, falling back to the
+logical ID when it is unset. If production and staging select the same
+physical Config Store, a staged push overwrites the production entry and
+production instances load it on their next start. Give staging its own
+physical Config Store and set its selector explicitly when pushing, as the
+commands above do.
 
 `--staging` on `config push` / `config diff` writes and compares the
-`<logical-store-id>_staging` key in the same store. It is mutually exclusive
-with `--key`: the staging key is derived from the store's logical id, so an
-explicit key would be written where nothing reads it.
+`<logical-store-id>` key in the physical store selected by the current
+environment. It is mutually exclusive with `--key`, and on Fastly any `--key`
+other than the logical store ID is rejected for every target, staged or not.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:

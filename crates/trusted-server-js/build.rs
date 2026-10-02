@@ -15,9 +15,21 @@ use build_print::{info, warn};
 use sha2::{Digest as _, Sha256};
 
 fn main() {
-    // Rebuild if TS sources change (belt-and-suspenders): enumerate every file under lib/
-    println!("cargo:rerun-if-changed=lib");
-    watch_dir_recursively(Path::new("lib"));
+    // Rebuild when the TypeScript sources or anything that shapes the bundle
+    // output changes. `lib` as a whole is deliberately not watched: it holds
+    // `node_modules`, and enumerating that tree emitted tens of thousands of
+    // directives that Cargo re-checked on every build.
+    for watched in [
+        "lib/src",
+        "lib/package.json",
+        "lib/package-lock.json",
+        "lib/build-all.mjs",
+        "lib/build-prebid-external.mjs",
+        "lib/tsconfig.json",
+        "lib/vite.config.ts",
+    ] {
+        println!("cargo:rerun-if-changed={watched}");
+    }
 
     // Allow opt-out or force via env
     let skip = env::var("TSJS_SKIP_BUILD").is_ok_and(|value| value == "1");
@@ -196,26 +208,4 @@ fn copy_bundle(filename: &str, required: bool, dist_dir: &Path, out_dir: &Path) 
     );
 
     fs::write(&target, "").expect("should write optional empty bundle placeholder");
-}
-
-fn watch_dir_recursively(root: &Path) {
-    if !root.exists() {
-        return;
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(read) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            // Always ask Cargo to rerun if this path changes
-            if let Some(path_str) = path.to_str() {
-                println!("cargo:rerun-if-changed={path_str}");
-            }
-            if path.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
 }

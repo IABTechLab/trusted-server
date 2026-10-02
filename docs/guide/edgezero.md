@@ -16,8 +16,10 @@ version operations use the adapter commands declared in `edgezero.toml`.
 Configuration is startup state, not a live control plane. A successful push
 does not change a running instance until the target's restart or deployment
 path loads that value. Use `--staging` only with the corresponding staging
-deployment flow: it writes `LOGICAL_ID_staging` in the same physical store,
-while production continues to read the ordinary logical key.
+deployment flow. On Fastly the entry key is always the logical store ID, so
+staging isolation comes from selecting a different physical store with
+`EDGEZERO__STORES__CONFIG__<ID>__NAME`; see
+[the CLI guide](/guide/cli#lifecycle-commands).
 
 ## Logical and physical stores
 
