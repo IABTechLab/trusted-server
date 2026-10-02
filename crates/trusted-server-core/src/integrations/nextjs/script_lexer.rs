@@ -275,16 +275,16 @@ impl ScriptLexer {
                             class.parenthesis_depth == self.parentheses.len()
                                 && class.brace_depth == self.braces.len()
                         });
-                        let kind = if class_body {
+                        // A superclass function can open at the class head's
+                        // depth. Its body must not consume the pending class.
+                        let kind = if let Some(body) = pending_body {
+                            body
+                        } else if class_body {
                             self.classes.pop().expect("should have pending class").body
+                        } else if self.statement_start || !self.expression_start {
+                            BraceKind::StatementBlock
                         } else {
-                            pending_body.unwrap_or(
-                                if self.statement_start || !self.expression_start {
-                                    BraceKind::StatementBlock
-                                } else {
-                                    BraceKind::Object
-                                },
-                            )
+                            BraceKind::Object
                         };
                         if self.braces.len() == MAX_TEMPLATE_DEPTH {
                             self.mode = Mode::Opaque;
@@ -458,6 +458,9 @@ mod tests {
             "class Demo { method() { return 1 } } /self.__next_f.push()/;",
             "const n = class { method() { return 1 } } / 2;",
             "const n = class extends mixin({}) {} / 2;",
+            "const n = class extends function() {} {} / 2;",
+            "const n = class extends function Base() {} {} / 2;",
+            "const n = class extends (function() {}) {} / 2;",
             "const n = class extends (class {}) {} / 2;",
             "const n = {class: {}, method() { return 1 }} / 2;",
             "const n = {method() { if (ready) { work() } /self.__next_f.push()/ }} / 2;",

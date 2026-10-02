@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn brace_slash_division_keeps_flight_lengths_and_both_rewrites() {
-        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js", "text": "é😀"});
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1", "text": "é😀"});
         let body = data.to_string();
         let payload = format!("1:T{:x},{body}", body.len());
         let push = format!(
@@ -369,13 +369,16 @@ mod tests {
         );
         let mut expected = data;
         expected["url"] = json!("https://test.example.com/page");
-        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
         for prefix in [
             "const n = {} / 2;",
             "const n = {nested: {}} / 2;",
             "const n = function() {} / 2;",
             "const n = function named() { return 1 } / 2;",
             "const n = class { method() { return 1 } } / 2;",
+            "const n = class extends function() {} {} / 2;",
+            "const n = class extends function Base() {} {} / 2;",
+            "const n = class extends (function() {}) {} / 2;",
         ] {
             let source = format!("{prefix}{push}");
             for split in (0..=source.len()).filter(|split| source.is_char_boundary(*split)) {
@@ -533,6 +536,58 @@ mod tests {
                     )],
                     "should not bypass captured Flight because of a prior ordinary reference: padding={padding}, chunk={chunk}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_next_f_references_preserve_current_and_later_flight() {
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1"});
+        let body = data.to_string();
+        let payload = format!("1:T{:x},{body}", body.len());
+        let push = format!(
+            "self.__next_f.push([1,{}])",
+            serde_json::to_string(&payload).expect("should encode Flight payload")
+        );
+        let mut expected = data;
+        expected["url"] = json!("https://test.example.com/page");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        for reference in ["self.__next_f", "window.__next_f", "foreign.__next_f"] {
+            let source = format!("{push};console.log({reference});");
+            for split in 0..=source.len() {
+                let mut processor = create_html_processor(mixed_config(10000, 10000));
+                let first = format!("<script>{}", &source[..split]);
+                let last = format!("{}</script><script>{push}</script>", &source[split..]);
+                let mut bytes = processor
+                    .process_chunk(first.as_bytes(), false)
+                    .expect("should accept script prefix");
+                bytes.extend(
+                    processor
+                        .process_chunk(last.as_bytes(), true)
+                        .expect("should complete Flight with trailing reference"),
+                );
+                let output = String::from_utf8(bytes).expect("should emit UTF-8");
+                let payloads = flight_payloads(&output);
+                assert_eq!(payloads.len(), 2, "should emit both Flight pushes once");
+                for payload in payloads {
+                    assert_mixed_t_model(&payload, &expected);
+                }
+                assert!(
+                    output.contains(&format!(";console.log({reference});</script>")),
+                    "should retain trailing reference at split {split}"
+                );
+                assert!(!output.contains("__ts_rsc_"), "should resolve placeholders");
+            }
+            let html = format!("<script>{source}</script><script>{push}</script>");
+            for compression in [Compression::None, Compression::Gzip] {
+                for chunk in [32, 1000, 8192] {
+                    let output = mixed_output_with_compression(&html, compression, chunk);
+                    let payloads = flight_payloads(&output);
+                    assert_eq!(payloads.len(), 2, "should emit both compressed pushes once");
+                    for payload in payloads {
+                        assert_mixed_t_model(&payload, &expected);
+                    }
+                }
             }
         }
     }
@@ -717,6 +772,113 @@ mod tests {
             fragments.concat(),
             "holding/restoration must preserve raw JS source, not HTML-escape it"
         );
+    }
+
+    #[test]
+    fn ordinary_gtm_before_captured_flight_is_chunk_invariant() {
+        let ordinary = "var tag='http://www.googletagmanager.com/gtm.js';";
+        let expected_ordinary = "var tag='/integrations/google_tag_manager/gtm.js';";
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1", "text": "é😀"});
+        let body = data.to_string();
+        let mut expected = data;
+        expected["url"] = json!("https://test.example.com/page");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        for payload in [format!("0:{body}\n"), format!("1:T{:x},{body}", body.len())] {
+            let push = format!(
+                "self.__next_f.push([1,{}])",
+                serde_json::to_string(&payload).expect("should encode Flight payload")
+            );
+            let html = format!("<script>{ordinary}{push}</script>");
+            let whole = mixed_output(&html, 8192);
+            assert!(
+                whole.starts_with(&format!("<script>{expected_ordinary}")),
+                "should rewrite ordinary source before Flight"
+            );
+            let payloads = flight_payloads(&whole);
+            assert_eq!(payloads.len(), 1, "should emit one captured push");
+            if payload.starts_with("1:T") {
+                assert_mixed_t_model(&payloads[0], &expected);
+            } else {
+                assert_eq!(payloads[0], format!("0:{expected}\n"));
+            }
+            for split in (0..=push.len()).filter(|split| push.is_char_boundary(*split)) {
+                let mut processor = create_html_processor(mixed_config(10000, 10000));
+                let fragments = [
+                    format!("<script>{ordinary}"),
+                    push[..split].to_owned(),
+                    format!("{}</script>", &push[split..]),
+                ];
+                let mut bytes = Vec::new();
+                for (index, fragment) in fragments.iter().enumerate() {
+                    bytes.extend(
+                        processor
+                            .process_chunk(fragment.as_bytes(), index == fragments.len() - 1)
+                            .expect("should complete ordinary and captured Flight source"),
+                    );
+                }
+                assert_eq!(
+                    String::from_utf8(bytes).expect("should emit UTF-8"),
+                    whole,
+                    "should preserve both rewrites at Flight split {split}"
+                );
+            }
+            for compression in [Compression::None, Compression::Gzip] {
+                for chunk in [128, 1000, 8192] {
+                    assert_eq!(
+                        mixed_output_with_compression(&html, compression, chunk),
+                        whole,
+                        "should preserve both rewrites for {compression:?} at chunk {chunk}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_gtm_before_flight_fallback_preserves_raw_payloads() {
+        let ordinary = "var tag='http://www.googletagmanager.com/gtm.js';";
+        let payload = "1:Tffff,'http://www.googletagmanager.com/gtm.js?id=GTM-MIX1'";
+        let encoded = serde_json::to_string(payload).expect("should encode raw Flight payload");
+        for (channel, limit, captured) in [(1, 10000, true), (1, 24, false), (2, 10000, false)] {
+            let push = format!("self.__next_f.push([{channel},{encoded}])");
+            let html = format!("<script>{ordinary}{push}</script>");
+            let whole = mixed_output_with_budget(&html, 8192, limit, 10000);
+            let expected_ordinary = if captured {
+                ordinary.replace(
+                    "http://www.googletagmanager.com",
+                    "/integrations/google_tag_manager",
+                )
+            } else {
+                ordinary.to_owned()
+            };
+            assert_eq!(
+                whole,
+                format!("<script>{expected_ordinary}{push}</script>"),
+                "should retain original fallback payload bytes"
+            );
+            for split in 0..=push.len() {
+                let mut processor = create_html_processor(mixed_config(limit, 10000));
+                let fragments = [
+                    format!("<script>{ordinary}"),
+                    push[..split].to_owned(),
+                    push[split..].to_owned(),
+                    "</script>".to_owned(),
+                ];
+                let mut bytes = Vec::new();
+                for (index, fragment) in fragments.iter().enumerate() {
+                    bytes.extend(
+                        processor
+                            .process_chunk(fragment.as_bytes(), index == fragments.len() - 1)
+                            .expect("should restore raw Flight without changing payload lengths"),
+                    );
+                }
+                assert_eq!(
+                    String::from_utf8(bytes).expect("should emit UTF-8"),
+                    whole,
+                    "should preserve fallback at channel {channel}, limit {limit}, split {split}"
+                );
+            }
+        }
     }
 
     #[test]

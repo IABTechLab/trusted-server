@@ -78,7 +78,7 @@ impl NextJsRscPlaceholderRewriter {
         let mut cursor = 0;
         let mut trimmed = std::mem::take(&mut state.rsc_receiver_trimmed);
         let mut queued_bytes = state.captured_payload_bytes;
-        while code[cursor..].contains("__next_f") {
+        loop {
             let remaining = &content[cursor..];
             let remaining_code = &code[cursor..];
             let head = if trimmed {
@@ -86,10 +86,12 @@ impl NextJsRscPlaceholderRewriter {
             } else {
                 first_qualified_flight_push(remaining_code)
             };
-            if let Some(head) = head
-                && let Some(arguments) =
-                    INERT_FLIGHT_CONTROL_ARGUMENTS.find(&remaining[head.end()..])
-            {
+            // Property references are ordinary source, including after a push.
+            // Only another qualified call can require capture or raw fallback.
+            let Some(head) = head else {
+                break;
+            };
+            if let Some(arguments) = INERT_FLIGHT_CONTROL_ARGUMENTS.find(&remaining[head.end()..]) {
                 cursor += head.end() + arguments.end();
                 trimmed = false;
                 continue;
@@ -185,7 +187,13 @@ impl NextJsRscPlaceholderRewriter {
             FragmentCapture::CompleteOwned(complete) => {
                 self.rewrite_complete(&complete, true, state, limit, max_queued_payload_bytes)
             }
-            FragmentCapture::Suppress => ScriptRewriteAction::RemoveNode,
+            FragmentCapture::Suppress => {
+                // Captured Flight bytes are withheld, so downstream stages see
+                // only empty source or a released receiver prefix, never a raw
+                // payload. Let GTM retain and rewrite preceding ordinary source.
+                state.current_fragment_protected = false;
+                ScriptRewriteAction::RemoveNode
+            }
             FragmentCapture::Restore(restored) => {
                 state.rsc_receiver_trimmed = false;
                 state.bypass_rsc |= state.flight_node_owned;
@@ -220,7 +228,7 @@ impl NextJsRscPlaceholderRewriter {
                         remaining = &remaining[end + 1..];
                         remaining_code = &remaining_code[end + 1..];
                         receiver_trimmed = false;
-                        if !remaining_code.contains("__next_f") {
+                        if !contains_qualified_flight(remaining_code) {
                             break false;
                         }
                     };
@@ -1072,6 +1080,54 @@ mod tests {
             ),
             "should capture the next qualified script"
         );
+    }
+
+    #[test]
+    fn oversized_payload_with_trailing_reference_keeps_later_capture() {
+        for trimmed in [false, true] {
+            for reference in ["self.__next_f", "window.__next_f", "foreign.__next_f"] {
+                let state = IntegrationDocumentState::default();
+                let rewriter =
+                    NextJsRscPlaceholderRewriter::new(Arc::new(NextJsIntegrationConfig {
+                        max_combined_payload_bytes: 100,
+                        ..(*test_config()).clone()
+                    }));
+                let receiver = if trimmed {
+                    assert_eq!(
+                        rewriter.rewrite("self.", &ctx(false, &state)),
+                        ScriptRewriteAction::Keep,
+                        "should release the qualified receiver"
+                    );
+                    ""
+                } else {
+                    "self."
+                };
+                let script = format!(
+                    r#"{receiver}__next_f.push([1,"1:T50,{}"]);console.log({reference});"#,
+                    "x".repeat(80)
+                );
+                assert_eq!(
+                    rewriter.rewrite(&script, &ctx(true, &state)),
+                    ScriptRewriteAction::Keep,
+                    "should retain oversized script"
+                );
+                assert!(
+                    !document_state(&state)
+                        .lock()
+                        .expect("should lock document state")
+                        .bypass_rsc,
+                    "should not bypass a complete group with a trailing reference"
+                );
+                assert!(
+                    matches!(
+                        rewriter
+                            .rewrite(r#"self.__next_f.push([1,"1:T3,abc"])"#, &ctx(true, &state)),
+                        ScriptRewriteAction::Replace(_)
+                    ),
+                    "should still capture the next script"
+                );
+            }
+        }
     }
 
     #[test]
