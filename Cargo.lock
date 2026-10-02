@@ -202,6 +202,7 @@ dependencies = [
  "compression-core",
  "futures-io",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -5286,12 +5287,17 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags 2.13.0",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -5369,6 +5375,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "derive_more",
  "edgezero-adapter-cloudflare",
  "edgezero-core",
  "error-stack",
@@ -5377,6 +5384,7 @@ dependencies = [
  "log",
  "serde_json",
  "tokio",
+ "toml",
  "trusted-server-core",
  "trusted-server-js",
  "worker",
@@ -5443,6 +5451,7 @@ dependencies = [
  "edgezero-cli",
  "edgezero-core",
  "error-stack",
+ "flate2",
  "futures",
  "glob",
  "http",
@@ -5453,6 +5462,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "regex",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
  "scraper",
@@ -5529,6 +5539,7 @@ dependencies = [
 name = "trusted-server-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "derive_more",

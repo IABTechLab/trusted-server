@@ -125,10 +125,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ),
         ("integrations/mod.rs", include_str!("integrations/mod.rs")),
         (
-            "integrations/nextjs/html_post_process.rs",
-            include_str!("integrations/nextjs/html_post_process.rs"),
-        ),
-        (
             "integrations/nextjs/mod.rs",
             include_str!("integrations/nextjs/mod.rs"),
         ),
@@ -139,6 +135,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         (
             "integrations/nextjs/rsc_placeholders.rs",
             include_str!("integrations/nextjs/rsc_placeholders.rs"),
+        ),
+        (
+            "integrations/nextjs/rsc_stream.rs",
+            include_str!("integrations/nextjs/rsc_stream.rs"),
         ),
         (
             "integrations/nextjs/script_rewriter.rs",
@@ -216,8 +216,6 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("s3_sigv4.rs", include_str!("s3_sigv4.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("settings_data.rs", include_str!("settings_data.rs")),
-        ("storage/kv_store.rs", include_str!("storage/kv_store.rs")),
-        ("storage/mod.rs", include_str!("storage/mod.rs")),
         (
             "streaming_processor.rs",
             include_str!("streaming_processor.rs"),
