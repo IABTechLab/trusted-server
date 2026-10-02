@@ -287,6 +287,9 @@ is on — cookie observed by server`.
 
 The page must not imply that setup-request network facts or an empty auction
 section describe the affected page.
+The setup-request projection reuses the section 9.1 `network` block and section
+9.2 `CookieHealth` contracts, including their bounds, without requiring a valid
+diagnostics cookie or constructing a `TraceReportV1` envelope.
 
 ### 6.2 Active publisher page
 
@@ -838,13 +841,14 @@ a new trace-envelope version.
 `auction_coverage.capture_status` describes only what reached the browser
 collector: `not_observed` means no valid server-auction record arrived and no
 capture issue is known, not that no server auction ran. `partial` requires at
-least one retained record plus a projection, transport, validation, or eviction
-issue; `unavailable` requires no retained records plus a known projection,
-transport, validation, or eviction issue; and
-`complete` requires at least one retained record without those capture issues.
+least one retained server-auction record plus a projection, transport,
+validation, or eviction issue; `unavailable` requires no retained server-auction
+records plus a known projection, transport, validation, or eviction issue; and
+`complete` requires at least one retained server-auction record without those
+capture issues.
 `correlation_unavailable` and `external_client_side_unobservable` describe
 interpretation limits and do not change an otherwise complete capture status.
-Evicting all received records therefore yields `unavailable` with
+Evicting all received server-auction records therefore yields `unavailable` with
 `record_evicted`, never `not_observed`. Recompute status after both in-memory
 eviction and snapshot size truncation.
 The issue array is deduplicated, sorted in enum order, bounded to 16 values, and
@@ -1027,8 +1031,12 @@ When valid auction evidence is supplied, TSJS accepts a slot extension only
 when its canonical token occurs exactly once
 in both the delivered slot list and the matching auction evidence. A missing,
 malformed, duplicate, or conflicting token prevents only that sidecar join,
-adds `evidence_validation_failed` and `correlation_unavailable`, and does not
-drop, reorder, or mutate the ordinary slot or bid. TSJS reads no other extension
+adds `correlation_unavailable`, and does not
+drop, reorder, or mutate the ordinary slot or bid. It does not add
+`evidence_validation_failed`: the evidence member itself validated, so this is
+a correlation-layer limit that leaves `capture_status` unchanged per section
+9.3. `evidence_validation_failed` is reserved for a supplied evidence member
+that fails strict validation. TSJS reads no other extension
 property. This validation occurs before the slot is handed to the existing GPT
 initialization path. An absent optional transport member does not trigger
 missing-token validation; no sidecar is emitted and no capture issue is added.
@@ -1124,13 +1132,32 @@ The direct TSJS caller records `evidence_transport_failed` from its existing
 non-OK, unreadable-JSON, and rejected-`fetch` paths. The Prebid adapter
 creates one bounded pending transport record after `buildRequests`, keyed by the
 request's original bid IDs and its normalized unit tokens. `interpretResponse`
-consumes it on a readable response; the pinned Prebid `onTimeout` and
-`onBidderError` bidder-spec hooks consume it and record
+consumes it on a readable response. Add `onTimeout` and `onBidderError` to the
+existing bidder-spec object passed to
+`pbjs.registerBidAdapter(undefined, ADAPTER_CODE, spec)`; neither hook exists in
+the TSJS adapter today. Confirm against the pinned Prebid build that this
+registration wraps the spec through `newBidder` and routes both callbacks.
+The new hooks consume the pending record and record
 `evidence_transport_failed` otherwise. Repeated hooks are idempotent. Pending
-records are capped at 128 and expire after the configured bid timeout plus five
-seconds. Expiry without any supported success/error/timeout hook proves no
-transport outcome, so it removes the marker and leaves evidence `not_observed`
-rather than inventing a failure. These hooks collect only bounded categories and
+records are capped at 128. At record creation, read the effective browser
+`pbjs.getConfig('bidderTimeout')` value in milliseconds; use it only when it is
+a finite integer from 0 through `2^31 - 1 - 5000`, otherwise use the pinned
+Prebid 10.26.0 default of 3000 ms (`DEFAULT_BIDDER_TIMEOUT` in its
+`src/config.ts`). Each record
+expires after that captured timeout plus 5000 ms, so the delay fits the browser
+timer's signed 32-bit limit. Compute the expiry with checked safe-integer
+addition to the record's finite nonnegative safe-integer creation timestamp.
+If the creation clock or the resulting expiry is invalid or unrepresentable,
+decline the trace-only pending record without adding a capture issue or changing
+previously collected evidence; that attempt remains `not_observed` and ordinary
+bidding continues unchanged.
+The TSJS integration's
+`merged.timeout`, including the injected `[integrations.prebid].timeout_ms`,
+sets this browser `bidderTimeout` when supplied; neither `[auction].timeout_ms`
+nor `[auction].auction_timeout_ms` is its source. Expiry without any supported
+success/error/timeout hook proves no transport outcome, so it removes the
+marker and leaves evidence `not_observed` rather than inventing a failure.
+These hooks collect only bounded categories and
 opaque tokens, never XHR error text or response bodies.
 
 For SSAT and SPA page-bids, the diagnostic auction token is also attached to
@@ -1145,10 +1172,15 @@ timestamps, implicit array position, ad-unit path, or a best-effort heuristic.
 
 TSJS retains at most the newest 16 validated server-auction records and 128
 correlation sidecars in memory. It increments checked eviction counters for
-older records; the snapshot adds those counts to the matching truncation fields
-and emits `record_evicted`, with `partial` if server records remain or
-`unavailable` if none remain after snapshot truncation. It performs no storage write until
-the explicit snapshot action.
+older records; the snapshot adds those counts to the matching truncation fields.
+Evicting a server-auction record emits `record_evicted`, with `partial` if
+server records remain or
+`unavailable` if none remain after snapshot truncation. Evicting a correlation
+sidecar increments `omitted_slot_correlations` and adds
+`correlation_unavailable` only; it never emits `record_evicted` and never
+changes `capture_status`, because server capture is unaffected. This distinction
+also applies to sidecars removed during snapshot size truncation. It performs
+no storage write until the explicit snapshot action.
 Requests that fail the applicable trace gate do not mint
 trace tokens, build trace evidence, add response members, emit sidecars, or
 install auction-evidence listeners.
@@ -1252,15 +1284,22 @@ the complete compact UTF-8 storage wrapper. If it exceeds 512 KiB, it removes
 the globally oldest GPT
 request cycles first while retaining the newest cycle for each GPT slot, then
 the oldest callback issues, then the oldest attribution issues, then the oldest
-uncorrelated server auctions, and finally the oldest remaining GPT cycles and
-server auctions until the report fits. It records every removal in
-`truncation`. A correlated auction and the newest GPT cycle that references it
-are retained or removed together once the algorithm reaches correlated server
-auctions; every sidecar referencing a removed auction or cycle is removed and
-counted. The report must not retain a dangling token while claiming a join.
+uncorrelated server auctions, and finally the oldest eligible correlated
+server auctions until the report fits. The newest cycle for each GPT slot is a
+floor for the whole procedure, not only its first stage: no stage removes a
+slot's last remaining cycle. When removing a correlated auction in the final
+stage, remove every retained GPT cycle that references it together with the
+auction; an auction referenced by any floor cycle is therefore protected from
+removal. A correlated auction is eligible for removal only when removing all
+its referencing cycles preserves every slot's floor. It records every removal
+in `truncation`; every sidecar referencing a removed auction or cycle is removed
+and counted. The report must not retain a dangling token while claiming a join.
 A report that still cannot fit after this bounded procedure fails snapshot
-creation. The implementation must include a worst-case fixture proving the
-result is bounded.
+creation, following the oversized case in section 13. The protected floor and
+its correlated auctions can exceed the budget on their own. The implementation
+must include a worst-case fixture proving successful reports are bounded, and
+one proving the floor-exceeds-budget case fails snapshot creation rather than
+emptying the GPT section.
 
 All omission counters use checked addition. If any source collection would
 make a counter exceed `u16::MAX`, projection rejects the source instead of
@@ -1548,6 +1587,11 @@ shell or actions.
   parse ordinary bids unchanged, and add `evidence_validation_failed`. Coverage
   is `partial` when valid records remain or `unavailable` when none remain,
   following section 9.3.
+- Valid evidence cannot join a missing, malformed, duplicate, or conflicting
+  slot token, or a correlation sidecar is evicted: add only
+  `correlation_unavailable`, preserve ordinary slots and bids, and leave server
+  `capture_status` unchanged. Count evicted sidecars in
+  `omitted_slot_correlations`.
 - TS Console capture failure: fail open for advertising and show incomplete
   coverage in diagnostics.
 - Storage unavailable or quota exceeded after a valid bounded report exists:
@@ -1711,13 +1755,26 @@ results, never a prerequisite for returning them.
   receives valid evidence and then evicts every server record during size
   truncation must yield `unavailable` with `record_evicted` and exact omission
   counts; partial eviction remains `partial`.
+- Missing, malformed, duplicate, and conflicting slot extensions with valid
+  evidence add only `correlation_unavailable` and preserve complete server
+  capture. Evicting correlation sidecars at the 128-record memory cap or during
+  snapshot truncation increments `omitted_slot_correlations` exactly and never
+  adds `record_evicted` or changes server `capture_status`.
 - Successful responses without an optional transport member add no validation
   issue; malformed supplied members add `evidence_validation_failed`. Cover
   both an empty collector and one with retained evidence or earlier failures.
 - Direct fetch failures and Prebid `interpretResponse`, `onTimeout`, and
   `onBidderError` paths consume their pending transport record exactly once;
   capped/expired records and absent hooks follow the specified `not_observed`
-  behavior without retaining error text or bodies.
+  behavior without retaining error text or bodies. Exercise the newly added
+  hooks through the pinned Prebid `registerBidAdapter`/`newBidder` registration
+  path, not only by calling the spec functions directly. Verify expiry uses the
+  captured browser `bidderTimeout` plus 5000 ms, including configured values,
+  the 3000 ms default, missing/invalid-value fallback, the maximum accepted
+  timeout, and fallback for values that would overflow the browser timer.
+  Invalid creation clocks and unsafe timestamp addition decline the pending
+  record without changing bids or inventing a transport failure. Later
+  configuration changes do not alter an existing record's expiry.
 - Exact-token correlation joins matching SSAT/SPA server auctions, GPT opportunities,
   and slot references; unmatched, duplicated, conflicting, missing, and
   forged tokens stay separate and produce explicit coverage states. No
@@ -1740,7 +1797,9 @@ results, never a prerequisite for returning them.
 - Trace projection replaces the nested GPT pathname with `/[redacted]`, rejects
   any other stored value, emits `TraceGptDiagnosticsV1`, applies deterministic
   ordering/truncation, and records exact omission counts in a worst-case 512 KiB
-  fixture.
+  fixture. An oversized newest-cycle-per-slot floor, including its protected
+  correlated auctions, fails snapshot creation without dropping a slot's last
+  cycle or offering a combined-report export.
 - Same-tab navigation occurs only after a successful write.
 - Viewer handles absent optional network facts and every cookie-health state.
 - Populate every excluded `adManager` field, `previousCreativeId`, slot
@@ -1805,8 +1864,12 @@ results, never a prerequisite for returning them.
   it.
 - The delivered CSP blocks inline injection, framing, third-party connections,
   and report-derived executable HTML.
-- Immutable asset fixtures prove published v1 bytes never change; changed bytes
-  require a new URL referenced by the shell.
+- A committed digest of each published v1 asset is asserted against the bytes
+  the build produces, so changing those bytes fails the check. Changed bytes
+  require a new asset-set URL and its
+  committed digest, preserving the published URL/digest pairs; a fixture also
+  asserts the shell references the current asset-set URL. This pins the byte
+  contract at build time rather than claiming a test can observe future releases.
 - Inactive publisher traffic has no trace assets, storage access, listeners, or
   cache-policy change, diagnostic token generation, or trace-auction response
   extension.
