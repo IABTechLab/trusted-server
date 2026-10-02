@@ -91,9 +91,18 @@ struct Prebid {
 #[derive(Default, Deserialize)]
 struct Bundle {
     #[serde(default)]
-    adapters: Vec<String>,
+    modules: BundleModules,
+}
+
+/// Explicit selections from core's bundle module schema; never expand generator presets.
+#[derive(Default, Deserialize)]
+struct BundleModules {
     #[serde(default)]
-    user_id_modules: Vec<String>,
+    bidder: Vec<String>,
+    #[serde(default)]
+    user_id: Vec<String>,
+    #[serde(default)]
+    analytics: Vec<String>,
 }
 
 /// Accept the same encodings as the private core list deserializer without expanding defaults.
@@ -175,12 +184,13 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
     for name in prebid
         .client_side_bidders
         .iter()
-        .chain(&prebid.bundle.adapters)
-        .chain(&prebid.bundle.user_id_modules)
+        .chain(&prebid.bundle.modules.bidder)
+        .chain(&prebid.bundle.modules.user_id)
+        .chain(&prebid.bundle.modules.analytics)
     {
         if !identifier(name) {
             return Err(Report::new(PbsError::Input(
-                "invalid bidder or identity-module identifier",
+                "invalid bidder or bundle-module identifier",
             )));
         }
     }
@@ -253,7 +263,15 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
         ),
         format!(
             "Browser bundle adapters: {}",
-            prebid.bundle.adapters.join(", ")
+            prebid.bundle.modules.bidder.join(", ")
+        ),
+        format!(
+            "Browser identity modules: {}",
+            prebid.bundle.modules.user_id.join(", ")
+        ),
+        format!(
+            "Browser analytics modules: {}",
+            prebid.bundle.modules.analytics.join(", ")
         ),
     ]);
     details.extend(warnings.iter().map(|warning| (*warning).to_owned()));
@@ -276,8 +294,9 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             "timeout_ms_explicit": prebid.timeout_ms,
             "debug_explicit": prebid.debug,
             "client_side_bidders": prebid.client_side_bidders,
-            "bundle_adapters": prebid.bundle.adapters,
-            "identity_modules": prebid.bundle.user_id_modules,
+            "bundle_adapters": prebid.bundle.modules.bidder,
+            "identity_modules": prebid.bundle.modules.user_id,
+            "analytics_modules": prebid.bundle.modules.analytics,
             "warnings": warnings
         }),
     })
@@ -326,9 +345,10 @@ enabled = false
 account_id = "NEVER_PRINT_ME"
 client_side_bidders = ["browserbidder"]
 
-[integrations.prebid.bundle]
-adapters = ["bundlebidder"]
-user_id_modules = ["sharedIdSystem"]
+[integrations.prebid.bundle.modules]
+bidder = ["exampleBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["exampleAnalyticsAdapter"]
 "#;
         fs::write(&path, source).expect("should write fixture");
         let report = inspect(&path).expect("should inspect config");
@@ -374,7 +394,12 @@ user_id_modules = ["sharedIdSystem"]
             1
         );
         assert_eq!(report.data["client_side_bidders"][0], "browserbidder");
-        assert_eq!(report.data["bundle_adapters"][0], "bundlebidder");
+        assert_eq!(report.data["bundle_adapters"], json!(["exampleBidAdapter"]));
+        assert_eq!(report.data["identity_modules"], json!(["sharedIdSystem"]));
+        assert_eq!(
+            report.data["analytics_modules"],
+            json!(["exampleAnalyticsAdapter"])
+        );
         assert_eq!(
             report.data["server_providers"][0]["server_bidder_candidates"][0]["host_secret_requirement"],
             "unresolved"
@@ -386,6 +411,9 @@ user_id_modules = ["sharedIdSystem"]
         let human = String::from_utf8(human).expect("should emit UTF-8");
         assert!(human.contains("pbs-main"));
         assert!(human.contains("serverbidder"));
+        assert!(human.contains("Browser bundle adapters: exampleBidAdapter"));
+        assert!(human.contains("Browser identity modules: sharedIdSystem"));
+        assert!(human.contains("Browser analytics modules: exampleAnalyticsAdapter"));
         assert!(!human.contains("NEVER_PRINT_ME"));
         let mut json = Vec::new();
         report
@@ -426,7 +454,7 @@ client_side_bidders = 'examplebidder\'
         assert!(
             error
                 .to_string()
-                .contains("invalid bidder or identity-module identifier"),
+                .contains("invalid bidder or bundle-module identifier"),
             "should report identifier validation: {error}"
         );
     }
@@ -452,6 +480,84 @@ client_side_bidders = 'examplebidder\'
                 output.data["client_side_bidders"],
                 json!(runtime.client_side_bidders)
             );
+        }
+    }
+
+    #[test]
+    fn bundle_selections_match_core_without_expanding_defaults() {
+        for input in [
+            "",
+            "[bundle]",
+            "[bundle.modules]",
+            "[bundle.modules]\nbidder = []\nuser_id = []\nanalytics = []",
+            "[bundle.modules]\nbidder = ['exampleBidAdapter', 'otherBidAdapter']\nuser_id = ['sharedIdSystem']\nanalytics = ['exampleAnalyticsAdapter']",
+            "[bundle.modules]\nuser_id = ['sharedIdSystem']",
+            "[bundle.modules]\nanalytics = ['exampleAnalyticsAdapter']",
+        ] {
+            let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
+                toml::from_str(input).expect("should parse current core bundle schema");
+            let text = format!(
+                "[integrations.prebid]\n{}",
+                input.replace("[bundle", "[integrations.prebid.bundle")
+            );
+            let file = tempfile::NamedTempFile::new().expect("should create config");
+            fs::write(file.path(), &text).expect("should write config");
+            let output = inspect(file.path()).expect("should inspect current core bundle schema");
+            assert_eq!(
+                output.data["bundle_adapters"],
+                json!(runtime.bundle.modules.bidder)
+            );
+            assert_eq!(
+                output.data["identity_modules"],
+                json!(runtime.bundle.modules.user_id.unwrap_or_default())
+            );
+            assert_eq!(
+                output.data["analytics_modules"],
+                json!(runtime.bundle.modules.analytics.unwrap_or_default())
+            );
+        }
+    }
+
+    #[test]
+    fn retired_bundle_fields_are_not_reported_as_current_selections() {
+        let input =
+            "[bundle]\nadapters = ['exampleBidAdapter']\nuser_id_modules = ['sharedIdSystem']";
+        assert!(
+            toml::from_str::<trusted_server_core::integrations::prebid::PrebidIntegrationConfig>(
+                input
+            )
+            .is_err(),
+            "core should reject the retired bundle schema"
+        );
+        let file = tempfile::NamedTempFile::new().expect("should create config");
+        fs::write(
+            file.path(),
+            input.replace("[bundle]", "[integrations.prebid.bundle]"),
+        )
+        .expect("should write config");
+        // Inspection is deliberately partial, not full runtime validation.
+        let output =
+            inspect(file.path()).expect("should ignore fields outside the inspected schema");
+        for field in ["bundle_adapters", "identity_modules", "analytics_modules"] {
+            assert_eq!(output.data[field], json!([]), "should not infer {field}");
+        }
+    }
+
+    #[test]
+    fn invalid_bundle_selections_never_echo_source_values() {
+        for field in ["bidder", "user_id", "analytics"] {
+            for value in ["['NEVER_PRINT_ME invalid']", "'NEVER_PRINT_ME'"] {
+                let file = tempfile::NamedTempFile::new().expect("should create config");
+                fs::write(
+                    file.path(),
+                    format!("[integrations.prebid.bundle.modules]\n{field} = {value}\n"),
+                )
+                .expect("should write config");
+                let error = inspect(file.path())
+                    .err()
+                    .expect("should reject invalid module selection");
+                assert!(!format!("{error:?}").contains("NEVER_PRINT_ME"));
+            }
         }
     }
 

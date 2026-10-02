@@ -512,7 +512,7 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # the checked-in User ID registry. Each `name` must appear only once.
 #
 # The module must be present in the built bundle: name it under
-# [integrations.prebid.bundle].user_id_modules, or omit that list to take the
+# [integrations.prebid.bundle.modules].user_id, or omit that list to take the
 # generator's default preset. `ts prebid client` resolves every managed name
 # through the checked-in User ID registry and fails if the generated manifest
 # omits its required module without updating the configured hash or SRI.

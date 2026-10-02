@@ -439,6 +439,16 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn validates_the_committed_pbs_example_descriptor() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/pbs-example/deployment.example.yaml");
+        let deployment = Deployment::load(&path)
+            .expect("should load the committed PBS example descriptor and its inputs");
+        let output = check(&deployment).expect("should check the committed PBS example");
+        assert_eq!(output.data["local_checks"], "passed");
+    }
+
+    #[test]
     fn pinned_image_requires_lowercase_sha256_hex() {
         let image = |digest: &str| format!("registry.example.com/pbs@sha256:{digest}");
         assert!(pinned_image(&image(&"0123456789abcdef".repeat(4))));
