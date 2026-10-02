@@ -702,3 +702,58 @@ ts prebid bundle --config publisher-a.toml --out build/prebid
 
 `ts prebid bundle` is local-only. It has no `--adapter` option and does not
 upload, provision, deploy, or push config.
+
+## Audit origin cache headers
+
+`ts dev audit headers` fetches responses from the publisher origin, classifies
+each by content type, and grades its cache-related response headers
+(`Cache-Control`, `Surrogate-Control`, `s-maxage`, `Surrogate-Key`, `Vary`,
+`ETag`) against the expected posture for that type. It reports a per-type
+pass/warn/fail verdict naming the responsible header and the recommended value.
+
+```bash
+# Audit the origin from trusted-server.toml (publisher.origin_url), discovering
+# assets from the root page's HTML.
+ts dev audit headers
+
+# Point at an origin explicitly, skipping the config lookup.
+ts dev audit headers --origin https://origin.publisher.com
+
+# Audit specific URLs instead of crawling.
+ts dev audit headers https://origin.publisher.com/app.js https://origin.publisher.com/
+
+# Machine-readable output for pipelines.
+ts dev audit headers --json
+```
+
+When no URLs are given, discovery fetches the origin root and follows the
+`<script>`, `<img>`, and `<link>` assets it links, restricted to the same origin
+(pass `--include-cross-origin` to follow off-origin assets, e.g. to audit a
+CDN's posture). Redirects are not followed, so a long-lived cached 3xx is graded
+on its own headers rather than the target's. Edge-only `/_ts/` routes are never
+probed against the origin.
+
+### Content-type postures
+
+| Group             | Expected posture                                                 |
+| ----------------- | ---------------------------------------------------------------- |
+| HTML              | `no-store`, or `private` (personalized, not shared-cacheable)    |
+| JavaScript        | `public, max-age>=31536000, immutable` + `ETag`, `Surrogate-Key` |
+| Static (CSS/font) | `public, max-age>=31536000, immutable` + `Surrogate-Key`         |
+| Image             | `public, max-age>=86400`; CDN TTL not below browser TTL          |
+| RTB/JSON          | `no-store` (never cached)                                        |
+
+### Exit codes
+
+The command is meant to be wired into CI, so the exit code carries the outcome:
+
+| Code | Meaning                                                 |
+| ---- | ------------------------------------------------------- |
+| 0    | All audited content-type groups pass                    |
+| 1    | At least one group has a FAIL verdict                   |
+| 2    | The CLI itself errored (unreachable origin, bad config) |
+| 3    | Warnings only, no failures                              |
+
+Code 2 is the generic CLI error code (shared with every `ts` command), so a CI
+gate must treat 2 as "the audit could not run", distinct from 3 ("cache
+warnings"). `ts dev audit` is available on all host platforms.
