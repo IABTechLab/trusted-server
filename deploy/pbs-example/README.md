@@ -23,7 +23,7 @@ Each region has two AZs, one EC2 host per AZ, a public ALB, and one NAT gateway 
 
 ## Safe local walkthrough
 
-These commands do not contact AWS. They require the pinned Terraform and Rust toolchains, Python 3, and Docker with the Compose plugin. On Apple Silicon macOS, replace `cargo run_cli_linux` with `cargo run_cli_macos`. Other hosts can use `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --`.
+These commands do not contact AWS. They require the pinned Terraform, Rust, and Node.js toolchains and Docker with the Compose plugin. The Node.js check uses only built-in modules; no npm install is needed. On Apple Silicon macOS, replace `cargo run_cli_linux` with `cargo run_cli_macos`. Other hosts can use `cargo run --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --`.
 
 ```bash
 terraform fmt -check -recursive deploy/pbs-example
@@ -36,17 +36,15 @@ terraform -chdir=deploy/pbs-example/modules/regional test -filter=tests/security
 cargo run_cli_linux prebid server check \
   --deployment deploy/pbs-example/deployment.example.yaml \
   --json
-python3 -m json.tool \
-  deploy/pbs-example/runtime/secret-bindings.example.json >/dev/null
 docker compose \
   --env-file deploy/pbs-example/runtime/examples/compose.env \
   -f deploy/pbs-example/runtime/compose.yaml \
   config --quiet
 bash -n deploy/pbs-example/scripts/smoke-runtime.sh
-deploy/pbs-example/scripts/test-smoke-runtime.py
+env -u NODE_OPTIONS -u NODE_PATH node deploy/pbs-example/scripts/test-smoke-runtime.mjs
 ```
 
-The `PBS example checks` GitHub Actions workflow runs Terraform formatting, both readonly-lock initializations, validation, and both mocked test suites. It also checks JSON, shell syntax, and Compose wiring. Changes to this example, `.tool-versions`, or the workflow trigger it. CI sets up Python 3.13 and checks Docker Compose availability. Run the wiring test without Python optimization, which disables assertions. The CLI descriptor command above is a separate local check; the example owner must rerun it when changing or adapting inputs.
+The `PBS example checks` GitHub Actions workflow runs Terraform formatting, both readonly-lock initializations, validation, and both mocked test suites. It also checks JSON, shell syntax, and Compose wiring. Changes to this example, `.tool-versions`, or the workflow trigger it. CI reads the Node.js version from `.tool-versions` and checks Docker Compose availability. The wiring command clears inherited Node.js preload options and module paths, and the script passes only `PATH` and `HOME` plus its explicit test inputs to subprocesses. It also parses `runtime/secret-bindings.example.json`. The CLI descriptor command above is a separate local check; the example owner must rerun it when changing or adapting inputs.
 
 The Terraform tests use mocked AWS providers and explicit plan mode. The deployment descriptor and binding file contain fictional identifiers for local validation only. The wiring test renders Compose JSON and exercises the smoke script with fake lifecycle and health commands. It verifies the deployment all-interface binding, smoke-only loopback binding, and forced dummy input selectors without starting containers.
 

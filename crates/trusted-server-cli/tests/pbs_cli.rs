@@ -13,8 +13,8 @@ const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
 
 fn fixture() -> TempDir {
     assert!(
-        which::which("python3").is_ok(),
-        "pbs_cli tests need python3 on PATH for the fake AWS executable"
+        which::which("node").is_ok(),
+        "pbs_cli tests need the pinned Node.js on PATH for the fake AWS executable"
     );
     let dir = tempfile::tempdir().expect("should create fixture directory");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/pbs");
@@ -22,55 +22,8 @@ fn fixture() -> TempDir {
         fs::copy(source.join(name), dir.path().join(name)).expect("should copy fixture");
     }
     let fake = dir.path().join("aws");
-    fs::write(
-        &fake,
-        r#"#!/usr/bin/env python3
-import json, os, pathlib, stat, sys
-args = sys.argv[1:]
-root = pathlib.Path(os.environ['PBS_FAKE_ROOT'])
-with (root / 'calls').open('a') as log:
-    log.write(json.dumps(args) + '\n')
-assert '--profile' in args and args[args.index('--profile')+1] == 'pbs-sandbox'
-if 'configure' in args:
-    if os.environ.get('PBS_FAKE_HISTORY') == 'unset':
-        sys.exit(1)
-    if os.environ.get('PBS_FAKE_HISTORY') == 'enabled':
-        print('enabled')
-    else:
-        print('disabled')
-    sys.exit(0)
-assert args[args.index('--region')+1] == 'us-east-1'
-assert os.environ.get('AWS_IGNORE_CONFIGURED_ENDPOINT_URLS') == 'true'
-path = pathlib.Path(args[args.index('--cli-input-json')+1].removeprefix('file://'))
-assert stat.S_IMODE(path.stat().st_mode) == 0o600
-with (root / 'payload_paths').open('a') as paths:
-    paths.write(str(path) + '\n')
-request = json.loads(path.read_text())
-arn = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:pbs/example-AbCdEf'
-if 'get-caller-identity' in args:
-    print(json.dumps({'Account': os.environ.get('PBS_FAKE_ACCOUNT', '123456789012')}))
-elif 'describe-secret' in args:
-    print(json.dumps({'ARN': arn}))
-elif 'put-secret-value' in args:
-    failure = os.environ.get('PBS_FAKE_FAILURE')
-    if failure in ('collision', 'transport'):
-        error = 'ResourceExistsException' if failure == 'collision' else 'Connection reset by peer'
-        print(error + ': ' + request['SecretString'], file=sys.stderr)
-        sys.exit(1)
-    (root / 'captured_request.json').write_text(json.dumps(request))
-    if failure == 'invalid-json':
-        print('invalid response ' + request['SecretString'])
-    elif failure == 'unverified':
-        print(json.dumps({'ARN': arn, 'VersionId': 'unexpected', 'SecretString': request['SecretString']}))
-    else:
-        print(json.dumps({'ARN': arn, 'VersionId': request['ClientRequestToken']}))
-elif 'describe-instance-status' in args:
-    print(json.dumps({'InstanceStatuses': []}))
-else:
-    sys.exit(2)
-"#,
-    )
-    .expect("should write fake AWS executable");
+    fs::write(&fake, include_str!("fixtures/pbs-aws.cjs"))
+        .expect("should write fake AWS executable");
     fs::set_permissions(fake, fs::Permissions::from_mode(0o700))
         .expect("should set executable mode");
     dir
@@ -92,6 +45,8 @@ fn command(dir: &Path) -> Command {
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY")
         .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
         .env("AWS_EC2_METADATA_DISABLED", "true");
     command
 }

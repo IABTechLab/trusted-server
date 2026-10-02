@@ -38,9 +38,14 @@ jobs:
           terraform_version: ${{ steps.terraform.outputs.version }}
           terraform_wrapper: false
 
-      - uses: actions/setup-python@v5
+      - name: Read pinned Node.js version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.13'
+          node-version: ${{ steps.node.outputs.version }}
 
       - name: Check Docker Compose prerequisite
         run: docker compose version
@@ -63,6 +68,5 @@ jobs:
 
       - name: Check runtime inputs and smoke wiring without starting containers
         run: |
-          python3 -m json.tool deploy/pbs-example/runtime/secret-bindings.example.json > /dev/null
           bash -n deploy/pbs-example/scripts/smoke-runtime.sh
-          python3 -I deploy/pbs-example/scripts/test-smoke-runtime.py
+          env -u NODE_OPTIONS -u NODE_PATH node deploy/pbs-example/scripts/test-smoke-runtime.mjs

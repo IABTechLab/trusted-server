@@ -88,6 +88,15 @@ jobs:
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Read pinned Node.js version for CLI fixtures
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
+
       - name: Build Axum adapter
         run: cargo build -p trusted-server-adapter-axum
 
@@ -225,6 +234,15 @@ jobs:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
+
+      - name: Read pinned Node.js version for CLI fixtures
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
 
       # No separate `cargo fmt` here: `trusted-server-cli` is a workspace member,
       # so the main `cargo fmt --all` job already formats it. Clippy still needs a

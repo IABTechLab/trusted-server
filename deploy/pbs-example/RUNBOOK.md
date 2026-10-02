@@ -6,7 +6,7 @@ This runbook describes local checks and the separately authorized operations tha
 
 - Work only in `deploy/pbs-example`.
 - Use Terraform `1.16.2` and the committed AWS provider lock files in both the root and regional module. Both lock AWS `6.64.0` for Linux and macOS on AMD64 and ARM64.
-- Local wiring checks require Python 3 and Docker with the Compose plugin. CI uses Python 3.13. Do not enable Python optimization; the wiring test refuses to run without assertions.
+- Local wiring checks require the Node.js version in `.tool-versions` and Docker with the Compose plugin. The check uses only built-in Node.js modules; no npm install is needed.
 - Use fictional values from `terraform.tfvars.example`, `deployment.example.yaml`, and `runtime/secret-bindings.example.json` only for local validation.
 - Replace the fictional AWS account, profile, certificate, hosted-zone, AMI, and CIDR inputs before any authorized cloud plan. Terraform renders actual instance and secret identifiers after apply.
 - Confirm the approved Trusted Server egress CIDRs. Do not use the documentation CIDR as a real allowlist.
@@ -58,13 +58,11 @@ Expected result: Compose renders successfully without pulling or starting the im
 Validate the JSON input and smoke command wiring without starting containers:
 
 ```bash
-python3 -m json.tool \
-  deploy/pbs-example/runtime/secret-bindings.example.json >/dev/null
 bash -n deploy/pbs-example/scripts/smoke-runtime.sh
-deploy/pbs-example/scripts/test-smoke-runtime.py
+env -u NODE_OPTIONS -u NODE_PATH node deploy/pbs-example/scripts/test-smoke-runtime.mjs
 ```
 
-The wiring test requires Python 3 and Docker Compose. It renders production and smoke configurations, uses fake Docker lifecycle and curl commands, and checks that inherited selectors cannot replace the dummy inputs. It does not pull images, start PBS, or prove runtime health.
+The wiring command clears inherited Node.js preload options and module paths. The script passes only `PATH` and `HOME` plus explicit test inputs to subprocesses. It parses the binding JSON, renders production and smoke configurations, uses fake Docker lifecycle and curl commands, and checks that inherited selectors cannot replace the dummy inputs. It does not pull images, start PBS, or prove runtime health.
 
 ### Separately approved local runtime smoke
 
