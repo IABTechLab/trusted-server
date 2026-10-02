@@ -48,6 +48,11 @@ auth-logout = "fastly profile delete"
 auth-status = "fastly profile list"
 build = "cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1 --color always"
 serve = "fastly compute serve"
+# Unused by `ts deploy`: this app declares stores, so EdgeZero always takes the
+# managed deployment path, which links each selected physical store to the
+# service version under its logical ID. Publishing with the Fastly CLI directly
+# clones the active version's links and omits the logical links the runtime
+# opens.
 deploy = "fastly compute publish"
 
 # -- Axum (native dev server) -----------------------------------------------

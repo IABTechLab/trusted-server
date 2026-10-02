@@ -319,11 +319,9 @@ declare `trusted_server_secrets`. Local Viceroy configuration exposes the store
 under the logical ID directly; see `[local_server.secret_stores]` in
 `fastly.toml`.
 
-The same runtime mapping mechanism applies to app-config stores. See
-[Fastly runtime config stores](/guide/configuration#fastly-runtime-config-store)
-for the initial provisioning and linking sequence, subsequent CLI pushes, and
-precautions when changing a live mapping. A process-environment override alone
-does not configure the Fastly runtime.
+The app-config store is selected the same way, through
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` in the deployment
+environment. No runtime mapping is stored in a Config Store.
 
 Create the separate request-signing store when that feature is enabled:
 
@@ -333,6 +331,29 @@ fastly secret-store create --name signing_keys
 
 The deployment creates the `trusted_server_secrets` link itself from the
 selected physical store. Do not create that link by hand.
+
+### Upgrading from EdgeZero v0.0.8
+
+Services deployed before this change link the physical store directly, such as
+`ts_secrets`, together with an `edgezero_runtime_env` Config Store. This binary
+opens `trusted_server_secrets` instead, and only a managed deployment creates
+that link. A plain `fastly compute publish` clones the active version's links,
+so it activates a version whose link is missing: app config fails to load and
+every publisher route returns 500 while `/health` keeps answering 200.
+
+When upgrading an existing service:
+
+- Deploy only through the managed path, `ts deploy --adapter fastly
+--application-release <release-root>` or EdgeZero's `deploy-fastly` action, so
+  the `trusted_server_secrets` link exists before activation.
+- Re-push staging app config under the logical key into the staging Config
+  Store. Entries previously pushed under `<logical-store-id>_staging` are
+  ignored.
+- Remove any `EDGEZERO__STORES__CONFIG__<ID>__KEY` selectors. The CLI now
+  writes to that selector when `--key` is absent, instead of ignoring it, so a
+  leftover selector pushes app config to a key the Fastly runtime never reads.
+- Optionally delete the stale `edgezero_runtime_env` link and any `*_staging`
+  config entries once no active version reads them.
 
 ## Create EC KV Store
 
@@ -356,7 +377,8 @@ passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 ```
 
-Store the high-entropy passphrase under that key in `ts_secrets`. The resolved
+Store the high-entropy passphrase under that key in the physical store
+selected for `trusted_server_secrets`. The resolved
 value, rather than the key name, must contain at least 32 characters. Pipe the
 value over standard input so it never appears in the process argument list:
 
@@ -394,7 +416,8 @@ Run the repository smoke from a clean shell:
 The script creates an isolated application config, applies its publisher-origin
 overrides, and runs strict validation. It then executes `ts config push
 --adapter fastly --local`, adds all three required entries to
-`[local_server.secret_stores.ts_secrets]`, and starts `fastly compute serve`
+`[local_server.secret_stores.trusted_server_secrets]`, and starts
+`fastly compute serve`
 through Viceroy. The required keys are `handler_password`,
 `publisher_proxy_secret`, and `ec_passphrase`.
 

@@ -19,10 +19,11 @@ remove guidance for the superseded service-scoped and runtime-selector models.
 
 ## Design
 
-All EdgeZero workspace dependencies will temporarily use the upstream branch
-`fix/fastly-environment-store-selectors`. Keeping the dependencies on one branch
+All EdgeZero workspace dependencies are pinned with `rev =` to the immutable
+commit `c2e862f436421cdcfbac620c06995f262d6788c9` on the upstream branch
+`fix/fastly-environment-store-selectors`. Pinning every crate to one commit
 ensures the adapter, CLI, core, and platform-specific crates resolve to the same
-revision while PR 381 is under review. A follow-up will replace the branch with
+revision while PR 381 is under review. Issue #1195 tracks replacing the rev with
 the release tag that contains the merged change.
 
 The Fastly entry point will stop reading `edgezero_runtime_env`. It will open

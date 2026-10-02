@@ -224,12 +224,13 @@ EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
   ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>" -- --comment "release"
 ```
 
-`<release-root>` is the extracted immutable application release that EdgeZero's
-`package-fastly-application-release` action produces from a `ts build`. The
-EdgeZero `deploy-fastly` action performs both steps, selects the manifest, and
-supplies the release root; see EdgeZero's GitHub Actions deployment guide
-(`docs/guide/deploy-github-actions.md` in the EdgeZero repository) for the
-producer and consumer workflow.
+`<release-root>` is an extracted immutable application release. Build the
+application CLI and Fastly package, then use EdgeZero's
+`package-application-release-fastly` action to assemble the release archive.
+The `deploy-fastly` action consumes that prebuilt archive, verifies and extracts
+it, selects the manifest, and supplies the release root. See EdgeZero's GitHub
+Actions deployment guide (`docs/guide/deploy-github-actions.md` in the EdgeZero
+repository) for the producer and consumer workflow.
 
 A staged deploy selects the physical Config Store from the staging environment
 and links it to the staged version under the logical store ID. The staged
@@ -238,24 +239,26 @@ the production config blob there. Push the staged config before probing the
 staged version:
 
 ```bash
-ts config push --adapter fastly --staging
-ts config diff --adapter fastly --staging
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
+  ts config push --adapter fastly --staging
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
+  ts config diff --adapter fastly --staging
 ```
 
 The config key is fixed on Fastly: production, staging, and local Viceroy all
-read `<logical-store-id>`. Staging isolation comes from the physical store the
-staging environment selects with `EDGEZERO__STORES__CONFIG__<ID>__NAME`, never
-from a different key. Production and staging may select the same physical
-Config Store or different stores. After `ts config push --staging`, the staged
-binary reads `<logical-store-id>` in the store selected by the staging
-environment, while the active production version continues to read the same
-key in its own store.
+read `<logical-store-id>`. `--staging` does not choose a different store or
+key: the physical store is whatever `EDGEZERO__STORES__CONFIG__<ID>__NAME`
+resolves to in the shell or deploy job that runs the push, falling back to the
+logical ID when it is unset. If production and staging select the same
+physical Config Store, a staged push overwrites the production entry and
+production instances load it on their next start. Give staging its own
+physical Config Store and set its selector explicitly when pushing, as the
+commands above do.
 
 `--staging` on `config push` / `config diff` writes and compares the
-`<logical-store-id>` key in the physical store selected by the staging
-environment. It is mutually exclusive with `--key`: Fastly accepts only the
-logical store ID as the key for every target, so an explicit key would be
-written where nothing reads it.
+`<logical-store-id>` key in the physical store selected by the current
+environment. It is mutually exclusive with `--key`, and on Fastly any `--key`
+other than the logical store ID is rejected for every target, staged or not.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:

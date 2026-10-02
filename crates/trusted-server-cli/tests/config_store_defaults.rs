@@ -133,8 +133,14 @@ fn config_push_resolves_the_physical_name_and_explicit_key() {
     );
 }
 
+// The canonical `__KEY` selector is the push destination when `--key` is absent.
+// Under EdgeZero v0.0.8 the CLI ignored it and always wrote the logical id; the
+// pinned revision returns the selector verbatim so the pushed entry and the
+// runtime that reads it cannot diverge. The Fastly runtime reads the logical id
+// for every target, so an operator deploying to Fastly should leave this unset,
+// which the Fastly guide now states.
 #[test]
-fn config_push_does_not_use_the_runtime_key_override_without_the_key_flag() {
+fn config_push_writes_the_runtime_key_override_without_the_key_flag() {
     let project = project();
     let key_var = format!(
         "EDGEZERO__STORES__CONFIG__{}__KEY",
@@ -145,7 +151,11 @@ fn config_push_does_not_use_the_runtime_key_override_without_the_key_flag() {
     let entries = stored_entries(&project);
     assert_eq!(entries.len(), 1);
     assert!(
-        entries.contains_key(CONFIG_BLOB_KEY),
-        "runtime-only key override should not move the CLI's write destination"
+        entries.contains_key("active_config"),
+        "the canonical key selector should be the push destination"
+    );
+    assert!(
+        !entries.contains_key(CONFIG_BLOB_KEY),
+        "the logical id should not also be written"
     );
 }
