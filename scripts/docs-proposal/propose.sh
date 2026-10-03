@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # Asks Copilot CLI to propose documentation edits for one merged commit.
 #
-# Usage: scripts/docs-proposal/propose.sh <merge-sha> <work-dir>
-# Writes proposal.patch (empty when nothing changes), rationale.md, and
-# evidence.json to <work-dir>, which must be inside the repository so Copilot
-# can read the prompts and write its outputs there.
+# Usage: scripts/docs-proposal/propose.sh <merge-sha> <work-dir> [<base-sha>]
+# Run from a checkout of <merge-sha>; this script may live in a separate
+# checkout. Copilot inspects <base-sha>..<merge-sha>, where <base-sha>
+# defaults to the first parent and is the previous main head when one push
+# added several commits. Writes proposal.patch (empty when nothing changes),
+# rationale.md, and evidence.json to <work-dir>, which must be inside the
+# repository so Copilot can read the prompts and write its outputs there.
 set -euo pipefail
 
 sha="$1"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(git rev-parse --show-toplevel)"
-spec="$root/docs/superpowers/specs/2026-08-19-documentation-refresh-design.md"
+spec="$here/../../docs/superpowers/specs/2026-08-19-documentation-refresh-design.md"
 # shellcheck source=scripts/docs-proposal/lib.sh
 source "$here/lib.sh"
 
 cd "$root"
 docs_proposal_require_sha "$sha"
+base="${3:-}"
+if [ -z "$base" ] || [ "$base" = "$sha" ] || ! git merge-base --is-ancestor "$base" "$sha" 2>/dev/null; then
+  base="$(git rev-parse "$sha^1")"
+fi
 mkdir -p "$2"
 work_dir="$(cd "$2" && pwd)"
 relative_dir="${work_dir#"$root"/}"
@@ -36,7 +43,7 @@ run_copilot() {
 
 {
   cat "$here/prompt.md"
-  printf '\n## Merged change\n\n- Commit: %s\n- Subject: %s\n\n' "$sha" "$(git log -1 --format=%s "$sha")"
+  printf '\n## Merged change\n\n- Commit: %s\n- Base: %s\n- Subject: %s\n\n' "$sha" "$base" "$(git log -1 --format=%s "$sha")"
   printf '## Sources of truth\n\n'
   awk '/^## Sources of truth/ { found = 1; next } /^## / { found = 0 } found' "$spec"
 } > "$work_dir/prompt.md"

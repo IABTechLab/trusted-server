@@ -23,13 +23,20 @@ on:
 
 permissions: {}
 
-# Sequential merges are proposed one at a time, in order.
+# Sequential merges are proposed one at a time, in order. The default queue
+# keeps only one pending run and cancels older ones, so keep them all.
 concurrency:
   group: docs-proposal
   cancel-in-progress: false
+  queue: max
 
+# Each job runs the proposal scripts from the workflow's own revision in
+# `tools/` against a checkout of the merge commit in `source/`, so retrying a
+# merge that predates this tooling, or a later fix to it, still works. A push
+# that adds several commits is inspected from the previous main head.
 env:
   MERGE_SHA: ${{ inputs.sha || github.sha }}
+  BASE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
 
 jobs:
   # Copilot runs here with a read-only token; it cannot push or open PRs.
@@ -39,72 +46,133 @@ jobs:
       contents: read
       copilot-requests: write
     steps:
-      - name: Checkout
+      - name: Checkout tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tools
+          persist-credentials: false
+
+      - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
           ref: ${{ env.MERGE_SHA }}
+          path: source
           fetch-depth: 0
           persist-credentials: false
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        run: echo "node-version=$(grep '^nodejs ' tools/.tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: docs/package-lock.json
+          cache-dependency-path: source/docs/package-lock.json
 
       - name: Install Copilot CLI
         run: npm install -g @github/copilot@1.0.90
 
       - name: Propose documentation edits
+        working-directory: source
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: scripts/docs-proposal/propose.sh "$MERGE_SHA" .docs-proposal
+        run: ../tools/scripts/docs-proposal/propose.sh "$MERGE_SHA" .docs-proposal "$BASE_SHA"
 
       - name: Upload proposal
         uses: actions/upload-artifact@v4
         with:
           name: docs-proposal
-          path: .docs-proposal/
+          path: source/.docs-proposal/
           include-hidden-files: true
           if-no-files-found: error
 
-  # Copilot does not run here; this job validates and publishes the patch.
-  publish:
+  # VitePress executes Vue in Markdown during the build, so the docs gates run
+  # here with no write token or persisted credentials.
+  validate:
     needs: propose
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
-      - name: Checkout
+      - name: Checkout tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tools
+          persist-credentials: false
+
+      - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
           ref: ${{ env.MERGE_SHA }}
+          path: source
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        run: echo "node-version=$(grep '^nodejs ' tools/.tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: docs/package-lock.json
+          cache-dependency-path: source/docs/package-lock.json
 
       - name: Download proposal
         uses: actions/download-artifact@v4
         with:
           name: docs-proposal
-          path: .docs-proposal
+          path: source/.docs-proposal
+
+      - name: Validate proposal
+        working-directory: source
+        run: ../tools/scripts/docs-proposal/validate.sh "$MERGE_SHA" .docs-proposal
+
+  # Copilot does not run here, and neither does any proposal content: this job
+  # re-checks the path allowlist on a fresh checkout and publishes the patch.
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tools
+          persist-credentials: false
+
+      - name: Checkout merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.MERGE_SHA }}
+          path: source
+          fetch-depth: 0
+
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' tools/.tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
+      - name: Download proposal
+        uses: actions/download-artifact@v4
+        with:
+          name: docs-proposal
+          path: source/.docs-proposal
 
       - name: Publish proposal pull request
+        working-directory: source
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/docs-proposal/publish.sh "$MERGE_SHA" .docs-proposal
+        run: ../tools/scripts/docs-proposal/publish.sh "$MERGE_SHA" .docs-proposal

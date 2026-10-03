@@ -1,13 +1,15 @@
 # Documentation proposal
 
 You are updating the public Trusted Server documentation after a commit merged
-to `main`. The merged commit and the table mapping implementation sources to
-documentation pages appear at the end of this file.
+to `main`. The merged commit, its base, and the table mapping implementation
+sources to documentation pages appear at the end of this file.
 
 ## Task
 
-1. Inspect the merged change with `git show --stat <commit>` and
-   `git show <commit>`.
+1. Inspect the merged change from its base to its commit with
+   `git log --oneline <base>..<commit>`, `git diff --stat <base> <commit>`,
+   and `git diff <base> <commit>`. The range covers every commit the push
+   added; `git show` omits the changes of a clean merge commit.
 2. Decide whether it changes behavior that `docs/index.md` or a page under
    `docs/guide/` describes: configuration fields and defaults, routes, adapter
    support, integrations, auction behavior, CLI commands and flags, browser

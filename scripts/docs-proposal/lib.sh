@@ -36,6 +36,20 @@ docs_proposal_disallowed_paths() {
   return "$found"
 }
 
+# Applies <patch> to the index on a detached checkout of <sha>, then exits
+# when it changes paths outside the allowlist.
+docs_proposal_apply() {
+  local sha="$1"
+  local patch="$2"
+  local disallowed
+  git switch --quiet --detach "$sha"
+  git apply --index "$patch"
+  if ! disallowed="$(git diff --cached --name-only --no-renames "$sha" | docs_proposal_disallowed_paths)"; then
+    printf '::error::Proposal changes paths outside docs/guide/** and docs/index.md:\n%s\n' "$disallowed"
+    exit 1
+  fi
+}
+
 docs_proposal_pr_body() {
   local sha="$1"
   local subject="$2"

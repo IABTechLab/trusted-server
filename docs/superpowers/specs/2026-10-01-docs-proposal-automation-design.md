@@ -33,8 +33,14 @@ only ever writes to a dedicated proposal branch and a pull request.
 
 ## Workflow shape
 
-`.github/workflows/docs-proposal.yml` has two jobs. Copilot never holds a
-token that can push or open pull requests.
+`.github/workflows/docs-proposal.yml` has three jobs. Copilot never holds a
+token that can push or open pull requests, and proposal content is never built
+or executed in a job that can.
+
+Every job checks out the workflow's own revision into `tools/` and the merge
+commit into `source/`, then runs the scripts from `tools/` against `source/`.
+Retrying a merge that predates this tooling therefore works, and a retry runs
+the current scripts rather than historical ones.
 
 ### Trigger
 
@@ -44,19 +50,24 @@ token that can push or open pull requests.
 - `workflow_dispatch` with a required `sha` input, for retries and for the
   first end-to-end validation. Both scripts require a full 40-character SHA
   reachable from `origin/main`.
-- `concurrency: { group: docs-proposal, cancel-in-progress: false }` so
-  sequential merges are processed one at a time, in order.
+- `concurrency` with `group: docs-proposal`, `cancel-in-progress: false`, and
+  `queue: max` so sequential merges are processed one at a time, in order.
+  The default queue keeps one pending run and cancels the rest, which would
+  skip merges.
 
 ### Job `propose`
 
 Permissions: `contents: read`, `copilot-requests: write`.
 
-1. Check out the merge commit with full history.
+1. Check out the tools and the merge commit with full history.
 2. Install Copilot CLI (`@github/copilot`) at a pinned version.
-3. `scripts/docs-proposal/propose.sh <sha> .docs-proposal`:
+3. `scripts/docs-proposal/propose.sh <sha> .docs-proposal <base>`:
    1. Renders `.docs-proposal/prompt.md` from `scripts/docs-proposal/prompt.md`,
-      the merge SHA, its subject, and the Sources-of-truth table from the
-      refresh design.
+      the merge SHA, its base, its subject, and the Sources-of-truth table from
+      the refresh design. The base is the push's previous `main` head, or the
+      first parent for a manual dispatch, so Copilot inspects
+      `git diff <base> <sha>`: a multi-commit push is covered in full, and a
+      clean merge commit is not hidden by `git show`'s empty combined diff.
    2. Runs `copilot -p` with `--no-ask-user`, `--allow-tool=write`, and
       `git show`, `git diff`, `git log`, and `git grep` shell tools; `git push`
       and `git commit` are denied, and file reads need no permission. Copilot
@@ -73,9 +84,24 @@ Permissions: `contents: read`, `copilot-requests: write`.
       that justifies it and a one-sentence reason.
 4. Upload the `.docs-proposal/` directory as an artifact.
 
+### Job `validate`
+
+Permissions: `contents: read`; checkouts do not persist credentials.
+VitePress executes Vue in Markdown during the build, so generated content runs
+only here.
+
+`scripts/docs-proposal/validate.sh <sha> .docs-proposal`:
+
+1. Empty diff: exit successfully.
+2. Apply `proposal.patch` to the merge commit and reject the proposal if any
+   changed path is outside `docs/guide/**` or `docs/index.md`.
+3. In `docs/`: `npm ci`, `npm run lint`, `npm run format`, `npm run build`.
+   Any failure fails the workflow; no pull request is offered.
+
 ### Job `publish`
 
-Permissions: `contents: write`, `pull-requests: write`. Copilot does not run.
+Permissions: `contents: write`, `pull-requests: write`. Copilot does not run,
+and nothing installs, builds, or executes proposal content.
 
 `scripts/docs-proposal/publish.sh <sha> .docs-proposal`:
 
@@ -83,22 +109,23 @@ Permissions: `contents: write`, `pull-requests: write`. Copilot does not run.
    `docs/auto/<short-sha>`, leave it alone and exit successfully: a
    maintainer's decision is never reopened or recreated.
 2. Empty diff: close any open pull request for that branch with a comment,
-   then exit successfully. Otherwise apply `proposal.patch` to the merge
-   commit.
-3. Reject the proposal if any changed path is outside `docs/guide/**` or
+   then exit successfully. Otherwise apply `proposal.patch` to a fresh
+   checkout of the merge commit.
+3. Reject the proposal again if any changed path is outside `docs/guide/**` or
    `docs/index.md`.
-4. In `docs/`: `npm ci`, `npm run lint`, `npm run format`, `npm run build`.
-   Any failure fails the job; no pull request is offered.
-5. Commit as `github-actions[bot]` on `docs/auto/<short-sha>`. If the remote
-   branch already exists and its tree equals the new tree, stop: the proposal
-   is unchanged and nothing is re-posted. Otherwise force-push.
-6. Find the originating pull request with
+4. Commit as `github-actions[bot]` on `docs/auto/<short-sha>`. If the remote
+   branch already exists and its tree equals the new tree, reuse the remote
+   commit and skip the push, so a retry resumes any later step that failed.
+   Otherwise force-push.
+5. Find the originating pull request with
    `gh api repos/{owner}/{repo}/commits/<sha>/pulls`. Create the pull request,
    or edit the existing one, with a body that links the merge commit and the
    originating pull request, includes `rationale.md`, and states that a human
    must verify the prose against the code before merging.
-7. `node scripts/docs-proposal/hunks.mjs review` builds review comments and
-   posts one `COMMENT` review through `gh api`.
+6. If `github-actions[bot]` already reviewed the pushed commit, stop: nothing
+   is re-posted. Otherwise `node scripts/docs-proposal/hunks.mjs review`
+   builds review comments and posts one `COMMENT` review through `gh api`
+   against the pushed commit.
 
 ## Per-hunk review
 
@@ -130,7 +157,7 @@ Documented in `scripts/README.md`:
 - Repository setting "Allow GitHub Actions to create and approve pull
   requests" is enabled.
 - Pull requests opened with `GITHUB_TOKEN` do not trigger other workflows.
-  The `publish` job runs the docs gates itself; maintainers re-run regular CI
+  The `validate` job runs the docs gates itself; maintainers re-run regular CI
   by pushing to the branch if needed.
 
 ## Security
@@ -140,7 +167,10 @@ Documented in `scripts/README.md`:
   permissions.
 - Input is code already merged to `main`, so no untrusted fork content reaches
   the agent.
-- The path allowlist is enforced by `publish.sh`, not by the prompt.
+- The path allowlist is enforced by `validate.sh` and again by `publish.sh`,
+  not by the prompt.
+- Generated Markdown is built only in the `validate` job, which has a
+  read-only token and no persisted credentials.
 - Proposed prose must use fictional `example.com` values, per `CLAUDE.md`;
   the reviewer verifies this before merging.
 
@@ -149,9 +179,11 @@ Documented in `scripts/README.md`:
 - `node --test scripts/docs-proposal/hunks.test.mjs` covers hunk listing,
   every row of the per-hunk table, unknown evidence ids, and the review payload.
 - `scripts/docs-proposal/test.sh` stubs `gh` and `npm` and pushes to a
-  temporary bare repository to cover the empty diff, closing a stale
-  proposal, a disallowed path, first publish, an unchanged retry, an updated
-  proposal, a closed proposal, and PR body rendering.
+  temporary bare repository to cover validation of empty, disallowed, and
+  allowed proposals, the empty diff, closing a stale proposal, a disallowed
+  path, first publish without a build, an unchanged retry, an updated proposal
+  whose review fails and is resumed without a second push, a closed proposal,
+  and PR body rendering.
 - `shellcheck` passes for every script.
 - The `docs-proposal-scripts` job in `format.yml` runs all three on every
   pull request.

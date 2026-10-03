@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Tests the documentation proposal helpers and publish flow with stubbed gh
-# and npm against a throwaway git repository.
+# Tests the documentation proposal helpers, validate flow, and publish flow
+# with stubbed gh and npm against a throwaway git repository.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,7 +70,11 @@ case "$1 $2" in
   "pr list") printf '%s' "${STUB_PR:-}" ;;
   "pr create") printf 'https://github.com/example/repo/pull/7\n' ;;
   "api repos/{owner}/{repo}/commits/"*) printf '%s' "${STUB_ORIGIN_PR:-}" ;;
+  "api --paginate") printf '%s' "${STUB_REVIEWS:-}" ;;
   "api --method")
+    if [ -n "${STUB_FAIL_REVIEW:-}" ]; then
+      exit 1
+    fi
     for arg in "$@"; do last="$arg"; done
     cp "$last" "$STUB_REVIEW"
     ;;
@@ -118,6 +122,19 @@ run_publish() {
   fi
 }
 
+run_validate() {
+  : > "$STUB_LOG"
+  if "$here/validate.sh" "$merge_sha" "$tmp/proposal" > "$tmp/out.log" 2>&1; then
+    printf '0'
+  else
+    printf '1'
+  fi
+}
+
+remote_head() {
+  git ls-remote origin "refs/heads/$branch" | cut -f1
+}
+
 remote_has_branch() {
   if git ls-remote --exit-code -q origin "refs/heads/$branch" >/dev/null; then
     printf 'yes'
@@ -125,6 +142,18 @@ remote_has_branch() {
     printf 'no'
   fi
 }
+
+make_patch ""
+assert_eq "$(run_validate)" 0 "should validate an empty proposal"
+assert_eq "$(grep -c 'npm' "$STUB_LOG" || true)" 0 "should not run the docs gates for an empty proposal"
+
+make_patch docs/superpowers/notes.md
+assert_eq "$(run_validate)" 1 "should reject a disallowed path before the docs gates"
+assert_eq "$(grep -c 'npm' "$STUB_LOG" || true)" 0 "should not build a disallowed proposal"
+
+make_patch docs/guide/cli.md
+assert_eq "$(run_validate)" 0 "should validate an allowed proposal"
+assert_contains "$(cat "$STUB_LOG")" "npm run build" "should run the docs build"
 
 make_patch ""
 assert_eq "$(STUB_PR="" run_publish)" 0 "should succeed on an empty proposal"
@@ -143,16 +172,23 @@ make_patch docs/guide/cli.md
 assert_eq "$(STUB_PR="" STUB_ORIGIN_PR=42 run_publish)" 0 "should publish a valid proposal"
 assert_eq "$(remote_has_branch)" yes "should push the proposal branch"
 assert_contains "$(cat "$STUB_LOG")" "pr create --base main --head $branch" "should open a PR from the proposal branch"
-assert_contains "$(cat "$STUB_LOG")" "npm run build" "should run the docs build"
+assert_eq "$(grep -c '^npm' "$STUB_LOG" || true)" 0 "should never build proposal content while publishing"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" '"path": "docs/guide/cli.md"' "should post a review for the hunk"
 
-assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should succeed on an unchanged retry"
-assert_eq "$(grep -c 'pr edit\|pr create\|reviews' "$STUB_LOG" || true)" 0 "should not re-post an unchanged proposal"
+published_head="$(remote_head)"
+assert_eq "$(STUB_PR="7 OPEN" STUB_REVIEWS=101 run_publish)" 0 "should succeed on an unchanged retry"
+assert_eq "$(remote_head)" "$published_head" "should not push an unchanged proposal"
+assert_eq "$(grep -c 'pr create\|--method POST' "$STUB_LOG" || true)" 0 "should not re-post an unchanged proposal"
 
 make_patch docs/index.md
-assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should update a changed proposal"
+assert_eq "$(STUB_PR="7 OPEN" STUB_FAIL_REVIEW=1 run_publish)" 1 "should fail when the review cannot be posted"
+pushed_head="$(remote_head)"
 assert_contains "$(cat "$STUB_LOG")" "pr edit 7" "should edit the existing PR"
+
+assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should resume a proposal whose review failed"
+assert_eq "$(remote_head)" "$pushed_head" "should not push again when resuming"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" '"path": "docs/index.md"' "should review the new hunk"
+assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" "\"commit_id\": \"$pushed_head\"" "should review the pushed commit"
 
 assert_eq "$(STUB_PR="7 CLOSED" run_publish)" 0 "should succeed for a closed proposal"
 assert_eq "$(grep -c 'pr edit\|pr create' "$STUB_LOG" || true)" 0 "should never reopen or recreate a closed proposal"
