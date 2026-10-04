@@ -16,6 +16,10 @@ publisher's first-party domain. This provides:
 - **Tamper resistance**: validated, signed URLs prevent in-flight URL substitution
 - **Configurable data sharing**: forwarding to vendors is per the deployer's configuration
 
+## Browser-facing first-party origin
+
+Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, for example `https://ads.publisher.example`. Rewritten proxy, click, CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin. When it is omitted, Trusted Server uses `https://{publisher.domain}` for compatibility. Relative creative source URLs and excluded third-party URLs remain unchanged. The publisher SSAT/page-bids path retains its explicit request-origin override and does not inject the creative bundle.
+
 ## How It Works
 
 ```
@@ -37,9 +41,9 @@ publisher's first-party domain. This provides:
                         ↓
 ┌──────────────────────────────────────────────────────┐
 │  Rewritten Creative HTML                             │
-│  <img src="/first-party/proxy?tsurl=...&tstoken=sig">│
-│  <iframe src="/first-party/proxy?tsurl=...&token=sig">│
-│  <style> .bg { background: url(/first-party/proxy...) }│
+│  <img src="https://ads.publisher.example/first-party/proxy?tsurl=...&tstoken=sig">│
+│  <iframe src="https://ads.publisher.example/first-party/proxy?tsurl=...&token=sig">│
+│  <style> .bg { background: url(https://ads.publisher.example/first-party/proxy...) }│
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -71,12 +75,12 @@ rewrite_creatives = true
 Regardless of mode, a creative larger than the 1 MiB per-creative cap is
 rejected and its `adm` is dropped.
 
-| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                         |
-| -------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                                                          |
-| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                         |
-| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                                                               |
-| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS exactly once, whether or not the bidder supplied a `<body>`; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
+| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                                                               |
+| -------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                                                                                                |
+| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                                                               |
+| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                                                                                                     |
+| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits absolute endpoints on the configured public origin and injects creative TSJS exactly once, whether or not the bidder supplied a `<body>`; SSAT/page-bids retains its request-origin override for its foreign-origin renderer and does not inject the bundle. |
 
 ::: warning Sanitization blanks script-based creatives
 Sanitization removes `script`/`object`/`embed`/`form` and similar elements
@@ -163,10 +167,10 @@ it does not control whether the processed `adm` is present.
 
 <!-- Rewritten -->
 <img
-  src="/first-party/proxy?tsurl=https://cdn.example.com/banner.jpg&tstoken=sig1"
+  src="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/banner.jpg&tstoken=sig1"
   srcset="
-    /first-party/proxy?tsurl=https://cdn.example.com/banner@1x.jpg&tstoken=sig2 1x,
-    /first-party/proxy?tsurl=https://cdn.example.com/banner@2x.jpg&tstoken=sig3 2x
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/banner@1x.jpg&tstoken=sig2 1x,
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/banner@2x.jpg&tstoken=sig3 2x
   "
 />
 ```

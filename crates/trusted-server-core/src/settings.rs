@@ -41,6 +41,13 @@ pub struct Publisher {
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
+    /// Browser-facing Trusted Server origin for first-party creative URLs.
+    ///
+    /// When omitted, generated URLs fall back to `https://{domain}` for
+    /// compatibility with existing configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = validate_public_origin))]
+    pub public_origin: Option<String>,
     /// Optional outbound Host header to send while connecting to `origin_url`.
     #[serde(default)]
     #[validate(custom(function = validate_host_header_override))]
@@ -95,6 +102,7 @@ impl Default for Publisher {
             domain: String::default(),
             cookie_domain: String::default(),
             origin_url: String::default(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
@@ -186,6 +194,7 @@ impl Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
+    ///     public_origin: None,
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -204,6 +213,14 @@ impl Publisher {
                 })
             })
             .unwrap_or_else(|| self.origin_url.clone())
+    }
+
+    /// Returns the effective browser-facing origin for generated first-party URLs.
+    #[must_use]
+    pub fn effective_public_origin(&self) -> String {
+        self.public_origin
+            .clone()
+            .unwrap_or_else(|| format!("https://{}", self.domain))
     }
 
     /// Returns the outbound Host header for proxied publisher-origin requests.
@@ -3403,6 +3420,52 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_public_origin(value: &str) -> Result<(), ValidationError> {
+    if value.chars().any(char::is_whitespace) || value.chars().any(char::is_control) {
+        let mut err = ValidationError::new("public_origin_has_whitespace");
+        err.add_param("value".into(), &value);
+        err.message =
+            Some("public_origin must not contain whitespace or control characters".into());
+        return Err(err);
+    }
+
+    if value.ends_with('/') {
+        let mut err = ValidationError::new("public_origin_trailing_slash");
+        err.add_param("value".into(), &value);
+        err.message = Some("public_origin must not include a trailing slash".into());
+        return Err(err);
+    }
+
+    let parsed = Url::parse(value).map_err(|parse_error| {
+        let mut err = ValidationError::new("invalid_public_origin");
+        err.add_param("value".into(), &value);
+        err.add_param("message".into(), &parse_error.to_string());
+        err.message = Some("public_origin must be an absolute http or https origin".into());
+        err
+    })?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ValidationError::new("invalid_public_origin_scheme"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(ValidationError::new("missing_public_origin_host"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ValidationError::new("public_origin_has_userinfo"));
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err(ValidationError::new("public_origin_has_path"));
+    }
+    if parsed.query().is_some() {
+        return Err(ValidationError::new("public_origin_has_query"));
+    }
+    if parsed.fragment().is_some() {
+        return Err(ValidationError::new("public_origin_has_fragment"));
+    }
+
+    Ok(())
+}
+
 fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
     if let Err(reason) = validate_host_header_override_value(value) {
         let mut err = ValidationError::new("invalid_host_header_override");
@@ -5200,6 +5263,84 @@ mod tests {
     }
 
     #[test]
+    fn publisher_public_origin_validates_and_falls_back_to_domain() {
+        let fallback = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without public origin");
+        assert_eq!(
+            fallback.publisher.effective_public_origin(),
+            "https://test-publisher.com",
+            "should use the publisher domain for the compatibility fallback"
+        );
+        let fallback_json = serde_json::to_value(&fallback).expect("should serialize settings");
+        assert!(
+            fallback_json["publisher"].get("public_origin").is_none(),
+            "should omit an unset public origin from serialized configs"
+        );
+
+        for origin in ["https://ads.example.com", "http://localhost:8080"] {
+            let settings = Settings::from_toml(&crate_test_settings_str().replace(
+                r#"origin_url = "https://origin.test-publisher.com""#,
+                &format!(
+                    "origin_url = \"https://origin.test-publisher.com\"\npublic_origin = \"{origin}\""
+                ),
+            ))
+            .expect("should accept an HTTP(S) origin without a trailing slash");
+            assert_eq!(settings.publisher.effective_public_origin(), origin);
+        }
+
+        for origin in [
+            "ftp://ads.example.com",
+            "https://user@ads.example.com",
+            "https://ads.example.com/path",
+            "https://ads.example.com?query=1",
+            "https://ads.example.com#fragment",
+            "https://ads.example.com/",
+            " https://ads.example.com",
+            "https://ads.example.com ",
+            "https://ads.exa\nmple.com",
+        ] {
+            let result = Settings::from_toml(&crate_test_settings_str().replace(
+                r#"origin_url = "https://origin.test-publisher.com""#,
+                &format!(
+                    "origin_url = \"https://origin.test-publisher.com\"\npublic_origin = \"{origin}\""
+                ),
+            ));
+            assert!(
+                result.is_err(),
+                "should reject invalid public origin {origin:?}"
+            );
+        }
+
+        for origin in [" https://ads.example.com", "https://ads.exa\nmple.com"] {
+            let mut json = serde_json::to_value(&fallback).expect("should serialize settings");
+            json["publisher"]["public_origin"] = serde_json::json!(origin);
+            assert!(
+                Settings::from_json_value(json).is_err(),
+                "should reject whitespace/control characters in public origin {origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publisher_public_origin_round_trips_through_json() {
+        let settings = Settings::from_toml(&crate_test_settings_str().replace(
+            r#"origin_url = "https://origin.test-publisher.com""#,
+            "origin_url = \"https://origin.test-publisher.com\"\npublic_origin = \"https://ads.example.com:8443\"",
+        ))
+        .expect("should parse an explicit public origin");
+        let json = serde_json::to_value(&settings).expect("should serialize settings");
+        assert_eq!(
+            json["publisher"]["public_origin"],
+            serde_json::json!("https://ads.example.com:8443")
+        );
+        let reconstructed = Settings::from_json_value(json).expect("should deserialize settings");
+        assert_eq!(
+            reconstructed.publisher.effective_public_origin(),
+            "https://ads.example.com:8443"
+        );
+    }
+
+    #[test]
     fn validate_rejects_invalid_publisher_domains() {
         for domain in [
             "",
@@ -6120,6 +6261,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6131,6 +6273,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6142,6 +6285,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6153,6 +6297,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6164,6 +6309,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6175,6 +6321,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6188,6 +6335,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8443".to_string(),
+            public_origin: None,
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -6202,6 +6350,7 @@ source_domain = "partner.example.com"
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
+            public_origin: None,
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,

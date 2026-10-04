@@ -20,7 +20,7 @@ use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
-use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
+use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor, first_party_url};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
@@ -1801,7 +1801,7 @@ struct ProxyRebuildResp {
 }
 
 /// Proxy rebuild endpoint.
-/// POST /first-party/proxy-rebuild
+/// POST or GET /first-party/proxy-rebuild
 /// Body: { tsclick: "/first-party/click?tsurl=...&a=1", add: {"b":"2"}, del: ["c"] }
 /// - Only allows adding new parameters or removing existing ones.
 /// - Base tsurl cannot change.
@@ -1858,17 +1858,16 @@ pub async fn handle_first_party_proxy_rebuild(
         rebuild_request_from_pairs(url::form_urlencoded::parse(req_query.as_bytes()))?
     };
 
-    // Accept both the root-relative form the rewriter emits and an absolute
-    // first-party URL: the client may have absolutized the click to keep it
-    // resolvable inside a `srcdoc` frame. Concatenating a dummy origin would
-    // mangle the absolute form, so parse it properly instead. The signature
-    // covers `tsurl` plus params only, never the origin, so both forms validate
-    // identically.
-    let c_url =
-        parse_request_target(&payload.tsclick).change_context(TrustedServerError::Proxy {
-            message: "invalid tsclick".to_string(),
-        })?;
-    if c_url.path() != "/first-party/click" {
+    let qualified_tsclick =
+        if payload.tsclick.starts_with('/') && !payload.tsclick.starts_with("//") {
+            first_party_url(settings, &payload.tsclick)
+        } else {
+            payload.tsclick.clone()
+        };
+    let c_url = url::Url::parse(&qualified_tsclick).change_context(TrustedServerError::Proxy {
+        message: "invalid tsclick".to_string(),
+    })?;
+    if !matches!(c_url.scheme(), "http" | "https") || c_url.path() != "/first-party/click" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid tsclick path".to_string(),
         }));
@@ -1876,7 +1875,7 @@ pub async fn handle_first_party_proxy_rebuild(
     // Validate the tstoken on the original click URL before applying any changes.
     // Without this, an attacker could submit an unsigned tsclick and mint valid
     // click redirects to arbitrary URLs.
-    reconstruct_and_validate_signed_target(settings, c_url.as_str())?;
+    reconstruct_and_validate_signed_target(settings, &qualified_tsclick)?;
 
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
@@ -1962,7 +1961,7 @@ pub async fn handle_first_party_proxy_rebuild(
         qs.append_pair(k, v);
     }
     qs.append_pair("tstoken", &token);
-    let href = format!("/first-party/click?{}", qs.finish());
+    let href = first_party_url(settings, &format!("/first-party/click?{}", qs.finish()));
 
     // Compute diagnostics: added and removed
     let mut added: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -2507,7 +2506,9 @@ mod tests {
     #[test]
     fn proxy_sign_returns_signed_url() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
+            let mut settings = create_test_settings();
+            settings.publisher.public_origin =
+                Some("https://ads.publisher.example:8443".to_string());
             let body = serde_json::json!({
                 "url": "https://cdn.example/asset.js?c=3&b=2",
             });
@@ -2517,7 +2518,11 @@ mod tests {
                 .expect("sign ok");
             assert_eq!(resp.status(), StatusCode::OK);
             let json = response_body_string(resp);
-            assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
+            assert!(
+                json.contains("https://ads.publisher.example:8443/first-party/proxy?tsurl="),
+                "{}",
+                json
+            );
             assert!(json.contains("tsexp"), "{}", json);
             assert!(
                 json.contains("\"base\":\"https://cdn.example/asset.js\""),
@@ -2627,8 +2632,12 @@ mod tests {
                             .as_str()
                             .expect("should include string href in sign response");
                         let signed_url =
-                            url::Url::parse(&format!("https://edge.example.com{href}"))
-                                .expect("should parse signed proxy URL");
+                            url::Url::parse(href).expect("should parse absolute signed proxy URL");
+                        assert_eq!(
+                            signed_url.origin().ascii_serialization(),
+                            settings.publisher.effective_public_origin(),
+                            "{label} should use the configured public origin"
+                        );
                         assert_eq!(
                             signed_url.path(),
                             "/first-party/proxy",
@@ -2985,6 +2994,89 @@ mod tests {
         });
     }
 
+    #[test]
+    fn proxy_rebuild_accepts_legacy_and_absolute_clicks_and_canonicalizes_output() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.publisher.public_origin =
+                Some("https://ads.publisher.example:8443".to_string());
+            let tsurl = "https://advertiser.example.com/landing";
+            let token = crate::http_util::compute_encrypted_sha256_token(&settings, tsurl);
+            let legacy = format!(
+                "/first-party/click?tsurl={}&tstoken={token}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>()
+            );
+
+            for tsclick in [legacy.clone(), format!("https://alias.example{legacy}")] {
+                let body = serde_json::json!({ "tsclick": tsclick });
+                let req = HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example/first-party/proxy-rebuild")
+                    .body(EdgeBody::from(
+                        serde_json::to_string(&body).expect("should serialize test JSON"),
+                    ))
+                    .expect("should build rebuild request");
+                let response = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                    .await
+                    .expect("should rebuild a valid click");
+                let body: serde_json::Value = serde_json::from_str(&response_body_string(response))
+                    .expect("should return JSON");
+                assert!(
+                    body["href"]
+                        .as_str()
+                        .expect("should return href")
+                        .starts_with("https://ads.publisher.example:8443/first-party/click?"),
+                    "should canonicalize to public_origin"
+                );
+            }
+
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("tsclick", &legacy)
+                .finish();
+            let req = build_http_request(
+                Method::GET,
+                format!("https://edge.example/first-party/proxy-rebuild?{query}"),
+            );
+            let response = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("should rebuild legacy GET click");
+            assert_eq!(response.status(), StatusCode::FOUND);
+            assert!(
+                response_header(&response, header::LOCATION)
+                    .expect("should return a Location header")
+                    .starts_with("https://ads.publisher.example:8443/first-party/click?")
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_rejects_invalid_click_authorities_and_paths() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            for tsclick in [
+                "//edge.example/first-party/click?tsurl=x",
+                "ftp://edge.example/first-party/click?tsurl=x",
+                "https://edge.example/first-party/click-extra?tsurl=x",
+                "not a URL",
+            ] {
+                let body = serde_json::json!({ "tsclick": tsclick });
+                let req = HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://edge.example/first-party/proxy-rebuild")
+                    .body(EdgeBody::from(
+                        serde_json::to_string(&body).expect("should serialize test JSON"),
+                    ))
+                    .expect("should build rebuild request");
+                assert!(
+                    handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                        .await
+                        .is_err(),
+                    "should reject {tsclick:?}"
+                );
+            }
+        });
+    }
+
     // Build a signed `/first-party/click` target with one extra param.
     fn signed_click_target(settings: &crate::settings::Settings) -> String {
         let tsurl = "https://cdn.example/landing.html";
@@ -3198,7 +3290,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .expect("should carry a Location header");
             assert!(
-                location.starts_with("/first-party/click?tsurl="),
+                location.starts_with(&format!(
+                    "{}/first-party/click?tsurl=",
+                    settings.publisher.effective_public_origin()
+                )),
                 "should redirect to the rebuilt first-party click: {location}"
             );
             assert!(
@@ -3247,7 +3342,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .expect("should carry a Location header");
             assert!(
-                location.starts_with("/first-party/click?tsurl="),
+                location.starts_with(&format!(
+                    "{}/first-party/click?tsurl=",
+                    settings.publisher.effective_public_origin()
+                )),
                 "should redirect to the rebuilt click: {location}"
             );
             assert!(
@@ -3280,7 +3378,10 @@ mod tests {
                 .expect("JSON rebuild should succeed");
 
             assert_eq!(resp.status(), StatusCode::OK);
-            assert!(response_body_string(resp).contains("\"href\":\"/first-party/click?tsurl="));
+            assert!(response_body_string(resp).contains(&format!(
+                "\"href\":\"{}/first-party/click?tsurl=",
+                settings.publisher.effective_public_origin()
+            )));
         });
     }
 
@@ -3425,14 +3526,10 @@ mod tests {
     fn reconstruct_valid_with_params_preserves_order() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
-        // Simulate creative-generated first-party URL
+        // Simulate creative-generated first-party URL.
         let first_party = creative::build_proxy_url(&settings, clear, "");
-        // Reconstruct and validate (need absolute URL for parsing)
-        let st = reconstruct_and_validate_signed_target(
-            &settings,
-            &format!("https://edge.example{}", first_party),
-        )
-        .expect("reconstruct ok");
+        let st = reconstruct_and_validate_signed_target(&settings, &first_party)
+            .expect("reconstruct ok");
         assert_eq!(st.tsurl, "https://cdn.example/asset.js");
         assert!(st.had_params);
         assert_eq!(st.target_url, canonical_clear_url(clear));
@@ -3443,11 +3540,8 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
         let first_party = creative::build_proxy_url(&settings, clear, "");
-        let st = reconstruct_and_validate_signed_target(
-            &settings,
-            &format!("https://edge.example{}", first_party),
-        )
-        .expect("reconstruct ok");
+        let st = reconstruct_and_validate_signed_target(&settings, &first_party)
+            .expect("reconstruct ok");
         assert_eq!(st.tsurl, clear);
         assert!(!st.had_params);
         assert_eq!(st.target_url, clear);
@@ -3458,10 +3552,9 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let clear = "ftp://cdn.example/file.gif";
-            // Build a first-party proxy URL with a token for the unsupported scheme
+            // Build a first-party proxy URL with a token for the unsupported scheme.
             let first_party = creative::build_proxy_url(&settings, clear, "");
-            let req =
-                build_http_request(Method::GET, format!("https://edge.example{}", first_party));
+            let req = build_http_request(Method::GET, first_party);
             let err: Report<TrustedServerError> =
                 handle_first_party_proxy(&settings, &noop_services(), req)
                     .await
@@ -3499,8 +3592,7 @@ mod tests {
             let settings = create_test_settings();
             let clear = "https://cdn.example/landing.html?x=1";
             let first_party = creative::build_click_url(&settings, clear, "");
-            let req =
-                build_http_request(Method::GET, format!("https://edge.example{}", first_party));
+            let req = build_http_request(Method::GET, first_party);
             let resp = handle_first_party_click(&settings, &noop_services(), req)
                 .await
                 .expect("should redirect");

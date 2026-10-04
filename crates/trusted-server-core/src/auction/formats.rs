@@ -1304,6 +1304,29 @@ mod tests {
     }
 
     #[test]
+    fn convert_to_openrtb_response_uses_public_origin_for_creative_rewrites() {
+        let mut settings = make_settings();
+        settings.publisher.public_origin = Some("https://ads.publisher.example:8443".to_string());
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.creative = Some(
+            r#"<body><img src="https://cdn.example.com/ad.png"><a href="https://advertiser.example.com/landing">ad</a></body>"#
+                .to_string(),
+        );
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, true)
+            .expect("should convert rewritten creative");
+        let json = response_json(response);
+        let adm = json["seatbid"][0]["bid"][0]["adm"]
+            .as_str()
+            .expect("should serialize creative HTML");
+        assert!(adm.contains("https://ads.publisher.example:8443/first-party/proxy?"));
+        assert!(adm.contains("https://ads.publisher.example:8443/first-party/click?"));
+        assert!(adm.contains("https://ads.publisher.example:8443/static/tsjs="));
+    }
+
+    #[test]
     fn convert_to_openrtb_response_rewrites_sanitized_creative_when_enabled() {
         let mut settings = make_settings();
         settings.auction.sanitize_creatives = true;

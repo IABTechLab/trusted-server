@@ -23,6 +23,7 @@ rejected until replaced.
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
+public_origin = "https://ads.publisher.example"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
@@ -314,6 +315,7 @@ Core publisher settings for domain, origin, and proxy configuration.
 | `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
 | `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
 | `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
+| `public_origin`               | String  | No       | Browser-facing Trusted Server origin used in rewritten creative URLs        |
 | `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
 | `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
 | `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
@@ -328,6 +330,8 @@ Core publisher settings for domain, origin, and proxy configuration.
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
+# Browser-facing origin for rewritten creative proxy, click, and TSJS URLs.
+public_origin = "https://ads.publisher.example"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
 proxy_secret = "publisher_proxy_secret"
@@ -339,6 +343,7 @@ proxy_secret = "publisher_proxy_secret"
 TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+TRUSTED_SERVER__PUBLISHER__PUBLIC_ORIGIN=https://ads.publisher.example
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
@@ -396,6 +401,16 @@ TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 - ❌ `origin.publisher.com` (missing protocol)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
+
+#### `public_origin`
+
+**Purpose**: Browser-facing Trusted Server origin used for first-party URLs emitted into rewritten creatives, including proxy, click, and injected TSJS URLs.
+
+This is distinct from `origin_url`, which is only the backend connection target. Do not derive it from request headers.
+
+**Format**: An `http` or `https` origin with a host and optional port, without userinfo, path, query, fragment, or a trailing slash. HTTPS is recommended for deployed publisher traffic; HTTP is supported for direct localhost development.
+
+**Default**: When omitted, Trusted Server uses `https://{publisher.domain}` to preserve existing configuration behavior.
 
 #### `origin_host_header_override`
 

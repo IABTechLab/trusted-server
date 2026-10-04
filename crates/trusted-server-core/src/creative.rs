@@ -7,7 +7,7 @@
 //!
 //! Key behaviors:
 //! - Absolute and protocol-relative URLs (http/https or `//`) are proxied to
-//!   `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
+//!   `{public_origin}/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
 //!   - `<img src>`, `data-src`, `[srcset]`, `[imagesrcset]`
 //!   - `<script src>`
 //!   - `<video src>`, `<audio src>`, `<source src>`
@@ -106,8 +106,8 @@ const MAX_CSS_NESTING_DEPTH: usize = 64;
 /// Covers every form the browser fetches: `url()` and `src()`, a bare string
 /// candidate in `image-set()`, and an `@import` prelude string.
 ///
-/// `base_origin` is prefixed onto the proxy path — empty for root-relative
-/// output, `https://<domain>` for absolute output (see [`build_proxy_url`]).
+/// `base_origin` overrides the configured public origin when non-empty.
+/// See [`build_proxy_url`] for the origin semantics.
 ///
 /// Values are read with a CSS tokenizer rather than by scanning for quotes, so
 /// the extent of a value comes from the grammar and escapes are already
@@ -550,6 +550,13 @@ fn takes_bare_string_urls(name: &str) -> bool {
     name.eq_ignore_ascii_case("image-set") || name.eq_ignore_ascii_case("-webkit-image-set")
 }
 
+/// Prefixes a controlled root-relative Trusted Server endpoint with its browser-facing origin.
+#[inline]
+pub(crate) fn first_party_url(settings: &Settings, path: &str) -> String {
+    debug_assert!(path.starts_with('/'));
+    format!("{}{}", settings.publisher.effective_public_origin(), path)
+}
+
 #[inline]
 fn build_signed_url_for(
     settings: &Settings,
@@ -593,14 +600,18 @@ fn build_signed_url_for(
         qs.append_pair(k, v);
     }
     qs.append_pair("tstoken", &token);
-    format!("{}?{}", base_path, qs.finish())
+    let signed = format!("{}?{}", base_path, qs.finish());
+    if base_path.starts_with('/') {
+        first_party_url(settings, &signed)
+    } else {
+        signed
+    }
 }
 
-/// Build a signed first-party proxy URL, prefixing `base_origin` before the
-/// `/first-party/proxy` path. An empty `base_origin` yields a root-relative URL
-/// (the default, for creatives rendered from the first-party origin); a
-/// `https://<domain>` origin yields an absolute URL that resolves correctly when
-/// the creative is rendered in a foreign origin (e.g. PUC's `srcdoc` under GAM).
+/// Build an absolute signed first-party proxy URL.
+///
+/// An empty `base_origin` uses the configured public origin. A non-empty origin
+/// preserves the publisher inline renderer's explicit request-origin override.
 #[inline]
 pub(super) fn build_proxy_url(settings: &Settings, clear_url: &str, base_origin: &str) -> String {
     build_signed_url_for(
@@ -1035,18 +1046,12 @@ fn process_auction_creative_with_rewriter(
     }
 }
 
-/// Rewrite ad creative HTML to first-party endpoints, for creatives rendered
-/// from the first-party origin (the `/auction` iframe `srcdoc`).
-/// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
+/// Rewrite ad creative HTML to first-party endpoints.
+/// - 1x1 `<img>` pixels → `{public_origin}/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
+/// - Non-pixel absolute images → `{public_origin}/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
+/// - `<iframe src>` (absolute or protocol-relative) → `{public_origin}/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
-///   (served from `/static/tsjs=tsjs-creative.min.js`).
-///
-/// The proxy/click URLs are emitted **root-relative** (`/first-party/…`), which
-/// resolves only when the creative's document base URL is the first-party origin.
-/// For creatives handed to a renderer in a foreign origin (e.g. the Prebid
-/// Universal Creative's `srcdoc` under GAM), use [`rewrite_inline_creative_html`].
+///   (served from `{public_origin}/static/tsjs=tsjs-creative.min.js`).
 #[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     rewrite_creative_html_impl(settings, markup, "", true, MAX_CREATIVE_SIZE)
@@ -1116,8 +1121,8 @@ pub fn expand_auction_price_macro(markup: &str, cpm: f64) -> String {
     markup.replace(AUCTION_PRICE_MACRO, &cpm.to_string())
 }
 
-/// Shared creative rewriter. `base_origin` is prefixed onto first-party proxy and
-/// click paths (empty for root-relative, `https://<domain>` for absolute);
+/// Shared creative rewriter. A non-empty `base_origin` overrides the configured
+/// public origin for first-party proxy and click URLs;
 /// `inject_tsjs` controls the `<body>` tsjs bundle injection; `max_output_size`
 /// bounds the rewritten result. See the public wrappers,
 /// [`rewrite_creative_html`], [`rewrite_inline_creative_html`], and
@@ -1169,7 +1174,11 @@ fn rewrite_creative_html_impl(
                     let injected = std::rc::Rc::clone(&injected_ts_creative);
                     move |el| {
                         if inject_tsjs && !injected.get() {
-                            let script_tag = tsjs::tsjs_unified_script_tag();
+                            let script_src = tsjs::tsjs_unified_script_src();
+                            let script_tag = format!(
+                                "<script src=\"{}\" id=\"trustedserver-js\"></script>",
+                                first_party_url(settings, &script_src)
+                            );
                             el.prepend(&script_tag, ContentType::Html);
                             injected.set(true);
                         }
@@ -1389,7 +1398,11 @@ fn rewrite_creative_html_impl(
     // rewrote to nothing, and a script-only result would read as an accepted
     // creative that renders blank.
     if inject_tsjs && !injected_ts_creative.get() && !rewritten.is_empty() {
-        rewritten.insert_str(0, &tsjs::tsjs_unified_script_tag());
+        let script_tag = format!(
+            "<script src=\"{}\" id=\"trustedserver-js\"></script>",
+            first_party_url(settings, &tsjs::tsjs_unified_script_src())
+        );
+        rewritten.insert_str(0, &script_tag);
         if rewritten.len() > max_output_size {
             log::warn!(
                 "rewrite_creative_html: output exceeds {} byte cap after runtime injection; rejecting",
@@ -1495,9 +1508,9 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreativeCssProcessor, StreamProcessor as _, process_auction_creative,
-        rewrite_creative_html, rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls,
-        sanitize_creative_html, to_abs,
+        CreativeCssProcessor, StreamProcessor as _, build_click_url, build_proxy_url,
+        process_auction_creative, rewrite_creative_html, rewrite_inline_creative_html,
+        rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
     };
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
@@ -1616,12 +1629,17 @@ mod tests {
         // GAM), so proxy/click URLs must be absolute against the publisher origin
         // — a root-relative `/first-party/…` would resolve against GAM and 404 —
         // and the tsjs bundle must not be injected into that iframe.
-        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.public_origin = Some("https://ads.example.com:8443".to_string());
         let html = "<html><body>\
              <img src=\"https://cdn.example/pixel.png\">\
              <a href=\"https://ads.example/click\">go</a>\
              </body></html>";
         let out = rewrite_inline_creative_html(&settings, "https://test-publisher.com", html);
+        assert!(
+            !out.contains("https://ads.example.com:8443"),
+            "should retain the inline renderer's request-origin override: {out}"
+        );
 
         assert!(
             out.contains("https://test-publisher.com/first-party/proxy?tsurl="),
@@ -3436,7 +3454,7 @@ b{background:url(\"https://cdn.example/c.png\")}";
           <img data-srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">
         "#;
         let out = rewrite_creative_html(&settings, html);
-        assert!(out.contains("data-src=\"/first-party/proxy?tsurl="));
+        assert!(out.contains("data-src=\"https://test-publisher.com/first-party/proxy?tsurl="));
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 1);
         // relative candidate remains
         assert!(out.contains("/local/img.png 1x"));
@@ -3596,7 +3614,55 @@ b{background:url(\"https://cdn.example/c.png\")}";
         // Non-excluded should be rewritten and SHOULD have data-tsclick
         assert!(out.contains("/first-party/click?tsurl="));
         assert!(out.contains("advertiser.example.com"));
-        assert!(out.contains("data-tsclick=\"/first-party/click"));
+        assert!(out.contains("data-tsclick=\"https://test-publisher.com/first-party/click"));
+    }
+
+    #[test]
+    fn generated_first_party_urls_use_public_origin() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.public_origin = Some("https://ads.publisher.example:8443".to_string());
+
+        let proxy = build_proxy_url(&settings, "https://cdn.example.com/ad.png?campaign=1", "");
+        let click = build_click_url(&settings, "https://advertiser.example.com/landing", "");
+        for generated in [&proxy, &click] {
+            let parsed = url::Url::parse(generated).expect("should build an absolute URL");
+            assert_eq!(
+                parsed.origin().ascii_serialization(),
+                "https://ads.publisher.example:8443"
+            );
+        }
+
+        let out = rewrite_creative_html(
+            &settings,
+            r#"<body><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x" style="background:url(https://cdn.example.com/bg.png)"><a href="https://advertiser.example.com/landing">ad</a></body>"#,
+        );
+        assert!(out.contains("https://ads.publisher.example:8443/first-party/proxy?"));
+        assert!(out.contains("https://ads.publisher.example:8443/first-party/click?"));
+        assert_eq!(
+            out.matches("https://ads.publisher.example:8443/first-party/proxy?")
+                .count(),
+            3,
+            "should qualify resource, srcset, and CSS rewrites"
+        );
+        assert!(out.contains("https://ads.publisher.example:8443/static/tsjs="));
+        assert!(!out.contains("origin.test-publisher.com"));
+        assert!(!out.contains("https://test-publisher.com/first-party"));
+
+        let fragment = rewrite_creative_html(&settings, "<p>Body-less creative</p>");
+        assert_eq!(
+            fragment
+                .matches("https://ads.publisher.example:8443/static/tsjs=")
+                .count(),
+            1,
+            "should inject the absolute runtime once into a body-less creative"
+        );
+    }
+
+    #[test]
+    fn generated_first_party_urls_fall_back_to_publisher_domain() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let proxy = build_proxy_url(&settings, "https://cdn.example.com/ad.png", "");
+        assert!(proxy.starts_with("https://test-publisher.com/first-party/proxy?"));
     }
 
     // ── sanitize_creative_html tests ────────────────────────────────────────

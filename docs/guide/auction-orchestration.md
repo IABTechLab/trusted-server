@@ -161,7 +161,7 @@ sequenceDiagram
       Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     else Ordinary creative
       Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
-      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: accepted external URLs remain direct
+      Note right of Client: Default: absolute first-party proxy/click URLs<br/>rewrite_creatives=false: accepted external URLs remain direct
     end
     deactivate Client
   end
@@ -570,7 +570,7 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
           "id": "bid-1",
           "impid": "header-banner",
           "price": 2.5,
-          "adm": "<iframe src=\"/first-party/proxy?tsurl=...&tstoken=sig\">...</iframe>",
+          "adm": "<iframe src=\"https://ads.publisher.example/first-party/proxy?tsurl=...&tstoken=sig\">...</iframe>",
           "w": 728,
           "h": 90
         }
@@ -664,8 +664,9 @@ merely because their URLs remain in the output.
 
 Both settings apply to winning-bid `adm` in both the shared `POST /auction`
 response converter and the production publisher SSAT/page-bids path. The former
-emits root-relative first-party URLs and injects creative TSJS; the latter emits
-absolute first-party URLs for its foreign-origin renderer and does not inject
+emits absolute first-party URLs on `publisher.public_origin`, falling back to
+`https://{publisher.domain}`, and injects creative TSJS; the latter retains its
+request-origin override for its foreign-origin renderer and does not inject
 that bundle. HTML/CSS returned by `/first-party/proxy` continues to be
 rewritten independently. `[debug].inject_adm_for_testing` adds the diagnostic
 `debug_bid` blob and enables a testing-only direct GAM replacement; it does not
@@ -673,16 +674,16 @@ control whether processed `adm` is delivered.
 
 **Elements handled by the rewrite pass:**
 
-| Element                          | Attributes                  | Target                         |
-| -------------------------------- | --------------------------- | ------------------------------ |
-| `<img>`                          | `src`, `data-src`, `srcset` | `/first-party/proxy?tsurl=...` |
-| `<script>`                       | `src`                       | `/first-party/proxy?tsurl=...` |
-| `<link>`                         | `href`, `imagesrcset`       | `/first-party/proxy?tsurl=...` |
-| `<iframe>`                       | `src`                       | `/first-party/proxy?tsurl=...` |
-| `<video>`, `<audio>`, `<source>` | `src`                       | `/first-party/proxy?tsurl=...` |
-| `<a>`, `<area>`                  | `href`                      | `/first-party/click?tsurl=...` |
-| `<style>`, `[style]`             | `url()` references          | `/first-party/proxy?tsurl=...` |
-| SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...` |
+| Element                          | Attributes                  | Target                                                      |
+| -------------------------------- | --------------------------- | ----------------------------------------------------------- |
+| `<img>`                          | `src`, `data-src`, `srcset` | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<script>`                       | `src`                       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<link>`                         | `href`, `imagesrcset`       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<iframe>`                       | `src`                       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<video>`, `<audio>`, `<source>` | `src`                       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<a>`, `<area>`                  | `href`                      | `https://ads.publisher.example/first-party/click?tsurl=...` |
+| `<style>`, `[style]`             | `url()` references          | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
 
 The rewrite pass leaves relative URLs and non-network schemes unchanged. When
 `sanitize_creatives` is also enabled, sanitization runs first and strips

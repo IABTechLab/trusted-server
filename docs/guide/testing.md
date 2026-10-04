@@ -4,6 +4,10 @@ Trusted Server spans native and WebAssembly targets. Use the repository's
 target-specific commands; `cargo test --workspace` is not a valid gate because
 the adapters do not share one compilation target.
 
+## Testing absolute creative rewrite URLs
+
+Creative rewrite tests should configure a distinct `publisher.public_origin` and assert the parsed URL origin, not only a `/first-party/...` path substring. Keep manual root-relative proxy and click fixtures for compatibility tests, because deployed creative output is absolute on the configured public origin.
+
 ## Required gates
 
 [AGENTS.md](https://github.com/IABTechLab/trusted-server/blob/main/AGENTS.md#ci-gates)

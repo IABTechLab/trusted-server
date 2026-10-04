@@ -59,6 +59,8 @@ domain = "example.com"
 cookie_domain = ".example.com"
 # Upstream origin to proxy publisher content from. No trailing slash.
 origin_url = "https://origin.example.com"
+# Browser-facing Trusted Server origin used in rewritten creative URLs. Use HTTPS in deployments.
+public_origin = "https://ads.example.com"
 # Secret Store key for the HMAC secret used to sign first-party proxy URLs.
 proxy_secret = "publisher_proxy_secret"
 # Optional: override the outbound Host header sent to origin_url.
