@@ -49,9 +49,10 @@ input order, and local equal-price tie-breaking.
 Repository discovery started from `origin/main` at `a4e01eb55`, not either
 prior pull request discussed below. That historical discovery commit contains
 the known P1 output defects listed as prerequisites here and is not an
-acceptable compatibility golden. The 2026-09-29 review checkpoint is
-`666953a0d`; it includes the post-discovery configuration-store, EC/EID, and
-stored-request changes recorded below. It is a review checkpoint, not the final
+acceptable compatibility golden. The 2026-10-01 review checkpoint is
+`cb9452545`; it includes the post-discovery configuration-store, EC/EID,
+stored-request, origin-readthrough, first-impression, and deterministic
+context-allowlist changes recorded below. It is a review checkpoint, not the final
 implementation baseline. Implementation branching is blocked until every
 prerequisite fix lands; the recorded baseline is then the resulting
 `origin/main` commit plus captured Next.js/GTM/RSC and browser-runtime output
@@ -194,7 +195,7 @@ recreated by this work.
 
 ### Baseline Delta, Open Defect, and In-Flight Work Disposition
 
-The following items are open as of 2026-09-29. They are coordination inputs,
+The following items remain open as of 2026-10-01. They are coordination inputs,
 not design authorities. “Prerequisite” means the focused fix lands on `main`
 and this specification records a new baseline before extraction begins; the
 crate split does not absorb that bug fix into a move commit.
@@ -224,16 +225,21 @@ They are baseline behavior, not optional input from their former pull requests:
 | #879             | Preserve manifest-derived logical config-store defaults, service-scoped runtime store-name/root-key selection, Cloudflare's primary/legacy outer-binding fallback, and the rule that a runtime key override does not change the CLI push destination without an explicit `--key`.                                                       |
 | #900–#903, #1157 | Preserve request-scoped EC snapshots and generation binding, conditional EID writes and conflict follow-up, snapshot-gated pull sync, idempotent withdrawal tombstones, grouped batch-sync ordering/accounting, and removal of the legacy consent-store input. These remain neutral core behavior rather than integration capabilities. |
 | #1159            | Preserve `Disabled`/`Explicit`/legacy-inferred stored-request intent, post-override usable-impression admission, zero-impression no-transport `Skip` metadata, and response parsing bound to the exact impressions actually sent. The extraction carries the complete existing regression matrix across the prepared-exchange seam.     |
+| #1169            | Preserve the separate origin-readthrough/shareability gate, method-complete authenticated cache-purge route, and origin diagnostics. Integration requirements may only veto the baseline cache decisions.                                                                                                                               |
+| #1191            | Preserve first-impression ownership, including pending-render behavior, retained denial tokens, one fallback reservation, and no timer-based release of a Trusted Server claim before render. Its bootstrap and browser test harness move with their owners.                                                                            |
+| #1209            | Preserve deterministic serialized context allowlists and canonical hashing of config envelopes and template fingerprints.                                                                                                                                                                                                               |
+
+The landed #1209 change fixes the context allowlist and its canonical hashing
+path; the broader #1197 prerequisite remains until every other set-valued
+configuration input used by the new fingerprints has the same guarantee.
 
 Other open work is coordinated without making it architectural authority or an
 automatic prerequisite:
 
 | Item         | Coordination contract                                                                                                                                                                                          |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| #1169        | Coordinate cache-policy, key-schema, and fixture changes. Preserve its separate origin-shareability decision if it merges before the baseline freeze.                                                          |
 | #1179        | Reconcile per-document buffer work with #1208 and select one reviewed EdgeZero pin. Reuse remains optional; composition works per request.                                                                     |
 | #1193        | Rebase caching onto the immutable composition and its fingerprint; do not retain a parallel composition or fingerprint path.                                                                                   |
-| #1191        | Preserve whichever claim/lifecycle contract lands before the baseline freeze; move its bootstrap/runtime harness and shared-state shape together.                                                              |
 | #1185        | External Prebid fork-source selection remains separate. Same-checkout enforcement here covers Trusted Server-owned package and input paths; future vendor-source selection requires an explicit extension.     |
 | #1002        | Its alternate release catalog, bootstrap transport, and hard cutover do not enter this design. Independently verified renderer tests may be reused; the release lines must otherwise be reconciled explicitly. |
 | #1121, #1154 | Preserve accepted diagnostic wire behavior while moving GPT presentation and state outward; core retains only neutral diagnostic facts.                                                                        |
@@ -762,12 +768,17 @@ length, schema, or parse failures remain configuration corruption. The category
 does not define one cross-adapter HTTP status; adapters retain their baseline
 startup policy except for the named Fastly correction:
 
-| Adapter    | Unavailable source                                                                                     | Verified-data corruption                                                                        |
-| ---------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| Fastly     | Missing, unreadable, or not-yet-propagated root/chunk uses the intentional transient 503 startup path. | Existing configuration/500 path.                                                                |
-| Axum       | Existing configuration/500 startup router on every route, including `/health`.                         | Same existing configuration/500 path.                                                           |
-| Cloudflare | Existing configuration/500 startup router on every routed request.                                     | Same existing configuration/500 path.                                                           |
-| Spin       | Existing startup-error router: application routes return 503 and `/health` remains 200.                | The same baseline router/status behavior; structured logs retain the corruption classification. |
+| Adapter    | Unavailable source                                                                                                                                                                                   | Verified-data corruption                                                                        |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Fastly     | A missing or not-yet-propagated root/chunk uses the intentional transient 503 startup path. A store-open or other platform I/O failure retains the baseline 500; `GET /health` remains 200 liveness. | Application routes use the existing configuration/500 path; `GET /health` remains 200 liveness. |
+| Axum       | Existing configuration/500 startup router on every route, including `/health`.                                                                                                                       | Same existing configuration/500 path.                                                           |
+| Cloudflare | Existing configuration/500 startup router on every routed request.                                                                                                                                   | Same existing configuration/500 path.                                                           |
+| Spin       | Existing startup-error router: application routes return 503 and `/health` remains 200.                                                                                                              | The same baseline router/status behavior; structured logs retain the corruption classification. |
+
+Fastly's entry-point config-store open before app construction and pre-router
+JA4 settings read retain their existing 500 failure path; the named 503
+correction applies only after a store opens successfully and its selected
+root/chunk is absent or unpropagated. `GET /health` bypasses these reads.
 
 No error includes configuration bytes, store contents, or secret values.
 
@@ -951,8 +962,16 @@ shared configuration does more than include that sibling source root:
 
 Separate build targets emit neutral and integration artifacts directly into
 private owner-specific directories below their Cargo `$OUT_DIR` and validate
-per-target manifests before embedding them. They never clean, discover, or copy
-from one shared `dist` directory. A checked-in, dependency-free Node runner
+per-target manifests before embedding them. The GPT integration target bundles
+one bootstrap-safe entry point owned by neutral browser source before its own
+listener code in the existing tag. This source-level dependency is explicitly
+declared and allowlisted in the cross-root import gate; it is not a general
+permission to import stateful core facilities. The integration manifest hashes
+that neutral entry point and its generated ABI record, so a service change
+invalidates GPT output without making unrelated integration source part of the
+neutral manifest. No build script reads a sibling Cargo `$OUT_DIR`, and GPT
+does not maintain a second claim algorithm. The targets never clean, discover, or copy from one shared `dist`
+directory. A checked-in, dependency-free Node runner
 outside `node_modules` acquires one atomic-directory lease at the canonical
 project root and records holder PID, process-start identity, nonce, start time,
 and child process-group/session identity. One public command acquires the outer
@@ -994,13 +1013,16 @@ paths. A resolution test imports `vitest`, `prebid.js`, and one exported Prebid
 module from a sibling integration file. The neutral Rust build script watches
 and hashes only neutral source plus shared configuration that can affect its
 artifact. The integration Rust build script watches and hashes the integration
-source plus the public facade declaration and shared configuration that can
+source plus the public facade declaration, the declared neutral
+first-impression source entry point and ABI record consumed by GPT, and shared configuration that can
 affect its artifacts. The production two-root typecheck and other repository
 validation commands remain separate validation inputs; they do not make sibling
 integration bytes part of the neutral owner manifest. Clean, incremental, and
 concurrent build tests change one integration source and prove the integration
 manifest is regenerated without spuriously changing the neutral manifest or
-observing another build's partial output.
+observing another build's partial output. Changing the neutral entry point
+regenerates GPT's bootstrap artifact and its integration manifest; changing an
+unrelated integration leaves both neutral output and GPT's bootstrap unchanged.
 
 `build-prebid-external.mjs` and its npm command remain at the canonical Node
 root as build orchestration, not browser runtime. The Prebid registry, aliases,
@@ -1092,8 +1114,8 @@ reimplemented matcher. Prerequisite #1199 converts the current raw-substring
 matchers to canonical URL ownership and supplies one shared positive/negative
 corpus used against both declaration and execution paths.
 
-Schema-2 validation evaluates the complete enabled chain for every
-`js_asset_proxy` asset, carrying each replacement URL and unchanged element
+Schema-2 validation evaluates the complete enabled chain for every enabled or
+blocked `js_asset_proxy` asset, carrying each replacement URL and unchanged element
 context into all later claims. It simulates both policy subjects: script source
 and script preload. An `enabled` policy must finish at that asset's
 configured first-party `path`; a `blocked` policy must finish in `Remove`, so an
@@ -1103,11 +1125,25 @@ transition, element kind, original URL, and final outcome. Schema-1
 compatibility uses the frozen legacy chain and does not apply new schema-2
 operator-policy strictness.
 
+`disabled` retains the asset definition without registering its proxy route or
+imposing an operator script-source outcome. Its own transition is `Unchanged`;
+other enabled rewriters may still change or remove the element. Validation and
+the runtime clamp below do not turn a disabled asset into an enabled or blocked
+one. This preserves the existing three-state `JsAssetProxyMode` behavior.
+
 Runtime repeats the check, but catalog drift in a previously stored schema-2
 blob is not an all-routes startup failure. On an asset-policy mismatch it emits
 a sampled structured error containing the tables, URL, element kind, and build
-ID, then installs a terminal exact-URL guard so the explicit operator policy
-wins: enabled ends at its configured path and blocked is removed. When a newly
+ID. The rewrite engine first records the original canonical script/preload URL
+and computes the complete ordinary chain, including a terminal `Remove`. Before
+committing that outcome to the HTML processor, an engine-owned exact-URL policy
+clamp overrides it for this stored asset: enabled emits the original element
+with its source set to the configured first-party path, and blocked removes the
+element. A removed element is never expected to reach another ordinary
+rewriter. The clamp is a catalog-drift disaster-containment exception for the
+script-source policy chain; unrelated document, consent, or response
+suppression outside that chain still applies. It does not change validation or
+ordinary `Remove` semantics. When a newly
 declared integration-owned native route collides with an operator asset path,
 the asset route is kept and that integration route is dropped with the same
 diagnostic. Fixed application routes are never droppable. Native/native and
@@ -1133,6 +1169,16 @@ ownership marker, and in its unconditional cleanup validates the directory's
 non-symlink real path and marker before removing only that directory. Runtime
 repetition remains disaster containment rather than accepted steady state.
 
+For every candidate release while schema-one readers remain deployed, this
+same inventory also runs each live schema-one export through the deployed reader
+and candidate reader under identical secret resolution in a restricted
+environment. It compares normalized settings, activation, hook/browser/route
+and provider order, external labels, and error classifications, modulo only
+explicitly reviewed behavior changes. Missing exports or a difference block
+promotion. The archived fixture used at initial cutover supplements rather
+than replaces this per-release, per-environment differential gate; no secret
+value or decoded envelope is logged.
+
 `ts config migrate` evaluates the complete schema-2 chain. Because its
 deterministic output order may make reordering unreachable, it comments out a
 mismatched asset table with a preservation/report block instead of emitting a
@@ -1152,11 +1198,24 @@ otherwise source-visible route collision to startup.
 
 The same router begins with fixed `ReservedRouteClaim` values. Core owns the
 common application-route inventory—discovery, auction, page-bids and its legacy
-alias, first-party routes, and shared admin/API namespaces—and each adapter adds
-its target-specific fixed routes and dynamic namespaces. Target-neutral
-validation checks the common set; `validate_for_targets` adds the selected
-adapter set; runtime uses the identical combined helper before inserting
-integration claims. A configured asset or integration claim colliding with a
+alias, first-party routes, `POST /verify-signature`, the method-complete
+`/_ts/admin/cache/purge` claim, and only admin routes actually registered by
+every adapter. Fastly alone claims `POST /_ts/api/v1/batch-sync` and
+`GET`/`OPTIONS /_ts/api/v1/identify`; those paths retain their existing
+publisher fallthrough on adapters without the routes. Each adapter adds its
+target-specific fixed routes and dynamic namespaces, including `/health` only
+where that adapter actually registers it. Claims come from the same typed route declarations that register
+fixed handlers; an adapter that cannot use those declarations directly must
+provide a route-table parity gate comparing its actual registrations with the
+claims by HTTP method, canonical path/pattern, catch-all precedence, and
+method fallthrough. A separately maintained list of presumed routes is not a
+completeness proof. In particular, every method that can reach publisher
+fallback at the cache-purge path must stay intercepted so an unsupported method
+cannot forward authenticated admin credentials to the publisher origin; methods
+rejected by the adapter before fallback are outside this claim. Target-neutral validation checks the
+common set; `validate_for_targets` adds the selected adapter set; runtime uses
+the identical combined helper before inserting integration claims. A
+configured asset or integration claim colliding with a
 reserved route is always a hard source/startup error, including under catalog
 drift. The asset-wins exception applies only to a newly added
 integration-owned route competing with an already stored operator asset.
@@ -1879,8 +1938,9 @@ comment-preserving `toml_edit` transformation, never a push. It:
 
 - rejects mixed old/new inventories and operates on one complete legacy source;
 - detects every legacy integration table unknown to the static catalog before
-  transforming known parents. Dry-run prints each unknown table as an exact
-  commented preservation block plus a manual-decision diagnostic and exits 1.
+  transforming known parents. Dry-run reports each unknown table's ID and
+  source location, but never prints its values or an exact preservation block
+  to stdout or logs; the source file remains untouched, and the command exits 1.
   A normal run refuses to write unless the operator explicitly names each ID
   with repeatable `--discard-unknown-integration <id>`; the report records that
   irreversible discard without printing values. Unknown data is never silently
@@ -1929,15 +1989,25 @@ gpt_diagnostics, openrtb, adserver_mock`, excluding promoted entries and
   scan and reports that it did so. Ordinary validate, diff, and push fail any
   app-prefixed variable that still targets a retired path;
 - preserves file permissions and uses the existing permission-preserving atomic
-  writer.
+  writer. Immediately before its atomic replacement, it compares the current
+  file's exact bytes and file identity with the bytes and identity read for
+  migration. An edit, replacement, or disappearance observed while the operator
+  was reviewing the prompt aborts without writing and asks the operator to
+  rerun migration. This is optimistic conflict detection, not an atomic
+  compare-and-swap against unrelated editors: an external edit in the narrow
+  interval after the final comparison can still race with rename. The command
+  reports that limitation before an in-place write; accepting a prompt does
+  not waive the final comparison.
 
 An interactive write prints all old/new ordinals and reordered pairs and
 prompts unless `--accept-reordering` was supplied. That flag covers any changed
 comparable provider, hook, or browser phase caused by grouping or parent
 promotion, not only provider-pair changes. A non-interactive write refuses such
 a result without the flag. It does not waive unknown-integration discard, which
-requires the per-ID option above. Dry-run never prompts and never writes: it
-exits 0 for a valid candidate needing no unaccepted decision, 1 when reorder
+requires the per-ID option above. Dry-run never prompts and never writes. It
+keeps the entire candidate in memory and emits only redacted IDs, locations,
+ordinals, and decisions, never source, transformed configuration, or overlay
+values. It exits 0 for a valid candidate needing no unaccepted decision, 1 when reorder
 acceptance, unknown-table disposition, or another reported manual edit is still
 required, and at least 2 for invalid input or tool failure. A whole-chain asset
 mismatch is one such manual edit: migration comments out the asset table and
@@ -1985,7 +2055,18 @@ remains, and providers enter the independent flat sequence in global lexical
 local-ID order. New schema-2 strictness is never applied retroactively to an
 unchanged schema-one blob. The application-schema marker remains at the data
 root, and every rollback binary is proven to reject an unknown root marker.
-New CLI writes schema 2 only.
+New CLI writes schema 2 only. `config push` resolves the selected adapter and
+deployment destination before any write and checks a schema-2 activation
+capability for that exact destination. Fastly requires the verified new
+service-version/store/root-key tuple described below. Cloudflare KV push is
+rejected because the Worker reads a version-bound binding, not that KV entry;
+schema 2 reaches Cloudflare only through the verified Worker-version binding
+cutover. Remote Spin push is rejected while its export/restore and versioned
+selection drill is blocked; the gate opens only for a deployment proven to
+select and restore the named versioned key/store atomically with its component.
+The gate cannot be bypassed by a generic force flag. Validate, diff, and local
+Axum migration remain available without a remote write. Tests assert that
+rejected pushes leave the selected store or binding unchanged.
 
 Rollout is adapter-specific:
 
@@ -1996,24 +2077,68 @@ Rollout is adapter-specific:
 | Spin       | Use a named versioned KV key/store only when the deployment platform can export, restore, and select it atomically with the component version.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | The default remote Spin path is blocked from schema-2 rollout until a concrete control-plane export/restore drill exists; liveness alone is not evidence because the startup-error router stays healthy.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Axum       | Use the migrated local file/environment as a development-only cutover.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Retain the archived schema-one file and restart the matching binary/config pair.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
-Before rollout, the candidate dual reader decodes an archived production
-schema-one envelope and compares normalized settings, plan, integration and
-provider order, and every `ExternalProviderLabel` with the old binary's output.
+The Cloudflare deployment producer is a checked-in
+`ts config export-binding --adapter cloudflare --output <protected-file>`
+command. It uses the same validated source, environment overlay, schema-two
+serializer, and canonical `BlobEnvelope` writer as `config push`, then writes
+the exact JSON value for `TRUSTED_SERVER_CONFIG` with the manifest-selected
+`trusted_server_config` outer property and the envelope as its string value.
+It emits no binding bytes to stdout or logs and uses a restrictive, atomic
+output file; a pre-existing output is not overwritten. The deployment control
+plane binds those exact bytes to a new Worker version, compares the bound
+version and envelope hash with the protected export, and requires a
+settings-dependent route plus authenticated schema/digest observation before
+activation. An unavailable version-bound readback or mismatch blocks cutover.
+The reader still accepts the existing `app_config` legacy and exact-empty-
+primary fallback; the new producer does not create new legacy-property writes.
+KV push alone never counts as a Cloudflare cutover.
+
+Before rollout, inventory and export the exact verified schema-one envelope
+from every live environment. Under the same secret-resolution context, the
+old and candidate readers compare normalized settings, activation, compiled
+plan, hook/browser/route and provider order, every `ExternalProviderLabel`,
+and error classification. A missing export or unexplained difference blocks
+dual-reader promotion. An archived production envelope remains an additional
+regression fixture.
 The common release order is: freeze writes; archive and verify schema one;
 deploy the dual-reader code against schema one; verify a settings-dependent
 route and explicitly enabled rollout observation reporting application schema,
 artifact ID, and non-secret composition digest; run
 `ts config migrate --dry-run`; cut over through the adapter-specific mechanism;
 then verify registry order, provider order, browser asset hashes, external
-provider IDs, and auction behavior before releasing the freeze. Existing
+provider IDs, and auction behavior. Fastly retains the freeze unless the
+version-bound paired-edit protocol below is available. Cloudflare retains the write freeze
+for its entire rollback window: if an operator-semantic edit is needed, the
+control plane creates and behavior-compares new schema-one and schema-two
+Worker versions with their respective bindings, verifies both, and only then
+activates the pair or explicitly ends the old rollback generation. It never
+rolls back to a binding older than the latest accepted edit. Blocked Spin
+remains frozen from schema-2 writes. Existing
 authenticated diagnostics may expose the same evidence, but no new public
 status route is introduced.
 
-For Fastly, after that initial freeze, the rollback window uses the dual-
-generation write policy in the table rather than leaving the old generation
-stale. The archived legacy source and schema-one writer remain available solely
-for this runbook. Each paired write is decoded and behavior-compared before
-activation, including kill switches. Comparison is modulo the documented schema
+For Fastly, the initial freeze remains the default throughout the rollback
+window. The table's paired-generation write policy is permitted only through
+fresh, immutable version-bound roots in separate old/new stores; it never
+updates either root selected by the currently accepted active/rollback pair in
+place. The archived legacy source and schema-one writer remain available solely
+for this runbook. For an operator-semantic edit, the control plane holds one
+edit/rollback lock, stages and verifies schema-one and schema-two roots, creates
+the matching old-reader rollback and dual-reader active service versions, and
+decodes and behavior-compares both candidates, including kill switches. It
+verifies each candidate's service-version/store/root-key linkage and
+representative POP-visible settings response and authenticated observation
+before allowing the new active version or its matched rollback version to be
+selected. If the platform cannot probe both candidates before selection, it
+keeps semantic writes frozen rather than claiming paired activation. For an
+edit, the newly verified old-reader version becomes the only permitted
+rollback target; the previously accepted rollback version is stale and cannot
+be selected. The control plane then selects only the matched new active version, waits for
+representative POP convergence, and marks the pair accepted together. During
+staging or partial propagation it prohibits rollback to either unverified or
+older-intent version; a failure leaves or restores the last accepted pair,
+reconciles any staged orphan, and keeps writes frozen until verification. No
+schema-one-only or schema-two-only edit is accepted. Comparison is modulo the documented schema
 differences: schema 1 retains local external labels and frozen lexical provider
 priority, while schema 2 uses qualified labels and configuration order. Shared
 intent such as enablement, provider membership, endpoints, timeouts, and
@@ -2063,11 +2188,15 @@ the declared response scope. This is a
 processing contract, not a general policy, permission, or vendor-state system.
 
 Registry requirements are an additional monotonic veto, never an alternate
-cache authorization path. Shared-template eligibility remains the conjunction
-of all current method, request-cache, diagnostics, key-cookie, bypass-cookie,
-unlisted-cookie, cookie-independent-origin, assembly-mode, and origin-response
-checks plus the registry requirement. The same combined request decision still
-governs both warm lookup and cold-store authorization. A registry hook can make
+cache authorization path. The request-side shared-template/readthrough gate
+remains the conjunction of the current method, request-cache, diagnostics,
+key-cookie, bypass-cookie, unlisted-cookie, cookie-independent-origin, and
+assembly-mode checks plus the registry requirement. It governs warm lookup
+and is retained for cold-store authorization. On a miss, origin-response
+status, headers, and cacheability additionally gate storage; after processing,
+the completed transformation, seam, and nonce requirements can veto storage
+again. Neither response-derived gate is retroactively applied to a warm lookup.
+A registry hook can make
 an otherwise shareable request private or origin-bound; it cannot make a
 request shareable when any existing cookie or cache gate rejected it.
 
@@ -2121,15 +2250,22 @@ the integrations-owned wrapper; request extensions make a repeated neutral
 preparation a no-op where an adapter boundary can be re-entered. Core invokes
 finalization on the existing response path. GPT diagnostics may request the
 fixed synchronous post-unified asset phase
-and all-response privacy; ordinary head injectors cannot approximate that
-position. The current auction-correlation decision is deployment-scoped, not
+and all-response privacy; an active diagnostics request also sets origin
+freshness/sharing to bypass both shared templates and origin readthrough before
+the early reader-origin decision whenever the decision requires private/no-store,
+including activation, cookie clearing, and malformed or duplicate directive
+cleanup. The veto is independent of the response privacy axis and retains
+#1169's origin-shareability telemetry. Ordinary head
+injectors cannot approximate that position. The current auction-correlation decision is deployment-scoped, not
 request-activation-scoped, and becomes a neutral enabled-capability query so
 SPA and non-navigation auctions retain correlation without a concrete GPT
 import.
 
 ## Browser Composition and APS Renderer
 
-`trusted-server-js` builds only the neutral core IIFE. Before extraction, the
+`trusted-server-js` builds only the neutral core IIFE and owns the
+bootstrap-safe first-impression source entry point declared as a GPT build
+input; it does not emit a second standalone bootstrap tag. Before extraction, the
 implementation audits every production value import from an integration or the
 fixed `creative` prelude into today's `core/` and `shared/` trees. Each import
 is classified rather than copied blindly:
@@ -2140,36 +2276,81 @@ is classified rather than copied blindly:
   selected state first. The initial surface
   includes logging, context-provider registration and context collection,
   auction request construction and normalized response parsing, queue
-  installation, slot lookup and rendering helpers, first-impression state, DOM
-  insertion-handler registration, and renderer registration/dispatch/lifecycle
-  operations.
+  installation, slot lookup and rendering helpers, an opaque first-impression
+  service, DOM insertion-handler registration, and renderer
+  registration/dispatch/lifecycle operations.
 - Pure stateless helpers may move to an integration-owned shared source module
   and be bundled into the consuming IIFE. They must not close over or initialize
   browser-core state.
 - Types are imported from declaration-only entry points. There are no runtime
   relative imports across the two crate source roots.
 
+The first-impression service owns the physical-element/generation claim map and
+all transitions. Its facade methods cover element resolution and read-only
+ownership/admission lookup;
+Trusted Server claim and pre-request release; publisher auction registration,
+pending-delivery transition, delivery consumption, and release; GPT request and
+render observation; one fallback reservation; retry delay; the lease duration;
+and navigation-generation advance with claim retirement. GPT stores a
+Trusted-Server targeting snapshot through a claim handle; Prebid presents the
+generation token captured when its callback was scheduled, plus an auction
+handle when one exists, and asks the service for a restore decision
+and snapshot only while the same physical element/generation has a
+Trusted-Server claim awaiting render. A by-element-only lookup cannot authorize
+a late callback from an older navigation. Neither caller
+reads or mutates claim owner, phase, or targeting fields. GPT may retain its
+separate navigation scheduler counter, but it advances the service generation
+and retires old claims before new-page admissions; a late old-generation
+Prebid callback cannot restore targeting or deliver. The service returns
+opaque claim/auction handles or admission decisions, not mutable
+`FirstImpressionState` or `FirstImpressionSlotClaim` objects. GPT and Prebid
+call this one service. The contract retains #1191's
+exact-element/generation binding, bounded overlapping publisher auctions,
+retained suppression/denial tokens, pending-render diagnostic without a timer
+unlock, and one fallback reservation after an abandoned publisher lease.
+Behavioral browser tests cover every transition, targeting restoration before
+render but not after render, SPA retirement, and a late overlapping callback
+after fallback or navigation. No integration duplicates the claim algorithm.
+
 Runtime calls use a stateless accessor mapped by the integration build to the
-already-installed namespace. Facade version 1 is exact, not a compatible range;
-each install callback resolves `getRuntimeV1()` lazily when it runs instead of
-capturing an eager imported object. A mismatch logs one diagnostic, skips that
-integration, and leaves its installed/shim flag unset so a failed Prebid load
-cannot look successful. The integration build fails on any undeclared
+already-installed namespace. Facade version 1 is exact, not a compatible range.
+Each post-core integration IIFE has a generated outer guard that reads the installed
+facade's version and ABI hash before executing any module initializer, global
+assignment, listener, timer, DOM operation, or inner IIFE body. A mismatch logs
+one diagnostic and returns from the outer IIFE, leaving all installed/shim flags
+unset and no integration side effects; this includes Prebid's current
+module-scope `window.pbjs` initialization. Install callbacks and later event
+callbacks resolve `getRuntimeV1()` again when they run rather than retaining an
+eager imported runtime object. The integration build fails on any undeclared
 cross-root value import. This covers current imports such as Permutive context
 registration, Prebid auction helpers, Testlight queue installation, GPT slot
 resolution, and the shared script/beacon guards; it is not limited to the APS
 renderer examples.
 
-A published facade version is immutable. The build derives an ABI record set
-from its value-level methods, canonical argument/result wire shapes, namespace
-members, and adoption markers. Records use a fixed kind byte plus the same
+A published facade version is immutable. One checked-in, versioned facade IDL
+is the authority for every public value-level member and every named type
+reachable from its arguments, results, callbacks, or adoption markers. It
+generates the TypeScript declaration consumed by both browser crates and the
+ABI record set; the implementation typechecks against that declaration, and an
+artifact gate enumerates actual public value members so undeclared extras fail.
+The canonical type grammar admits explicit primitive/literal types, ordered
+tuples, arrays, records and objects with UTF-8-sorted field names and explicit
+optional/nullable flags, unions sorted by their canonical member encoding,
+callback and Promise signatures, named opaque handles, and named live DOM
+references such as `HTMLElement`.
+Overloads are distinct records with explicit ordinal and parameter order;
+aliases expand through the reachable named-type graph with cycle references by
+stable name. Unsupported TypeScript constructs fail generation instead of
+being stringified ad hoc. Records cover namespace members, the opaque
+first-impression operations, and adoption markers; only types unreachable from
+the facade may change without a new version. Records use a fixed kind byte plus
+the same
 `U32_BE(UTF8_LEN) || UTF8` framing for member path and canonical signature, are
 sorted by kind and path, and hash as
 `SHA-256("ts-browser-runtime-abi-records-v1\0" || U32_BE(count) || records)`.
 The `records-v1` suffix versions the manifest encoding independently of the
-facade accessor number. Type-only
-additions that erase from the value-level surface do not enter the records unless
-they alter a serialized runtime shape.
+facade accessor number. A change in any reachable type or value member changes
+the record bytes even when JavaScript erases that type at runtime.
 
 Each released numeric accessor has checked-in exact record bytes and a derived
 hash under a versioned ABI snapshot directory. A merge-base-aware CI guard
@@ -2182,16 +2363,41 @@ trusting stored text, and embeds the version/hash pair in browser core and every
 integration artifact. Runtime rejects a stale same-version/different-hash asset
 exactly as it rejects a numeric mismatch.
 
-The GPT bootstrap still runs before the unified bundle, creates or adopts
-`window.tsjs`, and may install the first-impression state and GPT lifecycle
-listeners. The core IIFE must adopt that exact object identity, preserve
-pre-bundle claims and listener markers, validate the runtime-facade version, and
-initialize only missing registries. The legacy bootstrap state has no version,
-so adoption shape-validates it. GPT may intentionally replace legacy
+The pre-core GPT bootstrap is the deliberate exception to the post-core guard:
+it cannot read a facade that has not yet been installed. It stamps its neutral
+first-impression service with the expected facade version and ABI hash before
+installing listeners. Core checks that marker before adoption; on mismatch it
+does not create a competing service or reinterpret pre-core claims. It marks
+the service unavailable and makes new-core, immediate-GPT, and deferred-Prebid
+admissions fail closed with a diagnostic. Bootstrap callbacks or listeners
+already installed by the mismatched artifact may continue; this is not a
+document-wide fail-closed guarantee. The GPT bootstrap still runs before the unified bundle and creates or adopts
+`window.tsjs`. The neutral browser crate owns a bootstrap-safe
+first-impression service fragment generated from the same service source and
+facade ABI as core. The integration build places that fragment before GPT's
+listener code in the existing synchronous bootstrap tag; this is the one
+declared cross-root build import, not a runtime import or a second script tag. GPT
+bootstrap installs the service once, and its pre-core lifecycle listeners call
+that service rather than closing over a separate claim implementation. Core
+adopts the exact compatible service instance and `window.tsjs` identity,
+preserves pre-bundle claims and listener markers, validates the runtime-facade
+version, and initializes only missing registries. An unmarked pre-upgrade
+bootstrap may already have queued callbacks or listeners closing over its own
+claim algorithm. Core therefore preserves the `window.tsjs` object for
+unrelated APIs, marks the neutral first-impression service unavailable, and
+makes new-core, immediate-GPT, and deferred-Prebid admissions fail closed
+instead of attempting to migrate those live closures or install a second claim
+engine. Already-installed legacy callbacks may still run; this mixed-artifact
+document is diagnosed and is not claimed to have safe first-impression
+ownership. GPT may intentionally replace legacy
 `adInit`/`scheduleInitialAdInit` functions as the facade is installed; object and
 first-impression state identity are preserved, not function identity. Immediate
 GPT and deferred Prebid likewise adopt the facade and keep listener installation
-idempotent. Integration bundles consume it through an external runtime shim and
+idempotent. A Prebid installation marker includes the facade version and ABI
+hash; an earlier unversioned or mismatched shim marker is diagnosed and cannot
+count as a current installation. Its prior side effects cannot be undone, so
+the new shim fails closed without double-installing patches or setting a current
+marker. Integration bundles consume the facade through an external runtime shim and
 type-only browser-core declarations; their bundler must not inline the stateful
 registry implementation. Artifact tests load bootstrap, core, immediate GPT,
 synchronous GPT diagnostics, the neutral finalizer, and deferred Prebid in
@@ -2212,10 +2418,18 @@ Browser core installs `tsjs.que` in buffering mode and immediately arms one
 idempotent microtask failure fallback. Composition appends a marker after the
 complete sequence of immediate integration IIFEs in the unified asset. When
 reached, that marker says unified evaluation completed, so the earlier microtask
-becomes a no-op. Composition emits a dedicated neutral inline finalizer after
-the unified immediate asset and every fixed synchronous post-unified asset,
-including GPT diagnostics when active. The finalizer invokes the same drain
-when evaluation reaches it, after Permutive, all other immediate registrations,
+becomes a no-op. Composition emits a dedicated neutral, same-origin external
+classic-script finalizer after the unified immediate asset and every fixed
+synchronous post-unified asset, including GPT diagnostics when active. It uses
+the same trusted tag-attribute and CSP authorization path as the unified asset,
+has neither `async` nor `defer`, and is served by the existing static-asset
+handler at `/static/tsjs=tsjs-finalizer.min.js?v=<content-hash>` from bytes
+embedded by the neutral browser crate. This is a reserved fixed browser asset,
+not an integration module ID; stale query hashes follow the existing static
+route's non-immutable current-byte behavior. Its exact bytes/hash
+enter `BrowserDocumentAssets` and the document fingerprint as a fixed external
+asset. The finalizer invokes the same drain when evaluation reaches it, after
+Permutive, all other immediate registrations,
 and diagnostics setup are complete. It is not concatenated into the unified
 bundle. The drain executes opaque callbacks FIFO, including calls forwarded by
 Testlight or pushed while draining, isolates a throwing callback so later
@@ -2267,7 +2481,10 @@ containing:
 - the exact ordered byte parts and concatenated hash for the unified asset;
 - the ordered deferred and permitted standalone assets with their bytes and
   hashes;
-- the fixed creative prelude and neutral queue-finalizer bytes;
+- the fixed creative prelude and neutral external queue-finalizer bytes and hash;
+- the configured managed-external Prebid bundle tag, including its emitted
+  source URL and every effective attribute, even when its remote bytes have no
+  configured hash;
 - a deterministic document fingerprint covering injected asset IDs, hashes,
   order, attributes, and the exact static or configuration-rendered inline
   bytes.
@@ -2283,19 +2500,29 @@ external     = U8(kind) || U32_BE(emission_ordinal) || text(asset_id)
              || attributes || U8(0) || raw_sha256_32
 inline       = U8(kind) || U32_BE(emission_ordinal) || text(asset_id)
              || attributes || U8(1) || bytes(exact_inline_bytes)
+managed_external = U8(6) || U32_BE(emission_ordinal) || text(asset_id)
+             || attributes || U8(2) || U8(has_configured_sha256)
+             || (raw_sha256_32 if has_configured_sha256 else empty)
 document_fingerprint = SHA-256(
   UTF8("ts-browser-document-v1\0") || U32_BE(asset_count)
-  || external/inline records in emission order
+  || external/inline/managed_external records in emission order
 )
 ```
 
-`kind` is `1` for unified, `2` for deferred, `3` for standalone, and `4` for
-inline; `0` is reserved. Ordinals are zero-based positions in actual document
+`kind` is `1` for unified, `2` for deferred, `3` for standalone, `4` for
+inline, `5` for the neutral external finalizer, and `6` for a managed-external
+script whose bytes are fetched rather than embedded; `0` is reserved. Ordinals
+are zero-based positions in actual document
 emission order; records are never sorted. The trusted attribute-name constructor
 accepts ASCII HTML attribute names only. Names are ASCII-lowercased for encoding,
 and duplicate normalized names are rejected before hashing except equal
 duplicates collapsed as described below. External payloads use the raw
-validated 32-byte content hash; inline payloads include the exact bytes. Counts
+validated 32-byte content hash; inline payloads include the exact bytes. The
+managed-external record includes the exact emitted `src`, `defer`, `integrity`,
+`crossorigin`, and any other effective tag attributes in `attributes`; its
+optional configured SHA-256 has an explicit presence bit. Without that SHA,
+the fingerprint identifies the emitted tag and configuration, not the remote
+response bytes. Counts
 and lengths make empty values and field boundaries unambiguous. The lowercase
 hexadecimal representation is display only; composition embeds the raw 32-byte
 digest.
@@ -2350,7 +2577,7 @@ secret itself. Semantically set-valued fields serialize in deterministic order
 before EdgeZero hashes them. When `trusted_server_schema` is absent, the
 application schema contribution is exactly `1`.
 
-`build_id` is an artifact-specific deterministic build-time digest. Prerequisite
+`build_id` is an artifact-specific deterministic digest of build-time inputs. Prerequisite
 #1198 adds the canonical generator in core build support, initially invoked from
 `trusted-server-core/build.rs`; extraction reuses that implementation from each
 output-affecting crate/build context rather than cloning its rules. Each context
@@ -2368,7 +2595,9 @@ build_id     = LOWER_HEX(SHA-256(
 ```
 
 Each component-ID record has a unique stable component label and the raw
-32-byte component digest as its value; duplicate labels fail the build.
+32-byte component digest as its value. Traversal deduplicates an identical
+label/digest pair reached through two dependencies; a label with differing
+digests fails composition.
 
 File labels are normalized workspace-relative UTF-8 paths. The deployed
 component set is every runtime workspace crate reachable from the selected
@@ -2376,9 +2605,20 @@ adapter, including that `trusted-server-adapter-*` crate,
 `trusted-server-integrations`, `trusted-server-core`,
 `trusted-server-openrtb`, and both browser embedding crates where reachable.
 External registry/git dependency source is represented by `Cargo.lock`; local
-workspace dependency source receives its own component. Each selected adapter
-invokes the canonical generator from its own build context and composes the
-reachable labeled component digests; adapters do not reuse a core-only constant
+workspace dependency source receives its own component. Each output-affecting
+workspace crate's build script invokes the canonical generator in its own build
+context and emits a public raw 32-byte component constant plus its stable label.
+Core build support emits the root-workspace component. Each runtime workspace
+crate exposes a small component-record traversal that includes its own record
+and forwards its direct runtime workspace dependencies' records. The adapter
+combines those records once after static linking, deduplicates identical
+transitive records, and supplies the resulting ID to composition and template
+keys. This is a deterministic ID of compiled build-time digests, even though
+the final hash is assembled at startup. No adapter build script tries to read a
+dependency's `$OUT_DIR` or infer that dependency's Cargo feature environment.
+A target-matched `cargo metadata` gate compares the adapter's resolved runtime
+workspace dependency graph with the labels actually assembled; a missing,
+extra, or conflicting record fails. Adapters do not reuse a core-only constant
 as the deployed artifact ID.
 
 Each component inventory covers its Rust source, build script, manifest,
@@ -2392,6 +2632,14 @@ inventory helper; adding an output-affecting `rerun-if-changed` input without
 hashing it fails a gate. Each crate's own build context records `TARGET`,
 `HOST`, `PROFILE`, `OPT_LEVEL`, `DEBUG`, and sorted relevant `CARGO_CFG_*` and
 `CARGO_FEATURE_*` values; no crate infers another crate's effective features.
+It also records the actual `RUSTC` compiler identity (`rustc -vV` plus binary
+identity), effective `CARGO_ENCODED_RUSTFLAGS` including target features and
+codegen flags, and any effective profile or target-specific override not
+already represented by the recorded values. Release builds with a nonempty
+`RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` must fingerprint the wrapper
+executable and version as an explicit component input or fail; unknown
+output-affecting compiler inputs fail closed. The checked-in toolchain file
+alone is not a substitute for the compiler and invocation actually used.
 `.git`, `node_modules`, `dist`, `target`, every Cargo `$OUT_DIR`, and generated
 manifests/digests are excluded. Exact built browser bytes remain covered by
 `BrowserDocumentAssets`, so generated artifacts do not enter this source digest
@@ -2411,12 +2659,36 @@ Normal request execution never forces it merely for logging. An adapter that
 retains compositions may keep a process-local `CompositionObservationCache`,
 keyed only by application schema, envelope hash, and build ID, with at most 32
 LRU entries; this is an opportunistic deduplicator, not a global once guarantee.
-Explicitly enabled debug or sampled rollout observation may force and log the
-digest, ordered active integration IDs, and ordered browser asset IDs/hashes;
-a fresh instance may emit again, while an adapter constructing state per request
-does not enable this on ordinary traffic. Fastly observation also names the
-resolved platform store and root key. The rollout probe compares the observed
-artifact/schema/digest to expected deployment values. Runtime provider-order
+During rollout, the control plane supplies an adapter-specific, version-scoped
+`RolloutObservationKey` and a bounded expiry outside operator TOML. For each
+settings-dependent probe it sends a fresh 128-bit hexadecimal probe ID and
+`HMAC-SHA256(key, probe_id)` in a dedicated observation request header. The
+adapter validates the tag in constant time, consumes the header before any
+origin forwarding or cache-key construction, and only then forces and emits
+the observation without sampling or instance-level deduplication. An absent,
+expired, or invalid tag does not trigger observation; the header is still
+stripped. The event includes the non-secret probe ID, adapter/version, platform
+location, selected outer binding property where applicable, verified envelope
+SHA-256, application schema, build ID, composition digest, ordered active
+integration IDs, and ordered browser asset IDs/hashes; Fastly also records the
+resolved platform store and root key. It contains no key, tag, config bytes, or
+secret values. For every generation/version, the control plane preselects a
+settings-dependent request and expected response predicate derived from that
+generation's intended configuration. When old and new configurations are
+deliberately behavior-equivalent, the authenticated version/binding/envelope
+evidence distinguishes them; the HTTP response need not differ artificially.
+For a paired semantic edit, the predicate must exercise the edited behavior.
+The gate matches each unique probe ID and location to
+both the expected HTTP response and at least one expected
+binding/envelope/artifact/schema/digest event from that request, rejects
+conflicting responses or events, and fails if any representative probe/POP has
+none. A generic 2xx or `/health` is never sufficient. The rollback version is
+probed before it is declared usable. A platform unable to supply a version-scoped key and
+expiry cannot activate schema 2 until an equivalent private control exists.
+Outside authenticated rollout probes, optional debug or sampled observations
+may reuse the event schema, but ordinary requests do not force the digest. A
+fresh instance may emit again for a new probe; the opportunistic
+`CompositionObservationCache` applies only outside this mode. Runtime provider-order
 evidence comes from existing ordered `/auction`
 `ext.orchestrator.provider_details`. This makes rollout verification executable
 without a new endpoint. The composition digest remains distinct from the exact
@@ -2661,7 +2933,7 @@ provider-ID order to qualified configuration order. It preserves:
 - Current CLI ad-template diagnostics, audit/generator recovery behavior, and
   corrected prerequisite #1202 Prebid bundle mutation behavior.
 - The route and behavioral parity of Fastly, Axum, Cloudflare, and Spin, except
-  for the explicitly listed Fastly missing-chunk error-class correction.
+  for the explicitly listed Fastly missing-root/chunk classification correction.
 
 The intentional compatibility breaks are:
 
@@ -2782,8 +3054,8 @@ Milestone exit criteria are independent:
   are accepted; fixed integration-builder order, lexical provider priority,
   implicit APS activation, operator source semantics, cache policy, adapter behavior, and
   Fastly settings-only failure paths remain unchanged except that a missing or
-  not-yet-propagated config chunk becomes the documented transient startup/503
-  outcome instead of configuration/500. The EdgeZero typed hook,
+  not-yet-propagated config root/chunk follows the documented transient
+  startup/503 outcome instead of configuration/500. The EdgeZero typed hook,
   `config validate --adapter`, and selected-target diff/push validation are the
   explicit milestone-one CLI deltas. The browser-state
   corrections listed in the compatibility contract and one-time artifact/hash
@@ -3031,7 +3303,8 @@ to preserve `cfg(test)` imports.
   provider/hook/browser reordering, unknown legacy integration tables, and
   manual edits; non-interactive refusal without `--accept-reordering`; explicit
   per-ID unknown discard; and interactive confirmation. Goldens cover the
-  shipped example, an unknown table preservation block, parent promotion that
+  shipped example, a redacted unknown-table report with a sentinel secret that
+  never appears in stdout, stderr, or logs, parent promotion that
   changes hook order without changing provider order, and disabled Prebid with
   a staged URL and active legacy Prebid Server provider.
 - Ordering diagnostics cover provider details, ts-debug, telemetry `is_win`,
@@ -3055,15 +3328,33 @@ to preserve `cfg(test)` imports.
 - Route tables and duplicate detection retain behavior.
 - Common and target-specific reserved-route claims are inserted before
   integration claims. Asset and integration collisions with discovery, admin,
-  auction, page-bids, first-party, dynamic TSJS, and adapter-only routes fail
-  source validation and startup on every affected adapter; the catalog-drift
-  asset-wins fallback is tested only against a newly added integration route.
+  auction, page-bids, `POST /verify-signature`, first-party, dynamic TSJS,
+  `/health` only on adapters that register it, and adapter-only routes fail
+  source validation and startup on every affected adapter. The common claims
+  include canonical admin routes and denied legacy `/admin/keys/*` aliases;
+  Fastly-only claims include tester routes and the pre-router JA4 probe as well
+  as batch-sync and identify. Cloudflare `/health` remains publisher fallback.
+  A route-manifest parity gate proves actual fixed
+  registrations and reserved claims have the same method, canonical pattern,
+  precedence, and fallthrough behavior, including prefix-dispatched TSJS and
+  root/catch-all behavior; all seven methods that can reach publisher fallback
+  at the authenticated cache-purge path remain intercepted. Fastly's batch-sync and identify methods
+  are reserved only for Fastly, and their existing fallthrough on Axum,
+  Cloudflare, and Spin remains observable. The catalog-drift asset-wins fallback
+  is tested only against a newly added integration route.
 - A schema-2 blob accepted by catalog N is exercised under candidate N+1 after
   N+1 widens both a script-source claim and a native route into conflicts. The
   runtime remains available, enforces the exact operator asset policy, drops
   only the colliding integration-owned route, and emits sampled diagnostics
   naming the tables, URL/path, and build ID; the candidate-versus-live-config
   promotion gate rejects that release.
+- Catalog-drift asset tests cover both script sources and preloads with an
+  earlier `Remove`, `Replace` then `Remove`, and an unchanged element. The
+  engine-boundary clamp restores an enabled asset to its exact first-party path
+  or removes a blocked asset before committing the ordinary chain's outcome;
+  normal chains still stop at `Remove`. A disabled asset registers no proxy
+  route, imposes no final-outcome clamp, and does not prevent a later native
+  rewriter from changing the element.
 - The checked-in stored-catalog gate proves deployment-inventory/export
   bijection, accepts verified schema-one and schema-two envelopes without
   resolving secret values, rejects missing/tampered exports and degraded
@@ -3071,6 +3362,10 @@ to preserve `cfg(test)` imports.
   deletes its `--exports` input. Release-pipeline tests create a marked directory
   under a controlled temporary root, clean it on success or failure, and refuse
   cleanup for a mismatched marker, outside-root path, or symlink substitution.
+  Every candidate release also differentially decodes every live schema-one
+  export with the deployed and candidate readers under identical secret
+  resolution and rejects unexplained activation, ordering, label, or error
+  changes; one archived fixture is not a substitute for the live inventory.
 - DataDome preserves unconditional HTML origin-representation handling without
   selecting buffering, and scopes privacy to body-carrying synthesized HTML.
 - GPT diagnostics preparation, bootstrap injection, finalization, and caching
@@ -3121,7 +3416,12 @@ to preserve `cfg(test)` imports.
 - Request-processing requirements preserve DataDome origin bypass, full-body
   representation, streaming/buffering selection, scoped private caching, and
   origin-readthrough vetoes, and prevent request-private GPT diagnostics state
-  from entering ESI templates.
+  from entering ESI templates. Every GPT-diagnostics decision requiring
+  private/no-store independently vetoes shared-template and origin-readthrough
+  reuse before origin selection while setting all-response privacy. Tests cover
+  active diagnostics, inactive cookie clearing, and malformed/duplicate query
+  cleanup, including origin-shareability telemetry under the #1169 readthrough
+  path.
 - Warm-hit and cold-store matrices combine DataDome/GPT requirements with key,
   bypass, malformed, unlisted, absent, and empty cookies; integration privacy
   can only restrict the existing cookie/cache decision.
@@ -3135,7 +3435,7 @@ to preserve `cfg(test)` imports.
   validated settings-only view when a later target, mediator, route, or
   capability stage fails; failures in the baseline loader validations still
   withhold it. Tests inspect the staged `CompositionAttempt`, prove no config
-  re-read on the failure path, map unavailable root/chunk reads to redacted 503,
+  re-read on the failure path, map missing or unpropagated root/chunk to redacted 503,
   and retain hash/schema/parse corruption as 500. Reusable capability objects
   are immutable and request-stateless, with document buffers created per HTML
   processor. Fastly adapter tests prove a missing root or referenced config
@@ -3148,11 +3448,37 @@ to preserve `cfg(test)` imports.
   equal old/new physical IDs. An end-to-end fixture uses distinct non-default
   source/destination physical names and root keys and proves both schema writers
   consume their verified tuples. A runbook test keeps writes frozen through POP
-  probes and then enforces paired schema-one/schema-two changes during the
-  rollback window. Cloudflare fixtures pass schema-one and schema-two envelopes
+  probes. During the rollback window it either retains the freeze or stages
+  immutable schema-one/schema-two roots and matching service versions, verifies
+  both before selection, blocks rollback during partial propagation, and
+  accepts the pair only after the new active version converges. Failure leaves
+  the last accepted pair selectable, never a half-updated pair. Cloudflare
+  fixtures pass schema-one and schema-two envelopes
   through the manifest-derived property, legacy property, and exact-empty-primary
   fallback without changing the outer binding shape; whitespace-only and
   non-string primary values fail without consulting the legacy property.
+- `config push` refuses a schema-2 write to the uncutover Spin destination and
+  to Cloudflare KV, leaves remote bytes untouched, and accepts only a verified
+  Fastly new-generation tuple. Cloudflare's protected export command produces
+  the exact validated outer JSON binding without logging bytes; deployment
+  tests compare its envelope hash and selected property with the bound Worker
+  version before activation and reject mismatches. Cloudflare rollback tests apply a post-cutover
+  kill-switch edit and prove the activated rollback binding reflects it through
+  paired version/binding verification, or prove writes stayed frozen. Rollout
+  probes deterministically emit a redacted event with each authenticated unique
+  probe ID and representative POP; a missing event fails the gate. Missing,
+  expired, or invalid tags never force a digest or appear in telemetry, and the
+  observation header never reaches an origin or cache key. Each probe also
+  asserts a preselected settings-dependent response predicate; when the two
+  generations are behavior-equivalent, authenticated binding/envelope evidence
+  distinguishes them, and paired edits additionally probe the changed
+  behavior. `/health` or a generic 2xx cannot pass. Fastly's early
+  store-open and JA4 failures retain baseline 500, missing or unpropagated
+  root/chunk uses 503, and verified corruption uses 500; `GET /health` remains
+  200 in each case.
+- Interactive migration detects a changed, replaced, or disappeared source
+  during a reordering prompt and leaves the operator's newer file untouched;
+  the command states the narrow external-editor race after its final comparison.
 
 ### Browser tests
 
@@ -3206,18 +3532,26 @@ to preserve `cfg(test)` imports.
   Creative response metadata, and `markWinningBidAsUsed` preservation.
 - Unified, deferred, standalone, and inline assets expose bytes and hashes that
   match the emitted document fingerprint and static responses.
+- The neutral finalizer is a synchronous same-origin external classic script
+  with its own static response, content hash, fingerprint discriminant, and
+  trusted tag attributes. A real-browser test enforces `script-src 'self'` and
+  proves the unified asset and finalizer run in order and queued callbacks
+  drain. A blocked or missing finalizer leaves the success-path queue buffered.
 - Independent document-fingerprint vectors cover every asset discriminant,
   emission order, canonical attribute order, empty fields, duplicate normalized
-  attributes, exact inline bytes, raw external hashes, and ambiguous-boundary
+  attributes, exact inline bytes, raw external hashes, managed-external Prebid
+  tags with and without configured SHA/SRI, URL and attribute changes, and ambiguous-boundary
   inputs; implementations hashing hex text or delimiter-joined fields fail.
 - Composition-digest vectors combine the verified EdgeZero data hash,
   document-assets fingerprint, schema, and build ID using the specified raw-byte
   and length framing; reject hex-text or ambiguous concatenation variants;
   change when configured integration/provider order changes; never include
-  resolved secret values; and are lazily memoized. Explicit debug/sampled
-  rollout observation may force the digest; retained compositions deduplicate
-  opportunistically, fresh instances may emit again, and ordinary requests do
-  not force it. Set-valued source fields serialize deterministically.
+  resolved secret values; and are lazily memoized. Authenticated rollout probes
+  force and log the digest for each unique probe ID without sampling;
+  optional debug/sampled observations may reuse that event schema. Retained
+  compositions deduplicate opportunistically, fresh instances may emit again,
+  and requests outside rollout/debug mode do not force it. Set-valued source
+  fields serialize deterministically.
 - Build-ID generator vectors are deterministic across repeated builds and
   independently perturb core, integrations, OpenRTB, selected-adapter Rust,
   browser source, `edgezero.toml`, `Cargo.lock`, target, host, profile,
@@ -3226,7 +3560,11 @@ to preserve `cfg(test)` imports.
   ordering does not. Tests prove every output-affecting build-script watch input
   is hashed and every selected workspace dependency contributes exactly one
   component. Exclusion, LF/CRLF rejection, label/value-width, and per-deployment
-  expected-ID vectors are pinned.
+  expected-ID vectors are pinned. The adapter traversal is checked against
+  target-matched Cargo metadata, deduplicates identical transitive records,
+  rejects conflicting labels, and changes ID when the actual compiler binary,
+  encoded rustflags, target features, codegen flags, or a permitted wrapper
+  changes; untracked release wrappers fail.
 - Changing any integration setting that affects generated head output changes
   the document fingerprint; request-dependent head variation bypasses shared
   template reuse through processing requirements.
@@ -3259,18 +3597,34 @@ to preserve `cfg(test)` imports.
   Prebid load order using the moved assets.
 - An artifact test loads GPT bootstrap, core, immediate GPT, synchronous GPT
   diagnostics, the neutral finalizer, and deferred Prebid in production order;
-  proves object identity/listener idempotence and first-impression preservation;
-  rejects numeric-version and same-version/ABI-hash mismatches without setting
-  the Prebid shim flag; and verifies the temporary `apsPrebidRenderers`
-  compatibility alias. ABI tests pin the framed record/hash vectors, regenerate
-  each declared surface byte-for-byte, reject modification/deletion of a
+  proves object and neutral service identity/listener idempotence across
+  pre-core bootstrap and adoption, plus the opaque first-impression service's
+  claim, targeting snapshot/restore, pending, suppression-token, fallback,
+  render, navigation retirement, and lease
+  transitions. A stale marked pre-core service fails the adoption check without
+  a second service or listener installation; new-code admissions stop, while
+  previously installed callbacks are reported as uncontrolled. A separate unmarked legacy
+  bootstrap fixture proves new-core/GPT/Prebid admissions stop and the old
+  callbacks are reported as uncontrolled, not silently treated as migrated.
+  Post-core IIFEs reject
+  numeric-version and same-version/ABI-hash mismatches
+  without new mutations by the mismatched shim or setting its current-install
+  marker. The earlier Rust Prebid config tag may already have created
+  `window.pbjs`, and an external older bundle may already have installed a
+  shim; neither prior effect can be undone. A stale unversioned or mismatched
+  installation marker is diagnosed and cannot satisfy current idempotence or
+  cause a double patch. The test also verifies the temporary
+  `apsPrebidRenderers` compatibility alias. ABI tests pin the IDL grammar,
+  reachable named types, overload ordinals, DOM references, adoption markers,
+  and framed record/hash vectors, regenerate each declared surface byte-for-byte,
+  reject an undeclared actual value member or modification/deletion of a
   target-branch published snapshot, and permit only a newly numbered snapshot.
   Preloaded and Testlight-forwarded callbacks drain FIFO
   only after diagnostics setup on successful evaluation and observe Permutive
   context. A throwing immediate IIFE triggers the microtask failure fallback; a
-  throwing diagnostics IIFE is followed by the finalizer; missing finalizer
-  leaves the queue buffered; and each drain path isolates a throwing queued
-  callback.
+  throwing diagnostics IIFE is followed by the external finalizer; missing
+  finalizer leaves the queue buffered; and each drain path isolates a throwing
+  queued callback.
 - Production logging artifacts prove the default remains `warn`, an explicit
   publisher `warn` is not overwritten, and Creative does not raise the shared
   level.
@@ -3439,8 +3793,11 @@ The change is complete when:
     ownership is disjoint, composable handler registration obeys frozen legacy
     order for schema 1 and configuration order for schema 2, and GPT retains its
     synchronous-tag bootstrap contract. Facade versions have immutable
-    published ABI snapshots, and queued callbacks drain after synchronous GPT
-    diagnostics on the success path with separate failure fallbacks.
+    published IDL-derived ABI snapshots and pre-initializer mismatch guards.
+    The first-impression lifecycle remains one opaque core-owned service, and
+    queued callbacks drain through a CSP-compatible external finalizer after
+    synchronous GPT diagnostics on the success path with separate failure
+    fallbacks.
 13. `TrustedServerAppConfig`, `SourceConfigView`,
     `PartialSourceConfigView<T>`, `ValidatedSourceConfig`, integration secret
     handling, and final runtime composition are owned by
@@ -3457,8 +3814,9 @@ The change is complete when:
     loader validation and preserved across later composition failures. Adapters
     resolve the config location once; unavailable and corrupt data follow the
     explicit adapter status matrix, including Fastly's intentional unavailable/
-    503 correction; and fixed application routes are hard-reserved in the shared
-    claim routers.
+    503 correction and `/health` liveness; fixed application routes are
+    hard-reserved in the shared claim routers and actual adapter router tables
+    are proven complete against those claims.
 15. OpenRTB request-local state crosses the transport boundary through a
     prepared exchange-or-skip outcome and bound response parser without `Any`
     or vendor enum variants in core; renderer descriptors retain their wire
@@ -3471,16 +3829,20 @@ The change is complete when:
     blobs preserve existing secret paths, and binary rollback uses drill-tested
     adapter-specific version/store isolation or verified restoration where
     isolation is unavailable; Fastly verifies the exact old/new
-    service-version/store/root-key tuples and paired schema-one/schema-two writes
-    during its rollback window; Cloudflare preserves and tests its outer
-    primary/legacy binding shape; old schema-1 CLI writers are fenced after
-    cutover and stored-schema regression is monitored as a rollback event.
+    service-version/store/root-key tuples and permits paired schema-one/schema-two
+    edits during its rollback window only through verified immutable roots and
+    matched service versions, otherwise keeping writes frozen; Cloudflare preserves and tests its outer
+    primary/legacy binding shape and keeps the rollback binding current or
+    writes frozen throughout the window; unsafe schema-2 pushes and old
+    schema-1 CLI writers are fenced, rollout observation is deterministic, and
+    stored-schema regression is monitored as a rollback event.
 18. Browser assets carry bytes and hashes through composition; the versioned,
     unambiguously framed document fingerprint feeds the unambiguously framed
     composition digest and is included once in publisher template fingerprints;
     the artifact-specific build ID covers every reachable runtime workspace
     crate, the selected adapter, OpenRTB, build-script inputs, and
-    `edgezero.toml`; all existing URL, host, scheme, origin, assembly, Vary,
+    `edgezero.toml` plus the actual compiler and effective flags; all existing
+    URL, host, scheme, origin, assembly, Vary,
     cookie, and schema-version key dimensions remain; and request-dependent
     variants bypass shared reuse.
 19. Core test support, the Fastly-SDK migration guard, Cargo aliases, CI,
@@ -3500,12 +3862,16 @@ The change is complete when:
     reports default normalization, environment-overlay renames, priority
     changes across every comparable capability phase, unknown legacy tables,
     and required manual decisions with stable exit semantics; discarding unknown
-    data requires an explicit per-ID option; and migration never writes remotely.
+    data requires an explicit per-ID option; interactive writes reject
+    intervening local edits, and migration never writes remotely.
 24. Reserved GPT-diagnostics inputs and malformed Cookie fields are normalized
     on baseline routes even when diagnostics is absent or disabled.
 25. The adapter-specific rollout proves schema, physical binding, artifact, and
-    digest state through explicitly enabled debug/sampled observation and a
-    settings-dependent probe without adding any new status endpoint.
+    digest state through authenticated, unsampled unique-probe observation and
+    a configuration-dependent response predicate, with version/binding/envelope
+    evidence distinguishing behavior-equivalent generations, without adding
+    any new status endpoint; optional sampled/debug logs are not acceptance
+    evidence.
 26. The candidate release gate proves an authoritative live-environment
     inventory/export bijection and runs the candidate catalog's pure claim
     validation over each verified envelope without persisting or logging source
