@@ -13,6 +13,7 @@ use http::{Method, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
 
+use crate::consent::allows_eid_persistence;
 use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, RuntimeServices,
@@ -65,7 +66,14 @@ pub fn build_pull_sync_context(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
 ) -> Option<PullSyncContext> {
-    if registry.pull_enabled_partners().is_empty() || !ec_context.ec_allowed() {
+    // Without EID-persistence consent (TCF Purpose 1 + 4), finalization
+    // withholds browser-supplied partner UIDs. That leaves partner slots empty,
+    // which pull sync would otherwise read as eligible and disclose the EC ID
+    // to partners for exactly the users who opted out.
+    if registry.pull_enabled_partners().is_empty()
+        || !ec_context.ec_allowed()
+        || !allows_eid_persistence(ec_context.consent())
+    {
         return None;
     }
 
@@ -590,6 +598,57 @@ mod tests {
         assert!(
             context.is_none(),
             "should reject pull sync context when EC ID format is invalid"
+        );
+    }
+
+    #[test]
+    fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
+        // Purpose 1 granted keeps the EC, but Purpose 4 denied withholds EID
+        // writes and leaves partner slots empty. Pull sync must not read those
+        // empty slots as eligible and disclose the EC ID to partners.
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(crate::consent::types::TcfConsent {
+                version: 2,
+                cmp_id: 1,
+                cmp_version: 1,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 1,
+                tcf_policy_version: 4,
+                created_ds: 0,
+                last_updated_ds: 0,
+                // Purpose 1 (index 0) granted; Purpose 4 (index 3) denied.
+                purpose_consents: {
+                    let mut purposes = vec![false; 24];
+                    purposes[0] = true;
+                    purposes
+                },
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            source: crate::consent::types::ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+        assert!(
+            ec_context.ec_allowed(),
+            "should keep the EC allowed when Purpose 1 is granted"
+        );
+
+        let context = build_pull_sync_context(&ec_context, &registry);
+
+        assert!(
+            context.is_none(),
+            "should skip pull sync when TCF Purpose 4 is denied"
         );
     }
 

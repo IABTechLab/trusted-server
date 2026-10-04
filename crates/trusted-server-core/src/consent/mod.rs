@@ -483,6 +483,14 @@ pub fn gate_eids_by_consent<T>(
 /// TC string or GPP EU TCF section) must grant Purpose 1 (storage/access)
 /// **and** Purpose 4 (personalized ads). With no TCF data, EIDs are allowed
 /// only when GDPR does not apply.
+///
+/// A TCF signal means TCF rules apply. In decode mode a TC signal always sets
+/// `gdpr_applies`, so checking the decoded TCF first is equivalent to checking
+/// `gdpr_applies` first. In [`ConsentMode::Proxy`] the TC string is not
+/// decoded, so a request carrying a TC cookie has no effective TCF and GDPR
+/// applies: EID writes are withheld even when Purpose 4 is granted. This
+/// fails closed, matching how [`gate_eids_by_consent`] strips egress EIDs in
+/// proxy mode.
 #[must_use]
 pub(crate) fn allows_eid_persistence(ctx: &ConsentContext) -> bool {
     match effective_tcf(ctx) {

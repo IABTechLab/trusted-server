@@ -600,8 +600,10 @@ pub fn handle_admin_eids_lookup(
     };
 
     // Collect matches from both cookies, then dedupe the same way as response
-    // finalization so the preview reports exactly what an eligible request
-    // would store.
+    // finalization. The preview is cookie-only and ungated: it ignores the
+    // `/auction` request-body EIDs, the consent gate on identity-graph writes,
+    // and UIDs already stored in KV, so it lists candidate matches rather than
+    // exactly what a request would store.
     if let Some(value) = &sharedid_cookie
         && let Some(update) = collect_sharedid_update(value, registry)
     {

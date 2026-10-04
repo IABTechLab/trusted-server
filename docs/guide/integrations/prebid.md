@@ -812,7 +812,9 @@ takes ownership after the shim removes its automatically registered IAB
 listener. Purpose 1 and LiveRamp's GVL vendor
 consent (vendor 97) gate IdentityLink resolution and storage. Purpose 3 has no
 standalone default rule. Purpose 4 controls user-provided-data activity, but
-denying it alone does not block IdentityLink resolution or storage.
+denying it alone does not block IdentityLink resolution or browser-side storage.
+Persisting the RampID into the Edge Cookie identity graph is a separate,
+server-side step that requires TCF Purpose 1 and Purpose 4.
 
 Default EID transmission accepts a qualifying purpose and vendor basis from any
 of Purposes 2–10. Publishers can require Purpose 4 specifically by enabling
@@ -847,9 +849,12 @@ page or auction. When available, the opaque value follows the standard path:
 2. The current `/auction` request includes that entry.
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
    Server as `user.ext.eids`.
-4. The browser persists the same opaque value in the bounded `ts-eids` cookie.
-5. A later request can ingest it into an EC/KV partner configured with
-   `source_domain = "liveramp.com"`.
+4. After the response, the same `/auction` request ingests the body entry into
+   an EC/KV partner configured with `source_domain = "liveramp.com"`, when that
+   partner UID is not already stored.
+5. The browser also persists the opaque value in the bounded `ts-eids` cookie,
+   which lets requests without an EID body, such as `GET /_ts/page-bids` and
+   page navigations, ingest it.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -937,7 +942,7 @@ Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
-5. After the response, Trusted Server writes matched partner UIDs into the EC identity graph from the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie; a later source wins when two carry the same partner. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
+5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
 
 The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
 
