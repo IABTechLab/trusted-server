@@ -26,6 +26,24 @@ http = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
+# Also in the macOS block for the dev proxy; needed on every host so the probe can install
+# the process-level crypto provider its `-no-provider` reqwest build expects.
+rustls = { workspace = true }
+# Declared directly rather than inherited from the workspace, to control the rustls
+# crypto provider. `reqwest`'s plain `rustls-tls` forces `ring`, and this crate already
+# links `aws-lc-rs` through `reqwest` 0.13 (via `chromiumoxide` and `edgezero-cli`).
+# Compiling both providers makes rustls's process-level default ambiguous, and it then
+# panics on first use — which broke the dev-proxy tests. The `-no-provider` variant uses
+# whichever provider is already present instead of adding a second.
+#
+# `gzip` so the probe's Accept-Encoding axis compares decoded bytes: reqwest transparently
+# decodes a gzip response, which is what "differ only by content coding" must be tested
+# against.
+reqwest = { version = "0.12", default-features = false, features = [
+    "gzip",
+    "json",
+    "rustls-tls-webpki-roots-no-provider",
+] }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -67,6 +85,7 @@ webpki-roots = { workspace = true }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+flate2 = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

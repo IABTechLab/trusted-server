@@ -119,12 +119,12 @@ flowchart TD
     J -- "Unknown<br/>(no geo data)" --> Deny
 ```
 
-- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented. Writing browser-supplied Prebid EIDs into the identity graph additionally requires TCF Purpose 4 (personalized ads); see [Prebid EID Flow](#prebid-eid-flow). Pull sync does not apply the Purpose 4 check yet.
+- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented. Writing browser-supplied Prebid EIDs into the identity graph additionally requires TCF Purpose 4 (personalized ads); see [Prebid EID Flow](#prebid-eid-flow). Without Purpose 4, server-side pull sync is also skipped, so the EC ID is not sent to pull-sync partners.
 - **US State**: Opt-out model with three-tier fallback — GPC always blocks, then TCF if a CMP uses it, then US Privacy string, then fail-closed.
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
 
-The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, withdrawal tombstones, and completion markers that prevent stale point-read misses from rewriting completed tombstones. A marker key records the original tombstone's validity bound and is ignored at or after that time, even if its KV row has not expired yet. If the clock is unusable, the marker is ignored and withdrawal falls back to a strong root-existence check; only a confirmed existing root can be written. This prevents a stale marker from suppressing withdrawal when an expired EC key is created again. With a healthy store, repeated withdrawal of an already tombstoned EC ID leaves the row unchanged instead of refreshing its 24-hour TTL. Consent interpretation for each request remains based on the live request signals listed above.
 
 ## Partner Sync Channels
 
@@ -148,7 +148,7 @@ flowchart LR
 
 ### Prebid EID Flow
 
-Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a response. It collects matched partner UIDs from three request-local sources, applied in this order so a later source wins for the same partner:
+Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a response. It collects matched partner UIDs from three request-local sources, applied in this order so that, when two sources carry the same partner, the later source's UID is the candidate offered to KV:
 
 1. the `ts-eids` cookie,
 2. the `eids` array in the `/auction` request body,
@@ -156,7 +156,7 @@ Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finali
 
 The `/auction` body carries the full EID set Prebid.js resolved, so `/auction` ingestion is not limited by the size cap TSJS applies to the `ts-eids` cookie. The cookie still bridges Prebid user ID modules with the identity graph on requests that carry no EID body, such as `GET /_ts/page-bids` and page navigations.
 
-Identity-graph EID writes follow the same consent rule as bidstream EID forwarding: when a TCF signal is present, Purpose 1 (store/access device) and Purpose 4 (personalized ads) must both be consented, and when GDPR applies without a TCF signal the writes are withheld. A user who consents to Purpose 1 but not Purpose 4 keeps their EC, but no EIDs from the request are persisted.
+These Prebid EID writes follow the same consent rule as bidstream EID forwarding: when a TCF signal is present, Purpose 1 (store/access device) and Purpose 4 (personalized ads) must both be consented, and when GDPR applies without a TCF signal the writes are withheld. A user who consents to Purpose 1 but not Purpose 4 keeps their EC, but no EIDs from the request are persisted.
 
 ```mermaid
 sequenceDiagram
@@ -173,15 +173,21 @@ sequenceDiagram
     TSJS->>TSJS: Base64 encode full OpenRTB-style EID array<br/>[{source, uids:[{id, atype, ext?}]}]
     TSJS->>B: document.cookie = "ts-eids=..."
 
-    Note over B,TS: Next request without an EID body
-    B->>TS: Request with ts-eids cookie
+    Note over B,TS: Next eligible EID-sync request
+    B->>TS: Document navigation, POST /auction,<br/>or admitted GET /_ts/page-bids
     TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
-    TS->>KV: Upsert matched partner UIDs<br/>(requires TCF Purpose 1 + 4 under GDPR;<br/>skips write when UID unchanged)
+    TS->>KV: Add missing partner IDs in one conditional write<br/>skip when UIDs already match<br/>(requires TCF Purpose 1 + 4 under GDPR)
 ```
 
 Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
+
+Returning-user cookie persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not decode or persist these cookies. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
+
+Each eligible request attempts at most one conditional cookie update. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
+
+Browser cookies and the `/auction` request body do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser-supplied EID, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
 
 ### EID Seeding and Prebid Bidstream Forwarding
 
@@ -204,8 +210,8 @@ sequenceDiagram
         B->>B: Prebid User ID modules resolve IDs
         B->>TSJS: getUserIdsAsEids()
         TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs (size-capped)
-        B->>TS: Next request with ts-eids
-        TS->>KV: Decode cookie and upsert matched partner UIDs
+        B->>TS: Next eligible request with ts-eids
+        TS->>KV: Add missing matched partner UIDs<br/>defer different stored values
     end
 
     Note over B,TS: Prebid-routed auction
@@ -257,7 +263,17 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 }
 ```
 
-Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `/auction` request body, `ts-eids` cookie, or `sharedId` cookie carries a different value for the same configured partner source.
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs, from the `/auction` request body, the `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
+
+### Pull-Sync Completeness Marker
+
+When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+
+A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
+
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+
+Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
 
 ## Configuration
 
@@ -296,7 +312,7 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 - Newly generated ECs receive `Set-Cookie: ts-ec=...`.
 - When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
-- `/_ts/api/v1/batch-sync` writes mappings into the EC identity graph. Mapping timestamps are retained for API compatibility but no longer order writes; valid mappings use idempotent last-write-wins semantics.
+- `/_ts/api/v1/batch-sync` validates every input, groups valid mappings by normalized EC ID, and applies the last valid UID for each group once. Group outcomes still account for every original input; infrastructure failures reject the failing and remaining groups. Mapping timestamps remain required for API compatibility but do not order writes. See the [API Reference](/guide/api-reference) for the complete contract.
 - Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
 
 ## Next Steps

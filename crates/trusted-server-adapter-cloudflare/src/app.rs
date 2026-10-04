@@ -13,6 +13,8 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+#[cfg(any(test, target_arch = "wasm32"))]
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
@@ -72,6 +74,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -98,6 +101,30 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
+/// Older Cloudflare bindings used this JSON property before config stores adopted
+/// the manifest-derived default.
+///
+/// Remove this fallback only when support for those bindings is deliberately retired.
+#[cfg(any(test, target_arch = "wasm32"))]
+const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Debug, Eq, PartialEq, derive_more::Display)]
+enum CloudflareConfigEnvelopeError {
+    #[display(
+        "Cloudflare TRUSTED_SERVER_CONFIG has no `{primary_key}` or legacy `{legacy_key}` property"
+    )]
+    Missing {
+        primary_key: &'static str,
+        legacy_key: &'static str,
+    },
+    #[display("Cloudflare TRUSTED_SERVER_CONFIG value at `{key}` must be a string")]
+    NonString { key: &'static str },
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl core::error::Error for CloudflareConfigEnvelopeError {}
+
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
     let raw_config = CLOUDFLARE_CONFIG_JSON.with(|slot| slot.get().cloned());
@@ -105,7 +132,9 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
-        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+        .attach(format!(
+            "set TRUSTED_SERVER_CONFIG to JSON containing the `{CONFIG_BLOB_KEY}` blob envelope"
+        ))
     })?;
     let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -113,14 +142,11 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         })
         .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
     })?;
-    let envelope = value
-        .get("app_config")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
-            })
-        })?;
+    let envelope = cloudflare_config_envelope(&value).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: error.to_string(),
+        })
+    })?;
     let env = CLOUDFLARE_ENV
         .with(|slot| slot.get().cloned())
         .ok_or_else(|| {
@@ -133,6 +159,34 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
     settings_from_config_blob(envelope, &secret_store, &default_secret_store)
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn cloudflare_config_envelope(
+    value: &serde_json::Value,
+) -> Result<&str, CloudflareConfigEnvelopeError> {
+    match value.get(CONFIG_BLOB_KEY).filter(|envelope| {
+        // Treat a blank placeholder as absent so a populated legacy property
+        // remains usable during migration.
+        envelope.as_str() != Some("")
+    }) {
+        Some(envelope) => envelope
+            .as_str()
+            .ok_or(CloudflareConfigEnvelopeError::NonString {
+                key: CONFIG_BLOB_KEY,
+            }),
+        None => match value.get(LEGACY_CONFIG_BLOB_KEY) {
+            Some(envelope) => envelope
+                .as_str()
+                .ok_or(CloudflareConfigEnvelopeError::NonString {
+                    key: LEGACY_CONFIG_BLOB_KEY,
+                }),
+            None => Err(CloudflareConfigEnvelopeError::Missing {
+                primary_key: CONFIG_BLOB_KEY,
+                legacy_key: LEGACY_CONFIG_BLOB_KEY,
+            }),
+        },
+    }
+}
+
 /// Build the application state from explicit settings.
 ///
 /// # Errors
@@ -141,6 +195,13 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 /// registry fail to initialise.
 fn build_state_with_settings(
     settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
@@ -151,16 +212,21 @@ fn build_state_with_settings(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        services,
     }))
+}
+
+impl AppState {
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| build_runtime_services(ctx))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
-
-fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx)
-}
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
@@ -209,7 +275,7 @@ where
         let s = Arc::clone(&state);
         let f = f.clone();
         Box::pin(async move {
-            let services = build_per_request_services(&ctx);
+            let services = s.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
@@ -276,6 +342,20 @@ fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
         "Admin key management is not supported on Cloudflare Workers.\n\
          Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn cache_purge_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Template cache purge is not supported on Cloudflare Workers.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
     );
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
@@ -396,6 +476,30 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
@@ -407,7 +511,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&ctx);
+            let services = state.services_for_request(&ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
@@ -635,6 +739,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
         }
 
+        let cache_purge_unsupported =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(cache_purge_not_supported())
+            });
+        for method in publisher_fallback_methods() {
+            router = router.route(
+                "/_ts/admin/cache/purge",
+                method,
+                cache_purge_unsupported.clone(),
+            );
+        }
+
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
                 Ok(legacy_admin_alias_denied())
@@ -705,6 +821,20 @@ mod tests {
                 "/integrations/aps/renderer"
             ),
             "Cloudflare startup registry should expose the APS renderer"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_prefers_manifest_default_key() {
+        let value = serde_json::json!({
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+            CONFIG_BLOB_KEY: "manifest-envelope",
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("manifest-envelope"),
+            "manifest-derived key should take precedence"
         );
     }
 
@@ -799,6 +929,91 @@ mod tests {
         assert!(
             format!("{error:?}").contains("concurrent provider fanout"),
             "should identify unsupported fanout: {error:?}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_accepts_legacy_app_config_key() {
+        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: "legacy-envelope" });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("legacy-envelope"),
+            "legacy app_config key should remain compatible"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_treats_blank_primary_as_absent() {
+        let value = serde_json::json!({
+            CONFIG_BLOB_KEY: "",
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("legacy-envelope"),
+            "blank primary should not shadow a populated legacy property"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_reports_missing_keys() {
+        let value = serde_json::json!({});
+
+        let error = cloudflare_config_envelope(&value)
+            .expect_err("should reject config without either accepted property");
+
+        assert_eq!(
+            error,
+            CloudflareConfigEnvelopeError::Missing {
+                primary_key: CONFIG_BLOB_KEY,
+                legacy_key: LEGACY_CONFIG_BLOB_KEY,
+            },
+            "missing config should name both accepted keys"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cloudflare TRUSTED_SERVER_CONFIG has no `{CONFIG_BLOB_KEY}` or legacy `{LEGACY_CONFIG_BLOB_KEY}` property"
+            ),
+            "missing config should report absent properties, not invalid types"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_does_not_mask_malformed_manifest_value() {
+        let value = serde_json::json!({
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+            CONFIG_BLOB_KEY: true,
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Err(CloudflareConfigEnvelopeError::NonString {
+                key: CONFIG_BLOB_KEY,
+            }),
+            "malformed manifest-derived value should not fall back"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_reports_malformed_legacy_value() {
+        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: false });
+        let error = cloudflare_config_envelope(&value)
+            .expect_err("should reject a malformed legacy config value");
+
+        assert_eq!(
+            error,
+            CloudflareConfigEnvelopeError::NonString {
+                key: LEGACY_CONFIG_BLOB_KEY,
+            },
+            "malformed legacy value should name the legacy key"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Cloudflare TRUSTED_SERVER_CONFIG value at `app_config` must be a string",
+            "configuration error should name the malformed legacy key"
         );
     }
 }

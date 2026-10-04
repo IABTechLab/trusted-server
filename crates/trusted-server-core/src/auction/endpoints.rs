@@ -775,6 +775,7 @@ mod tests {
             "the endpoint must hand its snapshot to the request context"
         );
 
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
@@ -831,6 +832,7 @@ mod tests {
         graph.create(&ec_id, &live).expect("should seed live row");
 
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
