@@ -102,7 +102,7 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
     );
 
     if env::var(TEST_VAR).is_ok_and(|value| value == "1") {
-        for path in ["test", "vitest.config.ts"] {
+        for path in ["test", "vitest.config.ts", "build-prebid-external.mjs"] {
             println!("cargo:rerun-if-changed={}", ts_dir.join(path).display());
         }
         let status = Command::new(&npm)
@@ -131,6 +131,9 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
 }
 
 /// Run `npm ci` when `node_modules` is absent, serialized across build scripts.
+///
+/// Removes a partial `node_modules` left by a failed install so the next build
+/// retries it.
 fn install_dependencies_if_missing(npm: &Path, ts_dir: &Path) {
     let node_modules = ts_dir.join("node_modules");
 
@@ -151,11 +154,23 @@ fn install_dependencies_if_missing(npm: &Path, ts_dir: &Path) {
 
     info!("tsjs: node_modules missing; running npm ci");
     let status = Command::new(npm).arg("ci").current_dir(ts_dir).status();
-    assert!(
-        status.as_ref().is_ok_and(ExitStatus::success),
-        "tsjs: npm ci failed in {}",
-        ts_dir.display()
-    );
+    if status.as_ref().is_ok_and(ExitStatus::success) {
+        return;
+    }
+
+    // A failed `npm ci` can leave a partial node_modules behind. Remove it
+    // while still holding the lock so the next build retries the install
+    // instead of skipping it and failing the freshness check.
+    if node_modules.exists()
+        && let Err(err) = fs::remove_dir_all(&node_modules)
+    {
+        panic!(
+            "tsjs: npm ci failed in {} and removing the partial {} also failed: {err}",
+            ts_dir.display(),
+            node_modules.display()
+        );
+    }
+    panic!("tsjs: npm ci failed in {}", ts_dir.display());
 }
 
 /// Fail when `node_modules` is older than `package-lock.json`.
