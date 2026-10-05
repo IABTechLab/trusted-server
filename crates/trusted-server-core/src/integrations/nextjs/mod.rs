@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn non_code_flight_spellings_preserve_gtm_and_later_flight_rewrites() {
+    fn non_code_flight_spellings_preserve_source_and_later_flight_rewrites() {
         let payload = "0:{\"url\":\"https://origin.example.com/page\"}\n";
         let flight = flight_html(&[payload]);
         for prefix in [
@@ -291,8 +291,8 @@ mod tests {
                 );
                 let output = String::from_utf8(bytes).expect("should emit UTF-8");
                 assert!(
-                    output.contains(&format!("<script>{prefix}const tag='/integrations/google_tag_manager/gtm.js';</script>")),
-                    "should preserve non-code source and rewrite ordinary GTM at split {split}: {output}"
+                    output.contains(&format!("<script>{prefix}const tag='https://www.googletagmanager.com/gtm.js';</script>")),
+                    "should conservatively retain GTM beside inert Flight at split {split}: {output}"
                 );
                 assert!(
                     output.contains(r#"\"url\":\"https://test.example.com/page\""#),
@@ -418,6 +418,160 @@ mod tests {
                     assert!(!output.contains("__ts_rsc_"));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn lexer_false_negatives_preserve_raw_flight_and_later_rewrites() {
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1", "text": "é😀"});
+        let body = data.to_string();
+        let payload = format!("1:T{:x},{body}", body.len());
+        let push = format!(
+            "self.__next_f.push([1,{}]);",
+            serde_json::to_string(&payload).expect("should encode Flight payload")
+        );
+        let mut rewritten = data;
+        rewritten["url"] = json!("https://test.example.com/page");
+        rewritten["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        for prefix in [
+            "foo: { bar() } /'/.test(s);",
+            "switch (k) { case 1: {} /'/.test(s) }",
+            "const f = () => {}\n/'/.test(s);",
+            "const o = {while: (a) / 2, b: '/'};",
+            "for (const m of /'/g.exec(s) || []) {}",
+        ] {
+            // Exercise both an entirely missed script and a missed call after
+            // a captured one. Capturing a safe payload must not unprotect raw
+            // Flight elsewhere in the same parser fragment.
+            for leading in ["", push.as_str()] {
+                let source = format!("{leading}{prefix}{push}");
+                let assert_output = |output: &str| {
+                    let payloads = flight_payloads(output);
+                    let missed = usize::from(!leading.is_empty());
+                    assert_eq!(payloads.len(), missed + 2, "should emit each push once");
+                    assert_eq!(
+                        payloads[missed], payload,
+                        "should retain missed Flight bytes and lengths: {prefix}"
+                    );
+                    if missed != 0 {
+                        assert_mixed_t_model(&payloads[0], &rewritten);
+                    }
+                    assert_mixed_t_model(&payloads[missed + 1], &rewritten);
+                    assert!(!output.contains("__ts_rsc_"), "should resolve all captures");
+                };
+                for split in (0..=source.len()).filter(|split| source.is_char_boundary(*split)) {
+                    let mut processor = create_html_processor(mixed_config(10000, 10000));
+                    let first = format!("<script>{}", &source[..split]);
+                    let last = format!("{}</script><script>{push}</script>", &source[split..]);
+                    let mut bytes = processor
+                        .process_chunk(first.as_bytes(), false)
+                        .expect("should accept ambiguous JavaScript prefix");
+                    bytes.extend(
+                        processor
+                            .process_chunk(last.as_bytes(), true)
+                            .expect("should preserve raw and finish later Flight"),
+                    );
+                    assert_output(&String::from_utf8(bytes).expect("should emit UTF-8"));
+                }
+                let html = format!("<script>{source}</script><script>{push}</script>");
+                for compression in [Compression::None, Compression::Gzip] {
+                    for chunk_size in [32, 1000, 8192] {
+                        assert_output(&mixed_output_with_compression(
+                            &html,
+                            compression,
+                            chunk_size,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_flight_protection_survives_lexer_resynchronization_and_capture() {
+        let missed_body = "`http://www.googletagmanager.com/gtm.js`";
+        let missed_payload = format!("1:T{:x},{missed_body}", missed_body.len());
+        let missed_push = format!(
+            "self.__next_f.push([1,{}]);",
+            serde_json::to_string(&missed_payload).expect("should encode missed Flight")
+        );
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1"});
+        let body = data.to_string();
+        let push = format!(
+            "self.__next_f.push([1,{}]);",
+            serde_json::to_string(&format!("1:T{:x},{body}", body.len()))
+                .expect("should encode capturable Flight")
+        );
+        let mut expected = data;
+        expected["url"] = json!("https://test.example.com/page");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        let source = format!("foo: {{ bar() }} /'/.test(s);{missed_push} /'/.test(s);{push}");
+        let assert_output = |output: &str, boundary: usize| {
+            let payloads = flight_payloads(output);
+            assert_eq!(
+                payloads.len(),
+                3,
+                "should retain missed and captured pushes"
+            );
+            assert_eq!(
+                payloads[0], missed_payload,
+                "should preserve raw continuation at boundary {boundary}"
+            );
+            assert_mixed_t_model(&payloads[1], &expected);
+            assert_mixed_t_model(&payloads[2], &expected);
+            assert!(
+                !output.contains("__ts_rsc_"),
+                "should resolve safe captures"
+            );
+        };
+        for split in 0..=source.len() {
+            let mut processor = create_html_processor(mixed_config(10000, 10000));
+            let first = format!("<script>{}", &source[..split]);
+            let last = format!("{}</script><script>{push}</script>", &source[split..]);
+            let mut bytes = processor
+                .process_chunk(first.as_bytes(), false)
+                .expect("should accept raw Flight prefix");
+            bytes.extend(
+                processor
+                    .process_chunk(last.as_bytes(), true)
+                    .expect("should finish raw continuation and safe captures"),
+            );
+            assert_output(&String::from_utf8(bytes).expect("should emit UTF-8"), split);
+        }
+        let html = format!("<script>{source}</script><script>{push}</script>");
+        for compression in [Compression::None, Compression::Gzip] {
+            for chunk_size in [32, 1000, 8192] {
+                assert_output(
+                    &mixed_output_with_compression(&html, compression, chunk_size),
+                    chunk_size,
+                );
+            }
+        }
+        // A qualified head can be observed but not buffered when an earlier
+        // unrelated property makes the tentative receiver claim fail.
+        let body_start = missed_push.find('`').expect("should locate raw T body");
+        let first = format!(
+            "<script>var ref=foreign.__next_f;{}",
+            &missed_push[..body_start]
+        );
+        let continuation = format!("{}{push}", &missed_push[body_start..]);
+        for split in 0..=continuation.len() {
+            let mut processor = create_html_processor(mixed_config(10000, 10000));
+            let mut bytes = processor
+                .process_chunk(first.as_bytes(), false)
+                .expect("should release qualified but unbuffered Flight");
+            bytes.extend(
+                processor
+                    .process_chunk(&continuation.as_bytes()[..split], false)
+                    .expect("should preserve unbuffered continuation"),
+            );
+            let last = format!("{}</script><script>{push}</script>", &continuation[split..]);
+            bytes.extend(
+                processor
+                    .process_chunk(last.as_bytes(), true)
+                    .expect("should finish later safe captures"),
+            );
+            assert_output(&String::from_utf8(bytes).expect("should emit UTF-8"), split);
         }
     }
 

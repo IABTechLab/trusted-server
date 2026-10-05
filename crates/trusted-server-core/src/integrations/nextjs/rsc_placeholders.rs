@@ -76,6 +76,7 @@ impl NextJsRscPlaceholderRewriter {
         // capture. A malformed or unrecognized remainder stays original/protected.
         let mut ranges = Vec::new();
         let mut cursor = 0;
+        let mut unclaimed_raw_flight = false;
         let mut trimmed = std::mem::take(&mut state.rsc_receiver_trimmed);
         let mut queued_bytes = state.captured_payload_bytes;
         loop {
@@ -92,6 +93,8 @@ impl NextJsRscPlaceholderRewriter {
                 break;
             };
             if let Some(arguments) = INERT_FLIGHT_CONTROL_ARGUMENTS.find(&remaining[head.end()..]) {
+                unclaimed_raw_flight |=
+                    contains_qualified_flight(&content[cursor..cursor + head.start()]);
                 cursor += head.end() + arguments.end();
                 trimmed = false;
                 continue;
@@ -142,6 +145,8 @@ impl NextJsRscPlaceholderRewriter {
                 };
             }
             queued_bytes = total.expect("should have validated queue size");
+            unclaimed_raw_flight |=
+                contains_qualified_flight(&content[cursor..cursor + head.start()]);
             ranges.push((start, end));
             cursor = end + 1;
         }
@@ -152,6 +157,9 @@ impl NextJsRscPlaceholderRewriter {
                 ScriptRewriteAction::Keep
             };
         }
+        let raw_flight_remaining = state.raw_flight_unclaimed
+            || unclaimed_raw_flight
+            || contains_qualified_flight(&content[cursor..]);
         let mut rewritten = String::with_capacity(content.len());
         cursor = 0;
         for (start, end) in ranges {
@@ -168,7 +176,10 @@ impl NextJsRscPlaceholderRewriter {
         }
         state.captured_payload_bytes = queued_bytes;
         rewritten.push_str(&content[cursor..]);
-        state.current_fragment_protected = false;
+        // Captured payloads and recognized bootstrap controls are safe, but
+        // raw push spellings outside them may be executable lexer misses.
+        // Preserve those bytes even when another call was captured successfully.
+        state.current_fragment_protected = raw_flight_remaining;
         ScriptRewriteAction::replace(rewritten)
     }
 
@@ -188,10 +199,11 @@ impl NextJsRscPlaceholderRewriter {
                 self.rewrite_complete(&complete, true, state, limit, max_queued_payload_bytes)
             }
             FragmentCapture::Suppress => {
-                // Captured Flight bytes are withheld, so downstream stages see
-                // only empty source or a released receiver prefix, never a raw
-                // payload. Let GTM retain and rewrite preceding ordinary source.
-                state.current_fragment_protected = false;
+                // Captured bytes are withheld, so ordinary preceding source may
+                // still receive GTM rewriting. An earlier unclaimed raw head can
+                // leave its continuation in a released prefix, however, and that
+                // source must stay protected even during this later capture.
+                state.current_fragment_protected = state.raw_flight_unclaimed;
                 ScriptRewriteAction::RemoveNode
             }
             FragmentCapture::Restore(restored) => {
@@ -395,9 +407,10 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
         let shared = document_state(ctx.document_state);
-        let mut state = shared
+        let mut guard = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = &mut *guard;
         if std::mem::take(&mut state.next_data_fragment) {
             // Pages data is not executable Flight, even when a JSON string
             // contains a complete push spelling. Clear the downstream snapshot
@@ -405,6 +418,9 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             state.current_fragment_protected = false;
             state.flight_node_owned = false;
             state.flight_qualifier_tail.clear();
+            state.raw_flight_seen = false;
+            state.raw_flight_unclaimed = false;
+            state.raw_qualifier_tail.clear();
             state.flight_lexical = ScriptLexer::default();
             return ScriptRewriteAction::Keep;
         }
@@ -412,16 +428,40 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             state.current_fragment_protected = false;
             return ScriptRewriteAction::Keep;
         }
+        // A bounded raw observer is a safety guard, not a capture parser. Inert
+        // spellings may conservatively miss GTM rewriting in this script, but a
+        // lexical false negative must never let GTM corrupt raw Flight lengths.
+        let raw_head_end = observe_flight_qualifier(
+            content,
+            &mut state.raw_qualifier_tail,
+            &mut state.raw_flight_seen,
+        );
+        let previously_owned = state.flight_node_owned;
         let lexical_start = state.flight_lexical.clone();
         let code = state.flight_lexical.mask(content);
-        if state.flight_lexical.is_opaque() {
+        let code_head_end = if state.flight_lexical.is_opaque() {
             // At the lexical nesting limit, retain the existing conservative raw
             // qualification. Ordinary scripts without a push do not bypass Flight.
-            observe_flight_qualifier(&mut state, content);
+            let head_end = observe_flight_qualifier(
+                content,
+                &mut state.flight_qualifier_tail,
+                &mut state.flight_node_owned,
+            );
             state.bypass_rsc |= state.flight_node_owned;
+            head_end
         } else {
-            observe_flight_qualifier(&mut state, &code);
-        }
+            observe_flight_qualifier(
+                &code,
+                &mut state.flight_qualifier_tail,
+                &mut state.flight_node_owned,
+            )
+        };
+        // An unclaimed raw head may precede this fragment's capture buffer.
+        // Compare first-head offsets: a later lexical claim in the same fragment
+        // does not prove an earlier raw head safe, nor does a later fragment.
+        state.raw_flight_unclaimed |= !previously_owned
+            && raw_head_end
+                .is_some_and(|raw_end| code_head_end.is_none_or(|code_end| raw_end < code_end));
         // A call head can complete after a tentative property probe overflowed.
         // Once it proves Flight, preserve its entire raw continuation/group.
         if state.flight_node_owned
@@ -432,11 +472,26 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         {
             state.bypass_rsc = true;
         }
-        state.current_fragment_protected = state.flight_node_owned;
-        let action = self.rewrite_fragment(content, &code, lexical_start, ctx, &mut state);
+        state.current_fragment_protected = state.flight_node_owned || state.raw_flight_seen;
+        let action = self.rewrite_fragment(content, &code, lexical_start, ctx, state);
+        // Ownership alone does not prove buffering: an earlier unrelated
+        // property can cause the fragment to stream without a capture claim.
+        // Never let a later capture unprotect that raw source's continuation.
+        if !ctx.is_last_in_text_node
+            && state.raw_flight_seen
+            && !matches!(
+                state.rsc_script,
+                super::rsc_stream::FragmentState::Buffering(_)
+            )
+        {
+            state.raw_flight_unclaimed = true;
+        }
         if ctx.is_last_in_text_node {
             state.flight_node_owned = false;
             state.flight_qualifier_tail.clear();
+            state.raw_flight_seen = false;
+            state.raw_flight_unclaimed = false;
+            state.raw_qualifier_tail.clear();
             state.rsc_probe.clear();
             state.rsc_receiver_context.clear();
             state.rsc_receiver_trimmed = false;
@@ -480,34 +535,36 @@ fn first_qualified_flight_push(source: &str) -> Option<regex::Match<'_>> {
 }
 
 /// Observe a bounded whitespace-normalized call head without buffering script
-/// source, including initializer heads split after document bypass.
-fn observe_flight_qualifier(state: &mut super::rsc_stream::NextJsDocumentState, content: &str) {
-    if state.flight_node_owned {
-        return;
+/// source, including initializer heads split after document bypass. Return its
+/// original fragment byte-end so raw and masked observations can be compared.
+fn observe_flight_qualifier(content: &str, tail: &mut String, seen: &mut bool) -> Option<usize> {
+    if *seen {
+        return None;
     }
-    for character in content.chars() {
+    for (offset, character) in content.char_indices() {
         let character = if character.is_whitespace() {
             ' '
         } else {
             character
         };
-        if character == ' ' && state.flight_qualifier_tail.ends_with(' ') {
+        if character == ' ' && tail.ends_with(' ') {
             continue;
         }
-        state.flight_qualifier_tail.push(character);
-        if state.flight_qualifier_tail.len() > FLIGHT_QUALIFIER_TAIL_BYTES {
-            let start = state.flight_qualifier_tail.len() - FLIGHT_QUALIFIER_TAIL_BYTES;
-            let start = (start..state.flight_qualifier_tail.len())
-                .find(|index| state.flight_qualifier_tail.is_char_boundary(*index))
+        tail.push(character);
+        if tail.len() > FLIGHT_QUALIFIER_TAIL_BYTES {
+            let start = tail.len() - FLIGHT_QUALIFIER_TAIL_BYTES;
+            let start = (start..tail.len())
+                .find(|index| tail.is_char_boundary(*index))
                 .expect("should find bounded qualifier character boundary");
-            state.flight_qualifier_tail.drain(..start);
+            tail.drain(..start);
         }
-        if character == '(' && contains_qualified_flight(&state.flight_qualifier_tail) {
-            state.flight_node_owned = true;
-            state.flight_qualifier_tail.clear();
-            break;
+        if character == '(' && contains_qualified_flight(tail) {
+            *seen = true;
+            tail.clear();
+            return Some(offset + 1);
         }
     }
+    None
 }
 
 /// Bytes to withhold so a `__next_f` identifier split across text fragments can
@@ -573,6 +630,50 @@ mod tests {
         let shared = document_state(&state);
         let state = shared.lock().expect("should lock state");
         assert!(!state.flight_node_owned, "quoted text must not own Flight");
+        assert!(
+            state.raw_flight_seen,
+            "raw spelling should trigger only protection"
+        );
+        assert!(
+            state.current_fragment_protected,
+            "should protect possible raw Flight"
+        );
+        assert!(
+            !state.bypass_rsc,
+            "inert source must not bypass later scripts"
+        );
+    }
+
+    #[test]
+    fn raw_qualifier_observation_is_bounded_and_survives_every_split() {
+        for head in [
+            "self.__next_f . push (",
+            "window.__next_f . push (",
+            "(self.__next_f = self.__next_f || []).push (",
+            "(window.__next_f = window.__next_f || []).push (",
+        ] {
+            let head = head.replace(' ', &" \n".repeat(64));
+            for split in 0..=head.len() {
+                let mut tail = String::new();
+                let mut seen = false;
+                let _ = observe_flight_qualifier(&"é😀".repeat(1000), &mut tail, &mut seen);
+                assert!(
+                    tail.len() <= FLIGHT_QUALIFIER_TAIL_BYTES,
+                    "should bound raw tail"
+                );
+                assert!(!seen, "ordinary source must not protect Flight");
+                let _ = observe_flight_qualifier(&head[..split], &mut tail, &mut seen);
+                let _ = observe_flight_qualifier(&head[split..], &mut tail, &mut seen);
+                assert!(
+                    seen,
+                    "should recognize normalized raw head at split {split}"
+                );
+                assert!(
+                    tail.is_empty(),
+                    "should release tail once qualification succeeds"
+                );
+            }
+        }
     }
 
     #[test]

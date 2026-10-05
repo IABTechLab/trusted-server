@@ -59,6 +59,13 @@ pub(super) struct NextJsDocumentState {
     pub(super) current_fragment_protected: bool,
     /// Bounded qualifier observation remains active even after document bypass.
     pub(super) flight_qualifier_tail: String,
+    /// Raw qualification protects possible Flight even when the lexer misses it.
+    /// It never authorizes capture and lasts only for the current script node.
+    pub(super) raw_flight_seen: bool,
+    /// A raw head observed without a lexical claim may have already streamed.
+    /// Later captures cannot make its remaining source safe for ordinary GTM.
+    pub(super) raw_flight_unclaimed: bool,
+    pub(super) raw_qualifier_tail: String,
     /// Lexical context advances with original parser fragments, never replacements.
     pub(super) flight_lexical: ScriptLexer,
     /// Snapshot at the beginning of a claimed buffer for source-offset matching.
@@ -82,6 +89,9 @@ impl Default for NextJsDocumentState {
             flight_node_owned: false,
             current_fragment_protected: false,
             flight_qualifier_tail: String::new(),
+            raw_flight_seen: false,
+            raw_flight_unclaimed: false,
+            raw_qualifier_tail: String::new(),
             flight_lexical: ScriptLexer::default(),
             rsc_lexical_start: ScriptLexer::default(),
         }
