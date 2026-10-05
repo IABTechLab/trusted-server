@@ -321,7 +321,7 @@ function managedUserIdEntry(managed: InjectedManagedUserId): PrebidUserIdConfigE
  * Drops managed User ID entries that address a submodule an earlier entry
  * already claimed.
  *
- * `ts prebid bundle` rejects such a pair, but an operator running a prebuilt
+ * `ts prebid client` rejects such a pair, but an operator running a prebuilt
  * external bundle never invokes it, and core's duplicate check compares names
  * rather than the submodules they resolve to. Prebid registers one submodule
  * for a module's name and each of its aliases and reads only the first matching
@@ -2740,7 +2740,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
             'Prebid bundle. Add its exact Prebid module stem to ' +
             '[integrations.prebid.bundle.modules].bidder in trusted-server.toml and ' +
-            'rebuild it with `ts prebid bundle`.'
+            'rebuild it with `ts prebid client`.'
         );
       }
     }

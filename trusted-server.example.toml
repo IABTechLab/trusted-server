@@ -503,11 +503,11 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
 # Matching slots still refresh through GAM.
 # excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
-# Runtime bundle metadata — set after running `ts prebid bundle` and uploading:
+# Runtime bundle metadata — set after running `ts prebid client` and uploading:
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-# Bundle build inputs consumed by `ts prebid bundle`, not by the edge runtime.
+# Bundle build inputs consumed by `ts prebid client`, not by the edge runtime.
 # Values are exact upstream module stems without `.js`.
 # [integrations.prebid.bundle.modules]
 # bidder = ["rubiconBidAdapter"]
@@ -524,8 +524,8 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # the checked-in User ID registry. Each `name` must appear only once.
 #
 # The module must be present in the built bundle: name it under
-# [integrations.prebid.bundle].user_id_modules, or omit that list to take the
-# generator's default preset. `ts prebid bundle` resolves every managed name
+# [integrations.prebid.bundle.modules].user_id, or omit that list to take the
+# generator's default preset. `ts prebid client` resolves every managed name
 # through the checked-in User ID registry and fails if the generated manifest
 # omits its required module without updating the configured hash or SRI.
 #
