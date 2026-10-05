@@ -736,9 +736,11 @@ impl RuntimeServicesBuilder {
 
     /// Set the prefixes of the publisher the request was resolved to.
     ///
-    /// Optional in the builder, because a test has no publisher to resolve,
-    /// and [`Prefixes::default`](crate::prefix::Prefixes::default), carrying no
-    /// publisher domain, stands when it is not set. Every adapter sets it.
+    /// Optional in the builder, because services built for no request, such
+    /// as a test's, have no publisher to resolve, and
+    /// [`Prefixes::default`](crate::prefix::Prefixes::default), carrying no
+    /// publisher domain, stands when it is not set. Every adapter sets it on
+    /// the services of a request.
     #[must_use]
     pub fn prefixes(mut self, prefixes: crate::prefix::Prefixes) -> Self {
         self.prefixes = Some(prefixes);

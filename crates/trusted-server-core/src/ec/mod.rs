@@ -2921,40 +2921,54 @@ pub(crate) mod tests {
 
     /// The Edge Cookie is read under the request's public prefix alone, so a
     /// cookie written under another prefix, core's own `ts` included, is
-    /// ignored, and the one written back takes the request's prefix.
+    /// ignored, and the one written back takes the request's prefix. A prefix
+    /// carrying a publisher's name, as one host serving several writes, reads
+    /// and writes the same way, and another publisher's cookie is ignored.
     #[test]
     fn the_edge_cookie_is_read_and_written_under_the_requests_prefix() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Pfx001");
-        let prefixes = crate::prefix::Prefixes::new(
-            crate::prefix::PublicPrefix::new(["_ex"]).expect("should accept the prefix"),
-            crate::platform::ServerKeyPrefix::new("ex", "test-publisher.com"),
-        );
-        let services = noop_services().with_prefixes(prefixes);
+        for (parts, cookie, others) in [
+            (vec!["_ex"], "_ex-ec", vec!["ts-ec"]),
+            (
+                vec!["_ex", "www.example.com"],
+                "_ex.www.example.com-ec",
+                vec!["ts-ec", "_ex-ec", "_ex.other.example-ec"],
+            ),
+        ] {
+            let prefixes = crate::prefix::Prefixes::new(
+                crate::prefix::PublicPrefix::new(parts).expect("should accept the prefix"),
+                crate::platform::ServerKeyPrefix::new("ex", "test-publisher.com"),
+            );
+            let services = noop_services().with_prefixes(prefixes);
 
-        let old = create_test_request(&[("cookie", &format!("ts-ec={ec_id}"))]);
-        let ignored =
-            EcContext::read_from_request(&settings, &old, &services).expect("should read");
-        assert!(
-            ignored.ec_value().is_none() && !ignored.cookie_was_present(),
-            "a cookie under another prefix is ignored"
-        );
+            for other in others {
+                let old = create_test_request(&[("cookie", &format!("{other}={ec_id}"))]);
+                let ignored =
+                    EcContext::read_from_request(&settings, &old, &services).expect("should read");
+                assert!(
+                    ignored.ec_value().is_none() && !ignored.cookie_was_present(),
+                    "`{other}` is under another prefix than `{cookie}` and should be ignored"
+                );
+            }
 
-        let new = create_test_request(&[("cookie", &format!("_ex-ec={ec_id}"))]);
-        let read = EcContext::read_from_request(&settings, &new, &services).expect("should read");
-        assert_eq!(read.ec_value(), Some(ec_id.as_str()));
+            let new = create_test_request(&[("cookie", &format!("{cookie}={ec_id}"))]);
+            let read =
+                EcContext::read_from_request(&settings, &new, &services).expect("should read");
+            assert_eq!(read.ec_value(), Some(ec_id.as_str()), "{cookie}");
 
-        let mut response = http::Response::new(edgezero_core::body::Body::empty());
-        crate::ec::finalize::set_ec_cookie_on_response(&settings, &read, &mut response);
-        let written = response
-            .headers()
-            .get(http::header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .expect("should write the cookie");
-        assert!(
-            written.starts_with(&format!("_ex-ec={ec_id};")),
-            "{written}"
-        );
+            let mut response = http::Response::new(edgezero_core::body::Body::empty());
+            crate::ec::finalize::set_ec_cookie_on_response(&settings, &read, &mut response);
+            let written = response
+                .headers()
+                .get(http::header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .expect("should write the cookie");
+            assert!(
+                written.starts_with(&format!("{cookie}={ec_id};")),
+                "{written}"
+            );
+        }
     }
 
     #[test]

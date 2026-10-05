@@ -7,10 +7,11 @@
 //! nothing is selected.
 //!
 //! The two prefixes answer different questions. A public prefix starts the
-//! names the browser holds, being cookies, first-party storage keys and script
-//! globals, so it carries no domain, because a browser already keeps those
-//! apart by host. A server key prefix starts every key in a store publishers
-//! share, so it carries the publisher's domain, see [`ServerKeyPrefix`].
+//! names the browser holds, being cookies and first-party storage keys, so it
+//! carries no domain, because a browser already keeps each site's apart from
+//! every other site's. A server key prefix starts every key in a store
+//! publishers share, so it carries the publisher's domain, see
+//! [`ServerKeyPrefix`].
 //!
 //! A module gives the parts, and each use writes its own form from them,
 //! because what is allowed differs by use:
@@ -23,7 +24,10 @@
 //! | store key | [`ServerKeyPrefix::as_str`] | `ts.example.com` | as its module gives it |
 //!
 //! The page's client script is told the public prefix on its bundle tag rather
-//! than holding a copy, see [`PUBLIC_PREFIX_ATTRIBUTE`].
+//! than holding a copy, see [`PUBLIC_PREFIX_ATTRIBUTE`]. Its own globals, such
+//! as `window.tsjs`, are what page code calls it by and keep their names under
+//! every module, so the script global form is for a global a module names
+//! after the prefix.
 
 use core::fmt;
 use std::sync::Arc;
@@ -50,9 +54,11 @@ pub const PUBLIC_PREFIX_ATTRIBUTE: &str = "data-ts-public-prefix";
 ///
 /// Made of parts, such as `_ex` and `www.example.com`, which each use joins
 /// in its own form. Every part holds only ASCII letters, digits, `_`, `-` and
-/// `.`, so every form is a valid cookie name, storage key and attribute value,
-/// and the first part does not start with a digit, so the script global form
-/// is an identifier.
+/// `.`, so every form is a valid cookie name, storage key and attribute value.
+/// The first part starts with a letter or a single `_`, so the script global
+/// form is an identifier and no cookie name starts with `__`, where browsers
+/// give names such as `__Host-` rules of their own and drop a cookie that
+/// breaks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrefix {
     parts: Vec<String>,
@@ -62,7 +68,7 @@ pub struct PublicPrefix {
 impl PublicPrefix {
     /// The prefix made of `parts`, in order, or `None` when there are none,
     /// when a part is empty or holds anything else, or when the first part
-    /// starts with a digit.
+    /// starts with anything but a letter or a single `_`.
     #[must_use]
     pub fn new<I, S>(parts: I) -> Option<Self>
     where
@@ -79,9 +85,10 @@ impl PublicPrefix {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         });
-        let first_is_a_name = parts
-            .first()
-            .is_some_and(|first| !first.starts_with(|c: char| c.is_ascii_digit()));
+        let first_is_a_name = parts.first().is_some_and(|first| {
+            first.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && !first.starts_with("__")
+        });
         if !well_formed || !first_is_a_name {
             return None;
         }
@@ -129,7 +136,7 @@ impl PublicPrefix {
 
     /// The prefix as a script global, being the parts joined by `_` with every
     /// character an identifier cannot hold written as `_`, such as `ts` or
-    /// `_ex_www_example_com`.
+    /// `_ex_www_example_com`. Core names no global after it.
     #[must_use]
     pub fn script_global(&self) -> String {
         self.parts
@@ -171,8 +178,8 @@ impl fmt::Display for PublicPrefix {
 /// resolved to, being the loaded settings' `publisher.domain`, and never from
 /// the raw request.
 pub trait PrefixModule: Send + Sync + fmt::Debug {
-    /// The start of every cookie name, first-party storage key and script
-    /// global for the publisher this call was resolved to.
+    /// The start of every cookie name and first-party storage key for the
+    /// publisher this call was resolved to.
     ///
     /// # Errors
     ///
@@ -275,8 +282,8 @@ impl Prefixes {
     }
 }
 
-/// The prefixes of services no adapter resolved prefixes for, which only a
-/// test builds, being core's own names with no publisher domain.
+/// The prefixes of services built for no request, such as a test's or the
+/// operator command line's, being core's own names with no publisher domain.
 impl Default for Prefixes {
     fn default() -> Self {
         Self::new(
@@ -424,6 +431,10 @@ mod tests {
             vec![],
             vec![""],
             vec!["9ex"],
+            vec!["-ex"],
+            vec![".ex"],
+            vec!["__ex"],
+            vec!["__Host"],
             vec!["_ex", ""],
             vec!["_ex", "a b"],
             vec!["_ex", "a;b"],
@@ -445,6 +456,27 @@ mod tests {
         for other in ["ts", "tsx-ec", "_ex-ec", "sharedId"] {
             assert!(!prefix.owns_cookie_name(other.as_bytes()), "{other}");
         }
+    }
+
+    /// The client script reads the prefix from the attribute the server
+    /// writes, on the bundle tag, so both names are the same in the two
+    /// places.
+    #[test]
+    fn the_client_script_reads_the_attribute_the_server_writes() {
+        let script = include_str!("../../trusted-server-js/lib/src/shared/public_prefix.ts");
+
+        assert!(
+            script.contains(&format!(
+                "export const PUBLIC_PREFIX_ATTRIBUTE = '{PUBLIC_PREFIX_ATTRIBUTE}'"
+            )),
+            "the client script should read the attribute the server writes"
+        );
+        assert!(
+            script.contains("const BUNDLE_TAG_ID = 'trustedserver-js'")
+                && crate::tsjs::tsjs_script_tag_with_attributes(&[], &[])
+                    .contains(r#"id="trustedserver-js""#),
+            "the client script should read the tag the server writes"
+        );
     }
 
     #[test]

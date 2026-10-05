@@ -11,8 +11,8 @@ const BUNDLE_TAG_ID = 'trustedserver-js';
 /** The bundle tag attribute that carries the public prefix. */
 export const PUBLIC_PREFIX_ATTRIBUTE = 'data-ts-public-prefix';
 
-// Parts of letters, digits, `_`, `-` and `.`, the first not starting with a
-// digit, which is every prefix the server can write.
+// Letters, digits, `_`, `-` and `.`, starting with a letter or `_`, which
+// every prefix the server can write is.
 const PREFIX_SHAPE = /^[A-Za-z_][A-Za-z0-9._-]*$/;
 
 /** The public prefix for this page, or `null` where the page carries none. */

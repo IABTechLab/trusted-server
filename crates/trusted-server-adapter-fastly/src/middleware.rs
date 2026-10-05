@@ -22,6 +22,7 @@ use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_diagnostic_headers};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
+use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::settings::Settings;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
@@ -93,7 +94,8 @@ impl Middleware for FinalizeResponseMiddleware {
         );
         let path = ctx.request().uri().path().to_owned();
         // The publisher this request resolved to names the keys the geo
-        // module's answers are held under, so the services carry its prefixes.
+        // module's answers are held under, so the services carry its prefixes,
+        // which are core's own where no registry names a prefix module.
         let client = ctx
             .request()
             .extensions()
@@ -104,7 +106,10 @@ impl Middleware for FinalizeResponseMiddleware {
             Some(registry) => self.services.clone().with_prefixes(
                 registry.prefixes(&self.settings, ModuleRequest::of(ctx.request(), &client)),
             ),
-            None => self.services.clone(),
+            None => self
+                .services
+                .clone()
+                .with_prefixes(Prefixes::trusted_server(&self.settings)),
         };
 
         let mut response = match next.run(ctx).await {
