@@ -2,12 +2,10 @@
 //!
 //! [`TimedKvStore`] wraps an inner store plus a [`RequestTimings`] handle and
 //! records [`Phase::EcKv`] around every call. It implements both
-//! [`PlatformKvStore`] (for consent-store access obtained through
+//! [`PlatformKvStore`] (for a store handle threaded through
 //! [`RuntimeServices`](super::RuntimeServices)) and [`EcKvStore`] (for
 //! [`KvIdentityGraph`](crate::ec::kv::KvIdentityGraph) construction sites),
-//! because no single existing abstraction covers the whole `ts-kv` taxonomy:
-//! EC graph operations go through [`EcKvStore`] while consent persistence
-//! uses [`PlatformKvStore`] directly.
+//! so either KV abstraction can be decorated without a second wrapper type.
 //!
 //! The decorator measures store-call latency only: it never reads, parses,
 //! or logs any value passing through it.
@@ -110,6 +108,15 @@ impl<S: EcKvStore> EcKvStore for TimedKvStore<S> {
     ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
         let _span = self.timings.span(Phase::EcKv);
         self.inner.insert(key, write)
+    }
+
+    fn list_keys_with_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, Report<TrustedServerError>> {
+        let _span = self.timings.span(Phase::EcKv);
+        self.inner.list_keys_with_prefix(prefix, limit)
     }
 
     fn count_keys_with_prefix(

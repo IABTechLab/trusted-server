@@ -157,17 +157,16 @@ so no new clock abstraction is needed.
 Naming follows the completed template-cache terminology migration (`x-ts-template-cache`
 is the emitted header on `main`; `c2` naming is retired).
 
-`ts-kv` is instrumented by a timing decorator implementing `PlatformKvStore` that
-wraps the store handed to request-scoped consumers, because no single existing
-abstraction covers the taxonomy: EC graph operations go through `KvIdentityGraph`
-while consent persistence uses `PlatformKvStore` directly, and graphs are constructed
-independently in request setup, identify, admin lookup, batch sync, and finalization.
-Every request-path graph construction receives the timed store; pull-sync explicitly
-constructs its graph from an untimed store. Consent-store reads pass through the same
-decorator and are timed like any other store call. Included pre-send operations: EC
+`ts-kv` is instrumented by a timing decorator implementing both `PlatformKvStore` and
+the EC store trait, wrapping the store handed to request-scoped consumers, because EC
+graph operations go through `KvIdentityGraph` and graphs are constructed independently
+in request setup, identify, admin lookup, batch sync, and finalization. Every
+request-path graph construction receives the timed store; pull-sync explicitly
+constructs its graph from an untimed store. Included pre-send operations: EC
 generation `create_or_revive`, identify-path graph reads and evaluation, finalize-path
-`ingest_eid_cookies`/`upsert_partner_ids` and withdrawal tombstones, consent-store
-reads on consent routes, and batch-sync graph access when it runs before send.
+`ingest_eid_cookies`/`upsert_partner_ids` and withdrawal tombstones, and batch-sync
+graph access when it runs before send. The legacy consent KV store was removed on
+`main` (#903), so there is no separate consent-store read to time.
 Explicitly excluded: pull-sync work, which runs strictly after `send_to_client` and is
 invisible to both surfaces. The decorator measures store-call latency only: no value
 passing through it is read, parsed, or recorded, and the emitted surfaces carry no

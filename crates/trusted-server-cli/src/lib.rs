@@ -1,12 +1,20 @@
 #[cfg(not(target_arch = "wasm32"))]
+mod ad_templates;
+#[cfg(not(target_arch = "wasm32"))]
+mod app_config;
+#[cfg(not(target_arch = "wasm32"))]
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod prebid_bundle;
 #[cfg(not(target_arch = "wasm32"))]
 mod run;
+#[cfg(not(target_arch = "wasm32"))]
+mod tls;
+#[cfg(not(target_arch = "wasm32"))]
+mod url_guard;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use run::run_from_env;
+pub use run::{RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
 // `ts dev` group is available on every host target; its only subcommand,

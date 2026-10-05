@@ -142,11 +142,11 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 
 ### Key Components
 
-**Identity Sync Endpoint**:
+**Routed Endpoints**:
 
-- Route: `/integrations/lockr/sync`
-- Method: POST
-- Purpose: Synchronize EC ID with Lockr vault
+- Route: `/integrations/lockr/sdk` (GET) serves the Lockr SDK first-party
+- Route: `/integrations/lockr/api/*` (GET, POST) proxies Lockr API calls
+- Purpose: Keep SDK delivery and identity API traffic on the publisher origin
 
 **ID Mapping**:
 

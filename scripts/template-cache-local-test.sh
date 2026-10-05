@@ -10,17 +10,26 @@
 # Usage:
 #   ./scripts/template-cache-local-test.sh              # esi mode (shared template + edge assembly)
 #   ./scripts/template-cache-local-test.sh inline       # today's shipped behaviour, as a control
+#   ./scripts/template-cache-local-test.sh purge        # store -> hit -> purge -> miss, end to end
 
 set -euo pipefail
 
 MODE="${1:-esi}"
 case "$MODE" in
-  inline | esi) ;;
+  inline | esi | purge) ;;
   *)
-    echo "Unknown mode '$MODE'. Use one of: inline, esi." >&2
+    echo "Unknown mode '$MODE'. Use one of: inline, esi, purge." >&2
     exit 1
     ;;
 esac
+
+# `purge` exercises the same shared-template configuration as `esi`, then invalidates it.
+# Everything upstream of the purge assertions is identical, so the config generator and
+# every esi assertion keep running unchanged.
+CONFIG_MODE="$MODE"
+if [ "$MODE" = "purge" ]; then
+  CONFIG_MODE="esi"
+fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
@@ -179,13 +188,29 @@ class H(BaseHTTPRequestHandler):
             ("Surrogate-Control", "max-age=1200, stale-while-revalidate=21600, stale-if-error=604800"),
             ("Vary", "Accept-Encoding"),
         ]
+        page = PAGE
+        if self.path.startswith("/article/cookie-policy"):
+            # Model a downstream CDN selecting HTML after TS has selected its key.
+            # Clients deliberately send no X-Exp-Variant header.
+            assert self.headers.get("X-Exp-Variant") is None
+            cookies = {}
+            for field in self.headers.get_all("Cookie", []):
+                for pair in field.split(";"):
+                    name, separator, value = pair.strip().partition("=")
+                    if separator:
+                        cookies[name] = value
+            variant = cookies.get("ab_bucket", "absent") or "empty"
+            session = "session" in cookies
+            marker = f"<p>variant={variant};session={str(session).lower()}</p>"
+            page = PAGE.replace(b"<p>Body copy.</p>", marker.encode())
+            base.append(("Vary", "X-Exp-Variant"))
         if "gzip" in (self.headers.get("Accept-Encoding") or ""):
             print("origin: served COMPRESSED", flush=True)
-            self._send(gzip.compress(PAGE), "text/html; charset=utf-8",
+            self._send(gzip.compress(page), "text/html; charset=utf-8",
                        base + [("Content-Encoding", "gzip")])
         else:
             print("origin: served PLAINTEXT", flush=True)
-            self._send(PAGE, "text/html; charset=utf-8", base)
+            self._send(page, "text/html; charset=utf-8", base)
 
     def do_POST(self):
         print(f"origin: received POST {self.path}", flush=True)
@@ -219,7 +244,7 @@ ORIGIN_PID=$!
 sleep 1
 
 info "Generating stub config (mode: $MODE)"
-python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" \
+python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$CONFIG_MODE" \
   "$ORIGIN_PORT" "$BID_PORT" <<'PYEOF'
 import sys
 
@@ -295,7 +320,9 @@ s = replace_once(
 # and must go at the end: inserted here it would swallow every scalar key that
 # follows into `[[creative_opportunities.slot]]`.
 scalars = f'''assembly_mode = "{mode}"
-template_cache_vary = []
+template_cache_vary = ["x-exp-variant"]
+template_cache_key_cookies = ["ab_bucket"]
+template_cache_bypass_cookies = ["session"]
 origin_is_cookie_independent = true'''
 lines = s.split("\n")
 lines.insert(lines.index("[creative_opportunities]") + 1, scalars)
@@ -303,7 +330,7 @@ lines.append('''
 [[creative_opportunities.slot]]
 id = "ts-slot-header"
 div_id = "ts-slot-header"
-page_patterns = ["/article"]
+page_patterns = ["/article", "/article/cookie-policy*"]
 formats = [{ width = 728, height = 90 }]
 ''')
 open(out, "w").write("\n".join(lines))
@@ -499,7 +526,7 @@ check_post_reaches_origin() {
     "$(( $(grep -cF "origin: received POST /article" "$WORK/origin.log" || true) - before ))" "1"
 }
 
-if [ "$MODE" = "inline" ]; then
+if [ "$CONFIG_MODE" = "inline" ]; then
   check "inline fetches the origin every time" "$FETCHES" "2"
   check "inline writes no shared template" \
     "$(grep -c 'template_cache stored' "$WORK/viceroy.log" || true)" "0"
@@ -593,6 +620,8 @@ const googletag = {
 };
 const listeners = new Map();
 const windowObject = {
+  setTimeout,
+  clearTimeout,
   addEventListener(type, callback) { listeners.set(type, callback); },
   getComputedStyle: () => ({ display: "block", visibility: "visible" }),
   googletag,
@@ -649,7 +678,7 @@ NODEEOF
   check_post_reaches_origin
 fi
 
-if [ "$MODE" = "esi" ]; then
+if [ "$CONFIG_MODE" = "esi" ]; then
   info "Where the marker actually lives"
   echo "  The cached template (the shared copy — has a hole where bids go):"
   grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
@@ -739,7 +768,7 @@ COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 if ! [[ "$FIRST_BODY" =~ ^[0-9]+$ && "$COMPLETE" =~ ^[0-9]+$ ]]; then
   bad "socket probe did not return numeric body timings: '$B_LINE'"
 else
-  if [ "$MODE" = "inline" ]; then
+  if [ "$CONFIG_MODE" = "inline" ]; then
     check "inline delivers the article before the auction resolves" \
       "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
       "yes"
@@ -754,12 +783,179 @@ else
   printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 fi
 
-if [ "$MODE" != "inline" ]; then
+if [ "$CONFIG_MODE" != "inline" ]; then
   # Guards a regression where assembly rewrote a reader's accepted gzip origin request
   # to identity, making the origin send ~674KB where it would have sent ~100KB. The
   # cache still stores identity; that does not require changing what this reader accepts.
   check "the origin fetch stays compressed" \
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
+fi
+
+if [ "$MODE" = "purge" ]; then
+  info "Purge invalidates the shared template"
+
+  # The config's `password = "handler_password"` is a secret-store *reference*; the basic
+  # auth value is the seeded secret itself. Read it back from the generated manifest so
+  # this cannot drift from the seeding block above.
+  ADMIN_PASSWORD=$(awk -F'"' '/^key = "handler_password"/ { found = 1; next } \
+    found && /^data = / { print $2; exit }' "$WORK/fastly.toml")
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    bad "could not read the seeded admin password from the generated manifest"
+    ADMIN_PASSWORD="unreadable"
+  fi
+
+  # Viceroy 0.17 implements purge_surrogate_key against the same in-process cache it
+  # serves reads from, so store -> hit -> purge -> miss is genuinely end to end here. No
+  # Fastly service is involved, which is what makes this the strongest check available
+  # for the purge path.
+
+  fetch_article_state() {
+    local headers
+    headers=$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -D- -o /dev/null \
+      -H "Host: ts.example.com" \
+      -H "Accept-Encoding: gzip" \
+      -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
+      "http://127.0.0.1:$TS_PORT/article")
+    echo "$headers" > "$WORK/purge-probe.headers"
+    template_cache_state "$WORK/purge-probe.headers"
+  }
+
+  purge() {
+    curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o "$WORK/purge.out" -w '%{http_code}' \
+      -X POST \
+      -u "admin:$ADMIN_PASSWORD" \
+      -H "Host: ts.example.com" \
+      -H "Content-Type: application/json" \
+      --data "$1" \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge"
+  }
+
+  # The suite above has already warmed the cache; confirm that before purging, or a
+  # "miss after purge" result would prove nothing.
+  check "the template is warm before the purge" "$(fetch_article_state)" "hit"
+
+  check "purge-all is accepted" "$(purge '{"scope":"all"}')" "200"
+  check "purge-all reports success" \
+    "$(grep -c '\"purged\":true' "$WORK/purge.out" || true)" "1"
+
+  check "the next request misses after a purge, and refills" \
+    "$(fetch_article_state)" "miss-stored"
+  check "the cache refills after the purge" "$(fetch_article_state)" "hit"
+
+  info "Purge guards"
+
+  check "an unauthenticated purge is refused" \
+    "$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+      -X POST -H "Host: ts.example.com" -H "Content-Type: application/json" \
+      --data '{"scope":"all"}' \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge")" "401"
+
+  # The guard the route claims every method for: an unclaimed method would fall through
+  # to the publisher with the Authorization header still attached.
+  check "a GET is answered locally, not forwarded to the origin" \
+    "$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+      -u "admin:$ADMIN_PASSWORD" -H "Host: ts.example.com" \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge")" "405"
+
+  check "a form-postable content type is refused" \
+    "$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null -w '%{http_code}' \
+      -X POST -u "admin:$ADMIN_PASSWORD" -H "Host: ts.example.com" \
+      -H "Content-Type: text/plain" --data '{"scope":"all"}' \
+      "http://127.0.0.1:$TS_PORT/_ts/admin/cache/purge")" "415"
+
+  check "scope all carrying a url is refused rather than flushing" \
+    "$(purge '{"scope":"all","url":"http://ts.example.com/article"}')" "400"
+
+  # Purging one reader-facing URL, which is the scope a CMS webhook uses.
+  check "the template is warm before the url purge" "$(fetch_article_state)" "hit"
+  check "purge-url is accepted" \
+    "$(purge '{"scope":"url","url":"http://ts.example.com/article"}')" "200"
+  check "the next request misses after a url purge, and refills" \
+    "$(fetch_article_state)" "miss-stored"
+fi
+
+info "Cookie variant isolation and session bypass (mode: $MODE)"
+if python3 - "$TS_PORT" "$CONFIG_MODE" "$WORK/origin.log" "$REQUEST_TIMEOUT_SECONDS" <<'PYEOF'
+import gzip
+import sys
+import urllib.request
+from pathlib import Path
+
+port, mode, origin_log, timeout = sys.argv[1:]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def origin_gets(path):
+    return Path(origin_log).read_text().splitlines().count(f"origin: received GET {path}")
+
+
+def request(path, cookie, variant, state, fetches, session=False):
+    before = origin_gets(path)
+    headers = {
+        "Host": "ts.example.com",
+        "Accept-Encoding": "gzip",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    with opener.open(req, timeout=float(timeout)) as response:
+        body = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        html = body.decode()
+        assert response.status == 200, response.status
+        marker = f"<p>variant={variant};session={str(session).lower()}</p>"
+        assert marker in html, f"wrong cookie-selected HTML: expected {marker}"
+        assert html.count("<p>variant=") == 1, "should contain only this reader's variant"
+        assert "<!--ts-ad-seam-->" not in html, "unresolved assembly seam"
+        assert '\\"hb_pb\\":\\"4.25\\"' in html, "missing assembled winning bid"
+        policy = response.headers.get("Cache-Control", "").lower()
+        assert "private" in policy and "no-store" in policy, policy
+        actual = response.headers.get("X-TS-Template-Cache")
+        if mode == "esi":
+            assert actual == state, f"{cookie!r}: expected {state}, got {actual}"
+            if state == "hit":
+                assert response.headers.get("X-TS-Assembly") == "byte-seam"
+        else:
+            assert actual not in ("hit", "miss-stored", "miss-reserved"), actual
+    expected_fetches = fetches if mode == "esi" else 1
+    actual_fetches = origin_gets(path) - before
+    assert actual_fetches == expected_fetches, (
+        f"{cookie!r}: expected {expected_fetches} origin fetches, got {actual_fetches}"
+    )
+    print(f"  PASS {path} {cookie!r}: correct HTML, cache state, assembly and origin count")
+
+
+path = "/article/cookie-policy"
+for arm, state in [("A", "miss-stored"), ("B", "miss-stored"), ("A", "hit"), ("B", "hit")]:
+    request(path, f"ab_bucket={arm}", arm, state, int(state != "hit"))
+
+# Presence is a key dimension: neither missing nor empty may reuse A, B, or each other.
+for state in ["miss-stored", "hit"]:
+    request(path, None, "absent", state, int(state != "hit"))
+    request(path, "ab_bucket=", "empty", state, int(state != "hit"))
+
+# Unlisted opaque values must not fragment a warmed experiment arm.
+request(path, 'g_state={"i_l":0}; ab_bucket=A', "A", "hit", 0)
+request(path, "ab_bucket=A; metadata=one,two", "A", "hit", 0)
+
+# Bypass applies even when the anonymous arm is already warm, including empty sessions.
+for cookie in ["ab_bucket=A; session=test", "ab_bucket=A; session=test", "ab_bucket=A; session="]:
+    request(path, cookie, "A", "bypass-request", 1, session=True)
+request(path, "ab_bucket=A", "A", "hit", 0)
+
+# A cold session request must neither populate nor reserve an anonymous template.
+cold_path = "/article/cookie-policy-cold-session"
+request(cold_path, "ab_bucket=B; session=test", "B", "bypass-request", 1, session=True)
+request(cold_path, "ab_bucket=B", "B", "miss-stored", 1)
+request(cold_path, "ab_bucket=B", "B", "hit", 0)
+PYEOF
+then
+  ok "cookie runtime matrix"
+else
+  bad "cookie runtime matrix"
 fi
 
 info "Result"
