@@ -66,11 +66,14 @@ pub mod tests {
 /// drive byte-identical input.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod nextjs_auction {
+    use std::io::{Read as _, Write as _};
     use std::net::IpAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use bytes::Bytes;
     use error_stack::Report;
+    use flate2::{read::GzDecoder, write::GzEncoder};
 
     use crate::geo::GeoInfo;
     use crate::platform::{
@@ -194,13 +197,150 @@ pub mod nextjs_auction {
         )
     }
 
+    /// Isolated Next.js/GTM settings without auction dispatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the static GTM configuration is invalid.
+    #[must_use]
+    pub fn script_composition_settings() -> Settings {
+        let mut settings = settings();
+        settings.auction.enabled = false;
+        settings.creative_opportunities = None;
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true, "container_id": "GTM-MIX1"
+                }),
+            )
+            .expect("should enable fixture GTM");
+        settings
+    }
+
+    const SCRIPT_COMPOSITION_BOOTSTRAP: &str =
+        "(self.__next_f=self.__next_f||[]).push([0]);self.__next_f.push([2,null])";
+
+    /// HTML with standard bootstrap controls and a mixed Flight T record,
+    /// crossing parser-internal boundaries with same-delimiter query escapes.
+    #[must_use]
+    pub fn script_composition_html() -> String {
+        let content = serde_json::json!({
+            "url": format!("https://{ORIGIN_HOST}/app"),
+            "tag": "http://www.googletagmanager.com/gtm.js?q=\"x\"&v=é",
+            "ga": "//www.google-analytics.com/g/collect?v=2",
+            "text": "é😀</body>", "padding": "_".repeat(11000),
+        })
+        .to_string();
+        let payload = serde_json::json!(format!("1:T{:x},{content}", content.len()));
+        format!(
+            "<html><head></head><body><script>{SCRIPT_COMPOSITION_BOOTSTRAP}</script><script>self.__next_f.push([1,{payload}])</script><p>script-composition-suffix</p></body></html>"
+        )
+    }
+
+    /// Assert fully consumed adapter output, decoded JSON and recomputed T length.
+    ///
+    /// # Panics
+    ///
+    /// Panics if response coding, Flight syntax, rewrites, or completion are wrong.
+    pub fn assert_script_composition_response(bytes: &[u8], gzip: bool) {
+        let mut decoded = Vec::new();
+        if gzip {
+            GzDecoder::new(bytes)
+                .read_to_end(&mut decoded)
+                .expect("should decode complete gzip response");
+        } else {
+            decoded.extend_from_slice(bytes);
+        }
+        let html = String::from_utf8(decoded).expect("should emit UTF-8 HTML");
+        assert!(
+            html.contains("<p>script-composition-suffix</p>"),
+            "should deliver suffix sentinel"
+        );
+        assert!(html.ends_with("</body></html>"), "should finish HTML");
+        assert!(
+            !html.contains("__ts_rsc_"),
+            "should resolve every captured payload"
+        );
+        assert!(
+            html.contains(SCRIPT_COMPOSITION_BOOTSTRAP),
+            "should preserve inert bootstrap controls"
+        );
+        assert_eq!(
+            html.matches("self.__next_f.push([1,").count(),
+            1,
+            "should emit Flight once"
+        );
+        let json = html
+            .rsplit("self.__next_f.push(")
+            .next()
+            .expect("should keep push")
+            .split(")</script>")
+            .next()
+            .expect("should close push");
+        let push: serde_json::Value =
+            serde_json::from_str(json).expect("should retain valid push JSON");
+        let payload = push[1].as_str().expect("should retain payload");
+        let (header, body) = payload.split_once(',').expect("should retain T record");
+        assert_eq!(
+            usize::from_str_radix(&header[3..], 16).expect("should parse hex length"),
+            body.len(),
+            "should recount decoded T bytes"
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(body).expect("should preserve valid model JSON");
+        assert!(
+            data["url"]
+                .as_str()
+                .expect("should retain URL")
+                .contains(&format!("{PUBLISHER_HOST}/app")),
+            "should rewrite origin"
+        );
+        assert_eq!(
+            data["tag"],
+            "/integrations/google_tag_manager/gtm.js?q=\"x\"&v=é"
+        );
+        assert_eq!(data["ga"], "/integrations/google_tag_manager/g/collect?v=2");
+        assert_eq!(data["text"], "é😀</body>");
+        assert_eq!(data["padding"], "_".repeat(11000));
+    }
+
     /// Upstream that serves [`origin_html`] and one deterministic bid.
     #[derive(Default)]
     pub struct NextJsAuctionOrigin {
         auction_requests: AtomicUsize,
+        html_response: Option<Vec<u8>>,
+        gzip: bool,
+        streaming: bool,
     }
 
     impl NextJsAuctionOrigin {
+        /// Serve canned HTML instead of the default fixture, optionally gzip-encoded
+        /// and streamed in small chunks. The default fixture remains unchanged.
+        ///
+        /// # Panics
+        ///
+        /// Panics if in-memory gzip encoding fails.
+        #[must_use]
+        pub fn with_html_response(html: &str, gzip: bool, streaming: bool) -> Self {
+            let bytes = if gzip {
+                let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder
+                    .write_all(html.as_bytes())
+                    .expect("should encode fixture gzip");
+                encoder.finish().expect("should finish fixture gzip")
+            } else {
+                html.as_bytes().to_vec()
+            };
+            Self {
+                html_response: Some(bytes),
+                gzip,
+                streaming,
+                ..Self::default()
+            }
+        }
+
         /// Number of auction requests this fixture has answered.
         #[must_use]
         pub fn auction_requests(&self) -> usize {
@@ -215,6 +355,10 @@ pub mod nextjs_auction {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for NextJsAuctionOrigin {
+        fn supports_streaming_responses(&self) -> bool {
+            self.streaming
+        }
+
         async fn send(
             &self,
             request: PlatformHttpRequest,
@@ -241,11 +385,31 @@ pub mod nextjs_auction {
                         .attach(format!("unexpected fixture upstream: {host:?}")));
                 }
             };
+            let canned_origin =
+                request.request.uri().host() == Some(ORIGIN_HOST) && self.html_response.is_some();
+            let bytes = if canned_origin {
+                self.html_response
+                    .as_ref()
+                    .expect("should have canned response")
+                    .clone()
+            } else {
+                body.into_bytes()
+            };
+            let mut response = http::Response::builder()
+                .status(200)
+                .header("content-type", content_type);
+            if canned_origin && self.gzip {
+                response = response.header("content-encoding", "gzip");
+            }
+            let body = if request.stream_response && self.streaming {
+                let chunks: Vec<Bytes> = bytes.chunks(97).map(Bytes::copy_from_slice).collect();
+                edgezero_core::body::Body::stream(futures::stream::iter(chunks))
+            } else {
+                edgezero_core::body::Body::from(bytes)
+            };
             Ok(PlatformResponse::new(
-                http::Response::builder()
-                    .status(200)
-                    .header("content-type", content_type)
-                    .body(edgezero_core::body::Body::from(body))
+                response
+                    .body(body)
                     .expect("should build deterministic upstream response"),
             )
             .with_backend_name(request.backend_name))

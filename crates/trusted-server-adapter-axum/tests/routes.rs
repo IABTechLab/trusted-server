@@ -7,8 +7,10 @@
 use axum::body::Body as AxumBody;
 use axum::http::Request;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
+use std::sync::Arc;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -937,4 +939,154 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         !html.contains("__ts_rsc_") && !html.contains("<!--ts-inline-body-close-"),
         "should not leak generated placeholders: {html}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_rejects_malformed_request_hosts() {
+    for header in ["host", "x-forwarded-host", "forwarded"] {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            false,
+            true,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build script composition router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let hostile_host = "example.com</script><script>alert(1)</script>";
+        let value = if header == "forwarded" {
+            format!("host=\"{hostile_host}\"")
+        } else {
+            hostile_host.to_owned()
+        };
+        let mut request = Request::builder()
+            .uri("/script-composition")
+            .header("host", nextjs_auction::PUBLISHER_HOST)
+            .body(AxumBody::empty())
+            .expect("should build hostile host request");
+        request.headers_mut().insert(
+            header,
+            value.parse().expect("should encode hostile host header"),
+        );
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should respond to hostile host request");
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "should reject malformed {header} rather than rewrite script source"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("should consume host rejection response");
+        assert!(
+            !String::from_utf8_lossy(&body).contains(hostile_host),
+            "should not reflect the rejected host in the response"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
+    for host in [
+        "localhost:3000",
+        "example.com:8443",
+        "[::1]:3000",
+        "my_service:8080",
+        "_service_.example.com:8443",
+    ] {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            false,
+            true,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build script composition router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let request = Request::builder()
+            .uri("/script-composition")
+            .header("host", host)
+            .body(AxumBody::empty())
+            .expect("should build local host request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should serve local host request");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should accept host: {host}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should consume local host response");
+        let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
+        assert!(
+            html.contains(&format!("http://{host}/app")),
+            "should preserve host and port in rewritten Flight URL: {host}"
+        );
+        assert!(
+            !html.contains("__ts_rsc_"),
+            "should resolve every local host payload"
+        );
+        assert!(
+            html.ends_with("</body></html>"),
+            "should complete local response"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_html_response_is_complete() {
+    for gzip in [false, true] {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            gzip,
+            false,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build mixed integration router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/article")
+            .header("host", nextjs_auction::PUBLISHER_HOST)
+            .header("accept", "text/html")
+            .body(AxumBody::empty())
+            .expect("should build navigation");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should serve HTML");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().expect("should have ASCII coding")),
+            gzip.then_some("gzip")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should consume entire adapter body");
+        nextjs_auction::assert_script_composition_response(&body, gzip);
+    }
 }
