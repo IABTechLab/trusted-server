@@ -58,7 +58,7 @@ Not implemented: container deployment, rollback, runtime secret injection, calle
 
 ### Discovering requirements
 
-`inspect` reads exactly the chosen file and never rewrites or publishes it. It discovers server demand from `[auction.providers.*]` entries using the `prebid-server` profile and bidders routed through `[auction.bidders.*]`. The JSON report groups routed bidders under each provider. Browser settings still come from `[integrations.prebid]`, including the runtime's array, indexed-map, and string encodings for `client_side_bidders`. Bundle selections come from `[integrations.prebid.bundle.modules]`: `bidder`, `user_id`, and `analytics` appear as `bundle_adapters`, `identity_modules`, and `analytics_modules` in JSON and as separate lists in human output. The command reports explicitly supplied values only; it does not expand defaults, environment overrides, remote configuration, or request-time inputs. Confirm which source and environment are authoritative before relying on the report.
+`inspect` reads exactly the chosen file and never rewrites or publishes it. Omitting `--config` reads `trusted-server.toml` in the working directory. It discovers server demand from `[auction.providers.*]` entries using the `prebid-server` profile and bidders routed through `[auction.bidders.*]`. The JSON report groups routed bidders under each provider. Browser settings still come from `[integrations.prebid]`, including the runtime's array, indexed-map, and string encodings for `client_side_bidders`. Bundle selections come from `[integrations.prebid.bundle.modules]`: `bidder`, `user_id`, and `analytics` appear as `bundle_adapters`, `identity_modules`, and `analytics_modules` in JSON and as separate lists in human output. The command reports explicitly supplied values only; it does not expand defaults, environment overrides, remote configuration, or request-time inputs. Confirm which source and environment are authoritative before relying on the report.
 
 Account identifiers, endpoint values, and bid-parameter values are withheld. Parser errors also withhold source snippets. Server-side bidders, client-side bidders, and browser bundle adapters remain separate; listing a bidder does not establish partner authorization or a host-secret requirement. Disabled auctions and integrations remain disabled.
 
@@ -125,7 +125,7 @@ Deployment and rollback require a separately approved move to versioned runtime 
 ```bash
 ./scripts/test-cli.sh
 cargo fmt --all -- --check
-cargo clippy --package trusted-server-cli --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+cargo clippy-cli
 ```
 
 Unit tests cover local discovery, rendering, binding conflicts, account checks, confirmation, payload validation, retries, and status limitations. Unix process-level tests run the actual `ts` binary with a fake `aws` executable and require the Node.js version pinned in `.tool-versions`. The fake uses only built-in modules and needs no npm install. They verify no AWS execution for local commands, private temporary requests, absence of credentials in arguments/output, cleanup, history/account refusal, and partial-report exit codes. They never contact AWS. The unset-history case covers exit 1 with empty stdout, but this fake response does not establish the real AWS CLI contract. An authorized runtime owner must verify real secret-write version IDs and retry behavior against a throwaway secret before operational use.
