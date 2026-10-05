@@ -48,6 +48,8 @@ const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EVIDENCE_ENTRIES: usize = 128;
 /// Hard cap on the UTF-8 JSON payload before CDP transfers it back to Rust.
 const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Hard cap on browser startup, allowing cold launches on shared CI runners.
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -151,7 +153,8 @@ pub(crate) fn build_browser_config(
 ) -> Result<BrowserConfig, String> {
     let mut builder = BrowserConfig::builder()
         .chrome_executable(options.chrome)
-        .user_data_dir(options.profile_dir);
+        .user_data_dir(options.profile_dir)
+        .launch_timeout(BROWSER_LAUNCH_TIMEOUT);
     if !options.accept_invalid_certs {
         builder = builder.respect_https_errors();
     }

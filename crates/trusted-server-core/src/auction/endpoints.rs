@@ -22,6 +22,7 @@ use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
+use crate::request_timing::RequestTimings;
 use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
@@ -145,6 +146,16 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
+    // T0-anchored timeline (spec section 18). This route is the auction, so
+    // dispatch and resolve bracket `run_auction` rather than the origin
+    // fetch, and the commit mark lands once the OpenRTB response carrying the
+    // targeting has been built. A defaulted handle records into nothing that
+    // is ever read, so direct-handler tests are unaffected.
+    let timings = parts
+        .extensions
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
     let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
@@ -362,10 +373,17 @@ pub async fn handle_auction(
         ec_context,
     );
 
+    timings.set_auction_id(observation.auction_id);
+
     // Run the auction
+    timings.mark_auction_dispatched();
     let result = match orchestrator.run_auction(&auction_request, &context).await {
-        Ok(result) => result,
+        Ok(result) => {
+            timings.mark_auction_resolved();
+            result
+        }
         Err(err) => {
+            timings.mark_auction_resolved();
             let elapsed_ms = observation.elapsed_ms();
             emit_auction_events_best_effort_lazy(services, || {
                 build_auction_events(
@@ -409,6 +427,10 @@ pub async fn handle_auction(
             return Err(error);
         }
     };
+
+    // Targeting is available to the caller: for this route the response body
+    // is the commit, since there is no page state to write into.
+    timings.mark_auction_committed();
 
     emit_auction_events_best_effort_lazy(services, || {
         build_auction_events(

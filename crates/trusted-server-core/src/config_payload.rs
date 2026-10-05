@@ -72,16 +72,25 @@ pub fn settings_from_config_blob(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
-            .and_then(serde_json::Value::as_object_mut)
+    if let Some(tinybird) = data
+        .get_mut("tinybird")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
+        let enabled = tinybird.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+        let auction_enabled = tinybird
+            .get("auction_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let access_enabled = tinybird
+            .get("access_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !enabled || !auction_enabled {
+            tinybird.remove("auction_token_secret");
+        }
+        if !enabled || !access_enabled {
+            tinybird.remove("access_token_secret");
+        }
     }
 
     if let Some(partners) = data
