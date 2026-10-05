@@ -72,6 +72,15 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_X_FORWARDED_FOR,
 ];
 
+/// Request headers that describe a body and must not ride on a bodyless redirect follow-up.
+const REQUEST_BODY_HEADERS: [header::HeaderName; 5] = [
+    header::CONTENT_TYPE,
+    header::CONTENT_LENGTH,
+    header::CONTENT_ENCODING,
+    header::CONTENT_LANGUAGE,
+    header::CONTENT_LOCATION,
+];
+
 /// Curated request headers preserved for asset proxying.
 ///
 /// Unlike the HTML publisher fallback, asset requests need cache validation and
@@ -760,6 +769,10 @@ struct ProxyRedirectPolicy<'a> {
 /// the caller's EC ID as a `ts-ec` query parameter to the target URL.
 /// Optional bodies/headers can be supplied via [`ProxyRequestConfig`].
 ///
+/// Followed `307`/`308` redirects keep the original method and body. Followed
+/// `301`/`302`/`303` redirects are sent as a bodyless `GET` (a `HEAD` stays
+/// `HEAD`) without body-describing headers such as `Content-Type`.
+///
 /// # Errors
 ///
 /// - [`TrustedServerError::Proxy`] if the target URL is invalid, uses an unsupported
@@ -1265,6 +1278,9 @@ async fn proxy_with_redirects(
 
     let mut current_url = target_url_parsed.to_string();
     let mut current_method: Method = req.method().clone();
+    let mut current_body = body;
+    // Set once a redirect rewrites the request into a bodyless follow-up.
+    let mut body_dropped = false;
 
     for redirect_attempt in 0..=MAX_REDIRECTS {
         let parsed_url = url::Url::parse(&current_url).map_err(|_| {
@@ -1346,10 +1362,15 @@ async fn proxy_with_redirects(
             // insert() replaces any existing value, matching set_header() semantics.
             outbound_headers.insert(name.clone(), value.clone());
         }
+        if body_dropped {
+            for header_name in &REQUEST_BODY_HEADERS {
+                outbound_headers.remove(header_name);
+            }
+        }
         for (name, value) in &outbound_headers {
             builder = builder.header(name, value);
         }
-        let body_bytes = body.map(<[u8]>::to_vec).unwrap_or_default();
+        let body_bytes = current_body.map(<[u8]>::to_vec).unwrap_or_default();
         let edge_req =
             builder
                 .body(EdgeBody::from(body_bytes))
@@ -1477,8 +1498,18 @@ async fn proxy_with_redirects(
         );
 
         current_url = next_url.to_string();
-        if status == StatusCode::SEE_OTHER {
-            current_method = Method::GET;
+        // 307/308 replay the original method and body by design. 301/302/303
+        // become a bodyless GET (HEAD stays HEAD) so those redirects cannot
+        // carry the payload to a target the caller did not address.
+        if matches!(
+            status,
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+        ) {
+            if current_method != Method::HEAD {
+                current_method = Method::GET;
+            }
+            current_body = None;
+            body_dropped = true;
         }
     }
 
@@ -3986,6 +4017,173 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response_body_string(response), "redirected");
+        });
+    }
+
+    const REDIRECT_TEST_BODY: &[u8] = b"fictional-payload=example";
+
+    /// Send `method` with a body through one redirect of `status` and return the stub.
+    fn proxy_through_redirect(method: Method, status: u16) -> Arc<StubHttpClient> {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            status,
+            Vec::new(),
+            vec![("location", "https://redirect.example.com/final")],
+        );
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(method, "https://edge.example/");
+
+        futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_body(REDIRECT_TEST_BODY.to_vec())
+                .with_header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-www-form-urlencoded"),
+                )
+                .with_header(header::CONTENT_LANGUAGE, HeaderValue::from_static("en-US"))
+                .with_header(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from(REDIRECT_TEST_BODY.len()),
+                ),
+            &services,
+        ))
+        .expect("should follow redirect");
+
+        stub
+    }
+
+    fn recorded_header_names(stub: &StubHttpClient, index: usize) -> Vec<String> {
+        stub.recorded_request_headers()[index]
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn proxy_request_post_redirect_drops_body_for_301_302_303() {
+        for status in [301, 302, 303] {
+            let stub = proxy_through_redirect(Method::POST, status);
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["POST".to_string(), "GET".to_string()],
+                "should follow a {status} POST redirect with GET"
+            );
+            assert_eq!(
+                stub.recorded_request_uris()[1],
+                "https://redirect.example.com/final",
+                "should send the {status} follow-up to the Location target"
+            );
+            assert_eq!(
+                stub.recorded_request_bodies(),
+                vec![REDIRECT_TEST_BODY.to_vec(), Vec::new()],
+                "should send the body only on the first hop for {status}"
+            );
+            let first_hop_headers = recorded_header_names(&stub, 0);
+            let follow_up_headers = recorded_header_names(&stub, 1);
+            for body_header in ["content-type", "content-language", "content-length"] {
+                assert!(
+                    first_hop_headers.iter().any(|name| name == body_header),
+                    "should send {body_header} on the first {status} hop"
+                );
+                assert!(
+                    !follow_up_headers.iter().any(|name| name == body_header),
+                    "should not forward {body_header} on a bodyless {status} follow-up"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_request_post_redirect_retains_method_and_body_for_307_308() {
+        for status in [307, 308] {
+            let stub = proxy_through_redirect(Method::POST, status);
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["POST".to_string(), "POST".to_string()],
+                "should keep POST across a {status} redirect"
+            );
+            assert_eq!(
+                stub.recorded_request_bodies(),
+                vec![REDIRECT_TEST_BODY.to_vec(), REDIRECT_TEST_BODY.to_vec()],
+                "should replay the exact body across a {status} redirect"
+            );
+            assert!(
+                recorded_header_names(&stub, 1)
+                    .iter()
+                    .any(|name| name == "content-type"),
+                "should keep Content-Type across a {status} redirect"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_request_head_redirect_stays_head_for_301_302_303() {
+        for status in [301, 302, 303] {
+            let stub = proxy_through_redirect(Method::HEAD, status);
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD".to_string(), "HEAD".to_string()],
+                "should keep HEAD across a {status} redirect"
+            );
+            assert!(
+                stub.recorded_request_bodies()[1].is_empty(),
+                "should send no body on the {status} HEAD follow-up"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_request_post_redirect_still_enforces_per_hop_allowlist() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                307,
+                Vec::new(),
+                vec![("location", "https://blocked.example.com/final")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let allowed_domains = vec!["source.example.com".to_string()];
+            let req = build_http_request(Method::POST, "https://edge.example/");
+
+            let err = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://source.example.com/start")
+                    .without_ec_id()
+                    .without_forward_headers()
+                    .with_body(REDIRECT_TEST_BODY.to_vec())
+                    .with_allowed_domains(&allowed_domains),
+                &services,
+            )
+            .await
+            .expect_err("should block a redirect to a host outside the allowlist");
+
+            assert!(
+                matches!(
+                    err.current_context(),
+                    TrustedServerError::AllowlistViolation { host } if host == "blocked.example.com"
+                ),
+                "should report the blocked redirect host"
+            );
+            assert_eq!(
+                stub.recorded_request_bodies().len(),
+                1,
+                "should never send the body to the blocked host"
+            );
         });
     }
 
