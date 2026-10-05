@@ -29,15 +29,6 @@ fn main() {
     let crate_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("should set the core crate directory"),
     );
-    let out_dir =
-        PathBuf::from(env::var_os("OUT_DIR").expect("should set the build output directory"));
-    let digest = template_build_digest(&crate_dir);
-    fs::write(
-        out_dir.join("template_build_digest.rs"),
-        format!("const TEMPLATE_BUILD_DIGEST: &str = \"{digest}\";\n"),
-    )
-    .expect("should write the template build digest");
-
     // Keep every adapter's compiled default synchronized with the repository manifest.
     let manifest_path = crate_dir
         .ancestors()
@@ -63,12 +54,22 @@ fn main() {
     };
     let default_store_id = config_store.default_id();
     println!("cargo:rustc-env=TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID={default_store_id}");
+
+    let out_dir =
+        PathBuf::from(env::var_os("OUT_DIR").expect("should set the build output directory"));
+    let digest = template_build_digest(&crate_dir);
+    fs::write(
+        out_dir.join("template_build_digest.rs"),
+        format!("const TEMPLATE_BUILD_DIGEST: &str = \"{digest}\";\n"),
+    )
+    .expect("should write the template build digest");
 }
 
 /// Hash the core implementation and its dependency resolution without checkout paths.
 ///
 /// This private workspace crate lives two levels below the workspace manifest.
-/// All non-hidden source files are included, including embedded JS and future asset types.
+/// All source files are included except hidden, `#`-prefixed, and `~`-suffixed editor
+/// artifacts, so embedded JS and future asset types are covered.
 /// Unrelated edits intentionally invalidate templates rather than risk stale code.
 ///
 /// # Panics

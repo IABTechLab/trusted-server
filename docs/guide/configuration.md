@@ -2359,8 +2359,8 @@ stored as a shared template.
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, core build
 inputs, and schema version all participate in an opaque SHA-256 cache key. The
-build digest covers every non-hidden core source file (including Rust-inlined
-head scripts), the core build script, core and workspace manifests,
+build digest covers every core source file except hidden, `#`-prefixed, and
+`~`-suffixed editor artifacts (including Rust-inlined head scripts), the core build script, core and workspace manifests,
 `edgezero.toml`, and the workspace lockfile when present. Any change to these
 inputs causes a cold template fill per URL variant after deployment, even if the
 change does not affect rendered HTML. Core-owned formats (cached metadata, the

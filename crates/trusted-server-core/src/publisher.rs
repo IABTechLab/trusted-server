@@ -9317,10 +9317,9 @@ mod tests {
             assert_eq!(
                 (crate::platform::TEMPLATE_SCHEMA_VERSION, AD_ASSEMBLY_SEAM,),
                 (5, "<!--ts-ad-seam-->"),
-                "changing the seam must bump the cache schema, or a deploy assembles \
-                 against a marker that moved. The converse does not hold — the schema \
-                 also moves when the cache key's shape changes, as it did for v5 — so \
-                 updating this pin with an unchanged seam is legitimate."
+                "the core build digest in the template fingerprint isolates seam changes, \
+                 so updating the seam needs no schema bump; the schema moves only for \
+                 compatibility changes outside that digest (see TEMPLATE_SCHEMA_VERSION)"
             );
             assert_eq!(
                 body_close_injection(AssemblyMode::Esi, false),
@@ -12239,8 +12238,10 @@ mod tests {
         async fn a_template_written_under_the_previous_schema_version_is_never_read() {
             // v1 put an executable ESI include at the seam. v2 puts an inert comment
             // there and hands slots to the scheduler, so a v1 entry has no marker this
-            // binary can find. `schema_version` is the only thing keeping the two apart
-            // — nothing purges template cache on deploy.
+            // binary can find. A real v1 entry also carries an older build digest, but
+            // this fixture reuses the current fingerprint, so here `schema_version` is
+            // the only thing keeping the two apart. Nothing purges template cache on
+            // deploy.
             assert_ne!(
                 crate::platform::TEMPLATE_SCHEMA_VERSION,
                 ESI_INCLUDE_SCHEMA_VERSION,
