@@ -250,7 +250,16 @@ impl AppState {
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
         }
-        services
+        // The publisher this request resolved to names every key in a shared
+        // store and every name the browser holds.
+        let prefixes = self.registry.prefixes(
+            &self.settings,
+            trusted_server_core::module_context::ModuleRequest::of(
+                ctx.request(),
+                services.client_info(),
+            ),
+        );
+        services.with_prefixes(prefixes)
     }
 }
 
@@ -871,6 +880,41 @@ mod tests {
         [geo]
         assume_single_jurisdiction = true
     "#;
+
+    /// Every request's services carry the prefixes of the publisher its
+    /// settings describe, which start every shared store key and every name
+    /// the browser holds.
+    #[test]
+    fn a_requests_services_carry_the_publishers_prefixes() {
+        let settings = Settings::from_toml(
+            r#"
+                [publisher]
+                domain = "www.publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret-32-bytes-ok"
+
+                [geo]
+                assume_single_jurisdiction = true
+            "#,
+        )
+        .expect("should parse the settings");
+        let state = build_state_with_settings(settings).expect("should build the state");
+        let request = request_builder()
+            .method("GET")
+            .uri("https://www.publisher.example/")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build the request");
+        let ctx = RequestContext::new(request, PathParams::default());
+
+        let services = state.services_for_request(&ctx);
+
+        assert_eq!(
+            services.server_key_prefix().as_str(),
+            "ts.publisher.example"
+        );
+        assert_eq!(services.public_prefix().as_str(), "ts");
+    }
 
     /// Builds application state directly, bypassing the composition root's
     /// startup check, so the per-request behavior can be exercised with a

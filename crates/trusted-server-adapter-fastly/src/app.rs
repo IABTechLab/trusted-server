@@ -125,6 +125,7 @@ use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects,
     RequestFilterRegistryInput, RequestFilterRegistryOutcome,
 };
+use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
@@ -482,7 +483,13 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     if let Some(module) = state.registry.device_module() {
         services = services.with_device_module(module);
     }
-    services
+    // The publisher this request resolved to, its tenant included, names
+    // every key in a shared store and every name the browser holds.
+    let prefixes = state.registry.prefixes(
+        &state.settings,
+        ModuleRequest::of(ctx.request(), services.client_info()),
+    );
+    services.with_prefixes(prefixes)
 }
 
 /// Builds the services graph handed to a module on a response-side finalize
@@ -1519,15 +1526,18 @@ impl TrustedServerApp {
     }
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
-        let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
-            Arc::clone(&state.settings),
-            build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
-            build_finalize_services(
-                &state.settings,
-                Arc::clone(&state.default_kv_store),
-                Arc::clone(&state.loading_caches),
-            ),
-        ));
+        let mut router = RouterService::builder().middleware(
+            FinalizeResponseMiddleware::new(
+                Arc::clone(&state.settings),
+                build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
+                build_finalize_services(
+                    &state.settings,
+                    Arc::clone(&state.default_kv_store),
+                    Arc::clone(&state.loading_caches),
+                ),
+            )
+            .with_registry(Arc::clone(&state.registry)),
+        );
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
@@ -1792,6 +1802,26 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    /// Every request's services carry the prefixes of the publisher it
+    /// resolved to, which start every shared store key and every name the
+    /// browser holds.
+    #[test]
+    fn per_request_services_carry_the_publishers_prefixes() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+
+        assert_eq!(
+            services.server_key_prefix().as_str(),
+            "ts.test-publisher.com"
+        );
+        assert_eq!(services.public_prefix().as_str(), "ts");
     }
 
     #[test]

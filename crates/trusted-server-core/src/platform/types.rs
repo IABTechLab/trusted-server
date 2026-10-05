@@ -221,6 +221,10 @@ pub struct RuntimeServices {
     /// so building the services for a request bumps a reference count rather
     /// than copying the list, and cloning the services does the same.
     pub(crate) permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
+    /// The prefixes of the publisher this request was resolved to, from the
+    /// selected prefix module, which start every name the browser holds and
+    /// every key in a shared store. See [`crate::prefix`].
+    pub(crate) prefixes: crate::prefix::Prefixes,
 }
 
 impl RuntimeServices {
@@ -379,6 +383,26 @@ impl RuntimeServices {
         self.device_module.clone()
     }
 
+    /// The prefixes of the publisher this request was resolved to, being the
+    /// start of every name the browser holds and of every key in a shared
+    /// store. See [`crate::prefix`].
+    #[must_use]
+    pub fn prefixes(&self) -> &crate::prefix::Prefixes {
+        &self.prefixes
+    }
+
+    /// The start of every key the publisher's entries take in a shared store.
+    #[must_use]
+    pub fn server_key_prefix(&self) -> &super::ServerKeyPrefix {
+        self.prefixes.server_key()
+    }
+
+    /// The start of every name the browser holds for the publisher.
+    #[must_use]
+    pub fn public_prefix(&self) -> &crate::prefix::PublicPrefix {
+        self.prefixes.public()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -473,6 +497,17 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance carrying the prefixes of the publisher
+    /// the request was resolved to.
+    ///
+    /// Adapters apply what the selected prefix module gives, through
+    /// [`IntegrationRegistry::prefixes`](crate::integrations::IntegrationRegistry::prefixes),
+    /// alongside the other modules a request's services carry.
+    #[must_use]
+    pub fn with_prefixes(self, prefixes: crate::prefix::Prefixes) -> Self {
+        Self { prefixes, ..self }
+    }
+
     /// Returns a clone of this instance with the loading caches replaced.
     #[must_use]
     pub fn with_loading_caches(self, caches: Arc<super::LoadingCaches>) -> Self {
@@ -540,6 +575,7 @@ pub struct RuntimeServicesBuilder {
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
     device_module: Option<Arc<dyn DeviceModule>>,
+    prefixes: Option<crate::prefix::Prefixes>,
     permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
 }
 
@@ -561,6 +597,7 @@ impl RuntimeServicesBuilder {
             host_signals: None,
             resolved_ec_module: None,
             device_module: None,
+            prefixes: None,
             permission_signal_modules: Arc::default(),
         }
     }
@@ -697,6 +734,17 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the prefixes of the publisher the request was resolved to.
+    ///
+    /// Optional in the builder, because a test has no publisher to resolve,
+    /// and [`Prefixes::default`](crate::prefix::Prefixes::default), carrying no
+    /// publisher domain, stands when it is not set. Every adapter sets it.
+    #[must_use]
+    pub fn prefixes(mut self, prefixes: crate::prefix::Prefixes) -> Self {
+        self.prefixes = Some(prefixes);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -744,6 +792,7 @@ impl RuntimeServicesBuilder {
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
             device_module: self.device_module,
+            prefixes: self.prefixes.unwrap_or_default(),
             permission_signal_modules: self.permission_signal_modules,
         }
     }

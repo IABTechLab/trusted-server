@@ -36,6 +36,7 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::build_geo_module;
 use trusted_server_core::platform::{ClientInfo, RuntimeServices, UnavailableKvStore};
+use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -588,7 +589,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         Some(settings) => {
             // The entry point is synchronous host code, so it drives the async
             // module seam at the same boundary it already drives the router.
-            let services = entry_point_finalize_services(settings, &app_state);
+            let services = entry_point_finalize_services(settings, &app_state, entry_request(&req));
             let registered = app_state
                 .as_deref()
                 .and_then(|state| state.registry.device_module());
@@ -607,6 +608,9 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
+    // Kept for the finishing steps' module calls, which run after the
+    // request has been handed to the router.
+    let kept = EntryRequest::of(&req);
     let mut response = match into_core_request(req) {
         Ok(mut core_req) => {
             core_req.extensions_mut().insert(config_store);
@@ -637,7 +641,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                 settings,
                 &mut response,
                 client_ip,
-                entry_point_finalize_services(settings, &app_state),
+                entry_point_finalize_services(settings, &app_state, kept.module_request()),
             ));
         } else {
             match load_settings_from_config_store(&runtime_stores) {
@@ -646,7 +650,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                         &settings,
                         &mut response,
                         client_ip,
-                        entry_point_finalize_services(&settings, &app_state),
+                        entry_point_finalize_services(&settings, &app_state, kept.module_request()),
                     ));
                 }
                 Err(e) => {
@@ -749,17 +753,24 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// cache that holds nothing rather than no services at all. A module that
 /// needs the store then fails its own call instead of the entry point silently
 /// skipping the module.
+///
+/// The prefixes come from the selected prefix module where the state was
+/// built. A deployment whose state failed to build has no registry to name
+/// one, so core's own stand.
 fn entry_point_finalize_services(
     settings: &Settings,
     app_state: &Option<Arc<AppState>>,
+    request: ModuleRequest<'_>,
 ) -> RuntimeServices {
     match app_state {
         Some(state) => build_finalize_services(
             settings,
             Arc::clone(&state.default_kv_store),
             Arc::clone(&state.loading_caches),
-        ),
-        None => build_finalize_services(settings, Arc::new(UnavailableKvStore), Arc::default()),
+        )
+        .with_prefixes(state.registry.prefixes(settings, request)),
+        None => build_finalize_services(settings, Arc::new(UnavailableKvStore), Arc::default())
+            .with_prefixes(Prefixes::trusted_server(settings)),
     }
 }
 
@@ -1091,19 +1102,54 @@ pub(crate) async fn derive_device_signals(
 /// The scheme is `https` when the entry point marked the request as arriving
 /// over TLS, which it does from Fastly's own TLS metadata.
 fn entry_request(req: &FastlyRequest) -> ModuleRequest<'_> {
-    let scheme = if req.get_header_str("fastly-ssl").is_some() {
-        "https"
-    } else {
-        "http"
-    };
     ModuleRequest::new(
         req.get_method(),
         req.get_header_str(header::HOST.as_str())
             .unwrap_or_default(),
-        scheme,
+        entry_scheme(req),
         req.get_path(),
     )
     .with_query(req.get_query_str().unwrap_or_default())
+}
+
+/// `https` when the entry point marked the request as arriving over TLS,
+/// which it does from Fastly's own TLS metadata.
+fn entry_scheme(req: &FastlyRequest) -> &'static str {
+    if req.get_header_str("fastly-ssl").is_some() {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// What the client's request resolved to, owned, for the module calls that
+/// run after the request itself has been handed to the router.
+struct EntryRequest {
+    method: fastly::http::Method,
+    host: String,
+    scheme: &'static str,
+    path: String,
+    query: String,
+}
+
+impl EntryRequest {
+    fn of(req: &FastlyRequest) -> Self {
+        Self {
+            method: req.get_method().clone(),
+            host: req
+                .get_header_str(header::HOST.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            scheme: entry_scheme(req),
+            path: req.get_path().to_owned(),
+            query: req.get_query_str().unwrap_or_default().to_owned(),
+        }
+    }
+
+    fn module_request(&self) -> ModuleRequest<'_> {
+        ModuleRequest::new(&self.method, &self.host, self.scheme, &self.path)
+            .with_query(&self.query)
+    }
 }
 
 #[cfg(test)]

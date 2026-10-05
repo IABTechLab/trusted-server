@@ -298,19 +298,15 @@ mod tests {
 
     #[test]
     fn two_publishers_never_share_a_key() {
-        let key = |domain: &str| {
-            StoreKey::new(&ServerKeyPrefix::for_domain(domain), "page", "abc").to_string()
-        };
-
-        assert_ne!(key("example.com"), key("example.org"));
-        assert_ne!(key("clients.example.com"), key("public.example.com"));
-        assert_eq!(key("www.example.com"), key("example.com"));
+        crate::prefix::test_support::assert_keys_follow_the_publisher(|domain| {
+            StoreKey::new(&ServerKeyPrefix::new("ts", domain), "page", "abc").to_string()
+        });
     }
 
     #[test]
     fn a_key_names_the_publisher_then_the_cache() {
         let key = StoreKey::new(
-            &ServerKeyPrefix::for_domain("www.example.com"),
+            &ServerKeyPrefix::new("ts", "www.example.com"),
             "robots-txt",
             "k1",
         );
@@ -333,7 +329,7 @@ mod tests {
             memory_entries: 1,
             detachable: false,
         };
-        let key = StoreKey::new(&ServerKeyPrefix::for_domain("example.com"), "test", "k");
+        let key = StoreKey::new(&ServerKeyPrefix::new("ts", "example.com"), "test", "k");
         let runs = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             let counted = Arc::clone(&runs);

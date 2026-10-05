@@ -19,8 +19,9 @@ use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
-use crate::module_context::{ModuleCall, ModuleContext, ResolvedRequest};
+use crate::module_context::{ModuleCall, ModuleContext, ModuleRequest, ResolvedRequest};
 use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
+use crate::prefix::{PrefixModule, Prefixes, SelectedPrefixModule};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
 
@@ -673,6 +674,12 @@ pub struct IntegrationRegistration {
     /// Declaring one does not make it active, because the module is only asked
     /// to classify a request when `[device] module` names it.
     pub device_module: Option<(&'static str, Arc<dyn DeviceModule>)>,
+    /// Prefix module this registration supplies, with the name
+    /// `[prefix] module` selects it by.
+    ///
+    /// Declaring one does not make it active, because the module only gives
+    /// the deployment's prefixes when `[prefix] module` names it.
+    pub prefix_module: Option<(&'static str, Arc<dyn PrefixModule>)>,
     /// The rules this registration adds to `/robots.txt`, with the name
     /// `[robots-txt] modules` selects them by.
     ///
@@ -708,6 +715,7 @@ impl IntegrationRegistrationBuilder {
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
+                prefix_module: None,
                 robots_txt_contributor: None,
             },
         }
@@ -787,6 +795,18 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_device_module(mut self, name: &'static str, module: Arc<dyn DeviceModule>) -> Self {
         self.registration.device_module = Some((name, module));
+        self
+    }
+
+    /// Declare the prefix module this registration supplies, with the name
+    /// `[prefix] module` selects it by.
+    ///
+    /// It only gives the deployment's prefixes when `[prefix] module` names
+    /// it, see [`crate::prefix`], and a module the selector does not choose is
+    /// logged as a warning when the registry is built, the same as geo.
+    #[must_use]
+    pub fn with_prefix_module(mut self, name: &'static str, module: Arc<dyn PrefixModule>) -> Self {
+        self.registration.prefix_module = Some((name, module));
         self
     }
 
@@ -921,6 +941,12 @@ struct IntegrationRegistryInner {
     geo_module: Option<Arc<dyn PlatformGeo>>,
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
     device_module: Option<Arc<dyn DeviceModule>>,
+    // The prefix modules the running registrations supply, each with its
+    // name, in registration order. `[prefix] module` picks at most one.
+    prefix_modules: Vec<(&'static str, Arc<dyn PrefixModule>)>,
+    // The prefix module `[prefix] module` resolved to, core's own when
+    // nothing is selected.
+    prefix_module: SelectedPrefixModule,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -955,6 +981,8 @@ impl Default for IntegrationRegistryInner {
             geo_module: None,
             ec_module: None,
             device_module: None,
+            prefix_modules: Vec::new(),
+            prefix_module: SelectedPrefixModule::default(),
         }
     }
 }
@@ -981,6 +1009,7 @@ const DEVICE_MODULE_FASTLY: &str = "fastly";
 const EDGECOOKIE_TYPE: &str = crate::ec::module::MODULE_TYPE;
 const DEVICE_TYPE: &str = "device";
 const GEO_TYPE: &str = "geo";
+const PREFIX_TYPE: &str = crate::prefix::MODULE_TYPE;
 const ROBOTS_TXT_TYPE: &str = crate::robots_txt::MODULE_TYPE;
 
 impl IntegrationRegistryInner {
@@ -1244,6 +1273,51 @@ fn resolve_device_module(
     );
 
     Ok(resolved)
+}
+
+/// Resolves `[prefix] module` against the registered prefix modules, or to
+/// core's own when nothing is selected, and asks the module for the prefixes
+/// of the publisher the settings describe, so a module that names something
+/// its call never carries is refused here rather than on every request.
+///
+/// # Errors
+///
+/// A configuration error when the selector names no registered module, or
+/// when the module names a value other than the request and the settings.
+fn resolve_prefix_module(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<SelectedPrefixModule, Report<TrustedServerError>> {
+    let selected = match settings.prefix.module.as_deref() {
+        None => SelectedPrefixModule::trusted_server(),
+        Some(written) => {
+            let module =
+                named_module(PREFIX_TYPE, "prefix", written, &inner.prefix_modules, inner)?;
+            let name = inner
+                .prefix_modules
+                .iter()
+                .find(|(_, offered)| Arc::ptr_eq(offered, &module))
+                .map_or(PREFIX_TYPE, |(name, _)| *name);
+            SelectedPrefixModule::new(name, module)
+        }
+    };
+    let chosen = inner
+        .prefix_modules
+        .iter()
+        .find(|(name, _)| *name == selected.name())
+        .map(|(_, module)| module);
+    warn_unselected("prefix", PREFIX_TYPE, chosen, &inner.prefix_modules);
+    let trial = ModuleRequest::new(&Method::GET, &settings.publisher.domain, "https", "/");
+    selected.prefixes(settings, trial).map_err(|withheld| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "`[prefix] module` selects `{}`, which cannot give its prefixes: {withheld}. A \
+                 prefix module is handed the request and the settings, and nothing else",
+                selected.name()
+            ),
+        })
+    })?;
+    Ok(selected)
 }
 
 /// Refuses a `[robots-txt] modules` that names something nothing this
@@ -1836,6 +1910,10 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "device", name, registration.integration_id)?;
                 inner.device_modules.push((name, module));
             }
+            if let Some((name, module)) = registration.prefix_module {
+                claim_module_name(&mut claimed, "prefix", name, registration.integration_id)?;
+                inner.prefix_modules.push((name, module));
+            }
             if let Some((name, contributor)) = registration.robots_txt_contributor {
                 claim_module_name(
                     &mut claimed,
@@ -1893,6 +1971,7 @@ impl IntegrationRegistry {
         let geo_module = resolve_geo_module(settings, &inner)?;
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
+        inner.prefix_module = resolve_prefix_module(settings, &inner)?;
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
@@ -1944,6 +2023,33 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
+    }
+
+    /// The prefix module `[prefix] module` selects, or core's own when nothing
+    /// is selected.
+    #[must_use]
+    pub fn prefix_module(&self) -> &SelectedPrefixModule {
+        &self.inner.prefix_module
+    }
+
+    /// The prefixes of the publisher `request` was resolved to under
+    /// `settings`, from the selected prefix module.
+    ///
+    /// The module was asked once when the registry was built, so it names
+    /// nothing a request does not carry. Should it still give nothing, the
+    /// failure is logged and core's own prefixes stand.
+    #[must_use]
+    pub fn prefixes(&self, settings: &Settings, request: ModuleRequest<'_>) -> Prefixes {
+        self.inner
+            .prefix_module
+            .prefixes(settings, request)
+            .unwrap_or_else(|withheld| {
+                log::error!(
+                    "the prefix module `{}` gave no prefixes, so core's own stand: {withheld}",
+                    self.inner.prefix_module.name()
+                );
+                Prefixes::trusted_server(settings)
+            })
     }
 
     /// The robots.txt contributor `[robots-txt] modules` means by `written`,
@@ -2474,6 +2580,8 @@ impl IntegrationRegistry {
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
+                prefix_modules: Vec::new(),
+                prefix_module: SelectedPrefixModule::default(),
             }),
             plan: None,
         }
@@ -2553,6 +2661,8 @@ impl IntegrationRegistry {
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
+                prefix_modules: Vec::new(),
+                prefix_module: SelectedPrefixModule::default(),
             }),
             plan: None,
         }
@@ -5766,6 +5876,180 @@ mod tests {
             validate_nothing,
         )
         .with_module_name(GEO_PROBE_MODULE)]
+    }
+
+    /// The names the two prefix test modules run under, as modules under
+    /// `crates/testing` are named.
+    const PREFIX_PROBE_MODULE: &str = "testing.prefix-probe";
+    const PREFIX_READER_MODULE: &str = "testing.prefix-reader";
+
+    /// A prefix module giving `_ex` and `ex.<domain>`, so a test can tell it
+    /// apart from core's own.
+    #[derive(Debug)]
+    struct ExamplePrefix;
+
+    impl ExamplePrefix {
+        fn server_key(&self, settings: &Settings) -> crate::platform::ServerKeyPrefix {
+            crate::platform::ServerKeyPrefix::new("ex", &settings.publisher.domain)
+        }
+    }
+
+    impl PrefixModule for ExamplePrefix {
+        fn public_prefix(
+            &self,
+            _call: ModuleCall<'_>,
+        ) -> Result<crate::prefix::PublicPrefix, crate::module_context::Withheld> {
+            Ok(crate::prefix::PublicPrefix::new(["_ex"]).expect("should accept the prefix"))
+        }
+
+        fn server_key_prefix(
+            &self,
+            call: ModuleCall<'_>,
+        ) -> Result<crate::platform::ServerKeyPrefix, crate::module_context::Withheld> {
+            call.inject(self, Self::server_key)
+        }
+    }
+
+    /// A prefix module naming the reader's evidence, which its call never
+    /// carries.
+    #[derive(Debug)]
+    struct EvidenceReadingPrefix;
+
+    impl EvidenceReadingPrefix {
+        fn public(
+            &self,
+            evidence: &dyn crate::evidence::RequestInfo,
+        ) -> crate::prefix::PublicPrefix {
+            crate::prefix::PublicPrefix::new([evidence.user_agent()])
+                .expect("should accept the prefix")
+        }
+    }
+
+    impl PrefixModule for EvidenceReadingPrefix {
+        fn public_prefix(
+            &self,
+            call: ModuleCall<'_>,
+        ) -> Result<crate::prefix::PublicPrefix, crate::module_context::Withheld> {
+            call.inject(self, Self::public)
+        }
+
+        fn server_key_prefix(
+            &self,
+            _call: ModuleCall<'_>,
+        ) -> Result<crate::platform::ServerKeyPrefix, crate::module_context::Withheld> {
+            Ok(crate::platform::ServerKeyPrefix::new("ev", "example.com"))
+        }
+    }
+
+    fn prefix_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("prefix-probe")
+                .with_prefix_module(PREFIX_PROBE_MODULE, Arc::new(ExamplePrefix))
+                .build(),
+        ))
+    }
+
+    fn prefix_reader_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("prefix-reader")
+                .with_prefix_module(PREFIX_READER_MODULE, Arc::new(EvidenceReadingPrefix))
+                .build(),
+        ))
+    }
+
+    fn prefix_probe_builders() -> [crate::integrations::IntegrationBuilder; 2] {
+        [
+            crate::integrations::IntegrationBuilder::new(
+                "prefix-probe",
+                "seam-probe",
+                prefix_probe_registration,
+                validate_nothing,
+            )
+            .with_module_name(PREFIX_PROBE_MODULE),
+            crate::integrations::IntegrationBuilder::new(
+                "prefix-reader",
+                "seam-probe",
+                prefix_reader_registration,
+                validate_nothing,
+            )
+            .with_module_name(PREFIX_READER_MODULE),
+        ]
+    }
+
+    /// Settings running both probe modules on `www.example.com`, with
+    /// `[prefix] module` naming `selected` when given.
+    fn settings_selecting_prefix_module(selected: Option<&str>) -> Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.domain = "www.example.com".to_owned();
+        for id in ["prefix-probe", "prefix-reader"] {
+            settings
+                .insert_module_config("testing", &format!("testing.{id}"), &serde_json::json!({}))
+                .expect("should select the test module");
+        }
+        settings.prefix.module = selected.map(str::to_owned);
+        settings
+    }
+
+    #[test]
+    fn with_no_prefix_module_selected_the_registry_gives_core_ts() {
+        let settings = settings_selecting_prefix_module(None);
+        let registry = IntegrationRegistry::with_registrations(&settings, &prefix_probe_builders())
+            .expect("should build the registry");
+
+        let prefixes =
+            registry.prefixes(&settings, crate::module_context::test_support::request("/"));
+
+        assert_eq!(registry.prefix_module().name(), "ts");
+        assert_eq!(prefixes.public().as_str(), "ts");
+        assert_eq!(prefixes.public().cookie_name("ec"), "ts-ec");
+        assert_eq!(prefixes.server_key().as_str(), "ts.example.com");
+    }
+
+    #[test]
+    fn the_selected_prefix_module_gives_the_prefixes() {
+        let settings = settings_selecting_prefix_module(Some(PREFIX_PROBE_MODULE));
+        let registry = IntegrationRegistry::with_registrations(&settings, &prefix_probe_builders())
+            .expect("should build the registry");
+
+        let prefixes =
+            registry.prefixes(&settings, crate::module_context::test_support::request("/"));
+
+        assert_eq!(registry.prefix_module().name(), PREFIX_PROBE_MODULE);
+        assert_eq!(prefixes.public().cookie_name("ec"), "_ex-ec");
+        assert_eq!(prefixes.server_key().as_str(), "ex.example.com");
+    }
+
+    #[test]
+    fn a_prefix_module_nothing_supplies_is_refused() {
+        let settings = settings_selecting_prefix_module(Some("missing"));
+
+        let error = IntegrationRegistry::with_registrations(&settings, &prefix_probe_builders())
+            .err()
+            .expect("a prefix module nothing supplies should be refused");
+
+        assert!(
+            error.to_string().contains("[prefix] module") && error.to_string().contains("missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_module_naming_what_its_call_never_carries_is_refused() {
+        let settings = settings_selecting_prefix_module(Some(PREFIX_READER_MODULE));
+
+        let error = IntegrationRegistry::with_registrations(&settings, &prefix_probe_builders())
+            .err()
+            .expect("a prefix module that cannot answer should be refused at startup");
+
+        assert!(
+            error.to_string().contains(PREFIX_READER_MODULE)
+                && error.to_string().contains("request evidence"),
+            "{error}"
+        );
     }
 
     /// Settings whose `[geo] module` names `module`, which may be a value

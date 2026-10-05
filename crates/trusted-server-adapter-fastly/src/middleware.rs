@@ -19,6 +19,8 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_diagnostic_headers};
+use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
 use trusted_server_core::settings::Settings;
 
@@ -52,6 +54,9 @@ pub struct FinalizeResponseMiddleware {
     /// Built once with the application and cloned per request with that
     /// request's client metadata applied.
     services: RuntimeServices,
+    /// The registry whose selected prefix module names the publisher's
+    /// prefixes, or `None` where no application state was built.
+    registry: Option<Arc<IntegrationRegistry>>,
 }
 
 impl FinalizeResponseMiddleware {
@@ -66,7 +71,16 @@ impl FinalizeResponseMiddleware {
             settings,
             geo,
             services,
+            registry: None,
         }
+    }
+
+    /// The registry whose selected prefix module names each request's
+    /// publisher prefixes.
+    #[must_use]
+    pub fn with_registry(mut self, registry: Arc<IntegrationRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
     }
 }
 
@@ -78,6 +92,20 @@ impl Middleware for FinalizeResponseMiddleware {
             |info| info.client_ip,
         );
         let path = ctx.request().uri().path().to_owned();
+        // The publisher this request resolved to names the keys the geo
+        // module's answers are held under, so the services carry its prefixes.
+        let client = ctx
+            .request()
+            .extensions()
+            .get::<ClientInfo>()
+            .cloned()
+            .unwrap_or_default();
+        let services = match &self.registry {
+            Some(registry) => self.services.clone().with_prefixes(
+                registry.prefixes(&self.settings, ModuleRequest::of(ctx.request(), &client)),
+            ),
+            None => self.services.clone(),
+        };
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -88,7 +116,7 @@ impl Middleware for FinalizeResponseMiddleware {
         };
 
         let geo_info = if geo_allowed_for_response(&response) {
-            let services = self.services.clone().with_client_info(ClientInfo {
+            let services = services.clone().with_client_info(ClientInfo {
                 client_ip,
                 ..ClientInfo::default()
             });
