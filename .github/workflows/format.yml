@@ -154,5 +154,11 @@ jobs:
       - name: Run Prettier (check)
         run: npm run format
 
+      - name: Run Prettier (check) — Markdown outside docs/
+        working-directory: .
+        run: >-
+          docs/node_modules/.bin/prettier --config docs/.prettierrc --check
+          "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"
+
       - name: Build with VitePress (fails on dead links)
         run: npm run build
