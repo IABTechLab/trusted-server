@@ -18,7 +18,7 @@ use crate::output;
 /// is `on` or `off`. A missing third line is tolerated when reading (treated as
 /// `on` if a URL is present, else `off`) for forward-compatibility with the
 /// earlier two-line format.
-const SAFARI_RESTORE_FILE: &str = "safari-proxy-restore";
+pub(super) const SAFARI_RESTORE_FILE: &str = "safari-proxy-restore";
 
 /// Generates a PAC script that proxies only `https://` requests for matched FROM hosts.
 ///
