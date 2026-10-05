@@ -55,7 +55,7 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_EIDS, COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -1714,6 +1714,22 @@ fn deferred_inline_seam_token(
     })
 }
 
+/// The public prefix of the publisher a page is served for, from the selected
+/// prefix module, which the page's bundle tag tells the client script.
+fn page_public_prefix(
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    request_host: &str,
+    request_scheme: &str,
+    request_path: &str,
+) -> crate::prefix::PublicPrefix {
+    let request = ModuleRequest::new(&Method::GET, request_host, request_scheme, request_path);
+    integration_registry
+        .prefixes(settings, request)
+        .public()
+        .clone()
+}
+
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
@@ -1749,6 +1765,13 @@ fn create_html_stream_processor(
         .with_request_state(params.request_state)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
+        .with_public_prefix(page_public_prefix(
+            params.settings,
+            params.integration_registry,
+            params.request_host,
+            params.request_scheme,
+            params.request_path,
+        ))
         .with_prepared(params.prepared);
 
     // The middleware of the first [[fetch]] entry covering this path. What
@@ -2456,12 +2479,20 @@ fn assemble_if_shared(
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
-fn template_fingerprint(settings: &Settings, integration_registry: &IntegrationRegistry) -> String {
+fn template_fingerprint(
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    public_prefix: &crate::prefix::PublicPrefix,
+) -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
     hasher
         .update(crate::tsjs_bundle::compose_hash(&integration_registry.js_parts_all()).as_bytes());
+    // The bundle tag carries the public prefix, and a change to the selected
+    // module can change it with nothing in the settings changing.
+    hasher.update(public_prefix.as_str().as_bytes());
+    hasher.update([0]);
     // EdgeZero's canonical form sorts object keys itself, so independently deserialized
     // HashMaps hash identically even when a dependency enables `serde_json/preserve_order`.
     // Array order is preserved: set-valued settings must serialize deterministically
@@ -5093,12 +5124,18 @@ pub async fn handle_publisher_request(
                 config.origin_is_cookie_independent(),
             )
         });
+    // A key cookie naming one of this request's own identity cookies would
+    // make the template one reader's, so such a request shares none.
+    let identity =
+        crate::cookies::template_cache_policy::identity_cookies(services.public_prefix());
+    let keys_an_identity = key_cookie_names.iter().any(|name| identity.contains(name));
     let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
         req.headers(),
         key_cookie_names,
         bypass_cookie_names,
         cookie_independent,
     ) {
+        _ if keys_an_identity => (true, Vec::new()),
         TemplateCookieDecision::Bypass => (true, Vec::new()),
         TemplateCookieDecision::Eligible(values) => (false, values),
     };
@@ -5231,6 +5268,13 @@ pub async fn handle_publisher_request(
         } else {
             String::new()
         };
+    let page_public_prefix = page_public_prefix(
+        settings,
+        integration_registry,
+        request_host,
+        request_scheme,
+        target_uri.path(),
+    );
     let template_cache_key =
         request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
             url: target_uri.to_string(),
@@ -5253,7 +5297,11 @@ pub async fn handle_publisher_request(
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
             cookie_values,
-            template_fingerprint: template_fingerprint(settings, integration_registry),
+            template_fingerprint: template_fingerprint(
+                settings,
+                integration_registry,
+                &page_public_prefix,
+            ),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
@@ -5262,9 +5310,11 @@ pub async fn handle_publisher_request(
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
-    let eid_cookie_may_need_persistence = cookie_jar
-        .as_ref()
-        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+    let eid_cookie_may_need_persistence = cookie_jar.as_ref().is_some_and(|jar| {
+        jar.get(&services.public_prefix().cookie_name(COOKIE_EIDS))
+            .is_some()
+            || jar.get(COOKIE_SHAREDID).is_some()
+    });
     // This decision also gates the concurrent origin send below. A marker skip
     // cannot currently delay the origin behind an auction because marker
     // validation requires a non-empty registry, and every such auction sets
@@ -6103,7 +6153,7 @@ fn apply_auction_eids_and_device(
 ) {
     let ts_eids_value = targeting
         .cookie_jar
-        .and_then(|j| j.get(COOKIE_TS_EIDS))
+        .and_then(|j| j.get(&targeting.services.public_prefix().cookie_name(COOKIE_EIDS)))
         .map(|c| c.value().to_owned());
     let client_eids = if targeting.ec_id.is_some() {
         resolve_client_auction_eids(None, ts_eids_value.as_deref())
@@ -9992,6 +10042,7 @@ mod tests {
 
             let config = HtmlProcessorConfig {
                 csp_nonce_observed: None,
+                public_prefix: None,
                 prepared: Arc::new(Prepared::default()),
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
@@ -10265,7 +10316,24 @@ mod tests {
         fn fingerprint(settings: &Settings) -> String {
             let registry =
                 IntegrationRegistry::new(settings).expect("should create integration registry");
-            template_fingerprint(settings, &registry)
+            template_fingerprint(settings, &registry, &crate::prefix::PublicPrefix::default())
+        }
+
+        /// A stored page carries the public prefix on its bundle tag, so a page
+        /// stored under one prefix is never served under another.
+        #[test]
+        fn a_stored_page_is_keyed_by_the_public_prefix() {
+            let settings = crate::test_support::tests::create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let key = |public: &crate::prefix::PublicPrefix| {
+                template_fingerprint(&settings, &registry, public)
+            };
+
+            assert_ne!(
+                key(&crate::prefix::PublicPrefix::default()),
+                key(&crate::prefix::PublicPrefix::new(["_ex"]).expect("should accept the prefix"))
+            );
         }
 
         /// A browser module a vendor crate carries, before its rebuild.
@@ -10325,7 +10393,7 @@ mod tests {
             .with_module_name("testing.probe")];
             let registry = IntegrationRegistry::with_registrations(settings, &extra)
                 .expect("should build a registry with a carried module");
-            template_fingerprint(settings, &registry)
+            template_fingerprint(settings, &registry, &crate::prefix::PublicPrefix::default())
         }
 
         /// Base settings with one integration, core's stand-in, configured a
@@ -10447,13 +10515,18 @@ mod tests {
             );
             let first = Settings::from_toml(&source).expect("should parse context allowlist");
             let registry = test_registry(&create_test_settings());
-            let expected = template_fingerprint(&first, &registry);
+            let expected =
+                template_fingerprint(&first, &registry, &crate::prefix::PublicPrefix::default());
 
             for _ in 0..32 {
                 let settings =
                     Settings::from_toml(&source).expect("should reparse context allowlist");
                 assert_eq!(
-                    template_fingerprint(&settings, &registry),
+                    template_fingerprint(
+                        &settings,
+                        &registry,
+                        &crate::prefix::PublicPrefix::default()
+                    ),
                     expected,
                     "should fingerprint independently parsed allowlists identically"
                 );
@@ -11190,6 +11263,28 @@ mod tests {
         /// Shareable HTML: no `Set-Cookie`, no `Vary`, a public `Cache-Control`. Every
         /// condition the gate checks is satisfied, so a bypass here would be a bug in
         /// the wiring rather than in the fixture.
+        /// The client script holds no copy of the public prefix, so every
+        /// page tells it on the bundle tag, a stored page and a fresh one
+        /// alike, and with no prefix module selected that is `ts`.
+        #[tokio::test]
+        async fn a_page_tells_the_client_script_the_public_prefix() {
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode(mode));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+
+                let page = body_of(run(&settings, &services, navigation_request()).await).await;
+
+                let page = String::from_utf8_lossy(&page);
+                assert!(
+                    page.contains(r#"data-ts-public-prefix="ts""#),
+                    "{mode}: {page}"
+                );
+            }
+        }
+
         fn queue_shareable_html(stub: &StubHttpClient) {
             stub.push_response_with_headers(
                 200,
@@ -14598,6 +14693,41 @@ mod tests {
             Arc::new(settings)
         }
 
+        /// The settings check refuses a key cookie named as core's own identity
+        /// cookies are. A deployment's own prefix is known only on a request,
+        /// so a key cookie naming this request's Edge Cookie shares no
+        /// template.
+        #[tokio::test]
+        async fn a_key_cookie_naming_the_requests_edge_cookie_shares_no_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = cookie_policy_settings(Some(&["_ex-ec"]), None, true);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache)).with_prefixes(
+                crate::prefix::Prefixes::new(
+                    crate::prefix::PublicPrefix::new(["_ex"]).expect("should accept the prefix"),
+                    crate::platform::ServerKeyPrefix::new("ex", "test-publisher.com"),
+                ),
+            );
+            queue_shareable_html(&stub);
+
+            let response = run(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"_ex-ec=reader"]),
+            )
+            .await;
+
+            assert_eq!(
+                response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "bypass-request"
+            );
+            let _ = body_of(response).await;
+            assert!(
+                stored_cache_keys(&cache).is_empty(),
+                "a reader's identifier must never key a stored template"
+            );
+        }
+
         fn cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
             let mut request = navigation_request();
             for field in fields {
@@ -15213,13 +15343,13 @@ mod tests {
             // fingerprints differ on is the cookie policy.
             let registry = test_registry(&first);
             assert_ne!(
-                template_fingerprint(&first, &registry),
-                template_fingerprint(&second, &registry),
+                template_fingerprint(&first, &registry, &crate::prefix::PublicPrefix::default()),
+                template_fingerprint(&second, &registry, &crate::prefix::PublicPrefix::default()),
                 "should fingerprint the key policy"
             );
             assert_ne!(
-                template_fingerprint(&second, &registry),
-                template_fingerprint(&third, &registry),
+                template_fingerprint(&second, &registry, &crate::prefix::PublicPrefix::default()),
+                template_fingerprint(&third, &registry, &crate::prefix::PublicPrefix::default()),
                 "should fingerprint the bypass policy"
             );
             let stub = Arc::new(StubHttpClient::new());

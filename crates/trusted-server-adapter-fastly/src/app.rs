@@ -104,7 +104,7 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::constants::{COOKIE_EIDS, COOKIE_SHAREDID};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
@@ -650,7 +650,8 @@ async fn build_ec_request_state(
         );
     }
 
-    let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
+    let eids_cookie =
+        crate::extract_cookie_value(req, &services.public_prefix().cookie_name(COOKIE_EIDS));
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
     let (ec_context, setup_error) =
@@ -810,7 +811,14 @@ async fn execute_named(
     if matches!(handler, NamedRouteHandler::Data) {
         let kv = crate::maybe_identity_graph(&state.settings);
         let response = request_module(&state.settings.ec, &services)
-            .and_then(|module| handle_data(kv.as_ref(), module.as_deref(), &req))
+            .and_then(|module| {
+                handle_data(
+                    kv.as_ref(),
+                    module.as_deref(),
+                    services.public_prefix(),
+                    &req,
+                )
+            })
             .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
@@ -885,8 +893,12 @@ async fn run_named_route(
                 )
             }
         }
-        NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
-        NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::SetTester => {
+            handle_set_tester(&state.settings, services.public_prefix())
+        }
+        NamedRouteHandler::ClearTester => {
+            handle_clear_tester(&state.settings, services.public_prefix())
+        }
         NamedRouteHandler::Permissions => {
             unreachable!("the permissions are answered before EC setup")
         }
@@ -977,7 +989,8 @@ async fn run_named_route(
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser;
-    let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let eids_cookie =
+        crate::extract_cookie_value(&req, &services.public_prefix().cookie_name(COOKIE_EIDS));
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {

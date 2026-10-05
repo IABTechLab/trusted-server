@@ -787,10 +787,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         // /_ts/data, what is held against the request's own Edge Cookie. This
         // adapter keeps no identity graph, so the page says nothing is held.
-        let data_handler = move |ctx: RequestContext| async move {
-            Ok::<Response, EdgeError>(
-                handle_data(None, None, &ctx.into_request()).unwrap_or_else(|e| http_error(&e)),
-            )
+        let s = Arc::clone(&state);
+        let data_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let services = s.services_for_request(&ctx);
+                Ok::<Response, EdgeError>(
+                    handle_data(None, None, services.public_prefix(), &ctx.into_request())
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
+            }
         };
 
         // /verify-signature

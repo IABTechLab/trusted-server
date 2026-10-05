@@ -21,6 +21,9 @@
 //! | first-party storage | [`PublicPrefix::storage_key`] | `ts-evidence` | `_ex.www.example.com-evidence` |
 //! | script global | [`PublicPrefix::script_global`] | `ts` | `_ex_www_example_com` |
 //! | store key | [`ServerKeyPrefix::as_str`] | `ts.example.com` | as its module gives it |
+//!
+//! The page's client script is told the public prefix on its bundle tag rather
+//! than holding a copy, see [`PUBLIC_PREFIX_ATTRIBUTE`].
 
 use core::fmt;
 use std::sync::Arc;
@@ -38,6 +41,10 @@ pub const TRUSTED_SERVER_MODULE: &str = "ts";
 
 /// The head of every name core's own module gives.
 const TRUSTED_SERVER_HEAD: &str = "ts";
+
+/// The bundle tag attribute that tells the client script the public prefix,
+/// so the script writes the deployment's names and holds no copy of its own.
+pub const PUBLIC_PREFIX_ATTRIBUTE: &str = "data-ts-public-prefix";
 
 /// The start of every name the browser holds for a publisher, such as `_ex`.
 ///
@@ -134,6 +141,14 @@ impl PublicPrefix {
             })
             .collect::<Vec<_>>()
             .join("_")
+    }
+}
+
+/// Core's own, `ts`, for a value no request resolved, such as a default
+/// Edge Cookie state.
+impl Default for PublicPrefix {
+    fn default() -> Self {
+        TrustedServerPrefix::public()
     }
 }
 

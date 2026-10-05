@@ -152,15 +152,17 @@ pub async fn handle_ec_resolve(
     // Check every response header the module asked for against core's
     // reserved surface, exactly as the organic generation path does in
     // `EcContext::generate_with_module`. A module may set its own cookies
-    // and headers, but not a managed `ts-` cookie, a header in the `x-ts-`
+    // and headers, but not a cookie under the public prefix, a header in the `x-ts-`
     // namespace, or a framing or hop-by-hop header. Without this a
-    // browser-side module could set `ts-ec` itself and walk straight past
+    // browser-side module could set the Edge Cookie itself and walk straight past
     // the identifier bounds, the conflict check and the row-before-cookie
     // rule below. The check sits before the identifier is read because a
     // module can return headers with no identifier at all, which is the
     // 204 path, and that path applies headers too.
     for (name, value) in &generated.response_headers {
-        if let Some(effect) = super::module::reserved_response_effect(name, value) {
+        if let Some(effect) =
+            super::module::reserved_response_effect(name, value, services.public_prefix())
+        {
             return Err(Report::new(TrustedServerError::EdgeCookie {
                 message: format!(
                     "Module `{}` returned a response header `{name}` that {effect}",
@@ -241,11 +243,11 @@ pub async fn handle_ec_resolve(
     // carry, which a replacing write would drop.
     apply_module_response_headers(response.headers_mut(), generated.response_headers);
 
-    set_ec_cookie(settings, &mut response, &ec_id);
+    set_ec_cookie(settings, services.public_prefix(), &mut response, &ec_id);
     // The Edge Cookie is HttpOnly, so the page script cannot see it; the
     // non-HttpOnly marker tells the script the resolve succeeded so it does
     // not post again on every page view.
-    set_resolved_marker_cookie(settings, &mut response);
+    set_resolved_marker_cookie(settings, services.public_prefix(), &mut response);
 
     Ok(response)
 }
@@ -677,7 +679,7 @@ mod tests {
 
         let err = outcome.expect_err("a managed cookie effect should fail the request");
         assert!(
-            format!("{err:?}").contains("ts-` namespace"),
+            format!("{err:?}").contains("namespace the public prefix starts"),
             "the failure should name the reserved effect, got {err:?}"
         );
     }

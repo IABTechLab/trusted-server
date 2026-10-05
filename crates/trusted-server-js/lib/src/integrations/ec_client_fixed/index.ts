@@ -15,13 +15,15 @@
 // only. A real client-cycle module posts and verifies a real payload (for
 // example an OWID signature) instead of a shared constant.
 import { log } from '../../core/log';
+import { cookieName } from '../../shared/public_prefix';
 
 const RESOLVE_ENDPOINT = '/_ts/api/v1/ec/resolve';
 
-// The non-HttpOnly companion the server sets alongside the Edge Cookie. Must
-// match COOKIE_TS_EC_RESOLVED in crates/trusted-server-core/src/constants.rs;
+// The non-HttpOnly companion the server sets alongside the Edge Cookie, named
+// after the public prefix the page's bundle tag carries, such as `ts-ecr`.
+// Must match COOKIE_EC_RESOLVED in crates/trusted-server-core/src/constants.rs;
 // a Rust test asserts the two stay in sync.
-const MARKER_COOKIE_NAME = 'ts-ecr';
+const MARKER_COOKIE = 'ecr';
 
 // The fixed, known word shared with the server. Must match EXPECTED_VALUE in
 // crates/trusted-server-core/src/ec/module.rs; a Rust test asserts the two
@@ -54,20 +56,25 @@ export async function requiredPermissionIsSet(): Promise<boolean> {
 // Returns true when the resolved marker is present in `cookieString`. The Edge
 // Cookie itself is HttpOnly and never appears in `document.cookie`, so the
 // marker is the only signal the page has.
-export function hasResolvedMarker(cookieString: string): boolean {
-  return cookieString.split(';').some((part) => part.trim().startsWith(`${MARKER_COOKIE_NAME}=`));
+export function hasResolvedMarker(cookieString: string, marker: string): boolean {
+  return cookieString.split(';').some((part) => part.trim().startsWith(`${marker}=`));
 }
 
 // Posts the fixed known word to the resolve endpoint when no resolved marker is
 // present and the required permission is set. Returns the word posted, or null
 // when nothing was sent or the post failed (a resolve already succeeded, the
-// required permission is not set, the environment lacks `document`/`fetch`, or
-// the request threw).
+// page names no public prefix, the required permission is not set, the
+// environment lacks `document`/`fetch`, or the request threw).
 export async function resolveEdgeCookie(): Promise<string | null> {
   if (typeof document === 'undefined' || typeof fetch !== 'function') {
     return null;
   }
-  if (hasResolvedMarker(document.cookie)) {
+  const marker = cookieName(MARKER_COOKIE);
+  if (!marker) {
+    log.info('ec client_fixed: the page names no public prefix, not posting');
+    return null;
+  }
+  if (hasResolvedMarker(document.cookie, marker)) {
     return null;
   }
   if (!(await requiredPermissionIsSet())) {

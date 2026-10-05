@@ -878,8 +878,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         // What is held against the request's own Edge Cookie. This adapter
         // keeps no identity graph, so the page says nothing is held.
-        let data = make_handler(Arc::clone(&state), |_s, _services, req| async move {
-            handle_data(None, None, &req)
+        let data = make_handler(Arc::clone(&state), |_s, services, req| async move {
+            handle_data(None, None, services.public_prefix(), &req)
         });
         router = router.route(DATA_PAGE_PATH, Method::GET, data);
 

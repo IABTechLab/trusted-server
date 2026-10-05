@@ -62,7 +62,8 @@ const CONTENT_SECURITY_POLICY: &str = "sandbox; default-src 'none'; style-src 'u
 ///
 /// `kv` is the identity graph the deployment keeps, or `None` when it keeps
 /// none, and `module` is the Edge Cookie module it selects. The record is the
-/// one stored against the identifier in the request's own `ts-ec` cookie.
+/// one stored against the identifier in the request's own Edge Cookie, named
+/// after `public`, the request's public prefix.
 /// Nothing is created or written for the reader.
 ///
 /// # Errors
@@ -72,6 +73,7 @@ const CONTENT_SECURITY_POLICY: &str = "sandbox; default-src 'none'; style-src 'u
 pub fn handle_data(
     kv: Option<&KvIdentityGraph>,
     module: Option<&dyn EdgeCookieModule>,
+    public: &crate::prefix::PublicPrefix,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     if !is_opened_as_a_page(req) {
@@ -86,7 +88,7 @@ pub fn handle_data(
             "This deployment keeps no record against an Edge Cookie.",
         )));
     };
-    let Some(ec_id) = crate::ec::request_cookie_ec(req)? else {
+    let Some(ec_id) = crate::ec::request_cookie_ec(req, public)? else {
         return Ok(page(&nothing_held(
             "The request carried no Edge Cookie, so there is nothing to look up.",
         )));
@@ -303,6 +305,7 @@ mod tests {
             let response = handle_data(
                 Some(&graph),
                 Some(&module),
+                &crate::prefix::PublicPrefix::default(),
                 &request(Some(&cookie), mode, dest),
             )
             .expect("should answer");
@@ -322,6 +325,7 @@ mod tests {
         let response = handle_data(
             Some(&graph),
             Some(&module),
+            &crate::prefix::PublicPrefix::default(),
             &opened_as_a_page(Some(&cookie)),
         )
         .expect("should answer");
@@ -341,6 +345,7 @@ mod tests {
         let response = handle_data(
             Some(&graph),
             Some(&module),
+            &crate::prefix::PublicPrefix::default(),
             &opened_as_a_page(Some(&cookie)),
         )
         .expect("should answer");
@@ -395,6 +400,7 @@ mod tests {
             handle_data(
                 Some(&graph),
                 Some(&module),
+                &crate::prefix::PublicPrefix::default(),
                 &opened_as_a_page(Some(&cookie)),
             )
             .expect("should answer"),
@@ -598,8 +604,13 @@ mod tests {
                 "holds no record against the request",
             ),
         ] {
-            let response =
-                handle_data(kv, Some(&module), &opened_as_a_page(cookie)).expect("should answer");
+            let response = handle_data(
+                kv,
+                Some(&module),
+                &crate::prefix::PublicPrefix::default(),
+                &opened_as_a_page(cookie),
+            )
+            .expect("should answer");
 
             assert_eq!(response.status(), StatusCode::OK, "{why}");
             let html = body_text(response);
@@ -621,6 +632,7 @@ mod tests {
         let result = handle_data(
             Some(&graph),
             Some(&module),
+            &crate::prefix::PublicPrefix::default(),
             &opened_as_a_page(Some(&cookie)),
         );
 
@@ -638,12 +650,14 @@ mod tests {
         let answered = handle_data(
             Some(&graph),
             Some(&module),
+            &crate::prefix::PublicPrefix::default(),
             &opened_as_a_page(Some(&cookie)),
         )
         .expect("should answer");
         let refused = handle_data(
             Some(&graph),
             Some(&module),
+            &crate::prefix::PublicPrefix::default(),
             &request(Some(&cookie), None, None),
         )
         .expect("should answer");

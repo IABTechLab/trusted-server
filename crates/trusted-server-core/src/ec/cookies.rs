@@ -1,6 +1,7 @@
 //! EC cookie creation and expiration helpers.
 //!
-//! These functions handle the `Set-Cookie` header for the `ts-ec` cookie.
+//! These functions handle the `Set-Cookie` header for the Edge Cookie, named
+//! `<public prefix>-ec`, such as `ts-ec`.
 //! Cookie attributes follow current best practices:
 //!
 //! - `Domain` is computed as `.{publisher.domain}` for subdomain coverage
@@ -16,7 +17,8 @@
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Response, header};
 
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_RESOLVED};
+use crate::constants::{COOKIE_EC, COOKIE_EC_RESOLVED};
+use crate::prefix::PublicPrefix;
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
@@ -49,9 +51,10 @@ pub(crate) fn ec_id_has_only_allowed_chars(ec_id: &str) -> bool {
 ///
 /// Centralises the cookie attribute string so that changes to security
 /// attributes (e.g. adding `Partitioned`) only need updating in one place.
-fn format_set_cookie(domain: &str, value: &str, max_age: i32) -> String {
+fn format_set_cookie(public: &PublicPrefix, domain: &str, value: &str, max_age: i32) -> String {
     format!(
-        "{COOKIE_TS_EC}={value}; Domain={domain}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly",
+        "{}={value}; Domain={domain}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly",
+        public.cookie_name(COOKIE_EC),
     )
 }
 
@@ -64,8 +67,9 @@ fn format_set_cookie(domain: &str, value: &str, max_age: i32) -> String {
 /// an identifier is rejected outright rather than rewritten, so the cookie
 /// value and the identity-graph key can never silently diverge.
 #[must_use]
-pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
+pub(crate) fn create_ec_cookie(settings: &Settings, public: &PublicPrefix, ec_id: &str) -> String {
     format_set_cookie(
+        public,
         &settings.publisher.ec_cookie_domain(),
         ec_id,
         COOKIE_MAX_AGE,
@@ -82,7 +86,12 @@ pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 /// controlled ID value.
 ///
 /// `cookie_domain` comes from operator configuration and is considered trusted.
-pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_id: &str) {
+pub fn set_ec_cookie(
+    settings: &Settings,
+    public: &PublicPrefix,
+    response: &mut Response<EdgeBody>,
+    ec_id: &str,
+) {
     if !ec_id_has_only_allowed_chars(ec_id) {
         log::error!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes is empty, over {} bytes, or \
@@ -93,7 +102,7 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
         return;
     }
 
-    match HeaderValue::from_str(&create_ec_cookie(settings, ec_id)) {
+    match HeaderValue::from_str(&create_ec_cookie(settings, public, ec_id)) {
         Ok(val) => {
             response.headers_mut().append(header::SET_COOKIE, val);
         }
@@ -110,8 +119,13 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
 ///
 /// Used when a user revokes consent — the browser will delete the cookie
 /// on receipt of this header.
-pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
+pub fn expire_ec_cookie(
+    settings: &Settings,
+    public: &PublicPrefix,
+    response: &mut Response<EdgeBody>,
+) {
     match HeaderValue::from_str(&format_set_cookie(
+        public,
         &settings.publisher.ec_cookie_domain(),
         "",
         0,
@@ -127,7 +141,7 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
     }
     // Expire the resolved marker together with the Edge Cookie, so a page
     // whose visitor later re-establishes the permission can resolve again.
-    expire_ec_resolved_marker(settings, response);
+    expire_ec_resolved_marker(settings, public, response);
 }
 
 /// Expires the resolved marker on its own, leaving the Edge Cookie alone.
@@ -141,9 +155,14 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
 /// rather than a restarted one. Expiring the marker whenever the incoming
 /// value is not one the selected module owns restarts the cycle without
 /// depending on any vendor page script comparing a marker value correctly.
-pub fn expire_ec_resolved_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
+pub fn expire_ec_resolved_marker(
+    settings: &Settings,
+    public: &PublicPrefix,
+    response: &mut Response<EdgeBody>,
+) {
     let marker = format!(
-        "{COOKIE_TS_EC_RESOLVED}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        "{}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        public.cookie_name(COOKIE_EC_RESOLVED),
         settings.publisher.ec_cookie_domain(),
     );
     match HeaderValue::from_str(&marker) {
@@ -165,9 +184,14 @@ pub fn expire_ec_resolved_marker(settings: &Settings, response: &mut Response<Ed
 /// succeeded. It shares the Edge Cookie's `Domain`, `Path`, `Secure`,
 /// `SameSite`, and lifetime, and is expired together with it by
 /// [`expire_ec_cookie`].
-pub(crate) fn set_resolved_marker_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
+pub(crate) fn set_resolved_marker_cookie(
+    settings: &Settings,
+    public: &PublicPrefix,
+    response: &mut Response<EdgeBody>,
+) {
     let cookie = format!(
-        "{COOKIE_TS_EC_RESOLVED}=1; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+        "{}=1; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+        public.cookie_name(COOKIE_EC_RESOLVED),
         settings.publisher.ec_cookie_domain(),
     );
     match HeaderValue::from_str(&cookie) {
@@ -230,6 +254,30 @@ mod tests {
             .expect("should build test response")
     }
 
+    /// Every cookie this file writes takes the request's public prefix, so a
+    /// deployment's own names replace `ts` throughout.
+    #[test]
+    fn each_cookie_is_named_after_the_public_prefix() {
+        let settings = create_test_settings();
+        let public = PublicPrefix::new(["_ex"]).expect("should accept the prefix");
+        let mut response = empty_response();
+
+        set_ec_cookie(&settings, &public, &mut response, TEST_EC_ID);
+        set_resolved_marker_cookie(&settings, &public, &mut response);
+        expire_ec_cookie(&settings, &public, &mut response);
+
+        let names: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                let text = value.to_str().expect("should be valid UTF-8");
+                text.split('=').next().unwrap_or_default().to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["_ex-ec", "_ex-ecr", "_ex-ec", "_ex-ecr"]);
+    }
+
     /// A valid EC ID for use in cookie tests.
     const TEST_EC_ID: &str =
         "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffff0000000011111111.abcXYZ";
@@ -237,13 +285,13 @@ mod tests {
     #[test]
     fn create_ec_cookie_uses_computed_domain() {
         let settings = create_test_settings();
-        let result = create_ec_cookie(&settings, TEST_EC_ID);
+        let result = create_ec_cookie(&settings, &PublicPrefix::default(), TEST_EC_ID);
 
         assert_eq!(
             result,
             format!(
-                "{}={}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
-                COOKIE_TS_EC, TEST_EC_ID, settings.publisher.domain, COOKIE_MAX_AGE,
+                "ts-ec={}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
+                TEST_EC_ID, settings.publisher.domain, COOKIE_MAX_AGE,
             ),
             "should use computed cookie domain (.{{domain}})"
         );
@@ -267,7 +315,7 @@ mod tests {
         ] {
             let mut response = empty_response();
 
-            set_ec_cookie(&settings, &mut response, value);
+            set_ec_cookie(&settings, &PublicPrefix::default(), &mut response, value);
 
             let cookie = response
                 .headers()
@@ -278,12 +326,16 @@ mod tests {
             assert_eq!(
                 cookie,
                 format!(
-                    "{}={value}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
-                    COOKIE_TS_EC, settings.publisher.domain, COOKIE_MAX_AGE,
+                    "ts-ec={value}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
+                    settings.publisher.domain, COOKIE_MAX_AGE,
                 ),
                 "{case}"
             );
-            assert_eq!(cookie, create_ec_cookie(&settings, value), "{case}");
+            assert_eq!(
+                cookie,
+                create_ec_cookie(&settings, &PublicPrefix::default(), value),
+                "{case}"
+            );
         }
     }
 
@@ -304,7 +356,7 @@ mod tests {
         ] {
             let mut response = empty_response();
 
-            set_ec_cookie(&settings, &mut response, value);
+            set_ec_cookie(&settings, &PublicPrefix::default(), &mut response, value);
 
             assert!(
                 response.headers().get(header::SET_COOKIE).is_none(),
@@ -317,7 +369,7 @@ mod tests {
     fn expire_ec_cookie_sets_max_age_zero() {
         let settings = create_test_settings();
         let mut response = empty_response();
-        expire_ec_cookie(&settings, &mut response);
+        expire_ec_cookie(&settings, &PublicPrefix::default(), &mut response);
 
         let cookie_header = response
             .headers()
@@ -330,7 +382,7 @@ mod tests {
             "should set Max-Age=0 to expire cookie"
         );
         assert!(
-            cookie_str.starts_with(&format!("{COOKIE_TS_EC}=;")),
+            cookie_str.starts_with("ts-ec=;"),
             "should clear cookie value"
         );
         assert!(
@@ -343,7 +395,7 @@ mod tests {
     fn expire_ec_cookie_matches_security_attributes() {
         let settings = create_test_settings();
         let mut response = empty_response();
-        expire_ec_cookie(&settings, &mut response);
+        expire_ec_cookie(&settings, &PublicPrefix::default(), &mut response);
 
         let cookie_header = response
             .headers()
@@ -354,8 +406,8 @@ mod tests {
         assert_eq!(
             cookie_str,
             format!(
-                "{}=; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
-                COOKIE_TS_EC, settings.publisher.domain,
+                "ts-ec=; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
+                settings.publisher.domain,
             ),
             "expiry cookie should retain the same security attributes as the live cookie"
         );

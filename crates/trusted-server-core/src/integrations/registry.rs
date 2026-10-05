@@ -3817,7 +3817,7 @@ mod tests {
         PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, probe_registration, validate_nothing,
     };
     use super::*;
-    use crate::constants::COOKIE_TS_EC;
+    use crate::constants::COOKIE_EC;
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewareAction, MiddlewareContext, PhaseEntry};
     use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
@@ -4585,8 +4585,7 @@ mod tests {
         req.headers_mut().insert(
             header::COOKIE,
             HeaderValue::from_str(&format!(
-                "{}={}",
-                COOKIE_TS_EC,
+                "ts-{COOKIE_EC}={}",
                 crate::test_support::tests::VALID_SYNTHETIC_ID
             ))
             .expect("should build Cookie header"),

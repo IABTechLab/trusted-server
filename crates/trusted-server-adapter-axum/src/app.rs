@@ -576,7 +576,9 @@ fn named_route_handler(
                         handle_permissions(&state.settings, &services, &req).await
                     }
                     NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
-                    NamedRouteHandler::Data => handle_data(None, None, &req),
+                    NamedRouteHandler::Data => {
+                        handle_data(None, None, services.public_prefix(), &req)
+                    }
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
