@@ -62,6 +62,7 @@ pub mod proxy;
 pub mod publisher;
 pub mod redacted;
 pub mod request_signing;
+pub(crate) mod response_header_rewrite;
 pub mod response_privacy;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;

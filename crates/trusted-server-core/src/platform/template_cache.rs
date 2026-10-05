@@ -37,7 +37,8 @@ use crate::creative_opportunities::AssemblyMode;
 /// | 3       | Marker became `<!--ts-c2-v3-seam-7f4c9e2d-bids-->`; canonical collision-safe key, explicit origin freshness, and complete repeated document-policy metadata |
 /// | 4       | Marker is the shorter, accurate [`AD_ASSEMBLY_SEAM`](crate::publisher::AD_ASSEMBLY_SEAM) |
 /// | 5       | Key gained `request_path`, so entries from version 4 hash differently and must not be read |
-pub const TEMPLATE_SCHEMA_VERSION: u32 = 5;
+/// | 6       | Replayed CSP and `Link` policy metadata maps publisher-origin URLs to the serving host |
+pub const TEMPLATE_SCHEMA_VERSION: u32 = 6;
 
 /// Surrogate key attached to every template so an incident can purge the template cache globally.
 pub const TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
@@ -1049,9 +1050,9 @@ mod tests {
         let rendered = key().to_cache_key();
         assert_eq!(
             rendered,
-            "ts-template-cache-v5-499cb43a3160fe173ffa53ea0b999658c8f2c50fbe23818ab451a59f7dc040da"
+            "ts-template-cache-v6-7c9268c385cc2114543f9cf5410d2c792f9ba4deaefb54a40dc3eea685e71d16"
         );
-        assert!(rendered.starts_with("ts-template-cache-v5-"));
+        assert!(rendered.starts_with("ts-template-cache-v6-"));
         assert_eq!(rendered.len(), 85);
         for sensitive in ["example.com", "/news/article", "rsc", "abc123"] {
             assert!(
