@@ -26,24 +26,27 @@ http = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
-# Also in the macOS block for the dev proxy; needed on every host so the probe can install
-# the process-level crypto provider its `-no-provider` reqwest build expects.
-rustls = { workspace = true }
 # Declared directly rather than inherited from the workspace, to control the rustls
 # crypto provider. `reqwest`'s plain `rustls-tls` forces `ring`, and this crate already
-# links `aws-lc-rs` through `reqwest` 0.13 (via `chromiumoxide` and `edgezero-cli`).
+# links `aws-lc-rs` through `reqwest` (via `chromiumoxide` and `edgezero-cli`).
 # Compiling both providers makes rustls's process-level default ambiguous, and it then
 # panics on first use — which broke the dev-proxy tests. The `-no-provider` variant uses
 # whichever provider is already present instead of adding a second.
 #
-# `gzip` so the probe's Accept-Encoding axis compares decoded bytes: reqwest transparently
-# decodes a gzip response, which is what "differ only by content coding" must be tested
-# against.
+# Features: `blocking` for the `ts dev audit headers` origin client (OriginClient uses
+# reqwest::blocking); `gzip`/`json` for the probe's Accept-Encoding axis and JSON bodies.
 reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
     "gzip",
     "json",
     "rustls-tls-webpki-roots-no-provider",
 ] }
+# The `-no-provider` reqwest variant expects the process-level rustls `CryptoProvider`
+# to be installed by the caller. `ts dev proxy` only exists on macOS, so on other hosts
+# nothing else pulls a rustls provider; this pins aws-lc-rs (rustls's default) on every
+# host target so `ts dev audit` can install it before its first HTTPS fetch. On macOS it
+# deduplicates with the proxy's aws-lc-rs — still exactly one provider, so no ambiguity.
+rustls = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
