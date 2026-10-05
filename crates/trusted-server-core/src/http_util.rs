@@ -153,8 +153,9 @@ impl RequestInfo {
     /// before routing. On those paths, `Host` and [`ClientInfo`] TLS detection
     /// are the effective sources. Other adapters retain their existing policy.
     ///
-    /// The selected host must be a DNS name, IPv4 address, or bracketed IPv6
-    /// address, optionally followed by a numeric port. Forwarded-header
+    /// The selected host must be an ASCII hostname (including underscores for
+    /// local service names), IPv4 address, or bracketed IPv6 address, optionally
+    /// followed by a numeric port. Forwarded-header
     /// precedence is unchanged. Requests without any host retain an empty host.
     ///
     /// # Errors
@@ -235,11 +236,11 @@ fn is_valid_request_host(value: &str) -> bool {
             || host.split('.').any(|label| {
                 label.is_empty()
                     || label.len() > 63
-                    || !label.starts_with(|c: char| c.is_ascii_alphanumeric())
-                    || !label.ends_with(|c: char| c.is_ascii_alphanumeric())
+                    || !label.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    || !label.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
                     || !label
                         .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             })
         {
             return false;
@@ -650,6 +651,11 @@ mod tests {
             "example.com:443",
             "localhost:3000",
             "internal-proxy:8080",
+            "my_service:8080",
+            "service_.example.com:8443",
+            "_service.example.com",
+            "_.example.com",
+            "bad_label.example.com",
             "192.0.2.1:8080",
             "[2001:db8::1]",
             "[2001:db8::1]:443",
@@ -693,7 +699,6 @@ mod tests {
             "example.com:+443",
             "example.com:443:80",
             "bad host.example.com",
-            "bad_label.example.com",
             "-bad.example.com",
             "bad-.example.com",
             "example..com",

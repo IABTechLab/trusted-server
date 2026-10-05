@@ -994,7 +994,13 @@ async fn nextjs_gtm_rejects_malformed_request_hosts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
-    for host in ["localhost:3000", "example.com:8443", "[::1]:3000"] {
+    for host in [
+        "localhost:3000",
+        "example.com:8443",
+        "[::1]:3000",
+        "my_service:8080",
+        "_service_.example.com:8443",
+    ] {
         let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
             &nextjs_auction::script_composition_html(),
             false,
