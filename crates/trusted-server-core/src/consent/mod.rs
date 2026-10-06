@@ -545,13 +545,19 @@ fn log_consent_signals(signals: &RawConsentSignals) {
 }
 
 /// Logs a one-time warning when request geolocation is unavailable.
+///
+/// It says what happens next rather than only that geo is missing, because an
+/// operator reading it wants to know whether identity and advertising are
+/// still running. With no location the caller supplies the declared
+/// jurisdiction, which is the permission policy's top node, so they are. A
+/// lookup that fails is the different case, and that one does fail closed.
 fn log_missing_geo_warning_once() {
     if MISSING_GEO_WARNING_LOGGED.swap(true, Ordering::Relaxed) {
         return;
     }
 
     log::warn!(
-        "Geo lookup returned no data; consent jurisdiction will be unknown and EC creation will fail closed"
+        "Geo lookup returned no location, so the jurisdiction is the one the          permission policy declares rather than one resolved from the request.          Country and region rules cannot match. A geo lookup that fails, as          opposed to resolving nothing, is treated as unknown and fails closed."
     );
 }
 
