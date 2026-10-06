@@ -714,22 +714,27 @@ impl PermissionMaps {
     ) -> PermissionState {
         let acquisition =
             |permission| rules.map_or(Acquisition::RequiresSignal, |r| r.rule_for(permission));
-        let set = Permission::all()
-            .filter(|&permission| {
-                // The baseline is passed to the signal as well as applied to
-                // its answer, because a source amends the place rules and
-                // cannot amend what it cannot see.
-                let baseline = acquisition(permission);
-                match (baseline, signal(permission, baseline)) {
-                    (Acquisition::Denied, _) => false,
-                    (Acquisition::Granted, ConsentSignal::Revoke) => false,
-                    (Acquisition::Granted, _) => true,
-                    (Acquisition::RequiresSignal, ConsentSignal::Grant) => true,
-                    (Acquisition::RequiresSignal, _) => false,
+        let mut set = PermissionSet::none();
+        let mut awaiting = PermissionSet::none();
+        for permission in Permission::all() {
+            // The baseline is passed to the signal as well as applied to its
+            // answer, because a source amends the place rules and cannot
+            // amend what it cannot see.
+            let baseline = acquisition(permission);
+            match (baseline, signal(permission, baseline)) {
+                (Acquisition::Denied, _) => {}
+                (Acquisition::Granted, ConsentSignal::Revoke) => {}
+                (Acquisition::Granted, _) => set = set.with(permission),
+                (Acquisition::RequiresSignal, ConsentSignal::Grant) => set = set.with(permission),
+                (Acquisition::RequiresSignal, ConsentSignal::Revoke) => {}
+                // Requires a signal and nobody gave one. Not set, and not
+                // refused either, which the page has to be able to tell apart.
+                (Acquisition::RequiresSignal, ConsentSignal::Neutral) => {
+                    awaiting = awaiting.with(permission);
                 }
-            })
-            .collect();
-        PermissionState::new(set)
+            }
+        }
+        PermissionState::new(set).with_awaiting(awaiting)
     }
 
     /// The baseline permission state for a country and region with no session
@@ -769,6 +774,9 @@ impl PermissionMaps {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionState {
     set: PermissionSet,
+    /// The permissions whose baseline requires a signal and for which no
+    /// configured provider gave one. See [`awaiting`](Self::awaiting).
+    awaiting: PermissionSet,
     /// Whether the request explicitly withdrew device storage, as opposed to
     /// storage merely not being set. See
     /// [`storage_withdrawn`](Self::storage_withdrawn).
@@ -787,9 +795,36 @@ impl PermissionState {
     pub fn new(set: PermissionSet) -> Self {
         Self {
             set,
+            awaiting: PermissionSet::none(),
             storage_withdrawn: false,
             tdls: Arc::default(),
         }
+    }
+
+    /// The same state, recording which permissions are still waiting for a
+    /// signal. Set by resolution from the baseline and the providers' answers.
+    #[must_use]
+    pub fn with_awaiting(self, awaiting: PermissionSet) -> Self {
+        Self { awaiting, ..self }
+    }
+
+    /// The permissions whose baseline requires a signal and for which every
+    /// configured provider answered neutral, so nobody has answered yet.
+    ///
+    /// This is different from a permission that is not set. A refused
+    /// permission and one nobody has answered look the same in
+    /// [`permissions`](Self::permissions), and a page that cannot tell them
+    /// apart treats a prompt that never ran as a visitor who said no. A
+    /// permission is never both set and awaited.
+    #[must_use]
+    pub const fn awaiting(&self) -> PermissionSet {
+        self.awaiting
+    }
+
+    /// Whether a permission is still waiting for a signal.
+    #[must_use]
+    pub const fn is_awaited(&self, permission: Permission) -> bool {
+        self.awaiting.contains(permission)
     }
 
     /// The same state, recording whether device storage was explicitly
@@ -863,12 +898,14 @@ impl PermissionState {
     ///
     /// Names are the [`Permission::as_str`] Data Use identifiers, sorted so the
     /// same state always serializes to the same bytes whatever order the set
-    /// was built in. `tdls` carries the terms documents the data is available
-    /// under, in the order the providers were asked, so a page module reads the
-    /// terms alongside the permissions. An empty state renders as
-    /// `{"set":[],"tdls":[]}`, and both are answers (nothing is set, no terms
-    /// were declared) rather than missing values, so page code never has to
-    /// tell the two apart.
+    /// was built in. `awaiting` names the permissions still waiting for a
+    /// signal, so a page can hold what depends on them rather than read
+    /// "nobody has answered" as "refused". `tdls` carries the terms documents
+    /// the data is available under, in the order the providers were asked, so
+    /// a page module reads the terms alongside the permissions. An empty state
+    /// renders as `{"awaiting":[],"set":[],"tdls":[]}`, and all three are
+    /// answers (nothing is set, nothing is awaited, no terms were declared)
+    /// rather than missing values, so page code never has to tell them apart.
     ///
     /// This is the only place the page shape is spelled, so no caller writes
     /// the JSON by hand.
@@ -885,20 +922,23 @@ impl PermissionState {
     /// );
     /// assert_eq!(
     ///     state.page_json(),
-    ///     r#"{"set":["necessary.operations.storage"],"tdls":[]}"#
+    ///     r#"{"awaiting":[],"set":["necessary.operations.storage"],"tdls":[]}"#
     /// );
     ///
     /// assert_eq!(
     ///     PermissionState::default().page_json(),
-    ///     r#"{"set":[],"tdls":[]}"#
+    ///     r#"{"awaiting":[],"set":[],"tdls":[]}"#
     /// );
     /// ```
     #[must_use]
     pub fn page_json(&self) -> String {
         let mut names: Vec<&'static str> = self.set.iter().map(Permission::as_str).collect();
         names.sort_unstable();
+        let mut awaiting: Vec<&'static str> =
+            self.awaiting.iter().map(Permission::as_str).collect();
+        awaiting.sort_unstable();
         let tdls: Vec<&str> = self.tdls.iter().map(Tdl::as_str).collect();
-        serde_json::json!({ "set": names, "tdls": tdls }).to_string()
+        serde_json::json!({ "set": names, "awaiting": awaiting, "tdls": tdls }).to_string()
     }
 }
 
@@ -1406,6 +1446,7 @@ mod tests {
                     "advertising_marketing.first_party.contextual",
                     "necessary.operations.storage",
                 ],
+                "awaiting": [],
                 "tdls": [],
             })
             .to_string(),
@@ -1431,6 +1472,7 @@ mod tests {
             json,
             json!({
                 "set": ["necessary.operations.storage"],
+                "awaiting": [],
                 "tdls": ["https://terms.example.com/marketing/2.txt"],
             })
             .to_string(),
@@ -1449,9 +1491,62 @@ mod tests {
         // Assert
         assert_eq!(
             json,
-            json!({ "set": [], "tdls": [] }).to_string(),
+            json!({ "set": [], "awaiting": [], "tdls": [] }).to_string(),
             "an empty state should render as an empty set and no declared terms,              not as nothing"
         );
+    }
+
+    #[test]
+    fn a_permission_requiring_a_signal_that_nobody_gave_is_awaited() {
+        // Arrange: the requires-signal floor, where every permission needs a
+        // signal, and providers that answer nothing.
+        let state = PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral);
+
+        // Assert: nothing is set and everything is awaited, which is the
+        // state a page must hold on rather than read as a refusal.
+        assert!(
+            state.permissions().is_empty(),
+            "should set nothing without a signal"
+        );
+        assert!(
+            state.is_awaited(Permission::StoreOnDevice),
+            "should record that storage is still waiting for a signal"
+        );
+        assert_eq!(
+            state.page_json(),
+            json!({
+                "set": [],
+                "awaiting": Permission::all().map(Permission::as_str).collect::<std::collections::BTreeSet<_>>(),
+                "tdls": [],
+            })
+            .to_string(),
+            "the page should be told which permissions are still awaited"
+        );
+    }
+
+    #[test]
+    fn an_answered_or_baselined_permission_is_never_awaited() {
+        // Arrange: the floor again, with a provider that grants storage and
+        // revokes personalised advertising.
+        let state = PermissionMaps::floor_with(|permission, _| match permission {
+            Permission::StoreOnDevice => ConsentSignal::Grant,
+            Permission::SelectPersonalisedAds => ConsentSignal::Revoke,
+            _ => ConsentSignal::Neutral,
+        });
+
+        // Assert: a grant is set and not awaited, a refusal is neither set
+        // nor awaited, and a permission nobody answered is awaited.
+        assert!(state.is_set(Permission::StoreOnDevice));
+        assert!(
+            !state.is_awaited(Permission::StoreOnDevice),
+            "a grant is an answer"
+        );
+        assert!(!state.is_set(Permission::SelectPersonalisedAds));
+        assert!(
+            !state.is_awaited(Permission::SelectPersonalisedAds),
+            "a refusal is an answer too, and must not look like no answer"
+        );
+        assert!(state.is_awaited(Permission::SelectBasicAds));
     }
 
     #[test]

@@ -380,6 +380,11 @@ export interface GptSlotHandoff {
  */
 export interface PermissionsSnapshot {
   set: string[];
+  /**
+   * Permissions still waiting for a signal. Not set, and not refused
+   * either, which page code must tell apart from `set` being empty.
+   */
+  awaiting: string[];
   tdls: string[];
 }
 

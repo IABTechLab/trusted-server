@@ -14,6 +14,7 @@ function normalize(snapshot: PermissionsSnapshot): PermissionsSnapshot {
   return {
     ...snapshot,
     set: Array.isArray(snapshot.set) ? snapshot.set : [],
+    awaiting: Array.isArray(snapshot.awaiting) ? snapshot.awaiting : [],
     tdls: Array.isArray(snapshot.tdls) ? snapshot.tdls : [],
   };
 }
@@ -33,7 +34,7 @@ export function installPermissions(api: TsjsApi): void {
   const injected = api.permissions;
   let current: PermissionsSnapshot = isSnapshot(injected)
     ? normalize(injected)
-    : { set: [], tdls: [] };
+    : { set: [], awaiting: [], tdls: [] };
   let settled = false;
   let resolvePending: (snapshot: PermissionsSnapshot) => void = () => {};
   const pending = new Promise<PermissionsSnapshot>((resolve) => {
@@ -51,7 +52,7 @@ export function installPermissions(api: TsjsApi): void {
       return current;
     },
     set(value: PermissionsSnapshot) {
-      current = isSnapshot(value) ? normalize(value) : { set: [], tdls: [] };
+      current = isSnapshot(value) ? normalize(value) : { set: [], awaiting: [], tdls: [] };
       log.debug('permissions: received', current);
       settle(current);
     },
