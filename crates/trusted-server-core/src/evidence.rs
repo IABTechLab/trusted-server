@@ -16,8 +16,8 @@
 //!
 //! [`RequestInfo`] describes what a request carries, not what code in this
 //! repository happens to read today, so it carries the whole of it whether or
-//! not anything here reads it yet. What a provider may see is not the control.
-//! What a provider may do with what it sees is the control, and that is the
+//! not anything here reads it yet. What a module may see is not the control.
+//! What a module may do with what it sees is the control, and that is the
 //! permission model.
 
 use http::HeaderMap;
@@ -25,9 +25,9 @@ use http::HeaderMap;
 /// Host-computed client signals that are not carried in request headers.
 ///
 /// A host that can compute them supplies an implementation (Fastly exposes the
-/// TLS JA4 and HTTP/2 signals). A provider that needs them takes
+/// TLS JA4 and HTTP/2 signals). A module that needs them takes
 /// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none
-/// the provider cannot be built and the request stops.
+/// the module cannot be built and the request stops.
 pub trait HostSignals: Send + Sync + core::fmt::Debug {
     /// The full JA4 TLS signal, or `None` when unavailable.
     fn ja4(&self) -> Option<&str>;

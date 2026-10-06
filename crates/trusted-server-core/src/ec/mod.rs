@@ -1825,13 +1825,13 @@ pub(crate) mod tests {
             "the identifier should be committed with no client IP available"
         );
         assert_eq!(
-            provider
+            module
                 .seen_client_ip
                 .lock()
                 .expect("should lock the seen client IP")
                 .clone(),
             Some(String::new()),
-            "a host that cannot determine a client IP should hand the provider the documented unavailable value, which is the empty string"
+            "a host that cannot determine a client IP should hand the module the documented unavailable value, which is the empty string"
         );
     }
 

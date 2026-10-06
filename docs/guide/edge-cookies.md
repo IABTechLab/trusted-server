@@ -10,7 +10,7 @@ permit EC use.
 
 Trusted Server is technology. It is neutral on policy. The Edge Cookie gives the deployer a cookie slot and configuration over the surrounding attributes. The deployer determines the policy posture based on the laws and contractual arrangements that apply to their deployment. Privacy outcomes follow from that configuration, not from the cookie mechanism itself.
 
-An Edge Cookie (EC) is a first-party identifier that the built-in provider derives on a first site visit with an HMAC of the client IP address plus a short random suffix, created only when the permission model allows it. It is passed in requests on subsequent visits and activity. Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
+An Edge Cookie (EC) is a first-party identifier that the built-in module derives on a first site visit with an HMAC of the client IP address plus a short random suffix, created only when the permission model allows it. It is passed in requests on subsequent visits and activity. Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
 For full operational onboarding (partner configuration, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
 
@@ -88,11 +88,11 @@ When the required permissions cannot be established for the current request (for
 
 ## Permission Gating
 
-EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie provider advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC provider requires `necessary.operations.storage` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
+EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie module advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC module requires `necessary.operations.storage` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
 
 The Edge Cookie code never reads consent. It checks only whether the required **permission** is set. Consent is one of the sources that _set_ a permission, not something the gate reads directly, so the Edge Cookie logic does not change when a consent framework changes. Two sources combine for each request:
 
-- **A country and region baseline.** The country, and an optional region such as a US state, that the geo provider returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
+- **A country and region baseline.** The country, and an optional region such as a US state, that the geo module returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
 - **Consent and privacy signals.** TCF, GPP, and GPC (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`) decoded from the request and mapped onto permissions as a **grant or a revoke** on top of that baseline. There is no separate consent KV fallback.
 
 Today only `necessary.operations.storage` is resolved this way: its country and region baseline is adjusted by the incoming TCF signal, and the Edge Cookie is created only when the result is set. With no configured default country, an unknown country sets nothing without a signal, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules are configuration rather than core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
@@ -101,30 +101,30 @@ Today only `necessary.operations.storage` is resolved this way: its country and 
 flowchart TD
     Start[Resolve country and region] --> Baseline[Country or region rule,<br/>else the default country]
     Baseline --> Signals[Apply consent/privacy signals<br/>as a grant or revoke]
-    Signals --> Check{Provider's required<br/>permissions all set?}
+    Signals --> Check{Module's required<br/>permissions all set?}
     Check -- "Yes" --> Allow([Create EC])
     Check -- "No" --> Deny([No EC])
 ```
 
 The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, withdrawal tombstones, and completion markers that prevent stale point-read misses from rewriting completed tombstones. A marker key records the original tombstone's validity bound and is ignored at or after that time, even if its KV row has not expired yet. If the clock is unusable, the marker is ignored and withdrawal falls back to a strong root-existence check; only a confirmed existing root can be written. This prevents a stale marker from suppressing withdrawal when an expired EC key is created again. With a healthy store, repeated withdrawal of an already tombstoned EC ID leaves the row unchanged instead of refreshing its 24-hour TTL. Permission resolution for each request is based on the live request signals listed above.
 
-## Provider Types: Server-Side and Client-Side
+## Module Types: Server-Side and Client-Side
 
-The Edge Cookie identifier comes from a configurable provider, selected by `[ec] provider`. A provider is one of two types, and the permission gate above applies to both. The two reach the **same outcome** (a `ts-ec` cookie set and carried on every later request) by **different routes**.
+The Edge Cookie identifier comes from a configurable module, selected by `[ec] module`. A module is one of two types, and the permission gate above applies to both. The two reach the **same outcome** (a `ts-ec` cookie set and carried on every later request) by **different routes**.
 
-- **Server-side** (for example the built-in HMAC provider, or the built-in `host_signals` provider that creates the identifier from the host's TLS JA4 and HTTP/2 signals on a host that supplies them). The provider derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
-- **Client-side** (for example the `client_fixed` demo). The provider cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the provider's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The provider creates the identifier from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
+- **Server-side** (for example the built-in HMAC module, or the built-in `host_signals` module that creates the identifier from the host's TLS JA4 and HTTP/2 signals on a host that supplies them). The module derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
+- **Client-side** (for example the `client_fixed` demo). The module cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the module's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The module creates the identifier from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
 
 ```mermaid
 flowchart TD
-    Start(["Page request, no Edge Cookie"]) --> Type{"Provider type"}
+    Start(["Page request, no Edge Cookie"]) --> Type{"Module type"}
 
     Type -->|"Server-side (e.g. HMAC)"| SGen["generate() creates the identifier at the edge from request data"]
     SGen --> SSet["Page response sets ts-ec"]
 
     Type -->|"Client-side (e.g. client_fixed)"| CDefer["generate() defers, returns no identifier"]
-    CDefer --> CPage["Page response, no cookie, delivers the provider JS"]
-    CPage --> CBox[["Provider JS (black box): runs in the browser and does its work"]]
+    CDefer --> CPage["Page response, no cookie, delivers the module JS"]
+    CPage --> CBox[["Module JS (black box): runs in the browser and does its work"]]
     CBox --> CPost["JS posts the result to POST /_ts/api/v1/ec/resolve"]
     CPost --> CResolve["resolve_from_client() verifies and creates"]
     CResolve --> CSet["Resolve response sets ts-ec"]
@@ -140,15 +140,15 @@ The two types differ only in route and in the methods they use:
 | Example              | HMAC (`hmac`)             | `client_fixed` (demo)                          |
 | Created in           | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
 | `generate()` returns | the identifier            | no identifier (defers)                         |
-| Client JavaScript    | none                      | the provider JS (black box), which posts back  |
+| Client JavaScript    | none                      | the module JS (black box), which posts back    |
 | Endpoint             | none                      | `POST /_ts/api/v1/ec/resolve`                  |
 | Cookie set on        | the page response         | the resolve response                           |
 
-The resolve endpoint requires an `Origin` on the publisher's domain and a `text/plain` or `application/json` body, and it answers `409` rather than silently replacing an identity the request already carries. A created identifier is persisted to the identity graph before the cookie is set, so withdrawal reaches a client-set identity the same way it reaches an edge-created one. On success the cookie is set on the endpoint's own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back, and a non-`HttpOnly` marker cookie (`ts-ecr=1`, carrying no identity) tells the script a resolve succeeded so it does not post again on every page view. Every resolve response carries `Cache-Control: no-store`. The `client_fixed` demonstration provider is compiled only behind the `client-fixed-demo` cargo feature, so a production build rejects selecting it at startup.
+The resolve endpoint requires an `Origin` on the publisher's domain and a `text/plain` or `application/json` body, and it answers `409` rather than silently replacing an identity the request already carries. A created identifier is persisted to the identity graph before the cookie is set, so withdrawal reaches a client-set identity the same way it reaches an edge-created one. On success the cookie is set on the endpoint's own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back, and a non-`HttpOnly` marker cookie (`ts-ecr=1`, carrying no identity) tells the script a resolve succeeded so it does not post again on every page view. Every resolve response carries `Cache-Control: no-store`. The `client_fixed` demonstration module is compiled only behind the `client-fixed-demo` cargo feature, so a production build rejects selecting it at startup.
 
-Because the posted value comes from the browser, **verification is the provider's responsibility**. A client-side provider must verify the payload (for example a signature) before creating the identifier, or a client could forge an Edge Cookie. The endpoint itself is provider-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the provider, and writes the cookie.
+Because the posted value comes from the browser, **verification is the module's responsibility**. A client-side module must verify the payload (for example a signature) before creating the identifier, or a client could forge an Edge Cookie. The endpoint itself is module-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the module, and writes the cookie.
 
-A built-in `client_fixed` provider demonstrates the client-side type end to end with no vendor coupling. Client and server share one fixed, known word. When no Edge Cookie is present, the page script (shipped in the tsjs bundle when that provider is selected) posts that word, the server verifies it matches, and on a match sets it as the Edge Cookie. The value is verifiable because it is a known constant, which is the point of the demo. It is useless in production, because a fixed value is not an identity, so it is for demonstration and testing only.
+A built-in `client_fixed` module demonstrates the client-side type end to end with no vendor coupling. Client and server share one fixed, known word. When no Edge Cookie is present, the page script (shipped in the tsjs bundle when that module is selected) posts that word, the server verifies it matches, and on a match sets it as the Edge Cookie. The value is verifiable because it is a known constant, which is the point of the demo. It is useless in production, because a fixed value is not an identity, so it is for demonstration and testing only.
 
 ## Partner Sync Channels
 

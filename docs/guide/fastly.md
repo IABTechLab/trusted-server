@@ -336,7 +336,7 @@ Configure the secret-store key name in `trusted-server.toml`:
 
 ```toml
 [ec]
-provider = "hmac"
+module = "hmac"
 ec_store = "ec_identity_store"
 
 [ec.hmac]
