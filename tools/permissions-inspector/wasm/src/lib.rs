@@ -97,7 +97,10 @@ fn eval_json(input: &str) -> String {
         "jurisdiction": jurisdiction,
         "set": set,
         "tcf_decoded": ctx.tcf.is_some(),
-        "malformed_record": ctx.has_malformed_record(),
+        // No `malformed_record`. Whether an absent, unreadable or expired
+        // signal changes the permissions is each module's own decision,
+        // taken in its answer, so nothing at this level can report one and
+        // `false` would read as "none was found".
     })
     .to_string()
 }
