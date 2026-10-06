@@ -512,3 +512,78 @@ fn an_expired_tcf_record_is_not_treated_as_malformed() {
         "expiry is its own explicit state, deliberately distinct from malformed"
     );
 }
+
+#[test]
+fn the_four_shipped_providers_leave_only_the_marketing_channels_unanswerable() {
+    // The sample policy requires a signal for the marketing channel opt-ins,
+    // which no shipped scheme reads, and for the ad-tech Data Uses, which
+    // TCF can grant. Start-up names the former and not the latter.
+    use trusted_server_core::permission_signal::never_granted;
+    use trusted_server_core::permissions::PermissionMaps;
+
+    let named = never_granted(&all_four(), PermissionMaps::standard());
+    let mut names: Vec<&str> = named.iter().map(Permission::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "advertising_marketing.communications.email",
+            "advertising_marketing.communications.sms",
+        ],
+        "with all four providers only the channels no scheme carries are unanswerable"
+    );
+
+    let without_tcf = never_granted(&all_but("tcf"), PermissionMaps::standard());
+    assert!(
+        without_tcf.contains(Permission::StoreOnDevice),
+        "removing TCF leaves storage with no provider able to grant it"
+    );
+}
+
+#[test]
+fn a_visitor_in_the_eu_with_no_record_is_awaiting_what_tcf_could_grant() {
+    let geo = GeoInfo {
+        city: String::new(),
+        country: "FR".to_owned(),
+        continent: String::new(),
+        latitude: 0.0,
+        longitude: 0.0,
+        metro_code: 0,
+        region: None,
+        asn: None,
+    };
+    let state = assembled(
+        &ConsentContext::default(),
+        GeoStatus::Located(&geo),
+        &all_four(),
+    );
+    assert!(
+        state.is_awaited(Permission::StoreOnDevice)
+            && state.is_awaited(Permission::SelectPersonalisedAds),
+        "a prompt that has not run leaves the TCF-mapped Data Uses awaited"
+    );
+    let email = Permission::all()
+        .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+        .expect("the taxonomy should carry the email channel");
+    assert!(
+        !state.is_awaited(email),
+        "a channel no provider can grant is not awaited"
+    );
+    let state = assembled(
+        &ConsentContext {
+            tcf: Some(tcf_with_purposes(&[1])),
+            ..ConsentContext::default()
+        },
+        GeoStatus::Located(&geo),
+        &all_four(),
+    );
+    assert!(
+        state.is_set(Permission::StoreOnDevice) && !state.is_awaited(Permission::StoreOnDevice),
+        "an answered prompt settles what it granted"
+    );
+    assert!(
+        !state.is_awaited(Permission::SelectPersonalisedAds)
+            && !state.is_set(Permission::SelectPersonalisedAds),
+        "a record refusing a purpose is a refusal, not an awaited answer"
+    );
+}

@@ -125,15 +125,37 @@ away, and whether a TCF record answers for the deployment at all, remain the
 policy's decisions in the `signals` section of `permissions.yaml`, so a
 deployment changes those without changing a provider.
 
+## Who could still answer
+
+A permission whose baseline requires a signal, and for which every provider
+answered neutral, is not set and is not refused either. The page reads those
+as `awaiting` beside `set`, so a prompt that has not run yet can be told from
+a visitor who said no.
+
+Waiting is only right for a permission some configured provider could grant,
+so each provider declares which permissions it can ever grant under the
+policy. An opt-out declares nothing, because it only revokes. TCF declares
+every Data Use a purpose maps to, and nothing when the policy silences the
+record. Only what some provider declared is reported as awaiting, and a
+permission that requires a signal nothing here could give is simply unset.
+
+Start-up logs, at warn, every permission the policy requires a signal for
+somewhere that no configured provider can grant. It does not refuse, because
+the shipped sample policy carries two such permissions, the marketing channel
+opt-ins, which arrive through a scheme none of the four shipped providers
+reads.
+
 ## The terms the data is available under
 
 A provider may also declare the terms documents the request's data is available
 under, and the permission state carries what every configured provider declared,
-in the order they were asked. The page reads them as `tdls` alongside `set`:
+in the order they were asked. The page reads them as `tdls` alongside `set` and
+`awaiting`:
 
 ```json
 {
   "set": ["necessary.operations.storage"],
+  "awaiting": ["advertising_marketing.first_party.targeted"],
   "tdls": ["https://terms.example.com/marketing/2.txt"]
 }
 ```

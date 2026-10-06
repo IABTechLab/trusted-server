@@ -7,7 +7,9 @@ use error_stack::Report;
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
-use crate::permissions::{Acquisition, ConsentSignal, Permission, SignalPolicy};
+use crate::permissions::{
+    Acquisition, ConsentSignal, Permission, PermissionMaps, PermissionSet, SignalPolicy,
+};
 use crate::settings::Settings;
 use crate::tdl::Tdl;
 
@@ -154,6 +156,26 @@ pub trait PermissionSignalProvider: Send + Sync {
     /// How this provider would amend `permission` for this request.
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal;
 
+    /// The permissions this provider can ever answer [`ConsentSignal::Grant`]
+    /// for under `policy`, so a permission a signal could still set can be
+    /// told from one nothing in this deployment will ever set.
+    ///
+    /// Resolution records a permission that requires a signal and got none as
+    /// awaited, and a page holds what depends on an awaited permission until
+    /// an answer arrives. That is right only for a permission some configured
+    /// provider could grant. For any other, waiting is waiting for ever, so
+    /// the assembly narrows the awaited list to the union of these
+    /// declarations, and start-up names the permissions the policy requires a
+    /// signal for that no provider can grant.
+    ///
+    /// A scheme that only ever revokes, which is every opt-out, leaves this
+    /// at its default of nothing. A scheme that grants declares exactly what
+    /// it maps, under the policy it is given, so a record the policy does not
+    /// let answer declares nothing either.
+    fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+        PermissionSet::none()
+    }
+
     /// Whether the request carries an explicit withdrawal of `permission`
     /// under this scheme, as opposed to merely not granting it.
     ///
@@ -290,6 +312,38 @@ pub(crate) fn tdls(
     Arc::from(declared)
 }
 
+/// Every permission some provider in `providers` declares it can grant under
+/// `policy`, which is the most a signal arriving later could still set.
+#[must_use]
+pub fn answerable(
+    providers: &[Arc<dyn PermissionSignalProvider>],
+    policy: &SignalPolicy,
+) -> PermissionSet {
+    providers
+        .iter()
+        .map(|provider| provider.grants(policy))
+        .fold(PermissionSet::none(), PermissionSet::union)
+}
+
+/// The permissions `maps` requires a signal for somewhere that no provider in
+/// `providers` can grant, so they stay unset for every visitor of that place.
+///
+/// Start-up names these in the log. It does not refuse them, because the
+/// shipped sample policy itself carries two, the marketing channel opt-ins
+/// that arrive through a scheme none of the four shipped providers reads, and
+/// a deployment running only those four is not misconfigured for leaving a
+/// channel it never uses unset. A refusal belongs to a module that depends on
+/// such a permission, which is the check the page side adds when modules
+/// declare what they need.
+#[must_use]
+pub fn never_granted(
+    providers: &[Arc<dyn PermissionSignalProvider>],
+    maps: &PermissionMaps,
+) -> PermissionSet {
+    maps.requires_signal_anywhere()
+        .without(answerable(providers, maps.signals()))
+}
+
 /// The providers a deployment named, in the order it named them, drawn from
 /// the ones the build makes available.
 ///
@@ -402,6 +456,16 @@ pub fn build_permission_signal_providers(
             left_out.join(", ")
         );
     }
+    let unanswerable = never_granted(&selected, PermissionMaps::standard());
+    if !unanswerable.is_empty() {
+        let names: Vec<&str> = unanswerable.iter().map(Permission::as_str).collect();
+        log::warn!(
+            "Permission signals: the policy requires a signal for [{}] somewhere and no \
+             configured provider can grant them, so they stay unset there and a page is \
+             never told to wait for them",
+            names.join(", ")
+        );
+    }
     Ok(Arc::from(selected))
 }
 
@@ -489,6 +553,81 @@ mod tests {
 
     fn fixed(id: &'static str, signal: ConsentSignal) -> Arc<dyn PermissionSignalProvider> {
         Arc::new(Fixed(id, signal))
+    }
+
+    /// A provider that declares it can grant one permission, whatever it then
+    /// answers, standing in for a scheme with a mapping.
+    struct Granting(&'static str, Permission);
+
+    impl PermissionSignalProvider for Granting {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+            PermissionSet::none().with(self.1)
+        }
+    }
+
+    #[test]
+    fn a_provider_declares_nothing_grantable_unless_it_says_otherwise() {
+        // An opt-out only ever revokes, so the default declaration is empty
+        // and a deployment of opt-outs alone can grant nothing.
+        let policy = SignalPolicy::default();
+        assert!(
+            fixed("opt_out", ConsentSignal::Revoke)
+                .grants(&policy)
+                .is_empty()
+        );
+        assert!(answerable(&[fixed("a", ConsentSignal::Grant)], &policy).is_empty());
+    }
+
+    #[test]
+    fn what_is_answerable_is_the_union_of_every_declaration() {
+        let policy = SignalPolicy::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+            Arc::new(Granting("storage", Permission::StoreOnDevice)),
+            fixed("opt_out", ConsentSignal::Revoke),
+            Arc::new(Granting("profiling", Permission::CreateAdsProfile)),
+        ];
+        assert_eq!(
+            answerable(&providers, &policy),
+            PermissionSet::none()
+                .with(Permission::StoreOnDevice)
+                .with(Permission::CreateAdsProfile),
+            "should collect what every provider declares, in any order"
+        );
+    }
+
+    #[test]
+    fn start_up_names_what_requires_a_signal_that_nobody_can_grant() {
+        // Arrange: a policy requiring a signal for storage and profiling, and
+        // a deployment whose one granting provider covers storage only.
+        let maps = PermissionMaps::empty().with_default_rules(
+            crate::permissions::CountryRules::with_default(Acquisition::Granted)
+                .with_rule(Permission::StoreOnDevice, Acquisition::RequiresSignal)
+                .with_rule(Permission::CreateAdsProfile, Acquisition::RequiresSignal),
+        );
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> =
+            vec![Arc::new(Granting("storage", Permission::StoreOnDevice))];
+
+        // Assert: profiling is named, storage is not.
+        assert_eq!(
+            never_granted(&providers, &maps),
+            PermissionSet::none().with(Permission::CreateAdsProfile),
+            "should name only the permission no provider can grant"
+        );
+        assert_eq!(
+            never_granted(&[], &maps),
+            PermissionSet::none()
+                .with(Permission::StoreOnDevice)
+                .with(Permission::CreateAdsProfile),
+            "with no provider, everything requiring a signal is named"
+        );
     }
 
     #[test]

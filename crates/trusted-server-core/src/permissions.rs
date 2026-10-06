@@ -274,6 +274,24 @@ impl PermissionSet {
         self.0 & other.0 == other.0
     }
 
+    /// The permissions in both this set and `other`.
+    #[must_use]
+    pub const fn intersect(self, other: PermissionSet) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The permissions in either this set or `other`.
+    #[must_use]
+    pub const fn union(self, other: PermissionSet) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The permissions in this set and not in `other`.
+    #[must_use]
+    pub const fn without(self, other: PermissionSet) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// Iterates the permissions in the set, in bit-index order.
     ///
     /// The built-ins read nothing from the full set; this serves a provider or
@@ -654,6 +672,36 @@ impl PermissionMaps {
             .and_then(|code| self.by_country.get(&code))
     }
 
+    /// Every permission that requires a signal somewhere in the tree, at the
+    /// top node, in any country or in any region.
+    ///
+    /// This is the set a deployment's providers have to be able to grant
+    /// between them, because a permission in it that no provider can grant
+    /// stays unset for every visitor of that place. Start-up compares the two
+    /// and says so, see
+    /// [`never_granted`](crate::permission_signal::never_granted). A map with
+    /// no top node reports every permission, because such a map resolves an
+    /// unlisted place at the requires-signal floor.
+    #[must_use]
+    pub fn requires_signal_anywhere(&self) -> PermissionSet {
+        let requiring = |rules: &CountryRules| {
+            Permission::all()
+                .filter(|permission| {
+                    matches!(rules.rule_for(*permission), Acquisition::RequiresSignal)
+                })
+                .collect::<PermissionSet>()
+        };
+        let top = self
+            .default_rules
+            .as_ref()
+            .map_or_else(|| Permission::all().collect(), requiring);
+        self.by_country
+            .values()
+            .chain(self.by_region.values())
+            .map(requiring)
+            .fold(top, PermissionSet::union)
+    }
+
     /// The rules a request resolves to: its region, else its country, else the
     /// top node of the tree.
     ///
@@ -806,6 +854,22 @@ impl PermissionState {
     #[must_use]
     pub fn with_awaiting(self, awaiting: PermissionSet) -> Self {
         Self { awaiting, ..self }
+    }
+
+    /// The same state, awaiting only the permissions in `answerable`.
+    ///
+    /// Resolution records every permission that requires a signal and got
+    /// none. Some of those no configured provider could ever grant, for
+    /// example a marketing channel opt-in in a deployment that runs only the
+    /// four shipped schemes, and a page told to wait for them would wait for
+    /// ever. So the assembly narrows the list to what some provider declares
+    /// it can grant, and the rest are simply not set.
+    #[must_use]
+    pub fn awaiting_only(self, answerable: PermissionSet) -> Self {
+        Self {
+            awaiting: self.awaiting.intersect(answerable),
+            ..self
+        }
     }
 
     /// The permissions whose baseline requires a signal and for which every
@@ -1521,6 +1585,79 @@ mod tests {
             })
             .to_string(),
             "the page should be told which permissions are still awaited"
+        );
+    }
+
+    #[test]
+    fn awaiting_is_narrowed_to_what_a_provider_could_still_grant() {
+        // Arrange: the floor, where everything is awaited, and a deployment
+        // whose providers can only ever grant storage.
+        let state = PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral)
+            .awaiting_only(PermissionSet::none().with(Permission::StoreOnDevice));
+
+        // Assert: storage is still awaited, and a permission nobody could
+        // grant is not, because no page should wait for it.
+        assert!(state.is_awaited(Permission::StoreOnDevice));
+        assert!(
+            !state.is_awaited(Permission::SelectPersonalisedAds),
+            "should not await a permission no configured provider can grant"
+        );
+        assert!(
+            state.permissions().is_empty(),
+            "narrowing what is awaited should set nothing"
+        );
+    }
+
+    #[test]
+    fn the_permissions_requiring_a_signal_anywhere_are_the_union_over_the_tree() {
+        // Arrange: a top node granting everything, one country requiring a
+        // signal for storage, and a region requiring one for profiling.
+        let maps = PermissionMaps::empty()
+            .with_default_rules(CountryRules::with_default(Acquisition::Granted))
+            .with_country(
+                "FR",
+                CountryRules::with_default(Acquisition::Granted)
+                    .with_rule(Permission::StoreOnDevice, Acquisition::RequiresSignal),
+            )
+            .with_region(
+                "US",
+                "CA",
+                CountryRules::with_default(Acquisition::Denied)
+                    .with_rule(Permission::CreateAdsProfile, Acquisition::RequiresSignal),
+            );
+
+        // Assert: both places contribute, and nothing else does.
+        let expected = PermissionSet::none()
+            .with(Permission::StoreOnDevice)
+            .with(Permission::CreateAdsProfile);
+        assert_eq!(
+            maps.requires_signal_anywhere(),
+            expected,
+            "should collect every requires-signal rule from every node"
+        );
+        assert_eq!(
+            PermissionMaps::empty().requires_signal_anywhere(),
+            Permission::all().collect::<PermissionSet>(),
+            "a map with no top node resolves at the floor, so everything requires a signal"
+        );
+    }
+
+    #[test]
+    fn the_shipped_policy_requires_a_signal_for_the_marketing_channels() {
+        // The sample policy says these arrive through their own opt-in, which
+        // no shipped scheme supplies, so start-up will name them.
+        let requiring = PermissionMaps::standard().requires_signal_anywhere();
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert!(requiring.contains(email));
+        assert!(requiring.contains(Permission::StoreOnDevice));
+        let security = Permission::all()
+            .find(|permission| permission.as_str() == "necessary.operations.security")
+            .expect("the taxonomy should carry security");
+        assert!(
+            !requiring.contains(security),
+            "a permission granted everywhere requires a signal nowhere"
         );
     }
 

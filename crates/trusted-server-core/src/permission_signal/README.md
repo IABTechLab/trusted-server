@@ -149,6 +149,30 @@ the only one. The name matches the `tdl` member the Data Labels work puts on a
 node of an `OpenRTB` request, which is where these travel once a bid request
 carries them.
 
+## Who could still answer
+
+A permission whose baseline requires a signal, and for which every provider
+answered `Neutral`, is not set, and it is also not refused. Resolution records
+it as awaited, and the page reads the list as `awaiting` beside `set`, so a
+prompt that has not run yet can be told from a visitor who said no.
+
+Waiting is only right for a permission some configured provider could grant.
+So each provider declares, through `grants` on the trait, which permissions it
+can ever answer `Grant` for under the policy it is given. An opt-out revokes and
+declares nothing. TCF declares every Data Use a purpose maps to, and nothing
+when the policy silences the record. The assembly keeps as awaited only what
+some provider declared, and everything else that requires a signal and got none
+is simply unset.
+
+Start-up compares the policy against the declarations and logs, at warn, every
+permission the policy requires a signal for somewhere that no configured
+provider can grant. It does not refuse, because the shipped sample policy
+itself carries two such permissions, the marketing channel opt-ins, which
+arrive through a scheme none of the four shipped providers reads, and a
+deployment that never uses those channels is not misconfigured for leaving them
+unset. A refusal belongs to whatever depends on such a permission, which is
+the check a page module gets when modules declare what they need.
+
 ## Withdrawal is a separate question
 
 A provider may also say that the request explicitly *withdraws* a permission,

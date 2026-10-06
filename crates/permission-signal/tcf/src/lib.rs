@@ -20,7 +20,7 @@ use trusted_server_core::consent::effective_tcf;
 #[cfg(test)]
 use trusted_server_core::consent::types::TcfConsent;
 use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
-use trusted_server_core::permissions::{ConsentSignal, Permission};
+use trusted_server_core::permissions::{ConsentSignal, Permission, PermissionSet, SignalPolicy};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
 /// `provider`, in logs, and when a peer consults it.
@@ -72,6 +72,18 @@ impl PermissionSignalProvider for TcfProvider {
             // what they declined.
             ConsentSignal::Revoke
         }
+    }
+
+    /// Every Data Use a purpose maps to, when the policy lets a record answer,
+    /// and nothing when it does not, because a silenced record grants nothing
+    /// and a page must not wait for it.
+    fn grants(&self, policy: &SignalPolicy) -> PermissionSet {
+        if !policy.tcf_authoritative() {
+            return PermissionSet::none();
+        }
+        Permission::all()
+            .filter(|permission| mapping::purpose_for(*permission).is_some())
+            .collect()
     }
 
     /// Only a TCF record refusing storage withdraws, because only TCF records
@@ -210,6 +222,39 @@ mod tests {
             ),
             ConsentSignal::Neutral,
             "an absent record is silence, never a refusal"
+        );
+    }
+
+    #[test]
+    fn declares_exactly_the_data_uses_a_purpose_maps_to() {
+        // Under the shipped policy a record answers, so every mapped Data Use
+        // is declared and an unmapped one is not. Under a policy that silences
+        // the record nothing is declared, because a record that cannot answer
+        // is not one a page should wait for.
+        let declared = TcfProvider::new().grants(shipped_policy());
+        assert!(
+            declared.contains(Permission::StoreOnDevice),
+            "purpose 1 maps to storage, so storage is grantable"
+        );
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert!(
+            !declared.contains(email),
+            "no purpose maps to a marketing channel, so it is not grantable"
+        );
+        assert_eq!(
+            declared.iter().count(),
+            Permission::all()
+                .filter(|permission| purpose_for(*permission).is_some())
+                .count(),
+            "should declare each mapped Data Use once and nothing else"
+        );
+        assert!(
+            TcfProvider::new()
+                .grants(&SignalPolicy::default())
+                .is_empty(),
+            "a silenced record grants nothing"
         );
     }
 

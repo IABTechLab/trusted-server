@@ -131,6 +131,9 @@ pub fn assemble_permissions(
         storage_acquisition(geo),
     );
     state
+        // Only a permission some configured provider could still grant is
+        // worth a page waiting for. The rest are unset, not pending.
+        .awaiting_only(permission_signal::answerable(providers, maps.signals()))
         .with_storage_withdrawn(withdrawn)
         .with_tdls(permission_signal::tdls(providers, consent, evidence))
 }
@@ -211,6 +214,7 @@ mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
     use crate::permission_signal::SignalInput;
+    use crate::permissions::PermissionSet;
     use crate::test_support::tests::create_test_settings;
 
     /// A provider that grants every permission, standing in for a scheme that
@@ -281,6 +285,60 @@ mod tests {
             region: Some("CA".to_owned()),
             asn: None,
         }
+    }
+
+    /// A provider that could grant storage and has not, standing in for a
+    /// prompt that has not been answered yet.
+    struct Undecided;
+
+    impl PermissionSignalProvider for Undecided {
+        fn id(&self) -> &'static str {
+            "undecided"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+            PermissionSet::none().with(Permission::StoreOnDevice)
+        }
+    }
+
+    #[test]
+    fn only_a_permission_a_provider_could_still_grant_is_awaited() {
+        // Arrange: the top node requires a signal for storage and for the
+        // marketing channels, and the one provider could grant storage only.
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(Undecided)];
+        let state = assembled(
+            &ConsentContext::default(),
+            GeoStatus::NoLocation,
+            &providers,
+        );
+
+        // Assert: storage is awaited, and a channel nothing here could grant
+        // is neither set nor awaited.
+        assert!(
+            state.is_awaited(Permission::StoreOnDevice),
+            "should await the permission the provider has yet to answer"
+        );
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert!(
+            !state.is_awaited(email) && !state.is_set(email),
+            "should not tell a page to wait for a permission no provider can grant"
+        );
+    }
+
+    #[test]
+    fn nothing_is_awaited_when_no_provider_runs() {
+        // A publisher acting on no signal at all has nothing to wait for.
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
+        assert!(
+            state.awaiting().is_empty(),
+            "with no provider nothing can arrive, so nothing is awaited"
+        );
     }
 
     #[test]
