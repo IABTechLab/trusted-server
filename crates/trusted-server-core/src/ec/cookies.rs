@@ -132,14 +132,14 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
 
 /// Expires the resolved marker on its own, leaving the Edge Cookie alone.
 ///
-/// The marker records only that some client-cycle provider resolved in the
-/// past. It is not namespaced by the provider code the way the cookie value,
+/// The marker records only that some client-cycle module resolved in the
+/// past. It is not namespaced by the module code the way the cookie value,
 /// the identity-graph key and withdrawal are, so on a switch from one
-/// client-cycle provider to another the marker outlives the identity it was
-/// set for. The new provider's page script would then see the marker, skip the
+/// client-cycle module to another the marker outlives the identity it was
+/// set for. The new module's page script would then see the marker, skip the
 /// resolve it should perform, and the visitor would sit with no identity
 /// rather than a restarted one. Expiring the marker whenever the incoming
-/// value is not one the selected provider owns restarts the cycle without
+/// value is not one the selected module owns restarts the cycle without
 /// depending on any vendor page script comparing a marker value correctly.
 pub fn expire_ec_resolved_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
     let marker = format!(
@@ -250,7 +250,7 @@ mod tests {
     }
 
     /// Every value in the identifier alphabet is written verbatim, whatever
-    /// provider made it, with the standard security attributes.
+    /// module made it, with the standard security attributes.
     #[test]
     fn set_ec_cookie_writes_an_identifier_in_the_alphabet_verbatim() {
         let settings = create_test_settings();
@@ -260,9 +260,9 @@ mod tests {
                 "another HMAC identifier",
                 "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab",
             ),
-            ("a provider's opaque value", "8473625190"),
+            ("a module's opaque value", "8473625190"),
             // Unpadded base64url (RFC 4648 section 5) fits the alphabet, so a
-            // provider that carries binary data encodes it that way.
+            // module that carries binary data encodes it that way.
             ("a base64url value", "abcDEF123-_x"),
         ] {
             let mut response = empty_response();

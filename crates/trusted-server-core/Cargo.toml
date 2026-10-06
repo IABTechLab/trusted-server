@@ -64,7 +64,7 @@ uuid = { workspace = true, features = ["js"] }
 edgezero-core = { workspace = true }
 
 [features]
-# Compiles in the `client_fixed` demonstration Edge Cookie provider. Off by
+# Compiles in the `client_fixed` demonstration Edge Cookie module. Off by
 # default so production builds cannot select a fixed shared word as identity.
 client-fixed-demo = []
 default = []

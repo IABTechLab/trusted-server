@@ -1,18 +1,18 @@
 //! Client-cycle Edge Cookie resolution endpoint (`POST /_ts/api/v1/ec/resolve`).
 //!
-//! A client-side Edge Cookie provider defers on the organic page request
+//! A client-side Edge Cookie module defers on the organic page request
 //! (deriving no identifier at the edge) and lets the page do the work in the
 //! browser. When the page has its result it posts the value here, and this
-//! endpoint hands it to the configured provider's
-//! [`resolve_from_client`](super::provider::EdgeCookieModule::resolve_from_client)
+//! endpoint hands it to the configured module's
+//! [`resolve_from_client`](super::module::EdgeCookieModule::resolve_from_client)
 //! to create the Edge Cookie.
 //!
-//! The endpoint is provider-agnostic: it bounds the body, gates on the
-//! permission model (the same gate as organic generation), calls the provider,
+//! The endpoint is module-agnostic: it bounds the body, gates on the
+//! permission model (the same gate as organic generation), calls the module,
 //! and sets the cookie on its own response so the value is live for every
 //! subsequent first-party request. Whether the posted value is trustworthy is
-//! the provider's responsibility. The payload arrives from the browser, so a
-//! real provider verifies it (for example an OWID signature) before creating one.
+//! the module's responsibility. The payload arrives from the browser, so a
+//! real module verifies it (for example an OWID signature) before creating one.
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
@@ -25,7 +25,7 @@ use super::EcContext;
 use super::cookies::{ec_id_has_only_allowed_chars, set_ec_cookie, set_resolved_marker_cookie};
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
-use super::provider::{ClientResolveInput, apply_module_response_headers};
+use super::module::{ClientResolveInput, apply_module_response_headers};
 
 /// Maximum size of a resolve request body.
 ///
@@ -38,8 +38,8 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 ///
 /// The request must carry an `Origin` on the publisher's domain (this endpoint
 /// sets identity state, so a foreign page must not be able to drive it) and a
-/// `text/plain` or `application/json` body. Gates on the configured provider's
-/// required permissions, then asks the provider to create an Edge Cookie from
+/// `text/plain` or `application/json` body. Gates on the configured module's
+/// required permissions, then asks the module to create an Edge Cookie from
 /// the posted payload. A created identifier is persisted to the identity graph
 /// before the cookie is set, so withdrawal reaches a client-set identity the
 /// same way it reaches an edge-created one. With no graph available this
@@ -50,23 +50,23 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// status is `200`.
 ///
 /// Rejections: `403` for a missing or foreign `Origin`, `415` for another
-/// content type, `413` for an oversized body, `400` when the provider creates an
+/// content type, `413` for an oversized body, `400` when the module creates an
 /// identifier outside the identifier bounds, `409` when the request already
 /// carries a different identity (a resolve must not silently replace one), and
 /// `503` when the identity-graph write fails. When the permission gate is
-/// closed, no provider is configured, no graph is available, or the provider
+/// closed, no module is configured, no graph is available, or the module
 /// creates nothing, the response is `204` with no cookie. Every response this
-/// handler builds carries `Cache-Control: no-store`; a provider or
+/// handler builds carries `Cache-Control: no-store`; a module or
 /// configuration error propagates to the adapter's error response instead,
-/// and so does a provider asking for a response header inside core's reserved
-/// surface, which is a broken provider contract rather than a bad request.
+/// and so does a module asking for a response header inside core's reserved
+/// surface, which is a broken module contract rather than a bad request.
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] when the provider fails to process the
+/// Returns [`TrustedServerError`] when the module fails to process the
 /// payload, or asks for a response header inside core's reserved surface
 /// (see
-/// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)).
+/// [`reserved_response_effect`](crate::ec::module::reserved_response_effect)).
 /// A payload that is merely unverified or absent yields a `204` rather than an
 /// error.
 pub fn handle_ec_resolve(
@@ -90,7 +90,7 @@ pub fn handle_ec_resolve(
         return Ok(status_only(StatusCode::UNSUPPORTED_MEDIA_TYPE));
     }
 
-    // Gate: the configured provider's required permissions must be set for
+    // Gate: the configured module's required permissions must be set for
     // this request, the same gate as the organic generation path. A
     // client-driven resolve does not bypass the permission model.
     if !ec_context.ec_allowed() {
@@ -101,8 +101,8 @@ pub fn handle_ec_resolve(
     // The module this request resolved when its context was read, so the
     // endpoint answers with the instance the page's own request selected. The
     // client value is verified from the posted body below, not from request info.
-    let Some(provider) = ec_context.selected_module() else {
-        log::info!("EC resolve skipped: no Edge Cookie provider configured");
+    let Some(module) = ec_context.selected_module() else {
+        log::info!("EC resolve skipped: no Edge Cookie module configured");
         return Ok(status_only(StatusCode::NO_CONTENT));
     };
 
@@ -121,10 +121,10 @@ pub fn handle_ec_resolve(
         consent: Some(ec_context.consent()),
     };
 
-    let generated = provider.resolve_from_client(&input)?;
+    let generated = module.resolve_from_client(&input)?;
     log::debug!(
-        "EC resolve handled (provider={}): id {}",
-        provider.id(),
+        "EC resolve handled (module={}): id {}",
+        module.id(),
         if generated.id.is_some() {
             "created"
         } else {
@@ -132,22 +132,22 @@ pub fn handle_ec_resolve(
         },
     );
 
-    // Check every response header the provider asked for against core's
+    // Check every response header the module asked for against core's
     // reserved surface, exactly as the organic generation path does in
-    // `EcContext::generate_with_module`. A provider may set its own cookies
+    // `EcContext::generate_with_module`. A module may set its own cookies
     // and headers, but not a managed `ts-` cookie, a header in the `x-ts-`
     // namespace, or a framing or hop-by-hop header. Without this a
-    // browser-side provider could set `ts-ec` itself and walk straight past
+    // browser-side module could set `ts-ec` itself and walk straight past
     // the identifier bounds, the conflict check and the row-before-cookie
     // rule below. The check sits before the identifier is read because a
-    // provider can return headers with no identifier at all, which is the
+    // module can return headers with no identifier at all, which is the
     // 204 path, and that path applies headers too.
     for (name, value) in &generated.response_headers {
-        if let Some(effect) = super::provider::reserved_response_effect(name, value) {
+        if let Some(effect) = super::module::reserved_response_effect(name, value) {
             return Err(Report::new(TrustedServerError::EdgeCookie {
                 message: format!(
-                    "Provider `{}` returned a response header `{name}` that {effect}",
-                    provider.id(),
+                    "Module `{}` returned a response header `{name}` that {effect}",
+                    module.id(),
                 ),
             }));
         }
@@ -155,7 +155,7 @@ pub fn handle_ec_resolve(
 
     let generated_id = generated
         .id
-        .map(|value| super::provider::apply_module_code(provider.as_ref(), &value));
+        .map(|value| super::module::apply_module_code(module.as_ref(), &value));
     let Some(ec_id) = generated_id else {
         let mut response = status_only(StatusCode::NO_CONTENT);
         apply_module_response_headers(response.headers_mut(), generated.response_headers);
@@ -163,13 +163,13 @@ pub fn handle_ec_resolve(
     };
 
     // The same identifier bounds as the organic generation path: reject, never
-    // rewrite. A provider that created an out-of-bounds identifier is a bad
+    // rewrite. A module that created an out-of-bounds identifier is a bad
     // request from the client's perspective, because the posted payload
     // produced an unusable identity.
     if !ec_id_has_only_allowed_chars(&ec_id) {
         log::error!(
-            "EC resolve rejected: provider `{}` created an identifier outside the bounds",
-            provider.id(),
+            "EC resolve rejected: module `{}` created an identifier outside the bounds",
+            module.id(),
         );
         return Ok(status_only(StatusCode::BAD_REQUEST));
     }
@@ -182,14 +182,14 @@ pub fn handle_ec_resolve(
         && existing != ec_id
     {
         log::warn!(
-            "EC resolve rejected: request already carries a different identity (provider={})",
-            provider.id(),
+            "EC resolve rejected: request already carries a different identity (module={})",
+            module.id(),
         );
         return Ok(status_only(StatusCode::CONFLICT));
     }
 
     // Persist the identity-graph row before setting the cookie, keyed by the
-    // provider's canonical form, exactly like the organic generation path.
+    // module's canonical form, exactly like the organic generation path.
     // Without a row, withdrawal could never reach this identity, so with no
     // graph available this endpoint creates no cookie at all, which is stricter
     // than the organic generation path, where the identifier is committed and
@@ -208,7 +208,7 @@ pub fn handle_ec_resolve(
     entry.device = ec_context
         .device_signals()
         .map(super::device::DeviceSignals::to_kv_device);
-    let kv_key = super::provider::module_kv_key(provider.as_ref(), &ec_id);
+    let kv_key = super::module::module_kv_key(module.as_ref(), &ec_id);
     if let Err(err) = graph.create_or_revive(&kv_key, &entry) {
         log::error!("EC resolve failed to write the identity-graph row: {err:?}");
         return Ok(status_only(StatusCode::SERVICE_UNAVAILABLE));
@@ -216,10 +216,10 @@ pub fn handle_ec_resolve(
 
     let mut response = status_only(StatusCode::OK);
 
-    // Apply any response headers the provider asked for (for example to request
-    // more client evidence on a later request). Empty for the demo provider.
+    // Apply any response headers the module asked for (for example to request
+    // more client evidence on a later request). Empty for the demo module.
     // They accumulate with what this handler already set rather than replacing
-    // it, for the reasons on `provider::apply_module_response_headers`; here
+    // it, for the reasons on `module::apply_module_response_headers`; here
     // that keeps the `Cache-Control: no-store` every identity response must
     // carry, which a replacing write would drop.
     apply_module_response_headers(response.headers_mut(), generated.response_headers);
@@ -246,7 +246,7 @@ pub fn handle_ec_resolve(
 /// lands on the apex and every sibling with it.
 ///
 /// This is defense in depth rather than the primary control. The primary
-/// control is the provider's own verification of the value it is handed.
+/// control is the module's own verification of the value it is handed.
 fn origin_is_publisher(req: &Request<EdgeBody>, settings: &Settings) -> bool {
     let Some(origin) = req
         .headers()
@@ -405,8 +405,8 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, limit: usize) -> bool {
 mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
-    use crate::ec::provider::{
-        CLIENT_FIXED_PROVIDER_KEY, EcModuleSelection, EdgeCookieModule, GeneratedEdgeCookie,
+    use crate::ec::module::{
+        CLIENT_FIXED_MODULE_KEY, EcModuleSelection, EdgeCookieModule, GeneratedEdgeCookie,
         IdentityInput,
     };
     use crate::evidence::RequestInfo;
@@ -417,11 +417,11 @@ mod tests {
 
     fn settings_with_client_fixed() -> Settings {
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcModuleSelection::from(CLIENT_FIXED_PROVIDER_KEY));
+        settings.ec.module = Some(EcModuleSelection::from(CLIENT_FIXED_MODULE_KEY));
         settings
     }
 
-    // The fixed word shared by the `client_fixed` provider and its page script.
+    // The fixed word shared by the `client_fixed` module and its page script.
     const FIXED_WORD: &str = "an-ec";
 
     fn post(body: &str) -> Request<EdgeBody> {
@@ -482,26 +482,26 @@ mod tests {
             })
     }
 
-    /// A **test-only** provider modeling a client-generated, first-party
+    /// A **test-only** module modeling a client-generated, first-party
     /// identifier (a `UUID`) that the browser creates and posts back for the server
-    /// to set. It is not a production provider and exists only to exercise the
+    /// to set. It is not a production module and exists only to exercise the
     /// client-set Edge Cookie value path from end to end. The edge defers, the
     /// page posts a value, and it must round-trip as the cookie and the KV key.
     ///
     /// A `UUID` has no separator, so the built-in [`normalize_id_for_kv`] default
-    /// would append a trailing dot and corrupt it, which is why this provider
-    /// (like any opaque-identifier provider) returns the value unchanged.
+    /// would append a trailing dot and corrupt it, which is why this module
+    /// (like any opaque-identifier module) returns the value unchanged.
     ///
     /// [`normalize_id_for_kv`]: EdgeCookieModule::normalize_id_for_kv
     #[derive(Debug)]
-    struct TestIdProvider;
+    struct TestIdModule;
 
-    impl EdgeCookieModule for TestIdProvider {
+    impl EdgeCookieModule for TestIdModule {
         fn id(&self) -> &'static str {
             "testid"
         }
 
-        fn code(&self) -> crate::ec::provider::ModuleCode {
+        fn code(&self) -> crate::ec::module::ModuleCode {
             crate::module_code!("t0id")
         }
 
@@ -541,25 +541,25 @@ mod tests {
         }
     }
 
-    /// The identifier [`ResolveHeaderProvider`] creates when asked to.
-    const HEADER_PROVIDER_ID: &str = "5c3a1b70-2f4d-4a19-9c6e-7b0d18e4a221";
+    /// The identifier [`ResolveHeaderModule`] creates when asked to.
+    const HEADER_MODULE_ID: &str = "5c3a1b70-2f4d-4a19-9c6e-7b0d18e4a221";
 
-    /// A **test-only** provider that returns caller-chosen response headers
+    /// A **test-only** module that returns caller-chosen response headers
     /// and identifier from the client-resolve path, so a test can drive one
-    /// provider response effect at a time through this endpoint, with and
+    /// module response effect at a time through this endpoint, with and
     /// without an identifier.
     #[derive(Debug)]
-    struct ResolveHeaderProvider {
+    struct ResolveHeaderModule {
         headers: &'static [(&'static str, &'static str)],
         id: Option<&'static str>,
     }
 
-    impl EdgeCookieModule for ResolveHeaderProvider {
+    impl EdgeCookieModule for ResolveHeaderModule {
         fn id(&self) -> &'static str {
             "resolve-header"
         }
 
-        fn code(&self) -> crate::ec::provider::ModuleCode {
+        fn code(&self) -> crate::ec::module::ModuleCode {
             crate::module_code!("t0rh")
         }
 
@@ -600,28 +600,27 @@ mod tests {
         }
     }
 
-    /// Drives one resolve request through [`ResolveHeaderProvider`], returning
+    /// Drives one resolve request through [`ResolveHeaderModule`], returning
     /// whatever the handler produced.
-    fn resolve_with_header_provider(
+    fn resolve_with_header_module(
         headers: &'static [(&'static str, &'static str)],
         id: Option<&'static str>,
         graph: Option<&crate::ec::kv::KvIdentityGraph>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-        resolve_request_with_header_provider(headers, id, post(HEADER_PROVIDER_ID), graph)
+        resolve_request_with_header_module(headers, id, post(HEADER_MODULE_ID), graph)
     }
 
-    /// Drives `request` through [`ResolveHeaderProvider`], threaded the way a
-    /// composition root threads a provider.
-    fn resolve_request_with_header_provider(
+    /// Drives `request` through [`ResolveHeaderModule`], threaded the way a
+    /// composition root threads a module.
+    fn resolve_request_with_header_module(
         headers: &'static [(&'static str, &'static str)],
         id: Option<&'static str>,
         request: Request<EdgeBody>,
         graph: Option<&crate::ec::kv::KvIdentityGraph>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcModuleSelection::from("resolve-header"));
-        let services =
-            noop_services_with_ec_module(Arc::new(ResolveHeaderProvider { headers, id }));
+        settings.ec.module = Some(EcModuleSelection::from("resolve-header"));
+        let services = noop_services_with_ec_module(Arc::new(ResolveHeaderModule { headers, id }));
         let organic = Request::builder()
             .method(Method::GET)
             .uri("https://edge.example.com/")
@@ -634,15 +633,12 @@ mod tests {
 
     #[test]
     fn resolve_rejects_a_reserved_response_effect_when_nothing_is_created() {
-        // The 204 path applies provider headers too, so without the check a
-        // browser-side provider could set the managed identity cookie while
+        // The 204 path applies module headers too, so without the check a
+        // browser-side module could set the managed identity cookie while
         // returning no identifier, walking past the identifier bounds, the
         // conflict check and the row-before-cookie rule.
-        let outcome = resolve_with_header_provider(
-            &[("set-cookie", "ts-ec=forged-value; Path=/")],
-            None,
-            None,
-        );
+        let outcome =
+            resolve_with_header_module(&[("set-cookie", "ts-ec=forged-value; Path=/")], None, None);
 
         let err = outcome.expect_err("a managed cookie effect should fail the request");
         assert!(
@@ -653,12 +649,12 @@ mod tests {
 
     #[test]
     fn resolve_rejects_a_reserved_response_effect_on_the_created_path() {
-        // The same check has to cover the 200 path, where the provider does
+        // The same check has to cover the 200 path, where the module does
         // create and core is about to write its own cookie and headers.
         let graph = in_memory_graph();
-        let outcome = resolve_with_header_provider(
+        let outcome = resolve_with_header_module(
             &[("x-ts-ec", "forged-value")],
-            Some(HEADER_PROVIDER_ID),
+            Some(HEADER_MODULE_ID),
             Some(&graph),
         );
 
@@ -670,19 +666,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_accumulates_provider_response_headers_with_its_own() {
-        // The provider's own cookies must add to what the handler already set,
-        // never replace it. Replacing would keep only the last of a provider's
+    fn resolve_accumulates_module_response_headers_with_its_own() {
+        // The module's own cookies must add to what the handler already set,
+        // never replace it. Replacing would keep only the last of a module's
         // own cookies, and would drop the `Cache-Control: no-store` core writes
-        // onto every identity response (a provider cannot set `cache-control`
+        // onto every identity response (a module cannot set `cache-control`
         // itself, so core's directive is what has to survive).
         let graph = in_memory_graph();
-        let response = resolve_with_header_provider(
+        let response = resolve_with_header_module(
             &[
                 ("set-cookie", "vendor-ev=abc; Path=/"),
                 ("set-cookie", "vendor-state=xyz; Path=/"),
             ],
-            Some(HEADER_PROVIDER_ID),
+            Some(HEADER_MODULE_ID),
             Some(&graph),
         )
         .expect("should handle resolve");
@@ -718,7 +714,7 @@ mod tests {
             .collect();
         assert!(
             cache_control.contains(&"no-store"),
-            "a provider header must not drop the no-store an identity response carries, got {cache_control:?}"
+            "a module header must not drop the no-store an identity response carries, got {cache_control:?}"
         );
     }
 
@@ -727,7 +723,7 @@ mod tests {
         // An identifier the cookie cannot carry is refused, never rewritten,
         // and leaves neither a cookie nor an identity-graph row behind.
         let graph = in_memory_graph();
-        let response = resolve_with_header_provider(&[], Some("has a space"), Some(&graph))
+        let response = resolve_with_header_module(&[], Some("has a space"), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -753,7 +749,7 @@ mod tests {
         // cookie is set, because withdrawal could not reach an identity with
         // no row.
         let graph = crate::ec::kv::KvIdentityGraph::failing("test-ec-store");
-        let response = resolve_with_header_provider(&[], Some(HEADER_PROVIDER_ID), Some(&graph))
+        let response = resolve_with_header_module(&[], Some(HEADER_MODULE_ID), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -770,18 +766,14 @@ mod tests {
     fn resolve_refuses_an_advertised_oversized_body_before_reading_it() {
         // A `Content-Length` over the limit is refused before the body is read,
         // whatever the body turns out to hold.
-        let mut request = post(HEADER_PROVIDER_ID);
+        let mut request = post(HEADER_MODULE_ID);
         request
             .headers_mut()
             .insert(header::CONTENT_LENGTH, HeaderValue::from(MAX_BODY_SIZE + 1));
         let graph = in_memory_graph();
-        let response = resolve_request_with_header_provider(
-            &[],
-            Some(HEADER_PROVIDER_ID),
-            request,
-            Some(&graph),
-        )
-        .expect("should handle resolve");
+        let response =
+            resolve_request_with_header_module(&[], Some(HEADER_MODULE_ID), request, Some(&graph))
+                .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -798,10 +790,10 @@ mod tests {
         // A client-generated first-party UUID, the value the browser posts back.
         const TEST_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
-        let provider: Arc<dyn EdgeCookieModule> = Arc::new(TestIdProvider);
+        let module: Arc<dyn EdgeCookieModule> = Arc::new(TestIdModule);
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcModuleSelection::from("testid"));
-        let services = noop_services_with_ec_module(Arc::clone(&provider));
+        settings.ec.module = Some(EcModuleSelection::from("testid"));
+        let services = noop_services_with_ec_module(Arc::clone(&module));
 
         // 1. Organic first visit: no EC yet, and the edge defers because the
         //    identifier is generated in the browser, not derived server-side.
@@ -820,7 +812,7 @@ mod tests {
             .expect("should run generation");
         assert!(
             ec.ec_value().is_none(),
-            "a client-set provider defers creation to the browser"
+            "a client-set module defers creation to the browser"
         );
 
         // 2. The page generates its identifier and posts it to the resolve
@@ -854,7 +846,7 @@ mod tests {
         );
 
         // 3. A later request carries the EC cookie, and the identifier reads
-        //    back verbatim because the provider's own `accepts_id` decides its
+        //    back verbatim because the module's own `accepts_id` decides its
         //    shape.
         let ret = Request::builder()
             .method(Method::GET)
@@ -939,8 +931,8 @@ mod tests {
     /// stopped it.
     #[test]
     fn resolve_answers_204_with_no_cookie_when_it_creates_nothing() {
-        let mut no_provider = create_test_settings();
-        no_provider.ec.provider = None;
+        let mut no_module = create_test_settings();
+        no_module.ec.module = None;
         for (case, settings, body, allowed, has_graph) in [
             (
                 "the permission gate is closed",
@@ -949,7 +941,7 @@ mod tests {
                 false,
                 true,
             ),
-            ("no provider is configured", no_provider, "123", true, true),
+            ("no module is configured", no_module, "123", true, true),
             (
                 "there is no identity graph to hold the row, so a cookie would be a \
                  phantom identity",

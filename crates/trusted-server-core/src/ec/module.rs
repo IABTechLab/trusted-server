@@ -134,22 +134,22 @@ pub const HOST_SIGNALS_MODULE_KEY: &str = "host_signals";
 /// `client-fixed-demo` cargo feature, so a build without it still recognizes
 /// the name and refuses the selection at startup. The resolution in
 /// [`build_module`] matches it, as does its startup counterpart
-/// `check_named_provider_configuration`, and the integration registry adds the
+/// `check_named_module_configuration`, and the integration registry adds the
 /// client-cycle page-script module when the name is selected. It is also
-/// `ClientFixedProvider`'s `id`.
-pub const CLIENT_FIXED_PROVIDER_KEY: &str = "client_fixed";
+/// `ClientFixedModule`'s `id`.
+pub const CLIENT_FIXED_MODULE_KEY: &str = "client_fixed";
 
 /// The implementation ids core supplies itself, one per resolution arm in
 /// [`resolve_named_module`].
 ///
 /// [`build_module`] refuses an injected module under one of these ids
-/// rather than picking one of the two. [`CLIENT_FIXED_PROVIDER_KEY`] is listed
+/// rather than picking one of the two. [`CLIENT_FIXED_MODULE_KEY`] is listed
 /// whether or not the demonstration module is compiled in, because a build
 /// without it still owns the name.
 const BUILTIN_MODULE_KEYS: &[&str] = &[
     HMAC_MODULE_KEY,
     HOST_SIGNALS_MODULE_KEY,
-    CLIENT_FIXED_PROVIDER_KEY,
+    CLIENT_FIXED_MODULE_KEY,
 ];
 
 /// The registry code of the built-in HMAC module.
@@ -193,7 +193,7 @@ pub struct IdentityInput<'a> {
 pub struct ClientResolveInput<'a> {
     /// The raw body the client posted to the resolve endpoint. For a vendor
     /// module this is its own JSON envelope; for the built-in
-    /// `ClientFixedProvider` demo it is the fixed known word the page script
+    /// `ClientFixedModule` demo it is the fixed known word the page script
     /// posts.
     pub payload: &'a [u8],
 
@@ -603,7 +603,7 @@ impl<'a> AcceptedModules<'a> {
 /// - **Server-side** (for example [`HmacModule`]): derives the identifier at
 ///   the edge in [`generate`](Self::generate), and the page response sets the
 ///   cookie. Nothing client-side is involved.
-/// - **Client-side** (for example `ClientFixedProvider`): defers in
+/// - **Client-side** (for example `ClientFixedModule`): defers in
 ///   [`generate`](Self::generate) (returns `id: None`), runs its own JavaScript
 ///   in the browser, and creates the identifier from the value the page posts
 ///   back in
@@ -652,7 +652,7 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
     ///
-    /// A server-side provider creates here. A client-side provider defers here
+    /// A server-side module creates here. A client-side module defers here
     /// (returns `id: None`) and creates later in
     /// [`resolve_from_client`](Self::resolve_from_client) from the value the page
     /// posts back.
@@ -711,12 +711,12 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// posted to the resolve endpoint (`POST /_ts/api/v1/ec/resolve`).
     ///
     /// This is the client-side counterpart to [`generate`](Self::generate). A
-    /// provider that cannot derive an identifier at the edge defers from
+    /// module that cannot derive an identifier at the edge defers from
     /// `generate` (returning `id: None`, optionally with response headers that
     /// trigger client-side work), and the page posts its result back here. The
     /// payload arrives from the browser, so an implementation MUST verify it
     /// (for example checking a signature) before trusting it. The default
-    /// returns no identifier, so a provider that creates entirely server-side
+    /// returns no identifier, so a module that creates entirely server-side
     /// (such as [`HmacModule`]) need not implement it.
     ///
     /// # Errors
@@ -865,7 +865,7 @@ impl EdgeCookieModule for HostSignalModule {
     }
 }
 
-/// The fixed, known word shared by [`ClientFixedProvider`] and its page script.
+/// The fixed, known word shared by [`ClientFixedModule`] and its page script.
 ///
 /// Kept cookie-safe (no characters [`set_ec_cookie`] would reject) so
 /// it can be used as the Edge Cookie value verbatim. The page script posts this
@@ -895,12 +895,12 @@ const EXPECTED_VALUE: &str = "an-ec";
 /// instead of a shared constant.
 #[derive(Debug, Clone)]
 #[cfg(any(test, feature = "client-fixed-demo"))]
-pub struct ClientFixedProvider;
+pub struct ClientFixedModule;
 
 #[cfg(any(test, feature = "client-fixed-demo"))]
-impl EdgeCookieModule for ClientFixedProvider {
+impl EdgeCookieModule for ClientFixedModule {
     fn id(&self) -> &'static str {
-        CLIENT_FIXED_PROVIDER_KEY
+        CLIENT_FIXED_MODULE_KEY
     }
 
     fn code(&self) -> ModuleCode {
@@ -1099,18 +1099,18 @@ fn resolve_named_module(
         )));
     }
 
-    // The `client_fixed` demonstration provider takes no configuration block and
+    // The `client_fixed` demonstration module takes no configuration block and
     // no services, so it is built whenever it is selected. A fixed shared word
     // is not an identity, so it is compiled only into test and demonstration
     // builds and a build without it refuses the name rather than substituting
-    // anything. `check_named_provider_configuration` refuses the same name at
+    // anything. `check_named_module_configuration` refuses the same name at
     // startup, so reaching this error means the two have drifted apart.
-    if implementation == CLIENT_FIXED_PROVIDER_KEY {
+    if implementation == CLIENT_FIXED_MODULE_KEY {
         #[cfg(any(test, feature = "client-fixed-demo"))]
-        return Ok(Box::new(ClientFixedProvider));
+        return Ok(Box::new(ClientFixedModule));
         #[cfg(not(any(test, feature = "client-fixed-demo")))]
         return Err(Report::new(TrustedServerError::EdgeCookie {
-            message: "The `client_fixed` demo Edge Cookie provider is not compiled into this \
+            message: "The `client_fixed` demo Edge Cookie module is not compiled into this \
                       build. It is for demonstration and testing only; enable the \
                       trusted-server-core `client-fixed-demo` cargo feature to use it"
                 .to_owned(),
@@ -1132,23 +1132,23 @@ fn resolve_named_module(
         })
 }
 
-/// Checks that `implementation` names a provider this build compiles in, as
+/// Checks that `implementation` names a module this build compiles in, as
 /// far as the configuration on its own can answer.
 ///
 /// The startup counterpart to [`resolve_named_module`], and the reason
 /// configuration validation does not decide on its own whether every selection
 /// can be honored. Whether a name is compiled into this build is the
 /// resolution's knowledge, not the settings', because a build that does not
-/// compile the `client_fixed` demonstration provider in cannot honor that name
+/// compile the `client_fixed` demonstration module in cannot honor that name
 /// however it is configured. The arm lives here beside the resolution it
-/// belongs to, and goes with it when that provider becomes a module.
+/// belongs to, and goes with it when that module becomes a module.
 ///
 /// Whether a selection needs a settings block is answered by
 /// [`Ec::validate_module_selection`], which knows which implementations
-/// built into core take settings. The demonstration provider takes none, so it
+/// built into core take settings. The demonstration module takes none, so it
 /// is configured correctly with no block at all.
 ///
-/// Whether the host supplies a capability a provider needs is not answerable
+/// Whether the host supplies a capability a module needs is not answerable
 /// from configuration, so it is not asked here. [`ensure_module_available`]
 /// asks that, with the services the adapter injects.
 ///
@@ -1156,19 +1156,19 @@ fn resolve_named_module(
 ///
 /// Returns [`TrustedServerError::Configuration`] when `implementation` is not
 /// compiled into this build.
-pub(crate) fn check_named_provider_configuration(
+pub(crate) fn check_named_module_configuration(
     implementation: &str,
 ) -> Result<(), Report<TrustedServerError>> {
     // The one name a production build does not supply at all, which no amount
     // of configuration can fix. Rejecting it here rather than when the
-    // provider is built means an operator finds out at startup instead of on
+    // module is built means an operator finds out at startup instead of on
     // the first request.
-    if implementation == CLIENT_FIXED_PROVIDER_KEY {
+    if implementation == CLIENT_FIXED_MODULE_KEY {
         #[cfg(any(test, feature = "client-fixed-demo"))]
         return Ok(());
         #[cfg(not(any(test, feature = "client-fixed-demo")))]
         return Err(Report::new(TrustedServerError::Configuration {
-            message: "[ec] provider = \"client_fixed\" selects the demonstration provider, \
+            message: "[ec] module = \"client_fixed\" selects the demonstration module, \
                       which is not compiled into this build. Enable the trusted-server-core \
                       `client-fixed-demo` cargo feature for demonstrations"
                 .to_owned(),
@@ -2057,7 +2057,7 @@ mod tests {
     #[test]
     fn client_fixed_defers_in_generate() {
         let request_info = test_request_info();
-        let generated = ClientFixedProvider
+        let generated = ClientFixedModule
             .generate(&request_info, &IdentityInput::default())
             .expect("should generate");
         assert!(
@@ -2080,13 +2080,13 @@ mod tests {
         let cases: [Case<'_>; 3] = [
             (
                 "client_fixed with the known word",
-                &ClientFixedProvider,
+                &ClientFixedModule,
                 EXPECTED_VALUE.as_bytes(),
                 Some(EXPECTED_VALUE),
             ),
             (
                 "client_fixed with another word",
-                &ClientFixedProvider,
+                &ClientFixedModule,
                 b"not-the-word",
                 None,
             ),
@@ -2112,7 +2112,7 @@ mod tests {
     #[test]
     fn client_fixed_requires_store_on_device() {
         assert!(
-            ClientFixedProvider
+            ClientFixedModule
                 .required_permissions()
                 .contains(Permission::StoreOnDevice),
             "`client_fixed` writes a cookie, so it requires necessary.operations.storage"
@@ -2152,7 +2152,7 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_defers_without_fingerprints() {
+    fn host_signal_module_defers_without_fingerprints() {
         let signals = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
@@ -2377,8 +2377,8 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_check_and_the_resolution_agree_on_a_provider_with_no_block() {
-        // The demonstration provider is configured correctly with no
+    fn the_configuration_check_and_the_resolution_agree_on_a_module_with_no_block() {
+        // The demonstration module is configured correctly with no
         // `[ec.<name>]` block at all, so a check that demanded a block for
         // every selection rejected a valid deployment. The settings ask for a
         // block only from the implementations they know take settings, and
@@ -2386,7 +2386,7 @@ mod tests {
         // passes what the construction then refuses leaves the deployment
         // failing on its first request.
         let ec = Ec {
-            provider: Some(EcModuleSelection::from(CLIENT_FIXED_PROVIDER_KEY)),
+            module: Some(EcModuleSelection::from(CLIENT_FIXED_MODULE_KEY)),
             ..Ec::default()
         };
 
@@ -2395,11 +2395,11 @@ mod tests {
 
         let built = build_module(&ec, None, None)
             .expect("`client_fixed` should build with no configuration and no services")
-            .expect("`client_fixed` should yield a provider");
+            .expect("`client_fixed` should yield a module");
         assert_eq!(
             built.id(),
-            CLIENT_FIXED_PROVIDER_KEY,
-            "the built provider should be the one the selector names"
+            CLIENT_FIXED_MODULE_KEY,
+            "the built module should be the one the selector names"
         );
     }
 
@@ -2408,7 +2408,7 @@ mod tests {
         // Taking the block question out of the settings must not weaken it for
         // the names that do need a block.
         let ec = Ec {
-            provider: Some(EcModuleSelection::from(HMAC_MODULE_KEY)),
+            module: Some(EcModuleSelection::from(HMAC_MODULE_KEY)),
             ..Ec::default()
         };
 
@@ -2422,11 +2422,11 @@ mod tests {
     }
 
     #[test]
-    fn a_block_left_configured_alongside_a_blockless_provider_is_still_rejected() {
-        // The unreferenced-block rule does not soften for a provider that
+    fn a_block_left_configured_alongside_a_blockless_module_is_still_rejected() {
+        // The unreferenced-block rule does not soften for a module that
         // needs no block of its own, because a stale block is still a mistake.
         let mut ec = selected_hmac(HMAC_MODULE_KEY);
-        ec.provider = Some(EcModuleSelection::from(CLIENT_FIXED_PROVIDER_KEY));
+        ec.module = Some(EcModuleSelection::from(CLIENT_FIXED_MODULE_KEY));
 
         let err = ec
             .validate_module_selection()

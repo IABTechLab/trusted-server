@@ -756,7 +756,7 @@ struct IntegrationRegistryInner {
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
-    /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
+    /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
     extra_js_module_ids: Vec<&'static str>,
 }
 
@@ -945,14 +945,17 @@ impl IntegrationRegistry {
             }
         }
 
-        // A client-cycle Edge Cookie provider ships a page script that posts its
+        // A client-cycle Edge Cookie module ships a page script that posts its
         // result to the resolve endpoint. The script rides the tsjs bundle, so
-        // include its module when that provider is selected. The same module
+        // include its module when that module is selected. The same module
         // list drives both the served bundle and the injected `<script>` hash,
         // so they stay consistent.
-        if settings.ec.provider.as_ref().is_some_and(|selection| {
-            selection.key() == crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY
-        }) {
+        if settings
+            .ec
+            .module
+            .as_ref()
+            .is_some_and(|selection| selection.key() == crate::ec::module::CLIENT_FIXED_MODULE_KEY)
+        {
             inner.extra_js_module_ids.push("ec_client_fixed");
         }
 
@@ -1254,7 +1257,7 @@ impl IntegrationRegistry {
         }
 
         // Modules not tied to a registered integration, for example the
-        // client-cycle provider's page script.
+        // client-cycle module's page script.
         for id in &self.inner.extra_js_module_ids {
             if !ids.contains(id) {
                 ids.push(id);
@@ -2420,10 +2423,10 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_include_client_fixed_when_provider_selected() {
+    fn js_module_ids_include_client_fixed_when_module_selected() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.ec.provider = Some(crate::ec::provider::EcModuleSelection::from(
-            crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY,
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
+            crate::ec::module::CLIENT_FIXED_MODULE_KEY,
         ));
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
 
@@ -2431,7 +2434,7 @@ mod tests {
             registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "selecting the `client_fixed` provider should inject its demo page script"
+            "selecting the `client_fixed` module should inject its demo page script"
         );
     }
 
@@ -2474,7 +2477,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_client_fixed_without_provider() {
+    fn js_module_ids_exclude_client_fixed_without_module() {
         let registry =
             IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
                 .expect("should create registry");
@@ -2483,7 +2486,7 @@ mod tests {
             !registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "the demo page script should not ship unless the `client_fixed` provider is selected"
+            "the demo page script should not ship unless the `client_fixed` module is selected"
         );
     }
 

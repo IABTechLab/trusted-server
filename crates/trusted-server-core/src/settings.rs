@@ -22,7 +22,7 @@ use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::ec::module::{
-    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, check_named_provider_configuration,
+    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, check_named_module_configuration,
 };
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
@@ -743,7 +743,7 @@ impl Ec {
     /// one this deployment's adapter injects.
     ///
     /// Whether this build compiles an implementation in at all is answered by
-    /// `check_named_provider_configuration` in [`crate::ec::module`], beside
+    /// `check_named_module_configuration` in [`crate::ec::module`], beside
     /// the resolution it belongs to, rather than here, because the settings
     /// cannot know which implementations are compiled out of this build. Only
     /// the resolution knows that.
@@ -807,7 +807,7 @@ impl Ec {
         // Whether this build compiles the implementation in at all is the
         // resolution's question, not the settings', so it is asked there.
         let implementation = self.module_blocks.implementation(name);
-        check_named_provider_configuration(implementation)?;
+        check_named_module_configuration(implementation)?;
 
         // A module has a block only when it has settings, and core knows
         // which of its own implementations need them. Both modules that

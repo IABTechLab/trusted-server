@@ -1,8 +1,8 @@
-// Demonstration client for the client-cycle Edge Cookie provider (`client_fixed`).
+// Demonstration client for the client-cycle Edge Cookie module (`client_fixed`).
 //
 // Client and server share one fixed, known word. When the resolved marker is
 // absent, this posts that word to the resolve endpoint. With the `client_fixed`
-// provider selected, the server verifies the word and, on a match, persists the
+// module selected, the server verifies the word and, on a match, persists the
 // identity-graph row and sets the word as an HttpOnly Edge Cookie on the
 // response, together with a non-HttpOnly marker cookie. The Edge Cookie itself
 // is HttpOnly, so this script can never see it; the marker is what tells it a
@@ -11,7 +11,7 @@
 // The value is verifiable precisely because it is a known constant, which is the
 // point of the demo. It is useless in production, because a fixed value is not an
 // identity and every client posts the same word. For demonstration and testing
-// only. A real client-cycle provider posts and verifies a real payload (for
+// only. A real client-cycle module posts and verifies a real payload (for
 // example an OWID signature) instead of a shared constant.
 import { log } from '../../core/log';
 
@@ -23,13 +23,13 @@ const RESOLVE_ENDPOINT = '/_ts/api/v1/ec/resolve';
 const MARKER_COOKIE_NAME = 'ts-ecr';
 
 // The fixed, known word shared with the server. Must match EXPECTED_VALUE in
-// crates/trusted-server-core/src/ec/provider.rs; a Rust test asserts the two
+// crates/trusted-server-core/src/ec/module.rs; a Rust test asserts the two
 // stay in sync.
 const FIXED_WORD = 'an-ec';
 
-// The permission this provider requires, the same declaration the server-side
-// provider makes in `required_permissions` (crates/trusted-server-core/src/ec/
-// provider.rs). A page module is treated like any other provider: it declares
+// The permission this module requires, the same declaration the server-side
+// module makes in `required_permissions` (crates/trusted-server-core/src/ec/
+// module.rs). A page module is treated like any other module: it declares
 // what it requires and checks that against the resolved state the server
 // hands the page before it does anything. The server enforces the same gate on
 // the resolve endpoint, so this check is the page's half of one decision, not
