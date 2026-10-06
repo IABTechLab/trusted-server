@@ -291,7 +291,7 @@ s = replace_once(
 s = replace_once(
     s,
     '[integration]\nmodule = []',
-    '[integration]\nprovider = ["prebid"]',
+    '[integration]\nmodule = ["prebid"]',
     "integration selector",
 )
 s = replace_once(
