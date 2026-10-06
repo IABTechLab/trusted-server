@@ -1082,11 +1082,38 @@ passes; the nine pre-existing ShellCheck quoting notices are unchanged.
 
 All four integration jobs on `b2930d7b9`, including framework browser tests and
 four-runtime trace acceptance, have now passed remotely. The unrelated generated
-Python CodeQL job and its aggregate check still fail because this feature branch
-contains no Python. Cloudflare's new-pin worker-build artifact and actual local
+Python CodeQL job fails because this feature branch contains no Python. The
+separate CodeQL security gate reported test-fixture alerts; their resolution is
+recorded below. Cloudflare's new-pin worker-build artifact and actual local
 browser/raw-boundary suites use Trusted Server's resolved worker 0.8.5 and
 wasm-bindgen 0.2.126; that consumer runtime check is complete. Deployed-platform
 and physical-device acceptance remain separate release gates.
+
+### CodeQL alert triage
+
+On 2026-10-06, the user authorized fixing CodeQL findings or dismissing verified
+false positives. Two independent read-only reviewers confirmed alerts #196–203
+are confined to fictional authentication fixtures in `#[cfg(test)]` modules or
+the parity integration-test target. Alerts #202–203 flag test-only passwords;
+alerts #196–201 flag `expect()` calls on `Handler` deserialization. That
+deserialization does not invoke the `Settings`/Tinybird secret validation named
+in the alleged logging flow. No production secret reaches these fixtures.
+
+All eight alerts were dismissed individually with GitHub's `used in tests`
+reason and per-alert evidence. A fresh API check confirms no open alerts on
+`refs/pull/1107/merge` and a successful CodeQL security gate. The earlier
+explanation attributing the aggregate gate solely to Python extraction was
+incomplete; the extraction error and these alerts are independent.
+
+The generated `dynamic/github-code-quality/codeql` workflow still attempts Python
+analysis on `refs/pull/1107/head` and exits 32 because that head contains no
+Python. The default branch contains an unrelated Python browser helper, which
+accounts for repository-wide language detection. This is an analysis failure,
+not a dismissible vulnerability alert. Reading Code Quality setup returned HTTP
+403 with the current maintainer account; configuration changes require a
+repository admin. Any Python language-selection change is repository-wide and
+must account for that default-branch helper. No scanner rules, source files or
+production behavior were weakened to dismiss the test-only alerts.
 
 Bundle splitting remains a separate load-order/performance design. Preserve
 the build-input freshness guard and ordinary reserved-route/cache policy.
