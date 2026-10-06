@@ -265,13 +265,15 @@ pub struct EcContext {
     /// instead of being dropped by the built-in shape check. `None` when no
     /// provider is configured.
     selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
-    /// A snapshot of the request evidence a provider reads at generation time:
-    /// the request headers (so a provider can read cookies and client hints), and
-    /// the URL path and query string (so it can read request parameters).
-    /// Captured once at construction, and only when a provider is configured and
-    /// the request carries no usable identifier, so a no-provider deployment and
-    /// a returning visitor both clone nothing. A provider reads these through
-    /// [`RequestInfo`](crate::evidence::RequestInfo) at generate time.
+    /// A snapshot of the request evidence a provider reads when it creates an
+    /// identifier, at generation or in orphan recovery: the request headers (so
+    /// a provider can read cookies and client hints), and the URL path and query
+    /// string (so it can read request parameters). Captured once at
+    /// construction, when a provider is configured and the request either
+    /// carries no usable identifier or is a document navigation, the only
+    /// request that can recover an orphaned one. So a no-provider deployment
+    /// and a returning visitor's subresource requests clone nothing. A provider
+    /// reads these through [`RequestInfo`](crate::evidence::RequestInfo).
     request_headers: http::HeaderMap,
     request_path: String,
     request_query: String,
@@ -354,22 +356,25 @@ impl EcContext {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
 
-        // Snapshot the request evidence a provider reads at generation time (the
-        // headers, so it can read cookies and client hints, and the URL path and
-        // query, so it can read request parameters). Capture only when a provider
-        // is configured and no identifier already exists, so a no-provider
-        // deployment and a returning visitor clone nothing. Generation runs after
-        // the request body may be consumed, so the snapshot is owned.
-        let (request_headers, request_path, request_query) =
-            if selected_provider.is_some() && ec_value.is_none() {
-                (
-                    req.headers().clone(),
-                    req.uri().path().to_owned(),
-                    req.uri().query().unwrap_or_default().to_owned(),
-                )
-            } else {
-                (http::HeaderMap::new(), String::new(), String::new())
-            };
+        // Snapshot the request evidence a provider reads when it creates an
+        // identifier (the headers, so it can read cookies and client hints, and
+        // the URL path and query, so it can read request parameters). Capture
+        // only when a provider is configured and either no identifier exists or
+        // the request is a document navigation, which orphan recovery may need,
+        // so a no-provider deployment and a returning visitor's subresource
+        // requests clone nothing. Creation runs after the request body may be
+        // consumed, so the snapshot is owned.
+        let (request_headers, request_path, request_query) = if selected_provider.is_some()
+            && (ec_value.is_none() || crate::http_util::is_navigation_request(req))
+        {
+            (
+                req.headers().clone(),
+                req.uri().path().to_owned(),
+                req.uri().query().unwrap_or_default().to_owned(),
+            )
+        } else {
+            (http::HeaderMap::new(), String::new(), String::new())
+        };
 
         // Capture the client IP from platform services (normalized).
         let client_ip = services
@@ -1524,6 +1529,46 @@ pub(crate) mod tests {
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
             "the identifier the provider created should be committed under its code"
+        );
+    }
+
+    #[test]
+    fn recovery_on_a_navigation_passes_request_parameters_and_cookies_to_the_provider() {
+        use crate::platform::test_support::noop_services_with_ec_provider;
+
+        let provider = Arc::new(EvidenceCapturingProvider::default());
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some(EcProviderSelection::from("evidence"));
+
+        // A returning visitor's document navigation, carrying an identifier
+        // the provider owns, which is the request orphan recovery runs on.
+        let cookie = "ts-ec=t0ev~orphaned; client-id=xyz789";
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/page?id=abc123")
+            .header("cookie", cookie)
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let services = noop_services_with_ec_provider(provider.clone());
+        let geo = non_regulated_geo();
+        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+            .expect("should read EC context");
+        assert!(ec.ec_was_present(), "the identifier should be read back");
+        let selected = ec.selected_provider().expect("a provider is selected");
+        ec.candidate_id(selected.as_ref())
+            .expect("should create a replacement");
+
+        let seen = provider
+            .seen
+            .lock()
+            .expect("should lock seen evidence")
+            .clone();
+        assert_eq!(
+            seen,
+            Some(("abc123".to_owned(), cookie.to_owned())),
+            "recovery should give the provider the request's parameters and cookies"
         );
     }
 
