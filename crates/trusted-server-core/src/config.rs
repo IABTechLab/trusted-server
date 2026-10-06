@@ -976,6 +976,42 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn push_validation_keeps_the_sections_other_errors_for_a_labeled_block() {
+        // A block under a label has no fixed secret path, so push validation
+        // strips the error that judged its key name as a passphrase, and only
+        // that one: another error in the Edge Cookie section is still reported.
+        let toml = labeled_hmac_settings_str("ec_key");
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize a labeled provider block");
+        let mut settings = app_config.into_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Example partner",
+                "source_domain": "https://partner.example",
+            }))
+            .expect("should deserialize a partner"),
+        ];
+
+        // Read from the section's own errors, because deploy validation
+        // reports a bad partner as well.
+        let errors = TrustedServerAppConfig { settings }
+            .validate()
+            .expect_err("an error beside the passphrase should still be reported");
+        let Some(ValidationErrorsKind::Struct(ec)) = errors.errors().get("ec") else {
+            panic!("the Edge Cookie section should keep its error: {errors}");
+        };
+        assert!(
+            ec.errors().contains_key("partners"),
+            "the partner error should be reported: {errors}"
+        );
+        assert!(
+            !ec.errors().contains_key("primary"),
+            "the key name should not be judged as a passphrase: {errors}"
+        );
+    }
+
+    #[test]
     fn push_validation_rejects_an_empty_key_name_in_a_labeled_hmac_block() {
         let toml = labeled_hmac_settings_str("");
         let app_config: TrustedServerAppConfig =
