@@ -87,7 +87,7 @@ use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
-use crate::evidence::{BorrowedRequestInfo, HostSignals};
+use crate::evidence::BorrowedRequestInfo;
 use crate::geo::GeoInfo;
 use crate::permissions::{Permission, PermissionState};
 use crate::platform::RuntimeServices;
@@ -270,18 +270,6 @@ pub struct EcContext {
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
-    /// The host-signal service for this request, when the host supplies one
-    /// (the Fastly adapter registers the TLS and HTTP/2 signals). `None` on a
-    /// host that exposes none. Injected into a module that needs it when the
-    /// module is built.
-    host_signals: Option<Arc<dyn HostSignals>>,
-    /// The adapter-injected Edge Cookie module, when one is wired for this
-    /// request. Captured once from [`RuntimeServices`] at construction and read
-    /// on every path that builds a module (the organic path through
-    /// `request_module`, the resolve path through `build_module`), so a
-    /// vendor or host module resolves without core naming it. `None` for
-    /// built-in-only deployments.
-    ec_module: Option<Arc<dyn crate::ec::module::EdgeCookieModule>>,
     /// The selected Edge Cookie module (built-in or injected), built once at
     /// construction. Core asks it whether an identifier is well formed
     /// ([`accepts_id`](crate::ec::module::EdgeCookieModule::accepts_id)) so
@@ -419,14 +407,6 @@ impl EcContext {
         let selected_module: Option<Arc<dyn crate::ec::module::EdgeCookieModule>> =
             module::request_module(&settings.ec, services)?;
 
-        // The same two services are kept on the context so the resolve endpoint,
-        // which runs later in the request with no `RuntimeServices` of its own,
-        // can reach the module again. The module arrives through the one
-        // seam a composition root threads it into, so the resolve endpoint sees
-        // the same instance this request resolved.
-        let host_signals = services.host_signals();
-        let ec_module = services.resolved_ec_module();
-
         // Read back an existing identifier only when the selected module
         // accepts its shape, so an opaque vendor identifier (for example a signed
         // envelope) round-trips instead of being silently dropped by the built-in
@@ -534,8 +514,6 @@ impl EcContext {
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
-            host_signals,
-            ec_module,
             selected_module,
             request_headers,
             request_path,
@@ -953,22 +931,6 @@ impl EcContext {
         self.client_ip.as_deref()
     }
 
-    /// Returns the host-computed client signals captured for this request,
-    /// when the host supplies them.
-    ///
-    /// The resolve path rebuilds the provider with the same injected services
-    /// as the organic path, so it reads the host signals captured here rather
-    /// than re-deriving them.
-    pub(crate) fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
-        self.host_signals.clone()
-    }
-
-    /// Returns the adapter-injected Edge Cookie provider captured for this
-    /// request, or `None` for a built-in-only deployment.
-    pub(crate) fn ec_module(&self) -> Option<Arc<dyn crate::ec::provider::EdgeCookieModule>> {
-        self.ec_module.clone()
-    }
-
     /// Returns the pre-routing geo data, if available.
     #[must_use]
     pub fn geo_info(&self) -> Option<&GeoInfo> {
@@ -1181,8 +1143,6 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
-            host_signals: None,
-            ec_module: None,
             selected_module: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
@@ -1229,8 +1189,6 @@ impl EcContext {
             client_ip,
             geo_info: None,
             device_signals: None,
-            host_signals: None,
-            ec_module: None,
             selected_module: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
@@ -1266,8 +1224,6 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
-            host_signals: None,
-            ec_module: None,
             selected_module: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),

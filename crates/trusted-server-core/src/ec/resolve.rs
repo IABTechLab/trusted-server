@@ -27,7 +27,7 @@ use super::cookies::{
 };
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
-use super::provider::{ClientResolveInput, apply_module_response_headers, build_module};
+use super::provider::{ClientResolveInput, apply_module_response_headers};
 
 /// Maximum size of a resolve request body.
 ///
@@ -100,15 +100,10 @@ pub fn handle_ec_resolve(
         return Ok(status_only(StatusCode::NO_CONTENT));
     }
 
-    // Rebuild the provider with the same host signals captured on the context, so
-    // a provider that needs a service the host cannot supply fails here. The
+    // The module this request resolved when its context was read, so the
+    // endpoint answers with the instance the page's own request selected. The
     // client value is verified from the posted body below, not from request info.
-    let Some(provider) = build_module(
-        &settings.ec,
-        ec_context.host_signals(),
-        ec_context.ec_module(),
-    )?
-    else {
+    let Some(provider) = ec_context.selected_module() else {
         log::info!("EC resolve skipped: no Edge Cookie provider configured");
         return Ok(status_only(StatusCode::NO_CONTENT));
     };
@@ -417,7 +412,7 @@ mod tests {
         IdentityInput,
     };
     use crate::evidence::RequestInfo;
-    use crate::platform::test_support::noop_services_with_ec_module;
+    use crate::platform::test_support::{noop_services, noop_services_with_ec_module};
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use std::sync::Arc;
@@ -458,8 +453,22 @@ mod tests {
         crate::ec::kv::KvIdentityGraph::in_memory("test-ec-store")
     }
 
-    fn gated(ec_allowed: bool) -> EcContext {
-        EcContext::new_for_test_gated(None, ConsentContext::default(), ec_allowed)
+    /// A context whose gate is set by hand, carrying the module the settings
+    /// select, resolved as a request's own context resolves it.
+    fn gated(settings: &Settings, ec_allowed: bool) -> EcContext {
+        with_selected_module(
+            settings,
+            EcContext::new_for_test_gated(None, ConsentContext::default(), ec_allowed),
+        )
+    }
+
+    fn with_selected_module(settings: &Settings, context: EcContext) -> EcContext {
+        match crate::ec::module::request_module(&settings.ec, &noop_services())
+            .expect("should resolve the selected module")
+        {
+            Some(module) => context.with_module_for_test(module),
+            None => context,
+        }
     }
 
     /// Returns whether `value` is a canonical UUID (`8-4-4-4-12` lowercase hex).
@@ -782,8 +791,13 @@ mod tests {
     fn resolve_sets_cookie_marker_and_no_store_when_word_matches_and_allowed() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(&settings, true),
+            Some(&graph),
+        )
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -841,8 +855,13 @@ mod tests {
     fn resolve_returns_204_when_not_allowed() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &gated(false), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(&settings, false),
+            Some(&graph),
+        )
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -860,8 +879,13 @@ mod tests {
         let mut settings = create_test_settings();
         settings.ec.provider = None;
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post("123"), &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post("123"),
+            &gated(&settings, true),
+            Some(&graph),
+        )
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -874,13 +898,80 @@ mod tests {
         );
     }
 
+    /// A context read the way a composition root builds one, with the selected
+    /// built-in module threaded through the services, at a location whose
+    /// rules set storage without a signal so the gate is open.
+    fn resolve_with_threaded_module(settings: &Settings, body: &str) -> Response<EdgeBody> {
+        let module = crate::ec::module::build_reusable_module(&settings.ec, None, None)
+            .expect("should build the selected module")
+            .expect("a built-in module is reusable");
+        let services = noop_services_with_ec_module(module);
+        let organic = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/")
+            .body(EdgeBody::empty())
+            .expect("should build organic request");
+        let geo = crate::platform::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: Some("CA".to_owned()),
+            asn: None,
+        };
+        let ec = EcContext::read_from_request_with_geo(settings, &organic, &services, Some(&geo))
+            .expect("should read EC context");
+        assert!(
+            ec.ec_allowed(),
+            "the gate must be open for this to test anything"
+        );
+
+        handle_ec_resolve(settings, post(body), &ec, Some(&in_memory_graph()))
+            .expect("a valid selection should not be an error")
+    }
+
+    #[test]
+    fn resolve_answers_204_for_a_threaded_module_that_creates_nothing() {
+        let response = resolve_with_threaded_module(&create_test_settings(), FIXED_WORD);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "a module that creates nothing from a client post should answer 204"
+        );
+    }
+
+    #[test]
+    fn resolve_sets_the_cookie_for_a_threaded_client_fixed_module() {
+        let response = resolve_with_threaded_module(&settings_with_client_fixed(), FIXED_WORD);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the fixed word should create the Edge Cookie"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|cookie| cookie.starts_with("ts-ec="))),
+            "should set the Edge Cookie"
+        );
+    }
+
     #[test]
     fn resolve_rejects_oversized_body() {
         let settings = settings_with_client_fixed();
         let big = "x".repeat(MAX_BODY_SIZE + 1);
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(&big), &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response =
+            handle_ec_resolve(&settings, post(&big), &gated(&settings, true), Some(&graph))
+                .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -895,8 +986,9 @@ mod tests {
         let graph = in_memory_graph();
         for origin in [None, Some("https://attacker.example")] {
             let request = post_with(origin, Some("text/plain"), FIXED_WORD);
-            let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-                .expect("should handle resolve");
+            let response =
+                handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
+                    .expect("should handle resolve");
             assert_eq!(
                 response.status(),
                 StatusCode::FORBIDDEN,
@@ -918,7 +1010,7 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -936,7 +1028,7 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -954,7 +1046,7 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -976,7 +1068,7 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -1051,7 +1143,7 @@ mod tests {
             Some("application/x-www-form-urlencoded"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -1083,8 +1175,9 @@ mod tests {
     #[test]
     fn resolve_mints_nothing_without_an_identity_graph() {
         let settings = settings_with_client_fixed();
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &gated(true), None)
-            .expect("should handle resolve");
+        let response =
+            handle_ec_resolve(&settings, post(FIXED_WORD), &gated(&settings, true), None)
+                .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::NO_CONTENT,
@@ -1100,9 +1193,13 @@ mod tests {
     fn resolve_sets_no_cookie_for_unmatched_word() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
-        let response =
-            handle_ec_resolve(&settings, post("not-the-word"), &gated(true), Some(&graph))
-                .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post("not-the-word"),
+            &gated(&settings, true),
+            Some(&graph),
+        )
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
