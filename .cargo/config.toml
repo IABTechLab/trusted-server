@@ -36,10 +36,12 @@ test-fastly = "test -p trusted-server-core -p trusted-server-adapter-fastly -p t
 test-fastly-reuse = "test -p trusted-server-adapter-fastly --target wasm32-wasip1 --features reusable-sandbox"
 
 # --- Axum adapter (native dev server) ---
+# Test and clippy also cover the permission signal crates, whose own tests
+# run with the Axum adapter in CI.
 build-axum = "build -p trusted-server-adapter-axum"
 check-axum = "check -p trusted-server-adapter-axum"
-clippy-axum = "clippy -p trusted-server-adapter-axum --all-targets --all-features -- -D warnings"
-test-axum = "test -p trusted-server-adapter-axum"
+clippy-axum = "clippy -p trusted-server-adapter-axum -p trusted-server-permission-signal-gpc -p trusted-server-permission-signal-gpp -p trusted-server-permission-signal-mtm -p trusted-server-permission-signal-tcf -p trusted-server-permission-signal-us-privacy --all-targets --all-features -- -D warnings"
+test-axum = "test -p trusted-server-adapter-axum -p trusted-server-permission-signal-gpc -p trusted-server-permission-signal-gpp -p trusted-server-permission-signal-mtm -p trusted-server-permission-signal-tcf -p trusted-server-permission-signal-us-privacy"
 
 # --- Cloudflare adapter (native host + wasm32-unknown-unknown) ---
 # Build/check target the WASM runtime (requires the `cloudflare` feature);
