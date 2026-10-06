@@ -4478,7 +4478,7 @@ pub async fn handle_publisher_request(
     // ID, keeping the withdrawal CAS off the post-origin latency path.
     let active_ec_id_owned = ec_context.ec_value().map(str::to_owned);
     let active_ec_id = active_ec_id_owned.as_deref();
-    // The identity-graph key for the active EC ID, the owning provider's
+    // The identity-graph key for the active EC ID, the owning module's
     // canonical form of it. The snapshot preload reads and compares the row
     // under this key, the key the row was written under, rather than under the
     // identifier as issued.
@@ -7064,7 +7064,7 @@ pub async fn handle_page_bids(
             // bot/prefetch) and a partner registry exists to consume server-side
             // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
             // never reach here, so they incur no billable KV read. The row is
-            // read under the owning provider's canonical form of the
+            // read under the owning module's canonical form of the
             // identifier, the key it is stored under, rather than under the
             // identifier as issued.
             let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
@@ -24501,7 +24501,7 @@ mod tests {
     /// the handler emitted.
     ///
     /// The same capturing setup also covers how both paths key the identity
-    /// graph. A provider whose canonical form differs from the cookie value has
+    /// graph. A module whose canonical form differs from the cookie value has
     /// its row read under the canonical key, so the partner ID stored there
     /// reaches the dispatched auction request.
     mod navigation_publisher_domain_tests {
@@ -24511,7 +24511,7 @@ mod tests {
         use crate::auction::types::AuctionRequest;
         use crate::auction::{AuctionContext, AuctionOrchestrator};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
+        use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
@@ -24955,7 +24955,7 @@ mod tests {
             (graph, registry)
         }
 
-        /// A returning visitor carrying the identifier [`CanonicalizingProvider`]
+        /// A returning visitor carrying the identifier [`CanonicalizingModule`]
         /// creates, with consent that permits the server-side auction.
         fn canonicalizing_returning_visitor() -> EcContext {
             let consent = crate::consent::ConsentContext {
@@ -24963,7 +24963,7 @@ mod tests {
                 ..Default::default()
             };
             EcContext::new_for_test(Some(CANONICAL_COOKIE_VALUE.to_owned()), consent)
-                .with_provider_for_test(Arc::new(CanonicalizingProvider))
+                .with_module_for_test(Arc::new(CanonicalizingModule))
         }
 
         /// Asserts the dispatched auction request carried the partner ID the
@@ -24998,9 +24998,9 @@ mod tests {
 
         #[tokio::test]
         async fn initial_navigation_reads_the_identity_row_under_the_canonical_key() {
-            // The identity graph stores a row under the owning provider's
+            // The identity graph stores a row under the owning module's
             // canonical form of the identifier. Preloaded and resolved under
-            // the identifier as issued, a provider whose canonical form differs
+            // the identifier as issued, a module whose canonical form differs
             // from the cookie value found no row, so the auction carried no
             // server-side EIDs.
             let settings = settings_with_capturing_provider();
@@ -25077,14 +25077,14 @@ mod tests {
                     ..Default::default()
                 };
                 let mut ec_context = EcContext::new_for_test(None, consent)
-                    .with_provider_for_test(Arc::new(CanonicalizingProvider));
+                    .with_module_for_test(Arc::new(CanonicalizingModule));
                 ec_context
                     .generate_if_needed(&settings, Some(&graph))
-                    .expect("should create the identifier through the provider");
+                    .expect("should create the identifier through the module");
                 assert_eq!(
                     ec_context.ec_value(),
                     Some(CANONICAL_COOKIE_VALUE),
-                    "test precondition: the provider should create its identifier"
+                    "test precondition: the module should create its identifier"
                 );
                 let req = HttpRequest::builder()
                     .method(Method::GET)

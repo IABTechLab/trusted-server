@@ -25,7 +25,7 @@ use crate::error::TrustedServerError;
 use super::auth::authenticate_bearer;
 use super::kv::{KvIdentityGraph, UpsertResult};
 use super::log_id;
-use super::provider::{AcceptedProviders, EdgeCookieProvider};
+use super::module::{AcceptedModules, EdgeCookieModule};
 use super::rate_limiter::RateLimiter;
 use super::registry::PartnerRegistry;
 
@@ -115,17 +115,17 @@ pub fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
-    provider: Option<&dyn EdgeCookieProvider>,
+    module: Option<&dyn EdgeCookieModule>,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, provider, req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, module, req)
 }
 
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
-    provider: Option<&dyn EdgeCookieProvider>,
+    module: Option<&dyn EdgeCookieModule>,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // 1. Authenticate
@@ -173,7 +173,7 @@ fn handle_batch_sync_with_writer(
         writer,
         &partner.source_domain,
         &body.mappings,
-        &AcceptedProviders::active(provider),
+        &AcceptedModules::active(module),
     );
 
     let rejected = errors.len();
@@ -210,7 +210,7 @@ fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
     mappings: &[SyncMapping],
-    accepted_providers: &AcceptedProviders<'_>,
+    accepted_modules: &AcceptedModules<'_>,
 ) -> (usize, Vec<MappingError>) {
     let mut errors = Vec::new();
     let mut groups: Vec<MappingGroup> = Vec::new();
@@ -219,12 +219,12 @@ fn process_mappings(
     // Validate all inputs before beginning KV work. The vector preserves group
     // order; the map only locates an existing group in constant time.
     for (index, mapping) in mappings.iter().enumerate() {
-        // The global cookie bounds, then the provider that owns the
+        // The global cookie bounds, then the module that owns the
         // identifier's code, which canonicalizes its own value part and decides
         // whether the canonical form is one of its own. A partner echoing back
-        // an identifier a non-HMAC provider created is accepted here; an
+        // an identifier a non-HMAC module created is accepted here; an
         // identifier under a code this deployment does not read is not.
-        let Some(ec_id) = accepted_providers.canonical_kv_key(&mapping.ec_id) else {
+        let Some(ec_id) = accepted_modules.canonical_kv_key(&mapping.ec_id) else {
             errors.push(MappingError {
                 index,
                 reason: REASON_INVALID_EC_ID,
@@ -320,15 +320,15 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use crate::ec::provider::HmacProvider;
-    use crate::ec::tests::OpaqueProvider;
+    use crate::ec::module::HmacModule;
+    use crate::ec::tests::OpaqueModule;
     use crate::error::TrustedServerError;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
-    /// The built-in provider, standing in for a deployment that selected it.
-    fn hmac_provider() -> HmacProvider {
-        HmacProvider::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()))
+    /// The built-in module, standing in for a deployment that selected it.
+    fn hmac_module() -> HmacModule {
+        HmacModule::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()))
     }
 
     struct MockRateLimiter {
@@ -544,12 +544,12 @@ mod tests {
             mapping(&format!("{}.ABC123", "a".repeat(64)), "u3", 1),
         ];
 
-        let provider = hmac_provider();
+        let module = hmac_module();
         let (accepted, errors) = process_mappings(
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&provider)),
+            &AcceptedModules::active(Some(&module)),
         );
 
         assert_eq!(accepted, 1, "should count successful writes as accepted");
@@ -576,12 +576,12 @@ mod tests {
             mapping(&format!("{}.ABC123", "c".repeat(64)), "u3", 1),
         ];
 
-        let provider = hmac_provider();
+        let module = hmac_module();
         let (accepted, errors) = process_mappings(
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&provider)),
+            &AcceptedModules::active(Some(&module)),
         );
 
         assert_eq!(accepted, 1, "should keep accepted count before failure");
@@ -679,12 +679,12 @@ mod tests {
             mapping(&withdrawn_ec_id, "uid-2", 101),
         ];
 
-        let provider = hmac_provider();
+        let module = hmac_module();
         let (accepted, errors) = process_mappings(
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&provider)),
+            &AcceptedModules::active(Some(&module)),
         );
 
         assert_eq!(accepted, 0, "should not accept ineligible mappings");
@@ -697,8 +697,8 @@ mod tests {
     }
 
     #[test]
-    fn process_mappings_accepts_an_identifier_from_the_active_non_hmac_provider() {
-        // An identifier the active non-HMAC provider owns is accepted, so a
+    fn process_mappings_accepts_an_identifier_from_the_active_non_hmac_module() {
+        // An identifier the active non-HMAC module owns is accepted, so a
         // partner can sync a mapping against an identifier the HMAC grammar
         // would reject.
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
@@ -708,10 +708,10 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&OpaqueProvider)),
+            &AcceptedModules::active(Some(&OpaqueModule)),
         );
 
-        assert_eq!(accepted, 1, "the active provider's identifier is accepted");
+        assert_eq!(accepted, 1, "the active module's identifier is accepted");
         assert!(
             errors.is_empty(),
             "should report no errors, got: {errors:?}"
@@ -719,8 +719,8 @@ mod tests {
     }
 
     #[test]
-    fn process_mappings_rejects_a_code_no_configured_provider_reads() {
-        // The other side of the dispatch: a code belonging to a provider this
+    fn process_mappings_rejects_a_code_no_configured_module_reads() {
+        // The other side of the dispatch: a code belonging to a module this
         // deployment neither runs nor reads is not an identifier here, whatever
         // its shape.
         let writer = MockWriter::new(vec![]);
@@ -734,10 +734,10 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&OpaqueProvider)),
+            &AcceptedModules::active(Some(&OpaqueModule)),
         );
 
-        assert_eq!(accepted, 0, "an unknown provider code is not accepted");
+        assert_eq!(accepted, 0, "an unknown module code is not accepted");
         assert_eq!(errors.len(), 2, "both mappings should be rejected");
         assert!(
             errors
@@ -748,31 +748,30 @@ mod tests {
     }
 
     #[test]
-    fn process_mappings_canonicalizes_through_the_owning_provider() {
+    fn process_mappings_canonicalizes_through_the_owning_module() {
         // KV normalization is dispatched the same way as validation. The
-        // built-in provider lowercases its hash segment, so a partner echoing
+        // built-in module lowercases its hash segment, so a partner echoing
         // uppercase hex still writes the row created at generation time, while
-        // the opaque provider's own normalization leaves its value untouched.
+        // the opaque module's own normalization leaves its value untouched.
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let uppercase = format!("hmac~{}.ABC123", "A".repeat(64));
-        let provider = hmac_provider();
-        let accepted_providers = AcceptedProviders::active(Some(&provider));
+        let module = hmac_module();
+        let accepted_modules = AcceptedModules::active(Some(&module));
 
         assert_eq!(
-            accepted_providers.canonical_kv_key(&uppercase),
+            accepted_modules.canonical_kv_key(&uppercase),
             Some(format!("hmac~{}.ABC123", "a".repeat(64))),
-            "the built-in provider should lowercase only its hash segment"
+            "the built-in module should lowercase only its hash segment"
         );
         assert_eq!(
-            AcceptedProviders::active(Some(&OpaqueProvider))
+            AcceptedModules::active(Some(&OpaqueModule))
                 .canonical_kv_key("t0op~Opaque_Value_MixedCase"),
             Some("t0op~Opaque_Value_MixedCase".to_owned()),
-            "an opaque provider's identifier should be keyed verbatim"
+            "an opaque module's identifier should be keyed verbatim"
         );
 
         let mappings = vec![mapping(&uppercase, "uid-1", 100)];
-        let (accepted, errors) =
-            process_mappings(&writer, "partner", &mappings, &accepted_providers);
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings, &accepted_modules);
         assert_eq!(accepted, 1, "uppercase hex should still be accepted");
         assert!(
             errors.is_empty(),
@@ -795,12 +794,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 100), mapping(&ec_id, "uid-1", 101)];
 
-        let provider = hmac_provider();
+        let module = hmac_module();
         let (accepted, errors) = process_mappings(
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&provider)),
+            &AcceptedModules::active(Some(&module)),
         );
 
         assert_eq!(accepted, 2, "should accept every unchanged group member");
@@ -820,12 +819,12 @@ mod tests {
             mapping(&ec_id, "uid-old", 100),
         ];
 
-        let provider = hmac_provider();
+        let module = hmac_module();
         let (accepted, errors) = process_mappings(
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&provider)),
+            &AcceptedModules::active(Some(&module)),
         );
 
         assert_eq!(
@@ -860,7 +859,7 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&hmac_provider())),
+            &AcceptedModules::active(Some(&hmac_module())),
         );
 
         assert_eq!(accepted, 3, "should accept every valid group member");
@@ -895,7 +894,7 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&hmac_provider())),
+            &AcceptedModules::active(Some(&hmac_module())),
         );
 
         assert_eq!(
@@ -928,7 +927,7 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&hmac_provider())),
+            &AcceptedModules::active(Some(&hmac_module())),
         );
 
         assert_eq!(accepted, 2, "should accept both distinct EC IDs");
@@ -965,7 +964,7 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&hmac_provider())),
+            &AcceptedModules::active(Some(&hmac_module())),
         );
 
         assert_eq!(accepted, 2, "should accept valid group members");
@@ -998,7 +997,7 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&hmac_provider())),
+            &AcceptedModules::active(Some(&hmac_module())),
         );
 
         assert_eq!(accepted, 0, "should reject all ineligible group members");
@@ -1044,7 +1043,7 @@ mod tests {
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&hmac_provider())),
+            &AcceptedModules::active(Some(&hmac_module())),
         );
 
         assert_eq!(
@@ -1092,7 +1091,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
-            Some(&hmac_provider()),
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return success response");
@@ -1123,7 +1122,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
-            Some(&hmac_provider()),
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return multi-status response");
@@ -1162,7 +1161,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
-            Some(&hmac_provider()),
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return validation response");
@@ -1208,7 +1207,7 @@ mod tests {
             &writer,
             &registry,
             &limiter,
-            Some(&hmac_provider()),
+            Some(&hmac_module()),
             authorized_batch_request(&body),
         )
         .expect("should return infrastructure failure response");
@@ -1246,16 +1245,16 @@ mod tests {
     fn process_mappings_accepts_a_created_coded_ec_id() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         // Partners echo the identifier identify gave them, which carries the
-        // provider-code envelope since the creation path applies it.
+        // module-code envelope since the creation path applies it.
         let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 1)];
 
-        let provider = hmac_provider();
+        let module = hmac_module();
         let (accepted, errors) = process_mappings(
             &writer,
             "partner",
             &mappings,
-            &AcceptedProviders::active(Some(&provider)),
+            &AcceptedModules::active(Some(&module)),
         );
 
         assert_eq!(accepted, 1, "should accept a coded HMAC identifier");

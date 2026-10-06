@@ -46,7 +46,7 @@ fn test_settings() -> Settings {
             proxy_secret = "parity-test-proxy-secret"
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"

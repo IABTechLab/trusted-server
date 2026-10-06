@@ -26,7 +26,7 @@
 //! - [`kv_types`] — Schema types for KV identity graph entries
 //! - [`device`]: Device signal derivation (UA, JA4, H2 SETTINGS)
 //! - [`partner`] — Partner validation helpers (ID format, pull sync config)
-//! - [`provider`]: Edge Cookie providers and their selection
+//! - [`module`]: Edge Cookie modules and their selection
 //! - [`registry`] — In-memory partner registry built from config
 //! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
@@ -48,9 +48,9 @@ pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
+pub mod module;
 pub mod partner;
 pub mod prebid_eids;
-pub mod provider;
 pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
@@ -90,7 +90,7 @@ use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
-use provider::{EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput};
+use module::{EdgeCookieModule, GeneratedEdgeCookie, IdentityInput};
 
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
@@ -251,7 +251,7 @@ pub struct EcContext {
     /// The consent context for this request.
     consent: ConsentContext,
     /// Whether Edge Cookie creation is allowed for this request. Resolved once
-    /// at construction: closed when no provider is selected, otherwise from the
+    /// at construction: closed when no module is selected, otherwise from the
     /// request's consent context. Read via [`ec_allowed`](Self::ec_allowed).
     ec_allowed: bool,
     /// The normalized client IP, captured early before the request body
@@ -263,29 +263,29 @@ pub struct EcContext {
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
-    /// The selected Edge Cookie provider (built-in or injected), built once at
+    /// The selected Edge Cookie module (built-in or injected), built once at
     /// construction. Core asks it whether an identifier is well formed
-    /// ([`accepts_id`](crate::ec::provider::EdgeCookieProvider::accepts_id)) so
+    /// ([`accepts_id`](crate::ec::module::EdgeCookieModule::accepts_id)) so
     /// an opaque vendor identifier round-trips through read-back and withdrawal
     /// instead of being dropped by the built-in shape check. `None` when no
-    /// provider is configured.
-    selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
-    /// A snapshot of the request evidence a provider reads when it creates an
+    /// module is configured.
+    selected_module: Option<Arc<dyn crate::ec::module::EdgeCookieModule>>,
+    /// A snapshot of the request evidence a module reads when it creates an
     /// identifier, at generation or in orphan recovery: the request headers (so
-    /// a provider can read cookies and client hints), and the URL path and query
+    /// a module can read cookies and client hints), and the URL path and query
     /// string (so it can read request parameters). Captured once at
-    /// construction, when a provider is configured and the request either
+    /// construction, when a module is configured and the request either
     /// carries no usable identifier or is a document navigation, the only
-    /// request that can recover an orphaned one. So a no-provider deployment
-    /// and a returning visitor's subresource requests clone nothing. A provider
+    /// request that can recover an orphaned one. So a no-module deployment
+    /// and a returning visitor's subresource requests clone nothing. A module
     /// reads these through [`RequestInfo`](crate::evidence::RequestInfo).
     request_headers: http::HeaderMap,
     request_path: String,
     request_query: String,
-    /// Response headers a provider asked to set, captured when it creates an
+    /// Response headers a module asked to set, captured when it creates an
     /// identifier (in [`EcContext::generate_if_needed`], or during orphan
     /// recovery in EC finalization) and applied to the response by EC
-    /// finalization. Empty for providers that set no headers.
+    /// finalization. Empty for modules that set no headers.
     response_headers: Vec<(http::HeaderName, http::HeaderValue)>,
     /// Request-scoped persisted identity-graph state for the active EC ID.
     kv_snapshot: EcKvSnapshot,
@@ -334,26 +334,26 @@ impl EcContext {
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
 
-        // Take the selected provider once. It is used here to decide whether
+        // Take the selected module once. It is used here to decide whether
         // the incoming cookie value is a usable identifier, and again by
         // generation, which reuses this one rather than asking for another.
         // Resolving needs no request data, so an adapter that resolved the
         // selection while it built application state hands the same instance
         // back here and nothing is built a second time on this request.
-        let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
-            provider::request_provider(&settings.ec, services)?;
+        let selected_module: Option<Arc<dyn crate::ec::module::EdgeCookieModule>> =
+            module::request_module(&settings.ec, services)?;
 
-        // Read back an existing identifier only when the selected provider
+        // Read back an existing identifier only when the selected module
         // accepts its shape, so an opaque vendor identifier (for example a signed
         // envelope) round-trips instead of being silently dropped by the built-in
-        // shape check. With no provider configured, Trusted Server is stateless:
+        // shape check. With no module configured, Trusted Server is stateless:
         // an existing identifier is treated as absent so it is never used or
         // egressed, while the raw cookie value stays available to withdrawal
         // handling below.
         let ec_value = parsed.cookie_ec.clone().filter(|v| {
-            selected_provider
+            selected_module
                 .as_ref()
-                .is_some_and(|selected| provider::provider_owns_id(selected.as_ref(), v))
+                .is_some_and(|selected| module::module_owns_id(selected.as_ref(), v))
         });
         let ec_was_present = ec_value.is_some();
 
@@ -361,15 +361,15 @@ impl EcContext {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
 
-        // Snapshot the request evidence a provider reads when it creates an
+        // Snapshot the request evidence a module reads when it creates an
         // identifier (the headers, so it can read cookies and client hints, and
         // the URL path and query, so it can read request parameters). Capture
-        // only when a provider is configured and either no identifier exists or
+        // only when a module is configured and either no identifier exists or
         // the request is a document navigation, which orphan recovery may need,
-        // so a no-provider deployment and a returning visitor's subresource
+        // so a no-module deployment and a returning visitor's subresource
         // requests clone nothing. Creation runs after the request body may be
         // consumed, so the snapshot is owned.
-        let (request_headers, request_path, request_query) = if selected_provider.is_some()
+        let (request_headers, request_path, request_query) = if selected_module.is_some()
             && (ec_value.is_none() || crate::http_util::is_navigation_request(req))
         {
             (
@@ -396,11 +396,11 @@ impl EcContext {
         });
 
         // Gate Edge Cookie creation and use on the request's consent context
-        // (jurisdiction and consent signals). With no provider selected nothing
+        // (jurisdiction and consent signals). With no module selected nothing
         // may create or use an identifier, so the gate is closed rather than
         // open by default. Downstream consumers read the stored result via
         // [`EcContext::ec_allowed`] rather than re-deriving it.
-        let ec_allowed = selected_provider
+        let ec_allowed = selected_module
             .as_ref()
             .is_some_and(|_| consent::ec_consent_granted(&consent));
 
@@ -422,7 +422,7 @@ impl EcContext {
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
-            selected_provider,
+            selected_module,
             request_headers,
             request_path,
             request_query,
@@ -445,11 +445,11 @@ impl EcContext {
     ///
     /// # Errors
     ///
-    /// Forwards every error from `generate_with_provider`: the selected provider
-    /// failing to derive an identifier (which includes a provider that needs the
-    /// client IP being run on a host that cannot supply one), the provider
+    /// Forwards every error from `generate_with_module`: the selected module
+    /// failing to derive an identifier (which includes a module that needs the
+    /// client IP being run on a host that cannot supply one), the module
     /// producing an identifier outside the cookie-safe alphabet or over the
-    /// length cap, the provider asking for a response header inside core's
+    /// length cap, the module asking for a response header inside core's
     /// reserved surface, persisting the identifier to the KV identity graph
     /// failing, or every attempt within the retry limit producing an identifier
     /// the graph already holds.
@@ -462,11 +462,11 @@ impl EcContext {
             return Ok(());
         }
 
-        // A deployment with no provider selected is stateless: nothing to
-        // generate, and not an error. Reuse the provider built at read time
+        // A deployment with no module selected is stateless: nothing to
+        // generate, and not an error. Reuse the module built at read time
         // rather than building it again.
-        let Some(ec_provider) = self.selected_provider.clone() else {
-            log::trace!("EC generation skipped: no Edge Cookie provider configured");
+        let Some(ec_module) = self.selected_module.clone() else {
+            log::trace!("EC generation skipped: no Edge Cookie module configured");
             return Ok(());
         };
 
@@ -478,44 +478,44 @@ impl EcContext {
             return Ok(());
         }
 
-        // Whether the client IP is needed is the selected provider's decision,
-        // not core's. A provider that derives identity from headers, cookies,
+        // Whether the client IP is needed is the selected module's decision,
+        // not core's. A module that derives identity from headers, cookies,
         // query parameters, or the client reads no IP and must still run on a
         // host that cannot supply one. The IP is passed as the documented
         // unavailable value, the empty string (see
         // [`RequestInfo::client_ip`](crate::evidence::RequestInfo::client_ip)),
-        // and a provider that needs it refuses there, returning the error to
+        // and a module that needs it refuses there, returning the error to
         // the caller. The publisher proxy and integration proxy log it and
         // serve the response without an Edge Cookie.
-        self.generate_with_provider(ec_provider.as_ref(), settings, kv)
+        self.generate_with_module(ec_module.as_ref(), settings, kv)
     }
 
-    /// Asks the selected provider for one new identifier, without persisting
+    /// Asks the selected module for one new identifier, without persisting
     /// it.
     ///
     /// Runs the checks every new identifier has to pass before it is kept. The
-    /// provider's response headers are checked against core's reserved surface
-    /// and captured for EC finalization, even when the provider produces no
-    /// identifier, and the finished identifier, with its provider code applied,
+    /// module's response headers are checked against core's reserved surface
+    /// and captured for EC finalization, even when the module produces no
+    /// identifier, and the finished identifier, with its module code applied,
     /// is checked against the global bounds. Generation and orphan recovery both
-    /// use this, so a rotated identifier comes from the same provider
+    /// use this, so a rotated identifier comes from the same module
     /// and passes the same checks as a new one. The request evidence captured at
     /// read time (client IP, headers, and the URL path and query) is passed
     /// borrowed through [`RequestInfo`](crate::evidence::RequestInfo), and the
-    /// built-in HMAC provider reads only the client IP.
+    /// built-in HMAC module reads only the client IP.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::EdgeCookie`] when the provider fails to
-    /// derive an identifier (which for [`HmacProvider`] includes an
+    /// Returns [`TrustedServerError::EdgeCookie`] when the module fails to
+    /// derive an identifier (which for [`HmacModule`] includes an
     /// unavailable client IP), asks for a response header inside core's
     /// reserved surface (see
-    /// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)),
+    /// [`reserved_response_effect`](crate::ec::module::reserved_response_effect)),
     /// or produces an identifier that is empty, over the length cap, or outside
     /// the cookie-safe alphabet.
     pub(crate) fn candidate_id(
         &mut self,
-        ec_provider: &dyn EdgeCookieProvider,
+        ec_module: &dyn EdgeCookieModule,
     ) -> Result<Option<String>, Report<TrustedServerError>> {
         let input = IdentityInput {
             consent: Some(&self.consent),
@@ -525,84 +525,84 @@ impl EcContext {
             Some(&self.request_headers),
         )
         .with_request_target(&self.request_path, &self.request_query);
-        let generated: GeneratedEdgeCookie = ec_provider.generate(&request_info, &input)?;
-        // Check every response header the provider asked for against core's
-        // reserved surface before any of them are kept. A provider may set its
+        let generated: GeneratedEdgeCookie = ec_module.generate(&request_info, &input)?;
+        // Check every response header the module asked for against core's
+        // reserved surface before any of them are kept. A module may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
         // the `x-ts-` namespace, or a framing or hop-by-hop header. Without the
-        // check a provider could write `ts-ec` itself and bypass the identifier
+        // check a module could write `ts-ec` itself and bypass the identifier
         // validation and identity-graph row generation enforces. A rejection
         // returns an error, as the identifier-bounds rejection below does.
         // Because the check runs before the headers are captured, nothing from
-        // a rejected provider response is kept, and the response is served
+        // a rejected module response is kept, and the response is served
         // without a new Edge Cookie. Checked before the identifier is read,
-        // because a provider can return headers with no identifier at all.
+        // because a module can return headers with no identifier at all.
         for (name, value) in &generated.response_headers {
-            if let Some(effect) = provider::reserved_response_effect(name, value) {
+            if let Some(effect) = module::reserved_response_effect(name, value) {
                 return Err(Report::new(TrustedServerError::EdgeCookie {
                     message: format!(
-                        "Provider `{}` returned a response header `{name}` that {effect}",
-                        ec_provider.id(),
+                        "Module `{}` returned a response header `{name}` that {effect}",
+                        ec_module.id(),
                     ),
                 }));
             }
         }
         let generated_id = generated
             .id
-            .map(|value| crate::ec::provider::apply_provider_code(ec_provider, &value));
+            .map(|value| crate::ec::module::apply_module_code(ec_module, &value));
         let Some(ec_id) = generated_id else {
-            // Keep the response headers the provider asked for even though it
+            // Keep the response headers the module asked for even though it
             // produced no identifier (for example while it still needs more
             // client evidence). EC finalization applies them to the response.
             self.response_headers = generated.response_headers;
             log::info!(
-                "EC generation produced no identifier (provider={}); proceeding without an EC",
-                ec_provider.id(),
+                "EC generation produced no identifier (module={}); proceeding without an EC",
+                ec_module.id(),
             );
             return Ok(None);
         };
         // Enforce the global identifier bounds at creation. The cookie-safe
-        // alphabet and the length cap apply to every provider, so no
+        // alphabet and the length cap apply to every module, so no
         // implementation can emit a value the cookie layer or the identity
         // graph cannot carry. Rejection is loud and total; the identifier is
         // never rewritten.
         if !ec_id_has_only_allowed_chars(&ec_id) {
             return Err(Report::new(TrustedServerError::EdgeCookie {
                 message: format!(
-                    "Provider `{}` produced an identifier that is empty, over {} bytes, or \
+                    "Module `{}` produced an identifier that is empty, over {} bytes, or \
                      outside the cookie-safe alphabet",
-                    ec_provider.id(),
+                    ec_module.id(),
                     cookies::MAX_EC_ID_LEN,
                 ),
             }));
         }
-        // Keep the provider's response headers only now that its identifier
-        // has passed the bounds check, so a provider response whose identifier
+        // Keep the module's response headers only now that its identifier
+        // has passed the bounds check, so a module response whose identifier
         // is rejected keeps none of them. EC finalization applies them to the
         // response.
         self.response_headers = generated.response_headers;
         log::info!(
-            "Generated new EC ID (provider={}): {}",
-            ec_provider.id(),
+            "Generated new EC ID (module={}): {}",
+            ec_module.id(),
             log_id(&ec_id),
         );
         Ok(Some(ec_id))
     }
 
-    /// Derives and commits an EC identifier using a specific provider.
+    /// Derives and commits an EC identifier using a specific module.
     ///
     /// Split out of [`generate_if_needed`](Self::generate_if_needed) so the
-    /// provider is supplied explicitly, resolved once at read time and threaded
-    /// here rather than rebuilt. Each attempt asks the provider for a candidate
+    /// module is supplied explicitly, resolved once at read time and threaded
+    /// here rather than rebuilt. Each attempt asks the module for a candidate
     /// through [`candidate_id`](Self::candidate_id) and creates its
     /// identity-graph row only when no row already holds that key, so a
     /// colliding identifier never overwrites another identity's row and the
-    /// next attempt asks the provider again. The row is keyed by the provider's
+    /// next attempt asks the module again. The row is keyed by the module's
     /// canonical form of the identifier, and the request snapshot is bound to
     /// that key. The skip guards (existing EC, consent gate) stay in
     /// [`generate_if_needed`](Self::generate_if_needed).
     ///
-    /// The response headers a provider response asks for stay on the context
+    /// The response headers a module response asks for stay on the context
     /// only when its identifier is committed or it produced no identifier at
     /// all. A colliding candidate's headers are dropped before the next attempt
     /// and nothing is kept when persisting fails, so EC finalization never
@@ -614,23 +614,23 @@ impl EcContext {
     /// returns [`TrustedServerError::EdgeCookie`] when persisting a generated
     /// identifier to the KV identity graph fails or every attempt within the
     /// retry limit produces an identifier the graph already holds.
-    fn generate_with_provider(
+    fn generate_with_module(
         &mut self,
-        ec_provider: &dyn EdgeCookieProvider,
+        ec_module: &dyn EdgeCookieModule,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
     ) -> Result<(), Report<TrustedServerError>> {
         const MAX_CREATE_ATTEMPTS: usize = 5;
         for attempt in 0..MAX_CREATE_ATTEMPTS {
-            let Some(ec_id) = self.candidate_id(ec_provider)? else {
+            let Some(ec_id) = self.candidate_id(ec_module)? else {
                 return Ok(());
             };
-            // Key the identity graph by the provider's canonical form of the
+            // Key the identity graph by the module's canonical form of the
             // identifier, so equivalent representations of one identity share
             // one row. The built-in normalization lowercases only the HMAC
-            // hash segment; an opaque vendor provider overrides it to the
+            // hash segment; an opaque vendor module overrides it to the
             // identity function.
-            let kv_key = crate::ec::provider::provider_kv_key(ec_provider, &ec_id);
+            let kv_key = crate::ec::module::module_kv_key(ec_module, &ec_id);
             let now = current_timestamp();
             let mut entry = KvEntry::new(
                 &self.consent,
@@ -654,7 +654,7 @@ impl EcContext {
                     }
                     Ok(CreateIfAbsentOutcome::AlreadyExists) => {
                         // The colliding candidate is discarded, and the
-                        // response headers its provider response asked for
+                        // response headers its module response asked for
                         // are discarded with it.
                         self.response_headers.clear();
                         log::warn!(
@@ -664,7 +664,7 @@ impl EcContext {
                         continue;
                     }
                     Err(err) => {
-                        // Nothing is committed, so none of the provider's
+                        // Nothing is committed, so none of the module's
                         // response headers are kept either.
                         self.response_headers.clear();
                         log::error!(
@@ -698,20 +698,20 @@ impl EcContext {
         self.ec_value.as_deref()
     }
 
-    /// The providers whose identifiers this request's paths accept, being the
-    /// selected provider alone (see
-    /// [`AcceptedProviders`](provider::AcceptedProviders)).
+    /// The modules whose identifiers this request's paths accept, being the
+    /// selected module alone (see
+    /// [`AcceptedModules`](module::AcceptedModules)).
     #[must_use]
-    pub(crate) fn accepted_providers(&self) -> provider::AcceptedProviders<'_> {
-        provider::AcceptedProviders::active(self.selected_provider.as_deref())
+    pub(crate) fn accepted_modules(&self) -> module::AcceptedModules<'_> {
+        module::AcceptedModules::active(self.selected_module.as_deref())
     }
 
-    /// The identity-graph key for `value` under the providers this deployment
+    /// The identity-graph key for `value` under the modules this deployment
     /// reads.
     ///
     /// The canonical route from a request's identifier to a row key, so a
-    /// provider whose canonical form differs from the cookie value still finds
-    /// the row it created. The owning provider is picked by the identifier's
+    /// module whose canonical form differs from the cookie value still finds
+    /// the row it created. The owning module is picked by the identifier's
     /// `{code}~` prefix and supplies the canonical form of its own value part,
     /// matching the key [`generate_if_needed`](Self::generate_if_needed) wrote
     /// at creation.
@@ -723,14 +723,14 @@ impl EcContext {
     /// Each of these reaches the key through this function or through
     /// [`ec_kv_key`](Self::ec_kv_key), which wraps this function. Batch sync
     /// and the admin lookup have no EC context, so they call
-    /// [`AcceptedProviders::canonical_kv_key`](provider::AcceptedProviders::canonical_kv_key),
+    /// [`AcceptedModules::canonical_kv_key`](module::AcceptedModules::canonical_kv_key),
     /// the function this one wraps, directly.
     ///
-    /// `None` when no provider this deployment reads owns `value`, in which
+    /// `None` when no module this deployment reads owns `value`, in which
     /// case there is no row to read or write.
     #[must_use]
     pub(crate) fn kv_key_for(&self, value: &str) -> Option<String> {
-        self.accepted_providers().canonical_kv_key(value)
+        self.accepted_modules().canonical_kv_key(value)
     }
 
     /// The identity-graph key for this request's active identifier.
@@ -746,14 +746,14 @@ impl EcContext {
     /// empty while a live row still exists, and the cookie is the only way
     /// back to it.
     ///
-    /// This does not reach across a provider switch. An identifier created
-    /// under a retired provider's `{code}~` prefix is owned by no provider
+    /// This does not reach across a module switch. An identifier created
+    /// under a retired module's `{code}~` prefix is owned by no module
     /// this deployment reads, so [`kv_key_for`](Self::kv_key_for) yields
     /// `None` and its row is never tombstoned. Core cannot derive that key,
-    /// because the canonical form is the owning provider's own normalization.
-    /// So after a provider switch a withdrawal expires only the browser
+    /// because the canonical form is the owning module's own normalization.
+    /// So after a module switch a withdrawal expires only the browser
     /// cookie, because that path keys off the raw cookie rather than off
-    /// ownership, and the retired provider's row stays until its time to live
+    /// ownership, and the retired module's row stays until its time to live
     /// runs out.
     #[must_use]
     pub(crate) fn cookie_ec_kv_key(&self) -> Option<String> {
@@ -808,8 +808,8 @@ impl EcContext {
         self.device_signals = Some(signals);
     }
 
-    /// Returns the response headers a provider asked to set during
-    /// [`generate_if_needed`](Self::generate_if_needed). Empty unless a provider
+    /// Returns the response headers a module asked to set during
+    /// [`generate_if_needed`](Self::generate_if_needed). Empty unless a module
     /// produced any.
     #[must_use]
     pub fn response_headers(&self) -> &[(http::HeaderName, http::HeaderValue)] {
@@ -906,20 +906,18 @@ impl EcContext {
         self.pull_sync_marker.invalidate_for_replaced_ec();
     }
 
-    /// The Edge Cookie provider this request resolved at read time, if any.
+    /// The Edge Cookie module this request resolved at read time, if any.
     ///
-    /// Orphan recovery creates a replacement identifier through this provider,
-    /// so a rotated identifier comes from the same provider as a new one.
+    /// Orphan recovery creates a replacement identifier through this module,
+    /// so a rotated identifier comes from the same module as a new one.
     #[must_use]
-    pub(crate) fn selected_provider(
-        &self,
-    ) -> Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> {
-        self.selected_provider.clone()
+    pub(crate) fn selected_module(&self) -> Option<Arc<dyn crate::ec::module::EdgeCookieModule>> {
+        self.selected_module.clone()
     }
 
     /// Returns whether Edge Cookie creation is allowed for this request.
     ///
-    /// Resolved once at construction: closed when no provider is selected,
+    /// Resolved once at construction: closed when no module is selected,
     /// otherwise from the request's consent context (see
     /// [`consent::ec_consent_granted`]).
     #[must_use]
@@ -943,19 +941,19 @@ impl EcContext {
         self.ec_value.as_deref().map(generation::ec_hash)
     }
 
-    /// Attaches a selected provider to a test-only [`EcContext`].
+    /// Attaches a selected module to a test-only [`EcContext`].
     ///
-    /// The production constructor builds the provider from settings and
-    /// injected services. A test that only needs the provider's identifier
+    /// The production constructor builds the module from settings and
+    /// injected services. A test that only needs the module's identifier
     /// semantics (which identifiers it owns, and their canonical key form)
     /// takes this shortcut instead.
     #[cfg(test)]
     #[must_use]
-    pub fn with_provider_for_test(
+    pub fn with_module_for_test(
         mut self,
-        provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+        module: Arc<dyn crate::ec::module::EdgeCookieModule>,
     ) -> Self {
-        self.selected_provider = Some(provider);
+        self.selected_module = Some(module);
         self
     }
 
@@ -993,7 +991,7 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
-            selected_provider: None,
+            selected_module: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
             request_query: String::new(),
@@ -1024,7 +1022,7 @@ impl EcContext {
             client_ip,
             geo_info: None,
             device_signals: None,
-            selected_provider: None,
+            selected_module: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
             request_query: String::new(),
@@ -1058,7 +1056,7 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
-            selected_provider: None,
+            selected_module: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
             request_query: String::new(),
@@ -1104,7 +1102,7 @@ pub(crate) mod tests {
     use crate::ec::kv_backend::{
         EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
     };
-    use crate::ec::provider::{EcProviderSelection, ProviderCode};
+    use crate::ec::module::{EcModuleSelection, ModuleCode};
     use crate::evidence::RequestInfo;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -1181,7 +1179,7 @@ pub(crate) mod tests {
         let settings = create_test_settings();
         let mut ec =
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()))
-                .with_provider_for_test(hmac_provider());
+                .with_module_for_test(hmac_module());
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
 
         ec.generate_if_needed(&settings, Some(&graph))
@@ -1200,7 +1198,7 @@ pub(crate) mod tests {
         let settings = create_test_settings();
         let mut ec =
             EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()))
-                .with_provider_for_test(hmac_provider());
+                .with_module_for_test(hmac_module());
         // Collide on every attempt so the bounded retry is exhausted.
         let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
 
@@ -1264,22 +1262,22 @@ pub(crate) mod tests {
         format!("{}.{suffix}", prefix_char.repeat(64))
     }
 
-    /// A provider other than the built-in HMAC one, whose identifiers the HMAC
+    /// A module other than the built-in HMAC one, whose identifiers the HMAC
     /// grammar rejects (no dot, mixed case), modeling a vendor identifier such
     /// as a signed envelope. It accepts any of its own non-empty identifiers
     /// and keys the identity graph by the value unchanged.
     ///
     /// Shared with the admin lookup, batch sync and pull sync tests.
     #[derive(Debug)]
-    pub(crate) struct OpaqueProvider;
+    pub(crate) struct OpaqueModule;
 
-    impl EdgeCookieProvider for OpaqueProvider {
+    impl EdgeCookieModule for OpaqueModule {
         fn id(&self) -> &'static str {
             "opaque"
         }
 
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0op")
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0op")
         }
 
         fn generate(
@@ -1300,7 +1298,7 @@ pub(crate) mod tests {
     }
 
     /// A geo that resolves to the non-regulated jurisdiction (US, no region),
-    /// so the consent gate is open and generation runs in provider tests.
+    /// so the consent gate is open and generation runs in module tests.
     fn non_regulated_geo() -> GeoInfo {
         GeoInfo {
             city: String::new(),
@@ -1315,38 +1313,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn read_from_request_reuses_the_provider_the_composition_root_resolved() {
-        // The context reuses the provider the composition root resolved and
+    fn read_from_request_reuses_the_module_the_composition_root_resolved() {
+        // The context reuses the module the composition root resolved and
         // threaded through `RuntimeServices`, so the request builds none.
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("opaque"));
+        settings.ec.module = Some(EcModuleSelection::from("opaque"));
 
         let ec_config = settings.ec.clone();
         let resolved =
-            crate::ec::provider::build_shared_provider(&ec_config, Some(Arc::new(OpaqueProvider)))
+            crate::ec::module::build_shared_module(&ec_config, Some(Arc::new(OpaqueModule)))
                 .expect("the composition root should resolve the selection")
-                .expect("the selection should yield a provider");
+                .expect("the selection should yield a module");
 
         let services =
-            crate::platform::test_support::noop_services_with_ec_provider(Arc::clone(&resolved));
+            crate::platform::test_support::noop_services_with_ec_module(Arc::clone(&resolved));
         let req = create_test_request(&[]);
         let ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
 
         let used = ec
-            .selected_provider
+            .selected_module
             .as_ref()
-            .expect("the context should hold the selected provider");
+            .expect("the context should hold the selected module");
         assert!(
             Arc::ptr_eq(used, &resolved),
-            "reading EC state should reuse the provider resolved at startup rather \
+            "reading EC state should reuse the module resolved at startup rather \
              than building a second one for this request"
         );
     }
 
     #[test]
-    fn read_from_request_round_trips_an_opaque_provider_identifier() {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+    fn read_from_request_round_trips_an_opaque_module_identifier() {
+        use crate::platform::test_support::noop_services_with_ec_module;
 
         // A vendor identifier that is deliberately not the built-in HMAC shape
         // (no dot, mixed case), the exact value the built-in check would drop.
@@ -1354,65 +1352,65 @@ pub(crate) mod tests {
         const CODED_ID: &str = "t0op~AbC123opaqueEnvelopeValueXYZ";
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("opaque"));
+        settings.ec.module = Some(EcModuleSelection::from("opaque"));
         let cookie = format!("ts-ec={CODED_ID}");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        // With the opaque provider injected, its `accepts_id` governs read-back,
+        // With the opaque module injected, its `accepts_id` governs read-back,
         // so the identifier survives verbatim.
-        let services = noop_services_with_ec_provider(Arc::new(OpaqueProvider));
+        let services = noop_services_with_ec_module(Arc::new(OpaqueModule));
         let ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
         assert_eq!(
             ec.ec_value(),
             Some(CODED_ID),
-            "an opaque provider identifier should round-trip through read-back verbatim"
+            "an opaque module identifier should round-trip through read-back verbatim"
         );
         let _ = OPAQUE_ID;
 
-        // Control: with the provider selected but not injected by the adapter,
+        // Control: with the module selected but not injected by the adapter,
         // the request fails loudly instead of silently running stateless with
         // the identifier dropped.
         let err = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect_err("a selected but uninjected provider should fail the request");
+            .expect_err("a selected but uninjected module should fail the request");
         assert!(
             err.to_string().contains("opaque"),
-            "the error should name the selected provider, got: {err}"
+            "the error should name the selected module, got: {err}"
         );
 
-        // Control: with no provider selected at all, the identifier is treated
+        // Control: with no module selected at all, the identifier is treated
         // as absent, so a stateless deployment never uses or egresses it.
         let mut stateless = create_test_settings();
-        stateless.ec.provider = None;
-        stateless.ec.provider_blocks.clear();
+        stateless.ec.module = None;
+        stateless.ec.module_blocks.clear();
         let ec_without = EcContext::read_from_request(&stateless, &req, &noop_services())
             .expect("should read EC context");
         assert_eq!(
             ec_without.ec_value(),
             None,
-            "with no provider selected, an existing identifier is treated as absent"
+            "with no module selected, an existing identifier is treated as absent"
         );
         assert!(
             !ec_without.ec_allowed(),
-            "with no provider selected, the gate stays closed"
+            "with no module selected, the gate stays closed"
         );
     }
 
-    /// A provider that records the request query parameter `id` and the `Cookie`
+    /// A module that records the request query parameter `id` and the `Cookie`
     /// header it is given at generate time, proving request evidence (parameters
-    /// and cookies) reaches a provider through the organic generate path.
+    /// and cookies) reaches a module through the organic generate path.
     #[derive(Debug, Default)]
-    struct EvidenceCapturingProvider {
+    struct EvidenceCapturingModule {
         seen: std::sync::Mutex<Option<(String, String)>>,
     }
 
-    impl EdgeCookieProvider for EvidenceCapturingProvider {
+    impl EdgeCookieModule for EvidenceCapturingModule {
         fn id(&self) -> &'static str {
             "evidence"
         }
 
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0ev")
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0ev")
         }
 
         fn generate(
@@ -1435,12 +1433,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn generate_passes_request_parameters_and_cookies_to_the_provider() {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+    fn generate_passes_request_parameters_and_cookies_to_the_module() {
+        use crate::platform::test_support::noop_services_with_ec_module;
 
-        let provider = Arc::new(EvidenceCapturingProvider::default());
+        let module = Arc::new(EvidenceCapturingModule::default());
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("evidence"));
+        settings.ec.module = Some(EcModuleSelection::from("evidence"));
 
         // A request carrying a query parameter and a (non-EC) cookie, with no
         // existing `ts-ec` cookie so the generate path runs.
@@ -1451,14 +1449,14 @@ pub(crate) mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let services = noop_services_with_ec_provider(provider.clone());
+        let services = noop_services_with_ec_module(module.clone());
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
             .expect("should run generation");
 
-        let seen = provider
+        let seen = module
             .seen
             .lock()
             .expect("should lock seen evidence")
@@ -1466,25 +1464,25 @@ pub(crate) mod tests {
         assert_eq!(
             seen,
             Some(("abc123".to_owned(), "client-id=xyz789".to_owned())),
-            "the provider should read the request query parameter and cookies at generate time"
+            "the module should read the request query parameter and cookies at generate time"
         );
         assert_eq!(
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
-            "the identifier the provider created should be committed under its code"
+            "the identifier the module created should be committed under its code"
         );
     }
 
     #[test]
-    fn recovery_on_a_navigation_passes_request_parameters_and_cookies_to_the_provider() {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+    fn recovery_on_a_navigation_passes_request_parameters_and_cookies_to_the_module() {
+        use crate::platform::test_support::noop_services_with_ec_module;
 
-        let provider = Arc::new(EvidenceCapturingProvider::default());
+        let module = Arc::new(EvidenceCapturingModule::default());
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("evidence"));
+        settings.ec.module = Some(EcModuleSelection::from("evidence"));
 
         // A returning visitor's document navigation, carrying an identifier
-        // the provider owns, which is the request orphan recovery runs on.
+        // the module owns, which is the request orphan recovery runs on.
         let cookie = "ts-ec=t0ev~orphaned; client-id=xyz789";
         let req = Request::builder()
             .method("GET")
@@ -1494,16 +1492,16 @@ pub(crate) mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let services = noop_services_with_ec_provider(provider.clone());
+        let services = noop_services_with_ec_module(module.clone());
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
         assert!(ec.ec_was_present(), "the identifier should be read back");
-        let selected = ec.selected_provider().expect("a provider is selected");
+        let selected = ec.selected_module().expect("a module is selected");
         ec.candidate_id(selected.as_ref())
             .expect("should create a replacement");
 
-        let seen = provider
+        let seen = module
             .seen
             .lock()
             .expect("should lock seen evidence")
@@ -1511,23 +1509,23 @@ pub(crate) mod tests {
         assert_eq!(
             seen,
             Some(("abc123".to_owned(), cookie.to_owned())),
-            "recovery should give the provider the request's parameters and cookies"
+            "recovery should give the module the request's parameters and cookies"
         );
     }
 
-    /// A provider that creates an opaque, mixed-case, non-HMAC identifier at
+    /// A module that creates an opaque, mixed-case, non-HMAC identifier at
     /// the edge, so a test can prove such an identifier persists to the KV identity
     /// graph under its own value as the key.
     #[derive(Debug)]
-    struct ServerOpaqueProvider;
+    struct ServerOpaqueModule;
 
-    impl EdgeCookieProvider for ServerOpaqueProvider {
+    impl EdgeCookieModule for ServerOpaqueModule {
         fn id(&self) -> &'static str {
             "server_opaque"
         }
 
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0so")
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0so")
         }
 
         fn generate(
@@ -1552,13 +1550,13 @@ pub(crate) mod tests {
 
     #[test]
     fn generate_persists_an_opaque_identifier_to_kv_under_its_own_key() {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+        use crate::platform::test_support::noop_services_with_ec_module;
 
         const OPAQUE: &str = "t0so~Opaque_EC_Value_MixedCase_123";
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("server_opaque"));
-        let services = noop_services_with_ec_provider(Arc::new(ServerOpaqueProvider));
+        settings.ec.module = Some(EcModuleSelection::from("server_opaque"));
+        let services = noop_services_with_ec_module(Arc::new(ServerOpaqueModule));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
 
         // No existing cookie, so the edge creates one and persists it.
@@ -1593,16 +1591,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_provider_that_reads_no_client_ip_creates_when_the_host_has_none() {
-        use crate::platform::test_support::noop_services_with_ec_provider_without_client_ip;
+    fn a_module_that_reads_no_client_ip_creates_when_the_host_has_none() {
+        use crate::platform::test_support::noop_services_with_ec_module_without_client_ip;
 
-        // The requirement for a client IP belongs to the provider that uses
-        // one, not to core. A provider deriving identity from the request
+        // The requirement for a client IP belongs to the module that uses
+        // one, not to core. A module deriving identity from the request
         // query and cookies runs on a host that cannot determine a client IP,
         // and receives the documented unavailable value, the empty string.
-        let provider = Arc::new(EvidenceCapturingProvider::default());
+        let module = Arc::new(EvidenceCapturingModule::default());
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("evidence"));
+        settings.ec.module = Some(EcModuleSelection::from("evidence"));
         let req = Request::builder()
             .method("GET")
             .uri("http://example.com/page?id=abc123")
@@ -1610,7 +1608,7 @@ pub(crate) mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let services = noop_services_with_ec_provider_without_client_ip(provider.clone());
+        let services = noop_services_with_ec_module_without_client_ip(module.clone());
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
@@ -1621,7 +1619,7 @@ pub(crate) mod tests {
         );
 
         ec.generate_if_needed(&settings, None)
-            .expect("a provider that reads no client IP should still create an identifier");
+            .expect("a module that reads no client IP should still create an identifier");
         assert_eq!(
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
@@ -1630,8 +1628,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_hmac_provider_refuses_when_the_host_has_no_client_ip() {
-        // The other half: the built-in provider's only input is the client IP,
+    fn the_hmac_module_refuses_when_the_host_has_no_client_ip() {
+        // The other half: the built-in module's only input is the client IP,
         // so with none it fails rather than hashing the empty string into an
         // identifier every visitor on that host would share. Identity cannot be
         // established, so generate_if_needed returns the error, which the
@@ -1651,7 +1649,7 @@ pub(crate) mod tests {
 
         let err = ec
             .generate_if_needed(&settings, None)
-            .expect_err("the HMAC provider should refuse without a client IP");
+            .expect_err("the HMAC module should refuse without a client IP");
         assert!(
             err.to_string().contains("client IP"),
             "the error should name the missing client IP, got: {err}"
@@ -1659,22 +1657,22 @@ pub(crate) mod tests {
         assert_eq!(
             ec.ec_value(),
             None,
-            "no identifier should be committed when the provider refuses"
+            "no identifier should be committed when the module refuses"
         );
     }
 
-    /// A provider that creates an identifier outside the cookie-safe alphabet,
+    /// A module that creates an identifier outside the cookie-safe alphabet,
     /// to prove core rejects it at creation rather than rewriting it.
     #[derive(Debug)]
-    struct IllegalIdProvider;
+    struct IllegalIdModule;
 
-    impl EdgeCookieProvider for IllegalIdProvider {
+    impl EdgeCookieModule for IllegalIdModule {
         fn id(&self) -> &'static str {
             "illegal"
         }
 
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0il")
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0il")
         }
 
         fn generate(
@@ -1695,11 +1693,11 @@ pub(crate) mod tests {
 
     #[test]
     fn generate_rejects_an_identifier_outside_the_cookie_safe_alphabet() {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+        use crate::platform::test_support::noop_services_with_ec_module;
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("illegal"));
-        let services = noop_services_with_ec_provider(Arc::new(IllegalIdProvider));
+        settings.ec.module = Some(EcModuleSelection::from("illegal"));
+        let services = noop_services_with_ec_module(Arc::new(IllegalIdModule));
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
@@ -1710,7 +1708,7 @@ pub(crate) mod tests {
             .expect_err("an identifier outside the alphabet should be rejected at creation");
         assert!(
             err.to_string().contains("illegal"),
-            "the error should name the provider, got: {err}"
+            "the error should name the module, got: {err}"
         );
         assert_eq!(
             ec.ec_value(),
@@ -1719,23 +1717,23 @@ pub(crate) mod tests {
         );
     }
 
-    /// A provider that returns a caller-chosen response header, and `id` as its
-    /// identifier when one is given, so a test can drive one provider response
+    /// A module that returns a caller-chosen response header, and `id` as its
+    /// identifier when one is given, so a test can drive one module response
     /// effect at a time through the organic generate path.
     #[derive(Debug)]
-    struct HeaderSettingProvider {
+    struct HeaderSettingModule {
         name: &'static str,
         value: &'static str,
         id: Option<&'static str>,
     }
 
-    impl EdgeCookieProvider for HeaderSettingProvider {
+    impl EdgeCookieModule for HeaderSettingModule {
         fn id(&self) -> &'static str {
             "header_setting"
         }
 
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0hs")
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0hs")
         }
 
         fn generate(
@@ -1762,18 +1760,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// Runs generation through `provider` and hands back the context whether or
+    /// Runs generation through `module` and hands back the context whether or
     /// not generation succeeded, so a test can finalize a response on a context
     /// whose generation returned an error.
-    fn generate_with_header_setting_provider(
-        provider: HeaderSettingProvider,
+    fn generate_with_header_setting_module(
+        module: HeaderSettingModule,
         graph: Option<&KvIdentityGraph>,
     ) -> (Settings, EcContext, Result<(), Report<TrustedServerError>>) {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+        use crate::platform::test_support::noop_services_with_ec_module;
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("header_setting"));
-        let services = noop_services_with_ec_provider(Arc::new(provider));
+        settings.ec.module = Some(EcModuleSelection::from("header_setting"));
+        let services = noop_services_with_ec_module(Arc::new(module));
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
@@ -1783,8 +1781,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_rejected_provider_effect_never_reaches_the_finalized_response() {
-        // A provider that sets the managed `ts-ec` cookie, a header in the
+    fn a_rejected_module_effect_never_reaches_the_finalized_response() {
+        // A module that sets the managed `ts-ec` cookie, a header in the
         // `x-ts-` namespace or a framing header would bypass core's identifier
         // validation and its identity-graph row, so generation returns an
         // error rather than quietly dropping the effect. The publisher and
@@ -1793,7 +1791,7 @@ pub(crate) mod tests {
         // holds, so a rejected header kept among them would reach the browser
         // anyway. Each header is tried with no identifier, the case a cookie
         // write would otherwise slip through, and with one, to show that
-        // nothing from the rejected provider response is kept.
+        // nothing from the rejected module response is kept.
         for (name, value, id) in [
             ("set-cookie", "ts-ec=forged-value; Path=/", None),
             ("x-ts-ec", "forged", None),
@@ -1801,15 +1799,15 @@ pub(crate) mod tests {
             (
                 "set-cookie",
                 "ts-ec=forged-value; Path=/",
-                Some("provider-value"),
+                Some("module-value"),
             ),
-            ("x-ts-ec", "forged", Some("provider-value")),
-            ("transfer-encoding", "chunked", Some("provider-value")),
+            ("x-ts-ec", "forged", Some("module-value")),
+            ("transfer-encoding", "chunked", Some("module-value")),
         ] {
             let case = format!("`{name}` with identifier {id:?}");
             let graph = KvIdentityGraph::in_memory("test-ec-store");
-            let (settings, mut ec, outcome) = generate_with_header_setting_provider(
-                HeaderSettingProvider { name, value, id },
+            let (settings, mut ec, outcome) = generate_with_header_setting_module(
+                HeaderSettingModule { name, value, id },
                 Some(&graph),
             );
             let Err(err) = outcome else {
@@ -1817,7 +1815,7 @@ pub(crate) mod tests {
             };
             assert!(
                 err.to_string().contains("header_setting"),
-                "{case}: the error should name the provider, got: {err}"
+                "{case}: the error should name the module, got: {err}"
             );
             assert_eq!(
                 ec.ec_value(),
@@ -1864,23 +1862,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn generate_applies_a_provider_owned_cookie_to_the_response() {
-        // The other half of the rule: a provider's own cookie is not core's, so
+    fn generate_applies_a_module_owned_cookie_to_the_response() {
+        // The other half of the rule: a module's own cookie is not core's, so
         // it survives generation and reaches the browser response unchanged,
         // alongside the managed `ts-ec` cookie core writes itself.
         let graph = KvIdentityGraph::in_memory("test-ec-store");
-        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
-            HeaderSettingProvider {
+        let (settings, mut ec, outcome) = generate_with_header_setting_module(
+            HeaderSettingModule {
                 name: "set-cookie",
                 value: "acme-evidence=abc123; Path=/; Secure",
-                id: Some("provider-value"),
+                id: Some("module-value"),
             },
             Some(&graph),
         );
-        outcome.expect("generation should accept a provider-owned cookie");
+        outcome.expect("generation should accept a module-owned cookie");
         assert_eq!(
             ec.ec_value(),
-            Some("t0hs~provider-value"),
+            Some("t0hs~module-value"),
             "the identifier should still be committed"
         );
 
@@ -1908,7 +1906,7 @@ pub(crate) mod tests {
             cookies
                 .iter()
                 .any(|cookie| cookie.starts_with("acme-evidence=abc123")),
-            "the provider's own cookie should reach the response, got: {cookies:?}"
+            "the module's own cookie should reach the response, got: {cookies:?}"
         );
         assert!(
             cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
@@ -1916,9 +1914,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// A cookie a provider may set for itself, used to check which provider
+    /// A cookie a module may set for itself, used to check which module
     /// responses keep their headers.
-    const PROVIDER_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";
+    const MODULE_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";
 
     /// Runs EC finalization on `ec` for an empty response and returns the
     /// `Set-Cookie` values the response carries.
@@ -1950,10 +1948,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_discarded_candidate_keeps_none_of_its_provider_response_headers() {
-        // The provider's own cookie is permitted, but each of these candidates
+    fn a_discarded_candidate_keeps_none_of_its_module_response_headers() {
+        // The module's own cookie is permitted, but each of these candidates
         // is discarded, so generation returns an error and the cookie its
-        // provider response asked for must not reach the browser.
+        // module response asked for must not reach the browser.
         for (case, graph, id) in [
             // The identifier is outside the cookie-safe alphabet.
             (
@@ -1966,7 +1964,7 @@ pub(crate) mod tests {
             (
                 "a colliding candidate",
                 KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX)),
-                "provider-value",
+                "module-value",
             ),
             // The identity graph cannot store the candidate's row.
             (
@@ -1974,13 +1972,13 @@ pub(crate) mod tests {
                 KvIdentityGraph::new(crate::ec::kv_backend::test_support::FailingEcKv::new(
                     "failing-ec-store",
                 )),
-                "provider-value",
+                "module-value",
             ),
         ] {
-            let (settings, mut ec, outcome) = generate_with_header_setting_provider(
-                HeaderSettingProvider {
+            let (settings, mut ec, outcome) = generate_with_header_setting_module(
+                HeaderSettingModule {
                     name: "set-cookie",
-                    value: PROVIDER_EVIDENCE_COOKIE,
+                    value: MODULE_EVIDENCE_COOKIE,
                     id: Some(id),
                 },
                 Some(&graph),
@@ -1995,28 +1993,28 @@ pub(crate) mod tests {
                 !cookies
                     .iter()
                     .any(|cookie| cookie.starts_with("acme-evidence=")),
-                "{case}: the provider response's cookie should not reach the response, got: \
+                "{case}: the module response's cookie should not reach the response, got: \
                  {cookies:?}"
             );
         }
     }
 
     #[test]
-    fn a_provider_that_creates_nothing_still_has_its_headers_applied() {
-        // A provider may ask for more client evidence before it can create an
+    fn a_module_that_creates_nothing_still_has_its_headers_applied() {
+        // A module may ask for more client evidence before it can create an
         // identifier, for example with `Accept-CH`, so its headers reach the
         // response even though no Edge Cookie is set.
         let graph = KvIdentityGraph::in_memory("test-ec-store");
-        let (settings, mut ec, outcome) = generate_with_header_setting_provider(
-            HeaderSettingProvider {
+        let (settings, mut ec, outcome) = generate_with_header_setting_module(
+            HeaderSettingModule {
                 name: "accept-ch",
                 value: "Sec-CH-UA",
                 id: None,
             },
             Some(&graph),
         );
-        outcome.expect("a provider that creates nothing should not fail the request");
-        assert_eq!(ec.ec_value(), None, "the provider created no identifier");
+        outcome.expect("a module that creates nothing should not fail the request");
+        assert_eq!(ec.ec_value(), None, "the module created no identifier");
 
         let mut response = http::Response::builder()
             .status(200)
@@ -2038,7 +2036,7 @@ pub(crate) mod tests {
                 .get("accept-ch")
                 .and_then(|value| value.to_str().ok()),
             Some("Sec-CH-UA"),
-            "the provider's header should reach the response"
+            "the module's header should reach the response"
         );
         assert!(
             !response
@@ -2047,26 +2045,26 @@ pub(crate) mod tests {
                 .iter()
                 .filter_map(|value| value.to_str().ok())
                 .any(|cookie| cookie.starts_with("ts-ec=")),
-            "no Edge Cookie should be set when the provider created nothing"
+            "no Edge Cookie should be set when the module created nothing"
         );
     }
 
-    /// A provider whose identifier normalizes to a distinct canonical form, to
+    /// A module whose identifier normalizes to a distinct canonical form, to
     /// prove the identity graph is keyed by the canonical form.
     ///
     /// Shared with the identify, finalization, pull sync, admin lookup, auction
-    /// and publisher tests, which need a provider whose canonical key is not the
+    /// and publisher tests, which need a module whose canonical key is not the
     /// value the browser carries.
     #[derive(Debug)]
-    pub(crate) struct CanonicalizingProvider;
+    pub(crate) struct CanonicalizingModule;
 
-    impl EdgeCookieProvider for CanonicalizingProvider {
+    impl EdgeCookieModule for CanonicalizingModule {
         fn id(&self) -> &'static str {
             "canonical"
         }
 
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0ca")
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0ca")
         }
 
         fn generate(
@@ -2089,7 +2087,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The identifier [`CanonicalizingProvider`] creates, as the browser
+    /// The identifier [`CanonicalizingModule`] creates, as the browser
     /// carries it in the `ts-ec` cookie.
     pub(crate) const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
 
@@ -2100,24 +2098,24 @@ pub(crate) mod tests {
     /// [`EcContext::ec_kv_key`] derives.
     pub(crate) const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
 
-    /// The built-in HMAC provider, as an HMAC deployment selects it.
+    /// The built-in HMAC module, as an HMAC deployment selects it.
     ///
-    /// Creating or rotating an identifier needs a selected provider, so the
+    /// Creating or rotating an identifier needs a selected module, so the
     /// generation and orphan-recovery tests attach this one. Shared with the
     /// finalization tests.
-    pub(crate) fn hmac_provider() -> Arc<dyn EdgeCookieProvider> {
-        Arc::new(crate::ec::provider::HmacProvider::new(
+    pub(crate) fn hmac_module() -> Arc<dyn EdgeCookieModule> {
+        Arc::new(crate::ec::module::HmacModule::new(
             crate::redacted::Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
         ))
     }
 
     #[test]
     fn generate_keys_the_identity_graph_by_the_normalized_identifier() {
-        use crate::platform::test_support::noop_services_with_ec_provider;
+        use crate::platform::test_support::noop_services_with_ec_module;
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some(EcProviderSelection::from("canonical"));
-        let services = noop_services_with_ec_provider(Arc::new(CanonicalizingProvider));
+        settings.ec.module = Some(EcModuleSelection::from("canonical"));
+        let services = noop_services_with_ec_module(Arc::new(CanonicalizingModule));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
@@ -2129,7 +2127,7 @@ pub(crate) mod tests {
         assert_eq!(
             ec.ec_value(),
             Some(CANONICAL_COOKIE_VALUE),
-            "the cookie value keeps the provider's exact identifier under its code"
+            "the cookie value keeps the module's exact identifier under its code"
         );
         assert!(
             graph
@@ -2166,8 +2164,8 @@ pub(crate) mod tests {
             "a fresh HMAC identifier should carry the hmac code, got {created}"
         );
 
-        // A bare identifier with no provider code still reads back under the
-        // hmac provider.
+        // A bare identifier with no module code still reads back under the
+        // hmac module.
         let legacy = format!("{}.ABC123", "a".repeat(64));
         let cookie = format!("ts-ec={legacy}");
         let req = create_test_request(&[("cookie", &cookie)]);
@@ -2176,14 +2174,14 @@ pub(crate) mod tests {
         assert_eq!(
             ec.ec_value(),
             Some(legacy.as_str()),
-            "the legacy bare form should dual-read under the hmac provider"
+            "the legacy bare form should dual-read under the hmac module"
         );
     }
 
     #[test]
     fn the_request_path_hashes_an_ipv6_client_ip_by_its_64_prefix() {
         // A device rotates the lower 64 bits of its IPv6 address, so the
-        // context keeps only the /64 prefix and the HMAC provider hashes that.
+        // context keeps only the /64 prefix and the HMAC module hashes that.
         // Two addresses in one /64 share an identity hash, and it is the hash
         // of the prefix.
         let settings = create_test_settings();
@@ -2192,7 +2190,7 @@ pub(crate) mod tests {
         let prefix = "20010db885a30000";
         let passphrase = crate::test_support::tests::hmac_passphrase(
             &settings.ec,
-            crate::ec::provider::HMAC_PROVIDER_KEY,
+            crate::ec::module::HMAC_MODULE_KEY,
         );
         let expected = generation::generate_ec_id(passphrase, prefix)
             .expect("should generate from the prefix");
@@ -2224,9 +2222,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_foreign_provider_code_is_treated_as_absent() {
-        // An identifier carrying another provider's code must never be adopted
-        // by the selected provider, so switching providers cannot silently mix
+    fn a_foreign_module_code_is_treated_as_absent() {
+        // An identifier carrying another module's code must never be adopted
+        // by the selected module, so switching modules cannot silently mix
         // identity populations.
         let settings = create_test_settings();
         let foreign = format!("zz00~{}.ABC123", "a".repeat(64));
@@ -2237,7 +2235,7 @@ pub(crate) mod tests {
         assert_eq!(
             ec.ec_value(),
             None,
-            "an identifier with a foreign provider code is not this provider's"
+            "an identifier with a foreign module code is not this module's"
         );
     }
 

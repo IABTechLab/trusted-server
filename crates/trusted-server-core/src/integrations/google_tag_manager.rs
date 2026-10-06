@@ -3067,7 +3067,7 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
@@ -3103,7 +3103,7 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"

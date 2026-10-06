@@ -10,7 +10,7 @@
 #   1. [[handlers]] covering /_ts/admin  (admin authentication)
 #   2. [publisher]                       (domain + origin)
 #
-# Edge Cookie identity is optional and stays off until an [ec] provider is
+# Edge Cookie identity is optional and stays off until an [ec] module is
 # selected, so no identity secret is needed to start. See the Edge Cookie
 # section below.
 #
@@ -76,17 +76,17 @@ proxy_secret = "publisher_proxy_secret"
 # OPTIONAL — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Edge Cookie identity is OFF by default. With no provider selected, Trusted
+# Edge Cookie identity is OFF by default. With no module selected, Trusted
 # Server runs statelessly and generates no Edge Cookie. Activate one by
-# uncommenting the selector below, together with that provider's own
+# uncommenting the selector below, together with that module's own
 # [ec.<name>] block when it has settings (a block the selector does not name
 # is rejected at startup). Deployment tooling can merge a
-# TRUSTED_SERVER__EC__PROVIDER environment value into the published
+# TRUSTED_SERVER__EC__MODULE environment value into the published
 # configuration before it is loaded, and the running server itself reads its
 # settings from the platform config store rather than the environment. The
-# built-in hmac provider is host-neutral, and a vendor provider ships in its
+# built-in hmac module is host-neutral, and a vendor module ships in its
 # own crate that the adapter composes in.
-# provider = "hmac"
+# module = "hmac"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
@@ -97,8 +97,8 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
-# Built-in HMAC provider block. Uncomment it together with the
-# `provider = "hmac"` selector above. `passphrase` names the Secret Store key
+# Built-in HMAC module block. Uncomment it together with the
+# `module = "hmac"` selector above. `passphrase` names the Secret Store key
 # holding the secret used to derive EC identifiers. That secret must be
 # >= 32 bytes and non-placeholder in production. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
@@ -106,9 +106,9 @@ pull_sync_concurrency = 3
 # passphrase = "ec_passphrase"
 
 # A block can name the implementation it configures, which makes the block's
-# own name a label of your choosing. The same provider could therefore be
-# selected as `provider = "primary"` and configured in the block below
-# instead, which is how a deployment gives a provider a name that means
+# own name a label of your choosing. The same module could therefore be
+# selected as `module = "primary"` and configured in the block below
+# instead, which is how a deployment gives a module a name that means
 # something to the people running it.
 # [ec.primary]
 # implementation = "hmac"

@@ -21,7 +21,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY};
+use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -540,39 +540,39 @@ impl EcPartner {
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
 ///
-/// Every key in the section other than the fields below is one provider's
+/// Every key in the section other than the fields below is one module's
 /// `[ec.<name>]` settings table, held in
-/// [`provider_blocks`](Self::provider_blocks), so the field names below are
-/// reserved and cannot name a provider.
+/// [`module_blocks`](Self::module_blocks), so the field names below are
+/// reserved and cannot name a module.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Ec {
-    /// The name of the Edge Cookie identity provider to activate.
+    /// The name of the Edge Cookie identity module to activate.
     ///
     /// Set it in the `[ec]` TOML section, for example `"hmac"`. The name is
-    /// the provider's implementation unless its `[ec.<name>]` block names a
+    /// the module's implementation unless its `[ec.<name>]` block names a
     /// different one, in which case the name is a label of the operator's
-    /// choosing (see [`provider_blocks`](Self::provider_blocks)). Deployment
-    /// tooling can merge a `TRUSTED_SERVER__EC__PROVIDER` environment value
+    /// choosing (see [`module_blocks`](Self::module_blocks)). Deployment
+    /// tooling can merge a `TRUSTED_SERVER__EC__MODULE` environment value
     /// into the published configuration before it is loaded, so the same
-    /// compiled WebAssembly can switch providers at deployment. The running
+    /// compiled WebAssembly can switch modules at deployment. The running
     /// server reads its settings from the platform config store, not the
     /// environment. When absent, no Edge Cookie is generated and Trusted
     /// Server runs statelessly, and the explicit `"none"` spells the same
     /// choice. A selection whose implementation needs settings it has no block
     /// for is rejected at startup by
-    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    /// [`validate_module_selection`](Self::validate_module_selection).
     ///
-    /// Typed as [`EcProviderSelection`], which reads and writes the same
-    /// string, so every check that asks which provider is selected matches on
+    /// Typed as [`EcModuleSelection`], which reads and writes the same
+    /// string, so every check that asks which module is selected matches on
     /// one vocabulary rather than comparing string literals.
     #[serde(default)]
-    pub provider: Option<EcProviderSelection>,
+    pub module: Option<EcModuleSelection>,
 
     /// Deprecated location of the HMAC passphrase, read so a configuration
     /// written for the previous release still starts.
     ///
     /// [`migrate_legacy_ec_layout`](Self::migrate_legacy_ec_layout) maps it
-    /// to `provider = "hmac"` with the passphrase in the `[ec.hmac]` block and
+    /// to `module = "hmac"` with the passphrase in the `[ec.hmac]` block and
     /// logs a deprecation warning, so a fleet can move configuration and
     /// binaries independently. A configuration carrying both the old and the
     /// new form is rejected rather than guessed at.
@@ -605,18 +605,18 @@ pub struct Ec {
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub partners: Vec<EcPartner>,
 
-    /// The settings tables of the Edge Cookie identity providers, keyed by the
+    /// The settings tables of the Edge Cookie identity modules, keyed by the
     /// name each is written under.
     ///
-    /// A provider has a block only when it has settings of its own, so
-    /// `[ec] provider = "hmac"` needs an `[ec.hmac]` block for its required
-    /// passphrase while a provider with no settings needs none. The
-    /// [`provider`](Self::provider) selector names the active provider and
-    /// [`validate_provider_selection`](Self::validate_provider_selection)
+    /// A module has a block only when it has settings of its own, so
+    /// `[ec] module = "hmac"` needs an `[ec.hmac]` block for its required
+    /// passphrase while a module with no settings needs none. The
+    /// [`module`](Self::module) selector names the active module and
+    /// [`validate_module_selection`](Self::validate_module_selection)
     /// rejects a block it does not name, so at most one block survives
     /// startup.
     #[serde(flatten)]
-    pub provider_blocks: EcProviderBlocks,
+    pub module_blocks: EcModuleBlocks,
 }
 
 impl Ec {
@@ -679,42 +679,42 @@ impl Ec {
         Ok(())
     }
 
-    /// Validates the provider selection against the configured blocks.
+    /// Validates the module selection against the configured blocks.
     ///
-    /// When [`provider`](Self::provider) is set, the selection has to resolve
+    /// When [`module`](Self::module) is set, the selection has to resolve
     /// to an implementation this deployment can configure, and every block in
-    /// [`provider_blocks`](Self::provider_blocks) has to be the one the
-    /// selector names, so a deployment that selects a provider (in TOML or via
+    /// [`module_blocks`](Self::module_blocks) has to be the one the
+    /// selector names, so a deployment that selects a module (in TOML or via
     /// the environment override) but has not configured it fails fast at
-    /// startup rather than silently running stateless. When no provider is
+    /// startup rather than silently running stateless. When no module is
     /// selected, Trusted Server runs statelessly and this check passes.
     ///
     /// Whether the named implementation exists at all is settled by
-    /// [`build_provider`](crate::ec::provider::build_provider), which is the
+    /// [`build_module`](crate::ec::module::build_module), which is the
     /// one place that knows both the implementations built into core and the
     /// one this deployment's adapter injects.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when a provider name or
+    /// Returns [`TrustedServerError::Configuration`] when a module name or
     /// implementation is not `snake_case`, when a block is configured with no
     /// selector or alongside `"none"`, when the selector names a key `[ec]`
     /// reads as its own setting, when a block the selector does not name is
-    /// configured, or when the selected provider resolves to an
+    /// configured, or when the selected module resolves to an
     /// implementation that needs settings and has no block.
-    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        for (name, block) in self.provider_blocks.iter() {
-            Self::validate_provider_name(name)?;
+    pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        for (name, block) in self.module_blocks.iter() {
+            Self::validate_module_name(name)?;
             if let Some(implementation) = &block.implementation {
-                Self::validate_provider_name(implementation)?;
+                Self::validate_module_name(implementation)?;
             }
         }
 
-        let Some(selection) = self.provider.as_ref() else {
-            if !self.provider_blocks.is_empty() {
+        let Some(selection) = self.module.as_ref() else {
+            if !self.module_blocks.is_empty() {
                 return Err(Report::new(TrustedServerError::Configuration {
-                    message: "[ec.<name>] provider blocks are configured but no [ec] provider \
-                              is selected. Set [ec] provider = \"<name>\" to activate one, or \
+                    message: "[ec.<name>] module blocks are configured but no [ec] module \
+                              is selected. Set [ec] module = \"<name>\" to activate one, or \
                               remove the blocks to run statelessly"
                         .to_owned(),
                 }));
@@ -724,13 +724,13 @@ impl Ec {
 
         // `"none"` is explicit statelessness, the same meaning as omitting the
         // selector, spelled out. It is subject to the same rule that no
-        // provider blocks may be left configured.
-        let EcProviderSelection::Named(name) = selection else {
-            if !self.provider_blocks.is_empty() {
+        // module blocks may be left configured.
+        let EcModuleSelection::Named(name) = selection else {
+            if !self.module_blocks.is_empty() {
                 return Err(Report::new(TrustedServerError::Configuration {
-                    message: "[ec] provider = \"none\" selects stateless operation, but \
-                              [ec.<name>] provider blocks are configured. Remove the blocks, \
-                              or select the provider they configure"
+                    message: "[ec] module = \"none\" selects stateless operation, but \
+                              [ec.<name>] module blocks are configured. Remove the blocks, \
+                              or select the module they configure"
                         .to_owned(),
                 }));
             }
@@ -738,27 +738,27 @@ impl Ec {
         };
 
         let name = name.as_str();
-        Self::validate_provider_name(name)?;
+        Self::validate_module_name(name)?;
         if EC_SECTION_KEYS.contains(&name) || name == REMOVED_EC_PROVIDERS_TABLE {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "[ec] provider = \"{name}\" names a key the `[ec]` section reads as its \
-                     own setting, so no provider can be configured under it. Give the \
-                     provider a name of its own"
+                    "[ec] module = \"{name}\" names a key the `[ec]` section reads as its \
+                     own setting, so no module can be configured under it. Give the \
+                     module a name of its own"
                 ),
             }));
         }
 
-        // A provider has a block only when it has settings, and core knows
-        // which of its own implementations need them. A provider an adapter
+        // A module has a block only when it has settings, and core knows
+        // which of its own implementations need them. A module an adapter
         // injects has the contents of its block read by that adapter when it
-        // builds the provider, so core cannot say whether it needs one.
-        if self.provider_blocks.implementation(name) == HMAC_PROVIDER_KEY
-            && !self.provider_blocks.contains_key(name)
+        // builds the module, so core cannot say whether it needs one.
+        if self.module_blocks.implementation(name) == HMAC_MODULE_KEY
+            && !self.module_blocks.contains_key(name)
         {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "Edge Cookie provider `{name}` is selected but has no `[ec.{name}]` configuration"
+                    "Edge Cookie module `{name}` is selected but has no `[ec.{name}]` configuration"
                 ),
             }));
         }
@@ -767,7 +767,7 @@ impl Ec {
         // block is almost always a mistake (a mistyped selector or a stale
         // block), and accepting it silently invites configuration drift.
         let unreferenced: Vec<&str> = self
-            .provider_blocks
+            .module_blocks
             .keys()
             .map(String::as_str)
             .filter(|configured| *configured != name)
@@ -785,13 +785,13 @@ impl Ec {
         }
     }
 
-    /// Validates one provider name or implementation id.
+    /// Validates one module name or implementation id.
     ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when `name` is not
     /// `snake_case`.
-    fn validate_provider_name(name: &str) -> Result<(), Report<TrustedServerError>> {
+    fn validate_module_name(name: &str) -> Result<(), Report<TrustedServerError>> {
         let valid = !name.is_empty()
             && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
             && name
@@ -803,16 +803,16 @@ impl Ec {
         }
         Err(Report::new(TrustedServerError::Configuration {
             message: format!(
-                "Edge Cookie provider name `{name}` must be snake_case, matching \
+                "Edge Cookie module name `{name}` must be snake_case, matching \
                  ^[a-z][a-z0-9_]*$"
             ),
         }))
     }
 
-    /// Migrates the deprecated `[ec] passphrase` form to the provider layout.
+    /// Migrates the deprecated `[ec] passphrase` form to the module layout.
     ///
     /// A configuration still carrying the old key keeps working for one
-    /// release cycle, mapping to `provider = "hmac"` with the passphrase in
+    /// release cycle, mapping to `module = "hmac"` with the passphrase in
     /// the `[ec.hmac]` block, and a deprecation warning names the new
     /// location. A configuration carrying both forms is rejected so a
     /// half-edited file fails loudly instead of one form silently winning.
@@ -826,15 +826,15 @@ impl Ec {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when both the deprecated
-    /// key and any part of the provider configuration are present, or when the
+    /// key and any part of the module configuration are present, or when the
     /// deprecated passphrase fails [`Self::validate_passphrase`].
     pub fn migrate_legacy_ec_layout(&mut self) -> Result<(), Report<TrustedServerError>> {
         let Some(passphrase) = self.passphrase.take() else {
             return Ok(());
         };
-        if self.provider.is_some() || !self.provider_blocks.is_empty() {
+        if self.module.is_some() || !self.module_blocks.is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "[ec] passphrase (deprecated) and the [ec] provider configuration \
+                message: "[ec] passphrase (deprecated) and the [ec] module configuration \
                           are both present. Keep exactly one form, moving the passphrase to \
                           [ec.hmac] and deleting the old key"
                     .to_owned(),
@@ -851,12 +851,12 @@ impl Ec {
         })?;
         log::warn!(
             "[ec] passphrase is deprecated. Move it to [ec.hmac] passphrase and set \
-             [ec] provider = \"hmac\""
+             [ec] module = \"hmac\""
         );
-        self.provider = Some(EcProviderSelection::from(HMAC_PROVIDER_KEY));
-        self.provider_blocks.insert(
-            HMAC_PROVIDER_KEY.to_owned(),
-            EcProviderBlock::from(HmacProviderConfig { passphrase }),
+        self.module = Some(EcModuleSelection::from(HMAC_MODULE_KEY));
+        self.module_blocks.insert(
+            HMAC_MODULE_KEY.to_owned(),
+            EcModuleBlock::from(HmacModuleConfig { passphrase }),
         );
         Ok(())
     }
@@ -864,7 +864,7 @@ impl Ec {
 
 impl Validate for Ec {
     /// Validates the partner entries and the settings of every block that
-    /// configures the built-in HMAC provider.
+    /// configures the built-in HMAC module.
     ///
     /// Written out rather than derived because each block's errors are keyed
     /// by the name the operator wrote the block under, so a passphrase
@@ -874,7 +874,7 @@ impl Validate for Ec {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
         errors.merge_self("partners", self.partners.validate());
-        for (name, config) in self.provider_blocks.hmac_blocks() {
+        for (name, config) in self.module_blocks.hmac_blocks() {
             if let Err(block_errors) = config.validate() {
                 errors.errors_mut().insert(
                     Cow::Owned(name.to_owned()),
@@ -892,12 +892,12 @@ impl Validate for Ec {
 
 /// The keys the `[ec]` section reads as its own settings.
 ///
-/// Every other key in the section is one provider's `[ec.<name>]` settings
-/// table, so these names are reserved and cannot name a provider. They are
+/// Every other key in the section is one module's `[ec.<name>]` settings
+/// table, so these names are reserved and cannot name a module. They are
 /// written out because serde reads the [`Ec`] fields by name and has no way to
 /// report the list back for an error message.
 const EC_SECTION_KEYS: &[&str] = &[
-    "provider",
+    "module",
     "passphrase",
     "ec_store",
     "pull_sync_concurrency",
@@ -906,24 +906,24 @@ const EC_SECTION_KEYS: &[&str] = &[
     "partners",
 ];
 
-/// The removed table that used to hold every provider's settings.
+/// The removed table that used to hold every module's settings.
 const REMOVED_EC_PROVIDERS_TABLE: &str = "providers";
 
-/// The key in a provider block that names the implementation it configures.
+/// The key in a module block that names the implementation it configures.
 ///
-/// Anything reading a provider block out of a serialized configuration rather
-/// than out of [`EcProviderBlock`] reads the same key from here, so the two
+/// Anything reading a module block out of a serialized configuration rather
+/// than out of [`EcModuleBlock`] reads the same key from here, so the two
 /// cannot drift apart.
-pub(crate) const PROVIDER_IMPLEMENTATION_KEY: &str = "implementation";
+pub(crate) const MODULE_IMPLEMENTATION_KEY: &str = "implementation";
 
-/// The `[ec.<name>]` settings tables of the Edge Cookie identity providers,
+/// The `[ec.<name>]` settings tables of the Edge Cookie identity modules,
 /// keyed by the name each is written under.
 ///
-/// A provider that has settings is configured in its own table, for example:
+/// A module that has settings is configured in its own table, for example:
 ///
 /// ```toml
 /// [ec]
-/// provider = "hmac"
+/// module = "hmac"
 ///
 /// [ec.hmac]
 /// passphrase = "replace-with-32-plus-byte-random-secret"
@@ -935,25 +935,25 @@ pub(crate) const PROVIDER_IMPLEMENTATION_KEY: &str = "implementation";
 ///
 /// ```toml
 /// [ec]
-/// provider = "primary"
+/// module = "primary"
 ///
 /// [ec.primary]
 /// implementation = "hmac"
 /// passphrase = "replace-with-32-plus-byte-random-secret"
 /// ```
 ///
-/// The active provider is chosen by the [`Ec::provider`] selector, and the one
+/// The active module is chosen by the [`Ec::module`] selector, and the one
 /// table present must be the one it names (see
-/// [`Ec::validate_provider_selection`]).
+/// [`Ec::validate_module_selection`]).
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(transparent)]
-pub struct EcProviderBlocks(BTreeMap<String, EcProviderBlock>);
+pub struct EcModuleBlocks(BTreeMap<String, EcModuleBlock>);
 
-impl EcProviderBlocks {
-    /// The implementation the provider `name` resolves to.
+impl EcModuleBlocks {
+    /// The implementation the module `name` resolves to.
     ///
     /// A block may name the implementation it configures. Without one, and
-    /// when the provider has no block at all, the provider's name is its
+    /// when the module has no block at all, the module's name is its
     /// implementation.
     #[must_use]
     pub fn implementation<'a>(&'a self, name: &'a str) -> &'a str {
@@ -963,34 +963,34 @@ impl EcProviderBlocks {
             .unwrap_or(name)
     }
 
-    /// Every configured block that sets the built-in HMAC provider up, with
+    /// Every configured block that sets the built-in HMAC module up, with
     /// the name it is written under.
     ///
     /// The name is the label the operator chose, so a caller reporting one of
     /// these settings names the path the operator wrote rather than the
     /// implementation's own.
-    pub fn hmac_blocks(&self) -> impl Iterator<Item = (&str, &HmacProviderConfig)> {
+    pub fn hmac_blocks(&self) -> impl Iterator<Item = (&str, &HmacModuleConfig)> {
         self.0
             .iter()
             .filter_map(|(name, block)| block.hmac_settings().map(|config| (name.as_str(), config)))
     }
 }
 
-impl Deref for EcProviderBlocks {
-    type Target = BTreeMap<String, EcProviderBlock>;
+impl Deref for EcModuleBlocks {
+    type Target = BTreeMap<String, EcModuleBlock>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl DerefMut for EcProviderBlocks {
+impl DerefMut for EcModuleBlocks {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl<'de> Deserialize<'de> for EcProviderBlocks {
+impl<'de> Deserialize<'de> for EcModuleBlocks {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -998,10 +998,10 @@ impl<'de> Deserialize<'de> for EcProviderBlocks {
         struct BlocksVisitor;
 
         impl<'de> serde::de::Visitor<'de> for BlocksVisitor {
-            type Value = EcProviderBlocks;
+            type Value = EcModuleBlocks;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("the `[ec.<name>]` provider settings tables")
+                formatter.write_str("the `[ec.<name>]` module settings tables")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -1011,9 +1011,9 @@ impl<'de> Deserialize<'de> for EcProviderBlocks {
                 let mut blocks = BTreeMap::new();
                 while let Some(name) = map.next_key::<String>()? {
                     let table = map.next_value::<JsonValue>()?;
-                    blocks.insert(name.clone(), read_provider_block::<A::Error>(&name, table)?);
+                    blocks.insert(name.clone(), read_module_block::<A::Error>(&name, table)?);
                 }
-                Ok(EcProviderBlocks(blocks))
+                Ok(EcModuleBlocks(blocks))
             }
         }
 
@@ -1021,20 +1021,20 @@ impl<'de> Deserialize<'de> for EcProviderBlocks {
     }
 }
 
-/// Reads one key left over from the `[ec]` section as the provider block it
+/// Reads one key left over from the `[ec]` section as the module block it
 /// names.
 ///
 /// This is where the `[ec]` section gets the unknown-key check that the fixed
-/// fields lose by holding the provider blocks alongside them. A key that is
-/// not a table cannot be a provider, so it is reported as the mistyped setting
+/// fields lose by holding the module blocks alongside them. A key that is
+/// not a table cannot be a module, so it is reported as the mistyped setting
 /// it almost certainly is.
-fn read_provider_block<E>(name: &str, table: JsonValue) -> Result<EcProviderBlock, E>
+fn read_module_block<E>(name: &str, table: JsonValue) -> Result<EcModuleBlock, E>
 where
     E: serde::de::Error,
 {
     if name == REMOVED_EC_PROVIDERS_TABLE {
         return Err(E::custom(
-            "[ec.providers] is no longer read. Each provider's settings moved to a table of \
+            "[ec.providers] is no longer read. Each module's settings moved to a table of \
              its own under [ec], so a block written as [ec.providers.hmac] is now [ec.hmac]",
         ));
     }
@@ -1045,96 +1045,96 @@ where
             .collect::<Vec<_>>()
             .join(", ");
         return Err(E::custom(format!(
-            "unknown field `{name}`, expected one of {known}, or an [ec.<name>] provider \
+            "unknown field `{name}`, expected one of {known}, or an [ec.<name>] module \
              settings table"
         )));
     };
-    let implementation = match table.remove(PROVIDER_IMPLEMENTATION_KEY) {
+    let implementation = match table.remove(MODULE_IMPLEMENTATION_KEY) {
         None => None,
         Some(JsonValue::String(implementation)) => Some(implementation),
         Some(_) => {
             return Err(E::custom(format!(
-                "`implementation` in [ec.{name}] must be a string naming the provider \
+                "`implementation` in [ec.{name}] must be a string naming the module \
                  implementation the block configures"
             )));
         }
     };
 
     // The implementation decides how the rest of the table is read. Core reads
-    // its own providers' settings here, so a mistyped key fails where the
+    // its own modules' settings here, so a mistyped key fails where the
     // configuration is read rather than at the request that needed it, and
-    // keeps the settings of a provider an adapter injects as the raw values
+    // keeps the settings of a module an adapter injects as the raw values
     // that adapter deserializes for itself.
-    let settings = if implementation.as_deref().unwrap_or(name) == HMAC_PROVIDER_KEY {
+    let settings = if implementation.as_deref().unwrap_or(name) == HMAC_MODULE_KEY {
         let config = serde_json::from_value(JsonValue::Object(table))
             .map_err(|err| E::custom(format!("[ec.{name}] is invalid ({err})")))?;
-        EcProviderSettings::Hmac(config)
+        EcModuleSettings::Hmac(config)
     } else {
-        EcProviderSettings::Injected(table)
+        EcModuleSettings::Injected(table)
     };
-    Ok(EcProviderBlock {
+    Ok(EcModuleBlock {
         implementation,
         settings,
     })
 }
 
-/// One provider's `[ec.<name>]` settings table.
+/// One module's `[ec.<name>]` settings table.
 #[derive(Debug, Clone, Serialize)]
-pub struct EcProviderBlock {
+pub struct EcModuleBlock {
     /// The implementation this block configures, written as
     /// `implementation = "<id>"`, when the block's own name is not it.
     ///
     /// Setting it makes the block name a label of the operator's choosing, so
     /// one implementation can be configured under any name. Everything that
-    /// resolves the selected provider reads the implementation rather than the
+    /// resolves the selected module reads the implementation rather than the
     /// label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub implementation: Option<String>,
 
     /// Everything the block holds other than `implementation`.
     #[serde(flatten)]
-    pub settings: EcProviderSettings,
+    pub settings: EcModuleSettings,
 }
 
-impl EcProviderBlock {
-    /// The built-in HMAC provider's settings, when this block configures it.
+impl EcModuleBlock {
+    /// The built-in HMAC module's settings, when this block configures it.
     #[must_use]
-    pub fn hmac_settings(&self) -> Option<&HmacProviderConfig> {
+    pub fn hmac_settings(&self) -> Option<&HmacModuleConfig> {
         match &self.settings {
-            EcProviderSettings::Hmac(config) => Some(config),
-            EcProviderSettings::Injected(_) => None,
+            EcModuleSettings::Hmac(config) => Some(config),
+            EcModuleSettings::Injected(_) => None,
         }
     }
 }
 
-impl From<HmacProviderConfig> for EcProviderBlock {
-    /// Builds the `[ec.hmac]` block, the built-in HMAC provider configured
+impl From<HmacModuleConfig> for EcModuleBlock {
+    /// Builds the `[ec.hmac]` block, the built-in HMAC module configured
     /// under its own name. A block under a label names its implementation
     /// instead.
-    fn from(config: HmacProviderConfig) -> Self {
+    fn from(config: HmacModuleConfig) -> Self {
         Self {
             implementation: None,
-            settings: EcProviderSettings::Hmac(config),
+            settings: EcModuleSettings::Hmac(config),
         }
     }
 }
 
-/// The settings one provider block holds, read according to the
+/// The settings one module block holds, read according to the
 /// implementation the block configures.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub enum EcProviderSettings {
-    /// The built-in HMAC provider's settings.
-    Hmac(HmacProviderConfig),
+pub enum EcModuleSettings {
+    /// The built-in HMAC module's settings.
+    Hmac(HmacModuleConfig),
 
-    /// The settings of a provider an adapter injects, kept as the raw values
-    /// the block held. The adapter that builds the provider deserializes them
+    /// The settings of a module an adapter injects, kept as the raw values
+    /// the block held. The adapter that builds the module deserializes them
     /// into the vendor crate's own config type, so core never names a vendor
-    /// and a new provider adds nothing here.
+    /// and a new module adds nothing here.
     Injected(serde_json::Map<String, JsonValue>),
 }
 
-/// Configuration for the built-in HMAC Edge Cookie provider.
+/// Configuration for the built-in HMAC Edge Cookie module.
 ///
 /// Mapped from the `[ec.hmac]` TOML block, or from a block under a label whose
 /// `implementation` is `hmac`. Unknown keys are rejected, so a mistyped
@@ -1142,7 +1142,7 @@ pub enum EcProviderSettings {
 /// intended setting at its default.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
-pub struct HmacProviderConfig {
+pub struct HmacModuleConfig {
     /// Publisher passphrase used as the HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
@@ -3528,7 +3528,7 @@ impl Settings {
         })?;
 
         settings.ec.migrate_legacy_ec_layout()?;
-        settings.ec.validate_provider_selection()?;
+        settings.ec.validate_module_selection()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -3613,7 +3613,7 @@ impl Settings {
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
         let mut insecure_fields: Vec<String> = Vec::new();
 
-        for (name, hmac) in self.ec.provider_blocks.hmac_blocks() {
+        for (name, hmac) in self.ec.module_blocks.hmac_blocks() {
             if Ec::is_placeholder_passphrase(hmac.passphrase.expose()) {
                 insecure_fields.push(format!("ec.{name}.passphrase"));
             }
@@ -4302,7 +4302,7 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, create_test_settings,
-        hmac_passphrase, select_hmac_provider,
+        hmac_passphrase, select_hmac_module,
     };
 
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
@@ -4453,7 +4453,7 @@ mod tests {
         let mut settings = create_test_settings();
 
         settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
-        select_hmac_provider(&mut settings.ec, HMAC_PROVIDER_KEY, CANARY_EC_PASSPHRASE);
+        select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, CANARY_EC_PASSPHRASE);
 
         settings.handlers = vec![Handler {
             path: "^/secure".to_string(),
@@ -5320,12 +5320,12 @@ mod tests {
         );
         assert_eq!(settings.publisher.origin_host_header_override, None);
         assert_eq!(
-            settings.ec.provider.as_ref(),
-            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
-            "test settings should select the hmac EC provider"
+            settings.ec.module.as_ref(),
+            Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
+            "test settings should select the hmac EC module"
         );
         assert_eq!(
-            hmac_passphrase(&settings.ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&settings.ec, HMAC_MODULE_KEY),
             "test-secret-key-32-bytes-minimum"
         );
 
@@ -5495,19 +5495,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_selection_allows_no_provider_for_stateless_operation() {
+    fn module_selection_allows_no_module_for_stateless_operation() {
         let ec = Ec::default();
-        assert!(ec.provider.is_none(), "default Ec selects no provider");
-        ec.validate_provider_selection()
-            .expect("should allow no provider selected and run statelessly");
+        assert!(ec.module.is_none(), "default Ec selects no module");
+        ec.validate_module_selection()
+            .expect("should allow no module selected and run statelessly");
     }
 
     #[test]
     fn selecting_an_implementation_that_needs_settings_without_its_block_is_rejected() {
-        // The built-in HMAC provider has a required passphrase, so selecting
+        // The built-in HMAC module has a required passphrase, so selecting
         // it with no `[ec.hmac]` block is a deployment that would run
         // stateless under a selector saying otherwise.
-        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nprovider = \"hmac\"\n");
+        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nmodule = \"hmac\"\n");
 
         let err = Settings::from_toml(&toml_str)
             .expect_err("an implementation with no settings block should fail at startup");
@@ -5518,17 +5518,17 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_provider_with_no_settings_needs_no_block() {
-        // A block exists only when a provider has settings, and only the
-        // adapter that injects a provider knows whether it has any, so a
+    fn selecting_a_module_with_no_settings_needs_no_block() {
+        // A block exists only when a module has settings, and only the
+        // adapter that injects a module knows whether it has any, so a
         // selector naming one core does not supply is left to
-        // `build_provider`, which is where the injected providers are known.
-        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nprovider = \"acme\"\n");
+        // `build_module`, which is where the injected modules are known.
+        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nmodule = \"acme\"\n");
 
-        let settings = Settings::from_toml(&toml_str)
-            .expect("a provider with no settings should need no block");
+        let settings =
+            Settings::from_toml(&toml_str).expect("a module with no settings should need no block");
         assert!(
-            settings.ec.provider_blocks.is_empty(),
+            settings.ec.module_blocks.is_empty(),
             "the selection should stand on its own with no block configured"
         );
     }
@@ -5640,14 +5640,14 @@ mod tests {
     }
 
     #[test]
-    fn provider_blocks_without_a_selector_are_rejected() {
+    fn module_blocks_without_a_selector_are_rejected() {
         // A half-migrated configuration that carries an [ec.hmac] block but
         // never selects it would silently run stateless, so it is rejected at
         // startup instead.
-        let toml_str = crate_test_settings_str().replace("provider = \"hmac\"\n", "");
+        let toml_str = crate_test_settings_str().replace("module = \"hmac\"\n", "");
 
         let err = Settings::from_toml(&toml_str)
-            .expect_err("a provider block with no selector should fail at startup");
+            .expect_err("a module block with no selector should fail at startup");
         assert!(
             matches!(
                 err.current_context(),
@@ -5772,7 +5772,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_passphrase_migrates_to_the_hmac_provider() {
+    fn legacy_passphrase_migrates_to_the_hmac_module() {
         let mut ec = Ec {
             passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
             ..Ec::default()
@@ -5780,12 +5780,12 @@ mod tests {
         ec.migrate_legacy_ec_layout()
             .expect("should migrate the deprecated form");
         assert_eq!(
-            ec.provider.as_ref(),
-            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
-            "the deprecated passphrase should select the hmac provider"
+            ec.module.as_ref(),
+            Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
+            "the deprecated passphrase should select the hmac module"
         );
         assert_eq!(
-            hmac_passphrase(&ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&ec, HMAC_MODULE_KEY),
             "test-secret-key-32-bytes-minimum",
             "the passphrase should move into the hmac block"
         );
@@ -5803,7 +5803,7 @@ mod tests {
         ));
         assert!(
             !legacy.contains("[ec.hmac]"),
-            "the legacy configuration should carry no provider block"
+            "the legacy configuration should carry no module block"
         );
         legacy
     }
@@ -5832,12 +5832,12 @@ mod tests {
             Settings::from_toml(&legacy_ec_settings_str("test-secret-key-32-bytes-minimum"))
                 .expect("a legacy passphrase of adequate length should still start");
         assert_eq!(
-            settings.ec.provider.as_ref(),
-            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
-            "an adequate legacy passphrase should still select the hmac provider"
+            settings.ec.module.as_ref(),
+            Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
+            "an adequate legacy passphrase should still select the hmac module"
         );
         assert_eq!(
-            hmac_passphrase(&settings.ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&settings.ec, HMAC_MODULE_KEY),
             "test-secret-key-32-bytes-minimum",
             "an adequate legacy passphrase should still move into the hmac block"
         );
@@ -5921,10 +5921,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_passphrase_alongside_provider_config_is_rejected() {
+    fn legacy_passphrase_alongside_module_config_is_rejected() {
         let mut ec = Ec {
             passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
-            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            module: Some(EcModuleSelection::from(HMAC_MODULE_KEY)),
             ..Ec::default()
         };
         let err = ec
@@ -5941,8 +5941,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_key_in_the_hmac_provider_block_is_rejected() {
-        // A mistyped key in a provider block used to be dropped silently, which
+    fn an_unknown_key_in_the_hmac_module_block_is_rejected() {
+        // A mistyped key in a module block used to be dropped silently, which
         // leaves the setting the operator meant to change at its default.
         let toml_str = crate_test_settings_str().replace(
             "passphrase = \"test-secret-key-32-bytes-minimum\"",
@@ -5962,37 +5962,33 @@ mod tests {
     }
 
     #[test]
-    fn provider_none_is_explicit_stateless() {
+    fn module_none_is_explicit_stateless() {
         let ec = Ec {
-            provider: Some(EcProviderSelection::None),
+            module: Some(EcModuleSelection::None),
             ..Ec::default()
         };
-        ec.validate_provider_selection()
+        ec.validate_module_selection()
             .expect("explicit none with no blocks should be valid");
     }
 
     #[test]
-    fn provider_none_with_configured_blocks_is_rejected() {
+    fn module_none_with_configured_blocks_is_rejected() {
         let mut ec = Ec::default();
-        select_hmac_provider(
-            &mut ec,
-            HMAC_PROVIDER_KEY,
-            "test-secret-key-32-bytes-minimum",
-        );
-        ec.provider = Some(EcProviderSelection::None);
+        select_hmac_module(&mut ec, HMAC_MODULE_KEY, "test-secret-key-32-bytes-minimum");
+        ec.module = Some(EcModuleSelection::None);
         assert!(
-            ec.validate_provider_selection().is_err(),
+            ec.validate_module_selection().is_err(),
             "none alongside configured blocks should be rejected"
         );
     }
 
     #[test]
-    fn an_unselected_provider_block_is_rejected() {
+    fn an_unselected_module_block_is_rejected() {
         // A vendor selector with the vendor block present, plus a stray hmac
         // block, is almost always a stale or mistyped configuration.
         let toml_str = crate_test_settings_str().replace(
-            "provider = \"hmac\"",
-            "provider = \"acme\"\n\n            [ec.acme]\n            api_key = \"example\"",
+            "module = \"hmac\"",
+            "module = \"acme\"\n\n            [ec.acme]\n            api_key = \"example\"",
         );
         let err = Settings::from_toml(&toml_str)
             .expect_err("a configured but unselected block should fail at startup");
@@ -6008,12 +6004,12 @@ mod tests {
 
     #[test]
     fn a_labeled_block_the_selector_does_not_name_is_rejected() {
-        // A block under a label is still a provider block, so it is held to
+        // A block under a label is still a module block, so it is held to
         // the rule every block is held to, which is that the selector names
         // it.
         let toml_str = crate_test_settings_str_with_ec_section(
             r#"[ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
@@ -6036,7 +6032,7 @@ passphrase = "another-test-secret-key-32-bytes"
     #[test]
     fn the_removed_providers_table_is_rejected_with_its_new_location() {
         let toml_str = crate_test_settings_str_with_ec_section(
-            "[ec]\nprovider = \"hmac\"\n\n[ec.providers.hmac]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+            "[ec]\nmodule = \"hmac\"\n\n[ec.providers.hmac]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
         );
 
         let err = Settings::from_toml(&toml_str)
@@ -6050,11 +6046,11 @@ passphrase = "another-test-secret-key-32-bytes"
 
     #[test]
     fn a_key_under_ec_that_is_not_a_table_is_an_unknown_field() {
-        // Holding the provider blocks alongside the fixed keys costs the
+        // Holding the module blocks alongside the fixed keys costs the
         // section serde's own unknown-key check, so a mistyped setting has to
         // be caught where the blocks are read.
         let toml_str = crate_test_settings_str_with_ec_section(
-            "[ec]\nprovider = \"hmac\"\nec_stor = \"ec_identity_store\"\n\n[ec.hmac]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+            "[ec]\nmodule = \"hmac\"\nec_stor = \"ec_identity_store\"\n\n[ec.hmac]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
         );
 
         let err =
@@ -6090,11 +6086,11 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn a_reserved_key_cannot_name_a_provider() {
-        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nprovider = \"ec_store\"\n");
+    fn a_reserved_key_cannot_name_a_module() {
+        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nmodule = \"ec_store\"\n");
 
         let err =
-            Settings::from_toml(&toml_str).expect_err("a reserved key should not name a provider");
+            Settings::from_toml(&toml_str).expect_err("a reserved key should not name a module");
         assert!(
             format!("{err:?}").contains("names a key the `[ec]` section reads as its own setting"),
             "should say why the name cannot be used: {err:?}"
@@ -6102,11 +6098,11 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn provider_names_and_implementations_are_snake_case() {
+    fn module_names_and_implementations_are_snake_case() {
         for ec_section in [
-            "[ec]\nprovider = \"Primary\"\n",
-            "[ec]\nprovider = \"primary\"\n\n[ec.primary]\nimplementation = \"Hmac\"\n",
-            "[ec]\nprovider = \"primary\"\n\n[ec.Primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+            "[ec]\nmodule = \"Primary\"\n",
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"Hmac\"\n",
+            "[ec]\nmodule = \"primary\"\n\n[ec.Primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
         ] {
             let err = Settings::from_toml(&crate_test_settings_str_with_ec_section(ec_section))
                 .expect_err("a name outside snake_case should be rejected");
@@ -6122,7 +6118,7 @@ passphrase = "another-test-secret-key-32-bytes"
         // The implementation the block names decides how its settings are
         // read, so the block the operator wrote is what the error names.
         let toml_str = crate_test_settings_str_with_ec_section(
-            "[ec]\nprovider = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\n",
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\n",
         );
 
         let err = Settings::from_toml(&toml_str)
@@ -6139,10 +6135,9 @@ passphrase = "another-test-secret-key-32-bytes"
         // The pushed configuration is the serialized settings, so a label and
         // the implementation it names have to survive being written back.
         let toml_str = crate_test_settings_str_with_ec_section(
-            "[ec]\nprovider = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
         );
-        let settings =
-            Settings::from_toml(&toml_str).expect("should parse a labeled provider block");
+        let settings = Settings::from_toml(&toml_str).expect("should parse a labeled module block");
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
         assert_eq!(
@@ -6153,8 +6148,8 @@ passphrase = "another-test-secret-key-32-bytes"
         let reparsed =
             Settings::from_json_value(value).expect("should reparse the serialized settings");
         assert_eq!(
-            reparsed.ec.provider_blocks.implementation("primary"),
-            HMAC_PROVIDER_KEY,
+            reparsed.ec.module_blocks.implementation("primary"),
+            HMAC_MODULE_KEY,
             "the implementation should survive the round trip"
         );
         assert_eq!(
@@ -6174,26 +6169,25 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn an_injected_providers_settings_are_kept_as_written() {
-        // Core never names a vendor, so the block of a provider an adapter
+    fn an_injected_modules_settings_are_kept_as_written() {
+        // Core never names a vendor, so the block of a module an adapter
         // injects is kept as the values it held for that adapter to read.
         let toml_str = crate_test_settings_str_with_ec_section(
-            "[ec]\nprovider = \"acme\"\n\n[ec.acme]\nendpoint = \"https://ec.acme.example.com\"\n",
+            "[ec]\nmodule = \"acme\"\n\n[ec.acme]\nendpoint = \"https://ec.acme.example.com\"\n",
         );
-        let settings =
-            Settings::from_toml(&toml_str).expect("should parse a vendor provider block");
+        let settings = Settings::from_toml(&toml_str).expect("should parse a vendor module block");
 
         let block = settings
             .ec
-            .provider_blocks
+            .module_blocks
             .get("acme")
             .expect("should configure the acme block");
         assert_eq!(
-            settings.ec.provider_blocks.implementation("acme"),
+            settings.ec.module_blocks.implementation("acme"),
             "acme",
             "a block that names no implementation is its own name's"
         );
-        let EcProviderSettings::Injected(injected) = &block.settings else {
+        let EcModuleSettings::Injected(injected) = &block.settings else {
             panic!("a vendor block should keep its settings as the raw values it held");
         };
         assert_eq!(injected["endpoint"], "https://ec.acme.example.com");
@@ -6619,9 +6613,9 @@ source_domain = "partner.example.com"
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        select_hmac_provider(
+        select_hmac_module(
             &mut settings.ec,
-            HMAC_PROVIDER_KEY,
+            HMAC_MODULE_KEY,
             "test-secret-key-32-bytes-minimum",
         );
         settings.handlers[0].password =
@@ -7258,7 +7252,7 @@ source_domain = "partner.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
@@ -7292,7 +7286,7 @@ source_domain = "partner.example.com"
             max_buffered_body_bytes = 0
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
@@ -8426,7 +8420,7 @@ source_domain = "partner.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
@@ -8764,7 +8758,7 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
@@ -8851,7 +8845,7 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
@@ -8890,7 +8884,7 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
@@ -8935,7 +8929,7 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"

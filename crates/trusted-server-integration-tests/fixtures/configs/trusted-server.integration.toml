@@ -10,7 +10,7 @@ origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration_proxy_secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 

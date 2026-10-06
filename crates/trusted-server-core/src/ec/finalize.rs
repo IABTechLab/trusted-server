@@ -19,8 +19,8 @@ use super::kv::{
     apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
+use super::module::{apply_module_response_headers, module_kv_key};
 use super::prebid_eids::collect_eid_cookie_updates;
-use super::provider::{apply_provider_response_headers, provider_kv_key};
 use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
 use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
@@ -49,16 +49,16 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    // Apply any response headers the active provider asked for during
+    // Apply any response headers the active module asked for during
     // generation (for example to request more client evidence). This is empty
-    // unless a provider produced headers, so it is safe on every path. Each
+    // unless a module produced headers, so it is safe on every path. Each
     // one was checked against core's reserved response surface at capture
     // time in `EcContext::candidate_id`, so nothing here can set a
     // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
     // header. They accumulate with whatever the origin returned rather than
     // replacing it, for the reasons on
-    // `provider::apply_provider_response_headers`.
-    apply_provider_response_headers(
+    // `module::apply_module_response_headers`.
+    apply_module_response_headers(
         response.headers_mut(),
         ec_context.response_headers().iter().cloned(),
     );
@@ -87,7 +87,7 @@ pub fn ec_finalize_response(
 
     // Returning user: EC is permitted and came from the request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && ec_permitted {
-        // Key the snapshot, EID ingestion and orphan recovery by the provider's
+        // Key the snapshot, EID ingestion and orphan recovery by the module's
         // canonical form of the identifier, the key the identity-graph row is
         // stored under, so an ingested EID lands on the live row rather than on
         // a second row keyed by the value the browser carries.
@@ -224,7 +224,7 @@ fn reconcile_pull_sync_marker(
     );
 }
 
-/// Rotates an orphaned identifier to a new one created by the selected provider.
+/// Rotates an orphaned identifier to a new one created by the selected module.
 ///
 /// Called only once [`confirm_then_recover_orphaned_ec`] has proved the
 /// orphan's row absent. The replacement goes through the same checks as a new
@@ -239,22 +239,20 @@ fn recover_orphaned_ec(
     updates: &[super::kv::PartnerIdUpdate],
     response: &mut Response<EdgeBody>,
 ) {
-    // A deployment with no provider selected has nothing to rotate to.
-    let Some(provider) = ec_context.selected_provider() else {
+    // A deployment with no module selected has nothing to rotate to.
+    let Some(module) = ec_context.selected_module() else {
         return;
     };
 
-    // Ask the selected provider rather than the built-in generator, so a
+    // Ask the selected module rather than the built-in generator, so a
     // vendor deployment never rotates an orphaned cookie into a built-in
-    // identifier. Whether the client IP is needed is that provider's decision.
+    // identifier. Whether the client IP is needed is that module's decision.
     const MAX_RECOVERY_ATTEMPTS: usize = 5;
     for _attempt in 0..MAX_RECOVERY_ATTEMPTS {
-        let ec_id = match ec_context.candidate_id(provider.as_ref()) {
+        let ec_id = match ec_context.candidate_id(module.as_ref()) {
             Ok(Some(ec_id)) => ec_id,
             Ok(None) => {
-                log::info!(
-                    "Orphan EC recovery skipped because the provider produced no identifier"
-                );
+                log::info!("Orphan EC recovery skipped because the module produced no identifier");
                 ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
                     ec_id: orphan_kv_key.to_owned(),
                 });
@@ -268,7 +266,7 @@ fn recover_orphaned_ec(
                 return;
             }
         };
-        let kv_key = provider_kv_key(provider.as_ref(), &ec_id);
+        let kv_key = module_kv_key(module.as_ref(), &ec_id);
         let mut entry = KvEntry::new(
             ec_context.consent(),
             ec_context.geo_info(),
@@ -289,9 +287,9 @@ fn recover_orphaned_ec(
                 };
                 ec_context.replace_with_generated(ec_id, snapshot);
                 // A returning visitor runs no generation earlier in the
-                // request, so these are only the headers the provider asked
+                // request, so these are only the headers the module asked
                 // for while creating the replacement.
-                apply_provider_response_headers(
+                apply_module_response_headers(
                     response.headers_mut(),
                     ec_context.response_headers().iter().cloned(),
                 );
@@ -484,12 +482,12 @@ fn finalize_unusable_consent(
 /// The identity-graph keys a withdrawal must tombstone.
 ///
 /// Both the `ts-ec` cookie the request carried and the active identifier are
-/// turned into keys by the provider that owns them, so the tombstone lands on
+/// turned into keys by the module that owns them, so the tombstone lands on
 /// the row the live identifier is stored under rather than on the raw cookie
-/// value. An identifier no provider this deployment reads owns produces no key
-/// and is dropped, and with no provider selected the built-in HMAC grammar
+/// value. An identifier no module this deployment reads owns produces no key
+/// and is dropped, and with no module selected the built-in HMAC grammar
 /// decides, as
-/// [`AcceptedProviders::canonical_kv_key`](super::provider::AcceptedProviders::canonical_kv_key)
+/// [`AcceptedModules::canonical_kv_key`](super::module::AcceptedModules::canonical_kv_key)
 /// does. The two collapse to one key when they are the same identity written
 /// two ways.
 fn withdrawal_kv_keys(ec_context: &EcContext) -> HashSet<String> {
@@ -606,9 +604,7 @@ mod tests {
             consent,
             ec_allowed,
         )
-        .with_provider_for_test(std::sync::Arc::new(
-            crate::ec::tests::CanonicalizingProvider,
-        ))
+        .with_module_for_test(std::sync::Arc::new(crate::ec::tests::CanonicalizingModule))
     }
 
     fn graph_with_live_canonical_row() -> KvIdentityGraph {
@@ -1070,7 +1066,7 @@ mod tests {
             consent,
             Some("192.0.2.10".to_owned()),
         )
-        .with_provider_for_test(crate::ec::tests::hmac_provider());
+        .with_module_for_test(crate::ec::tests::hmac_module());
         ec_context.set_recovery_eligible(true);
         ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
             ec_id: orphaned_ec.clone(),
@@ -1633,18 +1629,18 @@ mod tests {
     }
 
     /// A returning visitor's context on a recovery-eligible navigation whose
-    /// row is missing, with `provider` selected.
+    /// row is missing, with `module` selected.
     fn orphan_context(
         orphan: &str,
         client_ip: Option<&str>,
-        provider: std::sync::Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+        module: std::sync::Arc<dyn crate::ec::module::EdgeCookieModule>,
     ) -> EcContext {
         let mut ec = EcContext::new_for_test_with_ip(
             Some(orphan.to_owned()),
             granting_consent(),
             client_ip.map(str::to_owned),
         )
-        .with_provider_for_test(provider);
+        .with_module_for_test(module);
         ec.set_recovery_eligible(true);
         ec.set_kv_snapshot(EcKvSnapshot::Missing {
             ec_id: orphan.to_owned(),
@@ -1720,8 +1716,8 @@ mod tests {
         let hmac_orphan = sample_ec_id("orphn2");
         let cases: [(&str, EcContext, KvIdentityGraph); 3] = [
             (
-                "the HMAC provider with no client IP",
-                orphan_context(&hmac_orphan, None, crate::ec::tests::hmac_provider()),
+                "the HMAC module with no client IP",
+                orphan_context(&hmac_orphan, None, crate::ec::tests::hmac_module()),
                 KvIdentityGraph::in_memory("test_store"),
             ),
             (
@@ -1729,7 +1725,7 @@ mod tests {
                 orphan_context(
                     &hmac_orphan,
                     Some("192.0.2.10"),
-                    crate::ec::tests::hmac_provider(),
+                    crate::ec::tests::hmac_module(),
                 ),
                 KvIdentityGraph::new(EmptyUnwritableEcKv),
             ),
@@ -1738,7 +1734,7 @@ mod tests {
                 orphan_context(
                     &hmac_orphan,
                     Some("192.0.2.10"),
-                    crate::ec::tests::hmac_provider(),
+                    crate::ec::tests::hmac_module(),
                 ),
                 KvIdentityGraph::new(crate::ec::tests::AddCollidingEcKv::new(u32::MAX)),
             ),
@@ -1750,7 +1746,7 @@ mod tests {
                 .to_owned();
             let orphan_kv_key = ec_context
                 .ec_kv_key()
-                .expect("the selected provider should own the orphan");
+                .expect("the selected module should own the orphan");
             let mut response = empty_response();
 
             ec_finalize_response(
@@ -1787,15 +1783,15 @@ mod tests {
     }
 
     #[test]
-    fn an_orphan_rotation_applies_the_replacement_providers_response_headers() {
+    fn an_orphan_rotation_applies_the_replacement_modules_response_headers() {
         // A returning visitor runs no generation earlier in the request, so the
-        // headers the provider asks for while creating the replacement reach
+        // headers the module asks for while creating the replacement reach
         // the response through the rotation alone.
         let settings = create_test_settings();
         let mut ec_context = orphan_context(
             "t0eh~orphaned-value",
             Some("192.0.2.10"),
-            std::sync::Arc::new(EvidenceHeaderProvider),
+            std::sync::Arc::new(EvidenceHeaderModule),
         );
         let graph = KvIdentityGraph::in_memory("test_store");
         let mut response = empty_response();
@@ -1813,7 +1809,7 @@ mod tests {
         assert_eq!(
             ec_context.ec_value(),
             Some("t0eh~evidence-id"),
-            "the orphan should rotate to the provider's replacement"
+            "the orphan should rotate to the module's replacement"
         );
         let cookies: Vec<&str> = response
             .headers()
@@ -1825,7 +1821,7 @@ mod tests {
             cookies
                 .iter()
                 .any(|cookie| cookie.starts_with("vendor-ev=abc")),
-            "the provider's cookie should reach the response, got {cookies:?}"
+            "the module's cookie should reach the response, got {cookies:?}"
         );
         assert!(
             cookies
@@ -1839,7 +1835,7 @@ mod tests {
                 .get_all(http::header::VARY)
                 .iter()
                 .any(|value| value == "sec-ch-ua"),
-            "the provider's Vary should reach the response"
+            "the module's Vary should reach the response"
         );
     }
 
@@ -2060,7 +2056,7 @@ mod tests {
         // The tombstone is the authoritative revocation marker, so it has to
         // land on the key the live row uses. Written under the raw cookie
         // value it creates a second row nothing reads, and the revocation
-        // never takes effect for a provider whose canonical form differs.
+        // never takes effect for a module whose canonical form differs.
         let settings = create_test_settings();
         let graph = graph_with_live_canonical_row();
         let consent = ConsentContext {
@@ -2100,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn eid_ingestion_keys_by_the_providers_canonical_form() {
+    fn eid_ingestion_keys_by_the_modules_canonical_form() {
         // An ingested EID must join the row the identifier already has. Keyed
         // by the raw cookie value the upsert finds no row and the partner ID
         // is dropped.
@@ -2145,30 +2141,30 @@ mod tests {
         );
     }
 
-    /// A provider that sets one cookie of its own and one `Vary` entry, the
-    /// two response effects a provider realistically asks for, so a test can
+    /// A module that sets one cookie of its own and one `Vary` entry, the
+    /// two response effects a module realistically asks for, so a test can
     /// watch both land on a response the origin already wrote headers to.
     #[derive(Debug)]
-    struct EvidenceHeaderProvider;
+    struct EvidenceHeaderModule;
 
-    impl crate::ec::provider::EdgeCookieProvider for EvidenceHeaderProvider {
+    impl crate::ec::module::EdgeCookieModule for EvidenceHeaderModule {
         fn id(&self) -> &'static str {
             "evidence-header"
         }
 
-        fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::provider_code!("t0eh")
+        fn code(&self) -> crate::ec::module::ModuleCode {
+            crate::module_code!("t0eh")
         }
 
         fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::provider::IdentityInput<'_>,
+            _input: &crate::ec::module::IdentityInput<'_>,
         ) -> Result<
-            crate::ec::provider::GeneratedEdgeCookie,
+            crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
         > {
-            Ok(crate::ec::provider::GeneratedEdgeCookie {
+            Ok(crate::ec::module::GeneratedEdgeCookie {
                 id: Some("evidence-id".to_owned()),
                 response_headers: vec![
                     (
@@ -2190,24 +2186,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_response_headers_reach_the_response_without_dropping_the_origins() {
+    fn module_response_headers_reach_the_response_without_dropping_the_origins() {
         // The response finalization runs on is the finished one, so it already
-        // carries the publisher origin's own headers. A provider effect must
+        // carries the publisher origin's own headers. A module effect must
         // add to those, never replace them: replacing `Set-Cookie` would drop
         // the publisher's session and sign-in cookies, and replacing `Vary`
         // would break the caching the origin asked for.
         let settings = create_test_settings();
-        let graph = KvIdentityGraph::in_memory("finalize-provider-headers-store");
+        let graph = KvIdentityGraph::in_memory("finalize-module-headers-store");
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::NonRegulated,
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
-            .with_provider_for_test(std::sync::Arc::new(EvidenceHeaderProvider));
+            .with_module_for_test(std::sync::Arc::new(EvidenceHeaderModule));
         ec_context
             .generate_if_needed(&settings, Some(&graph))
-            .expect("should create the identifier through the provider");
+            .expect("should create the identifier through the module");
 
         // What the publisher's origin returned, before EC finalization runs.
         let mut response = empty_response();
@@ -2240,13 +2236,13 @@ mod tests {
             cookies
                 .iter()
                 .any(|cookie| cookie.starts_with("publisher_session=origin-value")),
-            "the origin's own cookie must survive a provider effect, got {cookies:?}"
+            "the origin's own cookie must survive a module effect, got {cookies:?}"
         );
         assert!(
             cookies
                 .iter()
                 .any(|cookie| cookie.starts_with("vendor-ev=abc")),
-            "the provider's cookie must reach the response, got {cookies:?}"
+            "the module's cookie must reach the response, got {cookies:?}"
         );
         assert!(
             cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
@@ -2261,37 +2257,37 @@ mod tests {
             .collect();
         assert!(
             vary.contains(&"accept-encoding"),
-            "the origin's Vary must survive a provider effect, got {vary:?}"
+            "the origin's Vary must survive a module effect, got {vary:?}"
         );
         assert!(
             vary.contains(&"sec-ch-ua"),
-            "the provider's Vary must reach the response, got {vary:?}"
+            "the module's Vary must reach the response, got {vary:?}"
         );
     }
 
-    /// A provider standing in for the one a deployment switched *to*, with a
-    /// different registered code from the provider that created the live row.
+    /// A module standing in for the one a deployment switched *to*, with a
+    /// different registered code from the module that created the live row.
     #[derive(Debug)]
-    struct SwitchedProvider;
+    struct SwitchedModule;
 
-    impl crate::ec::provider::EdgeCookieProvider for SwitchedProvider {
+    impl crate::ec::module::EdgeCookieModule for SwitchedModule {
         fn id(&self) -> &'static str {
             "switched"
         }
 
-        fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::provider_code!("t0sw")
+        fn code(&self) -> crate::ec::module::ModuleCode {
+            crate::module_code!("t0sw")
         }
 
         fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::provider::IdentityInput<'_>,
+            _input: &crate::ec::module::IdentityInput<'_>,
         ) -> Result<
-            crate::ec::provider::GeneratedEdgeCookie,
+            crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
         > {
-            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+            Ok(crate::ec::module::GeneratedEdgeCookie::default())
         }
 
         fn accepts_id(&self, value: &str) -> bool {
@@ -2304,8 +2300,8 @@ mod tests {
     }
 
     #[test]
-    fn switching_provider_leaves_the_previous_providers_row_beyond_withdrawal() {
-        // A retired provider's identifier is owned by nobody this deployment
+    fn switching_module_leaves_the_previous_modules_row_beyond_withdrawal() {
+        // A retired module's identifier is owned by nobody this deployment
         // reads, so a later withdrawal expires the browser cookie but cannot
         // tombstone the row, and the identifier is never adopted either.
         let settings = create_test_settings();
@@ -2335,8 +2331,8 @@ mod tests {
             source: ConsentSource::Cookie,
             ..Default::default()
         };
-        // The browser still carries the identifier the previous provider
-        // created, but the deployment now runs a provider with a different
+        // The browser still carries the identifier the previous module
+        // created, but the deployment now runs a module with a different
         // code, so read-back treats the cookie as absent and the active
         // identifier is empty.
         let mut ec_context = make_context_with_consent(
@@ -2347,7 +2343,7 @@ mod tests {
             consent,
             false,
         )
-        .with_provider_for_test(std::sync::Arc::new(SwitchedProvider));
+        .with_module_for_test(std::sync::Arc::new(SwitchedModule));
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -2362,16 +2358,16 @@ mod tests {
 
         assert!(
             ec_context.ec_value().is_none(),
-            "the retired provider's identifier must never be adopted by the new one"
+            "the retired module's identifier must never be adopted by the new one"
         );
 
         let (row, _) = graph
             .get(CANONICAL_KV_KEY)
-            .expect("should read the previous provider's row")
-            .expect("the previous provider's row should still exist");
+            .expect("should read the previous module's row")
+            .expect("the previous module's row should still exist");
         assert!(
             row.consent.ok,
-            "withdrawal cannot reach a retired provider's row without the provider that owns the code"
+            "withdrawal cannot reach a retired module's row without the module that owns the code"
         );
 
         let cookies: Vec<&str> = response
@@ -2410,7 +2406,7 @@ mod tests {
             granting_consent(),
             Some("192.0.2.10".to_owned()),
         )
-        .with_provider_for_test(crate::ec::tests::hmac_provider());
+        .with_module_for_test(crate::ec::tests::hmac_module());
         ec.set_recovery_eligible(recovery_eligible);
         ec.set_kv_snapshot(snapshot);
         ec

@@ -1203,8 +1203,8 @@ fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
 
 /// Forwards the request's Edge Cookie identifier to the outbound target URL.
 ///
-/// Only an identifier the selected provider recognizes is forwarded. A value
-/// carrying another deployment's provider code, and any value at all in a
+/// Only an identifier the selected module recognizes is forwarded. A value
+/// carrying another deployment's module code, and any value at all in a
 /// stateless deployment, is withheld, so nothing this deployment did not issue
 /// reaches the origin.
 fn append_ec_id(
@@ -1565,7 +1565,7 @@ pub async fn handle_first_party_click(
     } = reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
     // The redirect target is a third party's URL, so only an identifier the
-    // selected provider recognizes is added to it. A stateless deployment adds
+    // selected module recognizes is added to it. A stateless deployment adds
     // nothing.
     let ec_id = match recognized_ec_id(settings, services, &req) {
         Ok(id) => id,
@@ -2961,20 +2961,20 @@ mod tests {
         });
     }
 
-    /// An identifier the built-in HMAC provider, the provider
+    /// An identifier the built-in HMAC module, the module
     /// `create_test_settings` selects, recognizes as its own.
     fn recognized_hmac_ec_id() -> String {
         format!("hmac~{}", crate::test_support::tests::VALID_SYNTHETIC_ID)
     }
 
-    /// A well-formed identifier carrying a provider code no deployment here
+    /// A well-formed identifier carrying a module code no deployment here
     /// reads, the shape a partner or another deployment would hand back.
     const FOREIGN_CODED_EC_ID: &str = "zz00~someone-elses-identifier";
 
     fn stateless_settings() -> Settings {
         let mut settings = create_test_settings();
-        settings.ec.provider = None;
-        settings.ec.provider_blocks.clear();
+        settings.ec.module = None;
+        settings.ec.module_blocks.clear();
         settings
     }
 
@@ -3018,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    fn click_withholds_an_ec_id_the_provider_does_not_recognize() {
+    fn click_withholds_an_ec_id_the_module_does_not_recognize() {
         let settings = create_test_settings();
         let param = click_ts_ec_param(
             &settings,
@@ -3028,15 +3028,15 @@ mod tests {
 
         assert_eq!(
             param, None,
-            "a value carrying another deployment's provider code should not reach the click target"
+            "a value carrying another deployment's module code should not reach the click target"
         );
     }
 
     #[test]
     fn click_withholds_every_ec_id_in_a_stateless_deployment() {
         let settings = stateless_settings();
-        // The value is one the built-in provider would recognize, so only the
-        // absence of a selected provider can withhold it.
+        // The value is one the built-in module would recognize, so only the
+        // absence of a selected module can withhold it.
         let param = click_ts_ec_param(
             &settings,
             &noop_services(),
@@ -3050,7 +3050,7 @@ mod tests {
     }
 
     #[test]
-    fn append_ec_id_forwards_only_what_the_provider_recognizes() {
+    fn append_ec_id_forwards_only_what_the_module_recognizes() {
         let settings = create_test_settings();
         let services = noop_services();
         let recognized = recognized_hmac_ec_id();
@@ -3080,7 +3080,7 @@ mod tests {
         assert_eq!(
             ts_ec_param(&url),
             None,
-            "a foreign provider code should not reach the origin"
+            "a foreign module code should not reach the origin"
         );
 
         let mut url =
