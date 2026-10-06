@@ -127,20 +127,6 @@ pub const HMAC_MODULE_KEY: &str = "hmac";
 /// arm when the host-signal module becomes a module of its own.
 pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host_signals";
 
-/// The name the host-signal module was selected by before it was renamed
-/// under the rule that every name an operator types into configuration is
-/// `snake_case`.
-///
-/// [`Ec::validate_module_selection`] refuses it at startup with a message
-/// naming [`HOST_SIGNALS_PROVIDER_KEY`], so a deployment still configured with
-/// the old spelling stops there and the operator is told what to write
-/// instead. The refusal comes before any block is looked for, because a block
-/// left under the old name is read as the block of a module the adapter
-/// injects, so without the refusal the old selector would find that block,
-/// pass the settings check, and fail later in [`resolve_named_module`] with
-/// a message about an adapter that supplies no such module.
-pub(crate) const RETIRED_HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
-
 /// The implementation ids core supplies itself, one per resolution arm in
 /// [`resolve_named_module`].
 ///

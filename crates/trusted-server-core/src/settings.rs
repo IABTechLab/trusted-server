@@ -21,10 +21,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::module::{
-    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY,
-    RETIRED_HOST_SIGNALS_PROVIDER_KEY,
-};
+use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -697,47 +694,15 @@ impl Ec {
     /// one place that knows both the implementations built into core and the
     /// one this deployment's adapter injects.
     ///
-    /// The host-signal provider's old name, `host-signals`, is refused here
-    /// before any block is looked for, so an operator whose configuration
-    /// still carries that spelling is told the name to write instead.
-    ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selector is the
-    /// old `host-signals` spelling, when a module name or implementation is
-    /// not `snake_case`, when a block is configured with no selector or
-    /// alongside `"none"`, when the selector names a key `[ec]` reads as its
-    /// own setting, when a block the selector does not name is configured, or
-    /// when the selected module resolves to an implementation that needs
-    /// settings and has no block.
+    /// Returns [`TrustedServerError::Configuration`] when a module name or
+    /// implementation is not `snake_case`, when a block is configured with no
+    /// selector or alongside `"none"`, when the selector names a key `[ec]`
+    /// reads as its own setting, when a block the selector does not name is
+    /// configured, or when the selected module resolves to an implementation
+    /// that needs settings and has no block.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        // The old spelling of the host-signal module's name is refused
-        // before any other question is asked, as the selector and as a block
-        // name, so an operator still carrying it is told the spelling to write
-        // rather than being handed the general `snake_case` rule below, which
-        // the old name also breaks. A block left behind under the old name is
-        // read as the block of a module the adapter injects, so without the
-        // refusal the old selector would find that block, pass the checks
-        // below, and fail later in module resolution with a message about an
-        // adapter that supplies no such module.
-        let selector_is_retired = matches!(
-            self.module.as_ref(),
-            Some(EcModuleSelection::Named(name)) if name == RETIRED_HOST_SIGNALS_PROVIDER_KEY
-        );
-        if selector_is_retired
-            || self
-                .module_blocks
-                .contains_key(RETIRED_HOST_SIGNALS_PROVIDER_KEY)
-        {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "[ec] module = \"host-signals\" is no longer accepted. The \
-                          host-signal module is now named \"host_signals\", so set [ec] \
-                          module = \"host_signals\" and rename its block to \
-                          [ec.host_signals]"
-                    .to_owned(),
-            }));
-        }
-
         for (name, block) in self.module_blocks.iter() {
             Self::validate_module_name(name)?;
             if let Some(implementation) = &block.implementation {
@@ -6253,56 +6218,20 @@ mod tests {
     }
 
     #[test]
-    fn the_old_host_signals_spelling_fails_at_startup_and_names_the_new_one() {
-        // The host-signal provider was renamed to `host_signals` under the
-        // rule that every name an operator types into configuration is
-        // `snake_case`. A deployment still configured with the old spelling
-        // has to stop when settings load, which every adapter does before it
-        // serves a request, and the error has to name the spelling to write
-        // instead.
-        let selecting = |selector: &str| {
-            crate_test_settings_str_with_ec_section(&format!(
-                "[ec]\nmodule = \"{selector}\"\n\n[ec.{selector}]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n"
-            ))
-        };
+    fn a_host_signals_block_is_read_as_the_built_in_modules_settings() {
+        // The block is the built-in module's own settings, rather than kept as
+        // the raw values of a module an adapter injects.
+        let settings = Settings::from_toml(&crate_test_settings_str_with_ec_section(&format!(
+            "[ec]
+module = \"{HOST_SIGNALS_PROVIDER_KEY}\"
 
-        // A block left under the old name is read as the block of a provider
-        // the adapter injects, so the old selector would find it and pass the
-        // block check if the name were not refused before the block is looked
-        // for.
-        let old = selecting(RETIRED_HOST_SIGNALS_PROVIDER_KEY);
-        let err =
-            Settings::from_toml(&old).expect_err("the old spelling should fail when settings load");
-        assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::Configuration { .. }
-            ),
-            "the old spelling should be a configuration error, got: {:?}",
-            err.current_context()
-        );
-        assert!(
-            err.to_string().contains(HOST_SIGNALS_PROVIDER_KEY),
-            "the error should name `host_signals`, got: {err}"
-        );
-
-        // With no block at all the answer has to be the same one, naming the
-        // new spelling rather than asking for a block under the old name.
-        let old_without_block = crate_test_settings_str_with_ec_section(&format!(
-            "[ec]\nmodule = \"{RETIRED_HOST_SIGNALS_PROVIDER_KEY}\"\n"
-        ));
-        let err = Settings::from_toml(&old_without_block)
-            .expect_err("the old spelling should fail with no block either");
-        assert!(
-            err.to_string().contains(HOST_SIGNALS_PROVIDER_KEY),
-            "the error should still name `host_signals`, got: {err}"
-        );
-
-        // The same configuration written with the new spelling loads, and the
-        // block is read as the built-in provider's own settings rather than
-        // kept as the raw values of a provider an adapter injects.
-        let settings = Settings::from_toml(&selecting(HOST_SIGNALS_PROVIDER_KEY))
-            .expect("the `host_signals` spelling should load");
+\
+             [ec.{HOST_SIGNALS_PROVIDER_KEY}]
+\
+             passphrase = \"test-secret-key-32-bytes-minimum\"
+"
+        )))
+        .expect("a host_signals selection with its block should load");
         assert!(
             settings
                 .ec
@@ -6310,10 +6239,9 @@ mod tests {
                 .get(HOST_SIGNALS_PROVIDER_KEY)
                 .and_then(EcModuleBlock::host_signals_settings)
                 .is_some(),
-            "the renamed block should be read as the host-signal provider's settings"
+            "the block should be read as the host-signal module's settings"
         );
     }
-
     #[test]
     fn a_labeled_block_the_selector_does_not_name_is_rejected() {
         // A block under a label is still a module block, so it is held to
