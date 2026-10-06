@@ -86,6 +86,56 @@ afterEach(() => {
 });
 
 describe('GptDiagnosticsOverlay', () => {
+  it.each(['View trace results', 'Download trace report'])(
+    'retains focused %s and the live region across GPT updates',
+    (label) => {
+      const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+      let root: ShadowRoot | undefined;
+      const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+        scheduleFrame: (callback) => callback(),
+        onShadowRoot: (created) => {
+          root = created;
+        },
+        onViewTrace: vi.fn(),
+        onDownloadTrace: vi.fn(),
+      });
+      if (!root) throw new Error('should mount diagnostics');
+      try {
+        overlay.setTraceState({ kind: 'storage_unavailable', downloadAvailable: true });
+        const control = button(root, label);
+        const status = root.querySelector('[aria-live="polite"]');
+        control.focus();
+        expect(root.activeElement).toBe(control);
+        store.recordSlotRequested(slot('example-slot'));
+        expect(button(root, label)).toBe(control);
+        expect(root.activeElement).toBe(control);
+        expect(root.querySelector('[aria-live="polite"]')).toBe(status);
+      } finally {
+        overlay.destroy();
+      }
+    }
+  );
+
+  it('allows an explicit retry when navigation did not depart from the document', () => {
+    let root: ShadowRoot | undefined;
+    const onViewTrace = vi.fn();
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => callback(),
+      onShadowRoot: (created) => {
+        root = created;
+      },
+      onViewTrace,
+    });
+    if (!root) throw new Error('should mount diagnostics');
+    try {
+      overlay.setTraceState({ kind: 'navigating', downloadAvailable: true });
+      button(root, 'View trace results').click();
+      expect(onViewTrace).toHaveBeenCalledTimes(1);
+    } finally {
+      overlay.destroy();
+    }
+  });
+
   it('adds an optional prominent trace action and independent storage recovery without replacing GPT export', () => {
     let root: ShadowRoot | undefined;
     const onViewTrace = vi.fn();

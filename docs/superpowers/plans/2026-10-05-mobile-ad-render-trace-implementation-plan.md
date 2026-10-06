@@ -366,7 +366,8 @@ release work.
 - [x] Resolve and verify the EdgeZero prerequisite before foundation integration.
 - [x] Execute and review foundation tasks F0–F8.
 - [x] Execute and review live-evidence tasks E1–E7.
-- [ ] Execute and review browser tasks V1–V7.
+- [x] Execute and review browser implementation V1–V6 and automated V7 journeys.
+- [ ] Complete V7 physical-device, actual session restoration and staging acceptance.
 - [ ] Record all acceptance evidence, full CI gates, and manual mobile results.
 - [ ] Enable only a controlled staging fixture; verify CDN/private responses and operator privacy acceptance.
 - [x] Keep enrichment and future schemas separately scheduled.
@@ -1013,6 +1014,67 @@ function downloadJson(json: string, filename: string): void {
 - [ ] Document reproduction/support/export instructions and browser-carried trust limits, no historic recovery, no client winner inference, host-only scope, independent cleanup retries and controlled staging rollout. Mark #1081/#1074/#1076 fields unavailable, not missing implementation.
 - [ ] Run the full shared verification gates/builds/docs and the complete browser runner, plus manual mobile checklist. Review final diff and acceptance matrix. Planned commit: `Verify the mobile trace journey and document release acceptance`.
 - [ ] Handoff v1 feature only after the first three phases meet all mandatory acceptance criteria; record pending environment/manual checks separately. Publishing/deployment is a subsequent explicit action.
+
+## Approved review corrections — 2026-10-06
+
+The user authorized this focused corrective pass after independent review of
+Claude's findings. Keep the same feature branches, spec and plan.
+
+- [x] Add a gated trace-only initial seam when ordinary ad-slot injection is
+      withheld. Execute the emitted script and verify evidence is recorded once
+      without invoking the scheduler, changing bids/slots or setting the ad-init
+      latch; preserve queue initialization, generation guards and fail-open behavior.
+- [x] Remove the redundant unconditional page-bids delivery observation. Retain
+      the successful branch's definitive delivery observation and verify actual SPA
+      success/fallback projections. The proposed partial-bid `Err` scenario is not
+      reachable in current planned production execution; do not fabricate a
+      legacy-test-only regression or claim a reproduced production truth defect.
+- [x] Keep View usable after a navigation does not depart, and retain connected
+      trace controls/live status across GPT data updates. Add retry/focus regressions.
+- [x] Replace the five newly introduced ES2022 test APIs with ES2020-compatible
+      access, without broadening the existing TypeScript target.
+- [x] Correct EdgeZero's per-observation preservation metadata conservatively;
+      document Fastly Content-Length folding; verify and pin the new upstream commit.
+- [x] Clarify mediator-inclusive record counts, asset-manifest maintenance,
+      publisher CSP compatibility, completed automation versus pending manual
+      acceptance, and deployed HTTPS Enable/End checks.
+- [x] Run target-matched checks and required full gates, independently review
+      the corrections, and update both existing draft PRs without adding Python.
+
+### Corrective-pass verification
+
+Three independent reviewers approved the final corrections with no remaining
+actionable findings: publisher/spec alignment, browser controls/types, and
+EdgeZero metadata/architecture. EdgeZero commit
+`75067d2c9a3cf865591665e88a736db4c8a13be0` replaces the previous reviewed pin
+in all six workspace dependencies and eight lockfile sources, without unrelated
+dependency changes. Its full workspace gates, adapter contracts and 54 raw
+ingress cases pass; all checks on EdgeZero PR #403 pass.
+
+Trusted Server's current-source format, all eight target-matched clippy gates,
+four adapter test suites, host CLI tests and 21 parity cases pass against the new
+pin. The host-only emitted-script regression executes real publisher output for
+four skip conditions and buffered/streaming finalizers, each with five callback
+modes; no scheduler or ad initialization runs and publisher-owned state remains
+unchanged. The overlay regressions prove retained focus/live status and retry.
+The normal JS and external Prebid builds, formatting, lint and all 1,736 Vitest
+tests in 69 files pass. The five new ES2022 test errors are removed; the broader
+JS TypeScript check retains unrelated baseline errors. Browser TypeScript
+passes using the workspace's existing Node type declarations. Core documentation,
+docs lint/format/build and Markdown formatting pass with existing warnings.
+
+Fresh Fastly, Axum, Cloudflare worker-build and Spin artifacts pass the complete
+repository browser runner: Next.js 49 passed with two expected skips; WordPress
+28 passed with 23 expected skips. All four separate runtime browser workflows
+pass, as do the three raw Cloudflare/Fastly/Spin boundary suites. These verify
+local runtime behavior and do not replace physical-device, actual restoration or
+deployed HTTPS/CDN/CSP acceptance. Both existing draft PRs receive the corrections;
+neither feature branch contains Python files. Frozen standalone v1 asset bytes
+remain unchanged by this corrective pass.
+
+Bundle splitting remains a separate load-order/performance design. Preserve
+the build-input freshness guard and ordinary reserved-route/cache policy.
+Physical mobile and deployed CDN/HTTPS acceptance remain release gates.
 
 ## Phase 4: Optional network enrichment
 

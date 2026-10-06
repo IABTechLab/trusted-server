@@ -72,7 +72,9 @@ describe('explicit GPT public projection', () => {
       expect(projected.ok).toBe(true);
       if (!projected.ok) throw new Error('should project actual pending cycles');
       expect(projected.value.slots[0]!.requests[0]!.trustedServerOpportunity).toBe(opportunity);
-      expect(Object.hasOwn(projected.value.slots[0]!.requests[0]!, 'size')).toBe(false);
+      expect(
+        Object.prototype.hasOwnProperty.call(projected.value.slots[0]!.requests[0]!, 'size')
+      ).toBe(false);
     }
   );
   it('classifies inspection failures without reading caller-controlled errors', () => {

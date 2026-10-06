@@ -143,6 +143,10 @@ GPT-only export as an equivalent fallback. The viewer keeps traced-document fact
 separate from its setup request. Server-auction and browser/GPT clocks remain
 separate; candidate selection or a filled slot does not establish an auction winner.
 
+Slot returned-bid counts include records returned by bidder and mediator calls,
+including mediator echoes. They are observations across stages, not unique bids;
+do not sum slot counts to infer a unique bid total.
+
 ### Storage, export and cleanup
 
 One versioned `sessionStorage` key holds at most 512 KiB of compact UTF-8 data.
@@ -171,6 +175,17 @@ Use a suitable same-origin deployment where the browser accepts the unchanged
 `Secure`, `HttpOnly`, host-only `SameSite=Lax` cookie. Its explicit activation lifetime
 is 1800 seconds; ordinary requests do not refresh it. Do not weaken cookie attributes
 or infer HTTPS from an untrusted forwarding header to make a test pass.
+
+On deployed Fastly and Spin staging services, verify HTTPS Enable returns a
+successful response, a separate state request observes the session, publisher
+reload captures evidence, and End followed by another state request observes
+inactivity. Local plain-HTTP runtime tests do not establish this HTTPS behavior.
+
+Publisher activation and context use injected inline scripts without an attached
+CSP nonce. A publisher nonce/hash policy that does not authorize those scripts
+can prevent diagnostics activation and capture. Check the literal activation gate
+and actual capture under the deployed publisher CSP; do not weaken that policy
+or the trace viewer's separate CSP to make the check pass.
 
 A pre-existing session cookie cannot be retroactively assigned this lifetime by
 the server. End tracing and explicitly enable it again to adopt the bounded cookie.
@@ -236,8 +251,18 @@ behavior:
   behavior being supported. Record session-restoration checks separately from
   automated storage fixtures.
 
-Record the device/browser versions and results in the same implementation plan.
+The linked plan is the immutable implementation baseline. Record device/browser
+versions and new acceptance results in the current rollout evidence, referencing
+that baseline and the exact deployed revision.
 Until these checks are complete, physical mobile acceptance remains pending.
+
+### Maintaining versioned assets
+
+The committed trace asset manifest covers source, compiler dependency locks and
+build options. After changing those inputs, rebuild and review the JS/CSS and
+refresh the source digest. Unchanged bytes keep their existing asset URL and
+digest. Once an asset set is published, changed bytes require a new versioned
+URL; the current feature's v1 set remains unpublished until release acceptance.
 
 ## What the Console Shows
 

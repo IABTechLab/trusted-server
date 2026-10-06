@@ -3283,6 +3283,8 @@ pub(crate) struct AdBidsState {
     debug_prefix: Arc<Mutex<String>>,
     /// Optional trace carry belongs to this request, outside the ordinary bid map.
     trace: Option<TraceAuctionCarry>,
+    /// Withheld ad-slot injection permits only trace observation at the body seam.
+    trace_only: bool,
 }
 
 #[cfg(test)]
@@ -3305,7 +3307,11 @@ impl AdBidsState {
     /// Record one auction result, rendering the script from the same map that is
     /// stored, so the two representations cannot drift.
     fn set(&self, bid_map: serde_json::Map<String, serde_json::Value>) {
-        let bids_script = build_bids_script_with_trace(&bid_map, self.trace());
+        let bids_script = if self.trace_only {
+            build_trace_only_script(self.trace())
+        } else {
+            build_bids_script_with_trace(&bid_map, self.trace())
+        };
         *self.script.lock().expect("should lock bid script") = Some(bids_script);
         *self.bids.lock().expect("should lock bid map") = bid_map;
     }
@@ -3324,6 +3330,11 @@ impl AdBidsState {
 
     fn attach_trace(&mut self, trace: TraceAuctionCarry) {
         self.trace = Some(trace);
+        self.set(self.bids());
+    }
+
+    fn withhold_ad_initialization(&mut self) {
+        self.trace_only = true;
         self.set(self.bids());
     }
 
@@ -5423,6 +5434,10 @@ pub async fn handle_publisher_request(
         )
     };
 
+    if ad_slots_script.is_none() && trace_auction.is_some() {
+        ad_bids_state.withhold_ad_initialization();
+    }
+
     // §4.7: HTML with synthesized per-navigation auction state must not be
     // stored or validated as an origin representation. Strip both browser and
     // surrogate validators/cache directives before returning it.
@@ -6207,6 +6222,26 @@ fn trace_transport_script(trace: Option<&TraceAuctionCarry>) -> Option<String> {
             serde_json::to_string(&transport)
                 .unwrap_or_else(|_| trace_serialization_unavailable().to_string())
         })
+}
+
+fn build_trace_only_script(trace: Option<&TraceAuctionCarry>) -> String {
+    let Some(transport) = trace_transport_script(trace) else {
+        return String::new();
+    };
+    format!(
+        "<script>(function(){{try{{\
+var t=window.tsjs=window.tsjs||{{}};\
+var x=JSON.parse(\"{}\");\
+function record(){{try{{\
+var t=window.tsjs;\
+if(window.__tsjs_trace_active!==true||!t||(t.navGeneration||0)!==0)return;\
+var g=t.traceGpt;\
+if(g&&typeof g.observeTransport===\"function\")g.observeTransport(undefined,x,\"initial_navigation_ssat\");\
+}}catch(e){{}}}}\
+if(t.traceGpt)record();else(t.que=t.que||[]).push(record);\
+}}catch(e){{}}}})();</script>",
+        html_escape_for_script(&transport)
+    )
 }
 
 fn trace_transport_value(transport: &crate::trace::TraceAuctionTransportV1) -> serde_json::Value {
@@ -7495,10 +7530,6 @@ pub async fn handle_page_bids(
             None,
         )
     });
-    if let Some(trace) = &trace_auction {
-        trace.observe_delivery(&winning_bids, &bid_map.keys().cloned().collect());
-    }
-
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
     // slots so the SPA hook does not call `adInit()` / create GPT slots.
     let slots_json: Vec<serde_json::Value> = if ad_stack_enabled {
@@ -15734,13 +15765,165 @@ mod tests {
                             "should deliver the directly observed skipped auction even with zero bids"
                         );
                         assert!(
-                            document.contains("s(b,undefined,x)"),
-                            "should supply optional transport to the initial scheduler"
+                            !document.contains("s(b,undefined,x)"),
+                            "should withhold the ad scheduler when ordinary ad slots are absent"
                         );
                     } else {
                         assert!(
                             !document.contains("initial_navigation_ssat"),
                             "should omit inactive transport"
+                        );
+                    }
+                }
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[tokio::test]
+            #[ignore = "requires the declared Node toolchain for emitted-script execution"]
+            async fn trace_document_skipped_emitted_script_leaves_ad_state_untouched() {
+                for gate in [
+                    "missing_opportunities",
+                    "auction_disabled",
+                    "consent_denied",
+                    "unmatched_path",
+                ] {
+                    for finalizer in [Finalizer::Buffered, Finalizer::Streaming] {
+                        let stub = Arc::new(StubHttpClient::new());
+                        let services = services_for_ip(
+                            Arc::clone(&stub),
+                            Arc::new(MemoryTemplateCache::default()),
+                            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
+                        );
+                        queue_shareable_html(&stub);
+                        let mut settings = settings_with_mode("inline");
+                        settings.auction.enabled = gate != "auction_disabled";
+                        if gate == "missing_opportunities" {
+                            settings.creative_opportunities = None;
+                        }
+                        settings
+                            .integrations
+                            .insert_config(
+                                "gpt_diagnostics",
+                                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+                            )
+                            .expect("should enable trace");
+                        let settings = Arc::new(settings);
+                        let mut request = conditional_trace_request(true);
+                        if gate == "unmatched_path" {
+                            *request.uri_mut() = "https://ts.example.com/unmatched"
+                                .parse()
+                                .expect("should build unmatched path");
+                        }
+                        TracePreDispatchHook::new(
+                            Arc::clone(&settings),
+                            Arc::new(|_| panic!("should not load setup metadata")),
+                        )
+                        .handle(&mut request)
+                        .await
+                        .expect("should freeze trace gate");
+                        crate::integrations::gpt_diagnostics::prepare_request(
+                            &settings,
+                            &mut request,
+                        )
+                        .expect("should freeze diagnostics decision");
+                        let mut ec_context = EcContext::new_for_test(
+                            None,
+                            crate::consent::ConsentContext {
+                                jurisdiction: if gate == "consent_denied" {
+                                    crate::consent::jurisdiction::Jurisdiction::Gdpr
+                                } else {
+                                    crate::consent::jurisdiction::Jurisdiction::NonRegulated
+                                },
+                                ..Default::default()
+                            },
+                        );
+                        let orchestrator =
+                            Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+                        let registry = IntegrationRegistry::new(&settings)
+                            .expect("should register integrations");
+                        let response = handle_publisher_request(
+                            &settings,
+                            &services,
+                            None,
+                            &mut ec_context,
+                            AuctionDispatch {
+                                orchestrator: &orchestrator,
+                                slots: &[article_slot()],
+                                registry: None,
+                            },
+                            request,
+                            EdgeCacheHeader::SMaxageFallback,
+                        )
+                        .await
+                        .expect("should preserve publisher response");
+                        let document = String::from_utf8(
+                            body_of(
+                                finalize_test_publisher_response(
+                                    response,
+                                    &settings,
+                                    &services,
+                                    &registry,
+                                    orchestrator,
+                                    finalizer,
+                                )
+                                .await,
+                            )
+                            .await,
+                        )
+                        .expect("should render publisher HTML");
+                        let script = document
+                            .rsplit_once("<script>")
+                            .expect("should emit the request-only body script")
+                            .1
+                            .split_once("</script>")
+                            .expect("should close the body script")
+                            .0;
+                        let probe = r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const script = process.argv[1];
+for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
+  const bids = {example: 'publisher-owned'};
+  const slots = [{id: 'publisher-owned'}];
+  const records = [];
+  let schedulerCalls = 0;
+  let adInitCalls = 0;
+  const api = {bids, adSlots: slots, initialAdInitScheduled: false, navGeneration: 0,
+    scheduleInitialAdInit() {schedulerCalls++;},
+    adInit() {adInitCalls++;}};
+  const bridge = {observeTransport(delivered, transport, source) {
+    if (mode === 'throws') throw Error('private diagnostic failure');
+    assert.equal(delivered, undefined);
+    assert.equal(source, 'initial_navigation_ssat');
+    assert.equal(transport.evidence.terminal_status, 'skipped');
+    records.push(transport);
+  }};
+  if (mode !== 'queued' && mode !== 'stale') api.traceGpt = bridge;
+  const window = {tsjs: api, __tsjs_trace_active: mode !== 'inactive'};
+  vm.runInNewContext(script, {window});
+  if (mode === 'queued' || mode === 'stale') {
+    assert.equal(records.length, 0);
+    assert.equal(api.que.length, 1);
+    api.traceGpt = bridge;
+    if (mode === 'stale') api.navGeneration = 1;
+    api.que[0]();
+  }
+  assert.equal(records.length, mode === 'ready' || mode === 'queued' ? 1 : 0);
+  assert.equal(api.bids, bids);
+  assert.equal(api.adSlots, slots);
+  assert.equal(api.initialAdInitScheduled, false);
+  assert.equal(schedulerCalls, 0);
+  assert.equal(adInitCalls, 0);
+}
+"#;
+                        let output = std::process::Command::new("node")
+                            .args(["-e", probe, script])
+                            .output()
+                            .expect("should execute the emitted script with Node");
+                        assert!(
+                            output.status.success(),
+                            "should observe only trace evidence: {}",
+                            String::from_utf8_lossy(&output.stderr)
                         );
                     }
                 }

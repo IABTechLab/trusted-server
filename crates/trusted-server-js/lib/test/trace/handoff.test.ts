@@ -85,7 +85,7 @@ describe('explicit same-tab trace handoff', () => {
     action.view();
     expect(fixture.target.location.assign).not.toHaveBeenCalled();
     expect(fixture.download).not.toHaveBeenCalled();
-    expect(fixture.states.at(-1)).toMatchObject({
+    expect(fixture.states[fixture.states.length - 1]).toMatchObject({
       kind: 'storage_unavailable',
       downloadAvailable: true,
     });
@@ -141,7 +141,7 @@ describe('explicit same-tab trace handoff', () => {
     expect(fixture.target.location.assign).not.toHaveBeenCalled();
     expect(fixture.download).not.toHaveBeenCalled();
     expect(JSON.stringify(fixture.states)).not.toContain('private');
-    expect(fixture.states.at(-1)).toMatchObject({
+    expect(fixture.states[fixture.states.length - 1]).toMatchObject({
       kind: 'capture_failed',
       downloadAvailable: false,
     });
@@ -154,7 +154,7 @@ describe('explicit same-tab trace handoff', () => {
     const action = handoff(fixture.options);
     action.view();
     expect(fixture.target.sessionStorage.setItem).toHaveBeenCalledTimes(1);
-    expect(fixture.states.at(-1)).toMatchObject({
+    expect(fixture.states[fixture.states.length - 1]).toMatchObject({
       kind: 'navigation_unavailable',
       downloadAvailable: true,
     });

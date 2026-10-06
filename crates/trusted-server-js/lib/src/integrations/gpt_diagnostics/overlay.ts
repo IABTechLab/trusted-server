@@ -525,7 +525,16 @@ export class GptDiagnosticsOverlay {
         .map((details) => details.closest<HTMLElement>('.tsgd-slot')?.dataset.runtimeSlot)
         .filter((runtimeSlot): runtimeSlot is string => runtimeSlot !== undefined)
     );
-    panel.replaceChildren();
+    const retainedToolbar =
+      this.onViewTrace && !this.collapsed
+        ? panel.querySelector<HTMLElement>('.tsgd-toolbar')
+        : null;
+    const retainedTraceStatus = retainedToolbar
+      ? panel.querySelector<HTMLElement>('.tsgd-trace-status')
+      : null;
+    for (const child of Array.from(panel.children)) {
+      if (child !== retainedToolbar && child !== retainedTraceStatus) child.remove();
+    }
 
     const header = this.document.createElement('header');
     header.className = 'tsgd-header';
@@ -542,51 +551,62 @@ export class GptDiagnosticsOverlay {
     collapse.setAttribute('aria-expanded', String(!this.collapsed));
     const close = this.button('Close', () => this.hide());
     header.append(title, status, collapse, close);
-    panel.append(header);
+    panel.prepend(header);
 
     if (this.collapsed) return;
 
-    const toolbar = this.document.createElement('div');
+    const toolbar = retainedToolbar ?? this.document.createElement('div');
     toolbar.className = 'tsgd-toolbar';
-    const filterLabel = this.document.createElement('label');
-    filterLabel.textContent = 'Filter';
-    const select = this.document.createElement('select');
-    select.setAttribute('aria-label', 'Filter diagnostic slots');
-    const filters: Array<[GptDiagnosticsFilter, string]> = [
-      ['all', 'All'],
-      ['visible', 'Visible'],
-      ['filled', 'Filled'],
-      ['empty', 'Empty'],
-      ['pending', 'Pending/Incomplete'],
-      ['unbound', 'Unbound/Ambiguous'],
-    ];
-    for (const [value, label] of filters) {
-      const option = this.document.createElement('option');
-      option.value = value;
-      option.textContent = label;
-      option.selected = this.filter === value;
-      select.append(option);
+    if (!retainedToolbar) {
+      const filterLabel = this.document.createElement('label');
+      filterLabel.textContent = 'Filter';
+      const select = this.document.createElement('select');
+      select.setAttribute('aria-label', 'Filter diagnostic slots');
+      const filters: Array<[GptDiagnosticsFilter, string]> = [
+        ['all', 'All'],
+        ['visible', 'Visible'],
+        ['filled', 'Filled'],
+        ['empty', 'Empty'],
+        ['pending', 'Pending/Incomplete'],
+        ['unbound', 'Unbound/Ambiguous'],
+      ];
+      for (const [value, label] of filters) {
+        const option = this.document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        option.selected = this.filter === value;
+        select.append(option);
+      }
+      select.addEventListener('change', () => {
+        this.filter = select.value as GptDiagnosticsFilter;
+        this.render();
+      });
+      const exportButton = this.button('Export JSON', () => this.onExport());
+      filterLabel.append(select);
+      toolbar.append(filterLabel, exportButton);
     }
-    select.addEventListener('change', () => {
-      this.filter = select.value as GptDiagnosticsFilter;
-      this.render();
-    });
-    const exportButton = this.button('Export JSON', () => this.onExport());
-    filterLabel.append(select);
-    toolbar.append(filterLabel, exportButton);
     if (this.onViewTrace) {
-      const viewTrace = this.button('View trace results', this.onViewTrace);
+      const viewTrace =
+        toolbar.querySelector<HTMLButtonElement>('[data-trace-action="view"]') ??
+        this.button('View trace results', this.onViewTrace);
       viewTrace.className = 'tsgd-trace-action';
-      viewTrace.disabled =
-        this.traceState.kind === 'capturing' || this.traceState.kind === 'navigating';
-      toolbar.prepend(viewTrace);
+      viewTrace.dataset.traceAction = 'view';
+      viewTrace.disabled = this.traceState.kind === 'capturing';
+      if (!viewTrace.parentNode) toolbar.prepend(viewTrace);
+      const existingDownload = toolbar.querySelector<HTMLButtonElement>(
+        '[data-trace-action="download"]'
+      );
       if (this.traceState.downloadAvailable && this.onDownloadTrace) {
-        const download = this.button('Download trace report', this.onDownloadTrace);
+        const download =
+          existingDownload ?? this.button('Download trace report', this.onDownloadTrace);
         download.className = 'tsgd-trace-action';
-        toolbar.append(download);
+        download.dataset.traceAction = 'download';
+        if (!download.parentNode) toolbar.append(download);
+      } else {
+        existingDownload?.remove();
       }
     }
-    panel.append(toolbar);
+    if (!retainedToolbar) panel.append(toolbar);
     if (this.onViewTrace) {
       const messages: Record<TraceHandoffState['kind'], string> = {
         ready: 'Capture the current page, then view its trace in this tab.',
@@ -601,12 +621,13 @@ export class GptDiagnosticsOverlay {
           'The download could not be started. Your report remains available for retry.',
         downloaded: 'The download was started. Your report remains available.',
       };
-      const traceStatus = this.document.createElement('p');
+      const traceStatus = retainedTraceStatus ?? this.document.createElement('p');
       traceStatus.className = 'tsgd-trace-status';
       traceStatus.setAttribute('role', 'status');
       traceStatus.setAttribute('aria-live', 'polite');
-      traceStatus.textContent = messages[this.traceState.kind];
-      panel.append(traceStatus);
+      const message = messages[this.traceState.kind];
+      if (traceStatus.textContent !== message) traceStatus.textContent = message;
+      if (!retainedTraceStatus) panel.append(traceStatus);
     }
 
     const summary = this.document.createElement('div');

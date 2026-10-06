@@ -302,7 +302,7 @@ describe('combined trace capture', () => {
     expect(result.report.gpt_diagnostics.slots).toHaveLength(64);
     expect(
       result.report.gpt_diagnostics.slots.every(
-        (value) => value.requests.at(-1)?.requestNumber === 10
+        (value) => value.requests[value.requests.length - 1]?.requestNumber === 10
       )
     ).toBe(true);
     expect(result.report.truncation.omitted_request_cycles).toBeGreaterThan(0);

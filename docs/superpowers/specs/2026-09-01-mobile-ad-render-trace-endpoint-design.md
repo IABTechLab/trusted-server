@@ -1078,6 +1078,8 @@ telemetry and OpenRTB objects:
   value makes the missing provider-to-slot no-bid relation explicit.
 - A slot's `returned_bid_count` counts actual returned bid records whose
   ordinary internal routing key matches that accepted slot. Accepted slots with
+  matching keys count records from both bidder and mediator calls, including
+  mediator echoes; the count is not unique across provider stages. Slots with
   duplicate routing keys retain distinct ordinals and opaque refs, but share
   that observed count. These counts are non-disjoint and must not be summed as
   unique bids. When existing winner/delivery data cannot distinguish those
@@ -1169,6 +1171,9 @@ The three transport call shapes are exact v1 contracts:
 Initial seam:
   scheduleInitialAdInit(bids, slots?, traceAuctionTransport?)
 
+Initial seam when ordinary ad-slot injection is withheld:
+  traceGpt.observeTransport(undefined, traceAuctionTransport, 'initial_navigation_ssat')
+
 SPA JSON:
   { slots, bids, trace_auction?: TraceAuctionTransportV1 }
 
@@ -1185,6 +1190,13 @@ affecting ads, in which case evidence remains `not_observed`. The SPA parser
 accepts only the exact optional top-level member and preserves its existing
 `slots` and `bids` behavior. These trace members never become required for a
 successful advertising response.
+
+When the ordinary initial page would not inject ad slots, deliver available
+trace evidence through the existing gated core bridge only. Queue that one
+observation until core initialization if necessary and retain the initial
+navigation-generation guard. This trace-only seam must not call the ad
+scheduler or `adInit`, set its latch, or assign bids or slots. Skipped-page
+evidence cannot activate an otherwise withheld ad stack.
 
 For initial-navigation SSAT and SPA page-bids only, when the existing GPT
 recorder consumes the matching Trusted Server opportunity for a concrete request
