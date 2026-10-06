@@ -195,7 +195,9 @@ recreated by this work.
 
 ### Baseline Delta, Open Defect, and In-Flight Work Disposition
 
-The following items remain open as of 2026-10-01. They are coordination inputs,
+The following items are tracked at the 2026-10-01 review checkpoint. Their
+issue states can change before implementation; the final baseline gate checks
+behavior, not only whether an issue is closed. They are coordination inputs,
 not design authorities. “Prerequisite” means the focused fix lands on `main`
 and this specification records a new baseline before extraction begins; the
 crate split does not absorb that bug fix into a move commit.
@@ -203,7 +205,7 @@ crate split does not absorb that bug fix into a move commit.
 | Item         | Disposition                                                                                                                                                                                                                                                                                                        |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | #1196        | Prerequisite. Restore cross-IIFE context/log state on the current layout, remove or debug-gate Creative's unconditional log-level bump, and add a production-artifact test. The milestone-one typed facade supersedes any transitional `Symbol.for` storage without reverting behavior.                            |
-| #1197        | Prerequisite. Make set-valued configuration serialization deterministic before EdgeZero or template hashes depend on it.                                                                                                                                                                                           |
+| #1197        | Prerequisite behavior. The issue was closed after the context-allowlist fix, but the final baseline gate still proves deterministic serialization for every set-valued configuration input before EdgeZero or template hashes depend on it.                                                                        |
 | #1198        | Prerequisite. Add the deterministic build digest defined below to the current template key before extraction, with the canonical generator owned by core build support; the split reuses the same generator for component digests.                                                                                 |
 | #1199        | Prerequisite. Replace substring browser guards and Rust/HTML script-source matchers, including Permutive, DataDome, Lockr, and Testlight, with canonical parsed URL ownership on the current layout. Declaration and execution use one positive/negative corpus.                                                   |
 | #1200        | Prerequisite. Remove the shared-`dist` partial-build race before two Rust crates consume browser outputs; milestone one then adopts owner-private outputs and the lock contract below.                                                                                                                             |
@@ -230,8 +232,8 @@ They are baseline behavior, not optional input from their former pull requests:
 | #1209            | Preserve deterministic serialized context allowlists and canonical hashing of config envelopes and template fingerprints.                                                                                                                                                                                                               |
 
 The landed #1209 change fixes the context allowlist and its canonical hashing
-path; the broader #1197 prerequisite remains until every other set-valued
-configuration input used by the new fingerprints has the same guarantee.
+path. Closing #1197 does not waive the broader deterministic-serialization
+check for other set-valued inputs used by the new fingerprints.
 
 Other open work is coordinated without making it architectural authority or an
 automatic prerequisite:
@@ -999,8 +1001,26 @@ Per-crate locks are invalid. Independent docs and Playwright projects retain
 their own dependency trees and commands and are outside this production-browser
 lease unless they invoke the canonical browser project.
 
-The integration build discovers immediate directories containing `index.ts`
-and emits one IIFE per entry point. An IIFE may call the external versioned
+Out-of-Cargo browser tests do not find the newest Cargo `$OUT_DIR` or read a
+shared `dist`. A host-only integration-test artifact exporter links the
+integrations composition root, which links both Rust browser crates, and
+accepts an explicit test configuration fixture. It writes that composition's
+embedded production bytes, IDs, SHA-256 hashes, and load phases to a fresh
+caller-selected temporary directory plus a manifest. The export includes GPT
+bootstrap, APS renderer document, the neutral finalizer, immediate, deferred,
+and standalone assets selected by the fixture. The exporter refuses a
+pre-existing output directory and verifies every written hash against the
+embedded value. Playwright and initial-render harnesses receive that manifest
+path explicitly, verify hashes before evaluation, and fail on a missing or
+unexpected asset. CI builds the exporter and runs any canonical Node project
+work through the shared lease; it never stages a second authoritative bundle
+set or guesses an output by modification time. The exporter is test tooling,
+not a runtime endpoint or operator CLI command.
+
+The integration build discovers all directories containing `index.ts` and
+emits one IIFE per entry point. Typed Rust registration and composition classify
+those built assets as immediate, deferred, or standalone; filesystem discovery
+does not select a load phase. An IIFE may call the external versioned
 browser runtime facade and therefore is not described as self-contained. Its Cargo build embeds each
 output and its SHA-256 hash. CI, browser integration scripts, and the CLI
 Prebid builder use the single workspace root rather than maintaining a second
@@ -1750,7 +1770,11 @@ deserializes and validates `TrustedServerAppConfig`, then its manual `Serialize`
 implementation emits the schema-2 storage DTO. Runtime reads that DTO rather
 than deserializing it back into the operator type. The DTO omits absent leaves
 and every leaf semantically equal to its declared default, even when the source
-spelled it explicitly; defaults are applied only by the reading binary.
+spelled it explicitly; defaults are applied only by the reading binary. The
+mandatory integration `enabled` field is an exception: every stored schema-2
+integration object emits its explicit boolean, including `false`, and the
+schema-2 reader rejects an object without it. There is no implicit stored
+enablement default and no path that turns a disabled block on by omission.
 Default comparison is field-specific and uses runtime canonicalization. For
 example, Prebid `script_patterns` use case-sensitive, order-preserving,
 duplicate-rejecting comparison after the exact route-pattern normalization used
@@ -2067,6 +2091,18 @@ select and restore the named versioned key/store atomically with its component.
 The gate cannot be bypassed by a generic force flag. Validate, diff, and local
 Axum migration remain available without a remote write. Tests assert that
 rejected pushes leave the selected store or binding unchanged.
+
+The CLI also stops delegating `ts config gc` without a rollout check. Fastly
+cutover tooling records the accepted active and rollback service-version,
+physical-store, and root-key tuples in an operator-controlled rollout record;
+each paired edit replaces that accepted pair only after both candidates are
+verified. During that pair's rollback window, `config gc` refuses either
+physical store before invoking EdgeZero's sweeping command. It also refuses
+when the record is missing, stale, or inconsistent with control-plane bindings
+for a schema-2-capable service; no generic force flag bypasses this check.
+After explicit rollback-window closure, GC may resume only after the control
+plane proves that no selectable active or rollback version references the
+protected roots. Tests prove rejected GC leaves both generations untouched.
 
 Rollout is adapter-specific:
 
@@ -3202,6 +3238,8 @@ to preserve `cfg(test)` imports.
 - TOML-to-envelope-to-runtime round trips preserve both order sidecars exactly,
   independent of JSON object-member order.
 - Order sidecars reject missing, duplicate, extra, or mismatched map keys.
+- Every stored schema-2 integration object emits `enabled`; a missing value is
+  rejected, and a disabled block remains disabled after push and reload.
 - Schema-1 stored blobs normalize through the transition reader; schema N+1 and
   every other unknown schema value fail before secrets are resolved. Golden
   rollback tests prove every binary retained for the rollback window rejects a
@@ -3457,6 +3495,10 @@ to preserve `cfg(test)` imports.
   through the manifest-derived property, legacy property, and exact-empty-primary
   fallback without changing the outer binding shape; whitespace-only and
   non-string primary values fail without consulting the legacy property.
+- Fastly `ts config gc` refuses both physical stores in the accepted
+  active/rollback pair, refuses a missing or stale rollout record before an
+  EdgeZero sweep, and leaves bytes unchanged. It resumes only after explicit
+  closure and verified absence of protected version bindings.
 - `config push` refuses a schema-2 write to the uncutover Spin destination and
   to Cloudflare KV, leaves remote bytes untouched, and accepts only a verified
   Fastly new-generation tuple. Cloudflare's protected export command produces
@@ -3595,6 +3637,9 @@ to preserve `cfg(test)` imports.
 - Cross-adapter Playwright tests remain in
   `trusted-server-integration-tests` and verify core, creative, APS, GPT, and
   Prebid load order using the moved assets.
+- Out-of-Cargo browser harnesses consume the explicit host-exporter manifest
+  of Rust-embedded production bytes, verify every hash and load phase, and
+  reject stale, mixed-owner, missing, or modification-time-selected artifacts.
 - An artifact test loads GPT bootstrap, core, immediate GPT, synchronous GPT
   diagnostics, the neutral finalizer, and deferred Prebid in production order;
   proves object and neutral service identity/listener idempotence across
