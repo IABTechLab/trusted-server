@@ -1,7 +1,10 @@
-//! Edge Cookie (EC) ID generation using HMAC.
+//! Reading an inbound Edge Cookie (EC) identifier.
 //!
-//! This module provides functionality for generating privacy-preserving EC IDs
-//! based on the client IP address and a secret key.
+//! [`recognized_ec_id`] reads the identifier a request carries and recognizes
+//! it through the selected provider, so only an identifier this deployment
+//! issued is handed on. The generation helpers here are compiled for tests
+//! only, and the production lifecycle creates identifiers through
+//! [`EcContext`](crate::ec::EcContext).
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
@@ -21,21 +24,19 @@ use crate::evidence::BorrowedRequestInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
-/// Generates a fresh EC ID using the configured Edge Cookie provider.
+/// Test helper that generates a fresh EC ID with the configured Edge Cookie
+/// provider.
 ///
-/// Routes through the pluggable provider model: the active `[ec] provider`
-/// selection decides the outcome. Returns `Ok(None)` when no provider is
-/// configured, so Trusted Server runs statelessly and creates no Edge Cookie.
-/// `request_headers` lets a provider that derives identity from request
-/// evidence read it; the built-in HMAC provider ignores it and uses only the
-/// normalized client IP.
+/// The `[ec] provider` selection decides the outcome. Returns `Ok(None)` when
+/// no provider is configured, so no Edge Cookie is created. `request_headers`
+/// lets a provider that derives identity from request evidence read it. The
+/// built-in HMAC provider ignores it and uses only the normalized client IP.
+/// The production lifecycle creates identifiers through
+/// [`EcContext`](crate::ec::EcContext) instead.
 ///
 /// # Errors
 ///
 /// - [`TrustedServerError::EdgeCookie`] if provider generation fails
-///
-/// Currently exercised only by tests: the production EC lifecycle generates IDs
-/// through [`crate::ec`]/`EcContext` rather than this edge-cookie helper.
 #[cfg(test)]
 pub fn generate_ec_id(
     settings: &Settings,
@@ -61,10 +62,8 @@ pub fn generate_ec_id(
     // The provider reads request data (for example the client IP) borrowed at
     // call time, so nothing is cloned.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
-    // The publisher path gates creation on the request's consent context at
-    // the call site, and the built-in provider reads neither that result nor
-    // the consent context, so
-    // they are not threaded here.
+    // This helper skips the consent gate, and the built-in provider does not
+    // read the consent context, so it is not threaded here.
     let generated = provider.generate(&request_info, &IdentityInput::default())?;
     let generated = crate::ec::provider::GeneratedEdgeCookie {
         id: generated
@@ -243,40 +242,10 @@ mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
     use http::{HeaderName, header};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::ec::generation::generate_ec_id as generate_canonical_ec_id;
-    use crate::ec::provider::HMAC_PROVIDER_KEY;
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
-    use crate::test_support::tests::{create_test_settings, hmac_passphrase};
-
-    #[test]
-    fn test_generate_ec_id_matches_canonical_generator_for_ipv6() {
-        // Regression guard: this module must hash the same normalized IP as
-        // the canonical generator in ec::generation. A divergent IPv6 /64
-        // normalization would mint non-correlating identity prefixes for the
-        // same client depending on which path generated the ID.
-        let settings = create_test_settings();
-        let ip = IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0db8, 0x85a3, 0x0000, 0x8a2e, 0x0370, 0x7334, 0x1234,
-        ));
-
-        let id_here = generate_ec_id(&settings, &noop_services_with_client_ip(ip), None)
-            .expect("should generate EC ID via edge_cookie")
-            .expect("should configure the hmac provider in test settings");
-        let passphrase = hmac_passphrase(&settings.ec, HMAC_PROVIDER_KEY);
-        let id_canonical = generate_canonical_ec_id(passphrase, &normalize_ip(ip))
-            .expect("should generate EC ID via canonical generator");
-
-        let bare_here = id_here
-            .strip_prefix("hmac~")
-            .expect("should carry the hmac provider code");
-        assert_eq!(
-            crate::ec::ec_hash(bare_here),
-            crate::ec::ec_hash(&id_canonical),
-            "should produce the same identity hash prefix as the canonical generator"
-        );
-    }
+    use crate::test_support::tests::create_test_settings;
 
     fn create_test_request(headers: &[(HeaderName, &str)]) -> Request<EdgeBody> {
         let mut builder = Request::builder().method("GET").uri("http://example.com");
@@ -316,6 +285,13 @@ mod tests {
         }
         true
     }
+
+    // `generate_ec_id`, `get_or_generate_ec_id` and
+    // `get_or_generate_ec_id_from_http_request` are test helpers compiled for
+    // tests only, so the tests that call them test those helpers and not the
+    // production path. The production path, including how the client IP is
+    // normalized before it is hashed, is tested through `EcContext` in
+    // `crate::ec`.
 
     #[test]
     fn test_generate_ec_id() {
@@ -395,13 +371,13 @@ mod tests {
             "should reject non-hex HMAC content"
         );
 
-        let invalid_suffix = format!("{}.{}", "a".repeat(64), "ab-129");
+        let invalid_suffix = format!("hmac~{}.{}", "a".repeat(64), "ab-129");
         assert!(
             !is_ec_id_format(&invalid_suffix),
             "should reject non-alphanumeric suffix"
         );
 
-        let extra_segment = format!("{}.{}.{}", "a".repeat(64), "Ab12z9", "zz");
+        let extra_segment = format!("hmac~{}.{}.{}", "a".repeat(64), "Ab12z9", "zz");
         assert!(
             !is_ec_id_format(&extra_segment),
             "should reject extra segments"

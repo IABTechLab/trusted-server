@@ -224,6 +224,41 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_info_lists_every_attached_header_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            "ExampleAgent/1.0"
+                .parse()
+                .expect("should parse a User-Agent value"),
+        );
+        headers.insert(
+            http::header::ACCEPT_LANGUAGE,
+            "en".parse().expect("should parse an Accept-Language value"),
+        );
+        let owned = OwnedRequestInfo::new(String::new(), headers.clone());
+        let borrowed = BorrowedRequestInfo::new("", Some(&headers));
+
+        for (case, mut names) in [
+            ("the owned snapshot", owned.header_names()),
+            ("the borrowed view", borrowed.header_names()),
+        ] {
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                vec!["accept-language", "user-agent"],
+                "{case} should list every attached header name"
+            );
+        }
+        assert!(
+            BorrowedRequestInfo::new("203.0.113.5", None)
+                .header_names()
+                .is_empty(),
+            "a borrowed view built without headers should list none"
+        );
+    }
+
     fn headers_with_cookie() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(

@@ -941,8 +941,10 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
-/// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
-/// exercise the seam an opaque-identifier vendor provider reaches core through.
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider, threaded the
+/// way a composition root threads the provider it resolved, so a test can
+/// exercise the seam a vendor provider reaches core through and check that the
+/// request path reuses that instance.
 pub(crate) fn noop_services_with_ec_provider(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {
@@ -964,29 +966,6 @@ pub(crate) fn noop_services_with_ec_provider_without_client_ip(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {
     noop_services_with_ec_provider_and_ip(ec_provider, None)
-}
-
-/// Build a [`RuntimeServices`] carrying an Edge Cookie provider that a
-/// composition root already resolved, the way a production adapter threads it.
-///
-/// Use this to check that the request path reuses that instance rather than
-/// resolving `[ec] provider` for itself.
-pub(crate) fn noop_services_with_resolved_ec_provider(
-    resolved: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
-            ..ClientInfo::default()
-        })
-        .resolved_ec_provider(resolved)
-        .build()
 }
 
 fn noop_services_with_ec_provider_and_ip(

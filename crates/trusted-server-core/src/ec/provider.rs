@@ -19,8 +19,7 @@
 //! at generate time, and the provider itself keeps none of it.
 //!
 //! [`HmacProvider`] is the built-in server-side implementation. It derives the
-//! identifier from the client IP using HMAC over the configured passphrase, the
-//! behavior Trusted Server has always shipped.
+//! identifier from the client IP using HMAC over the configured passphrase.
 
 use std::sync::Arc;
 
@@ -38,17 +37,16 @@ use super::generation;
 
 /// The Edge Cookie identity provider a deployment has selected.
 ///
-/// Deserialized from the `[ec] provider` string, and serialized back to the
-/// same string, so the configuration surface is unchanged. Provider names are
-/// open-ended (a vendor crate names its own), so every name other than the
-/// explicit `"none"` becomes [`Named`](Self::Named) rather than a parse
-/// failure, and whether the deployment can actually supply that provider is
-/// decided by [`build_provider`].
+/// Deserialized from the `[ec] provider` string and serialized back to the
+/// same string. Provider names are open-ended (a vendor crate names its own),
+/// so every name other than the explicit `"none"` becomes
+/// [`Named`](Self::Named) rather than a parse failure, and whether the
+/// deployment can actually supply that provider is decided by
+/// [`build_provider`].
 ///
-/// No individual provider has a variant of its own, the one still built into
-/// core included. Every provider is selected the same way, by name, so no
-/// caller can be written around one provider being different, and moving the
-/// built-in provider out into its own module changes nothing here.
+/// No provider has a variant of its own, so every provider is selected the
+/// same way, by name, and no caller can be written around one provider being
+/// different.
 ///
 /// This is the one place the selector is spelled. Everything that needs to ask
 /// which provider is selected matches on this rather than comparing string
@@ -109,23 +107,17 @@ impl From<EcProviderSelection> for String {
     }
 }
 
-/// The implementation id of the provider still built into core.
+/// The implementation id of the HMAC provider built into core.
 ///
-/// The id lives in the same open-ended namespace every vendor implementation
-/// id comes from, and nothing branches on it outside the resolution in
-/// [`build_provider`]. It is also [`HmacProvider::id`]'s return value and
-/// [`HMAC_PROVIDER_CODE`]'s text. It goes with that resolution arm when the
-/// built-in provider becomes a module of its own.
+/// It is also [`HmacProvider::id`]'s return value and the text of
+/// [`HMAC_PROVIDER_CODE`].
 pub const HMAC_PROVIDER_KEY: &str = "hmac";
 
-/// The implementation ids core supplies itself.
+/// The implementation ids core supplies itself, one per resolution arm in
+/// [`resolve_named_provider`].
 ///
-/// An id in this list is already taken, so an adapter that injects a provider
-/// under one of them has two suppliers claiming a single implementation and
-/// [`build_provider`] refuses the pair rather than picking one. The list grows
-/// and shrinks with the resolution arms in [`resolve_named_provider`], and it
-/// empties when the built-in HMAC provider becomes a module like every other
-/// provider, at which point no id is reserved and every provider is injected.
+/// [`build_provider`] refuses an injected provider under one of these ids
+/// rather than picking one of the two.
 const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY];
 
 /// The registry code of the built-in HMAC provider.
@@ -143,9 +135,8 @@ pub const HMAC_PROVIDER_CODE: ProviderCode = crate::provider_code!(HMAC_PROVIDER
 /// anything injected into the provider's constructor. This struct carries only
 /// the per-request gating context a provider may read for behavior beyond
 /// gating. On the organic request path the gate has confirmed Edge Cookie
-/// storage is allowed before `generate` is called. A direct
-/// `edge_cookie::generate_ec_id` call, test-only today, reaches `generate`
-/// without that gate.
+/// storage is allowed before `generate` is called. A test calling
+/// `edge_cookie::generate_ec_id` reaches `generate` without that gate.
 #[derive(Default)]
 pub struct IdentityInput<'a> {
     /// The request's consent context, when available, for provider-specific
@@ -288,35 +279,13 @@ pub fn reserved_response_effect(
     None
 }
 
-/// Applies a provider's response headers to a response that already carries
+/// Appends a provider's response headers to a response that already carries
 /// the publisher origin's own.
 ///
-/// Every header here accumulates with what the origin returned rather than
-/// replacing it, because a provider on this seam only ever adds evidence about
-/// the request. It is never correcting the origin's output, so core has no
-/// grounds to discard a value it did not write. Working through the headers a
-/// provider can actually set:
-///
-/// - `Set-Cookie` can never be folded into one field line, so replacing it
-///   drops every cookie the origin set, a publisher's session and sign-in
-///   cookies included. This is the case the whole rule turns on, because
-///   `response_headers` is a list of pairs precisely so a provider can set more
-///   than one cookie of its own, and replacing collapses those too.
-/// - The list-valued headers a provider realistically sets, `Vary` first among
-///   them, mean the union of their field lines. Replacing the origin's
-///   `Vary: Accept-Encoding` with the provider's own would break the cache
-///   correctness the origin asked for.
-/// - The single-valued headers where replacing would be the right answer are
-///   exactly the ones a provider must not author at all, being core's `x-ts-`
-///   namespace, the `ts-` managed cookies, and the framing and hop-by-hop set.
-///   [`reserved_response_effect`] rejects those before anything from the
-///   provider response is kept, so generation returns an error and none of
-///   them reaches the response.
-///
-/// So nothing a provider is permitted to set here needs to replace, and
-/// accumulating is the direction that cannot silently destroy someone else's
-/// header. Appending where one value was wanted leaves a duplicate a reviewer
-/// can see; replacing where two were wanted leaves nothing at all.
+/// Appending keeps the origin's `Set-Cookie` and `Vary` lines, and lets a
+/// provider set more than one cookie of its own.
+/// [`reserved_response_effect`] has already refused the single-valued headers
+/// core owns, so nothing a provider may set here needs to replace a value.
 pub(crate) fn apply_provider_response_headers<I>(headers: &mut http::HeaderMap, provider_headers: I)
 where
     I: IntoIterator<Item = (http::HeaderName, http::HeaderValue)>,
@@ -441,36 +410,9 @@ pub fn split_provider_code(full: &str) -> (Option<&str>, &str) {
 ///
 /// A coded identifier belongs to the provider whose registered code it
 /// carries, with the value part accepted by that provider's
-/// [`accepts_id`](EdgeCookieProvider::accepts_id). A legacy bare identifier
-/// (no code prefix) belongs only to the built-in HMAC provider, which
-/// dual-reads its pre-envelope form so deployed cookies keep working across
-/// the migration.
-///
-/// # Retiring the legacy bare reader
-///
-/// The reader stays until a bare identifier can no longer arrive. A returning
-/// visitor's bare cookie is never rewritten into the coded form, and its
-/// `COOKIE_MAX_AGE` lifetime in [`cookies`](super::cookies) (one year, not
-/// operator-configurable) runs from the moment it was written. The
-/// identity-graph row is not fixed the same way. When the `ts-eids` or
-/// `sharedId` cookies on an ordinary page view add or change a partner ID in
-/// the row, `ec_finalize_response` (see [`finalize`](super::finalize)) writes
-/// the bare-keyed row back through `upsert_partner_ids_from_snapshot` with a
-/// fresh `ENTRY_TTL` in [`kv`](super::kv) (also one year), so the row's clock
-/// restarts on each such view. The earliest safe retirement is therefore one
-/// year after the last write that could still leave a bare-keyed row, which
-/// is the later of the last release that could still create a bare
-/// identifier stopping everywhere and the last page view that refreshed such
-/// a row, plus however long a deployment's own rollout takes to reach every
-/// point of presence.
-///
-/// The other half of that condition, evidence that bare identifiers really
-/// have stopped arriving, cannot be checked today. Nothing counts or logs a
-/// bare-form read-back, so there is no observed legacy-reader traffic to look
-/// at, and the elapsed time alone cannot tell anyone whether a deployment
-/// somewhere is still serving them. Scheduling the removal needs that signal
-/// to exist first. Until it does the reader stays, and keeping it costs one
-/// string comparison per read-back.
+/// [`accepts_id`](EdgeCookieProvider::accepts_id). An identifier with no code
+/// prefix is the built-in HMAC provider's older form, still held in browsers,
+/// so the HMAC provider alone owns it.
 #[must_use]
 pub fn provider_owns_id(provider: &dyn EdgeCookieProvider, full: &str) -> bool {
     match split_provider_code(full) {
@@ -522,14 +464,11 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
 /// `canonical_kv_key` directly. Pull sync calls `canonical_kv_key` through
 /// `EcContext::kv_key_for` and still sends partners the identifier as issued.
 ///
-/// The set holds the deployment's active provider. The design's
-/// `legacy_providers` reader list, the providers that never create but must still
-/// recognize identifiers a previous provider issued, is not implemented on this
-/// branch, so [`active`](Self::active) fills `readers` with the one active
-/// provider. That is the seam: when the configured legacy readers land they are
-/// built alongside the active provider and pushed into the same list, and
-/// neither [`accepts`](Self::accepts) nor
-/// [`canonical_kv_key`](Self::canonical_kv_key) changes.
+/// The set holds the deployment's active provider, so an identifier another
+/// provider created is rejected, one created under an earlier selection
+/// included. A stateless deployment, with no provider in the set, falls back
+/// to the built-in HMAC grammar (see
+/// [`canonical_kv_key`](Self::canonical_kv_key)).
 pub struct AcceptedProviders<'a> {
     readers: Vec<&'a dyn EdgeCookieProvider>,
 }
@@ -725,18 +664,12 @@ impl EdgeCookieProvider for HmacProvider {
 /// Refuses an injected provider that claims an implementation core supplies
 /// itself.
 ///
-/// Two suppliers cannot own one implementation. Core ships the `hmac`
-/// provider, and once this work merges IAB Tech Lab is itself a vendor
-/// shipping an HMAC provider, so the two really can arrive under the same id
-/// in one deployment. The resolution order alone would answer that by quietly
-/// preferring the built-in one and dropping the injected provider, which an
-/// operator has no way to see, so the pair is refused here and the error names
-/// both claimants.
-///
-/// The check runs whatever the selector says, so an operator is told at startup
-/// rather than on the first request that happens to select the contested
-/// implementation, and it runs before the selection is read so a deployment
-/// cannot hide the clash by selecting something else.
+/// An adapter may inject a provider whose id is also a built-in id, and the
+/// resolution order alone would silently prefer the built-in one and drop the
+/// injected provider, so the pair is refused and the error names both
+/// claimants. The check runs before the selection is read, so the clash is
+/// reported at startup whatever the selector says, and selecting something
+/// else cannot hide it.
 ///
 /// # Errors
 ///
@@ -793,9 +726,6 @@ pub fn build_provider(
     let provider: Option<Box<dyn EdgeCookieProvider>> = match selection {
         // Explicit statelessness: the same meaning as omitting the selector.
         EcProviderSelection::None => None,
-        // Every provider is named, and this is the one place a name is resolved
-        // to an implementation. Nothing else in the codebase asks whether an
-        // implementation is built in.
         EcProviderSelection::Named(name) => Some(resolve_named_provider(name, ec, injected)?),
     };
     Ok(provider)
@@ -803,27 +733,21 @@ pub fn build_provider(
 
 /// Resolves one provider name to its implementation.
 ///
-/// The name resolves to the implementation its `[ec.<name>]` block names, or
-/// to the name itself when the block names none or the provider has no block,
-/// and everything below reads that implementation rather than the name the
-/// operator selected. The implementation is looked for among the providers
-/// built into core first, and is otherwise a provider the adapter injects
-/// through [`RuntimeServices`](crate::platform::RuntimeServices), the same seam
-/// the device and geo providers use, so core never names a vendor. The injected
-/// provider is used when its own id matches the implementation, and its
-/// `[ec.<name>]` block is read by the adapter that built it.
-///
-/// Looking at core first is safe only because
-/// [`ensure_no_name_collision`] has already refused an injected provider that
-/// claims a built-in implementation, so this order can never shadow one
-/// silently.
+/// The implementation is the one the name's `[ec.<name>]` block names, or the
+/// name itself. It is looked for among the providers built into core first,
+/// and is otherwise the provider the adapter injects through
+/// [`RuntimeServices`](crate::platform::RuntimeServices) when the
+/// implementation names that provider's id, so resolving an injected provider
+/// needs no vendor name in core. The adapter reads the injected provider's
+/// block when it builds it. Looking at core first cannot shadow an injected
+/// provider, because [`ensure_no_name_collision`] has already refused one that
+/// claims a built-in implementation.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the implementation matches
-/// no provider this deployment can build, or when a built-in implementation has
-/// no configuration block. Both fail loudly rather than silently running
-/// stateless, and both name the implementations this deployment has.
+/// no provider this deployment can build, naming the implementations it has,
+/// or when a built-in implementation has no configuration block.
 fn resolve_named_provider(
     name: &str,
     ec: &Ec,
@@ -831,12 +755,6 @@ fn resolve_named_provider(
 ) -> Result<Box<dyn EdgeCookieProvider>, Report<TrustedServerError>> {
     let implementation = ec.provider_blocks.implementation(name);
 
-    // The only place that knows a provider is built into core rather than
-    // supplied as a module. It disappears, along with `HMAC_PROVIDER_KEY`,
-    // when the HMAC provider becomes a module like every other provider, after
-    // which `hmac` resolves through the injected path below and nothing else
-    // changes.
-    //
     // Settings validation rejects a built-in implementation with no block
     // before this runs, so reaching the error means the two checks have
     // drifted apart. Stopping is the only safe answer, because returning no
@@ -1511,11 +1429,10 @@ mod tests {
 
     #[test]
     fn two_providers_claiming_one_name_are_refused_and_both_are_named() {
-        // Once this work merges, IAB Tech Lab supplies an HMAC provider as a
-        // vendor module while core still supplies one of its own, so a
-        // deployment really can wire two providers called `hmac`. Resolution
-        // order alone would prefer the built-in one and drop the injected one
-        // with nothing said, which is the fault this guards.
+        // An adapter may inject a provider called `hmac` while core supplies
+        // one of its own. Resolution order alone would prefer the built-in one
+        // and drop the injected one with nothing said, which is the fault this
+        // guards.
         let hmac = selected_hmac(HMAC_PROVIDER_KEY);
 
         let err = build_provider(&hmac, Some(Arc::new(VendorNamedHmacProvider)))
@@ -1552,21 +1469,6 @@ mod tests {
         };
         build_provider(&vendor, Some(Arc::new(VendorProvider)))
             .expect("a vendor provider under its own name should still build");
-    }
-
-    #[test]
-    fn a_selected_but_uninjected_vendor_provider_fails_loudly() {
-        let ec = Ec {
-            provider: Some(EcProviderSelection::from("acme")),
-            ..Ec::default()
-        };
-
-        let err = build_provider(&ec, None)
-            .expect_err("selecting a provider the adapter does not inject should error");
-        assert!(
-            err.to_string().contains("acme"),
-            "the error should name the selected provider, got: {err}"
-        );
     }
 
     #[test]
@@ -1634,9 +1536,8 @@ mod tests {
             .expect("the composition root should resolve the selection")
             .expect("the selection should yield a provider");
 
-        let services = crate::platform::test_support::noop_services_with_resolved_ec_provider(
-            Arc::clone(&resolved),
-        );
+        let services =
+            crate::platform::test_support::noop_services_with_ec_provider(Arc::clone(&resolved));
         let for_request = request_provider(&ec, &services)
             .expect("the request path should take the resolved provider")
             .expect("the resolved provider should be there");
@@ -1646,34 +1547,47 @@ mod tests {
             "the request path should reuse the resolved provider, not build a second one"
         );
 
-        // An adapter that threads nothing still resolves for itself, so core
-        // driven directly behaves exactly as it did before.
-        let unthreaded =
-            crate::platform::test_support::noop_services_with_ec_provider(Arc::new(VendorProvider));
-        let built = request_provider(&ec, &unthreaded)
-            .expect("an unthreaded adapter should resolve on the request path")
+        // With nothing threaded the request path builds the selection from the
+        // settings. No provider is injected on that path, so only a built-in
+        // selection can be built there.
+        let hmac = selected_hmac(HMAC_PROVIDER_KEY);
+        let built = request_provider(&hmac, &crate::platform::test_support::noop_services())
+            .expect("an unthreaded request path should build a built-in selection")
             .expect("the selection should yield a provider");
         assert_eq!(
             built.id(),
-            "acme",
-            "resolving on the request path should still select the injected provider"
+            HMAC_PROVIDER_KEY,
+            "the request path should build the built-in provider the settings select"
         );
     }
 
     #[test]
-    fn the_startup_check_rejects_an_uninjected_provider_and_allows_statelessness() {
+    fn an_uninjected_provider_is_refused_and_statelessness_is_allowed() {
         // A selection the adapter cannot supply is knowable without a request,
         // so the composition root rejects it while application state is built.
+        // The startup check wraps `build_provider`, so both refuse it.
         let selected = Ec {
             provider: Some(EcProviderSelection::from("acme")),
             ..Ec::default()
         };
-        let err = ensure_provider_available(&selected, None)
-            .expect_err("an uninjected provider should fail the startup check");
-        assert!(
-            err.to_string().contains("acme"),
-            "the error should name the selected provider, got: {err}"
-        );
+        for (case, outcome) in [
+            (
+                "build_provider",
+                build_provider(&selected, None).map(|_| ()),
+            ),
+            (
+                "the startup check",
+                ensure_provider_available(&selected, None),
+            ),
+        ] {
+            let Err(err) = outcome else {
+                panic!("{case} should refuse a provider the adapter does not inject");
+            };
+            assert!(
+                err.to_string().contains("acme"),
+                "{case}: the error should name the selected provider, got: {err}"
+            );
+        }
 
         // Statelessness is a supported deployment, spelled either way, and must
         // never be turned into a startup error.

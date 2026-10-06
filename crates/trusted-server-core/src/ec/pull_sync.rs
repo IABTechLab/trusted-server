@@ -599,50 +599,16 @@ mod tests {
         );
     }
 
-    /// A non-HMAC provider whose identifiers are opaque, modeling the
-    /// host-signal provider PR #1044 adds: valid identifiers that the built-in
-    /// HMAC grammar rejects outright.
-    #[derive(Debug)]
-    struct OpaqueProvider;
-
-    impl crate::ec::provider::EdgeCookieProvider for OpaqueProvider {
-        fn id(&self) -> &'static str {
-            "opaque"
-        }
-
-        fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::provider_code!("t0op")
-        }
-
-        fn generate(
-            &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::provider::IdentityInput<'_>,
-        ) -> Result<
-            crate::ec::provider::GeneratedEdgeCookie,
-            error_stack::Report<crate::error::TrustedServerError>,
-        > {
-            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
-        }
-
-        fn accepts_id(&self, value: &str) -> bool {
-            !value.is_empty()
-        }
-    }
-
     #[test]
     fn build_pull_sync_context_accepts_the_active_non_hmac_provider() {
-        // A deployment whose active provider is not the built-in HMAC one must
-        // still dispatch pull sync for the identifiers that provider created.
-        // The built-in grammar rejected every non-`hmac` code, so these
-        // identifiers worked in the organic path and were silently skipped
-        // here.
+        // An identifier the active non-HMAC provider owns is dispatched, under
+        // the key that provider gives it, exactly as the organic path reads it.
         const OPAQUE_ID: &str = "t0op~Opaque_Value_MixedCase";
 
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from("opaque"));
         let services = crate::platform::test_support::noop_services_with_ec_provider(
-            std::sync::Arc::new(OpaqueProvider),
+            std::sync::Arc::new(crate::ec::tests::OpaqueProvider),
         );
         let req = http::Request::builder()
             .method("GET")
@@ -685,6 +651,10 @@ mod tests {
             context.ec_id(),
             OPAQUE_ID,
             "should carry the identifier through unchanged"
+        );
+        assert_eq!(
+            context.kv_key, OPAQUE_ID,
+            "the opaque provider's identifier should be its own identity-graph key"
         );
     }
 
@@ -968,12 +938,12 @@ mod tests {
     }
 
     #[test]
-    fn build_pull_sync_context_accepts_a_minted_coded_ec_id() {
+    fn build_pull_sync_context_accepts_a_created_coded_ec_id() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
         };
-        // The form the creation path produces since the provider-code envelope.
+        // The form the creation path produces, under the provider code.
         let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
@@ -1362,10 +1332,9 @@ mod tests {
     #[test]
     fn dispatch_pull_sync_reads_and_writes_the_canonical_row() {
         // The row lives under the owning provider's canonical form of the
-        // identifier, and the request snapshot is bound to that key. Keyed by
-        // the identifier as issued, pull sync found no snapshot entry for a
-        // provider whose canonical form differs from the cookie value, so it
-        // skipped every partner and wrote nothing.
+        // identifier, and the request snapshot is bound to that key, so pull
+        // sync reads and writes that key even when the canonical form differs
+        // from the cookie value.
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =

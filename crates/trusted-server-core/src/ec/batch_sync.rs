@@ -320,47 +320,15 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use crate::ec::provider::{HmacProvider, IdentityInput, ProviderCode};
+    use crate::ec::provider::HmacProvider;
+    use crate::ec::tests::OpaqueProvider;
     use crate::error::TrustedServerError;
-    use crate::evidence::RequestInfo;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
     /// The built-in provider, standing in for a deployment that selected it.
     fn hmac_provider() -> HmacProvider {
         HmacProvider::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()))
-    }
-
-    /// A non-HMAC provider whose identifiers are opaque, modeling the
-    /// host-signal provider PR #1044 adds: valid identifiers that the built-in
-    /// HMAC grammar rejects outright.
-    #[derive(Debug)]
-    struct OpaqueProvider;
-
-    impl crate::ec::provider::EdgeCookieProvider for OpaqueProvider {
-        fn id(&self) -> &'static str {
-            "opaque"
-        }
-
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0op")
-        }
-
-        fn generate(
-            &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-        ) -> Result<crate::ec::provider::GeneratedEdgeCookie, Report<TrustedServerError>> {
-            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
-        }
-
-        fn accepts_id(&self, value: &str) -> bool {
-            !value.is_empty()
-        }
-
-        fn normalize_id_for_kv(&self, value: &str) -> String {
-            value.to_owned()
-        }
     }
 
     struct MockRateLimiter {
@@ -730,10 +698,9 @@ mod tests {
 
     #[test]
     fn process_mappings_accepts_an_identifier_from_the_active_non_hmac_provider() {
-        // A deployment whose active provider is not the built-in HMAC one still
-        // has to accept the identifiers that provider created. Before the
-        // dispatch these were rejected outright by the HMAC grammar, so a
-        // partner could never sync a mapping against them.
+        // An identifier the active non-HMAC provider owns is accepted, so a
+        // partner can sync a mapping against an identifier the HMAC grammar
+        // would reject.
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let mappings = vec![mapping("t0op~Opaque_Value_MixedCase", "uid-1", 100)];
 
@@ -810,6 +777,15 @@ mod tests {
         assert!(
             errors.is_empty(),
             "should report no errors, got: {errors:?}"
+        );
+        assert_eq!(
+            writer
+                .calls()
+                .into_iter()
+                .map(|call| call.ec_id)
+                .collect::<Vec<_>>(),
+            vec![format!("hmac~{}.ABC123", "a".repeat(64))],
+            "the write should go to the row under the lowercase canonical key"
         );
     }
 
@@ -1267,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn process_mappings_accepts_a_minted_coded_ec_id() {
+    fn process_mappings_accepts_a_created_coded_ec_id() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         // Partners echo the identifier identify gave them, which carries the
         // provider-code envelope since the creation path applies it.

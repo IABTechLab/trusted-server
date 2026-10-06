@@ -1,7 +1,8 @@
 //! Edge Cookie (EC) ID generation using HMAC.
 //!
-//! This module generates EC IDs from the client IP address and a configured
-//! secret key.
+//! This module creates EC IDs as an HMAC, keyed by a configured secret, over
+//! one or more request parts such as the client IP, and holds the format
+//! helpers for the built-in HMAC identifier.
 
 use std::net::IpAddr;
 
@@ -73,7 +74,7 @@ fn generate_random_suffix(length: usize) -> String {
 /// the client IP address, then appends a random suffix for additional
 /// uniqueness. The resulting format is `{64hex}.{6alnum}`.
 ///
-/// **Important:** `client_ip` must be pre-normalized via [`extract_client_ip`].
+/// **Important:** `client_ip` must be pre-normalized with `normalize_ip`.
 /// Raw IPv6 addresses produce different hashes than their normalized /64
 /// form, which would create duplicate identity graph entries.
 ///
@@ -93,8 +94,9 @@ pub fn generate_ec_id(
 /// The parts are joined with a unit separator (`\u{1f}`), which cannot appear in
 /// a client IP, User-Agent, or TLS and HTTP/2 signal, so distinct part lists
 /// cannot collide. A provider that derives identity from multiple request
-/// signals (for example a Fastly provider over JA4, H2, IP, and UA) passes them
-/// as separate parts. Each part must be pre-normalized by the caller.
+/// signals, for example a TLS fingerprint, HTTP/2 settings and the client IP,
+/// passes them as separate parts. Each part must be pre-normalized by the
+/// caller.
 ///
 /// # Errors
 ///
@@ -141,8 +143,8 @@ pub fn ec_hash(ec_id: &str) -> &str {
 /// defense-in-depth measure for EC IDs submitted by external partners
 /// (via batch sync) that may use uppercase hex.
 ///
-/// An identifier this function creates carries the built-in provider's code
-/// envelope (`hmac~` before the value, see
+/// A created identifier carries the built-in provider's code envelope
+/// (`hmac~` before the value, see
 /// [`PROVIDER_CODE_SEPARATOR`](super::provider::PROVIDER_CODE_SEPARATOR)),
 /// and partners echo that form back, so the envelope is kept and only the
 /// value inside it is lowercased. That keeps the key identical to the one
@@ -371,63 +373,36 @@ mod tests {
     }
 
     #[test]
-    fn is_valid_ec_id_accepts_valid() {
-        let value = format!("{}.Ab12z9", "a".repeat(64));
-        assert!(is_valid_ec_id(&value), "should accept a valid EC ID format");
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_missing_suffix() {
-        let missing_suffix = "a".repeat(64);
-        assert!(
-            !is_valid_ec_id(&missing_suffix),
-            "should reject missing suffix"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_invalid_hex() {
-        let invalid_hex = format!("{}.Ab12z9", "a".repeat(63) + "g");
-        assert!(
-            !is_valid_ec_id(&invalid_hex),
-            "should reject non-hex HMAC content"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_invalid_suffix() {
-        let invalid_suffix = format!("{}.ab-129", "a".repeat(64));
-        assert!(
-            !is_valid_ec_id(&invalid_suffix),
-            "should reject non-alphanumeric suffix"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_extra_segments() {
-        let extra_segment = format!("{}.Ab12z9.zz", "a".repeat(64));
-        assert!(
-            !is_valid_ec_id(&extra_segment),
-            "should reject extra segments"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_accepts_the_hmac_envelope() {
-        let coded = format!("hmac~{}.ABC123", "a".repeat(64));
-        assert!(
-            is_valid_ec_id(&coded),
-            "should accept a created identifier carrying the hmac code"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_other_provider_codes() {
-        let coded = format!("t0op~{}.ABC123", "a".repeat(64));
-        assert!(
-            !is_valid_ec_id(&coded),
-            "should reject an identifier carrying another provider's code"
-        );
+    fn is_valid_ec_id_accepts_only_the_hmac_grammar() {
+        let hash = "a".repeat(64);
+        for (input, expected, reason) in [
+            (format!("{hash}.Ab12z9"), true, "a valid EC ID format"),
+            (hash.clone(), false, "a missing suffix"),
+            (
+                format!("{}.Ab12z9", "a".repeat(63) + "g"),
+                false,
+                "non-hex HMAC content",
+            ),
+            (format!("{hash}.ab-129"), false, "a non-alphanumeric suffix"),
+            (format!("{hash}.Ab12z9.zz"), false, "an extra segment"),
+            (
+                format!("hmac~{hash}.ABC123"),
+                true,
+                "a created identifier carrying the hmac code",
+            ),
+            (
+                format!("t0op~{hash}.ABC123"),
+                false,
+                "an identifier carrying another provider's code",
+            ),
+        ] {
+            assert_eq!(
+                is_valid_ec_id(&input),
+                expected,
+                "{reason} should be {}: {input}",
+                if expected { "accepted" } else { "rejected" }
+            );
+        }
     }
 
     #[test]

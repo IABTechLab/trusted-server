@@ -724,7 +724,9 @@ mod tests {
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
     use crate::ec::kv_types::KvPartnerId;
-    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
+    use crate::ec::tests::{
+        CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider, OpaqueProvider,
+    };
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -1572,34 +1574,6 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
-    }
-
-    /// A non-HMAC provider whose identifiers are opaque, modeling the
-    /// host-signal provider PR #1044 adds.
-    #[derive(Debug)]
-    struct OpaqueProvider;
-
-    impl EdgeCookieProvider for OpaqueProvider {
-        fn id(&self) -> &'static str {
-            "opaque"
-        }
-
-        fn code(&self) -> super::super::provider::ProviderCode {
-            crate::provider_code!("t0op")
-        }
-
-        fn generate(
-            &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &super::super::provider::IdentityInput<'_>,
-        ) -> Result<super::super::provider::GeneratedEdgeCookie, Report<TrustedServerError>>
-        {
-            Ok(super::super::provider::GeneratedEdgeCookie::default())
-        }
-
-        fn accepts_id(&self, value: &str) -> bool {
-            !value.is_empty()
-        }
     }
 
     #[test]
