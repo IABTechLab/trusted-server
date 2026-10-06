@@ -193,7 +193,7 @@ sends on.
 
 ## Withdrawal is a separate question
 
-A module may also say that the request explicitly *withdraws* a permission,
+A module may also say that the request explicitly _withdraws_ a permission,
 which is different from not granting it. A withdrawal of storage expires the
 browser cookie and writes the authoritative tombstone against the identifier.
 A permission that is merely not set strips the response headers and leaves an
@@ -235,12 +235,12 @@ from configuration.
 Five crates ship, under `crates/permission-signal/`, and a deployment
 configuring nothing gets all five in this order:
 
-| Identifier         | Crate        | Reads                                             |
-| ------------------ | ------------ | ------------------------------------------------- |
-| `gpc`              | `gpc`        | The `Sec-GPC` header, Global Privacy Control      |
-| `gpp_sale_opt_out` | `gpp`        | The US sale opt-out in a GPP string               |
-| `us_privacy`       | `us-privacy` | The sale opt-out in a US Privacy string           |
-| `tcf`              | `tcf`        | A TCF v2 record, with its purpose mapping in code |
+| Identifier         | Crate        | Reads                                               |
+| ------------------ | ------------ | --------------------------------------------------- |
+| `gpc`              | `gpc`        | The `Sec-GPC` header, Global Privacy Control        |
+| `gpp_sale_opt_out` | `gpp`        | The US sale opt-out in a GPP string                 |
+| `us_privacy`       | `us-privacy` | The sale opt-out in a US Privacy string             |
+| `tcf`              | `tcf`        | A TCF v2 record, with its purpose mapping in code   |
 | `mtm`              | `mtm`        | The PMP answer, under the Model Terms for Marketing |
 
 The three opt-outs are separate rather than one so that a publisher who does

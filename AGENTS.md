@@ -334,7 +334,7 @@ configuration can set a permission with no consent at all.
 all the evidence available for a request, including host signals such as the TLS
 JA4 and HTTP/2 signals. The core never decides which vendor may see what,
 because withholding a signal from one vendor and not another discriminates
-between them, and the core stays neutral. What a vendor may *do* with the
+between them, and the core stays neutral. What a vendor may _do_ with the
 evidence is governed by the permissions it declares and the system sets. Access
 is universal, use is gated.
 
@@ -369,11 +369,11 @@ Bad: `"fix: added feature flags"`
 Each vendor-differentiated capability is pluggable behind its own trait, so a
 deployment selects an implementation and the core stays neutral:
 
-| Capability            | Trait                                    | Selector            | Built-in (core)                         | Vendor / host crates         |
-| --------------------- | ---------------------------------------- | ------------------- | --------------------------------------- | ---------------------------- |
-| Edge Cookie identity  | `EdgeCookieModule` (`ec/module.rs`)  | `[ec] module`     | HMAC, client_fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
-| Device detection      | `DeviceModule` (`ec/device.rs`)        | `[device] module` | User-Agent only (default)               | `crates/device/<vendor>`     |
-| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] module`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
+| Capability            | Trait                                                 | Selector                                       | Built-in (core)                                                                    | Vendor / host crates                |
+| --------------------- | ----------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------- |
+| Edge Cookie identity  | `EdgeCookieModule` (`ec/module.rs`)                   | `[ec] module`                                  | HMAC, client_fixed (opt-in, no default)                                            | `crates/edgecookie/<vendor>`        |
+| Device detection      | `DeviceModule` (`ec/device.rs`)                       | `[device] module`                              | User-Agent only (default)                                                          | `crates/device/<vendor>`            |
+| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)                  | `[geo] module`                                 | Disabled, no location (default)                                                    | `crates/geo/<vendor>`               |
 | Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission_signal] module` (an ordered list) | None, and with no module every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
 
 Principles for adding or changing a module:
@@ -429,14 +429,14 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File                          | Purpose                                                                                           |
-| ----------------------------- | ------------------------------------------------------------------------------------------------- |
-| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                 |
-| `fastly.toml`                 | Fastly service configuration and build settings                                                   |
+| File                          | Purpose                                                                                                                                            |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                                                                  |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                                                                    |
 | `trusted-server.example.toml` | Source-controlled app-config template, which carries the `[ec]`, `[geo]` and `[device]` module selectors and the `[permission_signal] module` list |
-| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
-| `.env.dev`                    | Local development environment variables                                                           |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope                                                  |
+| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                                                                        |
+| `.env.dev`                    | Local development environment variables                                                                                                            |
 
 ---
 

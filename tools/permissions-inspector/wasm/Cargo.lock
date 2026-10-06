@@ -538,7 +538,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -569,7 +569,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.8#567964158e4f8bd0d52321b9801de44966422e1b"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "log",
  "proc-macro2",
