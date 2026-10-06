@@ -2,7 +2,7 @@
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use validator::Validate;
 
 const MOVED_PROVIDERS_MESSAGE: &str = "`[auction.providers]` has moved. Select demand sources with `[demand] provider = [...]` and give each its settings in `[demand.<name>]`, as the configuration rules describe";
@@ -100,11 +100,13 @@ pub struct AuctionConfig {
     pub creative_store: String,
 
     /// Keys allowed in the auction request context map.
+    ///
     /// Only config entries from the JS payload whose key appears in this list
     /// are forwarded into the `AuctionRequest.context`. Unrecognised keys are
-    /// silently dropped. An empty list blocks all context keys.
+    /// silently dropped. An empty list blocks all context keys. Keys are
+    /// deduplicated and serialized in sorted order so config hashes are stable.
     #[serde(default = "default_allowed_context_keys")]
-    pub allowed_context_keys: HashSet<String>,
+    pub allowed_context_keys: BTreeSet<String>,
 }
 
 impl Default for AuctionConfig {
@@ -122,7 +124,7 @@ impl Default for AuctionConfig {
             mediator: MovedSetting,
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
-            allowed_context_keys: HashSet::new(),
+            allowed_context_keys: BTreeSet::new(),
         }
     }
 }
@@ -180,8 +182,8 @@ fn default_creative_store() -> String {
     "creative_store".to_owned()
 }
 
-fn default_allowed_context_keys() -> HashSet<String> {
-    HashSet::new()
+fn default_allowed_context_keys() -> BTreeSet<String> {
+    BTreeSet::new()
 }
 
 #[cfg(test)]

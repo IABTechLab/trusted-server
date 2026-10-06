@@ -75,7 +75,7 @@ TOML file.
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `ec.hmac.passphrase` (when `ec.provider = "hmac"`)
+- `ec.hmac.passphrase` (when `ec.module = "hmac"`)
 
 ---
 
@@ -148,11 +148,11 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure the `hmac` provider is selected and its `passphrase` names a secret-store entry in `trusted-server.toml`:
+1. Ensure the `hmac` module is selected and its `passphrase` names a secret-store entry in `trusted-server.toml`:
 
 ```toml
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "ec_passphrase"
@@ -162,7 +162,7 @@ passphrase = "ec_passphrase"
    passphrase value:
 
 ```bash
-TRUSTED_SERVER__EC__PROVIDER=hmac
+TRUSTED_SERVER__EC__MODULE=hmac
 TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 ```
 

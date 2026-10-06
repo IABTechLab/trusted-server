@@ -10,7 +10,7 @@ permit EC use.
 
 Trusted Server is technology. It is neutral on policy. The Edge Cookie gives the deployer a cookie slot and configuration over the surrounding attributes. The deployer determines the policy posture based on the laws and contractual arrangements that apply to their deployment. Privacy outcomes follow from that configuration, not from the cookie mechanism itself.
 
-An Edge Cookie (EC) is a first-party identifier that the built-in provider derives on a first site visit with an HMAC of the client IP address plus a short random suffix, created only when the permission model allows it. It is passed in requests on subsequent visits and activity. Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
+An Edge Cookie (EC) is a first-party identifier that the built-in module derives on a first site visit with an HMAC of the client IP address plus a short random suffix, created only when the permission model allows it. It is passed in requests on subsequent visits and activity. Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
 For full operational onboarding (partner configuration, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
 
@@ -88,11 +88,11 @@ When the required permissions cannot be established for the current request (for
 
 ## Permission Gating
 
-EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie provider advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC provider requires `necessary.operations.storage` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
+EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie module advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC module requires `necessary.operations.storage` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
 
 The Edge Cookie code never reads consent. It checks only whether the required **permission** is set. Consent is one of the sources that _set_ a permission, not something the gate reads directly, so the Edge Cookie logic does not change when a consent framework changes. Two sources combine for each request:
 
-- **A country and region baseline.** The country, and an optional region such as a US state, that the geo provider returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
+- **A country and region baseline.** The country, and an optional region such as a US state, that the geo module returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
 - **Consent and privacy signals.** TCF, GPP, and GPC (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`) decoded from the request and mapped onto permissions as a **grant or a revoke** on top of that baseline. There is no separate consent KV fallback.
 
 Today only `necessary.operations.storage` is resolved this way: its country and region baseline is adjusted by the incoming TCF signal, and the Edge Cookie is created only when the result is set. With no configured default country, an unknown country sets nothing without a signal, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules are configuration rather than core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
@@ -101,30 +101,30 @@ Today only `necessary.operations.storage` is resolved this way: its country and 
 flowchart TD
     Start[Resolve country and region] --> Baseline[Country or region rule,<br/>else the default country]
     Baseline --> Signals[Apply consent/privacy signals<br/>as a grant or revoke]
-    Signals --> Check{Provider's required<br/>permissions all set?}
+    Signals --> Check{Module's required<br/>permissions all set?}
     Check -- "Yes" --> Allow([Create EC])
     Check -- "No" --> Deny([No EC])
 ```
 
-The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Permission resolution for each request is based on the live request signals listed above.
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, withdrawal tombstones, and completion markers that prevent stale point-read misses from rewriting completed tombstones. A marker key records the original tombstone's validity bound and is ignored at or after that time, even if its KV row has not expired yet. If the clock is unusable, the marker is ignored and withdrawal falls back to a strong root-existence check; only a confirmed existing root can be written. This prevents a stale marker from suppressing withdrawal when an expired EC key is created again. With a healthy store, repeated withdrawal of an already tombstoned EC ID leaves the row unchanged instead of refreshing its 24-hour TTL. Permission resolution for each request is based on the live request signals listed above.
 
-## Provider Types: Server-Side and Client-Side
+## Module Types: Server-Side and Client-Side
 
-The Edge Cookie identifier comes from a configurable provider, selected by `[ec] provider`. A provider is one of two types, and the permission gate above applies to both. The two reach the **same outcome** (a `ts-ec` cookie set and carried on every later request) by **different routes**.
+The Edge Cookie identifier comes from a configurable module, selected by `[ec] module`. A module is one of two types, and the permission gate above applies to both. The two reach the **same outcome** (a `ts-ec` cookie set and carried on every later request) by **different routes**.
 
-- **Server-side** (for example the built-in HMAC provider, or the built-in `host_signals` provider that derives an identifier from the host's TLS JA4 and HTTP/2 signals on a host that supplies them). The provider derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
-- **Client-side** (for example the `client_fixed` demonstration provider). The provider cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the provider's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The provider derives an identifier from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
+- **Server-side** (for example the built-in HMAC module, or the built-in `host_signals` module that derives an identifier from the host's TLS JA4 and HTTP/2 signals on a host that supplies them). The module derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
+- **Client-side** (for example the `client_fixed` demonstration module). The module cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the module's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The module derives an identifier from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
 
 ```mermaid
 flowchart TD
-    Start(["Page request, no Edge Cookie"]) --> Type{"Provider type"}
+    Start(["Page request, no Edge Cookie"]) --> Type{"Module type"}
 
     Type -->|"Server-side (e.g. HMAC)"| SGen["generate() derives at the edge from request data"]
     SGen --> SSet["Page response sets ts-ec"]
 
     Type -->|"Client-side (e.g. client_fixed)"| CDefer["generate() defers, returns no identifier"]
-    CDefer --> CPage["Page response, no cookie, delivers the provider JS"]
-    CPage --> CBox[["Provider JS (black box): runs in the browser and does its work"]]
+    CDefer --> CPage["Page response, no cookie, delivers the module JS"]
+    CPage --> CBox[["Module JS (black box): runs in the browser and does its work"]]
     CBox --> CPost["JS posts the result to POST /_ts/api/v1/ec/resolve"]
     CPost --> CResolve["resolve_from_client() verifies and derives"]
     CResolve --> CSet["Resolve response sets ts-ec"]
@@ -140,15 +140,15 @@ The two types differ only in route and in the methods they use:
 | Example              | HMAC (`hmac`)             | `client_fixed` (demonstration)                 |
 | Created in           | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
 | `generate()` returns | the identifier            | no identifier (defers)                         |
-| Client JavaScript    | none                      | the provider JS (black box), which posts back  |
+| Client JavaScript    | none                      | the module JS (black box), which posts back    |
 | Endpoint             | none                      | `POST /_ts/api/v1/ec/resolve`                  |
 | Cookie set on        | the page response         | the resolve response                           |
 
-The resolve endpoint requires an `Origin` on the publisher's domain and a `text/plain` or `application/json` body, and it answers `409` rather than silently replacing an identity the request already carries. A created identifier is persisted to the identity graph before the cookie is set, so withdrawal reaches a client-set identity the same way it reaches an edge-created one. On success the cookie is set on the endpoint's own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back, and a non-`HttpOnly` marker cookie (`ts-ecr=1`, carrying no identity) tells the script a resolve succeeded so it does not post again on every page view. Every resolve response carries `Cache-Control: no-store`. The `client_fixed` demonstration provider is compiled only behind the `client-fixed-demo` cargo feature, so a production build rejects selecting it at startup.
+The resolve endpoint requires an `Origin` on the publisher's domain and a `text/plain` or `application/json` body, and it answers `409` rather than silently replacing an identity the request already carries. A created identifier is persisted to the identity graph before the cookie is set, so withdrawal reaches a client-set identity the same way it reaches an edge-created one. On success the cookie is set on the endpoint's own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back, and a non-`HttpOnly` marker cookie (`ts-ecr=1`, carrying no identity) tells the script a resolve succeeded so it does not post again on every page view. Every resolve response carries `Cache-Control: no-store`. The `client_fixed` demonstration module is compiled only behind the `client-fixed-demo` cargo feature, so a production build rejects selecting it at startup.
 
-Because the posted value comes from the browser, **verification is the provider's responsibility**. A client-side provider must verify the payload (for example a signature) before creating an identifier, or a client could forge an Edge Cookie. The endpoint itself is provider-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the provider, and writes the cookie.
+Because the posted value comes from the browser, **verification is the module's responsibility**. A client-side module must verify the payload (for example a signature) before creating an identifier, or a client could forge an Edge Cookie. The endpoint itself is module-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the module, and writes the cookie.
 
-A built-in `client_fixed` provider demonstrates the client-side type end to end with no vendor coupling. Client and server share one fixed, known word. When no Edge Cookie is present, the page script (shipped in the tsjs bundle when that provider is selected) posts that word, the server verifies it matches, and on a match sets it as the Edge Cookie. The value is verifiable because it is a known constant, which is the point of the demo. It is useless in production, because a fixed value is not an identity, so it is for demonstration and testing only.
+A built-in `client_fixed` module demonstrates the client-side type end to end with no vendor coupling. Client and server share one fixed, known word. When no Edge Cookie is present, the page script (shipped in the tsjs bundle when that module is selected) posts that word, the server verifies it matches, and on a match sets it as the Edge Cookie. The value is verifiable because it is a known constant, which is the point of the demo. It is useless in production, because a fixed value is not an identity, so it is for demonstration and testing only.
 
 ## Partner Sync Channels
 
@@ -189,15 +189,21 @@ sequenceDiagram
     TSJS->>TSJS: Base64 encode full OpenRTB-style EID array<br/>[{source, uids:[{id, atype, ext?}]}]
     TSJS->>B: document.cookie = "ts-eids=..."
 
-    Note over B,TS: Next page request
-    B->>TS: Request with ts-eids cookie
+    Note over B,TS: Next eligible EID-sync request
+    B->>TS: Document navigation, POST /auction,<br/>or admitted GET /_ts/page-bids
     TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
-    TS->>KV: upsert_partner_id() per match<br/>(skips write when UID unchanged)
+    TS->>KV: Add missing partner IDs in one conditional write<br/>skip when UIDs already match
 ```
 
 Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
+
+Returning-user cookie persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not decode or persist these cookies. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
+
+Each eligible request attempts at most one conditional cookie update. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
+
+Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser cookie, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
 
 ### EID Seeding and Prebid Bidstream Forwarding
 
@@ -220,8 +226,8 @@ sequenceDiagram
         B->>B: Prebid User ID modules resolve IDs
         B->>TSJS: getUserIdsAsEids()
         TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs
-        B->>TS: Next request with ts-eids
-        TS->>KV: Decode cookie and upsert matched partner UIDs
+        B->>TS: Next eligible request with ts-eids
+        TS->>KV: Add missing matched partner UIDs<br/>defer different stored values
     end
 
     Note over B,TS: Prebid-routed auction
@@ -274,6 +280,16 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
 
+### Pull-Sync Completeness Marker
+
+When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+
+A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, and generation continue to use KV. The marker acts as recent proof that the row existed, so deletion of a previously complete row is not detected until the marker expires, at most one hour after issuance. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and restore the normal lookup and orphan-recovery path.
+
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and any present `ts-ec-pull-complete` marker even when KV is unavailable.
+
+Issuing or expiring the marker adds `Set-Cookie` to the outgoing response. Cache-privacy handling makes an otherwise shareable response private when that happens. A valid marker is not refreshed on each request, so this cost is limited to responses that establish or clear marker state in exchange for avoiding later KV reads.
+
 ## Configuration
 
 Configure EC settings in the `[ec]` section of `trusted-server.toml`. See the [Configuration Reference](/guide/configuration) for the full surface and environment variable overrides.
@@ -311,7 +327,7 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 - Newly generated ECs receive `Set-Cookie: ts-ec=...`.
 - When the permission is not set but nothing was explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal. Withdrawal is deliberately narrow: a TCF record refusing storage in a jurisdiction whose baseline did not grant it. US-style opt-outs (GPC, a GPP sale opt-out, or a US Privacy opt-out) suppress use for the request but never expire the cookie or write a tombstone, so lifting the opt-out restores the identity.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
-- `/_ts/api/v1/batch-sync` writes mappings into the EC identity graph. Mapping timestamps are retained for API compatibility but no longer order writes; valid mappings use idempotent last-write-wins semantics.
+- `/_ts/api/v1/batch-sync` validates every input, groups valid mappings by normalized EC ID, and applies the last valid UID for each group once. Group outcomes still account for every original input; infrastructure failures reject the failing and remaining groups. Mapping timestamps remain required for API compatibility but do not order writes. See the [API Reference](/guide/api-reference) for the complete contract.
 - Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
 
 ## Next Steps

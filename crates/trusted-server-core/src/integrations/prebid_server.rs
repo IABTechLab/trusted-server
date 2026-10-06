@@ -165,18 +165,19 @@ impl CompiledDemand for PrebidServerDemand {
                         .then(|| (bidder.as_str().to_string(), params))
                 })
                 .collect::<Map<_, _>>();
+            // Usable inline parameters win. Otherwise only a stored request the
+            // slot's intent permits is sent, and a slot left with neither has
+            // no demand for Prebid Server and is left out of the request.
             let mut prebid = Map::new();
-            if bidder.is_empty() {
-                if slot.is_stored_request() || !slot.bidder_params().is_empty() {
-                    prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
-                }
-            } else {
+            if !bidder.is_empty() {
                 prebid.insert("bidder".to_string(), Value::Object(bidder));
+            } else if slot.allows_stored_fallback() {
+                prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
             }
-            debug_assert!(
-                !prebid.is_empty(),
-                "should never route a demandless slot to Prebid Server"
-            );
+            if prebid.is_empty() {
+                impression.omitted = true;
+                continue;
+            }
             *impression.ext = Some(Map::from_iter([(
                 "prebid".to_string(),
                 Value::Object(prebid),

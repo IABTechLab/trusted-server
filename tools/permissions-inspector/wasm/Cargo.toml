@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 trusted-server-core = { path = "../../../crates/trusted-server-core" }
-# The inspector runs the same permission signal providers an adapter ships,
+# The inspector runs the same permission signal modules an adapter ships,
 # in the same default order, so the page answers as a deployment would.
 trusted-server-permission-signal-gpc = { path = "../../../crates/permission-signal/gpc" }
 trusted-server-permission-signal-gpp = { path = "../../../crates/permission-signal/gpp" }

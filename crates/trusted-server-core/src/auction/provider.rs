@@ -264,10 +264,10 @@ impl GenericOpenRtbProvider {
         )? {
             OpenRtbBuildOutcome::Ready(request) => request,
             OpenRtbBuildOutcome::NoImpressions => {
-                return Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
-                    self.provider_name(),
-                    0,
-                )));
+                return Ok(ProviderRequestOutcome::Immediate(
+                    AuctionResponse::no_bid(self.provider_name(), 0)
+                        .with_metadata("routing", json!({"skipped_no_usable_demand": true})),
+                ));
             }
         };
 
@@ -311,6 +311,11 @@ impl GenericOpenRtbProvider {
             }));
         }
 
+        let sent_impression_ids = request
+            .imp
+            .iter()
+            .filter_map(|impression| impression.id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
         let body = serde_json::to_vec(&request).change_context(TrustedServerError::Auction {
             message: format!(
                 "Provider {} request serialization failed",
@@ -365,7 +370,8 @@ impl GenericOpenRtbProvider {
             pending,
             Box::new(GenericOpenRtbParseState {
                 provider_id: self.provider_name().to_string(),
-                input: input.clone(),
+                input: input
+                    .filtered_slots(|slot| sent_impression_ids.contains(slot.slot().id.as_str())),
                 captured,
             }),
         ))

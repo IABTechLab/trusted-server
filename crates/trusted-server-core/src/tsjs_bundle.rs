@@ -301,7 +301,7 @@ mod tests {
             .copied()
             .filter(|id| *id != "core")
             .collect::<Vec<_>>();
-        let mut cases = vec![all.clone(), non_core.clone()];
+        let mut cases = vec![all.to_vec(), non_core.clone()];
         cases.push(non_core.iter().rev().copied().collect());
         cases.push(vec!["core"]);
 
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn compose_reserves_the_exact_bundle_size_before_writing_it() {
-        let parts = compile_time_parts(&trusted_server_js::all_module_ids());
+        let parts = compile_time_parts(trusted_server_js::all_module_ids());
         let body = compose(&parts);
 
         assert_eq!(

@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-geo-fastly"
-description = "Fastly host geo provider backed by the Fastly geolocation API."
+description = "Fastly host geo module backed by the Fastly geolocation API."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

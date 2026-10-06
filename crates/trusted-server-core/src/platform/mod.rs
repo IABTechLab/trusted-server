@@ -55,8 +55,8 @@ pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformK
 pub use error::PlatformError;
 pub use geo::DisabledGeo;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult, UnavailableHttpClient,
+    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
@@ -72,7 +72,7 @@ pub use template_cache::{
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
     TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
     TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
-    UnavailableTemplateCache, VaryHeaderValues, VarySpec,
+    UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
@@ -87,28 +87,28 @@ use std::sync::Arc;
 
 use crate::settings::Settings;
 
-/// Selects the geo provider named by the `[geo] provider` selector.
+/// Selects the geo module named by the `[geo] module` selector.
 ///
-/// Returns [`DisabledGeo`] when no provider is selected, so a default
+/// Returns [`DisabledGeo`] when no module is selected, so a default
 /// deployment makes no host geo call and the permission baseline comes from
-/// the top of the `permissions.yaml` rules tree. `provider = "none"` spells the
+/// the top of the `permissions.yaml` rules tree. `module = "none"` spells the
 /// same choice explicitly. The host platform's own geo lookup is opt-in:
-/// `provider = "platform"` returns `host_default`, which the adapter passes
+/// `module = "platform"` returns `host_default`, which the adapter passes
 /// as its platform geo implementation.
 ///
-/// Any other value names an integration module that declares a geo provider.
+/// Any other value names an integration module that declares a geo module.
 /// This function returns [`DisabledGeo`] for one, because it cannot see the
-/// registry, and the adapter then replaces it with the module's provider from
+/// registry, and the adapter then replaces it with the module's module from
 /// `IntegrationRegistry::geo_provider`. So the value returned here is the base
 /// the adapter starts from, not necessarily what serves the request. A selector
-/// naming a module that supplies no geo provider is rejected when the registry
+/// naming a module that supplies no geo module is rejected when the registry
 /// is built, which is the only layer that can tell.
 #[must_use]
-pub fn build_geo_provider(
+pub fn build_geo_module(
     settings: &Settings,
     host_default: Arc<dyn PlatformGeo>,
 ) -> Arc<dyn PlatformGeo> {
-    match settings.geo.provider.as_deref() {
+    match settings.geo.module.as_deref() {
         Some("platform") => host_default,
         _ => Arc::new(DisabledGeo),
     }
@@ -185,7 +185,7 @@ mod tests {
     fn disabled_geo_requires_no_permissions() {
         assert!(
             DisabledGeo.required_permissions().is_empty(),
-            "the default disabled geo provider requires no permissions"
+            "the default disabled geo module requires no permissions"
         );
     }
 
@@ -216,10 +216,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_geo_provider_defaults_to_no_geo() {
+    async fn build_geo_module_defaults_to_no_geo() {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
-        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        let selected = build_geo_module(&settings, Arc::clone(&host));
         assert!(
             !Arc::ptr_eq(&host, &selected),
             "default settings should not use the host geo"
@@ -233,28 +233,28 @@ mod tests {
                 .await
                 .expect("disabled geo lookup should not fail")
                 .is_none(),
-            "the default geo provider should resolve nothing"
+            "the default geo module should resolve nothing"
         );
     }
 
     #[test]
-    fn build_geo_provider_none_selects_no_geo_explicitly() {
+    fn build_geo_module_none_selects_no_geo_explicitly() {
         let mut settings = Settings::default();
-        settings.geo.provider = Some("none".to_owned());
+        settings.geo.module = Some("none".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
-        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        let selected = build_geo_module(&settings, Arc::clone(&host));
         assert!(
             !Arc::ptr_eq(&host, &selected),
-            "provider none should not use the host geo"
+            "module none should not use the host geo"
         );
     }
 
     #[test]
-    fn build_geo_provider_uses_host_geo_when_platform_is_selected() {
+    fn build_geo_module_uses_host_geo_when_platform_is_selected() {
         let mut settings = Settings::default();
-        settings.geo.provider = Some("platform".to_owned());
+        settings.geo.module = Some("platform".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
-        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        let selected = build_geo_module(&settings, Arc::clone(&host));
         assert!(
             Arc::ptr_eq(&host, &selected),
             "the platform selector should use the host geo"

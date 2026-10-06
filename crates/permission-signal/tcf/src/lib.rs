@@ -1,29 +1,34 @@
-//! IAB TCF v2 as a permission signal provider.
+//! IAB TCF v2 as a permission signal module.
 //!
 //! Answers from the decoded TCF record for the purposes this crate maps to
 //! each permission, and is the one place that knows what a TCF purpose is.
 //! Core decodes the TC string, keeps the record against the Edge Cookie
 //! identifier, expires it by age and resolves it against a GPP EU section, and
-//! this provider reads what that pipeline produced rather than decoding the
+//! this module reads what that pipeline produced rather than decoding the
 //! cookie a second time. Reading the wire directly would silently skip the
 //! cached record on a returning visitor and the expiry rule, and answer
 //! differently from every other reader of the same request.
 //!
-//! This provider lives outside `trusted-server-core` deliberately, like every
+//! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 mod mapping;
 
+use std::sync::OnceLock;
+
 pub use mapping::purpose_for;
 
-use trusted_server_core::consent::effective_tcf;
 #[cfg(test)]
 use trusted_server_core::consent::types::TcfConsent;
-use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
-use trusted_server_core::permissions::{ConsentSignal, Permission};
+use trusted_server_core::consent::{ConsentContext, effective_tcf};
+use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
+use trusted_server_core::permissions::{
+    ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
+};
 
-/// The stable identifier this provider answers to in `[permission_signal]`
-/// `provider`, in logs, and when a peer consults it.
+/// The stable identifier this module answers to in `[permission_signal]`
+/// `module`, in logs, and when a peer consults it.
 pub const ID: &str = "tcf";
 
 /// TCF v2, when the policy says TCF answers for this deployment.
@@ -32,17 +37,17 @@ pub const ID: &str = "tcf";
 /// [`purpose_for`], so core carries no table of another scheme's numbers. A
 /// permission no purpose maps to gets silence, not a refusal.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TcfProvider;
+pub struct TcfModule;
 
-impl TcfProvider {
-    /// A new provider.
+impl TcfModule {
+    /// A new module.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 }
 
-impl PermissionSignalProvider for TcfProvider {
+impl PermissionSignalModule for TcfModule {
     fn id(&self) -> &'static str {
         ID
     }
@@ -58,6 +63,14 @@ impl PermissionSignalProvider for TcfProvider {
             // TCF has nothing to say about this Data Use, so it says nothing.
             return ConsentSignal::Neutral;
         };
+        if unreadable(input.consent) {
+            // A TC string arrived and could not be read. The visitor expressed
+            // a preference this module cannot see, which is not the same as
+            // no preference, so it fails closed on everything it maps rather
+            // than leaving the place baseline standing. An expired record is
+            // not this case, expiry being its own explicit state.
+            return ConsentSignal::Revoke;
+        }
         let Some(record) = effective_tcf(input.consent) else {
             // No TCF record on the request. Silence, not refusal, because
             // reading an absent scheme as a refusal would revoke on every
@@ -74,10 +87,33 @@ impl PermissionSignalProvider for TcfProvider {
         }
     }
 
+    /// Every Data Use a purpose maps to, when the policy lets a record answer,
+    /// and nothing when it does not, because a silenced record grants nothing
+    /// and a page must not wait for it.
+    fn grants(&self, policy: &SignalPolicy) -> PermissionSet {
+        if !policy.tcf_authoritative() {
+            return PermissionSet::none();
+        }
+        mapped()
+    }
+
+    /// The standalone TC string, when it decoded and has not expired. A record
+    /// carried inside a GPP string is the GPP string's, which the GPP
+    /// module vouches for.
+    fn valid_signal(
+        &self,
+        consent: &ConsentContext,
+        _evidence: &dyn RequestInfo,
+    ) -> Option<ValidSignal> {
+        consent.tcf.as_ref()?;
+        let raw = consent.raw_tc_string.as_deref()?;
+        Some(ValidSignal::new(ID, "tcf", raw))
+    }
+
     /// Only a TCF record refusing storage withdraws, because only TCF records
     /// a visitor declining the very signal storage depended on. A US-style
     /// opt-out suppresses use for the request and never destroys an identifier,
-    /// so the other providers leave this at its default.
+    /// so the other modules leave this at its default.
     ///
     /// Whether the refusal is destructive at all is core's to decide from the
     /// jurisdiction's storage baseline, which is why this answers the narrow
@@ -90,6 +126,22 @@ impl PermissionSignalProvider for TcfProvider {
         }
         effective_tcf(input.consent).is_some_and(|record| !record.has_storage_consent())
     }
+}
+
+/// Every Data Use a purpose maps to, computed once rather than on every
+/// request, because the mapping is a constant of this crate.
+fn mapped() -> PermissionSet {
+    static MAPPED: OnceLock<PermissionSet> = OnceLock::new();
+    *MAPPED.get_or_init(|| {
+        Permission::all()
+            .filter(|permission| mapping::purpose_for(*permission).is_some())
+            .collect()
+    })
+}
+
+/// Whether a TC string arrived that could not be decoded, expiry aside.
+fn unreadable(consent: &ConsentContext) -> bool {
+    consent.raw_tc_string.is_some() && consent.tcf.is_none() && !consent.expired
 }
 
 #[cfg(test)]
@@ -145,21 +197,21 @@ mod tests {
     ) -> ConsentSignal {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::RequiresSignal);
-        TcfProvider::new().signal(permission, &input)
+        TcfModule::new().signal(permission, &input)
     }
 
     fn withdraws(consent: &ConsentContext, policy: &SignalPolicy, permission: Permission) -> bool {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::RequiresSignal);
-        TcfProvider::new().withdraws(permission, &input)
+        TcfModule::new().withdraws(permission, &input)
     }
 
     #[test]
     fn answers_to_its_identifier() {
         assert_eq!(
-            TcfProvider::new().id(),
+            TcfModule::new().id(),
             ID,
-            "the provider answers to the identifier configuration names"
+            "the module answers to the identifier configuration names"
         );
     }
 
@@ -210,6 +262,118 @@ mod tests {
             ),
             ConsentSignal::Neutral,
             "an absent record is silence, never a refusal"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_tc_string_is_this_modules_refusal_and_an_expired_one_is_not() {
+        // A string arrived that could not be decoded. That is a preference
+        // this module cannot see, so it refuses what it maps, silently,
+        // and says nothing about a Data Use no purpose covers.
+        let unreadable = ConsentContext {
+            raw_tc_string: Some("not a TC string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            answer(&unreadable, shipped_policy(), Permission::StoreOnDevice),
+            ConsentSignal::Revoke,
+            "an unreadable record refuses the Data Uses this scheme covers"
+        );
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert_eq!(
+            answer(&unreadable, shipped_policy(), email),
+            ConsentSignal::Neutral,
+            "and says nothing about a Data Use no purpose maps to"
+        );
+        assert_eq!(
+            answer(
+                &unreadable,
+                &SignalPolicy::default(),
+                Permission::StoreOnDevice
+            ),
+            ConsentSignal::Neutral,
+            "a silenced scheme says nothing, readable or not"
+        );
+        let expired = ConsentContext {
+            raw_tc_string: Some("CPold".to_owned()),
+            expired: true,
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            answer(&expired, shipped_policy(), Permission::StoreOnDevice),
+            ConsentSignal::Neutral,
+            "expiry is its own explicit state and not an unreadable record"
+        );
+    }
+
+    #[test]
+    fn vouches_for_the_standalone_tc_string_only_when_it_decoded() {
+        let evidence = OwnedRequestInfo::default();
+        let decoded = ConsentContext {
+            raw_tc_string: Some("CPreadable".to_owned()),
+            ..with_record(&[1])
+        };
+        assert_eq!(
+            TcfModule::new().valid_signal(&decoded, &evidence),
+            Some(ValidSignal::new(ID, "tcf", "CPreadable")),
+            "a decoded record vouches for the string as received"
+        );
+        let unreadable = ConsentContext {
+            raw_tc_string: Some("not a TC string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            TcfModule::new().valid_signal(&unreadable, &evidence),
+            None,
+            "an unreadable string is not vouched for"
+        );
+        let expired = ConsentContext {
+            raw_tc_string: Some("CPold".to_owned()),
+            expired: true,
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            TcfModule::new().valid_signal(&expired, &evidence),
+            None,
+            "an expired record is not one this module uses, so it is not vouched for"
+        );
+        assert_eq!(
+            TcfModule::new().valid_signal(&ConsentContext::default(), &evidence),
+            None,
+            "and no record is no signal"
+        );
+    }
+
+    #[test]
+    fn declares_exactly_the_data_uses_a_purpose_maps_to() {
+        // Under the shipped policy a record answers, so every mapped Data Use
+        // is declared and an unmapped one is not. Under a policy that silences
+        // the record nothing is declared, because a record that cannot answer
+        // is not one a page should wait for.
+        let declared = TcfModule::new().grants(shipped_policy());
+        assert!(
+            declared.contains(Permission::StoreOnDevice),
+            "purpose 1 maps to storage, so storage is grantable"
+        );
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert!(
+            !declared.contains(email),
+            "no purpose maps to a marketing channel, so it is not grantable"
+        );
+        assert_eq!(
+            declared.iter().count(),
+            Permission::all()
+                .filter(|permission| purpose_for(*permission).is_some())
+                .count(),
+            "should declare each mapped Data Use once and nothing else"
+        );
+        assert!(
+            TcfModule::new().grants(&SignalPolicy::default()).is_empty(),
+            "a silenced record grants nothing"
         );
     }
 
@@ -278,7 +442,7 @@ mod tests {
     #[test]
     fn reads_the_eu_section_of_a_gpp_string_when_there_is_no_standalone_record() {
         // Core resolves a GPP string's EU TCF section as the effective record
-        // when no TC string arrived, and this provider reads what core resolved
+        // when no TC string arrived, and this module reads what core resolved
         // rather than the wire, so it sees that section too.
         let consent = ConsentContext {
             gpp: Some(GppConsent {

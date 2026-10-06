@@ -160,7 +160,7 @@ pub trait PlatformGeo: Send + Sync {
     /// ISO 3166-2 subdivision code without the country prefix (for example
     /// `CA`). The permission model keys its country and region rules on these
     /// codes, matched case-insensitively, so the Fastly and other geo
-    /// providers feed the same rules without translation.
+    /// modules feed the same rules without translation.
     ///
     /// # Errors
     ///
@@ -172,9 +172,9 @@ pub trait PlatformGeo: Send + Sync {
         services: &RuntimeServices,
     ) -> Result<Option<GeoInfo>, Report<PlatformError>>;
 
-    /// The permissions this provider's data use requires.
+    /// The permissions this module's data use requires.
     ///
-    /// The default is empty, so the default (disabled) geo provider requires no
+    /// The default is empty, so the default (disabled) geo module requires no
     /// permission.
     fn required_permissions(&self) -> crate::permissions::PermissionSet {
         crate::permissions::PermissionSet::none()

@@ -22,10 +22,10 @@ crates/
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
   device/
-    fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
-  edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
-  geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
-  permission-signal/                    # permission signal provider crates, one per scheme (gpc, gpp, tcf, us-privacy), and core links none
+    fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)
+  edgecookie/                           # vendor Edge Cookie module crates (built-in HMAC module is in core)
+  geo/                                  # vendor geo module crates (host geo is injected by the adapter)
+  permission-signal/                    # permission signal module crates, one per scheme (gpc, gpp, tcf, us-privacy), and core links none
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -44,6 +44,8 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
 | Viceroy     | 0.17.0 (from `.tool-versions`)           |
 | Wasmtime    | 44.0.1 (from `.tool-versions`)           |
+| AWS CLI     | 2.36.45 (from `.tool-versions`)          |
+| Terraform   | 1.16.2 (from `.tool-versions`)           |
 
 ---
 
@@ -105,6 +107,7 @@ spin up --from crates/trusted-server-adapter-spin
 # See .cargo/config.toml; default-members = [fastly] so Viceroy can locate
 # the binary via `cargo run --bin`.
 cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-fastly-reuse # Fastly adapter with the reusable-sandbox feature on
 cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
@@ -316,28 +319,28 @@ impl core::error::Error for MyError {}
 
 ### Permission model terminology
 
-Permissions are the primitive. A provider declares the permissions it requires
+Permissions are the primitive. A module declares the permissions it requires
 (`required_permissions`) and the system decides whether each is _set_. Consent
 is only one of many ways a permission may be established. Country or
 jurisdiction rules (a `Granted` group baseline), legitimate interest, or
 configuration can set a permission with no consent at all.
 
-- A provider that needs nothing **requires no permission**. Never write that it
+- A module that needs nothing **requires no permission**. Never write that it
   "runs without any consent".
-- A gated provider **runs once its required permissions are set**, by whatever
+- A gated module **runs once its required permissions are set**, by whatever
   method.
 
-**Evidence is not rationed, use is.** Every provider and every integration sees
+**Evidence is not rationed, use is.** Every module and every integration sees
 all the evidence available for a request, including host signals such as the TLS
 JA4 and HTTP/2 signals. The core never decides which vendor may see what,
 because withholding a signal from one vendor and not another discriminates
-between them, and the core stays neutral. What a vendor may *do* with the
+between them, and the core stays neutral. What a vendor may _do_ with the
 evidence is governed by the permissions it declares and the system sets. Access
 is universal, use is gated.
 
 The practical consequence: never "fix" a vendor's access to a signal by hiding
 the signal. If a use needs controlling, express it as a permission. A change
-that removes evidence from a provider's reach is working against the
+that removes evidence from a module's reach is working against the
 architecture, not protecting it.
 
 - Reserve "consent" for the consent subsystem (`consent/`, `ConsentContext`,
@@ -361,7 +364,7 @@ Bad: `"fix: added feature flags"`
 
 ---
 
-## Provider Architecture
+## Module Architecture
 
 Each vendor-differentiated capability is pluggable behind its own trait, so a
 deployment selects an implementation and the core stays neutral. Every
@@ -373,10 +376,10 @@ to read before changing any provider configuration.
 
 | Capability            | Trait                                    | Selector                  | Built-in (core)                              | Vendor / host crates         |
 | --------------------- | ---------------------------------------- | ------------------------- | -------------------------------------------- | ---------------------------- |
-| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`           | `hmac`, `host_signals`, `client_fixed` (opt-in, no default) | `crates/edgecookie/<vendor>` |
-| Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider`       | `builtin`, User-Agent only (the default)     | `crates/device/<vendor>`     |
+| Edge Cookie identity  | `EdgeCookieModule` (`ec/module.rs`)  | `[ec] provider`           | `hmac`, `host_signals`, `client_fixed` (opt-in, no default) | `crates/edgecookie/<vendor>` |
+| Device detection      | `DeviceModule` (`ec/device.rs`)        | `[device] provider`       | `builtin`, User-Agent only (the default)     | `crates/device/<vendor>`     |
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`          | None, no location (the default), or `platform` | `crates/geo/<vendor>`      |
-| Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] provider` (an ordered list) | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`, all of them with no list | `crates/permission-signal/<scheme>` |
+| Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission_signal] provider` (an ordered list) | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`, all of them with no list | `crates/permission-signal/<scheme>` |
 | Auction demand        | `DemandImplementation` (`auction/demand.rs`) | `[demand] provider` (a list) | `openrtb`, `prebid_server`, `aps`        | an integration builder       |
 | Ad server             | `AdServerImplementation` (`auction/demand.rs`) | `[adserver] provider` | `adserver_mock`                            | an integration builder       |
 | Page integrations     | `IntegrationBuilder` (`integrations/mod.rs`) | `[integration] provider` (a list) | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` | an adapter-supplied builder |
@@ -385,26 +388,26 @@ to read before changing any provider configuration.
 only. They are not page integrations and cannot be named in
 `[integration] provider`.
 
-Principles for adding or changing a provider:
+Principles for adding or changing a module:
 
 - **Core stays neutral.** The trait and the host-neutral default live in
   `trusted-server-core`. Host-specific and vendor implementations live in their
-  own crates and are injected by the adapter (for example `build_device_provider`
-  and `build_geo_provider`), so core never depends on a host SDK or a vendor, and
+  own crates and are injected by the adapter (for example `build_device_module`
+  and `build_geo_module`), so core never depends on a host SDK or a vendor, and
   the default request path makes no host-specific calls.
-- **Providers read request evidence, not a fixed parameter set.** A provider must
+- **Modules read request evidence, not a fixed parameter set.** A module must
   be able to see everything about the request it needs (User-Agent, headers, and
   host signals such as the TLS JA4 and HTTP/2 signals) through an evidence
   abstraction rather than a hard-coded struct of fields. Host signals come from
-  the host (the Fastly SDK) and are opt-in, so a neutral provider triggers no
+  the host (the Fastly SDK) and are opt-in, so a neutral module triggers no
   host signal calls.
-- **Providers are separated by capability but composed per request, and one may
+- **Modules are separated by capability but composed per request, and one may
   need another's output.** Geo resolves the country and region the permission
-  model uses, and the permission model gates whether the Edge Cookie provider
+  model uses, and the permission model gates whether the Edge Cookie module
   runs. Device signals gate Edge Cookie writes (the browser / bot gate). When
-  multiple vendor providers share a backend (for example a vendor's Edge Cookie,
-  geo, and device provider on one cloud pipeline) they share a single call per
-  request rather than calling independently. Give a provider the inputs and
+  multiple vendor modules share a backend (for example a vendor's Edge Cookie,
+  geo, and device module on one cloud pipeline) they share a single call per
+  request rather than calling independently. Give a module the inputs and
   upstream results it needs explicitly, rather than having it reach into globals.
 
 ---
@@ -456,11 +459,12 @@ Every PR must pass:
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm && cargo clippy-cli && cargo clippy-codegen`
-3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+3. `cargo test-fastly && cargo test-fastly-reuse && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
+8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 
 ---
 
@@ -549,18 +553,18 @@ both runtime behavior and build/tooling changes.
 
 ## Key Files
 
-| File                                         | Purpose                                           |
-| -------------------------------------------- | ------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
-| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
-| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
-| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| File                                                      | Purpose                                              |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`               |
+| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs                |
+| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start                 |
+| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules        |
 | `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
-| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
-| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
-| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
-| `crates/trusted-server-js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/trusted-server-js/src/bundle.rs`                    | Module map, concatenation, hashing                |
+| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
+| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
+| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
+| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---
 

@@ -36,10 +36,10 @@ use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
 use super::log_id;
+use super::module::{AcceptedModules, EdgeCookieModule};
 use super::prebid_eids::{
     analyze_prebid_eids_cookie, collect_sharedid_update, dedupe_partner_updates, is_valid_eid_uid,
 };
-use super::provider::{AcceptedProviders, EdgeCookieProvider};
 use super::registry::PartnerRegistry;
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
@@ -200,7 +200,7 @@ struct AdminEcLookupResponse {
     /// The EC ID as requested, from the path or the `ts-ec` cookie.
     ec_id: String,
     /// The identity-graph key the entry was read from, being the canonical form
-    /// of `ec_id` that [`AcceptedProviders::canonical_kv_key`] returns.
+    /// of `ec_id` that [`AcceptedModules::canonical_kv_key`] returns.
     kv_key: String,
     /// Platform KV store name the entry was read from.
     store: String,
@@ -279,19 +279,19 @@ struct SkippedPartnerId {
 pub fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
-    provider: Option<&dyn EdgeCookieProvider>,
+    module: Option<&dyn EdgeCookieModule>,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(kv) = kv else {
         return Ok(admin_ec_lookup_not_supported());
     };
 
-    let requested = match requested_ec_id(req, &AcceptedProviders::active(provider)) {
+    let requested = match requested_ec_id(req, &AcceptedModules::active(module)) {
         Ok(requested) => requested,
         Err(response) => return Ok(*response),
     };
 
-    // Read the row under the owning provider's canonical form of the
+    // Read the row under the owning module's canonical form of the
     // identifier, the key the row is stored under, rather than under the
     // identifier as requested. The two differ whenever the canonical form is
     // not the requested string itself, for example for a built-in HMAC
@@ -362,7 +362,7 @@ struct RequestedEcId {
     /// The EC ID as requested, from the path or the `ts-ec` cookie.
     ec_id: String,
     /// The canonical form of `ec_id` that
-    /// [`AcceptedProviders::canonical_kv_key`] returns, which the row is stored
+    /// [`AcceptedModules::canonical_kv_key`] returns, which the row is stored
     /// under.
     kv_key: String,
 }
@@ -371,17 +371,17 @@ struct RequestedEcId {
 /// identity-graph key its row is stored under.
 ///
 /// The identifier is validated in two parts: the global cookie bounds, then
-/// the provider that owns its `{code}~` prefix, so an operator can look up an
-/// identifier created by whichever provider this deployment reads rather than
+/// the module that owns its `{code}~` prefix, so an operator can look up an
+/// identifier created by whichever module this deployment reads rather than
 /// only a built-in HMAC one. The same check supplies the key, the canonical
-/// form of the identifier that [`AcceptedProviders::canonical_kv_key`]
+/// form of the identifier that [`AcceptedModules::canonical_kv_key`]
 /// returns.
 ///
 /// Returns the (boxed) error response to send directly when no valid ID is
 /// available.
 fn requested_ec_id(
     req: &Request<EdgeBody>,
-    accepted_providers: &AcceptedProviders<'_>,
+    accepted_modules: &AcceptedModules<'_>,
 ) -> Result<RequestedEcId, Box<Response<EdgeBody>>> {
     let remainder = req
         .uri()
@@ -396,11 +396,11 @@ fn requested_ec_id(
         remainder.to_owned()
     };
 
-    let Some(kv_key) = accepted_providers.canonical_kv_key(&ec_id) else {
+    let Some(kv_key) = accepted_modules.canonical_kv_key(&ec_id) else {
         return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
-            "invalid EC ID: not an identifier any provider this deployment reads \
-             issued (the built-in HMAC provider issues hmac~{64hex}.{6alnum} and \
+            "invalid EC ID: not an identifier any module this deployment reads \
+             issued (the built-in HMAC module issues hmac~{64hex}.{6alnum} and \
              still reads the bare legacy form)",
         )));
     };
@@ -640,9 +640,9 @@ pub fn handle_admin_eids_lookup(
         },
     };
 
-    // Mirror the ingestion path (`ingest_eid_cookies`): collect matches from
-    // both cookies, then dedupe the same way so the preview reports exactly
-    // what a navigation would store.
+    // Collect matches from both cookies, then dedupe the same way as response
+    // finalization so the preview reports exactly what an eligible request
+    // would store.
     if let Some(value) = &sharedid_cookie
         && let Some(update) = collect_sharedid_update(value, registry)
     {
@@ -724,7 +724,9 @@ mod tests {
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
     use crate::ec::kv_types::KvPartnerId;
-    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
+    use crate::ec::tests::{
+        CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule, OpaqueModule,
+    };
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -1574,42 +1576,12 @@ mod tests {
         assert_eq!(matched[0]["uid"], "shared-uid-123");
     }
 
-    /// A non-HMAC provider whose identifiers are opaque, modeling the
-    /// host-signal provider PR #1044 adds.
-    #[derive(Debug)]
-    struct OpaqueProvider;
-
-    #[async_trait::async_trait(?Send)]
-    impl EdgeCookieProvider for OpaqueProvider {
-        fn id(&self) -> &'static str {
-            "opaque"
-        }
-
-        fn code(&self) -> super::super::provider::ProviderCode {
-            crate::provider_code!("t0op")
-        }
-
-        async fn generate(
-            &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &super::super::provider::IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
-        ) -> Result<super::super::provider::GeneratedEdgeCookie, Report<TrustedServerError>>
-        {
-            Ok(super::super::provider::GeneratedEdgeCookie::default())
-        }
-
-        fn accepts_id(&self, value: &str) -> bool {
-            !value.is_empty()
-        }
-    }
-
     #[test]
     fn requested_ec_id_accepts_the_hmac_envelope() {
         let coded = format!("hmac~{}", test_ec_id());
         let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{coded}"));
 
-        let requested = requested_ec_id(&request, &AcceptedProviders::active(None))
+        let requested = requested_ec_id(&request, &AcceptedModules::active(None))
             .unwrap_or_else(|_| panic!("should accept a coded HMAC identifier in the path"));
 
         assert_eq!(
@@ -1623,41 +1595,41 @@ mod tests {
     }
 
     #[test]
-    fn requested_ec_id_accepts_the_active_non_hmac_provider_and_rejects_others() {
-        // The diagnostic must be usable on a deployment whose provider is not
+    fn requested_ec_id_accepts_the_active_non_hmac_module_and_rejects_others() {
+        // The diagnostic must be usable on a deployment whose module is not
         // the built-in HMAC one. Before the dispatch every non-`hmac` code was
         // a 400, so an operator could not look up the identifier in the very
         // cookie the browser was carrying.
-        let accepted = AcceptedProviders::active(Some(&OpaqueProvider));
+        let accepted = AcceptedModules::active(Some(&OpaqueModule));
 
         let opaque = "t0op~Opaque_Value_MixedCase";
         let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{opaque}"));
         let requested = requested_ec_id(&request, &accepted)
-            .unwrap_or_else(|_| panic!("should accept the active provider's identifier"));
+            .unwrap_or_else(|_| panic!("should accept the active module's identifier"));
         assert_eq!(
             requested.ec_id, opaque,
             "should report the identifier as given"
         );
 
-        // A code no configured provider reads stays a 400, even in the built-in
+        // A code no configured module reads stays a 400, even in the built-in
         // HMAC shape, so one deployment cannot inspect another's identifiers.
         let foreign = format!("t0zz~{}", test_ec_id());
         let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{foreign}"));
         let response = requested_ec_id(&request, &accepted)
-            .expect_err("an unread provider code should be rejected");
+            .expect_err("an unread module code should be rejected");
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
-            "an unread provider code should be a 400"
+            "an unread module code should be a 400"
         );
     }
 
     #[test]
     fn ec_lookup_reads_the_row_under_the_canonical_key() {
-        // The identity graph stores a row under the owning provider's
+        // The identity graph stores a row under the owning module's
         // canonical form of the identifier. Read under the identifier as
         // requested, the lookup answered 404 for a row that exists whenever a
-        // provider's canonical form differs from the cookie value.
+        // module's canonical form differs from the cookie value.
         let kv = kv_with_entry(CANONICAL_KV_KEY, &sample_entry());
         let req =
             get_request_with_cookie("/_ts/admin/ec", &format!("ts-ec={CANONICAL_COOKIE_VALUE}"));
@@ -1665,7 +1637,7 @@ mod tests {
         let response = handle_admin_ec_lookup(
             Some(&kv),
             &test_registry(),
-            Some(&CanonicalizingProvider),
+            Some(&CanonicalizingModule),
             &req,
         )
         .expect("should handle lookup");
@@ -1692,18 +1664,18 @@ mod tests {
 
     #[test]
     fn ec_lookup_given_an_uppercase_hmac_hash_reads_the_lowercase_row() {
-        // The built-in HMAC provider issues lowercase hex, and its canonical
+        // The built-in HMAC module issues lowercase hex, and its canonical
         // form lowercases the hash, so its row key is the identifier it issued.
         // An operator who pastes that identifier with the hash in uppercase is
         // still asking for the same row.
         let ec_id = format!("hmac~{}", test_ec_id());
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let uppercase = format!("hmac~{}.abc123", "A".repeat(64));
-        let provider = crate::ec::tests::hmac_provider();
+        let module = crate::ec::tests::hmac_module();
         let req = get_request(&format!("/_ts/admin/ec/{uppercase}"));
 
         let response =
-            handle_admin_ec_lookup(Some(&kv), &test_registry(), Some(provider.as_ref()), &req)
+            handle_admin_ec_lookup(Some(&kv), &test_registry(), Some(module.as_ref()), &req)
                 .expect("should handle lookup");
 
         assert_eq!(

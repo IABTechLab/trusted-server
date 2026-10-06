@@ -25,7 +25,7 @@ const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 /// Maximum length in bytes of an Edge Cookie identifier.
 ///
 /// A global bound enforced wherever an identifier enters the system (creation,
-/// cookie read-back, cookie write), so no provider can emit a value the cookie
+/// cookie read-back, cookie write), so no module can emit a value the cookie
 /// layer, logs, or the KV key space cannot carry.
 pub(crate) const MAX_EC_ID_LEN: usize = 256;
 
@@ -34,9 +34,9 @@ fn is_allowed_ec_id_char(c: char) -> bool {
 }
 
 // Identifier allowlist: [A-Za-z0-9._~-], the cookie-safe alphabet every
-// Edge Cookie identifier must fit regardless of which provider created it.
+// Edge Cookie identifier must fit regardless of which module created it.
 // This is intentionally broader than the built-in format validator
-// (`generation::is_valid_ec_id`), which enforces the HMAC provider's
+// (`generation::is_valid_ec_id`), which enforces the HMAC module's
 // `<64-hex>.<6-alphanumeric>` structure, either bare or under the `hmac~`
 // envelope; an opaque vendor identifier only has to fit the alphabet and the
 // length bound.
@@ -77,7 +77,7 @@ pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 /// Validates `ec_id` against the identifier alphabet and length bound before
 /// interpolation. An identifier that fails validation is rejected and the
 /// cookie is not set, with an error logged; the value is never rewritten, so
-/// a provider identifier survives byte for byte or not at all. This also
+/// a module identifier survives byte for byte or not at all. This also
 /// prevents an attacker from injecting spurious cookie attributes via a
 /// controlled ID value.
 ///
@@ -102,48 +102,6 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
             // the value, and format_set_cookie emits only controlled bytes.
             // Logged for defense-in-depth symmetry with the rejection above.
             log::warn!("Skipping EC Set-Cookie: invalid header value: {e}");
-        }
-    }
-}
-
-/// Sets an Edge Cookie created by a client-cycle provider on the response.
-///
-/// Unlike [`set_ec_cookie`], the value is treated as opaque: it need not match
-/// the canonical HMAC id shape, because a client-cycle provider's identifier
-/// (for example a signed envelope, or the client-random demo's value) is not in
-/// that format. The value is still validated against the same identifier
-/// alphabet and length bound as every other identifier
-/// ([`ec_id_has_only_allowed_chars`]); a value outside the bounds is rejected
-/// (no cookie set) and logged, never rewritten, which prevents header
-/// injection. The same `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, and
-/// `Domain` attributes as [`set_ec_cookie`] apply.
-pub(crate) fn set_provider_ec_cookie(
-    settings: &Settings,
-    response: &mut Response<EdgeBody>,
-    value: &str,
-) {
-    if !ec_id_has_only_allowed_chars(value) {
-        log::error!(
-            "Rejecting provider Edge Cookie value of {} bytes: empty, over {} bytes, or outside the identifier alphabet",
-            value.len(),
-            MAX_EC_ID_LEN,
-        );
-        return;
-    }
-
-    let cookie = format_set_cookie(
-        &settings.publisher.ec_cookie_domain(),
-        value,
-        COOKIE_MAX_AGE,
-    );
-    match HeaderValue::from_str(&cookie) {
-        Ok(val) => {
-            response.headers_mut().append(header::SET_COOKIE, val);
-        }
-        Err(e) => {
-            // Unreachable in practice: the identifier allowlist gates the value
-            // and format_set_cookie emits only controlled bytes.
-            log::warn!("Skipping provider EC Set-Cookie: invalid header value: {e}");
         }
     }
 }
@@ -174,14 +132,14 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
 
 /// Expires the resolved marker on its own, leaving the Edge Cookie alone.
 ///
-/// The marker records only that some client-cycle provider resolved in the
-/// past. It is not namespaced by the provider code the way the cookie value,
+/// The marker records only that some client-cycle module resolved in the
+/// past. It is not namespaced by the module code the way the cookie value,
 /// the identity-graph key and withdrawal are, so on a switch from one
-/// client-cycle provider to another the marker outlives the identity it was
-/// set for. The new provider's page script would then see the marker, skip the
+/// client-cycle module to another the marker outlives the identity it was
+/// set for. The new module's page script would then see the marker, skip the
 /// resolve it should perform, and the visitor would sit with no identity
 /// rather than a restarted one. Expiring the marker whenever the incoming
-/// value is not one the selected provider owns restarts the cycle without
+/// value is not one the selected module owns restarts the cycle without
 /// depending on any vendor page script comparing a marker value correctly.
 pub fn expire_ec_resolved_marker(settings: &Settings, response: &mut Response<EdgeBody>) {
     let marker = format!(
@@ -231,7 +189,7 @@ mod tests {
     #[test]
     fn the_ec_cookie_lifetime_is_one_year() {
         // The legacy bare-identifier reader's retirement condition (see
-        // `provider_owns_id`) is written in terms of this lifetime and the
+        // `module_owns_id`) is written in terms of this lifetime and the
         // identity-graph `ENTRY_TTL`, which `kv::tests::constants_have_expected_values`
         // pins to the same figure. Changing either moves the earliest safe
         // retirement, so neither may drift unnoticed.
@@ -291,91 +249,68 @@ mod tests {
         );
     }
 
+    /// Every value in the identifier alphabet is written verbatim, whatever
+    /// module made it, with the standard security attributes.
     #[test]
-    fn set_ec_cookie_appends_header() {
+    fn set_ec_cookie_writes_an_identifier_in_the_alphabet_verbatim() {
         let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, TEST_EC_ID);
+        for (case, value) in [
+            ("an HMAC identifier", TEST_EC_ID),
+            (
+                "another HMAC identifier",
+                "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab",
+            ),
+            ("a module's opaque value", "8473625190"),
+            // Unpadded base64url (RFC 4648 section 5) fits the alphabet, so a
+            // module that carries binary data encodes it that way.
+            ("a base64url value", "abcDEF123-_x"),
+        ] {
+            let mut response = empty_response();
 
-        let cookie_header = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("should have Set-Cookie header");
-        let cookie_str = cookie_header.to_str().expect("should be valid UTF-8");
+            set_ec_cookie(&settings, &mut response, value);
 
-        assert_eq!(
-            cookie_str,
-            create_ec_cookie(&settings, TEST_EC_ID),
-            "should match create_ec_cookie output"
-        );
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap_or_else(|| panic!("{case}: should set the cookie"))
+                .to_str()
+                .expect("should be valid UTF-8");
+            assert_eq!(
+                cookie,
+                format!(
+                    "{}={value}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
+                    COOKIE_TS_EC, settings.publisher.domain, COOKIE_MAX_AGE,
+                ),
+                "{case}"
+            );
+            assert_eq!(cookie, create_ec_cookie(&settings, value), "{case}");
+        }
     }
 
+    /// A value outside the alphabet sets no cookie at all, never a rewritten
+    /// one, so the cookie and the identity graph key cannot diverge and no
+    /// value can inject an attribute or a header.
     #[test]
-    fn set_ec_cookie_rejects_disallowed_chars_outright() {
-        // Rejection, never rewriting: an identifier outside the alphabet must
-        // not produce a cookie at all, so the cookie value and the identity
-        // graph key can never silently diverge.
+    fn set_ec_cookie_refuses_a_value_outside_the_alphabet() {
         let settings = create_test_settings();
-        let mut response = Response::new(EdgeBody::empty());
-        set_ec_cookie(
-            &settings,
-            &mut response,
-            "evil;injected
-foo=bar",
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "an identifier outside the alphabet should set no cookie"
-        );
-    }
+        for (case, value) in [
+            ("a semicolon", "evil; Domain=.attacker.com"),
+            (
+                "a carriage return and line feed",
+                "evil\r\nX-Injected: header",
+            ),
+            ("a line feed", "evil;injected\nfoo=bar"),
+            ("a space", "bad value"),
+        ] {
+            let mut response = empty_response();
 
-    #[test]
-    fn create_ec_cookie_preserves_well_formed_id() {
-        let settings = create_test_settings();
-        let id = "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab";
-        let result = create_ec_cookie(&settings, id);
-        let value = result
-            .strip_prefix(&format!("{COOKIE_TS_EC}="))
-            .and_then(|s| s.split_once(';').map(|(v, _)| v))
-            .expect("should have cookie value portion");
+            set_ec_cookie(&settings, &mut response, value);
 
-        assert_eq!(value, id, "should not modify a well-formed EC ID");
-    }
-
-    #[test]
-    fn set_ec_cookie_rejects_semicolon() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "should not set Set-Cookie when value contains a semicolon"
-        );
-    }
-
-    #[test]
-    fn set_ec_cookie_rejects_crlf() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, "evil\r\nX-Injected: header");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "should not set Set-Cookie when value contains CRLF"
-        );
-    }
-
-    #[test]
-    fn set_ec_cookie_rejects_space() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_ec_cookie(&settings, &mut response, "bad value");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "should not set Set-Cookie when value contains whitespace"
-        );
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{case}: should set no cookie"
+            );
+        }
     }
 
     #[test]
@@ -423,66 +358,6 @@ foo=bar",
                 COOKIE_TS_EC, settings.publisher.domain,
             ),
             "expiry cookie should retain the same security attributes as the live cookie"
-        );
-    }
-
-    #[test]
-    fn set_provider_ec_cookie_sets_opaque_value_with_security_attributes() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        // A client-cycle value that is not the canonical HMAC id shape.
-        set_provider_ec_cookie(&settings, &mut response, "8473625190");
-
-        let cookie_str = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("should set the EC cookie")
-            .to_str()
-            .expect("should be valid UTF-8");
-
-        assert_eq!(
-            cookie_str,
-            format!(
-                "{}=8473625190; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
-                COOKIE_TS_EC, settings.publisher.domain, COOKIE_MAX_AGE,
-            ),
-            "an opaque provider value should be set verbatim with the standard security attributes"
-        );
-    }
-
-    #[test]
-    fn set_provider_ec_cookie_preserves_base64url_value() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        // A base64url value (RFC 4648 section 5, unpadded) fits the identifier
-        // alphabet exactly and must be preserved verbatim. Standard base64
-        // (`+`, `/`, `=`) is outside the alphabet, so a provider that carries
-        // binary data re-encodes it as base64url before creating the cookie value.
-        let value = "abcDEF123-_x";
-        set_provider_ec_cookie(&settings, &mut response, value);
-
-        let cookie_str = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("should set the EC cookie")
-            .to_str()
-            .expect("should be valid UTF-8");
-
-        assert!(
-            cookie_str.starts_with(&format!("{COOKIE_TS_EC}={value};")),
-            "a base64url provider value should be preserved verbatim, got {cookie_str}"
-        );
-    }
-
-    #[test]
-    fn set_provider_ec_cookie_rejects_unsafe_value() {
-        let settings = create_test_settings();
-        let mut response = empty_response();
-        set_provider_ec_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
-
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "an unsafe value must not set a cookie, preventing header injection"
         );
     }
 }

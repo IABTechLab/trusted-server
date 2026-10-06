@@ -11,18 +11,18 @@ use trusted_server_core::consent::build_context_from_signals;
 use trusted_server_core::consent::types::RawConsentSignals;
 use trusted_server_core::ec::consent::{GeoStatus, assemble_permissions};
 use trusted_server_core::evidence::OwnedRequestInfo;
-use trusted_server_core::permission_signal::PermissionSignalProvider;
+use trusted_server_core::permission_signal::PermissionSignalModule;
 use trusted_server_core::permissions::{Permission, PermissionMaps};
 use trusted_server_core::platform::GeoInfo;
 
-/// The signal providers the inspector asks, in the order every adapter offers
-/// them when `[permission_signal] provider` names none.
-fn providers() -> Vec<Arc<dyn PermissionSignalProvider>> {
+/// The signal modules the inspector asks, in the order every adapter offers
+/// them when `[permission_signal] module` names none.
+fn modules() -> Vec<Arc<dyn PermissionSignalModule>> {
     vec![
-        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
-        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
-        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
-        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
     ]
 }
 
@@ -54,19 +54,19 @@ fn eval_json(input: &str) -> String {
     };
     let ctx = build_context_from_signals(&signals);
     // The page carries no request, only the consent signals above, and each of
-    // the four providers answers from the consent record rather than from
+    // the four modules answers from the consent record rather than from
     // request evidence, so empty evidence changes none of their answers. A
-    // provider that read a header or a cookie would need real evidence here.
+    // module that read a header or a cookie would need real evidence here.
     let evidence = OwnedRequestInfo::default();
-    let providers = providers();
+    let modules = modules();
     let maps = PermissionMaps::standard();
     let (state, jurisdiction) = match input.geo.as_str() {
         "failed" => {
-            let state = assemble_permissions(&ctx, &evidence, GeoStatus::Failed, &providers);
+            let state = assemble_permissions(&ctx, &evidence, GeoStatus::Failed, &modules);
             (state, "unknown".to_string())
         }
         "none" => {
-            let state = assemble_permissions(&ctx, &evidence, GeoStatus::NoLocation, &providers);
+            let state = assemble_permissions(&ctx, &evidence, GeoStatus::NoLocation, &modules);
             (state, jurisdiction_name(maps.default_jurisdiction()))
         }
         _ => {
@@ -81,7 +81,7 @@ fn eval_json(input: &str) -> String {
                 asn: None,
             };
             let state =
-                assemble_permissions(&ctx, &evidence, GeoStatus::Located(&info), &providers);
+                assemble_permissions(&ctx, &evidence, GeoStatus::Located(&info), &modules);
             let jurisdiction = jurisdiction_name(
                 maps.jurisdiction_for(input.country.as_deref(), input.region.as_deref()),
             );
@@ -97,7 +97,10 @@ fn eval_json(input: &str) -> String {
         "jurisdiction": jurisdiction,
         "set": set,
         "tcf_decoded": ctx.tcf.is_some(),
-        "malformed_record": ctx.has_malformed_record(),
+        // No `malformed_record`. Whether an absent, unreadable or expired
+        // signal changes the permissions is each module's own decision,
+        // taken in its answer, so nothing at this level can report one and
+        // `false` would read as "none was found".
     })
     .to_string()
 }

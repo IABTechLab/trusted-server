@@ -1,5 +1,8 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use edgezero_core::manifest::ManifestLoader;
 
 /// Source file that must stay out of the generated list.
 ///
@@ -10,12 +13,53 @@ const EXCLUDED: &str = "migration_guards.rs";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    write_default_config_store_id();
+    write_migration_guard_sources();
+}
+
+/// Keeps every adapter's compiled default synchronized with the repository
+/// manifest.
+fn write_default_config_store_id() {
+    let crate_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").expect("should receive CARGO_MANIFEST_DIR from Cargo"),
+    );
+    let manifest_path = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("should resolve the workspace root from CARGO_MANIFEST_DIR")
+        .join("edgezero.toml");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+
+    let manifest = match ManifestLoader::from_path(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            println!(
+                "cargo::error=should load EdgeZero manifest at {}: {error}",
+                manifest_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let Some(config_store) = manifest.manifest().stores.config.as_ref() else {
+        println!(
+            "cargo::error=should declare [stores.config] in EdgeZero manifest at {}",
+            manifest_path.display()
+        );
+        std::process::exit(1);
+    };
+    let default_store_id = config_store.default_id();
+    println!("cargo:rustc-env=TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID={default_store_id}");
+}
+
+/// Lists every Rust source file under `src` for the migration guard, so a
+/// file added to or removed from core joins or leaves the guard on its own.
+fn write_migration_guard_sources() {
     // Cargo walks a directory named here, so adding, renaming or deleting a
     // source file reruns this script and the guard list follows the tree.
     println!("cargo:rerun-if-changed=src");
 
     let manifest_dir =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("should read CARGO_MANIFEST_DIR"));
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("should read CARGO_MANIFEST_DIR"));
     let src_dir = manifest_dir.join("src");
 
     let mut sources = Vec::new();
@@ -35,7 +79,7 @@ fn main() {
     }
     generated.push_str("];\n");
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("should read OUT_DIR"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("should read OUT_DIR"));
     fs::write(out_dir.join("migration_guard_sources.rs"), generated)
         .expect("should write the migration guard source list");
 }

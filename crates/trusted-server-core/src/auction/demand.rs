@@ -132,6 +132,10 @@ pub struct ImpressionExtension<'a> {
     pub slot: &'a ProviderSlotInput,
     /// The impression's `ext` object.
     pub ext: &'a mut Option<Map<String, Value>>,
+    /// Set by an implementation that has no demand to send for this slot.
+    /// The driver leaves the impression out of the request, and makes no
+    /// request at all when every impression is left out.
+    pub omitted: bool,
 }
 
 /// The request and response behavior of one selected demand source, compiled

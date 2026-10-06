@@ -344,7 +344,7 @@ mod tests {
             assume_single_jurisdiction = true
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"

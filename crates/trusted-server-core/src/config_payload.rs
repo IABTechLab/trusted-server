@@ -17,8 +17,19 @@ use crate::settings::Settings;
 /// Canonical logical secret store used by Trusted Server app-config secrets.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
+/// Default logical config-store id, from `[stores.config].default` in `edgezero.toml`.
+///
+/// Derived at build time so every adapter uses the repository manifest's default.
+pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID");
+
 /// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
+///
+/// Intentionally matches the logical store ID: an ordinary `ts config push`
+/// writes there unless `--key` selects another key. This constant does not apply
+/// runtime overrides; use [`crate::settings_data::config_key`] with the adapter's
+/// runtime configuration, or [`crate::settings_data::default_config_key`] for
+/// process-environment overrides.
+pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
 /// Id of the one integration whose blocks carry secret references.
 const DATADOME_INTEGRATION_ID: &str = "datadome";
@@ -142,7 +153,7 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::provider::{HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
+    use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
@@ -150,8 +161,7 @@ mod tests {
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
-        crate_test_settings_str, hmac_passphrase, select_hmac_provider,
-        select_host_signals_provider,
+        crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_module,
     };
 
     fn test_settings() -> Settings {
@@ -517,7 +527,7 @@ mod tests {
         let mut data =
             serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
         data["ec"] = serde_json::json!({
-            "provider": "primary",
+            "module": "primary",
             "primary": {
                 "implementation": "hmac",
                 "passphrase": "labeled-passphrase-key",
@@ -539,6 +549,78 @@ mod tests {
             written["ec"]["primary"]["passphrase"], "resolved-labeled-passphrase-32-bytes",
             "should replace the key name with the value from the secret store"
         );
+    }
+
+    /// Answers `ec_key`, refuses to be asked for that key's value as though it
+    /// were a key name, and otherwise answers as [`UnifiedSecretStore`] does.
+    struct RefusesAValueAsAKey;
+
+    const CROSS_NAMED_PASSPHRASE: &str = "resolved-cross-named-passphrase-32-bytes";
+
+    impl PlatformSecretStore for RefusesAValueAsAKey {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            match key {
+                "ec_key" => Ok(CROSS_NAMED_PASSPHRASE.as_bytes().to_vec()),
+                CROSS_NAMED_PASSPHRASE => Err(Report::new(PlatformError::SecretStore)),
+                _ => UnifiedSecretStore.get_bytes(store_name, key),
+            }
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    /// A block named after one built-in implementation that configures the
+    /// other is on the fixed secret list already, so its passphrase is
+    /// resolved once and not read back as a key name.
+    #[test]
+    fn a_built_in_block_naming_the_other_built_in_resolves_its_passphrase_once() {
+        use crate::secret_resolution::ConfiguredSecretFields as _;
+
+        for (name, implementation) in [("hmac", "host_signals"), ("host_signals", "hmac")] {
+            let mut data =
+                serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+            data["ec"] = serde_json::json!({
+                "module": name,
+                (name): { "implementation": implementation, "passphrase": "ec_key" },
+            });
+
+            let listed = TrustedServerAppConfig::configured_secret_fields(&data);
+            let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+            let envelope_json =
+                serde_json::to_string(&envelope).expect("should serialize envelope");
+            let reconstructed = settings_from_config_blob(
+                &envelope_json,
+                &RefusesAValueAsAKey,
+                &StoreName::from("ts_secrets"),
+            )
+            .unwrap_or_else(|error| panic!("[ec.{name}] should load: {error:?}"));
+
+            assert!(
+                listed.is_empty(),
+                "[ec.{name}] is on the fixed list, so it is not listed again"
+            );
+            let written =
+                serde_json::to_value(&reconstructed).expect("should serialize the loaded settings");
+            assert_eq!(
+                written["ec"][name]["passphrase"], CROSS_NAMED_PASSPHRASE,
+                "[ec.{name}] should carry the stored passphrase"
+            );
+        }
     }
 
     #[test]
@@ -796,9 +878,9 @@ mod tests {
         let mut original = test_settings();
         original.publisher.proxy_secret =
             Redacted::new("12345678901234567890123456789012".to_string());
-        select_hmac_provider(
+        select_hmac_module(
             &mut original.ec,
-            HMAC_PROVIDER_KEY,
+            HMAC_MODULE_KEY,
             "12345678901234567890123456789012",
         );
         original.handlers[0].password = Redacted::new("true".to_string());
@@ -812,8 +894,8 @@ mod tests {
             "numeric-looking proxy secret should remain a string"
         );
         assert_eq!(
-            hmac_passphrase(&reconstructed.ec, HMAC_PROVIDER_KEY),
-            hmac_passphrase(&original.ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&reconstructed.ec, HMAC_MODULE_KEY),
+            hmac_passphrase(&original.ec, HMAC_MODULE_KEY),
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(
@@ -855,7 +937,7 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
-        select_hmac_provider(&mut settings.ec, HMAC_PROVIDER_KEY, "short_key");
+        select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved passphrase");
@@ -873,7 +955,7 @@ mod tests {
     #[test]
     fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
         let mut original = test_settings();
-        select_host_signals_provider(&mut original.ec, "host-signals-passphrase-key");
+        select_host_signals_module(&mut original.ec, "host-signals-passphrase-key");
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -885,9 +967,9 @@ mod tests {
         assert_eq!(
             reconstructed
                 .ec
-                .provider_blocks
-                .get(HOST_SIGNALS_PROVIDER_KEY)
-                .and_then(crate::settings::EcProviderBlock::host_signals_settings)
+                .module_blocks
+                .get(HOST_SIGNALS_MODULE_KEY)
+                .and_then(crate::settings::EcModuleBlock::host_signals_settings)
                 .map(|config| config.passphrase.expose().as_str()),
             Some("resolved-host-signals-passphrase-32-bytes-ok")
         );
@@ -896,7 +978,7 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
         let mut settings = test_settings();
-        select_host_signals_provider(&mut settings.ec, "short_key");
+        select_host_signals_module(&mut settings.ec, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved host_signals passphrase");

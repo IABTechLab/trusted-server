@@ -51,10 +51,12 @@ pub struct AdRequest {
 /// `code` identifies the slot (e.g. `"atf_sidebar_ad"`) and becomes the
 /// impression ID in the outgoing `OpenRTB` request.
 ///
-/// `bids` is optional. When absent or empty the PBS provider falls back to
-/// a stored-request keyed by `code` (`imp.ext.prebid.storedrequest.id`).
-/// When present, each entry's params are forwarded inline to PBS as
-/// `imp.ext.prebid.bidder.<bidder>`.
+/// `bids` is optional. Absent or empty bids retain legacy PBS stored fallback
+/// keyed by `code` (`imp.ext.prebid.storedrequest.id`). Bidder params route through
+/// the server-owned auction plan. The reserved `trustedServer` entry accepts
+/// `bidderParams`, `zone`, and boolean `storedRequest` inside its params. False
+/// disables stored fallback, true permits it, and omission retains legacy
+/// inference. Usable inline PBS params take precedence after provider overrides.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdUnit {
@@ -563,7 +565,7 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     fn make_request() -> Request<EdgeBody> {
         Request::builder()
@@ -729,6 +731,24 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_wire_stored_intent_survives_conversion_and_atomic_admission() {
+        for (intent, expected_inputs, malformed) in [
+            (json!(true), 1, 0),
+            (json!(false), 0, 0),
+            (json!(null), 0, 1),
+        ] {
+            let body: AdRequest = serde_json::from_value(json!({
+                "adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},
+                    "bids":[{"bidder":"trustedServer","params":{"bidderParams":{},"storedRequest":intent}}]}]
+            })).expect("should deserialize wire request");
+            let request = convert_body_to_auction_request(&body, &make_settings());
+            let routed = route_auction(request, &make_request(), &single_prebid_plan(), None);
+            assert_eq!(routed.inputs().len(), expected_inputs);
+            assert_eq!(routed.diagnostics().malformed_envelope_count(), malformed);
+        }
+    }
+
+    #[test]
     fn canonical_tsjs_request_without_bids_feeds_stored_request_router() {
         let body = AdRequest {
             ad_units: vec![AdUnit {
@@ -748,7 +768,7 @@ mod tests {
 
         assert_eq!(routed.inputs().len(), 1);
         assert!(
-            routed.inputs()[0].slots()[0].is_stored_request(),
+            routed.inputs()[0].slots()[0].allows_stored_fallback_without_candidates(),
             "canonical empty bidder map should preserve stored-request intent"
         );
     }
@@ -1042,7 +1062,7 @@ mod tests {
     #[test]
     fn convert_tsjs_to_auction_request_filters_context_values() {
         let mut settings = make_settings();
-        settings.auction.allowed_context_keys = HashSet::from([
+        settings.auction.allowed_context_keys = BTreeSet::from([
             "segments".to_string(),
             "lockr_id".to_string(),
             "count".to_string(),

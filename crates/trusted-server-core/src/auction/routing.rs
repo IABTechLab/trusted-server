@@ -13,6 +13,7 @@ use super::types::{AdSlot, AuctionRequest, MediaType};
 const TRUSTED_SERVER_ENVELOPE: &str = "trustedServer";
 const BIDDER_PARAMS_FIELD: &str = "bidderParams";
 const ZONE_FIELD: &str = "zone";
+const STORED_REQUEST_FIELD: &str = "storedRequest";
 
 /// Maximum bidder entries admitted from one browser `bidderParams` envelope.
 pub(crate) const MAX_BIDDER_ENTRIES: usize = 128;
@@ -158,6 +159,13 @@ impl ProviderAuctionInput {
     pub fn slots(&self) -> &[ProviderSlotInput] {
         &self.slots
     }
+
+    /// Clone this input while retaining only slots accepted by `keep`.
+    pub(crate) fn filtered_slots(&self, mut keep: impl FnMut(&ProviderSlotInput) -> bool) -> Self {
+        let mut filtered = self.clone();
+        filtered.slots.retain(|slot| keep(slot));
+        filtered
+    }
 }
 
 /// One eligible slot with only the demand assigned to this provider.
@@ -166,7 +174,7 @@ pub struct ProviderSlotInput {
     slot: AdSlot,
     bidder_params: BTreeMap<BidderId, Value>,
     zone: Option<String>,
-    trusted_stored_request: bool,
+    stored_request: StoredRequestIntent,
 }
 
 impl ProviderSlotInput {
@@ -188,11 +196,14 @@ impl ProviderSlotInput {
         self.zone.as_deref()
     }
 
-    /// Whether this slot carries no bidder parameters and is sent as a stored
-    /// request by an implementation that serves them.
-    #[must_use]
-    pub fn is_stored_request(&self) -> bool {
-        self.trusted_stored_request
+    #[cfg(test)]
+    pub(crate) fn allows_stored_fallback_without_candidates(&self) -> bool {
+        self.bidder_params.is_empty() && self.allows_stored_fallback()
+    }
+
+    pub(crate) fn allows_stored_fallback(&self) -> bool {
+        self.stored_request
+            .allows_fallback(!self.bidder_params.is_empty())
     }
 }
 
@@ -265,10 +276,34 @@ impl TrustedProviderRoutes {
     }
 }
 
+/// Stored fallback permission, retaining the original legacy admission shape.
+#[derive(Debug, Clone, Copy, Default)]
+enum StoredRequestIntent {
+    #[default]
+    Disabled,
+    Explicit,
+    Legacy {
+        empty_admission: bool,
+    },
+}
+
+impl StoredRequestIntent {
+    /// Legacy fallback retains original candidate presence after overrides.
+    /// Usable overrides become inline demand; candidates still empty afterward
+    /// preserve the pre-intent stored fallback behavior.
+    fn allows_fallback(self, has_candidates: bool) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Explicit => true,
+            Self::Legacy { empty_admission } => empty_admission || has_candidates,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct NormalizedSlotDemand {
     bidder_params: BTreeMap<BidderId, Value>,
-    stored_request: bool,
+    stored_request: StoredRequestIntent,
     zone: Option<String>,
 }
 
@@ -366,12 +401,13 @@ pub(crate) fn route_auction_with_trusted_routes(
         for (provider_index, builder) in builders.iter_mut().enumerate() {
             let bidder_params = std::mem::take(&mut routed_params[provider_index]);
             let trusted_route = trusted_provider_indices.contains(&provider_index);
-            let trusted_stored_request =
-                builder.serves_stored_requests && demand.stored_request && bidder_params.is_empty();
-            let include = builder.routing == RoutingMode::AllEligible
-                || !bidder_params.is_empty()
-                || trusted_stored_request
-                || trusted_route;
+            let include = !bidder_params.is_empty()
+                || trusted_route
+                || if builder.serves_stored_requests {
+                    demand.stored_request.allows_fallback(false)
+                } else {
+                    builder.routing == RoutingMode::AllEligible
+                };
             if !include {
                 continue;
             }
@@ -382,7 +418,7 @@ pub(crate) fn route_auction_with_trusted_routes(
                     .serves_stored_requests
                     .then(|| demand.zone.clone())
                     .flatten(),
-                trusted_stored_request,
+                stored_request: demand.stored_request,
             });
         }
     }
@@ -443,16 +479,26 @@ fn normalize_slot_demand(
 ) -> NormalizedSlotDemand {
     if bidders.is_empty() {
         return NormalizedSlotDemand {
-            stored_request: true,
+            stored_request: StoredRequestIntent::Legacy {
+                empty_admission: true,
+            },
             ..Default::default()
         };
     }
 
-    let mut demand = NormalizedSlotDemand::default();
+    let mut demand = NormalizedSlotDemand {
+        stored_request: StoredRequestIntent::Legacy {
+            empty_admission: false,
+        },
+        ..Default::default()
+    };
     if let Some(envelope) = bidders.get(TRUSTED_SERVER_ENVELOPE) {
         match normalize_envelope(envelope) {
             Some(normalized) => demand = normalized,
-            None => diagnostics.record_malformed_envelope(),
+            None => {
+                diagnostics.record_malformed_envelope();
+                demand = NormalizedSlotDemand::default();
+            }
         }
     }
 
@@ -477,10 +523,12 @@ fn normalize_slot_demand(
 
 fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     let object = envelope.as_object()?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), BIDDER_PARAMS_FIELD | ZONE_FIELD))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            BIDDER_PARAMS_FIELD | ZONE_FIELD | STORED_REQUEST_FIELD
+        )
+    }) {
         return None;
     }
     let zone = match object.get(ZONE_FIELD) {
@@ -488,28 +536,25 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
         Some(Value::String(zone)) if zone.len() <= MAX_PREBID_ZONE_BYTES => Some(zone.clone()),
         Some(_) => return None,
     };
-    let Some(raw_params) = object.get(BIDDER_PARAMS_FIELD) else {
+    let params = match object.get(BIDDER_PARAMS_FIELD) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_object()?),
+    };
+    let stored_request = match object.get(STORED_REQUEST_FIELD) {
+        None => StoredRequestIntent::Legacy {
+            empty_admission: params.is_none_or(serde_json::Map::is_empty),
+        },
+        Some(Value::Bool(false)) => StoredRequestIntent::Disabled,
+        Some(Value::Bool(true)) => StoredRequestIntent::Explicit,
+        Some(_) => return None,
+    };
+    let Some(params) = params else {
         return Some(NormalizedSlotDemand {
-            stored_request: true,
+            stored_request,
             zone,
             ..Default::default()
         });
     };
-    if raw_params.is_null() {
-        return Some(NormalizedSlotDemand {
-            stored_request: true,
-            zone,
-            ..Default::default()
-        });
-    }
-    let params = raw_params.as_object()?;
-    if params.is_empty() {
-        return Some(NormalizedSlotDemand {
-            stored_request: true,
-            zone,
-            ..Default::default()
-        });
-    }
     if params.len() > MAX_BIDDER_ENTRIES {
         return None;
     }
@@ -524,7 +569,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     }
     Some(NormalizedSlotDemand {
         bidder_params,
-        stored_request: false,
+        stored_request,
         zone,
     })
 }
@@ -655,6 +700,123 @@ mod tests {
     }
 
     #[test]
+    fn pbs_admission_respects_intent_without_changing_aps_eligibility() {
+        for (params, pbs_ids) in [
+            (json!({"bidderParams":{}, "storedRequest":false}), vec![]),
+            (
+                json!({"bidderParams":{"unknown":{"id":1}}, "storedRequest":false}),
+                vec![],
+            ),
+            (json!({"bidderParams":{"unknown":{"id":1}}}), vec![]),
+            (
+                json!({"bidderParams":{"alpha":{}}, "storedRequest":false}),
+                vec!["pbs_a"],
+            ),
+            (json!({"bidderParams":{"alpha":{}}}), vec!["pbs_a"]),
+            (
+                json!({"bidderParams":{"alpha":{"id":1}}, "storedRequest":true}),
+                vec!["pbs_a", "pbs_b"],
+            ),
+            (
+                json!({"bidderParams":{}, "storedRequest":true}),
+                vec!["pbs_a", "pbs_b"],
+            ),
+            (json!({"bidderParams":{}}), vec!["pbs_a", "pbs_b"]),
+        ] {
+            let routed = route_auction(
+                request(vec![slot(HashMap::from([(
+                    "trustedServer".to_string(),
+                    params,
+                )]))]),
+                &inbound(),
+                &plan(),
+                None,
+            );
+            let mut expected = vec!["aps_primary"];
+            expected.extend(pbs_ids);
+            assert_eq!(
+                routed
+                    .inputs()
+                    .iter()
+                    .map(|input| input.provider_id().as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(routed.diagnostics().malformed_envelope_count(), 0);
+        }
+    }
+
+    #[test]
+    fn malformed_stored_intent_rejects_envelope_atomically_but_preserves_direct_demand() {
+        for intent in [Value::Null, json!("false"), json!(0), json!([]), json!({})] {
+            for params in [
+                None,
+                Some(Value::Null),
+                Some(json!({})),
+                Some(json!({"alpha":{"id":1}})),
+            ] {
+                for direct in [false, true] {
+                    let mut value = json!({"storedRequest":intent, "zone":"example-zone"});
+                    if let Some(params) = params.clone() {
+                        value["bidderParams"] = params;
+                    }
+                    let mut bidders = HashMap::from([("trustedServer".to_string(), value)]);
+                    if direct {
+                        bidders.insert("alpha".to_string(), json!({"direct":1}));
+                    }
+                    let routed =
+                        route_auction(request(vec![slot(bidders)]), &inbound(), &plan(), None);
+                    assert_eq!(routed.diagnostics().malformed_envelope_count(), 1);
+                    assert_eq!(routed.inputs().len(), if direct { 2 } else { 1 });
+                    assert_eq!(routed.inputs()[0].provider_id().as_str(), "aps_primary");
+                    if direct {
+                        let slot = &input(&routed, "pbs_a").slots()[0];
+                        assert!(!slot.allows_stored_fallback());
+                        assert_eq!(slot.zone(), None);
+                        assert_eq!(
+                            slot.bidder_params().values().collect::<Vec<_>>(),
+                            vec![&json!({"direct":1})]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_stored_intent_and_disabled_inline_are_admitted() {
+        for (params, expected) in [
+            (
+                json!({"bidderParams": {}, "storedRequest": true}),
+                vec!["aps_primary", "pbs_a", "pbs_b"],
+            ),
+            (
+                json!({"bidderParams": {"alpha": {"placement": 1}}, "storedRequest": false}),
+                vec!["aps_primary", "pbs_a"],
+            ),
+        ] {
+            let routed = route_auction(
+                request(vec![slot(HashMap::from([(
+                    "trustedServer".to_string(),
+                    params,
+                )]))]),
+                &inbound(),
+                &plan(),
+                None,
+            );
+            assert_eq!(
+                routed
+                    .inputs()
+                    .iter()
+                    .map(|input| input.provider_id().as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(routed.diagnostics().malformed_envelope_count(), 0);
+        }
+    }
+
+    #[test]
     fn missing_null_and_empty_envelope_params_fan_out_stored_routes() {
         let cases = [
             ("missing", envelope(None)),
@@ -682,11 +844,11 @@ mod tests {
                 "{name} should fan out to both PBS providers while APS remains all-eligible"
             );
             assert!(
-                input(&routed, "pbs_a").slots()[0].is_stored_request(),
+                input(&routed, "pbs_a").slots()[0].allows_stored_fallback_without_candidates(),
                 "{name} should create stored intent"
             );
             assert!(
-                input(&routed, "pbs_b").slots()[0].is_stored_request(),
+                input(&routed, "pbs_b").slots()[0].allows_stored_fallback_without_candidates(),
                 "{name} should create stored intent for every PBS provider"
             );
         }
@@ -701,11 +863,11 @@ mod tests {
             None,
         );
         assert!(
-            input(&routed, "pbs_a").slots()[0].is_stored_request(),
+            input(&routed, "pbs_a").slots()[0].allows_stored_fallback_without_candidates(),
             "empty canonical demand should preserve stored-request behavior"
         );
         assert!(
-            input(&routed, "pbs_b").slots()[0].is_stored_request(),
+            input(&routed, "pbs_b").slots()[0].allows_stored_fallback_without_candidates(),
             "empty canonical demand should fan out to same-profile PBS plans"
         );
     }
@@ -955,13 +1117,13 @@ mod tests {
         let pbs_a = &input(&routed, "pbs_a").slots()[0];
         assert_eq!(pbs_a.bidder_params().len(), 1);
         assert!(
-            !pbs_a.is_stored_request(),
+            !pbs_a.allows_stored_fallback_without_candidates(),
             "inline params should win for this PBS provider"
         );
         assert_eq!(pbs_a.zone(), Some("home"));
         let pbs_b = &input(&routed, "pbs_b").slots()[0];
         assert!(pbs_b.bidder_params().is_empty());
-        assert!(pbs_b.is_stored_request());
+        assert!(pbs_b.allows_stored_fallback_without_candidates());
         let direct = &input(&routed, "openrtb_direct").slots()[0];
         assert_eq!(direct.bidder_params().len(), 1);
         assert!(direct.zone().is_none());

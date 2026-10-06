@@ -25,9 +25,9 @@ use http::header::{self, HeaderValue};
 use http::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
-use trusted_server_core::ec::device::{DeviceProvider, DeviceSignals};
-use trusted_server_core::ec::provider::{
-    EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput, ProviderCode,
+use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
+use trusted_server_core::ec::module::{
+    EdgeCookieModule, GeneratedEdgeCookie, IdentityInput, ModuleCode,
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
@@ -185,15 +185,15 @@ impl SeamProbeGeo {
 pub struct SeamProbeEc;
 
 /// The four-character code core stamps on identifiers this provider owns.
-const SEAM_PROBE_EC_CODE: ProviderCode = trusted_server_core::provider_code!("sprb");
+const SEAM_PROBE_EC_CODE: ModuleCode = trusted_server_core::module_code!("sprb");
 
 #[async_trait::async_trait(?Send)]
-impl EdgeCookieProvider for SeamProbeEc {
+impl EdgeCookieModule for SeamProbeEc {
     fn id(&self) -> &'static str {
         SEAM_PROBE_ID
     }
 
-    fn code(&self) -> ProviderCode {
+    fn code(&self) -> ModuleCode {
         SEAM_PROBE_EC_CODE
     }
 
@@ -223,7 +223,7 @@ impl EdgeCookieProvider for SeamProbeEc {
 pub struct SeamProbeDevice;
 
 #[async_trait::async_trait(?Send)]
-impl DeviceProvider for SeamProbeDevice {
+impl DeviceModule for SeamProbeDevice {
     fn id(&self) -> &'static str {
         SEAM_PROBE_ID
     }

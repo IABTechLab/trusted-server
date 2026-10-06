@@ -73,7 +73,7 @@ const PURPOSES: &[(u8, &[&str])] = &[
 /// The TCF purpose that grants `permission`, or `None` when no purpose does.
 ///
 /// A permission no purpose maps to is one TCF has nothing to say about, and
-/// the provider answers silence for it rather than a refusal.
+/// the module answers silence for it rather than a refusal.
 ///
 /// Compared on the identifier string, so a lookup is at most twenty string
 /// comparisons. Resolving each identifier back to a [`Permission`] first would

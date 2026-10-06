@@ -60,8 +60,11 @@ web-time = { workspace = true }
 getrandom = { workspace = true, features = ["js"] }
 uuid = { workspace = true, features = ["js"] }
 
+[build-dependencies]
+edgezero-core = { workspace = true }
+
 [features]
-# Compiles in the `client_fixed` demonstration Edge Cookie provider. Off by
+# Compiles in the `client_fixed` demonstration Edge Cookie module. Off by
 # default so production builds cannot select a fixed shared word as identity.
 client-fixed-demo = []
 default = []

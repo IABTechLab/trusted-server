@@ -13,6 +13,8 @@ use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+#[cfg(any(test, target_arch = "wasm32"))]
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
@@ -20,7 +22,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::provider::{EdgeCookieProvider, build_reusable_provider};
+use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{
@@ -79,23 +81,23 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
-    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    /// The Edge Cookie module `[ec] module` selects, resolved once here.
     ///
     /// This adapter runs a fresh instance per request, so application state and
     /// the request path used to resolve the same selection twice for every
     /// request, once to check it could be satisfied and once to use it.
     /// Resolving reads no request data, so the result is kept and handed to
     /// every request through
-    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
-    /// `None` for a deployment that selects no provider, and for one whose
-    /// provider must be resolved per request.
-    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    /// The permission signal providers `[permission_signal] provider` selects
+    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
+    /// `None` for a deployment that selects no module, and for one whose
+    /// module must be resolved per request.
+    resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules `[permission_signal] module` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
-    permission_signal_providers:
-        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -125,6 +127,30 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
+/// Older Cloudflare bindings used this JSON property before config stores adopted
+/// the manifest-derived default.
+///
+/// Remove this fallback only when support for those bindings is deliberately retired.
+#[cfg(any(test, target_arch = "wasm32"))]
+const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Debug, Eq, PartialEq, derive_more::Display)]
+enum CloudflareConfigEnvelopeError {
+    #[display(
+        "Cloudflare TRUSTED_SERVER_CONFIG has no `{primary_key}` or legacy `{legacy_key}` property"
+    )]
+    Missing {
+        primary_key: &'static str,
+        legacy_key: &'static str,
+    },
+    #[display("Cloudflare TRUSTED_SERVER_CONFIG value at `{key}` must be a string")]
+    NonString { key: &'static str },
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl core::error::Error for CloudflareConfigEnvelopeError {}
+
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
     let raw_config = CLOUDFLARE_CONFIG_JSON.with(|slot| slot.get().cloned());
@@ -132,7 +158,9 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
-        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+        .attach(format!(
+            "set TRUSTED_SERVER_CONFIG to JSON containing the `{CONFIG_BLOB_KEY}` blob envelope"
+        ))
     })?;
     let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -140,14 +168,11 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         })
         .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
     })?;
-    let envelope = value
-        .get("app_config")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
-            })
-        })?;
+    let envelope = cloudflare_config_envelope(&value).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: error.to_string(),
+        })
+    })?;
     let env = CLOUDFLARE_ENV
         .with(|slot| slot.get().cloned())
         .ok_or_else(|| {
@@ -160,11 +185,39 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
     settings_from_config_blob(envelope, &secret_store, &default_secret_store)
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn cloudflare_config_envelope(
+    value: &serde_json::Value,
+) -> Result<&str, CloudflareConfigEnvelopeError> {
+    match value.get(CONFIG_BLOB_KEY).filter(|envelope| {
+        // Treat a blank placeholder as absent so a populated legacy property
+        // remains usable during migration.
+        envelope.as_str() != Some("")
+    }) {
+        Some(envelope) => envelope
+            .as_str()
+            .ok_or(CloudflareConfigEnvelopeError::NonString {
+                key: CONFIG_BLOB_KEY,
+            }),
+        None => match value.get(LEGACY_CONFIG_BLOB_KEY) {
+            Some(envelope) => envelope
+                .as_str()
+                .ok_or(CloudflareConfigEnvelopeError::NonString {
+                    key: LEGACY_CONFIG_BLOB_KEY,
+                }),
+            None => Err(CloudflareConfigEnvelopeError::Missing {
+                primary_key: CONFIG_BLOB_KEY,
+                legacy_key: LEGACY_CONFIG_BLOB_KEY,
+            }),
+        },
+    }
+}
+
 /// Build the application state from explicit settings.
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
 /// fail to initialize.
 fn build_state_with_settings(
@@ -218,7 +271,7 @@ fn build_state_with_registrations_and_services(
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
     let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
 
-    // Composition root: resolve the provider selection once, before any request
+    // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. The registry is
@@ -228,56 +281,57 @@ fn build_state_with_registrations_and_services(
     // `RuntimeServices` may have resolved one already, and that one comes first
     // because it is what the request path will see. This adapter supplies no
     // host signals, so that argument stays `None` until it does.
-    let resolved_ec_provider = build_reusable_provider(
+    let resolved_ec_module = build_reusable_module(
         &settings.ec,
         None,
         services
             .as_ref()
-            .and_then(RuntimeServices::resolved_ec_provider)
-            .or_else(|| registry.ec_provider()),
+            .and_then(RuntimeServices::resolved_ec_module)
+            .or_else(|| registry.ec_module()),
     )?;
-    let permission_signal_providers =
-        trusted_server_core::permission_signal::build_permission_signal_providers(
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
-            &shipped_signal_providers(),
+            &shipped_signal_modules(),
         )?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        resolved_ec_provider,
-        permission_signal_providers,
+        resolved_ec_module,
+        permission_signal_modules,
         services,
     }))
 }
 
-/// The permission signal providers this adapter links, in the order they run
+/// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
 /// carry a choice someone made through an interface follow, so an answer
 /// given at a prompt amends the header the visitor arrived with.
 ///
-/// Core supplies no provider of its own, so this is where a deployment's
+/// Core supplies no module of its own, so this is where a deployment's
 /// schemes are decided. A scheme is added by linking its crate here, and a
 /// scheme core has never heard of plugs in the same way.
-fn shipped_signal_providers()
--> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
     vec![
-        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
-        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
-        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
-        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
     ]
 }
 
 impl AppState {
-    /// Build per-request [`RuntimeServices`], carrying the Edge Cookie provider
+    /// Build per-request [`RuntimeServices`], carrying the Edge Cookie module
     /// the composition root already resolved and applying the module-supplied
-    /// geo, Edge Cookie and device providers selected by `[geo]`, `[ec]` and
-    /// `[device] provider`.
+    /// geo, Edge Cookie and device modules selected by `[geo]`, `[ec]` and
+    /// `[device] module`.
     ///
-    /// No Edge Cookie provider is carried when the composition root found
+    /// No Edge Cookie module is carried when the composition root found
     /// nothing safe to keep, so the request path resolves the selection for
     /// itself.
     ///
@@ -291,17 +345,17 @@ impl AppState {
             .services
             .clone()
             .unwrap_or_else(|| {
-                build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
             })
-            .with_resolved_ec_provider(self.resolved_ec_provider.clone());
-        if let Some(provider) = self.registry.geo_provider() {
-            services = services.with_geo(provider);
+            .with_resolved_ec_module(self.resolved_ec_module.clone());
+        if let Some(module) = self.registry.geo_provider() {
+            services = services.with_geo(module);
         }
-        if let Some(provider) = self.registry.ec_provider() {
-            services = services.with_ec_provider(provider);
+        if let Some(module) = self.registry.ec_module() {
+            services = services.with_ec_provider(module);
         }
-        if let Some(provider) = self.registry.device_provider() {
-            services = services.with_device_provider(provider);
+        if let Some(module) = self.registry.device_provider() {
+            services = services.with_device_provider(module);
         }
         services
     }
@@ -330,7 +384,7 @@ impl AppState {
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this request, or when the request's `Cookie` header is not valid UTF-8.
 async fn build_ec_context(
     settings: &Settings,
@@ -428,6 +482,20 @@ fn admin_key_management_not_supported() -> Response {
     let body = edgezero_core::body::Body::from(
         "Admin key management is not supported on Cloudflare Workers.\n\
          Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn cache_purge_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Template cache purge is not supported on Cloudflare Workers.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
     );
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
@@ -645,7 +713,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     })
             } else {
                 // Identity could not be established (for example the selected
-                // Edge Cookie provider is unavailable). Answer with an error
+                // Edge Cookie module is unavailable). Answer with an error
                 // rather than serving the page with no identity.
                 let mut ec_context = match build_ec_context(&state.settings, &services, &req).await
                 {
@@ -840,6 +908,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
         }
 
+        let cache_purge_unsupported =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(cache_purge_not_supported())
+            });
+        for method in publisher_fallback_methods() {
+            router = router.route(
+                "/_ts/admin/cache/purge",
+                method,
+                cache_purge_unsupported.clone(),
+            );
+        }
+
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
                 Ok(legacy_admin_alias_denied())
@@ -869,10 +949,10 @@ mod tests {
 
     use super::*;
 
-    /// Settings selecting a vendor Edge Cookie provider this adapter does not
-    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// Settings selecting a vendor Edge Cookie module this adapter does not
+    /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
-    const UNINJECTED_PROVIDER_TOML: &str = r#"
+    const UNINJECTED_MODULE_TOML: &str = r#"
         [[handlers]]
         path = "^/_ts/admin"
         username = "admin"
@@ -885,13 +965,13 @@ mod tests {
         proxy_secret = "unit-test-proxy-secret"
 
         [ec]
-        provider = "acme"
+        module = "acme"
 
         [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
-        # An Edge Cookie provider is configured, so single-jurisdiction
-        # operation is acknowledged because no geo provider is selected.
+        # An Edge Cookie module is configured, so single-jurisdiction
+        # operation is acknowledged because no geo module is selected.
         [geo]
         assume_single_jurisdiction = true
     "#;
@@ -900,23 +980,23 @@ mod tests {
     /// default context.
     ///
     /// This adapter used to log the failure and continue with
-    /// `EcContext::default()`, so a deployment whose selected provider could not
+    /// `EcContext::default()`, so a deployment whose selected module could not
     /// be built served every request with no identity. The call sites propagate
     /// the error to `http_error`, matching the Fastly adapter. The settings are
     /// parsed directly, bypassing the composition root's startup check, so the
     /// per-request behavior can be exercised with a selection the adapter
     /// cannot supply.
     #[tokio::test]
-    async fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
-        let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
-            .expect("should parse settings selecting an uninjected provider");
+    async fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
+        let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)
+            .expect("should parse settings selecting an uninjected module");
         let req = request_builder()
             .method("POST")
             .uri("https://test-publisher.example.com/auction")
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        // No resolved provider is threaded here, so the request path resolves
+        // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
         let services = build_runtime_services(&ctx, &settings, &Arc::default());
@@ -924,11 +1004,11 @@ mod tests {
 
         let error = build_ec_context(&settings, &services, &req)
             .await
-            .expect_err("an unavailable Edge Cookie provider must fail the request");
+            .expect_err("an unavailable Edge Cookie module must fail the request");
 
         assert!(
             error.to_string().contains("acme"),
-            "the error should name the selected provider, got: {error}"
+            "the error should name the selected module, got: {error}"
         );
     }
 
@@ -1014,6 +1094,20 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_config_prefers_manifest_default_key() {
+        let value = serde_json::json!({
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+            CONFIG_BLOB_KEY: "manifest-envelope",
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("manifest-envelope"),
+            "manifest-derived key should take precedence"
+        );
+    }
+
+    #[test]
     fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
         let mut settings = Settings::from_toml(
             r#"
@@ -1076,6 +1170,91 @@ mod tests {
         assert!(
             format!("{error:?}").contains("concurrent provider fanout"),
             "should identify unsupported fanout: {error:?}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_accepts_legacy_app_config_key() {
+        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: "legacy-envelope" });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("legacy-envelope"),
+            "legacy app_config key should remain compatible"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_treats_blank_primary_as_absent() {
+        let value = serde_json::json!({
+            CONFIG_BLOB_KEY: "",
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Ok("legacy-envelope"),
+            "blank primary should not shadow a populated legacy property"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_reports_missing_keys() {
+        let value = serde_json::json!({});
+
+        let error = cloudflare_config_envelope(&value)
+            .expect_err("should reject config without either accepted property");
+
+        assert_eq!(
+            error,
+            CloudflareConfigEnvelopeError::Missing {
+                primary_key: CONFIG_BLOB_KEY,
+                legacy_key: LEGACY_CONFIG_BLOB_KEY,
+            },
+            "missing config should name both accepted keys"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cloudflare TRUSTED_SERVER_CONFIG has no `{CONFIG_BLOB_KEY}` or legacy `{LEGACY_CONFIG_BLOB_KEY}` property"
+            ),
+            "missing config should report absent properties, not invalid types"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_does_not_mask_malformed_manifest_value() {
+        let value = serde_json::json!({
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+            CONFIG_BLOB_KEY: true,
+        });
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Err(CloudflareConfigEnvelopeError::NonString {
+                key: CONFIG_BLOB_KEY,
+            }),
+            "malformed manifest-derived value should not fall back"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_reports_malformed_legacy_value() {
+        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: false });
+        let error = cloudflare_config_envelope(&value)
+            .expect_err("should reject a malformed legacy config value");
+
+        assert_eq!(
+            error,
+            CloudflareConfigEnvelopeError::NonString {
+                key: LEGACY_CONFIG_BLOB_KEY,
+            },
+            "malformed legacy value should name the legacy key"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Cloudflare TRUSTED_SERVER_CONFIG value at `app_config` must be a string",
+            "configuration error should name the malformed legacy key"
         );
     }
 }

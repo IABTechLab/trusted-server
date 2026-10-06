@@ -1,7 +1,10 @@
-//! Edge Cookie (EC) ID generation using HMAC.
+//! Reading an inbound Edge Cookie (EC) identifier.
 //!
-//! This module provides functionality for generating privacy-preserving EC IDs
-//! based on the client IP address and a secret key.
+//! [`recognized_ec_id`] reads the identifier a request carries and recognizes
+//! it through the selected module, so only an identifier this deployment
+//! issued is handed on. The generation helpers here are compiled for tests
+//! only, and the production lifecycle creates identifiers through
+//! [`EcContext`](crate::ec::EcContext).
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
@@ -13,29 +16,27 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 #[cfg(test)]
 use crate::ec::generation::normalize_ip;
 #[cfg(test)]
-use crate::ec::provider::IdentityInput;
-use crate::ec::provider::{provider_owns_id, request_provider};
+use crate::ec::module::IdentityInput;
+use crate::ec::module::{module_owns_id, request_module};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::evidence::BorrowedRequestInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
-/// Generates a fresh EC ID using the configured Edge Cookie provider.
+/// Test helper that generates a fresh EC ID with the configured Edge Cookie
+/// module.
 ///
-/// Routes through the pluggable provider model: the active `[ec] provider`
-/// selection decides the outcome. Returns `Ok(None)` when no provider is
-/// configured, so Trusted Server runs statelessly and creates no Edge Cookie.
-/// `request_headers` lets a provider that derives identity from request
-/// evidence read it; the built-in HMAC provider ignores it and uses only the
-/// normalized client IP.
+/// The `[ec] module` selection decides the outcome. Returns `Ok(None)` when
+/// no module is configured, so no Edge Cookie is created. `request_headers`
+/// lets a module that derives identity from request evidence read it. The
+/// built-in HMAC module ignores it and uses only the normalized client IP.
+/// The production lifecycle creates identifiers through
+/// [`EcContext`](crate::ec::EcContext) instead.
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::EdgeCookie`] if provider generation fails
-///
-/// Currently exercised only by tests: the production EC lifecycle generates IDs
-/// through [`crate::ec`]/`EcContext` rather than this edge-cookie helper.
+/// - [`TrustedServerError::EdgeCookie`] if module generation fails
 #[cfg(test)]
 pub async fn generate_ec_id(
     settings: &Settings,
@@ -53,26 +54,26 @@ pub async fn generate_ec_id(
 
     log::trace!("Generating fresh EC ID from normalized client context");
 
-    let Some(provider) = request_provider(&settings.ec, services)? else {
-        log::info!("No Edge Cookie provider configured; running statelessly");
+    let Some(module) = request_module(&settings.ec, services)? else {
+        log::info!("No Edge Cookie module configured; running statelessly");
         return Ok(None);
     };
 
-    // The provider reads request data (the client IP and the request headers)
-    // borrowed at call time, so nothing is cloned. A provider that also reads
+    // The module reads request data (the client IP and the request headers)
+    // borrowed at call time, so nothing is cloned. A module that also reads
     // host signals takes them from the injected `HostSignals` service rather
     // than from this request info.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
-    // The publisher path applies the permission gate at the call site, and the
-    // built-in provider reads neither the resolved permissions nor consent, so
-    // they are not threaded here.
-    let generated = provider
+    // This helper skips the permission gate, and the built-in module reads
+    // neither the resolved permissions nor the consent context, so they are
+    // not threaded here.
+    let generated = module
         .generate(&request_info, &IdentityInput::default(), services)
         .await?;
-    let generated = crate::ec::provider::GeneratedEdgeCookie {
+    let generated = crate::ec::module::GeneratedEdgeCookie {
         id: generated
             .id
-            .map(|value| crate::ec::provider::apply_provider_code(provider.as_ref(), &value)),
+            .map(|value| crate::ec::module::apply_module_code(module.as_ref(), &value)),
         response_headers: generated.response_headers,
     };
     Ok(generated.id)
@@ -89,13 +90,13 @@ pub async fn generate_ec_id(
 /// The only checks applied here are the global cookie bounds, the length cap
 /// and the cookie-safe alphabet in
 /// [`ec_id_has_only_allowed_chars`](crate::ec::cookies::ec_id_has_only_allowed_chars),
-/// which every identifier must satisfy whichever provider created it. Those
+/// which every identifier must satisfy whichever module created it. Those
 /// bounds are a backstop on what may travel in a cookie, not a test of
 /// authenticity, and on their own they accept any run of `[A-Za-z0-9._~-]`.
 ///
 /// Deciding whether this deployment issued the value needs the selected
-/// provider, which this function does not have, so it is deliberately not
-/// public. Use [`recognized_ec_id`], which applies provider ownership on top.
+/// module, which this function does not have, so it is deliberately not
+/// public. Use [`recognized_ec_id`], which applies module ownership on top.
 ///
 /// # Errors
 ///
@@ -135,12 +136,12 @@ pub(crate) fn unvalidated_ec_id_from_request(
 }
 
 /// Gets an existing EC ID from the request, but only one the deployment's
-/// selected provider recognizes.
+/// selected module recognizes.
 ///
 /// [`unvalidated_ec_id_from_request`] applies the global cookie bounds alone,
 /// the length cap and the cookie-safe alphabet, which any value a browser can
-/// be persuaded to carry will pass. This adds provider ownership on top, so the
-/// identifier's `{code}~` prefix is dispatched to the provider that owns it,
+/// be persuaded to carry will pass. This adds module ownership on top, so the
+/// identifier's `{code}~` prefix is dispatched to the module that owns it,
 /// which decides whether the value is one of its own. That is the same test the
 /// EC lifecycle applies when it reads the cookie back, so both agree on what
 /// this deployment issued.
@@ -151,13 +152,13 @@ pub(crate) fn unvalidated_ec_id_from_request(
 /// [`get_or_generate_ec_id`], which is `pub` and returns the raw cookie value
 /// without this ownership check, so prefer this function wherever the identifier
 /// will be trusted or egressed. A vendor identifier is not required to match the
-/// built-in HMAC shape, so the right test is the selected provider's own
-/// [`accepts_id`](crate::ec::provider::EdgeCookieProvider::accepts_id) rather
+/// built-in HMAC shape, so the right test is the selected module's own
+/// [`accepts_id`](crate::ec::module::EdgeCookieModule::accepts_id) rather
 /// than the built-in strict format check.
 ///
-/// Returns `None` for a value carrying another deployment's provider code, for a
-/// value the selected provider does not recognize, and for every value at all
-/// when no provider is selected, because a stateless deployment issues no
+/// Returns `None` for a value carrying another deployment's module code, for a
+/// value the selected module does not recognize, and for every value at all
+/// when no module is selected, because a stateless deployment issues no
 /// identifier and so has none to hand on.
 ///
 /// Use this wherever the identifier leaves the edge (an outbound origin URL, a
@@ -167,7 +168,7 @@ pub(crate) fn unvalidated_ec_id_from_request(
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-/// - [`TrustedServerError::EdgeCookie`] if the selected provider cannot be built
+/// - [`TrustedServerError::EdgeCookie`] if the selected module cannot be built
 pub fn recognized_ec_id(
     settings: &Settings,
     services: &RuntimeServices,
@@ -177,20 +178,20 @@ pub fn recognized_ec_id(
         return Ok(None);
     };
 
-    let Some(provider) = request_provider(&settings.ec, services)? else {
+    let Some(module) = request_module(&settings.ec, services)? else {
         log::debug!(
-            "No Edge Cookie provider configured; withholding the request's EC ID from egress"
+            "No Edge Cookie module configured; withholding the request's EC ID from egress"
         );
         return Ok(None);
     };
 
-    if provider_owns_id(provider.as_ref(), &ec_id) {
+    if module_owns_id(module.as_ref(), &ec_id) {
         return Ok(Some(ec_id));
     }
 
     log::debug!(
-        "Withholding an EC ID provider `{}` does not recognize from egress",
-        provider.id(),
+        "Withholding an EC ID module `{}` does not recognize from egress",
+        module.id(),
     );
     Ok(None)
 }
@@ -201,10 +202,10 @@ pub fn recognized_ec_id(
 /// 1. The `x-ts-ec` header
 /// 2. The `ts-ec` cookie
 ///
-/// If neither exists, generates a new EC ID via the configured provider.
+/// If neither exists, generates a new EC ID via the configured module.
 ///
 /// Returns `Ok(None)` when no existing EC ID is present and no Edge Cookie
-/// provider is configured, so the caller proceeds statelessly.
+/// module is configured, so the caller proceeds statelessly.
 ///
 /// # Errors
 ///
@@ -219,7 +220,7 @@ pub(crate) async fn get_or_generate_ec_id_from_http_request(
         return Ok(Some(id));
     }
 
-    // If no existing EC ID found, generate a fresh one through the provider.
+    // If no existing EC ID found, generate a fresh one through the module.
     let ec_id = generate_ec_id(settings, services, Some(req.headers())).await?;
     if ec_id.is_some() {
         log::trace!("No existing EC ID found; generated a fresh EC ID");
@@ -246,41 +247,10 @@ mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
     use http::{HeaderName, header};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::ec::generation::generate_ec_id as generate_canonical_ec_id;
-    use crate::ec::provider::HMAC_PROVIDER_KEY;
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
-    use crate::test_support::tests::{create_test_settings, hmac_passphrase};
-
-    #[tokio::test]
-    async fn test_generate_ec_id_matches_canonical_generator_for_ipv6() {
-        // Regression guard: this module must hash the same normalized IP as
-        // the canonical generator in ec::generation. A divergent IPv6 /64
-        // normalization would mint non-correlating identity prefixes for the
-        // same client depending on which path generated the ID.
-        let settings = create_test_settings();
-        let ip = IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0db8, 0x85a3, 0x0000, 0x8a2e, 0x0370, 0x7334, 0x1234,
-        ));
-
-        let id_here = generate_ec_id(&settings, &noop_services_with_client_ip(ip), None)
-            .await
-            .expect("should generate EC ID via edge_cookie")
-            .expect("should configure the hmac provider in test settings");
-        let passphrase = hmac_passphrase(&settings.ec, HMAC_PROVIDER_KEY);
-        let id_canonical = generate_canonical_ec_id(passphrase, &normalize_ip(ip))
-            .expect("should generate EC ID via canonical generator");
-
-        let bare_here = id_here
-            .strip_prefix("hmac~")
-            .expect("should carry the hmac provider code");
-        assert_eq!(
-            crate::ec::ec_hash(bare_here),
-            crate::ec::ec_hash(&id_canonical),
-            "should produce the same identity hash prefix as the canonical generator"
-        );
-    }
+    use crate::test_support::tests::create_test_settings;
 
     fn create_test_request(headers: &[(HeaderName, &str)]) -> Request<EdgeBody> {
         let mut builder = Request::builder().method("GET").uri("http://example.com");
@@ -321,6 +291,13 @@ mod tests {
         true
     }
 
+    // `generate_ec_id`, `get_or_generate_ec_id` and
+    // `get_or_generate_ec_id_from_http_request` are test helpers compiled for
+    // tests only, so the tests that call them test those helpers and not the
+    // production path. The production path, including how the client IP is
+    // normalized before it is hashed, is tested through `EcContext` in
+    // `crate::ec`.
+
     #[tokio::test]
     async fn test_generate_ec_id() {
         let settings: Settings = create_test_settings();
@@ -328,7 +305,7 @@ mod tests {
         let ec_id = generate_ec_id(&settings, &noop_services(), None)
             .await
             .expect("should generate EC ID")
-            .expect("should configure the hmac provider in test settings");
+            .expect("should configure the hmac module in test settings");
         log::debug!("Generated EC ID: {}", ec_id);
         assert!(
             is_ec_id_format(&ec_id),
@@ -337,17 +314,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_ec_id_returns_none_when_no_provider_is_configured() {
+    async fn generate_ec_id_returns_none_when_no_module_is_configured() {
         let mut settings = create_test_settings();
-        // No provider selected: Trusted Server runs statelessly.
-        settings.ec.provider = None;
+        // No module selected: Trusted Server runs statelessly.
+        settings.ec.module = None;
 
         let id = generate_ec_id(&settings, &noop_services(), None)
             .await
-            .expect("generation should not error when no provider is configured");
+            .expect("generation should not error when no module is configured");
         assert!(
             id.is_none(),
-            "no Edge Cookie provider should mean no Edge Cookie is created"
+            "no Edge Cookie module should mean no Edge Cookie is created"
         );
     }
 
@@ -359,11 +336,11 @@ mod tests {
         let id_with_ip = generate_ec_id(&settings, &noop_services_with_client_ip(ip), None)
             .await
             .expect("should generate EC ID with client IP")
-            .expect("should configure the hmac provider in test settings");
+            .expect("should configure the hmac module in test settings");
         let id_without_ip = generate_ec_id(&settings, &noop_services(), None)
             .await
             .expect("should generate EC ID without client IP")
-            .expect("should configure the hmac provider in test settings");
+            .expect("should configure the hmac module in test settings");
 
         let hmac_with_ip = id_with_ip.split_once('.').expect("should contain dot").0;
         let hmac_without_ip = id_without_ip.split_once('.').expect("should contain dot").0;
@@ -388,7 +365,7 @@ mod tests {
         let bare_legacy_shape = format!("{}.{}", "a".repeat(64), "Ab12z9");
         assert!(
             !is_ec_id_format(&bare_legacy_shape),
-            "a freshly created identifier always carries the provider code"
+            "a freshly created identifier always carries the module code"
         );
 
         let missing_suffix = format!("hmac~{}", "a".repeat(64));
@@ -403,13 +380,13 @@ mod tests {
             "should reject non-hex HMAC content"
         );
 
-        let invalid_suffix = format!("{}.{}", "a".repeat(64), "ab-129");
+        let invalid_suffix = format!("hmac~{}.{}", "a".repeat(64), "ab-129");
         assert!(
             !is_ec_id_format(&invalid_suffix),
             "should reject non-alphanumeric suffix"
         );
 
-        let extra_segment = format!("{}.{}.{}", "a".repeat(64), "Ab12z9", "zz");
+        let extra_segment = format!("hmac~{}.{}.{}", "a".repeat(64), "Ab12z9", "zz");
         assert!(
             !is_ec_id_format(&extra_segment),
             "should reject extra segments"
@@ -422,7 +399,7 @@ mod tests {
         // so a client can put whatever it likes in it, and the raw reader
         // prefers the header over the cookie. The global cookie bounds accept
         // any run of `[A-Za-z0-9._~-]`, so they cannot tell an identifier this
-        // deployment created from one an attacker typed. Provider ownership is
+        // deployment created from one an attacker typed. Module ownership is
         // what draws that line.
         let settings = create_test_settings();
         let services = noop_services();
@@ -430,9 +407,9 @@ mod tests {
         for forged in [
             // Passes the alphabet and the length cap, owned by nobody.
             "not-an-identifier",
-            // The built-in shape under another deployment's provider code.
+            // The built-in shape under another deployment's module code.
             "zz00~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234",
-            // This deployment's code carrying a value its provider never creates.
+            // This deployment's code carrying a value its module never creates.
             "hmac~not-the-hmac-shape",
         ] {
             let req = create_test_request(&[(HEADER_X_TS_EC, forged)]);
@@ -455,7 +432,7 @@ mod tests {
             );
         }
 
-        // A value the selected provider does own is still recognized, so the
+        // A value the selected module does own is still recognized, so the
         // check rejects forgeries rather than everything.
         let issued = format!("hmac~{}.Ab1234", "a".repeat(64));
         let req = create_test_request(&[(HEADER_X_TS_EC, issued.as_str())]);
@@ -464,7 +441,7 @@ mod tests {
                 .expect("should decide without erroring")
                 .as_deref(),
             Some(issued.as_str()),
-            "an identifier the selected provider owns should still be recognized"
+            "an identifier the selected module owns should still be recognized"
         );
     }
 
@@ -552,7 +529,7 @@ mod tests {
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
             .await
             .expect("should get or generate EC ID")
-            .expect("should configure the hmac provider in test settings");
+            .expect("should configure the hmac module in test settings");
         assert!(!ec_id.is_empty());
     }
 
@@ -580,7 +557,7 @@ mod tests {
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
             .await
             .expect("should generate fresh ID on invalid header")
-            .expect("should configure the hmac provider in test settings");
+            .expect("should configure the hmac module in test settings");
         assert_ne!(
             ec_id, "evil;injected",
             "should not use tampered header value"

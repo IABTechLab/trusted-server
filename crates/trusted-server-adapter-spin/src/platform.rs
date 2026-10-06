@@ -195,14 +195,10 @@ fn spin_secret_variable_name(
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV has no
 /// native TTL support, so [`put_bytes_with_ttl`](KvStore::put_bytes_with_ttl)
-/// *errors* (`KvError::Validation`) rather than silently writing a non-expiring
-/// record — the privacy-safe failure mode. Consequently TTL-backed consent
-/// persistence (`save_consent_to_kv`) is unavailable on Spin: each write returns
-/// the error, which the core caller logs and treats as non-fatal (consistent
-/// with all adapters — failing to persist consent never breaks the request, and
-/// not persisting is the safe direction). Operators configuring
-/// `settings.consent.consent_store` on Spin should expect stored-consent
-/// fallback not to function.
+/// returns `KvError::Unsupported` rather than silently writing a non-expiring
+/// record. `KvHandle` returns `KvError::Validation` for invalid keys, TTLs, or
+/// values before delegating to the backend. Callers of the generic platform KV
+/// interface must handle that capability difference explicitly.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]
@@ -711,8 +707,8 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
-    permission_signal_providers: &Arc<
-        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>],
+    permission_signal_modules: &Arc<
+        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
 ) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
@@ -743,17 +739,17 @@ pub fn build_runtime_services(
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
-        // Routed through the [geo] provider selector like the Fastly adapter,
+        // Routed through the [geo] module selector like the Fastly adapter,
         // so the selector behaves the same on every adapter. Spin has no host
         // geo service, so the host default resolves nothing either way.
-        .geo(trusted_server_core::platform::build_geo_provider(
+        .geo(trusted_server_core::platform::build_geo_module(
             settings,
             Arc::new(NullGeo),
         ))
-        // The signal providers were selected once at startup from the scheme
+        // The signal modules were selected once at startup from the scheme
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
-        .permission_signal_providers(Arc::clone(permission_signal_providers))
+        .permission_signal_modules(Arc::clone(permission_signal_modules))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,

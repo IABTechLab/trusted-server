@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -12,9 +12,9 @@ use sha2::{Digest as _, Sha256};
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
-use crate::ec::device::DeviceProvider;
+use crate::ec::device::DeviceModule;
 use crate::ec::kv::KvIdentityGraph;
-use crate::ec::provider::{EcProviderSelection, EdgeCookieProvider};
+use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
@@ -191,6 +191,38 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
         guard.clear();
+    }
+}
+
+/// Per-document buffer for script text fragments split across chunks.
+///
+/// `lol_html` can deliver one text node as several chunks, so a rewriter that
+/// needs the whole script must accumulate until `is_last_in_text_node`.
+///
+/// This lives in [`IntegrationDocumentState`] rather than on the rewriter.
+/// Rewriters are registered once as `Arc<dyn IntegrationScriptRewriter>` and
+/// live as long as the [`IntegrationRegistry`], so a buffer owned by a
+/// rewriter is shared by every document that registry serves. A document whose
+/// stream ends before the final fragment — client disconnect, origin error,
+/// truncated body — leaves its partial script in that buffer, and the next
+/// document prepends the residue to its own accumulation. That corrupts the
+/// response and can disclose the previous document's content.
+///
+/// Keyed per integration id, so each integration gets its own buffer, and
+/// dropped with the document state at end of document.
+#[derive(Debug, Default)]
+pub struct ScriptTextAccumulator {
+    buffer: Mutex<String>,
+}
+
+impl ScriptTextAccumulator {
+    /// Locks the buffer.
+    ///
+    /// Recovers from poisoning rather than panicking: a poisoned buffer holds
+    /// at worst a partial script, and the caller's `is_last_in_text_node`
+    /// handling already tolerates unexpected contents.
+    pub fn buffer(&self) -> MutexGuard<'_, String> {
+        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -639,12 +671,12 @@ pub struct IntegrationRegistration {
     /// to create an identifier when `[ec] provider` names this module's id. This
     /// is the same route geo takes, so identity is not a second extension
     /// mechanism sitting beside the integration system.
-    pub ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    pub ec_module: Option<Arc<dyn EdgeCookieModule>>,
     /// Device provider this module supplies, selectable by `[device] provider`.
     ///
     /// Declaring one does not make it active, because the module is only asked
     /// to classify a request when `[device] provider` names this module's id.
-    pub device_provider: Option<Arc<dyn DeviceProvider>>,
+    pub device_provider: Option<Arc<dyn DeviceModule>>,
 }
 
 impl IntegrationRegistration {
@@ -674,7 +706,7 @@ impl IntegrationRegistrationBuilder {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 geo_provider: None,
-                ec_provider: None,
+                ec_module: None,
                 device_provider: None,
             },
         }
@@ -739,8 +771,8 @@ impl IntegrationRegistrationBuilder {
     /// module's id, and a declared provider the selector does not choose is
     /// logged as a warning when the registry is built, the same as geo.
     #[must_use]
-    pub fn with_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
-        self.registration.ec_provider = Some(provider);
+    pub fn with_ec_provider(mut self, provider: Arc<dyn EdgeCookieModule>) -> Self {
+        self.registration.ec_module = Some(provider);
         self
     }
 
@@ -750,7 +782,7 @@ impl IntegrationRegistrationBuilder {
     /// this module's id, and a declared provider the selector does not choose
     /// is logged as a warning when the registry is built, the same as geo.
     #[must_use]
-    pub fn with_device_provider(mut self, provider: Arc<dyn DeviceProvider>) -> Self {
+    pub fn with_device_provider(mut self, provider: Arc<dyn DeviceModule>) -> Self {
         self.registration.device_provider = Some(provider);
         self
     }
@@ -832,7 +864,7 @@ struct IntegrationRegistryInner {
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
-    /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
+    /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
     extra_js_module_ids: Vec<&'static str>,
     // Preparers from every builder, named or not, in registration order.
     request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
@@ -841,16 +873,16 @@ struct IntegrationRegistryInner {
     geo_providers: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
     // Edge Cookie providers each declaring module supplies, in registration
     // order. `[ec] provider` picks at most one of them.
-    ec_providers: Vec<(&'static str, Arc<dyn EdgeCookieProvider>)>,
+    ec_providers: Vec<(&'static str, Arc<dyn EdgeCookieModule>)>,
     // Device providers each declaring module supplies, in registration order.
     // `[device] provider` picks at most one of them.
-    device_providers: Vec<(&'static str, Arc<dyn DeviceProvider>)>,
+    device_providers: Vec<(&'static str, Arc<dyn DeviceModule>)>,
     // The provider `[geo] provider` resolved to, or `None` when the selector
     // is `platform` and the adapter's own host lookup stands. Unset and `none`
     // both resolve the disabled provider.
     geo_provider: Option<Arc<dyn PlatformGeo>>,
-    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    device_provider: Option<Arc<dyn DeviceProvider>>,
+    ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    device_provider: Option<Arc<dyn DeviceModule>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -881,7 +913,7 @@ impl Default for IntegrationRegistryInner {
             ec_providers: Vec::new(),
             device_providers: Vec::new(),
             geo_provider: None,
-            ec_provider: None,
+            ec_module: None,
             device_provider: None,
         }
     }
@@ -900,7 +932,7 @@ const DEVICE_PROVIDER_BUILTIN: &str = "builtin";
 
 /// `[device] provider` value opting in to the host provider the adapter builds.
 ///
-/// Resolved by `build_device_provider` in [`device`](crate::ec::device) rather
+/// Resolved by `build_device_module` in [`device`](crate::ec::device) rather
 /// than by a module, so the registry supplies nothing for it.
 const DEVICE_PROVIDER_FASTLY: &str = "fastly";
 
@@ -913,12 +945,12 @@ const DEVICE_PROVIDER_FASTLY: &str = "fastly";
 fn resolve_ec_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
-) -> Option<Arc<dyn EdgeCookieProvider>> {
+) -> Option<Arc<dyn EdgeCookieModule>> {
     // `None` spells statelessness and never names a module, so only a named
     // selection can match one.
-    let selector = match settings.ec.provider.as_ref() {
-        Some(EcProviderSelection::Named(key)) => Some(key.as_str()),
-        Some(EcProviderSelection::None) | None => None,
+    let selector = match settings.ec.module.as_ref() {
+        Some(EcModuleSelection::Named(key)) => Some(key.as_str()),
+        Some(EcModuleSelection::None) | None => None,
     };
     let resolved = selector.and_then(|key| {
         inner
@@ -947,8 +979,8 @@ fn resolve_ec_provider(
 fn resolve_device_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
-) -> Result<Option<Arc<dyn DeviceProvider>>, Report<TrustedServerError>> {
-    let selector = settings.device.provider.as_deref();
+) -> Result<Option<Arc<dyn DeviceModule>>, Report<TrustedServerError>> {
+    let selector = settings.device.module.as_deref();
     let resolved = match selector {
         // Unset and `builtin` both name the provider core supplies itself, and
         // `fastly` names the host provider the adapter builds, so the registry
@@ -1007,7 +1039,7 @@ fn resolve_device_provider(
 fn module_device_provider(
     module_id: &str,
     inner: &IntegrationRegistryInner,
-) -> Result<Arc<dyn DeviceProvider>, Report<TrustedServerError>> {
+) -> Result<Arc<dyn DeviceModule>, Report<TrustedServerError>> {
     if let Some((_, provider)) = inner
         .device_providers
         .iter()
@@ -1023,15 +1055,15 @@ fn module_device_provider(
         .any(|id| id == module_id)
     {
         format!(
-            "`[device] provider` selects integration module `{module_id}`, which declares no device provider"
+            "`[device] module` selects integration module `{module_id}`, which declares no device provider"
         )
     } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
         format!(
-            "`[device] provider` selects integration module `{module_id}`, which `[integration] provider` does not name, so its device provider is unavailable"
+            "`[device] module` selects integration module `{module_id}`, which `[integration] provider` does not name, so its device provider is unavailable"
         )
     } else {
         format!(
-            "`[device] provider` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device provider are [{}]",
+            "`[device] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device provider are [{}]",
             inner
                 .device_providers
                 .iter()
@@ -1062,7 +1094,7 @@ fn resolve_geo_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
 ) -> Result<Option<Arc<dyn PlatformGeo>>, Report<TrustedServerError>> {
-    let selector = settings.geo.provider.as_deref();
+    let selector = settings.geo.module.as_deref();
     let resolved = match selector {
         // Unset resolves nothing and makes no host geo call, so a default
         // deployment is not tied to any host geo service. `none` spells the
@@ -1111,15 +1143,15 @@ fn module_geo_provider(
         .any(|id| id == module_id)
     {
         format!(
-            "`[geo] provider` selects integration module `{module_id}`, which declares no geo provider"
+            "`[geo] module` selects integration module `{module_id}`, which declares no geo provider"
         )
     } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
         format!(
-            "`[geo] provider` selects integration module `{module_id}`, which `[integration] provider` does not name, so its geo provider is unavailable"
+            "`[geo] module` selects integration module `{module_id}`, which `[integration] provider` does not name, so its geo provider is unavailable"
         )
     } else {
         format!(
-            "`[geo] provider` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo provider are [{}]",
+            "`[geo] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo provider are [{}]",
             inner
                 .geo_providers
                 .iter()
@@ -1411,7 +1443,7 @@ impl IntegrationRegistry {
                     .geo_providers
                     .push((registration.integration_id, provider));
             }
-            if let Some(provider) = registration.ec_provider {
+            if let Some(provider) = registration.ec_module {
                 inner
                     .ec_providers
                     .push((registration.integration_id, provider));
@@ -1453,18 +1485,21 @@ impl IntegrationRegistry {
             }
         }
 
-        // A client-cycle Edge Cookie provider ships a page script that posts its
+        // A client-cycle Edge Cookie module ships a page script that posts its
         // result to the resolve endpoint. The script rides the tsjs bundle, so
-        // include its module when that provider is selected. The same module
+        // include its module when that module is selected. The same module
         // list drives both the served bundle and the injected `<script>` hash,
         // so they stay consistent.
-        if settings.ec.provider.as_ref().is_some_and(|selection| {
-            selection.key() == crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY
-        }) {
+        if settings
+            .ec
+            .module
+            .as_ref()
+            .is_some_and(|selection| selection.key() == crate::ec::module::CLIENT_FIXED_MODULE_KEY)
+        {
             inner.extra_js_module_ids.push("ec_client_fixed");
         }
         let geo_provider = resolve_geo_provider(settings, &inner)?;
-        inner.ec_provider = resolve_ec_provider(settings, &inner);
+        inner.ec_module = resolve_ec_provider(settings, &inner);
         inner.device_provider = resolve_device_provider(settings, &inner)?;
         inner.geo_provider = geo_provider;
 
@@ -1493,14 +1528,14 @@ impl IntegrationRegistry {
     /// The Edge Cookie provider `[ec] provider` selected from a module, or
     /// `None` when the selector names a provider built into core or nothing.
     #[must_use]
-    pub fn ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
-        self.inner.ec_provider.clone()
+    pub fn ec_module(&self) -> Option<Arc<dyn EdgeCookieModule>> {
+        self.inner.ec_module.clone()
     }
 
     /// The device provider `[device] provider` selected from a module, or
     /// `None` when the selector names a provider built into core or nothing.
     #[must_use]
-    pub fn device_provider(&self) -> Option<Arc<dyn DeviceProvider>> {
+    pub fn device_provider(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_provider.clone()
     }
 
@@ -1819,7 +1854,7 @@ impl IntegrationRegistry {
         }
 
         // Modules not tied to a registered integration, for example the
-        // client-cycle provider's page script.
+        // client-cycle module's page script.
         for id in &self.inner.extra_js_module_ids {
             if !ids.contains(id) {
                 ids.push(id);
@@ -2007,7 +2042,7 @@ impl IntegrationRegistry {
                 ec_providers: Vec::new(),
                 device_providers: Vec::new(),
                 geo_provider: None,
-                ec_provider: None,
+                ec_module: None,
                 device_provider: None,
             }),
             plan: None,
@@ -2048,7 +2083,7 @@ impl IntegrationRegistry {
                 ec_providers: Vec::new(),
                 device_providers: Vec::new(),
                 geo_provider: None,
-                ec_provider: None,
+                ec_module: None,
                 device_provider: None,
             }),
             plan: None,
@@ -2085,7 +2120,7 @@ impl IntegrationRegistry {
                 ec_providers: Vec::new(),
                 device_providers: Vec::new(),
                 geo_provider: None,
-                ec_provider: None,
+                ec_module: None,
                 device_provider: None,
             }),
             plan: None,
@@ -2162,7 +2197,7 @@ impl IntegrationRegistry {
                 ec_providers: Vec::new(),
                 device_providers: Vec::new(),
                 geo_provider: None,
-                ec_provider: None,
+                ec_module: None,
                 device_provider: None,
             }),
             plan: None,
@@ -3181,10 +3216,10 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_include_client_fixed_when_provider_selected() {
+    fn js_module_ids_include_client_fixed_when_module_selected() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY,
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
+            crate::ec::module::CLIENT_FIXED_MODULE_KEY,
         ));
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
 
@@ -3192,7 +3227,7 @@ mod tests {
             registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "selecting the `client_fixed` provider should inject its demo page script"
+            "selecting the `client_fixed` module should inject its demo page script"
         );
     }
 
@@ -3229,7 +3264,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_client_fixed_without_provider() {
+    fn js_module_ids_exclude_client_fixed_without_module() {
         let registry =
             IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
                 .expect("should create registry");
@@ -3238,7 +3273,7 @@ mod tests {
             !registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "the demo page script should not ship unless the `client_fixed` provider is selected"
+            "the demo page script should not ship unless the `client_fixed` module is selected"
         );
     }
 
@@ -3933,7 +3968,7 @@ mod tests {
     struct PermissionDemandingDevice;
 
     #[async_trait::async_trait(?Send)]
-    impl crate::ec::device::DeviceProvider for PermissionDemandingDevice {
+    impl crate::ec::device::DeviceModule for PermissionDemandingDevice {
         fn id(&self) -> &'static str {
             "device-probe"
         }
@@ -3981,7 +4016,7 @@ mod tests {
     #[test]
     fn a_module_device_provider_declaring_permissions_is_refused_at_startup() {
         let mut settings = settings_naming("device-probe");
-        settings.device.provider = Some("device-probe".to_owned());
+        settings.device.module = Some("device-probe".to_owned());
 
         let error = IntegrationRegistry::with_registrations(&settings, &device_probe_builders())
             .err()
@@ -4014,7 +4049,7 @@ mod tests {
     /// core resolves itself, such as `none` or `platform`.
     fn settings_selecting_geo_provider(provider: &str) -> Settings {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.geo.provider = Some(provider.to_owned());
+        settings.geo.module = Some(provider.to_owned());
         settings
     }
 
@@ -4075,7 +4110,7 @@ mod tests {
         // in place, which is what `platform` now spells.
         let settings = crate::test_support::tests::create_test_settings();
         assert!(
-            settings.geo.provider.is_none(),
+            settings.geo.module.is_none(),
             "the shared test settings should leave the geo selector unset"
         );
 

@@ -18,7 +18,7 @@ use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::auction::compile_auction_plan;
 use trusted_server_core::config::validate_settings_for_deploy_with;
-use trusted_server_core::ec::provider::IdentityInput;
+use trusted_server_core::ec::module::IdentityInput;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::integrations::{
@@ -478,7 +478,7 @@ fn ec_selector_naming_a_module_resolves_that_modules_provider() {
     let registry = registry_with_probe(&settings);
 
     let provider = registry
-        .ec_provider()
+        .ec_module()
         .expect("`[ec] provider = \"seam_probe\"` should resolve the module's provider");
 
     assert_eq!(
@@ -562,7 +562,7 @@ async fn ec_provider_generates_an_identifier_with_the_modules_prefix() {
     let registry = registry_with_probe(&settings);
 
     let provider = registry
-        .ec_provider()
+        .ec_module()
         .expect("`[ec] provider = \"seam_probe\"` should resolve the module's provider");
 
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());

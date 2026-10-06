@@ -10,6 +10,13 @@ version = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Opt-in reusable sandbox lifecycle. Off by default, and `fastly.toml`'s build
+# command does not pass it, so production builds keep the single-request entry
+# point. Enabling the feature alone does not enable reuse: the bounds still
+# come from the runtime environment (see `sandbox::resolve_mode`).
+reusable-sandbox = []
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -30,6 +37,7 @@ serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
+trusted-server-permission-signal-mtm = { workspace = true }
 trusted-server-permission-signal-tcf = { workspace = true }
 trusted-server-permission-signal-us-privacy = { workspace = true }
 trusted-server-device-fastly = { workspace = true }
