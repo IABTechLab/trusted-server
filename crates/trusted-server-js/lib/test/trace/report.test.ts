@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { buildTraceReport } from '../../src/trace/report';
 
@@ -177,6 +177,90 @@ describe('combined trace capture', () => {
       reason: 'invalid_snapshot',
     });
   });
+  it('accepts an exact protected-floor byte budget and rejects one byte less', () => {
+    const source = input();
+    Object.assign(source.requestContext.network, { region: 'é"\\' });
+    source.gptSource.callbackIssues = [];
+    source.gptSource.attributionIssues = [];
+    const full = success(buildTraceReport(source));
+    const bytes = new TextEncoder().encode(JSON.stringify(full)).length;
+    expect(success(buildTraceReport(source, bytes))).toEqual(full);
+    expect(buildTraceReport(source, bytes - 1)).toEqual({
+      ok: false,
+      reason: 'snapshot_too_large',
+    });
+  });
+  it('accounts exactly for issue commas and the omission counter growing to two digits', () => {
+    const source = input();
+    const issue = source.gptSource.callbackIssues[0];
+    source.gptSource.callbackIssues = Array.from({ length: 10 }, (_, i) => ({
+      ...issue,
+      timestampMs: i + 1,
+    }));
+    source.gptSource.attributionIssues = [];
+    const full = success(buildTraceReport(source));
+    for (const removed of [9, 10]) {
+      const expected = {
+        ...full,
+        report: {
+          ...full.report,
+          gpt_diagnostics: {
+            ...full.report.gpt_diagnostics,
+            callbackIssues: full.report.gpt_diagnostics.callbackIssues.slice(removed),
+          },
+          truncation: { ...full.report.truncation, omitted_callback_issues: removed },
+        },
+      };
+      const budget = new TextEncoder().encode(JSON.stringify(expected)).length;
+      expect(success(buildTraceReport(source, budget))).toEqual(expected);
+    }
+  });
+  for (const seed of [0, 9, 99, 999, 9999]) {
+    it(`accounts exactly for auction and sidecar removal with omission seed ${seed}`, () => {
+      const source = input();
+      Object.assign(source.requestContext.network, { region: 'é"\\' });
+      source.gptSource.callbackIssues = [];
+      source.gptSource.attributionIssues = [];
+      Object.assign(source.collector, {
+        serverAuctions: [auction(1), auction(2)],
+        slotCorrelations: [sidecar(1), sidecar(2)],
+        omittedServerAuctions: seed,
+        omittedSlotCorrelations: seed,
+      });
+      const full = success(buildTraceReport(source));
+      const expected = {
+        ...full,
+        report: {
+          ...full.report,
+          server_auctions: full.report.server_auctions.slice(1),
+          slot_correlations: full.report.slot_correlations.slice(1),
+          truncation: {
+            ...full.report.truncation,
+            omitted_server_auctions: seed + 1,
+            omitted_slot_correlations: seed + 1,
+          },
+          auction_coverage: {
+            capture_status: 'partial',
+            issues: ['record_evicted', 'correlation_unavailable'],
+          },
+        },
+      };
+      const budget = new TextEncoder().encode(JSON.stringify(expected)).length;
+      expect(success(buildTraceReport(source, budget))).toEqual(expected);
+    });
+  }
+  it('rejects checked omission overflow during byte-budget auction removal', () => {
+    const source = input();
+    source.gptSource.callbackIssues = [];
+    source.gptSource.attributionIssues = [];
+    Object.assign(source.collector, { serverAuctions: [auction()], omittedServerAuctions: 65535 });
+    const full = success(buildTraceReport(source));
+    const budget = new TextEncoder().encode(JSON.stringify(full)).length - 1;
+    expect(buildTraceReport(source, budget)).toEqual({
+      ok: false,
+      reason: 'omission_counter_overflow',
+    });
+  });
   it('removes an uncorrelated auction and recomputes coverage when no evidence remains', () => {
     const source = input();
     source.gptSource.callbackIssues = [];
@@ -297,7 +381,22 @@ describe('combined trace capture', () => {
         runtime_slot_number: (i % 64) + 1,
       })),
     });
-    const result = success(buildTraceReport(source));
+    const serialization = vi.spyOn(JSON, 'stringify');
+    let result: ReturnType<typeof success>;
+    let completeMeasurements: number;
+    try {
+      result = success(buildTraceReport(source));
+      completeMeasurements = serialization.mock.calls.filter(
+        ([value]) =>
+          value !== null &&
+          typeof value === 'object' &&
+          Object.prototype.hasOwnProperty.call(value, 'stored_at_ms') &&
+          Object.prototype.hasOwnProperty.call(value, 'report')
+      ).length;
+    } finally {
+      serialization.mockRestore();
+    }
+    expect(completeMeasurements).toBeLessThanOrEqual(2);
     expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThanOrEqual(512 * 1024);
     expect(result.report.gpt_diagnostics.slots).toHaveLength(64);
     expect(

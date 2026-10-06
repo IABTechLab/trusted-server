@@ -70,11 +70,19 @@ describe('explicit same-tab trace handoff', () => {
     expect(fixture.order).toEqual([]);
     expect(fixture.target.sessionStorage.getItem).not.toHaveBeenCalled();
     action.view();
-    expect(fixture.order).toEqual(['snapshot', 'store', 'navigate:/_ts/trace']);
+    expect(fixture.order).toEqual(['snapshot', 'store', `navigate:${TRACE_ORIGIN}/_ts/trace`]);
     const wrapper = JSON.parse(fixture.target.sessionStorage.setItem.mock.calls[0][1]);
     expect(wrapper.report.request_context).toEqual(fixture.target.__tsjs_trace_request_context);
     expect(wrapper.report.gpt_diagnostics.page.pathname).toBe('/[redacted]');
     expect(wrapper.stored_at_ms).toBe(TRACE_NOW);
+  });
+  it('keeps the handoff on the publisher origin when the document has an external base', () => {
+    const fixture = setup();
+    fixture.target.location.assign.mockImplementation((url) => {
+      fixture.order.push(`navigate:${new URL(url, 'https://other.example/').href}`);
+    });
+    handoff(fixture.options).view();
+    expect(fixture.order).toEqual(['snapshot', 'store', `navigate:${TRACE_ORIGIN}/_ts/trace`]);
   });
   it('preserves a valid immutable combined report for explicit direct download after storage failure', () => {
     const fixture = setup();

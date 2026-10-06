@@ -206,18 +206,38 @@ export function buildTraceReport(
     };
     recompute();
     const wrapper = { stored_at_ms: captureClock, report: draft };
-    // Every draft member is already independently owned data. Serialize only that
-    // draft while measuring; final ingestion checks the complete schema and depth.
+    // Measure the owned draft once, then account for removed JSON payloads,
+    // commas, counter digits and coverage changes without serializing it again.
+    // A final independent measurement enforces the budget before ingestion.
     const encoder = new TextEncoder();
-    const fits = (): boolean => encoder.encode(JSON.stringify(wrapper)).length <= maximumBytes;
+    const bytes = (value: unknown): number => encoder.encode(JSON.stringify(value)).length;
+    let reportBytes = bytes(wrapper);
+    const fits = (): boolean => reportBytes <= maximumBytes;
+    const omit = (counter: keyof TraceReportV1['truncation'], count: number): void => {
+      const current = draft.truncation[counter];
+      const next = add(current, count);
+      reportBytes += String(next).length - String(current).length;
+      draft.truncation[counter] = next;
+    };
+    const retain = <Item>(items: Item[], keep: (item: Item) => boolean): Item[] => {
+      const retained: Item[] = [];
+      for (const item of items) {
+        if (keep(item)) retained.push(item);
+        else reportBytes -= bytes(item);
+      }
+      reportBytes -= Math.max(0, items.length - 1) - Math.max(0, retained.length - 1);
+      return retained;
+    };
+    const recomputeMeasured = (): void => {
+      const previous = bytes(draft.auction_coverage);
+      recompute();
+      reportBytes += bytes(draft.auction_coverage) - previous;
+    };
     const pruneSidecars = (
       predicate: (sidecar: Mutable<TraceReportV1>['slot_correlations'][number]) => boolean
     ): void => {
-      const retained = draft.slot_correlations.filter((sidecar) => !predicate(sidecar));
-      draft.truncation.omitted_slot_correlations = add(
-        draft.truncation.omitted_slot_correlations,
-        draft.slot_correlations.length - retained.length
-      );
+      const retained = retain(draft.slot_correlations, (sidecar) => !predicate(sidecar));
+      omit('omitted_slot_correlations', draft.slot_correlations.length - retained.length);
       draft.slot_correlations = retained;
     };
     const floors = new Set(
@@ -239,14 +259,14 @@ export function buildTraceReport(
     });
     for (const { slot, cycle } of cycles) {
       if (fits()) break;
-      slot.requests = slot.requests.filter((retained) => retained !== cycle);
-      draft.truncation.omitted_request_cycles = add(draft.truncation.omitted_request_cycles, 1);
+      slot.requests = retain(slot.requests, (retained) => retained !== cycle);
+      omit('omitted_request_cycles', 1);
       pruneSidecars(
         (sidecar) =>
           sidecar.runtime_slot_number === slot.runtimeSlotNumber &&
           sidecar.request_number === cycle.requestNumber
       );
-      recompute();
+      recomputeMeasured();
     }
     const removeIssues = <Issue extends { timestampMs: number }>(
       source: Issue[] | undefined,
@@ -259,8 +279,9 @@ export function buildTraceReport(
       for (const { issue } of ordered) {
         if (fits()) break;
         const index = source.indexOf(issue);
+        reportBytes -= bytes(issue) + (source.length > 1 ? 1 : 0);
         source.splice(index, 1);
-        draft.truncation[counter] = add(draft.truncation[counter], 1);
+        omit(counter, 1);
       }
     };
     removeIssues(draft.gpt_diagnostics.callbackIssues, 'omitted_callback_issues');
@@ -268,18 +289,15 @@ export function buildTraceReport(
     const remainingCycles = () => draft.gpt_diagnostics.slots.flatMap((slot) => slot.requests);
     const removeAuction = (record: Mutable<TraceReportV1>['server_auctions'][number]): void => {
       const id = record.diagnostic_auction_id;
-      draft.server_auctions = draft.server_auctions.filter((retained) => retained !== record);
-      draft.truncation.omitted_server_auctions = add(draft.truncation.omitted_server_auctions, 1);
+      draft.server_auctions = retain(draft.server_auctions, (retained) => retained !== record);
+      omit('omitted_server_auctions', 1);
       for (const slot of draft.gpt_diagnostics.slots) {
-        const retained = slot.requests.filter((cycle) => cycle.trustedServerAuctionId !== id);
-        draft.truncation.omitted_request_cycles = add(
-          draft.truncation.omitted_request_cycles,
-          slot.requests.length - retained.length
-        );
+        const retained = retain(slot.requests, (cycle) => cycle.trustedServerAuctionId !== id);
+        omit('omitted_request_cycles', slot.requests.length - retained.length);
         slot.requests = retained;
       }
       pruneSidecars((sidecar) => sidecar.diagnostic_auction_id === id);
-      recompute();
+      recomputeMeasured();
     };
     for (const record of [...draft.server_auctions]) {
       if (fits()) break;
@@ -297,7 +315,8 @@ export function buildTraceReport(
       )
         removeAuction(record);
     }
-    if (!fits()) return { ok: false, reason: 'snapshot_too_large' };
+    if (!fits() || bytes(wrapper) > maximumBytes)
+      return { ok: false, reason: 'snapshot_too_large' };
     const result = parseTraceStoredReport(wrapper, origin, captureClock);
     return result ? { ok: true, value: result } : { ok: false, reason: 'invalid_snapshot' };
   } catch {

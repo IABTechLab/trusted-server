@@ -104,6 +104,13 @@ test('captures a real zero-bid SSAT auction and carries its GPT cycle through th
   expect(evidence.value.slotCorrelations[0].slot_ref).toBe(
     evidence.value.serverAuctions[0].slots[0].slot_ref
   )
+  await page.route('https://other.example/**', (route) => route.abort())
+  await page.evaluate(() => {
+    const base = document.createElement('base')
+    base.href = 'https://other.example/'
+    document.head.prepend(base)
+  })
+  expect(await page.evaluate(() => document.baseURI)).toBe('https://other.example/')
   await clickTraceHandoff(page)
   await page.waitForURL(traceRuntimeUrl('/_ts/trace'))
   await expect(

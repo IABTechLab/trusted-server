@@ -235,6 +235,23 @@ describe('consolidated trace report viewer', () => {
     expect(document.getElementById('trace-report')).toBeNull();
     expect(document.body.textContent).toContain('Local report deleted');
   });
+  it('moves focus to the local status when deletion hides its focused control', () => {
+    const fixture = setup();
+    mountTraceViewer(document, fixture.options);
+    const remove = button('Delete local report');
+    remove.focus();
+    remove.click();
+    expect(remove.hidden).toBe(true);
+    expect(document.activeElement).toBe(document.getElementById('trace-cleanup-local-status'));
+  });
+  it('keeps another cleanup control focused during local deletion', () => {
+    const fixture = setup();
+    mountTraceViewer(document, fixture.options);
+    const clear = button('Clear report and end tracing');
+    clear.focus();
+    button('Delete local report').click();
+    expect(document.activeElement).toBe(clear);
+  });
   for (const local of ['deleted', 'failed'] as const)
     for (const mutation of ['requested', 'failed'] as const)
       for (const observation of ['inactive', 'active', 'failed'] as const) {
@@ -314,7 +331,9 @@ describe('consolidated trace report viewer', () => {
     expect(document.getElementById('trace-report')).toBeNull();
     request.mockResolvedValueOnce(new Response('{}'));
     request.mockResolvedValueOnce(new Response('{"observed_active":false}'));
-    button('Retry end tracing').click();
+    const retry = button('Retry end tracing');
+    retry.focus();
+    retry.click();
     await vi.waitFor(() =>
       expect(document.getElementById('trace-cleanup-server-status')?.textContent).toContain(
         'Tracing is off'
@@ -323,9 +342,35 @@ describe('consolidated trace report viewer', () => {
     expect(fixture.options.confirm).toHaveBeenCalledTimes(1);
     expect(fixture.storage.removeItem).toHaveBeenCalledTimes(2);
     expect(request).toHaveBeenCalledTimes(4);
+    expect(document.activeElement).toBe(document.getElementById('trace-cleanup-server-status'));
     expect(document.getElementById('trace-cleanup-local-status')?.textContent).toContain(
       'Local report deleted'
     );
+  });
+  it('does not move focus back from another control when a pending retry succeeds', async () => {
+    const fixture = setup();
+    request.mockResolvedValueOnce(new Response('{}', { status: 500 }));
+    request.mockResolvedValueOnce(new Response('{"observed_active":true}'));
+    mountTraceViewer(document, fixture.options);
+    button('Clear report and end tracing').click();
+    await vi.waitFor(() => expect(button('Retry end tracing').hidden).toBe(false));
+    request.mockResolvedValueOnce(new Response('{}'));
+    let resolveState: ((response: Response) => void) | undefined;
+    request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveState = resolve;
+        })
+    );
+    const retry = button('Retry end tracing');
+    retry.focus();
+    retry.click();
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(4));
+    const retained = button('Return to previous page');
+    retained.focus();
+    resolveState?.(new Response('{"observed_active":false}'));
+    await vi.waitFor(() => expect(retry.hidden).toBe(true));
+    expect(document.activeElement).toBe(retained);
   });
   it('still deletes the report and attempts state verification when both network steps are offline', async () => {
     const fixture = setup();

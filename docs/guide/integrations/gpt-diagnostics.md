@@ -176,10 +176,24 @@ Use a suitable same-origin deployment where the browser accepts the unchanged
 is 1800 seconds; ordinary requests do not refresh it. Do not weaken cookie attributes
 or infer HTTPS from an untrusted forwarding header to make a test pass.
 
-On deployed Fastly and Spin staging services, verify HTTPS Enable returns a
+On deployed Fastly, Cloudflare and Spin staging services, verify HTTPS Enable returns a
 successful response, a separate state request observes the session, publisher
 reload captures evidence, and End followed by another state request observes
 inactivity. Local plain-HTTP runtime tests do not establish this HTTPS behavior.
+
+Enable and End require the browser's canonical Origin to agree with the
+runtime-provided origin and request authority. A TLS-terminating proxy that
+forwards HTTPS traffic as HTTP, or replaces the public authority with an internal
+host, can therefore cause an intentional `403`, including on Spin and Axum.
+Use a deployment that preserves the public origin in the runtime's trusted
+request metadata and verify both actions through the actual proxy. Untrusted
+`Forwarded` or `X-Forwarded-*` headers cannot repair that mismatch.
+
+The current Axum entry point supplies trusted origin metadata only for its
+plain-HTTP listener. TLS offload does not supply a trusted HTTPS origin, so an
+HTTPS browser session cannot pass Enable/End through that arrangement. Axum
+HTTPS support needs a suitable trusted transport binding before it can meet
+the deployed HTTPS acceptance gate.
 
 Publisher activation and context use injected inline scripts without an attached
 CSP nonce. A publisher nonce/hash policy that does not authorize those scripts

@@ -108,7 +108,7 @@ export function createTraceHandoff(options: TraceHandoffOptions): TraceHandoff |
           return;
         }
         try {
-          options.target.location.assign('/_ts/trace');
+          options.target.location.assign(`${origin}/_ts/trace`);
           notify('navigating');
         } catch {
           notify('navigation_unavailable');

@@ -539,6 +539,7 @@ export function mountTraceViewer(
   localStatus.id = 'trace-cleanup-local-status';
   localStatus.setAttribute('role', 'status');
   localStatus.setAttribute('aria-live', 'polite');
+  localStatus.tabIndex = -1;
   cleanup.append(localStatus);
   const serverStatus = element(
     root,
@@ -548,6 +549,7 @@ export function mountTraceViewer(
   serverStatus.id = 'trace-cleanup-server-status';
   serverStatus.setAttribute('role', 'status');
   serverStatus.setAttribute('aria-live', 'polite');
+  serverStatus.tabIndex = -1;
   cleanup.append(serverStatus);
   const removeLocal = (): void => {
     let result: ReturnType<typeof deleteTraceReport>;
@@ -558,10 +560,13 @@ export function mountTraceViewer(
     }
     if (destroyed) return;
     if (result.status === 'deleted') {
+      const losingFocus =
+        root.activeElement === deleteButton || article.contains(root.activeElement);
       stored = undefined;
       article.remove();
       deleteButton.hidden = true;
       localStatus.textContent = 'Local report deleted from this tab.';
+      if (losingFocus) localStatus.focus();
     } else
       localStatus.textContent =
         'Local report deletion failed. The report remains displayed; retry deletion.';
@@ -569,6 +574,7 @@ export function mountTraceViewer(
   let ending = false;
   const end = async (): Promise<void> => {
     if (destroyed || ending) return;
+    const retryHadFocus = root.activeElement === retryButton;
     ending = true;
     clearButton.disabled = retryButton.disabled = true;
     serverStatus.textContent = 'Requesting tracing end and checking the next request…';
@@ -588,6 +594,12 @@ export function mountTraceViewer(
           : 'End tracing unconfirmed. Tracing may remain active. Retry end tracing.';
     retryButton.hidden = result.confirmed;
     clearButton.disabled = retryButton.disabled = false;
+    if (
+      result.confirmed &&
+      retryHadFocus &&
+      (root.activeElement === retryButton || root.activeElement === root.body)
+    )
+      serverStatus.focus();
     ending = false;
   };
   const clearButton = control(controls, 'Clear report and end tracing', () => {

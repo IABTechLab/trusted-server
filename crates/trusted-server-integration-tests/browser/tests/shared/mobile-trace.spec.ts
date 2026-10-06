@@ -495,6 +495,7 @@ test.describe('browser-carried trace report viewer', () => {
     await expect(page.locator('#trace-cleanup-local-status')).toHaveText(
       'Local report deleted from this tab.'
     )
+    await expect(page.locator('#trace-cleanup-local-status')).toBeFocused()
   })
 
   test('deletes the report offline and retries end with a separate server observation after reconnecting', async ({
@@ -549,6 +550,7 @@ test.describe('browser-carried trace report viewer', () => {
     await expect(page.locator('#trace-cleanup-server-status')).toContainText(
       'Tracing is off'
     )
+    await expect(page.locator('#trace-cleanup-server-status')).toBeFocused()
     expect(requests).toEqual(['POST /_ts/trace/end', 'GET /_ts/trace/state'])
     expect(
       (await page.context().cookies()).find((item) => item.name === SESSION)

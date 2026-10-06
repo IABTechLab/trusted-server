@@ -1119,6 +1119,74 @@ Bundle splitting remains a separate load-order/performance design. Preserve
 the build-input freshness guard and ordinary reserved-route/cache policy.
 Physical mobile and deployed CDN/HTTPS acceptance remain release gates.
 
+## Latest independent review follow-up — 2026-10-06
+
+Keep the approved report schema, exact truncation order, protected slot floors,
+omission overflow checks and 512 KiB UTF-8 budget. Implement the confirmed
+corrections centrally on the existing branches, then independently review them.
+
+- [x] Select both host-only Node emitted-script regressions explicitly in CI.
+- [x] Replace repeated whole-report measurement with exact byte accounting for
+      removed values, commas, counter digit changes and coverage updates. Retain
+      one final complete measurement and all existing survivor-order assertions.
+- [x] Bind the handoff URL to the captured publisher origin, including pages
+      with an external base element, and recover focus when cleanup hides the
+      focused control without stealing focus from another control.
+- [x] Add operator-facing changelog entries for the default-off trace workflow,
+      bounded diagnostics cookie, reserved paths and private document handling.
+- [x] Include Cloudflare in deployed HTTPS acceptance and document TLS-offload
+      constraints without trusting forwarded scheme/authority headers.
+- [x] Correct EdgeZero's Axum metadata wording and identify earlier probe counts
+      as historical. Preserve URI registered-name syntax, including valid
+      punctuation and trailing dots; a DNS-only policy is not this API's contract.
+- [x] Rebuild and review unpublished trace assets, run the required gates and
+      actual browser workflows, and obtain independent review of the final fixes.
+
+Bundle splitting and optional network enrichment remain separately scoped.
+Upstream merge and repinning to its merged revision remain integration steps;
+this corrective pass does not authorize merging either draft PR.
+
+### Executed corrective-pass evidence
+
+The initial complexity regression failed with 838 complete-wrapper JSON
+serializations. The corrected builder passes with at most two, retaining the
+existing worst-case survivor order, exact omission counters and protected slot
+floors. Additional exact-budget tests cover UTF-8/escaped strings, counter
+digit transitions, array commas, empty arrays, coverage changes and byte-stage
+omission overflow.
+
+Fresh verification after the main merge: all eight target-matched clippy gates,
+four adapter test aliases, the host CLI helper including its browser fixtures,
+21 parity tests, format, core rustdoc, native/WASM builds and both explicitly
+selected Node regressions pass. The normal JS and pinned external Prebid builds,
+1,748 Vitest tests in 69 files, final focused regressions, lint and formatting
+pass. The final asset guard confirms rebuilt bytes and manifest digests; v1 is
+still unpublished. Package-wide TypeScript retains unrelated existing errors,
+with none in the modified trace source/tests; browser TypeScript passes.
+
+The complete browser runner passes Next.js 49 and WordPress 28 tests, including
+a real handoff under an external base and real Delete/Retry focus checks. Its
+first attempt stopped before tests because Docker was inactive; starting Docker
+and retrying resolved that prerequisite. All-four-runtime trace workflows pass
+4/4, and fresh Cloudflare/Fastly/Spin raw boundary suites pass 3/3 using the
+current consumer dependency graph and freshly built artifacts.
+
+Three independent scopes reviewed report performance/byte bounds, remaining
+runtime/UI/CI/operator surfaces, and EdgeZero authority/provenance/docs. Review
+corrections include typed immutable expected-report fixtures, the actual config
+key and explicit Axum plain-HTTP limitations; final rereviews have no remaining
+actionable findings. EdgeZero docs format/lint/build pass under Node 24.12.0;
+its source is unchanged by this follow-up, and all checks pass at docs revision
+`4f221d257e3224c946326b949bb966ac822ae5a3`. Trusted Server keeps the reviewed
+implementation pin until the upstream merge/release handoff.
+
+Hosted Trusted Server checks passed for main-merge head `b7e48c7bc`; the latest
+corrective working tree passed the local gates recorded above. The PR merge
+reference has zero open CodeQL alerts. The earlier Python extraction
+failure cleared after that merge; prior CodeQL paragraphs are historical
+checkpoints. No Python is added by this feature. Physical-device, real browser
+session restoration and deployed HTTPS/CDN/CSP acceptance remain release gates.
+
 ## Phase 4: Optional network enrichment
 
 ### Scheduling boundary
