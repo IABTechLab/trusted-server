@@ -385,6 +385,13 @@ export interface PermissionsSnapshot {
    * either, which page code must tell apart from `set` being empty.
    */
   awaiting: string[];
+  /**
+   * The signals the server's providers read and found valid, each as it
+   * was received. A signal absent from this list was missing, could not be
+   * read, or is one the deployment does not act on, and page code relies
+   * on exactly these and no other.
+   */
+  signals: ValidSignal[];
   tdls: string[];
 }
 
@@ -424,6 +431,16 @@ export interface FirstImpressionState {
   nextToken: number;
   slots: Record<string, FirstImpressionSlotClaim>;
   fallbackSlots: Record<string, HTMLElement>;
+}
+
+/** One signal a server-side provider read and found valid. */
+export interface ValidSignal {
+  /** The provider that read it, by its configured id. */
+  provider: string;
+  /** The scheme it belongs to, for example `tcf` or `gpp`. */
+  scheme: string;
+  /** The signal as received. */
+  value: string;
 }
 
 export interface TsjsApi {

@@ -7,8 +7,10 @@
 //! This provider lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
+use trusted_server_core::consent::ConsentContext;
+use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
-use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission};
+use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
 /// `provider`, in logs, and when a peer consults it.
@@ -42,19 +44,34 @@ impl PermissionSignalProvider for GppSaleOptOutProvider {
         {
             return ConsentSignal::Neutral;
         }
+        // A GPP string that arrived and could not be read is treated as the
+        // opt-out it may have carried, because a preference this provider
+        // cannot see is not the same as no preference.
+        let unreadable = input.consent.raw_gpp_string.is_some() && input.consent.gpp.is_none();
         let opted_out = input
             .consent
             .gpp
             .as_ref()
             .and_then(|gpp| gpp.us_sale_opt_out)
             == Some(true);
-        if opted_out && input.policy.opt_out_revokes(permission) {
+        if (opted_out || unreadable) && input.policy.opt_out_revokes(permission) {
             return ConsentSignal::Revoke;
         }
         // Silence rather than refusal. Reading an absent signal as a refusal
         // would revoke the permission on every request that did not carry this
         // scheme, which is most of them.
         ConsentSignal::Neutral
+    }
+
+    /// The GPP string, when it decoded.
+    fn valid_signal(
+        &self,
+        consent: &ConsentContext,
+        _evidence: &dyn RequestInfo,
+    ) -> Option<ValidSignal> {
+        consent.gpp.as_ref()?;
+        let raw = consent.raw_gpp_string.as_deref()?;
+        Some(ValidSignal::new(ID, "gpp", raw))
     }
 }
 
@@ -99,6 +116,51 @@ mod tests {
             GppSaleOptOutProvider::new().id(),
             ID,
             "the provider answers to the identifier configuration names"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gpp_string_is_read_as_the_opt_out_it_may_have_carried() {
+        let unreadable = ConsentContext {
+            raw_gpp_string: Some("not a GPP string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            answer(&unreadable, shipped_policy(), Permission::StoreOnDevice),
+            ConsentSignal::Revoke,
+            "an unreadable string refuses what the policy lets an opt-out revoke"
+        );
+        assert_eq!(
+            answer(
+                &unreadable,
+                shipped_policy(),
+                Permission::MeasureAdPerformance
+            ),
+            ConsentSignal::Neutral,
+            "and nothing the policy leaves alone"
+        );
+    }
+
+    #[test]
+    fn vouches_for_the_gpp_string_only_when_it_decoded() {
+        let evidence = OwnedRequestInfo::default();
+        let decoded = ConsentContext {
+            raw_gpp_string: Some("DBABMA~CPreadable".to_owned()),
+            ..with_sale_opt_out(Some(false))
+        };
+        assert_eq!(
+            GppSaleOptOutProvider::new().valid_signal(&decoded, &evidence),
+            Some(ValidSignal::new(ID, "gpp", "DBABMA~CPreadable")),
+            "a decoded string is vouched for as received, whatever it says"
+        );
+        let unreadable = ConsentContext {
+            raw_gpp_string: Some("not a GPP string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            GppSaleOptOutProvider::new().valid_signal(&unreadable, &evidence),
+            None,
+            "an unreadable string is not"
         );
     }
 

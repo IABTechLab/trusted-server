@@ -286,12 +286,6 @@ impl PermissionSet {
         Self(self.0 | other.0)
     }
 
-    /// The permissions in this set and not in `other`.
-    #[must_use]
-    pub const fn without(self, other: PermissionSet) -> Self {
-        Self(self.0 & !other.0)
-    }
-
     /// Iterates the permissions in the set, in bit-index order.
     ///
     /// The built-ins read nothing from the full set; this serves a provider or
@@ -672,36 +666,6 @@ impl PermissionMaps {
             .and_then(|code| self.by_country.get(&code))
     }
 
-    /// Every permission that requires a signal somewhere in the tree, at the
-    /// top node, in any country or in any region.
-    ///
-    /// This is the set a deployment's providers have to be able to grant
-    /// between them, because a permission in it that no provider can grant
-    /// stays unset for every visitor of that place. Start-up compares the two
-    /// and says so, see
-    /// [`never_granted`](crate::permission_signal::never_granted). A map with
-    /// no top node reports every permission, because such a map resolves an
-    /// unlisted place at the requires-signal floor.
-    #[must_use]
-    pub fn requires_signal_anywhere(&self) -> PermissionSet {
-        let requiring = |rules: &CountryRules| {
-            Permission::all()
-                .filter(|permission| {
-                    matches!(rules.rule_for(*permission), Acquisition::RequiresSignal)
-                })
-                .collect::<PermissionSet>()
-        };
-        let top = self
-            .default_rules
-            .as_ref()
-            .map_or_else(|| Permission::all().collect(), requiring);
-        self.by_country
-            .values()
-            .chain(self.by_region.values())
-            .map(requiring)
-            .fold(top, PermissionSet::union)
-    }
-
     /// The rules a request resolves to: its region, else its country, else the
     /// top node of the tree.
     ///
@@ -815,6 +779,38 @@ impl PermissionMaps {
     }
 }
 
+/// A signal a provider read from the request and found valid, as it was
+/// received.
+///
+/// The permission state carries one of these for every signal a configured
+/// provider used, so whatever reads the state can rely on exactly those
+/// signals and no other. A signal that was absent, could not be read, or
+/// that no configured provider acts on is not here, and nothing says why,
+/// because the provider for that scheme has already decided what its
+/// absence means for the permissions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ValidSignal {
+    /// The provider that read and used the signal, by its configured id.
+    pub provider: &'static str,
+    /// The scheme the signal belongs to, for example `tcf` or `gpp`, so a
+    /// reader can find a scheme without knowing which provider read it.
+    pub scheme: &'static str,
+    /// The signal as it was received.
+    pub value: String,
+}
+
+impl ValidSignal {
+    /// A valid signal of `scheme`, read by `provider`, as received.
+    #[must_use]
+    pub fn new(provider: &'static str, scheme: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            provider,
+            scheme,
+            value: value.into(),
+        }
+    }
+}
+
 /// The permissions Trusted Server currently has set for a request.
 ///
 /// A provider executes only when [`all_set`](Self::all_set) of its required
@@ -833,6 +829,9 @@ pub struct PermissionState {
     /// [`tdls`](Self::tdls). Shared rather than owned because the state is
     /// cloned along the request path and the list is the same list.
     tdls: Arc<[Tdl]>,
+    /// The signals the configured providers read and found valid. See
+    /// [`signals`](Self::signals).
+    signals: Arc<[ValidSignal]>,
 }
 
 impl PermissionState {
@@ -846,6 +845,7 @@ impl PermissionState {
             awaiting: PermissionSet::none(),
             storage_withdrawn: false,
             tdls: Arc::default(),
+            signals: Arc::default(),
         }
     }
 
@@ -910,6 +910,26 @@ impl PermissionState {
         Self { tdls, ..self }
     }
 
+    /// The same state, carrying the signals the providers read and found
+    /// valid. Set by assembly, in the order the providers are asked.
+    #[must_use]
+    pub fn with_signals(self, signals: Arc<[ValidSignal]>) -> Self {
+        Self { signals, ..self }
+    }
+
+    /// The signals the configured providers read from the request and
+    /// found valid, each as it was received.
+    ///
+    /// This is the list a page, a bid request or a person reading the state
+    /// relies on. A signal that is not here was absent, could not be read, or
+    /// is one no configured provider acts on, and the provider for its
+    /// scheme has already decided what that means for the permissions, so
+    /// nothing downstream needs to reason about the signal itself.
+    #[must_use]
+    pub fn signals(&self) -> &[ValidSignal] {
+        &self.signals
+    }
+
     /// The terms documents the data for this request is available under, in
     /// the order the providers were asked.
     ///
@@ -966,10 +986,14 @@ impl PermissionState {
     /// signal, so a page can hold what depends on them rather than read
     /// "nobody has answered" as "refused". `tdls` carries the terms documents
     /// the data is available under, in the order the providers were asked, so
-    /// a page module reads the terms alongside the permissions. An empty state
-    /// renders as `{"awaiting":[],"set":[],"tdls":[]}`, and all three are
-    /// answers (nothing is set, nothing is awaited, no terms were declared)
-    /// rather than missing values, so page code never has to tell them apart.
+    /// a page module reads the terms alongside the permissions. `signals`
+    /// carries the signals the providers read and found valid, each as it was
+    /// received, so a page relies on exactly what the state was built from.
+    /// An empty state renders as
+    /// `{"awaiting":[],"set":[],"signals":[],"tdls":[]}`, and all four are
+    /// answers (nothing is set, nothing is awaited, no signal was valid, no
+    /// terms were declared) rather than missing values, so page code never
+    /// has to tell them apart.
     ///
     /// This is the only place the page shape is spelled, so no caller writes
     /// the JSON by hand.
@@ -986,12 +1010,12 @@ impl PermissionState {
     /// );
     /// assert_eq!(
     ///     state.page_json(),
-    ///     r#"{"awaiting":[],"set":["necessary.operations.storage"],"tdls":[]}"#
+    ///     r#"{"awaiting":[],"set":["necessary.operations.storage"],"signals":[],"tdls":[]}"#
     /// );
     ///
     /// assert_eq!(
     ///     PermissionState::default().page_json(),
-    ///     r#"{"awaiting":[],"set":[],"tdls":[]}"#
+    ///     r#"{"awaiting":[],"set":[],"signals":[],"tdls":[]}"#
     /// );
     /// ```
     #[must_use]
@@ -1002,7 +1026,13 @@ impl PermissionState {
             self.awaiting.iter().map(Permission::as_str).collect();
         awaiting.sort_unstable();
         let tdls: Vec<&str> = self.tdls.iter().map(Tdl::as_str).collect();
-        serde_json::json!({ "set": names, "awaiting": awaiting, "tdls": tdls }).to_string()
+        serde_json::json!({
+            "set": names,
+            "awaiting": awaiting,
+            "signals": &*self.signals,
+            "tdls": tdls,
+        })
+        .to_string()
     }
 }
 
@@ -1511,6 +1541,7 @@ mod tests {
                     "necessary.operations.storage",
                 ],
                 "awaiting": [],
+                "signals": [],
                 "tdls": [],
             })
             .to_string(),
@@ -1537,6 +1568,7 @@ mod tests {
             json!({
                 "set": ["necessary.operations.storage"],
                 "awaiting": [],
+                "signals": [],
                 "tdls": ["https://terms.example.com/marketing/2.txt"],
             })
             .to_string(),
@@ -1555,7 +1587,7 @@ mod tests {
         // Assert
         assert_eq!(
             json,
-            json!({ "set": [], "awaiting": [], "tdls": [] }).to_string(),
+            json!({ "set": [], "awaiting": [], "signals": [], "tdls": [] }).to_string(),
             "an empty state should render as an empty set and no declared terms,              not as nothing"
         );
     }
@@ -1581,6 +1613,7 @@ mod tests {
             json!({
                 "set": [],
                 "awaiting": Permission::all().map(Permission::as_str).collect::<std::collections::BTreeSet<_>>(),
+                "signals": [],
                 "tdls": [],
             })
             .to_string(),
@@ -1605,59 +1638,6 @@ mod tests {
         assert!(
             state.permissions().is_empty(),
             "narrowing what is awaited should set nothing"
-        );
-    }
-
-    #[test]
-    fn the_permissions_requiring_a_signal_anywhere_are_the_union_over_the_tree() {
-        // Arrange: a top node granting everything, one country requiring a
-        // signal for storage, and a region requiring one for profiling.
-        let maps = PermissionMaps::empty()
-            .with_default_rules(CountryRules::with_default(Acquisition::Granted))
-            .with_country(
-                "FR",
-                CountryRules::with_default(Acquisition::Granted)
-                    .with_rule(Permission::StoreOnDevice, Acquisition::RequiresSignal),
-            )
-            .with_region(
-                "US",
-                "CA",
-                CountryRules::with_default(Acquisition::Denied)
-                    .with_rule(Permission::CreateAdsProfile, Acquisition::RequiresSignal),
-            );
-
-        // Assert: both places contribute, and nothing else does.
-        let expected = PermissionSet::none()
-            .with(Permission::StoreOnDevice)
-            .with(Permission::CreateAdsProfile);
-        assert_eq!(
-            maps.requires_signal_anywhere(),
-            expected,
-            "should collect every requires-signal rule from every node"
-        );
-        assert_eq!(
-            PermissionMaps::empty().requires_signal_anywhere(),
-            Permission::all().collect::<PermissionSet>(),
-            "a map with no top node resolves at the floor, so everything requires a signal"
-        );
-    }
-
-    #[test]
-    fn the_shipped_policy_requires_a_signal_for_the_marketing_channels() {
-        // The sample policy says these arrive through their own opt-in, which
-        // no shipped scheme supplies, so start-up will name them.
-        let requiring = PermissionMaps::standard().requires_signal_anywhere();
-        let email = Permission::all()
-            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
-            .expect("the taxonomy should carry the email channel");
-        assert!(requiring.contains(email));
-        assert!(requiring.contains(Permission::StoreOnDevice));
-        let security = Permission::all()
-            .find(|permission| permission.as_str() == "necessary.operations.security")
-            .expect("the taxonomy should carry security");
-        assert!(
-            !requiring.contains(security),
-            "a permission granted everywhere requires a signal nowhere"
         );
     }
 

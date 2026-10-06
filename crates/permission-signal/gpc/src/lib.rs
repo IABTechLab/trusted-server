@@ -9,8 +9,10 @@
 //! This provider lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
+use trusted_server_core::consent::ConsentContext;
+use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
-use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission};
+use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
 /// `provider`, in logs, and when a peer consults it.
@@ -48,6 +50,16 @@ impl PermissionSignalProvider for GpcProvider {
         // scheme, which is most of them.
         ConsentSignal::Neutral
     }
+
+    /// The header's one value, when it was sent. There is nothing to
+    /// decode, so a sent header is always valid.
+    fn valid_signal(
+        &self,
+        consent: &ConsentContext,
+        _evidence: &dyn RequestInfo,
+    ) -> Option<ValidSignal> {
+        consent.gpc.then(|| ValidSignal::new(ID, "gpc", "1"))
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +91,21 @@ mod tests {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::Granted);
         GpcProvider::new().signal(permission, &input)
+    }
+
+    #[test]
+    fn vouches_for_the_header_only_when_it_was_sent() {
+        let evidence = OwnedRequestInfo::default();
+        assert_eq!(
+            GpcProvider::new().valid_signal(&with_header(true), &evidence),
+            Some(ValidSignal::new(ID, "gpc", "1")),
+            "a sent header is the one value it can carry"
+        );
+        assert_eq!(
+            GpcProvider::new().valid_signal(&with_header(false), &evidence),
+            None,
+            "no header is no signal"
+        );
     }
 
     #[test]

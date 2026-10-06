@@ -8,7 +8,7 @@ use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
 use crate::permissions::{
-    Acquisition, ConsentSignal, Permission, PermissionMaps, PermissionSet, SignalPolicy,
+    Acquisition, ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
 };
 use crate::settings::Settings;
 use crate::tdl::Tdl;
@@ -165,8 +165,7 @@ pub trait PermissionSignalProvider: Send + Sync {
     /// an answer arrives. That is right only for a permission some configured
     /// provider could grant. For any other, waiting is waiting for ever, so
     /// the assembly narrows the awaited list to the union of these
-    /// declarations, and start-up names the permissions the policy requires a
-    /// signal for that no provider can grant.
+    /// declarations.
     ///
     /// A scheme that only ever revokes, which is every opt-out, leaves this
     /// at its default of nothing. A scheme that grants declares exactly what
@@ -192,6 +191,24 @@ pub trait PermissionSignalProvider: Send + Sync {
     /// depended on the record.
     fn withdraws(&self, _permission: Permission, _input: &SignalInput<'_>) -> bool {
         false
+    }
+
+    /// The signal this provider read from the request and used, as it was
+    /// received, or `None` when there is none it can use.
+    ///
+    /// Absent, unreadable, expired and not-acted-on all answer `None`, and
+    /// nothing here says which. What each of those means for the
+    /// permissions is this provider's decision in [`signal`](Self::signal),
+    /// taken silently. Core carries what every provider vouched for on the
+    /// permission state, and a signal nobody vouched for is dropped from
+    /// everything Trusted Server sends on, so a corrupt record never reaches
+    /// a page or a bid request.
+    fn valid_signal(
+        &self,
+        _consent: &ConsentContext,
+        _evidence: &dyn RequestInfo,
+    ) -> Option<ValidSignal> {
+        None
     }
 
     /// The terms documents this provider says the request's data is
@@ -325,23 +342,23 @@ pub fn answerable(
         .fold(PermissionSet::none(), PermissionSet::union)
 }
 
-/// The permissions `maps` requires a signal for somewhere that no provider in
-/// `providers` can grant, so they stay unset for every visitor of that place.
+/// The signals the configured providers read and found valid, in the order
+/// the providers are asked.
 ///
-/// Start-up names these in the log. It does not refuse them, because the
-/// shipped sample policy itself carries two, the marketing channel opt-ins
-/// that arrive through a scheme none of the four shipped providers reads, and
-/// a deployment running only those four is not misconfigured for leaving a
-/// channel it never uses unset. A refusal belongs to a module that depends on
-/// such a permission, which is the check the page side adds when modules
-/// declare what they need.
+/// Each provider vouches for at most one signal, its own scheme's, so the
+/// list reads the way the deployment is configured. No provider vouching
+/// for anything leaves the list empty, which says the request carried
+/// nothing a configured provider could use.
 #[must_use]
-pub fn never_granted(
+pub(crate) fn signals(
     providers: &[Arc<dyn PermissionSignalProvider>],
-    maps: &PermissionMaps,
-) -> PermissionSet {
-    maps.requires_signal_anywhere()
-        .without(answerable(providers, maps.signals()))
+    consent: &ConsentContext,
+    evidence: &dyn RequestInfo,
+) -> Arc<[ValidSignal]> {
+    providers
+        .iter()
+        .filter_map(|provider| provider.valid_signal(consent, evidence))
+        .collect()
 }
 
 /// The providers a deployment named, in the order it named them, drawn from
@@ -454,16 +471,6 @@ pub fn build_permission_signal_providers(
              provider. A signal this deployment does not act on is read from the request \
              and then ignored",
             left_out.join(", ")
-        );
-    }
-    let unanswerable = never_granted(&selected, PermissionMaps::standard());
-    if !unanswerable.is_empty() {
-        let names: Vec<&str> = unanswerable.iter().map(Permission::as_str).collect();
-        log::warn!(
-            "Permission signals: the policy requires a signal for [{}] somewhere and no \
-             configured provider can grant them, so they stay unset there and a page is \
-             never told to wait for them",
-            names.join(", ")
         );
     }
     Ok(Arc::from(selected))
@@ -603,30 +610,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn start_up_names_what_requires_a_signal_that_nobody_can_grant() {
-        // Arrange: a policy requiring a signal for storage and profiling, and
-        // a deployment whose one granting provider covers storage only.
-        let maps = PermissionMaps::empty().with_default_rules(
-            crate::permissions::CountryRules::with_default(Acquisition::Granted)
-                .with_rule(Permission::StoreOnDevice, Acquisition::RequiresSignal)
-                .with_rule(Permission::CreateAdsProfile, Acquisition::RequiresSignal),
-        );
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> =
-            vec![Arc::new(Granting("storage", Permission::StoreOnDevice))];
+    /// A provider that vouches for a signal, standing in for a scheme that
+    /// read its string and could decode it.
+    struct Vouching(&'static str, &'static str);
 
-        // Assert: profiling is named, storage is not.
+    impl PermissionSignalProvider for Vouching {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn valid_signal(
+            &self,
+            _consent: &ConsentContext,
+            _evidence: &dyn RequestInfo,
+        ) -> Option<ValidSignal> {
+            Some(ValidSignal::new(self.0, self.0, self.1))
+        }
+    }
+
+    #[test]
+    fn the_valid_signals_are_what_each_provider_vouched_for_in_order() {
+        let consent = ConsentContext::default();
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+            Arc::new(Vouching("first", "one")),
+            fixed("silent", ConsentSignal::Revoke),
+            Arc::new(Vouching("second", "two")),
+        ];
+        let valid = signals(&providers, &consent, &no_evidence());
         assert_eq!(
-            never_granted(&providers, &maps),
-            PermissionSet::none().with(Permission::CreateAdsProfile),
-            "should name only the permission no provider can grant"
+            &*valid,
+            &[
+                ValidSignal::new("first", "first", "one"),
+                ValidSignal::new("second", "second", "two"),
+            ],
+            "should carry what was vouched for, in configured order, and nothing else"
         );
-        assert_eq!(
-            never_granted(&[], &maps),
-            PermissionSet::none()
-                .with(Permission::StoreOnDevice)
-                .with(Permission::CreateAdsProfile),
-            "with no provider, everything requiring a signal is named"
+        assert!(
+            signals(
+                &[fixed("silent", ConsentSignal::Grant)],
+                &consent,
+                &no_evidence()
+            )
+            .is_empty(),
+            "a provider vouches for nothing unless it says otherwise"
         );
     }
 

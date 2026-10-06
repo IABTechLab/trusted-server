@@ -16,11 +16,14 @@ mod mapping;
 
 pub use mapping::purpose_for;
 
-use trusted_server_core::consent::effective_tcf;
 #[cfg(test)]
 use trusted_server_core::consent::types::TcfConsent;
+use trusted_server_core::consent::{ConsentContext, effective_tcf};
+use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
-use trusted_server_core::permissions::{ConsentSignal, Permission, PermissionSet, SignalPolicy};
+use trusted_server_core::permissions::{
+    ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
+};
 
 /// The stable identifier this provider answers to in `[permission_signal]`
 /// `provider`, in logs, and when a peer consults it.
@@ -58,6 +61,14 @@ impl PermissionSignalProvider for TcfProvider {
             // TCF has nothing to say about this Data Use, so it says nothing.
             return ConsentSignal::Neutral;
         };
+        if unreadable(input.consent) {
+            // A TC string arrived and could not be read. The visitor expressed
+            // a preference this provider cannot see, which is not the same as
+            // no preference, so it fails closed on everything it maps rather
+            // than leaving the place baseline standing. An expired record is
+            // not this case, expiry being its own explicit state.
+            return ConsentSignal::Revoke;
+        }
         let Some(record) = effective_tcf(input.consent) else {
             // No TCF record on the request. Silence, not refusal, because
             // reading an absent scheme as a refusal would revoke on every
@@ -86,6 +97,19 @@ impl PermissionSignalProvider for TcfProvider {
             .collect()
     }
 
+    /// The standalone TC string, when it decoded and has not expired. A record
+    /// carried inside a GPP string is the GPP string's, which the GPP
+    /// provider vouches for.
+    fn valid_signal(
+        &self,
+        consent: &ConsentContext,
+        _evidence: &dyn RequestInfo,
+    ) -> Option<ValidSignal> {
+        consent.tcf.as_ref()?;
+        let raw = consent.raw_tc_string.as_deref()?;
+        Some(ValidSignal::new(ID, "tcf", raw))
+    }
+
     /// Only a TCF record refusing storage withdraws, because only TCF records
     /// a visitor declining the very signal storage depended on. A US-style
     /// opt-out suppresses use for the request and never destroys an identifier,
@@ -102,6 +126,11 @@ impl PermissionSignalProvider for TcfProvider {
         }
         effective_tcf(input.consent).is_some_and(|record| !record.has_storage_consent())
     }
+}
+
+/// Whether a TC string arrived that could not be decoded, expiry aside.
+fn unreadable(consent: &ConsentContext) -> bool {
+    consent.raw_tc_string.is_some() && consent.tcf.is_none() && !consent.expired
 }
 
 #[cfg(test)]
@@ -222,6 +251,87 @@ mod tests {
             ),
             ConsentSignal::Neutral,
             "an absent record is silence, never a refusal"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_tc_string_is_this_providers_refusal_and_an_expired_one_is_not() {
+        // A string arrived that could not be decoded. That is a preference
+        // this provider cannot see, so it refuses what it maps, silently,
+        // and says nothing about a Data Use no purpose covers.
+        let unreadable = ConsentContext {
+            raw_tc_string: Some("not a TC string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            answer(&unreadable, shipped_policy(), Permission::StoreOnDevice),
+            ConsentSignal::Revoke,
+            "an unreadable record refuses the Data Uses this scheme covers"
+        );
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert_eq!(
+            answer(&unreadable, shipped_policy(), email),
+            ConsentSignal::Neutral,
+            "and says nothing about a Data Use no purpose maps to"
+        );
+        assert_eq!(
+            answer(
+                &unreadable,
+                &SignalPolicy::default(),
+                Permission::StoreOnDevice
+            ),
+            ConsentSignal::Neutral,
+            "a silenced scheme says nothing, readable or not"
+        );
+        let expired = ConsentContext {
+            raw_tc_string: Some("CPold".to_owned()),
+            expired: true,
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            answer(&expired, shipped_policy(), Permission::StoreOnDevice),
+            ConsentSignal::Neutral,
+            "expiry is its own explicit state and not an unreadable record"
+        );
+    }
+
+    #[test]
+    fn vouches_for_the_standalone_tc_string_only_when_it_decoded() {
+        let evidence = OwnedRequestInfo::default();
+        let decoded = ConsentContext {
+            raw_tc_string: Some("CPreadable".to_owned()),
+            ..with_record(&[1])
+        };
+        assert_eq!(
+            TcfProvider::new().valid_signal(&decoded, &evidence),
+            Some(ValidSignal::new(ID, "tcf", "CPreadable")),
+            "a decoded record vouches for the string as received"
+        );
+        let unreadable = ConsentContext {
+            raw_tc_string: Some("not a TC string".to_owned()),
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            TcfProvider::new().valid_signal(&unreadable, &evidence),
+            None,
+            "an unreadable string is not vouched for"
+        );
+        let expired = ConsentContext {
+            raw_tc_string: Some("CPold".to_owned()),
+            expired: true,
+            ..ConsentContext::default()
+        };
+        assert_eq!(
+            TcfProvider::new().valid_signal(&expired, &evidence),
+            None,
+            "an expired record is not one this provider uses, so it is not vouched for"
+        );
+        assert_eq!(
+            TcfProvider::new().valid_signal(&ConsentContext::default(), &evidence),
+            None,
+            "and no record is no signal"
         );
     }
 

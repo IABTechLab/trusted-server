@@ -427,6 +427,9 @@ the `permissions.yaml` keys and `Permission::as_str()`.
   "awaiting": [
     "advertising_marketing.first_party.targeted"
   ],
+  "signals": [
+    { "provider": "tcf", "scheme": "tcf", "value": "CP..." }
+  ],
   "tdls": []
 }
 ```
@@ -435,8 +438,10 @@ the `permissions.yaml` keys and `Permission::as_str()`.
 configured signal provider could grant, and for which no provider has given
 one on this request. It is how a page tells a prompt that has not been answered
 from a visitor who refused, since both leave the Data Use out of `set`.
-`tdls` lists the terms documents the request's data is available under, as
-declared by the signal providers.
+`signals` lists the signals the providers read and found valid, each as it was
+received, so page code relies on exactly those and no other. `tdls` lists the
+terms documents the request's data is available under, as declared by the
+signal providers.
 
 Delivery follows the pattern already used for `adSlots` and `bids`, and the
 timing depends on how the page is assembled. Under inline assembly the value is
@@ -451,7 +456,7 @@ case rather than missing.
 
 Because the arrival point moves, a page module must not read `tsjs.permissions`
 directly at load. TSJS core defaults the value to
-`{ set: [], awaiting: [], tdls: [] }` and exposes
+`{ set: [], awaiting: [], signals: [], tdls: [] }` and exposes
 `tsjs.whenPermissions()`, a promise that resolves when the real value arrives,
 immediately in the head-first case or at the body seam, with a
 `DOMContentLoaded` fallback. That promise is the waiting point for a vendor page

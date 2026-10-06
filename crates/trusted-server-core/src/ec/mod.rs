@@ -483,6 +483,11 @@ impl EcContext {
             geo_status,
             services.permission_signal_providers(),
         );
+        // A signal no provider vouched for goes no further. The provider for
+        // its scheme has already decided what its absence means, so what is
+        // forwarded is exactly what the permissions were built from.
+        let mut consent = consent;
+        consent.keep_only(permissions.signals());
         // With no module selected nothing may create or use an identifier, so
         // the gate is closed rather than open by default.
         let ec_allowed = selected_module

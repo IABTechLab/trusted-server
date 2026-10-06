@@ -136,6 +136,7 @@ pub fn assemble_permissions(
         .awaiting_only(permission_signal::answerable(providers, maps.signals()))
         .with_storage_withdrawn(withdrawn)
         .with_tdls(permission_signal::tdls(providers, consent, evidence))
+        .with_signals(permission_signal::signals(providers, consent, evidence))
 }
 
 /// The acquisition rule for Edge Cookie storage in the request's resolved
@@ -173,7 +174,9 @@ pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
 /// signal-to-permission rule lives in core.
 ///
 /// Each provider amends what the ones before it settled on. The order is the
-/// policy, and [`combine`] documents why.
+/// policy, and [`combine`] documents why. A record that arrived and could
+/// not be read is its own scheme's provider's to answer, in the same order,
+/// and nothing here answers ahead of the providers.
 ///
 /// Whether an amendment changes anything is then decided by the country/region
 /// map, which drops a `granted` baseline on a `Revoke` and has nothing to drop
@@ -187,22 +190,6 @@ fn permission_signal<'a>(
     providers: &'a [Arc<dyn PermissionSignalProvider>],
 ) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
     move |permission, baseline| {
-        // A record that arrived and could not be read fails closed, ahead of
-        // every configured provider and regardless of which are configured.
-        //
-        // This is not a signaling scheme and is deliberately not in the
-        // configured list. A publisher chooses which signals to act on, but
-        // not what happens when one of those signals arrives unreadable. An
-        // unreadable record is a preference someone expressed that cannot be
-        // read, which is different from no record at all, so it must not
-        // degrade to the no-signal baseline.
-        //
-        // It overrides rather than taking a place in the order because the
-        // ordered rule would otherwise let a readable record from one scheme
-        // overwrite the refusal caused by an unreadable one from another.
-        if consent.has_malformed_record() {
-            return ConsentSignal::Revoke;
-        }
         permission_signal::combine(providers, permission, consent, evidence, signals, baseline)
     }
 }
@@ -214,7 +201,7 @@ mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
     use crate::permission_signal::SignalInput;
-    use crate::permissions::PermissionSet;
+    use crate::permissions::{PermissionSet, ValidSignal};
     use crate::test_support::tests::create_test_settings;
 
     /// A provider that grants every permission, standing in for a scheme that
@@ -416,71 +403,88 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // An unreadable record. Not a scheme a publisher lists, so it applies
-    // whatever they configured, and it is not subject to the ordering.
+    // An unreadable record is its own scheme's provider's to answer. Core
+    // answers nothing ahead of the providers, so with none configured the
+    // baseline stands whatever the request carries.
     // ------------------------------------------------------------------
 
     #[test]
-    fn an_unreadable_record_revokes_even_with_no_providers_configured() {
+    fn core_answers_nothing_ahead_of_the_providers() {
         let consent = ConsentContext {
             raw_tc_string: Some("this is not a TC string".to_owned()),
             ..ConsentContext::default()
         };
-        assert!(
-            consent.has_malformed_record(),
-            "the fixture has to actually be unreadable for this to test anything"
-        );
         let geo = us_ca_geo();
         let state = assembled(&consent, GeoStatus::Located(&geo), &[]);
         assert!(
-            !state.is_set(Permission::StoreOnDevice),
-            "a preference someone expressed that cannot be read must not degrade to the \
-             no-signal baseline, and a publisher cannot configure that away"
+            state.is_set(Permission::StoreOnDevice),
+            "with no provider configured, what a TC string says or fails to say is nobody's \
+             to answer, so the baseline stands"
+        );
+        assert!(
+            state.signals().is_empty(),
+            "and nothing vouches for the string, so it is not a valid signal"
         );
     }
 
+    /// A provider that vouches for whatever TC string the request carries,
+    /// standing in for a scheme that decoded it.
+    struct VouchingForTcf;
+
+    impl PermissionSignalProvider for VouchingForTcf {
+        fn id(&self) -> &'static str {
+            "vouching"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn valid_signal(
+            &self,
+            consent: &ConsentContext,
+            _evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Option<ValidSignal> {
+            consent
+                .raw_tc_string
+                .as_deref()
+                .map(|raw| ValidSignal::new("vouching", "tcf", raw))
+        }
+    }
+
     #[test]
-    fn a_readable_record_does_not_overwrite_an_unreadable_one() {
-        // The regression the override exists to prevent: under the ordered
-        // rule alone, a provider that grants would be asked after the
-        // unreadable GPP string and would overwrite the refusal it caused.
+    fn the_assembled_state_carries_the_signals_the_providers_vouched_for() {
         let consent = ConsentContext {
-            raw_gpp_string: Some("this is not a GPP string".to_owned()),
+            raw_tc_string: Some("CPxyz".to_owned()),
             ..ConsentContext::default()
         };
-        assert!(
-            consent.has_malformed_record(),
-            "the fixture has to actually be unreadable for this to test anything"
-        );
-        let geo = us_ca_geo();
-        let state = assembled(&consent, GeoStatus::Located(&geo), &granting());
-        assert!(
-            !state.is_set(Permission::StoreOnDevice),
-            "one scheme arriving unreadable is not cured by another scheme granting"
+        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(VouchingForTcf)];
+        let state = assembled(&consent, GeoStatus::NoLocation, &providers);
+        assert_eq!(
+            state.signals(),
+            &[ValidSignal::new("vouching", "tcf", "CPxyz")],
+            "should carry the signal as received, attributed to the provider that read it"
         );
     }
 
     #[test]
-    fn a_malformed_gpp_or_us_privacy_record_is_detected() {
-        // Each undecodable record form has to be detected, or the override
-        // above would not fire for it.
-        let gpp = ConsentContext {
-            raw_gpp_string: Some("not-a-gpp-string".to_owned()),
+    fn the_context_keeps_only_what_was_vouched_for() {
+        let mut consent = ConsentContext {
+            raw_tc_string: Some("CPxyz".to_owned()),
+            raw_gpp_string: Some("not a GPP string".to_owned()),
+            gpp_section_ids: Some(vec![7]),
+            raw_us_privacy: Some("1YNN".to_owned()),
             ..ConsentContext::default()
         };
-        let usp = ConsentContext {
-            raw_us_privacy: Some("bogus".to_owned()),
-            ..ConsentContext::default()
-        };
+        consent.keep_only(&[ValidSignal::new("vouching", "tcf", "CPxyz")]);
+        assert_eq!(consent.raw_tc_string.as_deref(), Some("CPxyz"));
         assert!(
-            gpp.has_malformed_record() && usp.has_malformed_record(),
-            "each undecodable record form should be detected"
+            consent.raw_gpp_string.is_none() && consent.gpp_section_ids.is_none(),
+            "a GPP string nobody vouched for goes no further, with its section ids"
         );
-        let geo = us_ca_geo();
         assert!(
-            !assembled(&usp, GeoStatus::Located(&geo), &granting())
-                .is_set(Permission::StoreOnDevice),
-            "an unreadable US Privacy string blocks the granted baseline like any other record"
+            consent.raw_us_privacy.is_none(),
+            "a US Privacy string nobody vouched for goes no further"
         );
     }
 

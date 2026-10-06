@@ -164,14 +164,30 @@ when the policy silences the record. The assembly keeps as awaited only what
 some provider declared, and everything else that requires a signal and got none
 is simply unset.
 
-Start-up compares the policy against the declarations and logs, at warn, every
-permission the policy requires a signal for somewhere that no configured
-provider can grant. It does not refuse, because the shipped sample policy
-itself carries two such permissions, the marketing channel opt-ins, which
-arrive through a scheme none of the four shipped providers reads, and a
-deployment that never uses those channels is not misconfigured for leaving them
-unset. A refusal belongs to whatever depends on such a permission, which is
-the check a page module gets when modules declare what they need.
+## The signals that were valid
+
+Each provider also says, through `valid_signal` on the trait, which signal it
+read from the request and used, as it was received. Core carries what every
+configured provider vouched for on the permission state, and the page reads
+the list as `signals` beside `set`, `awaiting` and `tdls`. A page, a bid
+request or a person reading the state relies on exactly those signals and no
+other.
+
+A signal that was absent, could not be read, has expired, or that no
+configured provider acts on is not in the list, and nothing says which. What
+each of those means for the permissions is the decision of the provider for
+that scheme, taken in `signal` and taken silently. Nothing is logged, because
+an unreadable record is a visitor's preference and not an operational fault.
+The four shipped providers read their own unreadable record as the refusal it
+may have carried, on the permissions their scheme covers, and say nothing
+about any other scheme. Core answers nothing ahead of the providers, so the
+order decides what a readable record from one scheme means beside an
+unreadable one from another, as it decides everything else.
+
+A signal nobody vouched for goes no further. After assembly the consent
+context keeps only the raw strings the valid signals name, so a corrupt or
+expired record never reaches a bid request or anything else Trusted Server
+sends on.
 
 ## Withdrawal is a separate question
 
@@ -229,14 +245,8 @@ not act on Global Privacy Control can remove it and keep the other two.
 
 ## What is not a provider
 
-A consent record that arrives and cannot be read revokes, ahead of the
-providers and whichever of them are configured. That is error handling, not a
-signaling scheme, so it is not in the list and cannot be removed. A
-publisher chooses which signals to act on; they do not choose what happens
-when one of those signals arrives unreadable. An unreadable record is a
-preference someone expressed that could not be read, which is not the same as
-no record at all, so it must not degrade to the no-signal baseline.
-
-It overrides rather than taking a place in the order, because the ordered rule
-would otherwise let a readable record from one scheme overwrite the refusal
-caused by an unreadable one from another.
+Nothing. Core reads no scheme and answers for none, an unreadable record
+included. A publisher chooses which signals to act on by listing providers,
+and each provider decides for its own scheme what an absent, unreadable or
+expired signal means. A scheme that is not listed does not run, whatever the
+request carries for it.

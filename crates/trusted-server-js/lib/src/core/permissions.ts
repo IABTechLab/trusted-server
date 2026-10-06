@@ -7,14 +7,15 @@ function isSnapshot(value: unknown): value is PermissionsSnapshot {
   return typeof value === 'object' && value !== null;
 }
 
-// Page code reads `set` and `tdls` without checking either exists, so both are
-// arrays whatever arrived. The edge always sends both, and a page assigning a
-// snapshot by hand, or an older edge, may not.
+// Page code reads the four lists without checking any exists, so each is an
+// array whatever arrived. The edge always sends all four, and a page assigning
+// a snapshot by hand, or an older edge, may not.
 function normalize(snapshot: PermissionsSnapshot): PermissionsSnapshot {
   return {
     ...snapshot,
     set: Array.isArray(snapshot.set) ? snapshot.set : [],
     awaiting: Array.isArray(snapshot.awaiting) ? snapshot.awaiting : [],
+    signals: Array.isArray(snapshot.signals) ? snapshot.signals : [],
     tdls: Array.isArray(snapshot.tdls) ? snapshot.tdls : [],
   };
 }
@@ -34,7 +35,7 @@ export function installPermissions(api: TsjsApi): void {
   const injected = api.permissions;
   let current: PermissionsSnapshot = isSnapshot(injected)
     ? normalize(injected)
-    : { set: [], awaiting: [], tdls: [] };
+    : { set: [], awaiting: [], signals: [], tdls: [] };
   let settled = false;
   let resolvePending: (snapshot: PermissionsSnapshot) => void = () => {};
   const pending = new Promise<PermissionsSnapshot>((resolve) => {
@@ -52,7 +53,9 @@ export function installPermissions(api: TsjsApi): void {
       return current;
     },
     set(value: PermissionsSnapshot) {
-      current = isSnapshot(value) ? normalize(value) : { set: [], awaiting: [], tdls: [] };
+      current = isSnapshot(value)
+        ? normalize(value)
+        : { set: [], awaiting: [], signals: [], tdls: [] };
       log.debug('permissions: received', current);
       settle(current);
     },

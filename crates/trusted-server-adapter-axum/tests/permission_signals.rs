@@ -466,7 +466,7 @@ fn a_withdrawal_needs_the_tcf_provider_to_be_running() {
 // ----------------------------------------------------------------------
 
 #[test]
-fn a_malformed_tcf_record_blocks_baseline_grants() {
+fn an_unreadable_tcf_record_is_the_tcf_providers_refusal() {
     let consent = ConsentContext {
         raw_tc_string: Some("not-a-tc-string".to_owned()),
         ..ConsentContext::default()
@@ -481,20 +481,45 @@ fn a_malformed_tcf_record_blocks_baseline_grants() {
         !state.storage_withdrawn(),
         "and it fails closed by suppression, never destructively"
     );
+    assert!(
+        state.signals().is_empty(),
+        "and the string is not a valid signal, so nothing downstream sees it"
+    );
+    let state = assembled(&consent, GeoStatus::Located(&geo), &all_but("tcf"));
+    assert!(
+        state.is_set(Permission::StoreOnDevice),
+        "a scheme that does not run answers nothing, readable or not"
+    );
 }
 
 #[test]
-fn a_readable_tcf_record_does_not_cure_an_unreadable_gpp_string() {
+fn an_unreadable_gpp_string_is_the_gpp_providers_opt_out_and_the_order_decides() {
+    // The GPP provider reads its own unreadable string as the opt-out it
+    // may have carried. Asked after it, a readable TCF record consenting to
+    // storage amends that, because the order is the policy. Nothing in
+    // core answers ahead of the providers any more.
     let consent = ConsentContext {
         tcf: Some(tcf_with_purposes(&[1, 4])),
+        raw_tc_string: Some("CPreadable".to_owned()),
         raw_gpp_string: Some("this is not a GPP string".to_owned()),
         ..ConsentContext::default()
     };
     let geo = us_ca_geo();
+    assert!(
+        !assembled(&consent, GeoStatus::Located(&geo), &all_but("tcf"))
+            .is_set(Permission::StoreOnDevice),
+        "without TCF the GPP provider's reading of its unreadable string stands"
+    );
     let state = assembled(&consent, GeoStatus::Located(&geo), &all_four());
     assert!(
-        !state.is_set(Permission::StoreOnDevice),
-        "one scheme arriving unreadable is not cured by another scheme arriving readable"
+        state.is_set(Permission::StoreOnDevice),
+        "asked last, the readable TCF record amends the GPP provider's answer"
+    );
+    let schemes: Vec<&str> = state.signals().iter().map(|s| s.scheme).collect();
+    assert_eq!(
+        schemes,
+        vec!["tcf"],
+        "only the readable string is vouched for, so only it goes any further"
     );
 }
 
@@ -510,33 +535,6 @@ fn an_expired_tcf_record_is_not_treated_as_malformed() {
     assert!(
         state.is_set(Permission::StoreOnDevice),
         "expiry is its own explicit state, deliberately distinct from malformed"
-    );
-}
-
-#[test]
-fn the_four_shipped_providers_leave_only_the_marketing_channels_unanswerable() {
-    // The sample policy requires a signal for the marketing channel opt-ins,
-    // which no shipped scheme reads, and for the ad-tech Data Uses, which
-    // TCF can grant. Start-up names the former and not the latter.
-    use trusted_server_core::permission_signal::never_granted;
-    use trusted_server_core::permissions::PermissionMaps;
-
-    let named = never_granted(&all_four(), PermissionMaps::standard());
-    let mut names: Vec<&str> = named.iter().map(Permission::as_str).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        vec![
-            "advertising_marketing.communications.email",
-            "advertising_marketing.communications.sms",
-        ],
-        "with all four providers only the channels no scheme carries are unanswerable"
-    );
-
-    let without_tcf = never_granted(&all_but("tcf"), PermissionMaps::standard());
-    assert!(
-        without_tcf.contains(Permission::StoreOnDevice),
-        "removing TCF leaves storage with no provider able to grant it"
     );
 }
 

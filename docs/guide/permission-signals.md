@@ -139,23 +139,38 @@ every Data Use a purpose maps to, and nothing when the policy silences the
 record. Only what some provider declared is reported as awaiting, and a
 permission that requires a signal nothing here could give is simply unset.
 
-Start-up logs, at warn, every permission the policy requires a signal for
-somewhere that no configured provider can grant. It does not refuse, because
-the shipped sample policy carries two such permissions, the marketing channel
-opt-ins, which arrive through a scheme none of the four shipped providers
-reads.
+## The signals that were valid
+
+Each provider also says which signal it read from the request and used, as it
+was received, and the page reads the list as `signals` beside `set`. A page,
+a bid request or a person reading the state relies on exactly those signals
+and no other.
+
+A signal that was absent, could not be read, has expired, or that no
+configured provider acts on is not in the list, and nothing says which. What
+each of those means for the permissions is the decision of the provider for
+that scheme, taken silently. The four that ship read their own unreadable
+record as the refusal it may have carried, on the permissions their scheme
+covers, and say nothing about any other scheme. Nothing in the core answers
+ahead of the providers, so the configured order decides what a readable record
+from one scheme means beside an unreadable one from another.
+
+A signal nobody vouched for goes no further. After the permissions are
+assembled the consent context keeps only the strings the valid signals name,
+so a corrupt or expired record never reaches a bid request.
 
 ## The terms the data is available under
 
 A provider may also declare the terms documents the request's data is available
 under, and the permission state carries what every configured provider declared,
-in the order they were asked. The page reads them as `tdls` alongside `set` and
-`awaiting`:
+in the order they were asked. The page reads them as `tdls` alongside `set`,
+`awaiting` and `signals`:
 
 ```json
 {
   "set": ["necessary.operations.storage"],
   "awaiting": ["advertising_marketing.first_party.targeted"],
+  "signals": [{ "provider": "tcf", "scheme": "tcf", "value": "CP..." }],
   "tdls": ["https://terms.example.com/marketing/2.txt"]
 }
 ```
@@ -193,13 +208,11 @@ never depended on the record.
 
 ## What is not a provider
 
-A consent record that arrives and cannot be read revokes, ahead of the
-providers and whichever of them are configured. That is error handling rather
-than a signaling scheme, so it is not in the list and cannot be removed. A
-publisher chooses which signals to act on, but not what happens when one of
-those signals arrives unreadable. An unreadable record is a preference
-someone expressed that could not be read, which is not the same as no
-record at all, so it must not degrade to the no-signal baseline.
+Nothing. The core reads no scheme and answers for none, an unreadable record
+included. A publisher chooses which signals to act on by listing providers,
+and each provider decides for its own scheme what an absent, unreadable or
+expired signal means. A scheme that is not listed does not run, whatever the
+request carries for it.
 
 ## Adding a scheme
 
