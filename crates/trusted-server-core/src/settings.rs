@@ -1263,46 +1263,46 @@ impl DeviceConfig {
     }
 }
 
-/// Which permission signal providers run, and in what order.
+/// Which permission signal modules run, and in what order.
 ///
-/// Mapped from the `[permission_signal]` TOML section, where `provider`
+/// Mapped from the `[permission_signal]` TOML section, where `module`
 /// selects, as it does in `[ec]`, `[geo]` and `[device]`. Those each name one
-/// provider, whereas signals compose, because a request can carry a TCF string
+/// module, whereas signals compose, because a request can carry a TCF string
 /// and a Global Privacy Control header at once and both have something to say.
-/// So here `provider` names a list, and the order is the policy, because the
-/// last provider with an opinion decides.
+/// So here `module` names a list, and the order is the policy, because the
+/// last module with an opinion decides.
 ///
-/// A provider that gains settings will take them in a
-/// `[permission_signal.<name>]` block named for it. None of the providers that
-/// ship has settings, so `provider` is the only key accepted, and any other key
+/// A module that gains settings will take them in a
+/// `[permission_signal.<name>]` block named for it. None of the modules that
+/// ship has settings, so `module` is the only key accepted, and any other key
 /// is refused as an unknown field rather than silently ignored.
 ///
 /// See `crates/trusted-server-core/src/permission_signal/README.md`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Validate)]
 pub struct PermissionSignalConfig {
-    /// The providers to run, in order, named by the identifier each provider
+    /// The modules to run, in order, named by the identifier each module
     /// crate declares, for example `gpc`, `gpp_sale_opt_out`, `us_privacy` and
     /// `tcf` and `mtm` for the five that ship.
     ///
-    /// Absent means every provider the adapter offers, in the order it offers
+    /// Absent means every module the adapter offers, in the order it offers
     /// them. A publisher who does not want to act on one removes it from the
-    /// list, and there is no separate switch, because a provider that is not
+    /// list, and there is no separate switch, because a module that is not
     /// listed does not run. An empty list runs none of them, leaving every
     /// permission at its country and region baseline.
     ///
-    /// Which names are valid is only known where the provider crates are
-    /// linked, so the check that each name matches an available provider and
+    /// Which names are valid is only known where the module crates are
+    /// linked, so the check that each name matches an available module and
     /// none is repeated happens at the adapter's composition root, through
-    /// [`build_permission_signal_providers`], and refuses startup rather than
+    /// [`build_permission_signal_modules`], and refuses startup rather than
     /// silently ignoring a typo.
     ///
-    /// [`build_permission_signal_providers`]:
-    ///     crate::permission_signal::build_permission_signal_providers
+    /// [`build_permission_signal_modules`]:
+    ///     crate::permission_signal::build_permission_signal_modules
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Vec<String>>,
+    pub module: Option<Vec<String>>,
 }
 
-/// Read by hand rather than derived, so that `sources`, the key `provider`
+/// Read by hand rather than derived, so that `sources`, the key `module`
 /// replaced, is refused with a message saying what to write instead. A derived
 /// struct could only refuse it by name by declaring it as a field, and would
 /// then list it among the keys it expects whenever it refused any other.
@@ -1314,24 +1314,24 @@ impl<'de> Deserialize<'de> for PermissionSignalConfig {
         let mut section = serde_json::Map::<String, JsonValue>::deserialize(deserializer)?;
         if section.contains_key("sources") {
             return Err(serde::de::Error::custom(
-                "[permission_signal] sources is no longer accepted. Name the providers \
-                 to run, in order, in [permission_signal] provider instead",
+                "[permission_signal] sources is no longer accepted. Name the modules \
+                 to run, in order, in [permission_signal] module instead",
             ));
         }
-        if let Some(key) = section.keys().find(|key| key.as_str() != "provider") {
+        if let Some(key) = section.keys().find(|key| key.as_str() != "module") {
             return Err(serde::de::Error::custom(format!(
-                "unknown field `{key}` in [permission_signal], expected `provider`. No \
-                 permission signal provider takes settings yet, so a \
+                "unknown field `{key}` in [permission_signal], expected `module`. No \
+                 permission signal module takes settings yet, so a \
                  [permission_signal.<name>] block is not accepted"
             )));
         }
         // Read as an option, so an explicit JSON null is the same as leaving
         // the key out.
-        let provider = match section.remove("provider") {
+        let module = match section.remove("module") {
             Some(value) => serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             None => None,
         };
-        Ok(Self { provider })
+        Ok(Self { module })
     }
 }
 
@@ -1396,7 +1396,7 @@ impl GeoConfig {
     /// top node.
     ///
     /// The top node is required: its `group` is the permission baseline for a
-    /// request the geo provider leaves unmatched, and its `jurisdiction` is the
+    /// request the geo module leaves unmatched, and its `jurisdiction` is the
     /// consent handling for that same request, so there must always be one.
     /// Checking it here turns a malformed policy into a configuration error at
     /// startup rather than a panic on the first lookup.
@@ -1417,19 +1417,19 @@ impl GeoConfig {
     /// Validates that running jurisdiction consumers without geolocation is
     /// explicitly acknowledged.
     ///
-    /// With no geo provider, every request resolves to the permission baseline
+    /// With no geo module, every request resolves to the permission baseline
     /// at the top of the `permissions.yaml` `rules` tree, so a visitor from any
     /// other jurisdiction silently receives that node's rules. That is
     /// acceptable only as an explicit operator
-    /// decision. When an Edge Cookie provider is configured (the permission
-    /// model gates it by jurisdiction) and no geo provider is selected,
+    /// decision. When an Edge Cookie module is configured (the permission
+    /// model gates it by jurisdiction) and no geo module is selected,
     /// [`assume_single_jurisdiction`](Self::assume_single_jurisdiction) must be
     /// `true`.
     ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when an Edge Cookie
-    /// provider is configured, no geo provider is selected, and
+    /// module is configured, no geo module is selected, and
     /// `assume_single_jurisdiction` is not set.
     pub fn validate_jurisdiction_acknowledgment(
         &self,
@@ -1442,10 +1442,10 @@ impl GeoConfig {
         let ec_active = !matches!(ec.module, None | Some(EcModuleSelection::None));
         if geo_disabled && ec_active && !self.assume_single_jurisdiction {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "[ec] provider is configured but no [geo] provider is selected, so \
+                message: "[ec] module is configured but no [geo] module is selected, so \
                           every request would be treated as the top of the permissions.yaml \
                           rules tree. Set [geo] assume_single_jurisdiction = true to \
-                          acknowledge single-jurisdiction operation, or select a geo provider"
+                          acknowledge single-jurisdiction operation, or select a geo module"
                     .to_owned(),
             }));
         }
@@ -6695,11 +6695,11 @@ passphrase = "another-test-secret-key-32-bytes"
     #[test]
     fn ec_without_geo_requires_the_single_jurisdiction_acknowledgment() {
         // The base test settings acknowledge single-jurisdiction operation.
-        // Removing the acknowledgment while an EC provider is configured and
-        // no geo provider is selected must fail at startup.
+        // Removing the acknowledgment while an EC module is configured and
+        // no geo module is selected must fail at startup.
         let toml_str = crate_test_settings_str().replace("assume_single_jurisdiction = true\n", "");
         let err = Settings::from_toml(&toml_str)
-            .expect_err("an EC provider with no geo provider needs the acknowledgment");
+            .expect_err("an EC module with no geo module needs the acknowledgment");
         assert!(
             matches!(
                 err.current_context(),
@@ -6709,14 +6709,14 @@ passphrase = "another-test-secret-key-32-bytes"
             err.current_context()
         );
 
-        // Selecting a geo provider removes the requirement.
+        // Selecting a geo module removes the requirement.
         let toml_str = crate_test_settings_str()
             .replace("assume_single_jurisdiction = true\n", "")
             .replace("[geo]", "[geo]\n            module = \"platform\"");
         Settings::from_toml(&toml_str)
-            .expect("a geo provider resolves jurisdictions, so no acknowledgment is needed");
+            .expect("a geo module resolves jurisdictions, so no acknowledgment is needed");
 
-        // With no EC provider there is no jurisdiction consumer to protect.
+        // With no EC module there is no jurisdiction consumer to protect.
         let toml_str = crate_test_settings_str()
             .replace("assume_single_jurisdiction = true\n", "")
             .replace("module = \"hmac\"", "")
@@ -9656,7 +9656,7 @@ mod permission_signal_config_tests {
     use crate::test_support::tests::crate_test_settings_str;
 
     // Which names are valid is only known where the scheme crates are linked,
-    // so the checks that a name matches an available provider, and that none
+    // so the checks that a name matches an available module, and that none
     // is repeated, live with the seam in `permission_signal::select`. What is
     // tested here is the shape of the section itself.
 
@@ -9670,10 +9670,10 @@ mod permission_signal_config_tests {
     }
 
     #[test]
-    fn no_section_is_allowed_and_means_every_provider() {
+    fn no_section_is_allowed_and_means_every_module() {
         let config = PermissionSignalConfig::default();
         assert!(
-            config.provider.is_none(),
+            config.module.is_none(),
             "absent rather than empty, because the two mean opposite things"
         );
     }
@@ -9681,9 +9681,9 @@ mod permission_signal_config_tests {
     #[test]
     fn the_section_round_trips_through_toml() {
         let parsed: PermissionSignalConfig =
-            toml::from_str(r#"provider = ["gpc", "tcf"]"#).expect("should parse the section");
+            toml::from_str(r#"module = ["gpc", "tcf"]"#).expect("should parse the section");
         assert_eq!(
-            parsed.provider.as_deref(),
+            parsed.module.as_deref(),
             Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
             "the order written is the order read, because the order is the policy"
         );
@@ -9694,14 +9694,14 @@ mod permission_signal_config_tests {
         // The section is written by derive and read by hand, so what a push
         // writes into a blob must be what a deployment reads back from it.
         let written = PermissionSignalConfig {
-            provider: Some(vec!["tcf".to_owned(), "gpc".to_owned()]),
+            module: Some(vec!["tcf".to_owned(), "gpc".to_owned()]),
         };
         let blob = serde_json::to_value(&written).expect("should write the section");
         let read: PermissionSignalConfig =
             serde_json::from_value(blob).expect("should read back what was written");
         assert_eq!(read, written, "the list and its order survive the blob");
 
-        let null: PermissionSignalConfig = serde_json::from_value(json!({ "provider": null }))
+        let null: PermissionSignalConfig = serde_json::from_value(json!({ "module": null }))
             .expect("should read an explicit null");
         assert_eq!(
             null,
@@ -9713,9 +9713,9 @@ mod permission_signal_config_tests {
     #[test]
     fn an_empty_list_is_kept_apart_from_no_list() {
         let parsed: PermissionSignalConfig =
-            toml::from_str("provider = []").expect("should parse an empty list");
+            toml::from_str("module = []").expect("should parse an empty list");
         assert_eq!(
-            parsed.provider.as_deref(),
+            parsed.module.as_deref(),
             Some(&[][..]),
             "a publisher acting on no signal at all writes an empty list, and it must \
              not read back as having written nothing"
@@ -9724,28 +9724,28 @@ mod permission_signal_config_tests {
 
     #[test]
     fn an_unknown_key_is_refused() {
-        let error = toml::from_str::<PermissionSignalConfig>(r#"providers = ["gpc"]"#)
+        let error = toml::from_str::<PermissionSignalConfig>(r#"modules = ["gpc"]"#)
             .expect_err("should refuse a misspelled key rather than silently ignore it");
         assert!(
             error
                 .to_string()
-                .contains("unknown field `providers` in [permission_signal], expected `provider`"),
+                .contains("unknown field `modules` in [permission_signal], expected `module`"),
             "the refusal names the key it did not recognize and the one it accepts: {error}"
         );
     }
 
     #[test]
-    fn the_removed_sources_key_is_refused_naming_provider() {
+    fn the_removed_sources_key_is_refused_naming_module() {
         for written in [
             r#"sources = ["gpc", "tcf"]"#,
-            "provider = [\"gpc\", \"tcf\"]\nsources = [\"gpc\", \"tcf\"]",
+            "module = [\"gpc\", \"tcf\"]\nsources = [\"gpc\", \"tcf\"]",
         ] {
             let error = toml::from_str::<PermissionSignalConfig>(written)
                 .expect_err("should refuse the removed key, alone or beside its replacement");
             assert!(
                 error.to_string().contains(
-                    "[permission_signal] sources is no longer accepted. Name the providers \
-                     to run, in order, in [permission_signal] provider instead"
+                    "[permission_signal] sources is no longer accepted. Name the modules \
+                     to run, in order, in [permission_signal] module instead"
                 ),
                 "the refusal says which key to write instead: {error}"
             );
@@ -9758,7 +9758,7 @@ mod permission_signal_config_tests {
 
         let error = Settings::from_toml(&written).expect_err("should refuse the removed key");
         assert!(
-            format!("{error:?}").contains("[permission_signal] provider"),
+            format!("{error:?}").contains("[permission_signal] module"),
             "reading a TOML file names the key that replaced it: {error:?}"
         );
 
@@ -9769,7 +9769,7 @@ mod permission_signal_config_tests {
             .try_into::<TrustedServerAppConfig>()
             .expect_err("should refuse the removed key before a push");
         assert!(
-            error.to_string().contains("[permission_signal] provider"),
+            error.to_string().contains("[permission_signal] module"),
             "a push names the key that replaced it: {error}"
         );
 
@@ -9781,19 +9781,19 @@ mod permission_signal_config_tests {
         let error =
             Settings::from_json_value(blob).expect_err("should refuse the removed key at startup");
         assert!(
-            format!("{error:?}").contains("[permission_signal] provider"),
+            format!("{error:?}").contains("[permission_signal] module"),
             "startup names the key that replaced it: {error:?}"
         );
     }
 
     #[test]
-    fn a_block_of_provider_settings_is_refused_as_an_unknown_field() {
-        // No provider takes settings yet, so a block for one is refused rather
+    fn a_block_of_module_settings_is_refused_as_an_unknown_field() {
+        // No module takes settings yet, so a block for one is refused rather
         // than read and then ignored.
         let written =
-            settings_toml_with("provider = [\"gpc\"]\n\n[permission_signal.gpc]\nenabled = true");
+            settings_toml_with("module = [\"gpc\"]\n\n[permission_signal.gpc]\nenabled = true");
         let error =
-            Settings::from_toml(&written).expect_err("should refuse settings no provider takes");
+            Settings::from_toml(&written).expect_err("should refuse settings no module takes");
         let message = format!("{error:?}");
         assert!(
             message.contains("unknown field `gpc` in [permission_signal]")

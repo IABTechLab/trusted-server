@@ -278,14 +278,14 @@ s = replace_once(
 # The permission baseline and consent handling come from the permissions.yaml
 # rules tree compiled into the binary. The Viceroy geolocation block appended
 # to the harness fastly.toml below maps the loopback client to US/CA, and the
-# platform geo provider is selected here, so the auction runs under the US
+# platform geo module is selected here, so the auction runs under the US
 # state opt-out rules with no consent signal, which is what the retired
 # default_country lever used to arrange.
 s = replace_once(
     s,
-    chr(10) + '# provider = "platform"' + chr(10),
-    chr(10) + 'provider = "platform"' + chr(10),
-    "platform geo provider",
+    chr(10) + '# module = "platform"' + chr(10),
+    chr(10) + 'module = "platform"' + chr(10),
+    "platform geo module",
 )
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
@@ -359,7 +359,7 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
 # Give Viceroy a geolocation answer for the loopback client, so the platform
-# geo provider selected in the app config resolves US/CA.
+# geo module selected in the app config resolves US/CA.
 cat >> "$WORK/fastly.toml" <<'GEOEOF'
 
 [local_server.geolocation]

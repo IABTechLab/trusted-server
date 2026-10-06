@@ -347,7 +347,7 @@ impl EcContext {
     }
 
     /// Reads the EC context, resolving the location through the configured geo
-    /// provider first.
+    /// module first.
     ///
     /// This is the constructor adapters use: it runs the geo lookup itself so
     /// a failed lookup is distinguished from "no location resolved". No
@@ -358,7 +358,7 @@ impl EcContext {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError`] when the selected Edge Cookie provider
+    /// Returns [`TrustedServerError`] when the selected Edge Cookie module
     /// cannot be built, the same as
     /// [`read_from_request_with_geo`](Self::read_from_request_with_geo).
     pub fn read_from_request_resolving_geo(
@@ -481,9 +481,9 @@ impl EcContext {
             &consent,
             &evidence,
             geo_status,
-            services.permission_signal_providers(),
+            services.permission_signal_modules(),
         );
-        // A signal no provider vouched for goes no further. The provider for
+        // A signal no module vouched for goes no further. The module for
         // its scheme has already decided what its absence means, so what is
         // forwarded is exactly what the permissions were built from.
         let mut consent = consent;
@@ -1017,7 +1017,7 @@ impl EcContext {
         self.selected_module.clone()
     }
 
-    /// Returns whether the configured Edge Cookie provider's required
+    /// Returns whether the configured Edge Cookie module's required
     /// permissions are set for this request.
     ///
     /// Resolved once at construction through the permission model (see
@@ -1030,7 +1030,7 @@ impl EcContext {
     /// Whether the request carries an explicit signal withdrawing Edge Cookie
     /// storage, scoped to the jurisdiction's storage baseline.
     ///
-    /// Answered by the signal providers at construction and recorded on the
+    /// Answered by the signal modules at construction and recorded on the
     /// permission state, see [`PermissionState::storage_withdrawn`]. Of the
     /// schemes that ship, only a TCF record refusing storage withdraws, and
     /// only where the storage baseline is not `granted`. Suppression (the
@@ -1049,7 +1049,7 @@ impl EcContext {
     /// [`crate::consent::gate_eids_by_permissions`]): storage (the identifier
     /// exists and is readable) and personalised-ad selection (it is shared to
     /// select ads). [`ec_allowed`](Self::ec_allowed) covers only the
-    /// provider's own requirements, so a storage-only grant keeps first-party
+    /// module's own requirements, so a storage-only grant keeps first-party
     /// use while withholding partner sharing.
     #[must_use]
     pub fn ec_sharing_allowed(&self) -> bool {
@@ -1061,7 +1061,7 @@ impl EcContext {
     /// Returns the permissions resolved for this request.
     ///
     /// Assembled once at construction, the country/region baseline augmented by
-    /// the session's signals. The core gates provider execution on these, and a
+    /// the session's signals. The core gates module execution on these, and a
     /// consumer may read them for its own logic.
     #[must_use]
     pub fn permissions(&self) -> &PermissionState {
@@ -1236,13 +1236,13 @@ impl EcContext {
     }
 
     /// The same context, recording that the request explicitly withdrew
-    /// storage, as assembly records it when a signal provider answers so.
+    /// storage, as assembly records it when a signal module answers so.
     ///
-    /// Core links no provider, so a core test cannot derive the withdrawal
+    /// Core links no module, so a core test cannot derive the withdrawal
     /// from a consent record the way a deployment does through the TCF
-    /// provider. It states the answer instead and tests what finalization does
+    /// module. It states the answer instead and tests what finalization does
     /// with it. That a TCF refusal produces this answer is proved where the
-    /// providers are linked, in the Axum adapter's `permission_signals` test.
+    /// modules are linked, in the Axum adapter's `permission_signals` test.
     #[cfg(test)]
     #[must_use]
     pub fn with_storage_withdrawn_for_test(mut self, withdrawn: bool) -> Self {
@@ -2428,13 +2428,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A geo provider whose lookup fails, the state the permission model's
+    /// A geo module whose lookup fails, the state the permission model's
     /// fail-closed rule exists for.
     ///
-    /// No geo provider shipped in this workspace can fail: the Fastly SDK's
-    /// `geo_lookup` returns an `Option`, the Cloudflare provider reads request
-    /// headers, and the Axum and Spin providers resolve nothing at all. The
-    /// `Result` on [`PlatformGeo::lookup`] is there for a provider that does
+    /// No geo module shipped in this workspace can fail: the Fastly SDK's
+    /// `geo_lookup` returns an `Option`, the Cloudflare module reads request
+    /// headers, and the Axum and Spin modules resolve nothing at all. The
+    /// `Result` on [`PlatformGeo::lookup`] is there for a module that does
     /// its own fallible lookup, so this stands in for one and proves the floor
     /// is reached through the seam rather than only from a hand-built status.
     #[derive(Debug)]
@@ -2465,7 +2465,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_geo_provider_failure_resolves_permissions_at_the_requires_signal_floor() {
+    fn a_geo_module_failure_resolves_permissions_at_the_requires_signal_floor() {
         use crate::permissions::Permission;
         use crate::platform::test_support::build_services_with_geo;
 
@@ -2488,7 +2488,7 @@ pub(crate) mod tests {
             .expect("a failed lookup should resolve permissions, not fail the request");
         assert!(
             !failed.permissions().is_set(Permission::StoreOnDevice),
-            "a geo provider failure must resolve at the requires-signal floor"
+            "a geo module failure must resolve at the requires-signal floor"
         );
         assert_eq!(
             failed.consent().jurisdiction,
@@ -2530,7 +2530,7 @@ pub(crate) mod tests {
         let mut ec =
             EcContext::new_for_test(Some(valid_ec_id("a", "ABC123")), ConsentContext::default());
         ec.permissions = PermissionState::new([Permission::StoreOnDevice].into_iter().collect());
-        assert!(ec.ec_allowed(), "the provider gate is open");
+        assert!(ec.ec_allowed(), "the module gate is open");
         assert!(
             !ec.ec_sharing_allowed(),
             "storage alone must not allow sharing beyond the edge"

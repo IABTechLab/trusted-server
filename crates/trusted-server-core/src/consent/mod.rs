@@ -305,7 +305,7 @@ fn has_eu_tcf_signal(raw_tc_present: bool, gpp_section_ids: Option<&[u16]>) -> b
 /// Returns the effective decoded TCF consent for enforcement decisions.
 ///
 /// A standalone TC string wins, and the EU TCF section of a GPP string stands
-/// in when there is none. Public because the TCF permission signal provider
+/// in when there is none. Public because the TCF permission signal module
 /// lives outside core and reads the record this pipeline produced, rather than
 /// decoding the cookie a second time and disagreeing with every other reader
 /// of the same request about expiry and the cached record.

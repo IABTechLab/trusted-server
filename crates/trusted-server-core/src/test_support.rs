@@ -27,7 +27,7 @@ pub mod tests {
             # A gdpr-eu country, where every permission requires a signal. This
             # reproduces the prior no-default floor, so existing tests are
             # unaffected by the now-required default.
-            # Tests run with no geo provider, so single-jurisdiction operation
+            # Tests run with no geo module, so single-jurisdiction operation
             # is acknowledged the same way a deployment would.
             assume_single_jurisdiction = true
 
@@ -193,7 +193,7 @@ pub mod nextjs_auction {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             # The fixture serves one publisher in one place, so it says so
-            # rather than selecting a geo provider it has no use for.
+            # rather than selecting a geo module it has no use for.
             [geo]
             assume_single_jurisdiction = true
             "#,

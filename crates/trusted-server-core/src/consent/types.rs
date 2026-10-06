@@ -149,14 +149,14 @@ pub struct ConsentContext {
 }
 
 impl ConsentContext {
-    /// Keeps only the raw strings a configured provider vouched for, so a
+    /// Keeps only the raw strings a configured module vouched for, so a
     /// signal that was absent, unreadable, expired or not acted on is never
     /// forwarded in a bid request or anywhere else this context is read.
     ///
     /// `signals` are the [`ValidSignal`]s on the assembled permission state,
     /// matched by scheme. The decoded records are left alone, because a
     /// decoded record only exists where the raw string was readable and the
-    /// providers have already read it.
+    /// modules have already read it.
     pub fn keep_only(&mut self, signals: &[crate::permissions::ValidSignal]) {
         let vouched = |scheme: &str| signals.iter().any(|signal| signal.scheme == scheme);
         if !vouched("tcf") {

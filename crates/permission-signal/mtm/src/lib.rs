@@ -1,17 +1,17 @@
-//! Model Terms for Marketing (MTM) as a permission signal provider.
+//! Model Terms for Marketing (MTM) as a permission signal module.
 //!
 //! The Preference Management Platform (PMP) asks a visitor one question and
 //! keeps one of three words, `standard`, `personalized` or `non-marketing`.
-//! That word is the whole of the answer, and this provider reads it from the
+//! That word is the whole of the answer, and this module reads it from the
 //! first party cookie `__mtm_pref` the PMP writes on the publisher's domain,
 //! which exists so that the server can see the answer at all. The PMP keeps
-//! its own copy elsewhere and mirrors it here. Absent, the provider says
+//! its own copy elsewhere and mirrors it here. Absent, the module says
 //! nothing and the country and region rules stand, which is clause 5.3 of the
 //! Model Terms, under which a preference with no value permits neither kind of
 //! marketing.
 //!
 //! What each word means is worked out from the Model Terms' own text, the
-//! versioned document this provider declares as the terms the data is
+//! versioned document this module declares as the terms the data is
 //! available under. Appendix 1 defines standard marketing as content unrelated
 //! to browsing history or interactions, and personalized marketing as content
 //! related to them, both including the use of cookies, and clause 4.4 permits
@@ -20,7 +20,7 @@
 //! interactions are the ones `standard` and `personalized` differ on.
 //!
 //! `non-marketing` changes nothing. The visitor named neither kind of
-//! marketing, so this provider has no choice to act on and every Data Use is
+//! marketing, so this module has no choice to act on and every Data Use is
 //! left to the country and region rules, which is clause 5.3's position.
 //!
 //! The word is still recorded and the terms are still declared, because the
@@ -34,7 +34,7 @@
 //! decline to bind in an opt-out jurisdiction says so in its own permissions
 //! policy, which is where jurisdiction belongs.
 //!
-//! This provider lives outside `trusted-server-core` deliberately, like every
+//! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use std::sync::OnceLock;
@@ -42,14 +42,14 @@ use std::sync::OnceLock;
 use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::constants::COOKIE_MTM_PREF;
 use trusted_server_core::evidence::RequestInfo;
-use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
+use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{
     ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
 };
 use trusted_server_core::tdl::Tdl;
 
-/// The stable identifier this provider answers to in `[permission_signal]`
-/// `provider`, in logs, and when a peer consults it.
+/// The stable identifier this module answers to in `[permission_signal]`
+/// `module`, in logs, and when a peer consults it.
 pub const ID: &str = "mtm";
 
 /// The scheme, as a [`ValidSignal`] names it.
@@ -127,10 +127,10 @@ pub fn preference(evidence: &dyn RequestInfo) -> Option<Preference> {
 
 /// The Model Terms for Marketing, read from the PMP answer.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct MtmProvider;
+pub struct MtmModule;
 
-impl MtmProvider {
-    /// A new provider.
+impl MtmModule {
+    /// A new module.
     #[must_use]
     pub const fn new() -> Self {
         Self
@@ -150,7 +150,7 @@ fn covered() -> PermissionSet {
     })
 }
 
-impl PermissionSignalProvider for MtmProvider {
+impl PermissionSignalModule for MtmModule {
     fn id(&self) -> &'static str {
         ID
     }
@@ -158,11 +158,11 @@ impl PermissionSignalProvider for MtmProvider {
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
         let Some(word) = preference(input.evidence) else {
             // No answer on the request. Silence, so the country and region
-            // rules stand, amended by whatever other providers say.
+            // rules stand, amended by whatever other modules say.
             return ConsentSignal::Neutral;
         };
         // `non-marketing` changes nothing. The visitor made no marketing choice
-        // for this provider to act on, so whatever the country and region
+        // for this module to act on, so whatever the country and region
         // rules say stands, which is clause 5.3's position for a preference
         // that names neither kind of marketing.
         //
@@ -174,7 +174,7 @@ impl PermissionSignalProvider for MtmProvider {
         // `granted`, so the baseline applies and marketing is permitted. A
         // deployment that wants a decline to bind in an opt-out jurisdiction
         // sets that in its own permissions policy, which is where jurisdiction
-        // belongs, and not in this provider, which only says what the two
+        // belongs, and not in this module, which only says what the two
         // marketing words mean.
         if word == Preference::NonMarketing {
             return ConsentSignal::Neutral;
@@ -248,7 +248,7 @@ mod tests {
         let consent = ConsentContext::default();
         let policy = SignalPolicy::default();
         let input = SignalInput::new(&consent, evidence, &policy, Acquisition::RequiresSignal);
-        MtmProvider::new().signal(permission, &input)
+        MtmModule::new().signal(permission, &input)
     }
 
     fn named(name: &str) -> Permission {
@@ -306,7 +306,7 @@ mod tests {
             assert_eq!(
                 Preference::parse(value).map(Preference::as_str),
                 Some(*word),
-                "the provider must accept what the platform writes: {set_cookie}",
+                "the module must accept what the platform writes: {set_cookie}",
             );
         }
     }
@@ -318,7 +318,7 @@ mod tests {
     /// seeing its own answer and the visitor's next choice would be lost with
     /// nothing reporting anything wrong.
     ///
-    /// This provider only ever reads the cookie, so the rule binds whoever
+    /// This module only ever reads the cookie, so the rule binds whoever
     /// writes it. The assertion is here because these fixtures are the
     /// platform's real output, so the day that changes, this is where it shows.
     #[test]
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn answers_to_its_identifier() {
-        assert_eq!(MtmProvider::new().id(), ID);
+        assert_eq!(MtmModule::new().id(), ID);
     }
 
     #[test]
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn declares_the_eleven_data_uses_the_words_cover() {
-        let declared = MtmProvider::new().grants(&SignalPolicy::default());
+        let declared = MtmModule::new().grants(&SignalPolicy::default());
         assert_eq!(
             declared.iter().count(),
             UNDER_EITHER_WORD.len() + PERSONALIZED_ONLY.len(),
@@ -495,25 +495,25 @@ mod tests {
     #[test]
     fn vouches_for_the_word_and_declares_the_terms_only_when_one_is_present() {
         let consent = ConsentContext::default();
-        let provider = MtmProvider::new();
+        let module = MtmModule::new();
         assert_eq!(
-            provider.valid_signal(&consent, &with_cookie("standard")),
+            module.valid_signal(&consent, &with_cookie("standard")),
             Some(ValidSignal::new(ID, SCHEME, "standard"))
         );
-        let declared = provider.tdls(&consent, &with_cookie("personalized"));
+        let declared = module.tdls(&consent, &with_cookie("personalized"));
         assert_eq!(
             declared.iter().map(Tdl::as_str).collect::<Vec<_>>(),
             vec![TERMS],
             "an answer is given under the Model Terms"
         );
-        assert_eq!(provider.valid_signal(&consent, &with_cookie("maybe")), None);
-        assert!(provider.tdls(&consent, &with_cookie("maybe")).is_empty());
+        assert_eq!(module.valid_signal(&consent, &with_cookie("maybe")), None);
+        assert!(module.tdls(&consent, &with_cookie("maybe")).is_empty());
         assert_eq!(
-            provider.valid_signal(&consent, &OwnedRequestInfo::default()),
+            module.valid_signal(&consent, &OwnedRequestInfo::default()),
             None
         );
         assert!(
-            provider
+            module
                 .tdls(&consent, &OwnedRequestInfo::default())
                 .is_empty()
         );
@@ -541,14 +541,14 @@ mod tests {
     fn non_marketing_is_still_a_recorded_answer_under_the_terms() {
         let evidence = with_cookie("non-marketing");
         let consent = ConsentContext::default();
-        let provider = MtmProvider::new();
+        let module = MtmModule::new();
 
-        let signal = provider
+        let signal = module
             .valid_signal(&consent, &evidence)
             .expect("a decline is a valid answer");
         assert_eq!(signal.value, "non-marketing");
         assert_eq!(
-            provider.tdls(&consent, &evidence).len(),
+            module.tdls(&consent, &evidence).len(),
             1,
             "the answer was given under the Model Terms whatever it said",
         );
@@ -561,7 +561,7 @@ mod tests {
         let evidence = with_cookie("standard");
         let input = SignalInput::new(&consent, &evidence, &policy, Acquisition::RequiresSignal);
         assert!(
-            !MtmProvider::new().withdraws(Permission::StoreOnDevice, &input),
+            !MtmModule::new().withdraws(Permission::StoreOnDevice, &input),
             "a standard answer refuses personalization and leaves an issued identifier alone"
         );
     }

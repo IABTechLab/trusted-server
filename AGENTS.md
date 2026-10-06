@@ -22,10 +22,10 @@ crates/
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
   device/
-    fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
-  edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
-  geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
-  permission-signal/                    # permission signal provider crates, one per scheme (gpc, gpp, tcf, us-privacy); core links none
+    fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)
+  edgecookie/                           # vendor Edge Cookie module crates (built-in HMAC module is in core)
+  geo/                                  # vendor geo module crates (host geo is injected by the adapter)
+  permission-signal/                    # permission signal module crates, one per scheme (gpc, gpp, tcf, us-privacy); core links none
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -319,18 +319,18 @@ impl core::error::Error for MyError {}
 
 ### Permission model terminology
 
-Permissions are the primitive. A provider declares the permissions it requires
+Permissions are the primitive. A module declares the permissions it requires
 (`required_permissions`) and the system decides whether each is _set_. Consent
 is only one of many ways a permission may be established. Country or
 jurisdiction rules (a `Granted` group baseline), legitimate interest, or
 configuration can set a permission with no consent at all.
 
-- A provider that needs nothing **requires no permission**. Never write that it
+- A module that needs nothing **requires no permission**. Never write that it
   "runs without any consent".
-- A gated provider **runs once its required permissions are set**, by whatever
+- A gated module **runs once its required permissions are set**, by whatever
   method.
 
-**Evidence is not rationed, use is.** Every provider and every integration sees
+**Evidence is not rationed, use is.** Every module and every integration sees
 all the evidence available for a request, including host signals such as the TLS
 JA4 and HTTP/2 signals. The core never decides which vendor may see what,
 because withholding a signal from one vendor and not another discriminates
@@ -340,7 +340,7 @@ is universal, use is gated.
 
 The practical consequence: never "fix" a vendor's access to a signal by hiding
 the signal. If a use needs controlling, express it as a permission. A change
-that removes evidence from a provider's reach is working against the
+that removes evidence from a module's reach is working against the
 architecture, not protecting it.
 
 - Reserve "consent" for the consent subsystem (`consent/`, `ConsentContext`,
@@ -364,38 +364,38 @@ Bad: `"fix: added feature flags"`
 
 ---
 
-## Provider Architecture
+## Module Architecture
 
 Each vendor-differentiated capability is pluggable behind its own trait, so a
 deployment selects an implementation and the core stays neutral:
 
 | Capability            | Trait                                    | Selector            | Built-in (core)                         | Vendor / host crates         |
 | --------------------- | ---------------------------------------- | ------------------- | --------------------------------------- | ---------------------------- |
-| Edge Cookie identity  | `EdgeCookieModule` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
-| Device detection      | `DeviceModule` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
-| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
-| Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] provider` (an ordered list) | None, and with no provider every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
+| Edge Cookie identity  | `EdgeCookieModule` (`ec/module.rs`)  | `[ec] module`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
+| Device detection      | `DeviceModule` (`ec/device.rs`)        | `[device] module` | User-Agent only (default)               | `crates/device/<vendor>`     |
+| Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] module`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
+| Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission_signal] module` (an ordered list) | None, and with no module every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
 
-Principles for adding or changing a provider:
+Principles for adding or changing a module:
 
 - **Core stays neutral.** The trait and the host-neutral default live in
   `trusted-server-core`. Host-specific and vendor implementations live in their
   own crates and are injected by the adapter (for example `build_device_module`
   and `build_geo_module`), so core never depends on a host SDK or a vendor, and
   the default request path makes no host-specific calls.
-- **Providers read request evidence, not a fixed parameter set.** A provider must
+- **Modules read request evidence, not a fixed parameter set.** A module must
   be able to see everything about the request it needs (User-Agent, headers, and
   host signals such as the TLS JA4 and HTTP/2 signals) through an evidence
   abstraction rather than a hard-coded struct of fields. Host signals come from
-  the host (the Fastly SDK) and are opt-in, so a neutral provider triggers no
+  the host (the Fastly SDK) and are opt-in, so a neutral module triggers no
   host signal calls.
-- **Providers are separated by capability but composed per request, and one may
+- **Modules are separated by capability but composed per request, and one may
   need another's output.** Geo resolves the country and region the permission
-  model uses, and the permission model gates whether the Edge Cookie provider
+  model uses, and the permission model gates whether the Edge Cookie module
   runs. Device signals gate Edge Cookie writes (the browser / bot gate). When
-  multiple vendor providers share a backend (for example a vendor's Edge Cookie,
-  geo, and device provider on one cloud pipeline) they share a single call per
-  request rather than calling independently. Give a provider the inputs and
+  multiple vendor modules share a backend (for example a vendor's Edge Cookie,
+  geo, and device module on one cloud pipeline) they share a single call per
+  request rather than calling independently. Give a module the inputs and
   upstream results it needs explicitly, rather than having it reach into globals.
 
 ---

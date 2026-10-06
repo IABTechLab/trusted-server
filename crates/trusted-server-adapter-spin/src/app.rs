@@ -82,8 +82,8 @@ pub struct AppState {
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
-    permission_signal_providers:
-        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -177,10 +177,10 @@ fn build_state_with_services(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
-    let permission_signal_providers =
-        trusted_server_core::permission_signal::build_permission_signal_providers(
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
-            &shipped_signal_providers(),
+            &shipped_signal_modules(),
         )?;
 
     Ok(Arc::new(AppState {
@@ -188,28 +188,28 @@ fn build_state_with_services(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         ec_module,
-        permission_signal_providers,
+        permission_signal_modules,
         services,
     }))
 }
 
-/// The permission signal providers this adapter links, in the order they run
+/// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
 /// carry a choice someone made through an interface follow, so an answer
 /// given at a prompt amends the header the visitor arrived with.
 ///
-/// Core supplies no provider of its own, so this is where a deployment's
+/// Core supplies no module of its own, so this is where a deployment's
 /// schemes are decided. A scheme is added by linking its crate here, and a
 /// scheme core has never heard of plugs in the same way.
-fn shipped_signal_providers()
--> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
     vec![
-        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
-        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
-        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
-        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
-        Arc::new(trusted_server_permission_signal_mtm::MtmProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
     ]
 }
 
@@ -223,7 +223,7 @@ impl AppState {
         self.services
             .clone()
             .unwrap_or_else(|| {
-                build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
             })
             .with_resolved_ec_module(self.ec_module.clone())
     }
@@ -1228,8 +1228,8 @@ mod tests {
         [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
-        # An Edge Cookie provider is configured, so single-jurisdiction
-        # operation is acknowledged because no geo provider is selected.
+        # An Edge Cookie module is configured, so single-jurisdiction
+        # operation is acknowledged because no geo module is selected.
         [geo]
         assume_single_jurisdiction = true
     "#;

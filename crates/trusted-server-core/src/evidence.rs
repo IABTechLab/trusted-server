@@ -72,11 +72,11 @@ pub trait RequestInfo: Send + Sync + core::fmt::Debug {
     /// The value of request cookie `name`, or `None` when the request does not
     /// carry it.
     ///
-    /// Defaulted, parsing the `Cookie` header, so a provider that needs a
+    /// Defaulted, parsing the `Cookie` header, so a module that needs a
     /// cookie does not write its own splitting and trimming and get it subtly
     /// different from the next one. An implementation holding a parsed jar may
     /// override it. Core keeps no list of which cookies belong to which
-    /// scheme, which is what lets a permission signal provider for a scheme
+    /// scheme, which is what lets a permission signal module for a scheme
     /// core has never heard of read its own signal.
     fn cookie(&self, name: &str) -> Option<&str> {
         let header = self.header("cookie")?;

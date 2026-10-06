@@ -1,43 +1,43 @@
-//! Global Privacy Control as a permission signal provider.
+//! Global Privacy Control as a permission signal module.
 //!
 //! Answers from the `Sec-GPC` request header, which core reads into the
-//! consent record's `gpc` flag. Separate from the GPP and US Privacy providers
+//! consent record's `gpc` flag. Separate from the GPP and US Privacy modules
 //! so that a publisher who does not act on Global Privacy Control can leave
 //! this one out of the configured list without also losing the other two
 //! opt-outs.
 //!
-//! This provider lives outside `trusted-server-core` deliberately, like every
+//! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::evidence::RequestInfo;
-use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
+use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
-/// The stable identifier this provider answers to in `[permission_signal]`
-/// `provider`, in logs, and when a peer consults it.
+/// The stable identifier this module answers to in `[permission_signal]`
+/// `module`, in logs, and when a peer consults it.
 pub const ID: &str = "gpc";
 
 /// The `Sec-GPC` request header, Global Privacy Control.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct GpcProvider;
+pub struct GpcModule;
 
-impl GpcProvider {
-    /// A new provider.
+impl GpcModule {
+    /// A new module.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 }
 
-impl PermissionSignalProvider for GpcProvider {
+impl PermissionSignalModule for GpcModule {
     fn id(&self) -> &'static str {
         ID
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
         // The policy decides whether this scheme counts at all and what an
-        // opt-out takes away, so a provider the policy does not list stays
+        // opt-out takes away, so a module the policy does not list stays
         // silent even when configuration names it.
         if !input.policy.opt_out_sources().contains(&OptOutSource::Gpc) {
             return ConsentSignal::Neutral;
@@ -90,19 +90,19 @@ mod tests {
     ) -> ConsentSignal {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::Granted);
-        GpcProvider::new().signal(permission, &input)
+        GpcModule::new().signal(permission, &input)
     }
 
     #[test]
     fn vouches_for_the_header_only_when_it_was_sent() {
         let evidence = OwnedRequestInfo::default();
         assert_eq!(
-            GpcProvider::new().valid_signal(&with_header(true), &evidence),
+            GpcModule::new().valid_signal(&with_header(true), &evidence),
             Some(ValidSignal::new(ID, "gpc", "1")),
             "a sent header is the one value it can carry"
         );
         assert_eq!(
-            GpcProvider::new().valid_signal(&with_header(false), &evidence),
+            GpcModule::new().valid_signal(&with_header(false), &evidence),
             None,
             "no header is no signal"
         );
@@ -111,9 +111,9 @@ mod tests {
     #[test]
     fn answers_to_its_identifier() {
         assert_eq!(
-            GpcProvider::new().id(),
+            GpcModule::new().id(),
             ID,
-            "the provider answers to the identifier configuration names"
+            "the module answers to the identifier configuration names"
         );
     }
 
@@ -178,7 +178,7 @@ mod tests {
             Acquisition::RequiresSignal,
         );
         assert!(
-            !GpcProvider::new().withdraws(Permission::StoreOnDevice, &input),
+            !GpcModule::new().withdraws(Permission::StoreOnDevice, &input),
             "a browser setting suppresses use for the request and never destroys an identifier"
         );
     }

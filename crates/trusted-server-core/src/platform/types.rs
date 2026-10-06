@@ -11,7 +11,7 @@ use super::{
 };
 use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
-use crate::permission_signal::PermissionSignalProvider;
+use crate::permission_signal::PermissionSignalModule;
 
 /// Geographic information extracted from a request.
 ///
@@ -209,7 +209,7 @@ pub struct RuntimeServices {
     /// case every permission stays at its country and region baseline. Shared,
     /// so building the services for a request bumps a reference count rather
     /// than copying the list, and cloning the services does the same.
-    pub(crate) permission_signal_providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+    pub(crate) permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
 }
 
 impl RuntimeServices {
@@ -324,10 +324,10 @@ impl RuntimeServices {
         self.resolved_ec_module.clone()
     }
 
-    /// The permission signal providers this deployment runs, in order.
+    /// The permission signal modules this deployment runs, in order.
     #[must_use]
-    pub fn permission_signal_providers(&self) -> &[Arc<dyn PermissionSignalProvider>] {
-        &self.permission_signal_providers
+    pub fn permission_signal_modules(&self) -> &[Arc<dyn PermissionSignalModule>] {
+        &self.permission_signal_modules
     }
 
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
@@ -416,7 +416,7 @@ pub struct RuntimeServicesBuilder {
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    permission_signal_providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+    permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
 }
 
 impl RuntimeServicesBuilder {
@@ -434,7 +434,7 @@ impl RuntimeServicesBuilder {
             client_info: None,
             host_signals: None,
             resolved_ec_module: None,
-            permission_signal_providers: Arc::default(),
+            permission_signal_modules: Arc::default(),
         }
     }
 
@@ -537,22 +537,22 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the permission signal providers this deployment runs, in the order
+    /// Set the permission signal modules this deployment runs, in the order
     /// they are asked.
     ///
     /// Optional, and empty when unset. An adapter hands in the shared list
-    /// [`build_permission_signal_providers`] selected from the scheme crates it
-    /// links, so the request path asks exactly the providers configuration
+    /// [`build_permission_signal_modules`] selected from the scheme crates it
+    /// links, so the request path asks exactly the modules configuration
     /// named, in that order, and core supplies none of its own.
     ///
-    /// [`build_permission_signal_providers`]:
-    ///     crate::permission_signal::build_permission_signal_providers
+    /// [`build_permission_signal_modules`]:
+    ///     crate::permission_signal::build_permission_signal_modules
     #[must_use]
-    pub fn permission_signal_providers(
+    pub fn permission_signal_modules(
         mut self,
-        providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+        modules: Arc<[Arc<dyn PermissionSignalModule>]>,
     ) -> Self {
-        self.permission_signal_providers = providers;
+        self.permission_signal_modules = modules;
         self
     }
 
@@ -598,7 +598,7 @@ impl RuntimeServicesBuilder {
                 .expect("should set client_info before building RuntimeServices"),
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
-            permission_signal_providers: self.permission_signal_providers,
+            permission_signal_modules: self.permission_signal_modules,
         }
     }
 }

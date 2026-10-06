@@ -1,15 +1,15 @@
-//! IAB TCF v2 as a permission signal provider.
+//! IAB TCF v2 as a permission signal module.
 //!
 //! Answers from the decoded TCF record for the purposes this crate maps to
 //! each permission, and is the one place that knows what a TCF purpose is.
 //! Core decodes the TC string, keeps the record against the Edge Cookie
 //! identifier, expires it by age and resolves it against a GPP EU section, and
-//! this provider reads what that pipeline produced rather than decoding the
+//! this module reads what that pipeline produced rather than decoding the
 //! cookie a second time. Reading the wire directly would silently skip the
 //! cached record on a returning visitor and the expiry rule, and answer
 //! differently from every other reader of the same request.
 //!
-//! This provider lives outside `trusted-server-core` deliberately, like every
+//! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 mod mapping;
@@ -22,13 +22,13 @@ pub use mapping::purpose_for;
 use trusted_server_core::consent::types::TcfConsent;
 use trusted_server_core::consent::{ConsentContext, effective_tcf};
 use trusted_server_core::evidence::RequestInfo;
-use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
+use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{
     ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
 };
 
-/// The stable identifier this provider answers to in `[permission_signal]`
-/// `provider`, in logs, and when a peer consults it.
+/// The stable identifier this module answers to in `[permission_signal]`
+/// `module`, in logs, and when a peer consults it.
 pub const ID: &str = "tcf";
 
 /// TCF v2, when the policy says TCF answers for this deployment.
@@ -37,17 +37,17 @@ pub const ID: &str = "tcf";
 /// [`purpose_for`], so core carries no table of another scheme's numbers. A
 /// permission no purpose maps to gets silence, not a refusal.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TcfProvider;
+pub struct TcfModule;
 
-impl TcfProvider {
-    /// A new provider.
+impl TcfModule {
+    /// A new module.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 }
 
-impl PermissionSignalProvider for TcfProvider {
+impl PermissionSignalModule for TcfModule {
     fn id(&self) -> &'static str {
         ID
     }
@@ -65,7 +65,7 @@ impl PermissionSignalProvider for TcfProvider {
         };
         if unreadable(input.consent) {
             // A TC string arrived and could not be read. The visitor expressed
-            // a preference this provider cannot see, which is not the same as
+            // a preference this module cannot see, which is not the same as
             // no preference, so it fails closed on everything it maps rather
             // than leaving the place baseline standing. An expired record is
             // not this case, expiry being its own explicit state.
@@ -99,7 +99,7 @@ impl PermissionSignalProvider for TcfProvider {
 
     /// The standalone TC string, when it decoded and has not expired. A record
     /// carried inside a GPP string is the GPP string's, which the GPP
-    /// provider vouches for.
+    /// module vouches for.
     fn valid_signal(
         &self,
         consent: &ConsentContext,
@@ -113,7 +113,7 @@ impl PermissionSignalProvider for TcfProvider {
     /// Only a TCF record refusing storage withdraws, because only TCF records
     /// a visitor declining the very signal storage depended on. A US-style
     /// opt-out suppresses use for the request and never destroys an identifier,
-    /// so the other providers leave this at its default.
+    /// so the other modules leave this at its default.
     ///
     /// Whether the refusal is destructive at all is core's to decide from the
     /// jurisdiction's storage baseline, which is why this answers the narrow
@@ -197,21 +197,21 @@ mod tests {
     ) -> ConsentSignal {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::RequiresSignal);
-        TcfProvider::new().signal(permission, &input)
+        TcfModule::new().signal(permission, &input)
     }
 
     fn withdraws(consent: &ConsentContext, policy: &SignalPolicy, permission: Permission) -> bool {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::RequiresSignal);
-        TcfProvider::new().withdraws(permission, &input)
+        TcfModule::new().withdraws(permission, &input)
     }
 
     #[test]
     fn answers_to_its_identifier() {
         assert_eq!(
-            TcfProvider::new().id(),
+            TcfModule::new().id(),
             ID,
-            "the provider answers to the identifier configuration names"
+            "the module answers to the identifier configuration names"
         );
     }
 
@@ -266,9 +266,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_tc_string_is_this_providers_refusal_and_an_expired_one_is_not() {
+    fn an_unreadable_tc_string_is_this_modules_refusal_and_an_expired_one_is_not() {
         // A string arrived that could not be decoded. That is a preference
-        // this provider cannot see, so it refuses what it maps, silently,
+        // this module cannot see, so it refuses what it maps, silently,
         // and says nothing about a Data Use no purpose covers.
         let unreadable = ConsentContext {
             raw_tc_string: Some("not a TC string".to_owned()),
@@ -316,7 +316,7 @@ mod tests {
             ..with_record(&[1])
         };
         assert_eq!(
-            TcfProvider::new().valid_signal(&decoded, &evidence),
+            TcfModule::new().valid_signal(&decoded, &evidence),
             Some(ValidSignal::new(ID, "tcf", "CPreadable")),
             "a decoded record vouches for the string as received"
         );
@@ -325,7 +325,7 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            TcfProvider::new().valid_signal(&unreadable, &evidence),
+            TcfModule::new().valid_signal(&unreadable, &evidence),
             None,
             "an unreadable string is not vouched for"
         );
@@ -335,12 +335,12 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            TcfProvider::new().valid_signal(&expired, &evidence),
+            TcfModule::new().valid_signal(&expired, &evidence),
             None,
-            "an expired record is not one this provider uses, so it is not vouched for"
+            "an expired record is not one this module uses, so it is not vouched for"
         );
         assert_eq!(
-            TcfProvider::new().valid_signal(&ConsentContext::default(), &evidence),
+            TcfModule::new().valid_signal(&ConsentContext::default(), &evidence),
             None,
             "and no record is no signal"
         );
@@ -352,7 +352,7 @@ mod tests {
         // is declared and an unmapped one is not. Under a policy that silences
         // the record nothing is declared, because a record that cannot answer
         // is not one a page should wait for.
-        let declared = TcfProvider::new().grants(shipped_policy());
+        let declared = TcfModule::new().grants(shipped_policy());
         assert!(
             declared.contains(Permission::StoreOnDevice),
             "purpose 1 maps to storage, so storage is grantable"
@@ -372,9 +372,7 @@ mod tests {
             "should declare each mapped Data Use once and nothing else"
         );
         assert!(
-            TcfProvider::new()
-                .grants(&SignalPolicy::default())
-                .is_empty(),
+            TcfModule::new().grants(&SignalPolicy::default()).is_empty(),
             "a silenced record grants nothing"
         );
     }
@@ -444,7 +442,7 @@ mod tests {
     #[test]
     fn reads_the_eu_section_of_a_gpp_string_when_there_is_no_standalone_record() {
         // Core resolves a GPP string's EU TCF section as the effective record
-        // when no TC string arrived, and this provider reads what core resolved
+        // when no TC string arrived, and this module reads what core resolved
         // rather than the wire, so it sees that section too.
         let consent = ConsentContext {
             gpp: Some(GppConsent {

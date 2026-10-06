@@ -941,7 +941,7 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
-/// Build a [`RuntimeServices`] with an injected geo provider, so a test can
+/// Build a [`RuntimeServices`] with an injected geo module, so a test can
 /// drive a geo outcome through the [`PlatformGeo`] seam rather than
 /// constructing the resolved status by hand.
 ///

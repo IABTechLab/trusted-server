@@ -10,7 +10,7 @@ pub const COOKIE_TS_TESTER: &str = "ts-tester";
 /// The Model Terms for Marketing preference, one of the three words
 /// `standard`, `personalized` and `non-marketing`, written as a first party
 /// cookie by whatever preference platform asked the visitor and read by the
-/// Model Terms for Marketing signal provider. Not a Trusted Server name, so
+/// Model Terms for Marketing signal module. Not a Trusted Server name, so
 /// that anyone can build a platform that sets it. Trusted Server reads this
 /// cookie and never writes it.
 pub const COOKIE_MTM_PREF: &str = "__mtm_pref";

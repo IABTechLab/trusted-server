@@ -1,43 +1,43 @@
-//! The US Privacy string sale opt-out as a permission signal provider.
+//! The US Privacy string sale opt-out as a permission signal module.
 //!
 //! Answers from the sale opt-out carried in the four character `us_privacy`
 //! string, which core decodes into the consent record. Core also constructs
 //! that string from a Global Privacy Control header in a US state when the
-//! deployment's consent settings say to, and this provider sees the result
+//! deployment's consent settings say to, and this module sees the result
 //! the same way, because it reads the record and not the wire.
 //!
-//! This provider lives outside `trusted-server-core` deliberately, like every
+//! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use trusted_server_core::consent::{ConsentContext, PrivacyFlag};
 use trusted_server_core::evidence::RequestInfo;
-use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
+use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
-/// The stable identifier this provider answers to in `[permission_signal]`
-/// `provider`, in logs, and when a peer consults it.
+/// The stable identifier this module answers to in `[permission_signal]`
+/// `module`, in logs, and when a peer consults it.
 pub const ID: &str = "us_privacy";
 
 /// A US Privacy string sale opt-out, read from `us_privacy`.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct UsPrivacyProvider;
+pub struct UsPrivacyModule;
 
-impl UsPrivacyProvider {
-    /// A new provider.
+impl UsPrivacyModule {
+    /// A new module.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 }
 
-impl PermissionSignalProvider for UsPrivacyProvider {
+impl PermissionSignalModule for UsPrivacyModule {
     fn id(&self) -> &'static str {
         ID
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
         // The policy decides whether this scheme counts at all and what an
-        // opt-out takes away, so a provider the policy does not list stays
+        // opt-out takes away, so a module the policy does not list stays
         // silent even when configuration names it.
         if !input
             .policy
@@ -48,7 +48,7 @@ impl PermissionSignalProvider for UsPrivacyProvider {
         }
         // A US Privacy string that arrived and could not be read is treated
         // as the opt-out it may have carried, because a preference this
-        // provider cannot see is not the same as no preference.
+        // module cannot see is not the same as no preference.
         let unreadable =
             input.consent.raw_us_privacy.is_some() && input.consent.us_privacy.is_none();
         let opted_out = input
@@ -109,15 +109,15 @@ mod tests {
     ) -> ConsentSignal {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::Granted);
-        UsPrivacyProvider::new().signal(permission, &input)
+        UsPrivacyModule::new().signal(permission, &input)
     }
 
     #[test]
     fn answers_to_its_identifier() {
         assert_eq!(
-            UsPrivacyProvider::new().id(),
+            UsPrivacyModule::new().id(),
             ID,
-            "the provider answers to the identifier configuration names"
+            "the module answers to the identifier configuration names"
         );
     }
 
@@ -151,7 +151,7 @@ mod tests {
             ..with_sale_flag(PrivacyFlag::No)
         };
         assert_eq!(
-            UsPrivacyProvider::new().valid_signal(&decoded, &evidence),
+            UsPrivacyModule::new().valid_signal(&decoded, &evidence),
             Some(ValidSignal::new(ID, "us_privacy", "1YNN")),
             "a decoded string is vouched for as received, whatever it says"
         );
@@ -160,7 +160,7 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            UsPrivacyProvider::new().valid_signal(&unreadable, &evidence),
+            UsPrivacyModule::new().valid_signal(&unreadable, &evidence),
             None,
             "an unreadable string is not"
         );
@@ -252,7 +252,7 @@ mod tests {
             Acquisition::RequiresSignal,
         );
         assert!(
-            !UsPrivacyProvider::new().withdraws(Permission::StoreOnDevice, &input),
+            !UsPrivacyModule::new().withdraws(Permission::StoreOnDevice, &input),
             "a sale opt-out suppresses use for the request and never destroys an identifier"
         );
     }

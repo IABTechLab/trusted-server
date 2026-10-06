@@ -1,10 +1,10 @@
-//! Provider permissions: a technical permission model gating provider execution.
+//! Module permissions: a technical permission model gating module execution.
 //!
-//! A provider advertises the [`Permission`]s its data use *requires*. Trusted
+//! A module advertises the [`Permission`]s its data use *requires*. Trusted
 //! Server resolves which permissions are currently *set* from the session's
 //! signals and the country it resolves to, and refuses to run the Edge Cookie
-//! provider when its required permissions are not set. The device and geo
-//! providers declare their requirements through the same method, and the
+//! module when its required permissions are not set. The device and geo
+//! modules declare their requirements through the same method, and the
 //! built-in ones require none; gating their execution on that declaration is
 //! follow-up work.
 //!
@@ -26,14 +26,14 @@
 //!
 //! Resolution takes the most specific match and falls back to the node above:
 //! the request's region when it is listed, otherwise its country, otherwise
-//! the top of the tree. So a request with no country at all (no geo provider,
+//! the top of the tree. So a request with no country at all (no geo module,
 //! or a lookup that resolved nothing), and a request whose country has no rule,
 //! both resolve to the top node's group. The top node also declares the
 //! `jurisdiction` the consent gates use for a visitor whose place could not be
-//! resolved (see [`PermissionMaps::default_jurisdiction`]). A geo provider that
+//! resolved (see [`PermissionMaps::default_jurisdiction`]). A geo module that
 //! reports an outright lookup failure is the exception, resolving every
 //! permission to the requires-signal floor rather than the top node (see
-//! [`PermissionMaps::floor_with`]), though no geo provider shipped today
+//! [`PermissionMaps::floor_with`]), though no geo module shipped today
 //! reports one.
 
 use std::collections::BTreeMap;
@@ -45,18 +45,18 @@ use serde_yaml_ng::Value;
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::tdl::Tdl;
 
-/// A technical permission a provider may require, labeled with its IAB Privacy
+/// A technical permission a module may require, labeled with its IAB Privacy
 /// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
 ///
 /// Only the identifier is used, with no TCF or taxonomy policy implemented. Every
 /// named variant with a TCF purpose in `permissions.yaml` is resolved against
 /// the session's signals. Only [`Permission::StoreOnDevice`] (and
-/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped provider
+/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped module
 /// today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
     /// TCF Purpose 1, store and/or access information on a device. It gates the
-    /// built-in Edge Cookie provider today. No IAB Privacy Taxonomy Data Use exists
+    /// built-in Edge Cookie module today. No IAB Privacy Taxonomy Data Use exists
     /// for device storage yet, so this uses a proposed `necessary.operations`
     /// key pending an upstream addition.
     StoreOnDevice,
@@ -84,7 +84,7 @@ pub enum Permission {
     SelectBasicContent,
     /// An IAB Privacy Taxonomy Data Use with no dedicated variant, identified by
     /// its index into [`EXTRA_DATA_USES`]. These carry a policy flag in
-    /// `permissions.yaml` for completeness; no provider gates on them today.
+    /// `permissions.yaml` for completeness; no module gates on them today.
     Extra(u8),
 }
 
@@ -105,7 +105,7 @@ const NAMED_DATA_USES: [&str; 11] = [
 ];
 
 /// Every other IAB Privacy Taxonomy Data Use, carried so `permissions.yaml` can
-/// set a policy flag for the whole taxonomy (bit index 11..). No provider gates
+/// set a policy flag for the whole taxonomy (bit index 11..). No module gates
 /// on these today; they exist for completeness, testing, and demonstration.
 const EXTRA_DATA_USES: [&str; 53] = [
     "advertising_marketing",
@@ -239,7 +239,7 @@ impl core::fmt::Display for Permission {
 /// A set of [`Permission`]s, stored as a bitset keyed by each permission's bit
 /// index.
 ///
-/// Used both for what a provider requires and for what Trusted Server has set.
+/// Used both for what a module requires and for what Trusted Server has set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PermissionSet(u128);
 
@@ -288,7 +288,7 @@ impl PermissionSet {
 
     /// Iterates the permissions in the set, in bit-index order.
     ///
-    /// The built-ins read nothing from the full set; this serves a provider or
+    /// The built-ins read nothing from the full set; this serves a module or
     /// diagnostic path that enumerates what is present.
     pub fn iter(self) -> impl Iterator<Item = Permission> {
         Permission::all().filter(move |p| self.contains(*p))
@@ -304,7 +304,7 @@ impl FromIterator<Permission> for PermissionSet {
 
 /// How a permission is acquired in a given country.
 ///
-/// This is intentionally country-keyed, not provider-keyed: a provider only
+/// This is intentionally country-keyed, not module-keyed: a module only
 /// advertises *which* permissions it needs, and the country's rules decide *how*
 /// each is obtained.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -393,18 +393,18 @@ enum RevokeSet {
 /// `signals` section of `permissions.yaml`.
 ///
 /// The permission model holds this as data so a deployment changes it without
-/// changing a provider. It is jurisdiction-free, and it carries only the
+/// changing a module. It is jurisdiction-free, and it carries only the
 /// decisions that are a deployment's to make: whether a TCF record answers at
 /// all, which signals count as a US-style opt-out, and what an opt-out takes
 /// away. What each scheme's own signal means, such as which TCF purpose grants
-/// which Data Use, is that scheme's provider crate's, not this policy's. The
+/// which Data Use, is that scheme's module crate's, not this policy's. The
 /// country/region baseline decides the rest.
 #[derive(Debug, Clone, Default)]
 pub struct SignalPolicy {
     /// Whether a present TCF record's grants and revokes apply. Whether a
     /// consenting record then stands over an opt-out, or the opt-out over it,
-    /// is decided by the order the providers are asked in, which is
-    /// `[permission_signal] provider`, not by this flag.
+    /// is decided by the order the modules are asked in, which is
+    /// `[permission_signal] module`, not by this flag.
     tcf_authoritative: bool,
     /// The signals that constitute a US-style opt-out.
     opt_out_sources: Vec<OptOutSource>,
@@ -469,7 +469,7 @@ fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsEr
 
 /// The place tree from `permissions.yaml`, flattened for lookup.
 ///
-/// `by_country` is keyed on the ISO 3166-1 alpha-2 code a geo provider returns
+/// `by_country` is keyed on the ISO 3166-1 alpha-2 code a geo module returns
 /// (upper-cased). `by_region` keeps the finer rules written under a country,
 /// keyed by country and region (for example a US state), which take precedence
 /// over the country entry. `default_rules` is the top node's group, the answer
@@ -514,8 +514,8 @@ impl PermissionMaps {
     /// `permissions.yaml`. The consent mapping reads this rather than encoding
     /// any signal policy in the code.
     #[must_use]
-    // Public because the permission signal provider crates live outside core
-    // and read the deployment's policy, in their tests and where a provider
+    // Public because the permission signal module crates live outside core
+    // and read the deployment's policy, in their tests and where a module
     // needs the shipped decisions rather than a policy built by hand.
     pub fn signals(&self) -> &SignalPolicy {
         &self.signals
@@ -529,7 +529,7 @@ impl PermissionMaps {
     }
 
     /// Registers explicit rules for a region within a country, keyed by the ISO
-    /// 3166-1 alpha-2 country and the geo provider's region code (for example
+    /// 3166-1 alpha-2 country and the geo module's region code (for example
     /// `US` and `CA`).
     ///
     /// A region entry takes precedence over the country entry, so a deployer can
@@ -563,7 +563,7 @@ impl PermissionMaps {
     }
 
     /// The jurisdiction the policy declares for a visitor whose place the geo
-    /// provider could not resolve, taken from the top of the `rules:` tree.
+    /// module could not resolve, taken from the top of the `rules:` tree.
     ///
     /// The consent gates resolve a jurisdiction from the request's place, so
     /// with no place they would resolve [`Jurisdiction::Unknown`] and fail
@@ -685,7 +685,7 @@ impl PermissionMaps {
     /// Resolves the permission state for a request: the place baseline
     /// augmented by a session signal.
     ///
-    /// `country` and `region` are what a geo provider returns (`region` may be
+    /// `country` and `region` are what a geo module returns (`region` may be
     /// `None`). Whatever the tree does not answer falls back to the node above,
     /// ending at the top node, so an unlisted country and a request with no
     /// country at all both resolve to the top node's group. `signal` maps each
@@ -707,7 +707,7 @@ impl PermissionMaps {
     /// Resolves every permission at the requires-signal floor, whatever the
     /// policy tree says.
     ///
-    /// This is the state for a geo provider that reported an outright lookup
+    /// This is the state for a geo module that reported an outright lookup
     /// failure. The request's place is unknown in a way the policy's top node
     /// must not paper over, so nothing is set unless the session's signals
     /// grant it.
@@ -779,32 +779,32 @@ impl PermissionMaps {
     }
 }
 
-/// A signal a provider read from the request and found valid, as it was
+/// A signal a module read from the request and found valid, as it was
 /// received.
 ///
 /// The permission state carries one of these for every signal a configured
-/// provider used, so whatever reads the state can rely on exactly those
+/// module used, so whatever reads the state can rely on exactly those
 /// signals and no other. A signal that was absent, could not be read, or
-/// that no configured provider acts on is not here, and nothing says why,
-/// because the provider for that scheme has already decided what its
+/// that no configured module acts on is not here, and nothing says why,
+/// because the module for that scheme has already decided what its
 /// absence means for the permissions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ValidSignal {
-    /// The provider that read and used the signal, by its configured id.
-    pub provider: &'static str,
+    /// The module that read and used the signal, by its configured id.
+    pub module: &'static str,
     /// The scheme the signal belongs to, for example `tcf` or `gpp`, so a
-    /// reader can find a scheme without knowing which provider read it.
+    /// reader can find a scheme without knowing which module read it.
     pub scheme: &'static str,
     /// The signal as it was received.
     pub value: String,
 }
 
 impl ValidSignal {
-    /// A valid signal of `scheme`, read by `provider`, as received.
+    /// A valid signal of `scheme`, read by `module`, as received.
     #[must_use]
-    pub fn new(provider: &'static str, scheme: &'static str, value: impl Into<String>) -> Self {
+    pub fn new(module: &'static str, scheme: &'static str, value: impl Into<String>) -> Self {
         Self {
-            provider,
+            module,
             scheme,
             value: value.into(),
         }
@@ -813,13 +813,13 @@ impl ValidSignal {
 
 /// The permissions Trusted Server currently has set for a request.
 ///
-/// A provider executes only when [`all_set`](Self::all_set) of its required
+/// A module executes only when [`all_set`](Self::all_set) of its required
 /// permissions returns `true`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionState {
     set: PermissionSet,
     /// The permissions whose baseline requires a signal and for which no
-    /// configured provider gave one. See [`awaiting`](Self::awaiting).
+    /// configured module gave one. See [`awaiting`](Self::awaiting).
     awaiting: PermissionSet,
     /// Whether the request explicitly withdrew device storage, as opposed to
     /// storage merely not being set. See
@@ -829,7 +829,7 @@ pub struct PermissionState {
     /// [`tdls`](Self::tdls). Shared rather than owned because the state is
     /// cloned along the request path and the list is the same list.
     tdls: Arc<[Tdl]>,
-    /// The signals the configured providers read and found valid. See
+    /// The signals the configured modules read and found valid. See
     /// [`signals`](Self::signals).
     signals: Arc<[ValidSignal]>,
 }
@@ -850,7 +850,7 @@ impl PermissionState {
     }
 
     /// The same state, recording which permissions are still waiting for a
-    /// signal. Set by resolution from the baseline and the providers' answers.
+    /// signal. Set by resolution from the baseline and the modules' answers.
     #[must_use]
     pub fn with_awaiting(self, awaiting: PermissionSet) -> Self {
         Self { awaiting, ..self }
@@ -859,10 +859,10 @@ impl PermissionState {
     /// The same state, awaiting only the permissions in `answerable`.
     ///
     /// Resolution records every permission that requires a signal and got
-    /// none. Some of those no configured provider could ever grant, for
+    /// none. Some of those no configured module could ever grant, for
     /// example a marketing channel opt-in in a deployment that runs only the
     /// four shipped schemes, and a page told to wait for them would wait for
-    /// ever. So the assembly narrows the list to what some provider declares
+    /// ever. So the assembly narrows the list to what some module declares
     /// it can grant, and the rest are simply not set.
     #[must_use]
     pub fn awaiting_only(self, answerable: PermissionSet) -> Self {
@@ -873,7 +873,7 @@ impl PermissionState {
     }
 
     /// The permissions whose baseline requires a signal and for which every
-    /// configured provider answered neutral, so nobody has answered yet.
+    /// configured module answered neutral, so nobody has answered yet.
     ///
     /// This is different from a permission that is not set. A refused
     /// permission and one nobody has answered look the same in
@@ -892,7 +892,7 @@ impl PermissionState {
     }
 
     /// The same state, recording whether device storage was explicitly
-    /// withdrawn. Set by assembly from what the signal providers answered,
+    /// withdrawn. Set by assembly from what the signal modules answered,
     /// scoped to the jurisdiction's storage baseline.
     #[must_use]
     pub fn with_storage_withdrawn(self, storage_withdrawn: bool) -> Self {
@@ -903,26 +903,26 @@ impl PermissionState {
     }
 
     /// The same state, carrying the terms documents the data for this request
-    /// is available under. Set by assembly from what the signal providers
+    /// is available under. Set by assembly from what the signal modules
     /// declared, in the order they are asked.
     #[must_use]
     pub fn with_tdls(self, tdls: Arc<[Tdl]>) -> Self {
         Self { tdls, ..self }
     }
 
-    /// The same state, carrying the signals the providers read and found
-    /// valid. Set by assembly, in the order the providers are asked.
+    /// The same state, carrying the signals the modules read and found
+    /// valid. Set by assembly, in the order the modules are asked.
     #[must_use]
     pub fn with_signals(self, signals: Arc<[ValidSignal]>) -> Self {
         Self { signals, ..self }
     }
 
-    /// The signals the configured providers read from the request and
+    /// The signals the configured modules read from the request and
     /// found valid, each as it was received.
     ///
     /// This is the list a page, a bid request or a person reading the state
     /// relies on. A signal that is not here was absent, could not be read, or
-    /// is one no configured provider acts on, and the provider for its
+    /// is one no configured module acts on, and the module for its
     /// scheme has already decided what that means for the permissions, so
     /// nothing downstream needs to reason about the signal itself.
     #[must_use]
@@ -931,7 +931,7 @@ impl PermissionState {
     }
 
     /// The terms documents the data for this request is available under, in
-    /// the order the providers were asked.
+    /// the order the modules were asked.
     ///
     /// Whoever receives the data reads these to decide whether the terms are
     /// ones they accept, and whether they may pass the data on. An empty list
@@ -950,7 +950,7 @@ impl PermissionState {
     /// permission that is simply not set strips the Edge Cookie response
     /// headers and leaves an already-issued identifier alone, so a returning
     /// visitor is not permanently withdrawn before they ever get to answer.
-    /// Which scheme can withdraw is each provider's to say, and only where the
+    /// Which scheme can withdraw is each module's to say, and only where the
     /// jurisdiction's storage baseline did not grant storage outright.
     #[must_use]
     pub const fn storage_withdrawn(&self) -> bool {
@@ -964,13 +964,13 @@ impl PermissionState {
     }
 
     /// Whether every permission in `required` is set. An empty requirement is
-    /// always satisfied, so a provider that requires nothing always runs.
+    /// always satisfied, so a module that requires nothing always runs.
     #[must_use]
     pub const fn all_set(&self, required: PermissionSet) -> bool {
         self.set.contains_all(required)
     }
 
-    /// The full set of permissions that are set, for a provider that adapts its
+    /// The full set of permissions that are set, for a module that adapts its
     /// behavior to whatever is present.
     #[must_use]
     pub const fn permissions(&self) -> PermissionSet {
@@ -985,9 +985,9 @@ impl PermissionState {
     /// was built in. `awaiting` names the permissions still waiting for a
     /// signal, so a page can hold what depends on them rather than read
     /// "nobody has answered" as "refused". `tdls` carries the terms documents
-    /// the data is available under, in the order the providers were asked, so
+    /// the data is available under, in the order the modules were asked, so
     /// a page module reads the terms alongside the permissions. `signals`
-    /// carries the signals the providers read and found valid, each as it was
+    /// carries the signals the modules read and found valid, each as it was
     /// received, so a page relies on exactly what the state was built from.
     /// An empty state renders as
     /// `{"awaiting":[],"set":[],"signals":[],"tdls":[]}`, and all four are
@@ -1074,7 +1074,7 @@ struct SignalsSpec {
 ///
 /// Only whether a TCF record answers for this deployment. Which purpose grants
 /// which Data Use is the TCF scheme's own knowledge and lives in the TCF
-/// permission signal provider crate, so this file carries no table of another
+/// permission signal module crate, so this file carries no table of another
 /// scheme's numbers and a deployment running no TCF configures none.
 #[derive(Debug, Deserialize)]
 struct TcfSignalSpec {
@@ -1327,7 +1327,7 @@ fn parse_jurisdiction(
 /// neither is stored carrying what it inherits from the node above it. The top
 /// node must name both, which is what makes inheritance always terminate.
 ///
-/// The tree is three levels deep, because a geo provider returns a country and
+/// The tree is three levels deep, because a geo module returns a country and
 /// a region and nothing finer, so a place written under a region is rejected
 /// rather than silently ignored.
 fn build_rules_tree(
@@ -1443,9 +1443,9 @@ pub enum PermissionsError {
     /// A node of the `rules` tree was neither a group name nor a block.
     #[display("the rule for `{path}` must be a group name or a block with a `group:` line")]
     InvalidRule { path: String },
-    /// A place was written under a region, deeper than a geo provider resolves.
+    /// A place was written under a region, deeper than a geo module resolves.
     #[display(
-        "the rule for `{path}` has places written under it; the tree stops at a region, because that is the finest place a geo provider returns"
+        "the rule for `{path}` has places written under it; the tree stops at a region, because that is the finest place a geo module returns"
     )]
     NestedTooDeep { path: String },
     /// The YAML was malformed or did not match the expected shape.
@@ -1595,7 +1595,7 @@ mod tests {
     #[test]
     fn a_permission_requiring_a_signal_that_nobody_gave_is_awaited() {
         // Arrange: the requires-signal floor, where every permission needs a
-        // signal, and providers that answer nothing.
+        // signal, and modules that answer nothing.
         let state = PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral);
 
         // Assert: nothing is set and everything is awaited, which is the
@@ -1622,9 +1622,9 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_is_narrowed_to_what_a_provider_could_still_grant() {
+    fn awaiting_is_narrowed_to_what_a_module_could_still_grant() {
         // Arrange: the floor, where everything is awaited, and a deployment
-        // whose providers can only ever grant storage.
+        // whose modules can only ever grant storage.
         let state = PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral)
             .awaiting_only(PermissionSet::none().with(Permission::StoreOnDevice));
 
@@ -1633,7 +1633,7 @@ mod tests {
         assert!(state.is_awaited(Permission::StoreOnDevice));
         assert!(
             !state.is_awaited(Permission::SelectPersonalisedAds),
-            "should not await a permission no configured provider can grant"
+            "should not await a permission no configured module can grant"
         );
         assert!(
             state.permissions().is_empty(),
@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn an_answered_or_baselined_permission_is_never_awaited() {
-        // Arrange: the floor again, with a provider that grants storage and
+        // Arrange: the floor again, with a module that grants storage and
         // revokes personalised advertising.
         let state = PermissionMaps::floor_with(|permission, _| match permission {
             Permission::StoreOnDevice => ConsentSignal::Grant,
@@ -1772,7 +1772,7 @@ mod tests {
 
         assert!(
             state.all_set(PermissionSet::none()),
-            "a provider requiring nothing always runs"
+            "a module requiring nothing always runs"
         );
         assert!(
             state.all_set(PermissionSet::none().with(Permission::StoreOnDevice)),

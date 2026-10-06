@@ -644,11 +644,11 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
         generation::normalize_ec_id_for_kv(value)
     }
 
-    /// The permissions this provider's data use requires.
+    /// The permissions this module's data use requires.
     ///
-    /// Trusted Server executes the provider only when every permission returned
-    /// here is set. The default is empty, so a vendor-neutral provider requires
-    /// no permission. A provider that stores identity on the device, or shares it
+    /// Trusted Server executes the module only when every permission returned
+    /// here is set. The default is empty, so a vendor-neutral module requires
+    /// no permission. A module that stores identity on the device, or shares it
     /// onward, declares the matching permission so the request's country and
     /// signal rules can gate it.
     fn required_permissions(&self) -> PermissionSet {
@@ -712,9 +712,9 @@ impl EdgeCookieModule for HmacModule {
     }
 
     fn required_permissions(&self) -> PermissionSet {
-        // The HMAC provider writes the Edge Cookie to the device, so it requires
+        // The HMAC module writes the Edge Cookie to the device, so it requires
         // permission to store on the device (TCF Purpose 1). Whether that needs a
-        // signal is decided by the country rules, not by the provider.
+        // signal is decided by the country rules, not by the module.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
@@ -784,7 +784,7 @@ impl EdgeCookieModule for HostSignalModule {
 
     fn required_permissions(&self) -> PermissionSet {
         // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
-        // (TCF Purpose 1), the same gate as the HMAC provider.
+        // (TCF Purpose 1), the same gate as the HMAC module.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
@@ -1727,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn hmac_provider_requires_store_on_device() {
+    fn hmac_module_requires_store_on_device() {
         let module = HmacModule::new(test_passphrase());
         let required = module.required_permissions();
         assert!(
@@ -1741,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_mints_from_fingerprints_and_requires_store_on_device() {
+    fn host_signal_module_mints_from_fingerprints_and_requires_store_on_device() {
         let signals = Arc::new(TestHostSignals {
             ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
             h2: Some("1:65536;4:6291456".to_owned()),
@@ -1763,12 +1763,12 @@ mod tests {
         );
     }
 
-    /// A minimal provider that overrides nothing optional, used to prove the
+    /// A minimal module that overrides nothing optional, used to prove the
     /// trait defaults.
     #[derive(Debug)]
-    struct MinimalProvider;
+    struct MinimalModule;
 
-    impl EdgeCookieModule for MinimalProvider {
+    impl EdgeCookieModule for MinimalModule {
         fn id(&self) -> &'static str {
             "minimal"
         }
@@ -1791,12 +1791,12 @@ mod tests {
     }
 
     #[test]
-    fn a_neutral_provider_requires_no_permissions_by_default() {
-        // MinimalProvider does not override required_permissions, so it
+    fn a_neutral_module_requires_no_permissions_by_default() {
+        // MinimalModule does not override required_permissions, so it
         // inherits the trait default of none and requires no permission.
         assert!(
-            MinimalProvider.required_permissions().is_empty(),
-            "a vendor-neutral provider requires nothing by default"
+            MinimalModule.required_permissions().is_empty(),
+            "a vendor-neutral module requires nothing by default"
         );
     }
 
@@ -1807,18 +1807,18 @@ mod tests {
         // floor.
         let maps = PermissionMaps::empty();
 
-        // No signal: the provider's required permission is not set, so Trusted
+        // No signal: the module's required permission is not set, so Trusted
         // Server would not commit the Edge Cookie.
         assert!(
             !maps.resolve(None, |_| false).all_set(required),
-            "the floor should not run the Edge Cookie provider without the permission set"
+            "the floor should not run the Edge Cookie module without the permission set"
         );
 
-        // A grant signal for necessary.operations.storage: the provider's permission is now set.
+        // A grant signal for necessary.operations.storage: the module's permission is now set.
         assert!(
             maps.resolve(None, |p| p == Permission::StoreOnDevice)
                 .all_set(required),
-            "the Edge Cookie provider runs once necessary.operations.storage is set"
+            "the Edge Cookie module runs once necessary.operations.storage is set"
         );
     }
 

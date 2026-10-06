@@ -123,11 +123,11 @@ describe('core/permissions', () => {
     api.permissions = {
       set: ['necessary.operations.storage'],
       awaiting: [],
-      signals: [{ provider: 'tcf', scheme: 'tcf', value: 'CPxyz' }],
+      signals: [{ module: 'tcf', scheme: 'tcf', value: 'CPxyz' }],
       tdls: [],
     };
 
-    expect(api.permissions.signals).toEqual([{ provider: 'tcf', scheme: 'tcf', value: 'CPxyz' }]);
+    expect(api.permissions.signals).toEqual([{ module: 'tcf', scheme: 'tcf', value: 'CPxyz' }]);
   });
 
   it('carries the terms the edge declared for the request', async () => {

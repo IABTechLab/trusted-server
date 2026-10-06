@@ -4519,7 +4519,7 @@ pub async fn handle_publisher_request(
     // including withdrawal tombstoning, so it is not filtered by permission.
     // The identifier forwarded into the auction request (user.id) is sharing
     // beyond the edge, so it rides the same permission pair as bidstream EIDs
-    // (storage plus personalized-ad selection), not only the provider's gate.
+    // (storage plus personalized-ad selection), not only the module's gate.
     // Under an explicit withdrawal that pair is unset, so auction dispatch
     // forwards no EC while the origin-overlapped snapshot read still happens
     // for the active ID, keeping the withdrawal CAS off the post-origin

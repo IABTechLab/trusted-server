@@ -372,7 +372,7 @@ export interface GptSlotHandoff {
  * server for this request.
  *
  * `tdls` are the terms documents the data for this request is available under,
- * as declared by the permission signal providers the deployment runs, in the
+ * as declared by the permission signal modules the deployment runs, in the
  * order they were asked. Each entry addresses a published document a person can
  * read. An empty list says no terms were declared, which is not the same as
  * terms that permit anything, so page code that needs a basis and finds none
@@ -386,7 +386,7 @@ export interface PermissionsSnapshot {
    */
   awaiting: string[];
   /**
-   * The signals the server's providers read and found valid, each as it
+   * The signals the server's modules read and found valid, each as it
    * was received. A signal absent from this list was missing, could not be
    * read, or is one the deployment does not act on, and page code relies
    * on exactly these and no other.
@@ -433,10 +433,10 @@ export interface FirstImpressionState {
   fallbackSlots: Record<string, HTMLElement>;
 }
 
-/** One signal a server-side provider read and found valid. */
+/** One signal a server-side module read and found valid. */
 export interface ValidSignal {
-  /** The provider that read it, by its configured id. */
-  provider: string;
+  /** The module that read it, by its configured id. */
+  module: string;
   /** The scheme it belongs to, for example `tcf` or `gpp`. */
   scheme: string;
   /** The signal as received. */

@@ -1,7 +1,7 @@
 # Permission Model
 
-Trusted Server runs the Edge Cookie provider only when the technical
-permissions it requires are set, and the device and geo providers declare
+Trusted Server runs the Edge Cookie module only when the technical
+permissions it requires are set, and the device and geo modules declare
 their requirements the same way. The permission model is
 how a deployer's policy decides whether those permissions are set, without that
 policy being baked into the core.
@@ -16,12 +16,12 @@ and the deployer brings the policy that decides how permissions are established
 and what they allow.
 
 The default deployment makes no host-specific call, creates no identifiers, and
-resolves no location until an operator enables a provider. It requires exactly
+resolves no location until an operator enables a module. It requires exactly
 one policy decision, the baseline that applies when no country can be resolved,
 which is stated at the top of the `rules:` tree in `permissions.yaml`. Trusted
 Server does not assume a jurisdiction for you, so you declare one, and
 the examples use the most protective baseline (GDPR-EU). With no Edge Cookie
-provider selected there is nothing to gate, so no identifier is created and the
+module selected there is nothing to gate, so no identifier is created and the
 request proceeds.
 
 ## Where the vocabulary comes from
@@ -30,40 +30,40 @@ The permissions are not a vocabulary this project invented. They are the IAB
 Tech Lab Privacy Taxonomy Data Uses, with the IAB TCF Europe purposes mapped
 onto them where no Data Use exists yet.
 
-That matters for reading the rest of this guide. When a provider declares the
+That matters for reading the rest of this guide. When a module declares the
 permissions its data use requires, it is naming a Data Use from that taxonomy,
 so an operator or an auditor can check the declaration against the taxonomy
 rather than against our interpretation of it. What a deployment decides about a
 signal, whether a TCF record answers and what an opt-out takes away, is recorded
 in `permissions.yaml` alongside the rules. What a scheme's own signal means, such
 as which TCF purpose grants which Data Use, belongs to that scheme's
-[permission signal provider](./permission-signals) and is tested there.
+[permission signal module](./permission-signals) and is tested there.
 
 ## Separating legal policy from the core
 
-The core does not encode any jurisdiction's law or any single policy. A provider
+The core does not encode any jurisdiction's law or any single policy. A module
 advertises the technical permissions its data use requires, and the core runs
-the Edge Cookie provider only when every permission that provider requires is
-set. An Edge Cookie provider that requires nothing always runs, so a
+the Edge Cookie module only when every permission that module requires is
+set. An Edge Cookie module that requires nothing always runs, so a
 vendor-neutral default needs no consent prompt and no per-request
 policy interaction.
 
-Device and geo providers declare their required permissions through the same
+Device and geo modules declare their required permissions through the same
 method, and the core does not yet gate either of them on what they declare, so
 for those two the declaration is recorded rather than enforced. The only place
-a declaration currently decides whether a provider runs is the Edge Cookie
+a declaration currently decides whether a module runs is the Edge Cookie
 path, in `ec/mod.rs`. Treat a device or geo declaration as a statement of
-intent until that gap is closed, and do not rely on it to keep a provider from
+intent until that gap is closed, and do not rely on it to keep a module from
 running.
 
 ## Evidence is not rationed, use is
 
-Every provider sees all the evidence available for a request. Trusted Server
+Every module sees all the evidence available for a request. Trusted Server
 does not decide which vendor is allowed to see which signal, because
 withholding a signal from one vendor and not another would discriminate between
 them, and the core stays neutral between vendors.
 
-What a vendor may do with what it sees is the part that is governed. A provider
+What a vendor may do with what it sees is the part that is governed. A module
 declares the permissions its data use requires, and the permission model decides
 whether each one is set. So access is universal and use is gated, rather than
 the other way round.
@@ -73,7 +73,7 @@ permission, not a hidden signal.
 
 ## Permission sources
 
-Permissions are the single currency every service and provider reads. A provider
+Permissions are the single currency every service and module reads. A module
 never reads consent, a consent framework, or any other source directly. It sees
 only the resulting permissions, so it cannot depend on how they were derived.
 
@@ -83,14 +83,14 @@ flowchart LR
     C["Consent signals<br/>(TCF, GPP, GPC)"] --> P
     I["Interaction with<br/>the user"] --> P
     X["External data<br/>(extension, profile)"] --> P
-    P --> S["Providers and services<br/>(Edge Cookie, device, geo)"]
+    P --> S["Modules and services<br/>(Edge Cookie, device, geo)"]
 ```
 
 A request's permissions are set by one or more **permission sources**. Consent
 is one source among many, not the basis for every permission:
 
 - **Country and region.** The baseline position for a jurisdiction, from the geo
-  provider, keyed by ISO 3166-1 with an optional region such as a US state. When
+  module, keyed by ISO 3166-1 with an optional region such as a US state. When
   a region has no rule of its own the country's rule applies, and when no
   country is identified, or the country has no rule either, the baseline at the
   top of the rules tree applies. That top baseline is required, so there is
@@ -98,7 +98,7 @@ is one source among many, not the basis for every permission:
 - **Consent and privacy signals.** TCF, GPP, GPC or a US Privacy string read
   from the request, mapped onto permissions as a grant or a revoke on top of
   the baseline. Each is answered by a [permission signal
-  provider](./permission-signals), a crate outside the core, asked in the
+  module](./permission-signals), a crate outside the core, asked in the
   order configuration gives.
 - **Interaction with the user.** A publisher may establish a preference because
   it chooses to, not only because a law requires it.
@@ -110,11 +110,11 @@ established, so any of these sources plugs into the same mechanism.
 
 ### Why this matters
 
-Implementors of services, features, and providers are protected from the method
+Implementors of services, features, and modules are protected from the method
 used to derive the current request's permissions. They work against a clean,
 stable set of permissions that does not change when laws, consent frameworks, or
 signal sources change. A new GPP section, a new opt-out signal, or a revised
-jurisdiction rule changes a _source_, never the permission a provider checks.
+jurisdiction rule changes a _source_, never the permission a module checks.
 
 If a source carries a distinction a consumer needs but no existing permission can
 express, the fix is to add a permission to the model, never to leak the source
@@ -131,7 +131,7 @@ taxonomy addition. All eleven purposes are resolved against the incoming
 consent and privacy signals. A present TCF record grants or revokes each purpose
 directly, and a US-style opt-out (GPC, a GPP sale opt-out, or a US Privacy
 opt-out) revokes the Data Uses the policy lists, each answered by its own
-provider in the order configuration gives, so which of them stands when they
+module in the order configuration gives, so which of them stands when they
 disagree is that order. The remaining taxonomy Data Uses
 have no TCF purpose, so no signal maps to them and their configured baseline
 stands. What a US-style opt-out revokes, and whether a TCF record answers for
@@ -139,18 +139,18 @@ the deployment at all, are declared in the `signals` section of
 `permissions.yaml`, so a deployer changes that policy by editing the file.
 Which TCF purpose grants which Data Use is not policy but the TCF scheme's own
 meaning, so it lives in the TCF [permission signal
-provider](./permission-signals) crate, and the core carries no table of another
+module](./permission-signals) crate, and the core carries no table of another
 scheme's numbers.
 
 `permissions.yaml` carries a policy flag for **every** Data Use in the taxonomy,
 not only the eleven below. The eleven have a dedicated identifier because a
-provider may gate on them. Every other Data Use is listed for completeness and,
+module may gate on them. Every other Data Use is listed for completeness and,
 where no informed policy decision has been made, is `denied` by default. Trusted
 Server is not the policy authority, so a deployer sets the flags to match its own
 jurisdiction rules.
 
 The eleven named Data Uses, with the TCF purpose each maps from, as the TCF
-provider crate maps them:
+module crate maps them:
 
 | #   | Data Use identifier                             | IAB TCF Europe purpose                          |
 | --- | ----------------------------------------------- | ----------------------------------------------- |
@@ -166,19 +166,19 @@ provider crate maps them:
 | 10  | `necessary.operations.improve`                  | Develop and improve services                    |
 | 11  | `select-basic-content`                          | Use limited data to select content              |
 
-## How providers use permissions
+## How modules use permissions
 
-A provider advertises a required permission set. The core resolves the
-permissions it has set for the request, then runs the Edge Cookie provider only
-when every permission that provider requires is set. Device and geo providers
+A module advertises a required permission set. The core resolves the
+permissions it has set for the request, then runs the Edge Cookie module only
+when every permission that module requires is set. Device and geo modules
 advertise a set in the same way, and nothing gates them on it yet, so the table
-below lists only the provider whose declaration currently decides whether it
+below lists only the module whose declaration currently decides whether it
 runs.
 
-| Provider                  | Requires                       | Effect when not set       |
+| Module                  | Requires                       | Effect when not set       |
 | ------------------------- | ------------------------------ | ------------------------- |
 | Built-in HMAC Edge Cookie | `necessary.operations.storage` | No Edge Cookie is created |
-| A vendor-neutral provider | nothing                        | Always runs               |
+| A vendor-neutral module | nothing                        | Always runs               |
 
 The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.storage`
 (Purpose 1), because writing the cookie stores information on the device.
@@ -202,8 +202,8 @@ codes with no country prefix (`CA` is California). Codes are matched
 case-insensitively, so `us` and `US` name the same place. Where a code sits
 also tells two identical codes apart, since `DE` at the first level is Germany
 and `DE` under `US` is Delaware. These are the codes a
-geo provider returns. The Fastly geo provider emits them directly, and any other
-provider must do the same.
+geo module returns. The Fastly geo module emits them directly, and any other
+module must do the same.
 
 A node can be written two ways. The shorthand is a single string, which becomes
 that node's `group` and gives it no children, so `GB: gdpr-uk` is a complete
@@ -318,7 +318,7 @@ For a worked example, take a deployer who sets
 profiling. A request arrives with a TCF string that consents to Purpose 3
 (create profiles for personalised advertising), which maps to that Data Use. The
 resolver pairs the `denied` baseline with the grant signal and still leaves the
-permission **unset**, so a provider that requires profiling does not run. The
+permission **unset**, so a module that requires profiling does not run. The
 same consent against a `requires_signal` baseline would set it. Consent lifts
 `requires_signal`; it never lifts `denied`.
 
@@ -347,14 +347,14 @@ rather than silently ignored.
 ## How a request resolves
 
 A permission is _set_ when Trusted Server may rely on it for this request, and
-unset otherwise. The Edge Cookie provider runs only when every permission it
+unset otherwise. The Edge Cookie module runs only when every permission it
 requires is set, which is the one place a declaration currently decides whether
-a provider runs.
+a module runs.
 
 A consent record that is present but cannot be decoded blocks baseline grants
 (fail-closed) rather than degrading to the no-signal baseline, ahead of every
-signal provider and whichever are configured. The providers are then asked in
-the order `[permission_signal] provider` gives, each amending what the ones
+signal module and whichever are configured. The modules are then asked in
+the order `[permission_signal] module` gives, each amending what the ones
 before it settled, and the last with an opinion decides. So which of a US-style
 opt-out (GPC, a GPP sale opt-out, or a US Privacy opt-out) and a consenting TCF
 record stands when they disagree is the configured order, not a rule in code.
@@ -362,7 +362,7 @@ The default order asks Global Privacy Control first, because it is a browser
 setting with no interface of its own, and the schemes carrying a choice
 someone made through an interface after, so an answer given at a prompt
 amends the header the visitor arrived with, and a deployment wanting the
-opposite puts the provider it wants to win last. See
+opposite puts the module it wants to win last. See
 [Permission Signals](./permission-signals). Opt-outs suppress use for the
 request and never destroy an already-issued identifier. Destructive
 withdrawal (the cookie expired and the identity-graph row tombstoned) happens
@@ -389,14 +389,14 @@ flowchart TD
     Grant -- "No" --> Unset
     Rule -- "Denied" --> Unset
 
-    Set --> Check{Provider's required<br/>permissions all set?}
+    Set --> Check{Module's required<br/>permissions all set?}
     Unset --> Check
-    Check -- "Yes" --> Run([Run provider])
-    Check -- "No" --> Skip([Skip provider])
+    Check -- "Yes" --> Run([Run module])
+    Check -- "No" --> Skip([Skip module])
 ```
 
-The "Failed" branch is the rule for a geo provider that can report a failed
-lookup. None of the providers shipped today can, so a geo outage takes the
+The "Failed" branch is the rule for a geo module that can report a failed
+lookup. None of the modules shipped today can, so a geo outage takes the
 "No or none resolved" branch instead. See the note on the top node below.
 
 ## How the resolved permissions reach downstream code
@@ -428,20 +428,20 @@ the `permissions.yaml` keys and `Permission::as_str()`.
     "advertising_marketing.first_party.targeted"
   ],
   "signals": [
-    { "provider": "tcf", "scheme": "tcf", "value": "CP..." }
+    { "module": "tcf", "scheme": "tcf", "value": "CP..." }
   ],
   "tdls": []
 }
 ```
 
 `awaiting` lists the Data Uses whose baseline requires a signal, which some
-configured signal provider could grant, and for which no provider has given
+configured signal module could grant, and for which no module has given
 one on this request. It is how a page tells a prompt that has not been answered
 from a visitor who refused, since both leave the Data Use out of `set`.
-`signals` lists the signals the providers read and found valid, each as it was
+`signals` lists the signals the modules read and found valid, each as it was
 received, so page code relies on exactly those and no other. `tdls` lists the
 terms documents the request's data is available under, as declared by the
-signal providers.
+signal modules.
 
 Delivery follows the pattern already used for `adSlots` and `bids`, and the
 timing depends on how the page is assembled. Under inline assembly the value is
@@ -473,36 +473,36 @@ resolved and never to widen it.
 
 ## Configuration
 
-The geo provider, which resolves the country, is selected in
+The geo module, which resolves the country, is selected in
 `trusted-server.toml`. The rules tree, including the baseline for a request with
 no resolvable country, lives in the human-editable `permissions.yaml` at the
 repository root, compiled into the build (not loaded at runtime).
 
 ```toml
-# trusted-server.toml selects the geo provider. The baseline used when a request
-# matches no node, or the geo provider resolves no country, is stated at the top
+# trusted-server.toml selects the geo module. The baseline used when a request
+# matches no node, or the geo module resolves no country, is stated at the top
 # of the rules tree in permissions.yaml.
 [geo]
-provider = "platform"
-# With no geo provider, every request resolves at the top of the rules tree. A
-# deployment that runs an Edge Cookie provider without a geo provider must
+module = "platform"
+# With no geo module, every request resolves at the top of the rules tree. A
+# deployment that runs an Edge Cookie module without a geo module must
 # acknowledge that explicitly:
 # assume_single_jurisdiction = true
 ```
 
-The top of the tree covers requests the geo provider leaves unmatched. A
+The top of the tree covers requests the geo module leaves unmatched. A
 failed geo lookup is different, because it resolves every permission to the
 requires-signal floor instead of the top baseline, and is logged at error level.
 
 Read that alongside which lookups can actually fail, because it decides how
-much the top baseline is doing for you. None of the geo providers shipped
+much the top baseline is doing for you. None of the geo modules shipped
 today can fail. Fastly's lookup returns "no data" rather than an error, the
-Cloudflare provider reads request headers, and the Axum and Spin providers
+Cloudflare module reads request headers, and the Axum and Spin modules
 resolve nothing at all. **A geo outage therefore reaches the top baseline,
 not the floor**, because "no data" and "the deployer left this unmatched" are
 the same state. Choose the top `group` and `jurisdiction` on that basis, meaning
 whatever they grant is what an outage grants. The floor applies to a geo
-provider that does its own lookup and can report a failure.
+module that does its own lookup and can report a failure.
 
 ```yaml
 # permissions.yaml (excerpt). Each group lists every permission and its flag.
@@ -534,7 +534,7 @@ rules:
 
 ## Relationship to Edge Cookies
 
-Edge Cookie creation is gated through this model, because the built-in HMAC provider
+Edge Cookie creation is gated through this model, because the built-in HMAC module
 requires `necessary.operations.storage`, so an Edge Cookie is created only when that
 permission is set. See [Edge Cookies](/guide/edge-cookies) for the full
 request lifecycle.

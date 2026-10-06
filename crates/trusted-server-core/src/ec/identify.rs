@@ -64,7 +64,7 @@ pub fn handle_identify(
     // Identify returns the partner's UID for this visitor, which is sharing
     // the identity beyond the edge, so it needs the same permission pair as
     // bidstream EIDs (storage plus personalised-ad selection), not only the
-    // provider's storage permission.
+    // module's storage permission.
     if !ec_context.ec_sharing_allowed() {
         return json_response_with_origin(
             StatusCode::FORBIDDEN,

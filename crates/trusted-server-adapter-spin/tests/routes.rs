@@ -1005,8 +1005,8 @@ const UNINJECTED_MODULE_TOML: &str = r#"
     [ec.acme]
     endpoint = "https://ec.acme.example.com"
 
-    # An Edge Cookie provider is configured, so single-jurisdiction operation
-    # is acknowledged because no geo provider is selected.
+    # An Edge Cookie module is configured, so single-jurisdiction operation
+    # is acknowledged because no geo module is selected.
     [geo]
     assume_single_jurisdiction = true
 "#;

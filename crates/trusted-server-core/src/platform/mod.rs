@@ -196,7 +196,7 @@ mod tests {
     fn disabled_geo_requires_no_permissions() {
         assert!(
             DisabledGeo.required_permissions().is_empty(),
-            "the default disabled geo provider requires no permissions"
+            "the default disabled geo module requires no permissions"
         );
     }
 
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn build_geo_provider_defaults_to_no_geo() {
+    fn build_geo_module_defaults_to_no_geo() {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_module(&settings, Arc::clone(&host));
@@ -239,12 +239,12 @@ mod tests {
                 .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
                 .expect("disabled geo lookup should not fail")
                 .is_none(),
-            "the default geo provider should resolve nothing"
+            "the default geo module should resolve nothing"
         );
     }
 
     #[test]
-    fn build_geo_provider_none_selects_no_geo_explicitly() {
+    fn build_geo_module_none_selects_no_geo_explicitly() {
         let mut settings = Settings::default();
         settings.geo.module = Some("none".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);

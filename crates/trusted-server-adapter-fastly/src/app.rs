@@ -201,8 +201,8 @@ pub(crate) struct AppState {
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
-    pub(crate) permission_signal_providers:
-        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    pub(crate) permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -264,10 +264,10 @@ pub(crate) fn build_state_from_settings(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
-    let permission_signal_providers =
-        trusted_server_core::permission_signal::build_permission_signal_providers(
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
-            &shipped_signal_providers(),
+            &shipped_signal_modules(),
         )?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
@@ -280,27 +280,27 @@ pub(crate) fn build_state_from_settings(
         default_kv_store,
         auction_telemetry_sink,
         ec_module,
-        permission_signal_providers,
+        permission_signal_modules,
     }))
 }
 
-/// The permission signal providers this adapter links, in the order they run
+/// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
 /// carry a choice someone made through an interface follow, so an answer
 /// given at a prompt amends the header the visitor arrived with.
 ///
-/// Core supplies no provider of its own, so this is where a deployment's
+/// Core supplies no module of its own, so this is where a deployment's
 /// schemes are decided. A scheme is added by linking its crate here, and a
 /// scheme core has never heard of plugs in the same way.
-fn shipped_signal_providers()
--> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
     vec![
-        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
-        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
-        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
-        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
-        Arc::new(trusted_server_permission_signal_mtm::MtmProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
     ]
 }
 
@@ -372,10 +372,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
-        // The signal providers were selected once at startup from the scheme
+        // The signal modules were selected once at startup from the scheme
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
-        .permission_signal_providers(Arc::clone(&state.permission_signal_providers))
+        .permission_signal_modules(Arc::clone(&state.permission_signal_modules))
         .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
 
     // Hand every request the module resolved at the composition root, so the
@@ -1748,7 +1748,7 @@ mod tests {
             ec_module,
             // These tests exercise routing, and a request with no signal
             // module resolves at the place baseline.
-            permission_signal_providers: Arc::default(),
+            permission_signal_modules: Arc::default(),
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -3123,9 +3123,9 @@ mod tests {
                     [ec]
                     passphrase = "test-secret-key-32-bytes-minimum"
 
-                    # The deprecated passphrase migrates to the hmac provider, so
+                    # The deprecated passphrase migrates to the hmac module, so
                     # single-jurisdiction operation is acknowledged because no
-                    # geo provider is selected.
+                    # geo module is selected.
                     [geo]
                     assume_single_jurisdiction = true
 

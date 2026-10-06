@@ -66,7 +66,7 @@ pub fn ec_finalize_response(
     let ec_permitted = ec_context.ec_allowed();
 
     if !ec_permitted {
-        // The providers answer withdrawal when the permissions are assembled, so
+        // The modules answer withdrawal when the permissions are assembled, so
         // the answer is read here rather than decoded again from the consent record.
         let storage_withdrawn = ec_context.storage_withdrawn();
         // Expire the request-local marker independently of the EC cookie: a
@@ -751,8 +751,8 @@ mod tests {
         // identity graph.
         let ec_id = sample_ec_id("zz9999");
         // A TCF record refusing storage under the requires-signal floor is
-        // the withdrawal trigger. The TCF provider answers that at assembly,
-        // and core links no provider, so the answer is stated here.
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(refusing_tcf()),
@@ -796,8 +796,8 @@ mod tests {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("held01");
         // A TCF record refusing storage under the requires-signal floor is
-        // the withdrawal trigger. The TCF provider answers that at assembly,
-        // and core links no provider, so the answer is stated here.
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(refusing_tcf()),
@@ -856,8 +856,8 @@ mod tests {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("dead01");
         // A TCF record refusing storage under the requires-signal floor is
-        // the withdrawal trigger. The TCF provider answers that at assembly,
-        // and core links no provider, so the answer is stated here.
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(refusing_tcf()),
@@ -908,8 +908,8 @@ mod tests {
         let ec_id = sample_ec_id("aBc123");
         // A TCF record refusing storage is the withdrawal trigger, under a
         // storage baseline at the requires-signal floor, where refusing the
-        // signal storage depends on is destructive. The TCF provider answers
-        // that at assembly, and core links no provider, so the answer is
+        // signal storage depends on is destructive. The TCF module answers
+        // that at assembly, and core links no module, so the answer is
         // stated here and what finalization does with it is what is tested.
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
@@ -2149,8 +2149,8 @@ mod tests {
             source: ConsentSource::Cookie,
             ..Default::default()
         };
-        // The TCF provider answers the withdrawal at assembly, and core links
-        // no provider, so the answer is stated here.
+        // The TCF module answers the withdrawal at assembly, and core links
+        // no module, so the answer is stated here.
         let mut ec_context = canonicalizing_context(true, false, consent, false)
             .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
@@ -2422,8 +2422,8 @@ mod tests {
         // created, but the deployment now runs a module with a different
         // code, so read-back treats the cookie as absent and the active
         // identifier is empty.
-        // The TCF provider answers the withdrawal at assembly, and core links
-        // no provider, so the answer is stated here.
+        // The TCF module answers the withdrawal at assembly, and core links
+        // no module, so the answer is stated here.
         let mut ec_context = make_context_with_consent(
             None,
             Some(CANONICAL_COOKIE_VALUE),
@@ -2627,8 +2627,8 @@ mod tests {
         let active_ec = sample_ec_id("activ2");
         let cookie_ec = sample_ec_id("cook2e");
         // A TCF record refusing storage under the requires-signal floor is
-        // the withdrawal trigger. The TCF provider answers that at assembly,
-        // and core links no provider, so the answer is stated here.
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             tcf: Some(refusing_tcf()),

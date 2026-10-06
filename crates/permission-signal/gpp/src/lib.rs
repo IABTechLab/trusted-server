@@ -1,41 +1,41 @@
-//! The GPP US sale opt-out as a permission signal provider.
+//! The GPP US sale opt-out as a permission signal module.
 //!
 //! Answers from the US sale opt-out carried in the `__gpp` string, which core
 //! decodes into the consent record. It says nothing about the EU TCF section a
-//! GPP string may also carry, because that is the TCF provider's scheme.
+//! GPP string may also carry, because that is the TCF module's scheme.
 //!
-//! This provider lives outside `trusted-server-core` deliberately, like every
+//! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::evidence::RequestInfo;
-use trusted_server_core::permission_signal::{PermissionSignalProvider, SignalInput};
+use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
-/// The stable identifier this provider answers to in `[permission_signal]`
-/// `provider`, in logs, and when a peer consults it.
+/// The stable identifier this module answers to in `[permission_signal]`
+/// `module`, in logs, and when a peer consults it.
 pub const ID: &str = "gpp_sale_opt_out";
 
 /// A GPP US sale opt-out, read from the `__gpp` string.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct GppSaleOptOutProvider;
+pub struct GppSaleOptOutModule;
 
-impl GppSaleOptOutProvider {
-    /// A new provider.
+impl GppSaleOptOutModule {
+    /// A new module.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 }
 
-impl PermissionSignalProvider for GppSaleOptOutProvider {
+impl PermissionSignalModule for GppSaleOptOutModule {
     fn id(&self) -> &'static str {
         ID
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
         // The policy decides whether this scheme counts at all and what an
-        // opt-out takes away, so a provider the policy does not list stays
+        // opt-out takes away, so a module the policy does not list stays
         // silent even when configuration names it.
         if !input
             .policy
@@ -45,7 +45,7 @@ impl PermissionSignalProvider for GppSaleOptOutProvider {
             return ConsentSignal::Neutral;
         }
         // A GPP string that arrived and could not be read is treated as the
-        // opt-out it may have carried, because a preference this provider
+        // opt-out it may have carried, because a preference this module
         // cannot see is not the same as no preference.
         let unreadable = input.consent.raw_gpp_string.is_some() && input.consent.gpp.is_none();
         let opted_out = input
@@ -107,15 +107,15 @@ mod tests {
     ) -> ConsentSignal {
         let evidence = OwnedRequestInfo::default();
         let input = SignalInput::new(consent, &evidence, policy, Acquisition::Granted);
-        GppSaleOptOutProvider::new().signal(permission, &input)
+        GppSaleOptOutModule::new().signal(permission, &input)
     }
 
     #[test]
     fn answers_to_its_identifier() {
         assert_eq!(
-            GppSaleOptOutProvider::new().id(),
+            GppSaleOptOutModule::new().id(),
             ID,
-            "the provider answers to the identifier configuration names"
+            "the module answers to the identifier configuration names"
         );
     }
 
@@ -149,7 +149,7 @@ mod tests {
             ..with_sale_opt_out(Some(false))
         };
         assert_eq!(
-            GppSaleOptOutProvider::new().valid_signal(&decoded, &evidence),
+            GppSaleOptOutModule::new().valid_signal(&decoded, &evidence),
             Some(ValidSignal::new(ID, "gpp", "DBABMA~CPreadable")),
             "a decoded string is vouched for as received, whatever it says"
         );
@@ -158,7 +158,7 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            GppSaleOptOutProvider::new().valid_signal(&unreadable, &evidence),
+            GppSaleOptOutModule::new().valid_signal(&unreadable, &evidence),
             None,
             "an unreadable string is not"
         );
@@ -250,7 +250,7 @@ mod tests {
             Acquisition::RequiresSignal,
         );
         assert!(
-            !GppSaleOptOutProvider::new().withdraws(Permission::StoreOnDevice, &input),
+            !GppSaleOptOutModule::new().withdraws(Permission::StoreOnDevice, &input),
             "a sale opt-out suppresses use for the request and never destroys an identifier"
         );
     }
