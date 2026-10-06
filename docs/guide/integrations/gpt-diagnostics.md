@@ -213,7 +213,7 @@ There is no historical recovery or server-side report store.
 ### Release acceptance
 
 Keep `trace_page_enabled` off until the required automated checks in the
-[implementation plan](../../superpowers/plans/2026-10-05-mobile-ad-render-trace-implementation-plan.md)
+[implementation plan](https://github.com/IABTechLab/trusted-server/blob/750ba8dc470aa37f3eb62512cc2b5a025bab8f9d/docs/superpowers/plans/2026-10-05-mobile-ad-render-trace-implementation-plan.md)
 pass. The browser checks must exercise the complete setup, real cookie observation,
 publisher reload, capture, viewer, export and end flow on each supported adapter.
 Real bidder transport and creative rendering require their separate live checks;
