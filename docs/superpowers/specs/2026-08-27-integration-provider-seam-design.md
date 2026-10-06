@@ -1,6 +1,6 @@
 # Design Spec: The Integration Provider Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28. This PR adds design
+**Status:** Proposed, 2026-08-27, revised 2026-08-28 and 2026-10-06. This PR adds design
 documents only and targets `main` directly. Following the review of #1043
 (27 August) the seam it defines is a precondition for the provider series
 rather than a follow-up to it, so the order is now this spec, then its
@@ -99,7 +99,17 @@ owns nothing behind it. Concretely:
 - An adapter composes the deployment by injecting the registrations it was
   built with, exactly as it already injects the geo and device providers.
 - Tech Lab engineering assesses and reviews vendor crates. It does not
-  maintain them.
+  maintain them. A vendor crate pins the dependency versions its module
+  needs, because Cargo links different major versions of one crate into one
+  binary, and a vendor release needs no pull request to this repository. One
+  crate for every vendor would mean one release train and one person choosing
+  versions for everyone, which does not scale with the number of modules.
+- What an operator selects to supply a capability is a module. "Provider"
+  keeps the one meaning it has on `main`, an auction provider instance, so
+  the identity, geo, device and page selectors read `[ec] module`,
+  `[geo] module`, `[device] module` and `[integration] module`, and the
+  identifiers this series added use the same word. The auction tables in
+  §3.4 keep `provider`, because they name auction providers.
 
 ## 3. Design
 
@@ -107,8 +117,14 @@ owns nothing behind it. Concretely:
 
 Make the builder contract public and give the registry a second input.
 
-- `IntegrationBuilder` becomes `pub` with a public constructor, and
-  `builders()` stays as the built-in set.
+- `IntegrationBuilder` becomes `pub` with a public constructor. The built-in
+  set is discovered at build time from the integration directories, in the
+  way `trusted-server-js/build.rs` already discovers browser modules, so
+  `builders()` is generated and core keeps no hand-written list of vendors.
+  That removes the drift the 31 August review found in `migration_guards.rs`,
+  where one integration had no entry. An external crate still arrives
+  through the registrations an adapter supplies, which is the only route for
+  code outside this repository.
 - `IntegrationRegistry::with_plan`, the constructor every adapter calls
   since PR #1016, gains a companion,
   `IntegrationRegistry::with_plan_and_registrations(settings, plan, extra)`,
@@ -348,6 +364,100 @@ selection path onto this section, move the HMAC and User-Agent-only
 providers into module crates, and keep everything else. #1045, #1046
 and #1047 are unaffected beyond the rebase.
 
+### 3.7 Page changes as middleware
+
+A page change is one middleware, a capability an integration registers, run
+only where an ordered entry in the settings names it. The middleware contract
+replaces the four page hook traits, `IntegrationAttributeRewriter`,
+`IntegrationScriptRewriter`, `IntegrationHtmlStreamProcessorFactory` and
+`IntegrationHeadInjector`, and their four context types. Proxies and request
+filters are not page changes and keep their traits. A script-source claim
+stays a declared transition, and the trusted attributes an integration adds
+to the unified script tag stay with its browser assets.
+
+**The contract.** A registered middleware is `Send + Sync` and holds no
+request state. For each document core calls its factory once, with one
+context, and gets back an action. The context carries the request host and
+scheme, the origin host, the per-document state and the script buffering
+limit, which the four old contexts carried between them. The element name,
+the attribute name and the last-chunk flag arrive with each matched element
+or text chunk. An action combines any of these parts, and an empty action
+leaves the document unchanged:
+
+| Action part      | Replaces                                | Decision it carries                                                                               |
+| ---------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Head inserts     | `IntegrationHeadInjector`               | Markup to write at the start of `<head>`.                                                         |
+| Element handlers | `IntegrationAttributeRewriter`          | For each element a selector matches, keep it, replace one attribute value, or remove the element. |
+| Text handlers    | `IntegrationScriptRewriter`             | For the text inside each element a selector matches, keep it, replace it, or remove the node.     |
+| Stream processor | `IntegrationHtmlStreamProcessorFactory` | One processor over the document the HTML rewriter produced.                                       |
+
+The parts carry exactly the decisions the four traits carry today, so
+converting a hook repackages it and must not change what it does. A
+middleware a crate supplies is named by its integration and a local name,
+`<integration>.<local-middleware>`, in the way a qualified provider ID is
+written.
+
+**Where it runs.** Each phase has its own ordered list of entries, `[[fetch]]`
+and `[[serve]]`. An entry covers one media type, optionally only the requests
+under a path prefix, and names the middleware to run in order. A response
+takes the first entry that covers it. Each middleware is handed the document
+as the ones before it left it. A middleware reads its settings from
+`[middleware.<name>]`.
+
+```toml
+[[fetch]]
+media_type = "text/html"
+path = "/news/"
+middleware = ["prebid.strip", "gpt"]
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["prebid.strip"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["datadome"]
+```
+
+Entries carry no settings and activate nothing. Whether an integration runs
+is decided where it is today, and an entry only places and orders the page
+changes of the integrations that run. A middleware named in no entry is a
+warning at startup, and a name no registration supplies is a startup error.
+Page changes therefore take their order from the entries rather than from
+the integration's one position, so a publisher can run a change on part of a
+site, or place two changes of one integration apart, without touching the
+auction's priority.
+
+**The two phases.** Fetch is obtaining the document from the origin. A fetch
+middleware is handed nothing about the reader, so its output cannot depend on
+who asked, and what it leaves is what a shared template stores for every
+reader. Serve is preparing the document for the response. A serve middleware
+runs per reader, on that reader's copy, whether the page came from the store
+or the origin, and nothing it writes is stored. The rules that today keep one
+reader's bytes out of a shared template by declaration, being a hook raising
+`RequestProcessingRequirements` for request-dependent output, the rule
+against copying request-private state into a template, and the rule that a
+fingerprinted head insert is configuration-rendered, become structural for
+page changes. The requirements type stays as a contract about the request,
+raised by the request filter and the preparation hook.
+
+**What converts.** On `main` the four traits have nineteen implementations in
+twelve of the fifteen integrations: nine attribute rewriters (`datadome`,
+`google_tag_manager`, `gpt`, `js_asset_proxy`, `lockr`, `permutive`,
+`prebid`, `sourcepoint`, `testlight`), three script rewriters
+(`google_tag_manager` and two in `nextjs`), one stream processor (`nextjs`)
+and six head injectors (`aps`, `datadome`, `didomi`, `gpt`, `prebid`,
+`sourcepoint`). Eighteen become middleware. The APS head injector returns no
+markup and only sets a trusted tag attribute, so it becomes that attribute
+and registers no middleware. One implementation reads a request-scoped
+decision, DataDome's head injector leaving out its client tag for a request
+its filter marked, so it becomes a serve middleware and its tag moves to the
+start of `<head>`, which is a visible change and is stated as one. The other
+eighteen run in the fetch phase, where they run today. Each integration
+converts in a change of its own, checked against the differential harness,
+and the four traits, their contexts and the registry's four hook lists are
+deleted when the last implementation converts.
+
 ## 4. Migration of the nine existing vendors
 
 One vendor per PR, after this change lands. Each migration PR gives its vendor crate a visible maintainers declaration, the way Prebid.js requires of every adapter, and per-crate code ownership, so the boundary carries a named owner from its first day. Each moves its Rust, its
@@ -397,8 +507,8 @@ Two more places every move must touch, found by mapping `main`:
 
 ## 5. What does not change
 
-The request pipeline, the hook traits and their order, the served script
-format and its hash, every `[integration.*]` table, the permission model,
+The request pipeline, the served script format and its hash, every
+`[integration.*]` table, the permission model,
 and the identity lifecycle, envelope and validation contracts from #986 as
 implemented in PRs #1043 to #1046. No integration changes behavior. A
 deployment that lists the same integrations gets the same responses.
@@ -427,7 +537,13 @@ deployment that lists the same integrations gets the same responses.
    because the built-in set still registers through the same path.
 4. **No vendor left behind.** The rewritten deploy-validation test shows
    every registered integration validates its configuration.
-5. All CI gates in `CLAUDE.md`, on all four adapters.
+5. **Page changes through the contract.** The test integration registers a
+   middleware. It runs only where a `[[fetch]]` or `[[serve]]` entry names it,
+   a fetch middleware's output reaches a second reader from the shared
+   template, a serve middleware's change never reaches the stored copy, and
+   each of the nineteen converted implementations reproduces its recorded
+   output.
+6. All CI gates in `CLAUDE.md`, on all four adapters.
 
 ## 7. Risk
 
@@ -554,7 +670,7 @@ defines, and both should land before the first vendor is asked to use it.
 ## 9. Sign-off
 
 | #   | Decision                                                                                                                                                                                                                                                                                                                                                   | Status               |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --- |
 | 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                                                                                                                                                                                                  | Proposed             |
 | 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                                                                                                                                                                                                     | Proposed, governance |
 | 3   | A registration may carry its own browser JavaScript                                                                                                                                                                                                                                                                                                        | Proposed             |
@@ -564,8 +680,18 @@ defines, and both should land before the first vendor is asked to use it.
 | 7   | Identity, geo and device providers are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                          | Proposed             |
 | 8   | No provider is built into core, because HMAC and the User-Agent-only device provider are Tech Lab-owned crates registered by an integration builder and selected by `[ec] provider` and `[device] provider`, neither being a page integration, and core keeps only `none`                                                                                  | Proposed             |
 | 9   | This spec and its core implementation precede #1043, so 51Degrees implements the core seam and the nine vendor moves in §4 stay one PR each                                                                                                                                                                                                                | Proposed             |
+| 10  | What an operator selects is a module, and provider keeps its meaning of an auction provider instance (§2)                                                                                                                                                                                                                                                  |                      |     |
+| 11  | The built-in integrations are discovered at build time, and an external crate registers through the adapter (§3.1)                                                                                                                                                                                                                                         |                      |     |
+| 12  | A page change is one middleware, run only where an ordered `[[fetch]]` or `[[serve]]` entry names it, in two phases (§3.7)                                                                                                                                                                                                                                 |                      |     |
+| 13  | A vendor crate pins its own dependency versions and releases without a pull request here, and Tech Lab reviews it (§2)                                                                                                                                                                                                                                     |                      |     |
 
 ## Revision record
+
+- 2026-10-06. Merged `main` at 7a0ecb4. Added the module name (§2), build-time
+  discovery of the built-in set (§3.1), the reasons for the maintainers
+  convention (§2), and page changes as middleware in ordered phase entries
+  with a fetch and a serve phase (§3.7, acceptance 5, sign-off rows 10 to
+  13). The hook traits leave "What does not change".
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
