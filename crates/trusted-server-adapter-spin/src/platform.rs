@@ -736,10 +736,10 @@ pub fn build_runtime_services(
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
-        // Routed through the [geo] provider selector like the Fastly adapter,
+        // Routed through the [geo] module selector like the Fastly adapter,
         // so the selector behaves the same on every adapter. Spin has no host
         // geo service, so the host default resolves nothing either way.
-        .geo(trusted_server_core::platform::build_geo_provider(
+        .geo(trusted_server_core::platform::build_geo_module(
             settings,
             Arc::new(NullGeo),
         ))

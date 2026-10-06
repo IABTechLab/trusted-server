@@ -16,7 +16,7 @@ use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
-use trusted_server_core::ec::device::{DeviceProvider, DeviceSignals, build_device_provider};
+use trusted_server_core::ec::device::{DeviceModule, DeviceSignals, build_device_module};
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
@@ -26,11 +26,11 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
-use trusted_server_core::platform::build_geo_provider;
+use trusted_server_core::platform::build_geo_module;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
-use trusted_server_device_fastly::{FastlyDeviceProvider, FastlyHostSignals};
+use trusted_server_device_fastly::{FastlyDeviceModule, FastlyHostSignals};
 
 mod app;
 mod backend;
@@ -615,10 +615,10 @@ fn apply_entry_point_finalize_headers(
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
 ) {
-    // Route through the [geo] provider selector, so a deployment that opts
+    // Route through the [geo] module selector, so a deployment that opts
     // out of geolocation makes no host geo call on the entry-point finalize
     // path either.
-    let geo = build_geo_provider(settings, Arc::new(FastlyPlatformGeo));
+    let geo = build_geo_module(settings, Arc::new(FastlyPlatformGeo));
     let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
         geo.lookup(client_ip).unwrap_or_else(|e| {
             log::warn!("entry-point geo lookup failed: {e}");
@@ -866,15 +866,15 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
     None
 }
 
-/// Derives device signals via the configured device-detection provider.
+/// Derives device signals via the configured device-detection module.
 ///
-/// The providers read request data from injected services. Device
+/// The modules read request data from injected services. Device
 /// classification reads only the User-Agent, borrowed here through a
 /// `BorrowedRequestInfo`, unless `fastly` is selected, in which case the Fastly
-/// provider also reads the TLS and HTTP/2 signals captured into a
+/// module also reads the TLS and HTTP/2 signals captured into a
 /// [`FastlyHostSignals`]. The Fastly entry point still reads those TLS and
 /// HTTP/2 signals on every request to build the host-signal service and client
-/// info, so the capture is not conditional on the provider selection.
+/// info, so the capture is not conditional on the module selection.
 pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) -> DeviceSignals {
     let mut headers = HeaderMap::new();
     if let Some(value) = req
@@ -888,9 +888,9 @@ pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) ->
         .map(|ip| ip.to_string())
         .unwrap_or_default();
     let request_info = BorrowedRequestInfo::new(&client_ip, None).with_headers(&headers);
-    build_device_provider(settings, || {
+    build_device_module(settings, || {
         let host_signals: Arc<dyn HostSignals> = Arc::new(FastlyHostSignals::from_request(req));
-        Box::new(FastlyDeviceProvider::new(host_signals)) as Box<dyn DeviceProvider>
+        Box::new(FastlyDeviceModule::new(host_signals)) as Box<dyn DeviceModule>
     })
     .detect(&request_info)
 }

@@ -127,7 +127,7 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_provider,
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_module,
 };
 use trusted_server_device_fastly::FastlyHostSignals;
 
@@ -308,7 +308,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 
     // The TLS JA4 and HTTP/2 signals arrive as trusted internal headers
     // injected by the entry point. They build the host-signal service a
-    // host-signal provider reads. Fastly always supplies the capability, so the
+    // host-signal module reads. Fastly always supplies the capability, so the
     // service is always set even when a request carried no signal.
     let tls_ja4 = ctx
         .request()
@@ -334,7 +334,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(build_geo_provider(
+        .geo(build_geo_module(
             &state.settings,
             Arc::new(FastlyPlatformGeo),
         ))

@@ -239,9 +239,9 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
 /// Host-computed client signals that are not carried in request headers.
 ///
 /// A host that can compute them supplies an implementation (Fastly exposes the
-/// TLS JA4 and HTTP/2 signals). A provider that needs them takes
+/// TLS JA4 and HTTP/2 signals). A module that needs them takes
 /// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none the
-/// provider cannot be built and the request stops.
+/// module cannot be built and the request stops.
 pub trait HostSignals: Send + Sync + core::fmt::Debug {
     /// The full JA4 TLS signal, or `None` when unavailable.
     fn ja4(&self) -> Option<&str>;

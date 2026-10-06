@@ -139,7 +139,7 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY};
+    use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
@@ -147,7 +147,7 @@ mod tests {
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
-        crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_provider,
+        crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_module,
     };
 
     fn test_settings() -> Settings {
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn resolves_the_host_signals_passphrase_from_the_mapped_store() {
         let mut original = test_settings();
-        select_host_signals_provider(&mut original.ec, "host-signals-passphrase-key");
+        select_host_signals_module(&mut original.ec, "host-signals-passphrase-key");
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -953,7 +953,7 @@ mod tests {
             reconstructed
                 .ec
                 .module_blocks
-                .get(HOST_SIGNALS_PROVIDER_KEY)
+                .get(HOST_SIGNALS_MODULE_KEY)
                 .and_then(crate::settings::EcModuleBlock::host_signals_settings)
                 .map(|config| config.passphrase.expose().as_str()),
             Some("resolved-host-signals-passphrase-32-bytes-ok")
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_a_short_resolved_host_signals_passphrase() {
         let mut settings = test_settings();
-        select_host_signals_provider(&mut settings.ec, "short_key");
+        select_host_signals_module(&mut settings.ec, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved host_signals passphrase");

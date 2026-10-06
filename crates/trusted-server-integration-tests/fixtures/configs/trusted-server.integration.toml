@@ -13,7 +13,7 @@ proxy_secret = "integration_proxy_secret"
 # and Viceroy supplies the host geo lookup. The permission model replaces this
 # with a [geo] default_country baseline in the next PR of the series.
 [geo]
-provider = "platform"
+module = "platform"
 
 [ec]
 module = "hmac"

@@ -88,9 +88,9 @@ use error_stack::Report;
 
 use crate::settings::Settings;
 
-/// A geo provider that resolves nothing.
+/// A geo module that resolves nothing.
 ///
-/// Installed when `[geo] provider = "none"` is selected, so a client IP is
+/// Installed when `[geo] module = "none"` is selected, so a client IP is
 /// never sent to any host geo service. Every geo consumer already treats
 /// [`GeoInfo`] as optional, so a `None` result degrades gracefully (the
 /// jurisdiction is unknown, the auction omits geo, and so on).
@@ -102,22 +102,22 @@ impl PlatformGeo for DisabledGeo {
     }
 }
 
-/// Selects the geo provider named by the `[geo] provider` selector.
+/// Selects the geo module named by the `[geo] module` selector.
 ///
 /// The host platform's geo lookup is the default: with no selector,
 /// `host_default` (the adapter's platform geo implementation) resolves the
 /// location, matching the behavior before the selector existed, and
-/// `provider = "platform"` spells the same choice explicitly. Selecting
-/// `provider = "none"` returns [`DisabledGeo`] instead, so a client IP is
-/// never sent to any host geo service. A selected-but-unknown provider is
+/// `module = "platform"` spells the same choice explicitly. Selecting
+/// `module = "none"` returns [`DisabledGeo`] instead, so a client IP is
+/// never sent to any host geo service. A selected-but-unknown module is
 /// rejected at startup by
 /// [`GeoConfig::validate_module_selection`](crate::settings::GeoConfig::validate_module_selection).
 #[must_use]
-pub fn build_geo_provider(
+pub fn build_geo_module(
     settings: &Settings,
     host_default: Arc<dyn PlatformGeo>,
 ) -> Arc<dyn PlatformGeo> {
-    match settings.geo.provider.as_deref() {
+    match settings.geo.module.as_deref() {
         Some("none") => Arc::new(DisabledGeo),
         _ => host_default,
     }
@@ -216,10 +216,10 @@ mod tests {
     }
 
     #[test]
-    fn build_geo_provider_defaults_to_the_host_geo() {
+    fn build_geo_module_defaults_to_the_host_geo() {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
-        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        let selected = build_geo_module(&settings, Arc::clone(&host));
         assert!(
             Arc::ptr_eq(&host, &selected),
             "default settings should use the host geo"
@@ -227,30 +227,30 @@ mod tests {
     }
 
     #[test]
-    fn build_geo_provider_none_selects_no_geo() {
+    fn build_geo_module_none_selects_no_geo() {
         let mut settings = Settings::default();
-        settings.geo.provider = Some("none".to_owned());
+        settings.geo.module = Some("none".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
-        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        let selected = build_geo_module(&settings, Arc::clone(&host));
         assert!(
             !Arc::ptr_eq(&host, &selected),
-            "provider none should not use the host geo"
+            "module none should not use the host geo"
         );
         assert!(
             selected
                 .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
                 .expect("disabled geo lookup should not fail")
                 .is_none(),
-            "the disabled geo provider should resolve nothing"
+            "the disabled geo module should resolve nothing"
         );
     }
 
     #[test]
-    fn build_geo_provider_uses_host_geo_when_platform_is_selected() {
+    fn build_geo_module_uses_host_geo_when_platform_is_selected() {
         let mut settings = Settings::default();
-        settings.geo.provider = Some("platform".to_owned());
+        settings.geo.module = Some("platform".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
-        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        let selected = build_geo_module(&settings, Arc::clone(&host));
         assert!(
             Arc::ptr_eq(&host, &selected),
             "the platform selector should use the host geo"

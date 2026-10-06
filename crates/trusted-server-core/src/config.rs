@@ -13,7 +13,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
-use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY};
+use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -160,7 +160,7 @@ fn remove_labeled_module_secret_errors(errors: &mut ValidationErrors, ec: &Ec) {
             ec.module_blocks
                 .host_signals_blocks()
                 .map(|(name, _)| name)
-                .filter(|name| *name != HOST_SIGNALS_PROVIDER_KEY),
+                .filter(|name| *name != HOST_SIGNALS_MODULE_KEY),
         );
     for name in labeled {
         let Some(ValidationErrorsKind::Struct(block_errors)) = ec_errors.errors_mut().get_mut(name)
@@ -191,7 +191,7 @@ impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig
     /// operator's choosing holds that secret at `ec.<label>.passphrase`, which
     /// is only knowable from the configuration itself.
     fn configured_secret_fields(data: &serde_json::Value) -> Vec<SecretField> {
-        labeled_provider_block_names(data)
+        labeled_module_block_names(data)
             .map(|name| SecretField {
                 kind: SecretKind::KeyInDefault,
                 optional: true,
@@ -212,7 +212,7 @@ impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig
 /// `secret_fields` already lists, whichever of the two it configures, so it is
 /// left out rather than listed twice. A block naming any other implementation
 /// holds that implementation's settings, which core does not read.
-fn labeled_provider_block_names(data: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
+fn labeled_module_block_names(data: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
     data.get("ec")
         .and_then(serde_json::Value::as_object)
         .into_iter()
@@ -224,7 +224,7 @@ fn labeled_provider_block_names(data: &serde_json::Value) -> impl Iterator<Item 
             else {
                 return false;
             };
-            let built_in = |key: &str| key == HMAC_MODULE_KEY || key == HOST_SIGNALS_PROVIDER_KEY;
+            let built_in = |key: &str| key == HMAC_MODULE_KEY || key == HOST_SIGNALS_MODULE_KEY;
             built_in(implementation) && !built_in(name.as_str())
         })
         .map(|(name, _)| name.clone())
@@ -1060,12 +1060,12 @@ formats = [{ width = 300, height = 250 }]
         // check under that name.
         let mut settings = valid_settings();
         settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
-            HOST_SIGNALS_PROVIDER_KEY,
+            HOST_SIGNALS_MODULE_KEY,
         ));
         settings.ec.module_blocks.clear();
         settings.ec.module_blocks.insert(
-            HOST_SIGNALS_PROVIDER_KEY.to_owned(),
-            crate::settings::EcModuleBlock::from(crate::settings::HostSignalsProviderConfig {
+            HOST_SIGNALS_MODULE_KEY.to_owned(),
+            crate::settings::EcModuleBlock::from(crate::settings::HostSignalsModuleConfig {
                 passphrase: Redacted::new("host_signals_key".to_owned()),
             }),
         );

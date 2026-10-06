@@ -652,8 +652,8 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 // FastlyPlatformGeo
 // ---------------------------------------------------------------------------
 
-/// The Fastly host geo provider now lives in its own crate,
-/// `trusted-server-geo-fastly`, so every provider implementation sits under
+/// The Fastly host geo module now lives in its own crate,
+/// `trusted-server-geo-fastly`, so every module implementation sits under
 /// `crates/<type>/<vendor>`. It is re-exported here so this module's
 /// [`build_runtime_services`] and the adapter's existing call sites keep
 /// referring to it through `crate::platform`.

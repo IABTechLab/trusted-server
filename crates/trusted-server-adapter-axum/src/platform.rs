@@ -572,9 +572,9 @@ pub fn build_runtime_services(
         // API-route integration flow by reusing a poisoned connection after a
         // truncated POST. Revisit pooling if profiling shows allocation cost.
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
-        // Route through the [geo] provider selector like the Fastly adapter,
+        // Route through the [geo] module selector like the Fastly adapter,
         // so the selector behaves the same on every adapter.
-        .geo(trusted_server_core::platform::build_geo_provider(
+        .geo(trusted_server_core::platform::build_geo_module(
             settings,
             Arc::clone(GEO.get_or_init(|| Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>)),
         ))

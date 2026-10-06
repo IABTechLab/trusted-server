@@ -123,16 +123,16 @@ pub const HMAC_MODULE_KEY: &str = "hmac";
 /// An ordinary id in the same open-ended namespace as [`HMAC_MODULE_KEY`],
 /// spelled exactly the way a vendor crate spells its own, and nothing branches
 /// on it outside the resolution in [`build_module`]. It is also
-/// [`HostSignalProvider::id`]'s return value, and it goes with that resolution
+/// [`HostSignalModule::id`]'s return value, and it goes with that resolution
 /// arm when the host-signal module becomes a module of its own.
-pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host_signals";
+pub const HOST_SIGNALS_MODULE_KEY: &str = "host_signals";
 
 /// The implementation ids core supplies itself, one per resolution arm in
 /// [`resolve_named_module`].
 ///
 /// [`build_module`] refuses an injected module under one of these ids
 /// rather than picking one of the two.
-const BUILTIN_MODULE_KEYS: &[&str] = &[HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY];
+const BUILTIN_MODULE_KEYS: &[&str] = &[HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY];
 
 /// The registry code of the built-in HMAC module.
 ///
@@ -576,18 +576,18 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// sees its own value part.
     fn code(&self) -> ModuleCode;
 
-    /// Whether this provider was built from evidence about one request.
+    /// Whether this module was built from evidence about one request.
     ///
-    /// Almost every provider is built from configuration and services that are
+    /// Almost every module is built from configuration and services that are
     /// the same for every request, so one instance can be resolved once and
-    /// handed to all of them. [`HostSignalProvider`] is the exception, because
+    /// handed to all of them. [`HostSignalModule`] is the exception, because
     /// it is built from the TLS and HTTP/2 signals of a single request and
     /// answers `true` here. A composition root reads this through
     /// [`build_reusable_module`] to decide whether keeping the instance is
     /// safe, and keeping a request-scoped one would serve every later request
     /// from the first request's evidence.
     ///
-    /// The default is `false`, which is right for a provider whose constructor
+    /// The default is `false`, which is right for a module whose constructor
     /// takes only configuration and long-lived services.
     fn is_request_scoped(&self) -> bool {
         false
@@ -700,12 +700,12 @@ impl EdgeCookieModule for HmacModule {
 /// `HostSignals` capability, so any host that supplies one can use it. A host
 /// that supplies no `HostSignals` cannot build it, and the request stops.
 #[derive(Debug, Clone)]
-pub struct HostSignalProvider {
+pub struct HostSignalModule {
     passphrase: Redacted<String>,
     host_signals: Arc<dyn HostSignals>,
 }
 
-impl HostSignalProvider {
+impl HostSignalModule {
     /// Creates the module with the passphrase and its injected host signals.
     #[must_use]
     pub fn new(passphrase: Redacted<String>, host_signals: Arc<dyn HostSignals>) -> Self {
@@ -716,9 +716,9 @@ impl HostSignalProvider {
     }
 }
 
-impl EdgeCookieModule for HostSignalProvider {
+impl EdgeCookieModule for HostSignalModule {
     fn id(&self) -> &'static str {
-        HOST_SIGNALS_PROVIDER_KEY
+        HOST_SIGNALS_MODULE_KEY
     }
 
     // Built from the signals of one request, so it is only ever valid for
@@ -795,7 +795,7 @@ fn ensure_no_name_collision(
 
 /// Builds the Edge Cookie module named by the `[ec] module` selector.
 ///
-/// This is the composition root for the built-in providers: the adapter supplies
+/// This is the composition root for the built-in modules: the adapter supplies
 /// the [`HostSignals`] when the host can produce them, and this constructs the
 /// selected module. The per-request [`RequestInfo`] is passed borrowed to
 /// [`generate`](EdgeCookieModule::generate) at call time rather than stored, so
@@ -876,10 +876,10 @@ fn resolve_named_module(
         return Ok(Box::new(HmacModule::new(config.passphrase.clone())));
     }
 
-    // The host-signal provider needs signals only some hosts supply, and
+    // The host-signal module needs signals only some hosts supply, and
     // that check cannot be made in settings validation at all, so it is made
     // here rather than creating a degraded identifier under this name.
-    if implementation == HOST_SIGNALS_PROVIDER_KEY {
+    if implementation == HOST_SIGNALS_MODULE_KEY {
         let config = ec
             .module_blocks
             .get(name)
@@ -887,19 +887,19 @@ fn resolve_named_module(
             .ok_or_else(|| {
                 Report::new(TrustedServerError::EdgeCookie {
                     message: format!(
-                        "Edge Cookie provider `{name}` uses the `host_signals` implementation \
+                        "Edge Cookie module `{name}` uses the `host_signals` implementation \
                          but has no `[ec.{name}]` configuration"
                     ),
                 })
             })?;
         let signals = host_signals.ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
-                message: "The host_signals Edge Cookie provider requires a host that supplies \
+                message: "The host_signals Edge Cookie module requires a host that supplies \
                           TLS/HTTP-2 signals, which this host does not"
                     .to_owned(),
             })
         })?;
-        return Ok(Box::new(HostSignalProvider::new(
+        return Ok(Box::new(HostSignalModule::new(
             config.passphrase.clone(),
             signals,
         )));
@@ -995,7 +995,7 @@ pub fn build_shared_module(
 /// alone, and keeping one saves resolving the same settings again on every
 /// request.
 ///
-/// [`HostSignalProvider`] is not, because it is built from the signals of
+/// [`HostSignalModule`] is not, because it is built from the signals of
 /// one request and reports
 /// [`is_request_scoped`](EdgeCookieModule::is_request_scoped). Keeping that
 /// one would freeze the signals captured while application state was built,
@@ -1099,7 +1099,7 @@ impl EdgeCookieModule for SharedModule {
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
-    use crate::test_support::tests::{select_hmac_module, select_host_signals_provider};
+    use crate::test_support::tests::{select_hmac_module, select_host_signals_module};
     use http::HeaderMap;
 
     /// Settings selecting the built-in HMAC module under `name`, which is a
@@ -1110,11 +1110,11 @@ mod tests {
         ec
     }
 
-    /// Settings selecting the built-in host-signal provider under its own
+    /// Settings selecting the built-in host-signal module under its own
     /// name, with `passphrase` in its block.
     fn selected_host_signals(passphrase: &str) -> Ec {
         let mut ec = Ec::default();
-        select_host_signals_provider(&mut ec, passphrase);
+        select_host_signals_module(&mut ec, passphrase);
         ec
     }
 
@@ -1689,12 +1689,12 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_creates_from_signals() {
+    fn host_signal_module_creates_from_signals() {
         let signals = Arc::new(TestHostSignals {
             ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
             h2: Some("1:65536;4:6291456".to_owned()),
         });
-        let module = HostSignalProvider::new(test_passphrase(), signals);
+        let module = HostSignalModule::new(test_passphrase(), signals);
         let request_info = test_request_info();
         let generated = module
             .generate(&request_info, &IdentityInput::default())
@@ -1706,12 +1706,12 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_defers_without_signals() {
+    fn host_signal_module_defers_without_signals() {
         let signals = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
         });
-        let module = HostSignalProvider::new(test_passphrase(), signals);
+        let module = HostSignalModule::new(test_passphrase(), signals);
         let request_info = test_request_info();
         let generated = module
             .generate(&request_info, &IdentityInput::default())
@@ -1772,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_built_from_request_evidence_is_never_kept_and_reused() {
+    fn a_module_built_from_request_evidence_is_never_kept_and_reused() {
         // The host-signal module captures the signals of the request it
         // was built for. A composition root builds application state with an
         // empty host-signal service, because there is no request yet, so
@@ -1909,12 +1909,12 @@ mod tests {
     #[test]
     fn the_startup_check_rejects_host_signals_on_a_host_that_supplies_none() {
         // Whether the adapter injects a host-signal service is fixed per
-        // deployment, so selecting the host-signal provider on an adapter that
+        // deployment, so selecting the host-signal module on an adapter that
         // injects none is knowable without a request.
         let selected = selected_host_signals(test_passphrase().expose());
 
         let err = ensure_module_available(&selected, None, None).expect_err(
-            "the host-signal provider should fail the startup check with no host signals",
+            "the host-signal module should fail the startup check with no host signals",
         );
         assert!(
             err.to_string().contains("TLS/HTTP-2 signals"),

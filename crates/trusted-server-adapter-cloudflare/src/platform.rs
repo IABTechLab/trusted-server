@@ -632,9 +632,9 @@ pub fn build_runtime_services(
 
     // Geo: read Cloudflare-injected headers — no #[cfg] needed; headers are
     // simply absent on the native host target, producing Ok(None) from lookup().
-    // Routed through the [geo] provider selector like the Fastly adapter, so
+    // Routed through the [geo] module selector like the Fastly adapter, so
     // the selector behaves the same on every adapter.
-    let geo = trusted_server_core::platform::build_geo_provider(settings, Arc::new(build_geo(ctx)));
+    let geo = trusted_server_core::platform::build_geo_module(settings, Arc::new(build_geo(ctx)));
 
     RuntimeServices::builder()
         .config_store(config_store)
