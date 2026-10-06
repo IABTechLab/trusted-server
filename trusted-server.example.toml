@@ -94,9 +94,12 @@ ec_store = "ec_identity_store"
 # Extra origins allowed to POST the client resolve endpoint. The endpoint
 # always accepts https://<publisher.domain> and nothing else by default. List
 # further origins here if the pages that resolve identity are served from
-# another origin, www being the common case. Each entry is a serialized origin
-# (RFC 6454) compared by the same-origin test, so the scheme, host and port all
-# have to match, and a subdomain is never accepted just for being a subdomain.
+# another origin, www being the common case. Each entry is a bare origin
+# (RFC 6454), being http:// or https:// and a host with an optional port, with
+# no path, trailing slash, query or fragment, and any other entry is refused
+# when the configuration is pushed or loaded. Entries are compared by the
+# same-origin test, so the scheme, host and port all have to match, and a
+# subdomain is never accepted just for being a subdomain.
 # resolve_allowed_origins = ["https://www.example.com"]
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3

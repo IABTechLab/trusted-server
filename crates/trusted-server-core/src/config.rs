@@ -373,6 +373,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    settings.ec.validate_resolve_allowed_origins()?;
     Ok(())
 }
 
@@ -1345,6 +1346,20 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the whitespace-only secret reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_new_rejects_a_resolve_allowed_origin_that_is_not_bare() {
+        let mut settings = valid_settings();
+        settings.ec.resolve_allowed_origins = vec!["https://www.example.com/".to_owned()];
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should refuse at push an entry the settings refuse at load");
+
+        assert!(
+            err.to_string().contains("`https://www.example.com/`"),
+            "error should name the entry: {err:?}"
         );
     }
 

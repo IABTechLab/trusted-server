@@ -277,32 +277,103 @@ fn origin_is_publisher(req: &Request<EdgeBody>, settings: &Settings) -> bool {
 
 /// Whether two serialized origins are the same origin under RFC 6454.
 ///
-/// Each side must be a serialized origin as RFC 6454 §6.1 defines it, being
-/// a scheme, `://` and a host with an optional port and nothing after it, so a
-/// value carrying a path, query or fragment is not an origin and never
-/// matches. The two are then compared as the scheme, host and port triple of
-/// RFC 6454 §4, which is the same-origin test of §5. The scheme and host are
-/// case-insensitive and a missing port stands for the scheme's default, so a
-/// configured `https://www.example.com:443` matches the `https://www.example.com`
-/// a browser sends, while `http://` or another port never matches. The
-/// opaque `null` origin (RFC 6454 §6.2) is never the same as anything.
+/// Each side is read by [`parse_serialized_origin`], so a value that is not a
+/// serialized origin, such as one carrying a path, a query or a fragment,
+/// never matches. The two are then compared as the scheme, host and port
+/// triple of RFC 6454 §4, which is the same-origin test of §5. The scheme and
+/// host are case-insensitive and a missing port stands for the scheme's
+/// default, so a configured `https://www.example.com:443` matches the
+/// `https://www.example.com` a browser sends, while `http://` or another port
+/// never matches. The opaque `null` origin (RFC 6454 §6.2) is never the same
+/// as anything.
 fn origins_match(candidate: &str, allowed: &str) -> bool {
-    let parse = |origin: &str| -> Option<url::Origin> {
-        let url = url::Url::parse(origin).ok()?;
-        let is_bare_origin = url.path() == "/"
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && !origin.trim_end().ends_with('/');
-        if !is_bare_origin {
-            return None;
-        }
-        let origin = url.origin();
-        origin.is_tuple().then_some(origin)
-    };
-    match (parse(candidate), parse(allowed)) {
-        (Some(candidate), Some(allowed)) => candidate == allowed,
+    match (
+        parse_serialized_origin(candidate),
+        parse_serialized_origin(allowed),
+    ) {
+        (Ok(candidate), Ok(allowed)) => candidate == allowed,
         _ => false,
     }
+}
+
+/// Why a value is not a serialized origin.
+///
+/// Each reason reads as the end of a sentence about the value, so a message
+/// can name the value and then say what is wrong with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub(crate) enum NotAnOrigin {
+    /// The value is empty.
+    #[display("is empty")]
+    Empty,
+    /// The value has no scheme, another scheme, or is the opaque `null`.
+    #[display("does not begin with `http://` or `https://`")]
+    Scheme,
+    /// A user name or password comes before the host.
+    #[display("carries a user name or password")]
+    Userinfo,
+    /// Something follows the host and port, a lone trailing slash included.
+    #[display("has a path, and a trailing slash is one")]
+    Path,
+    /// A query follows the host and port.
+    #[display("has a query")]
+    Query,
+    /// A fragment follows the host and port.
+    #[display("has a fragment")]
+    Fragment,
+    /// What follows the scheme is not a host with an optional port.
+    #[display("does not name a host with an optional port")]
+    Host,
+}
+
+impl core::error::Error for NotAnOrigin {}
+
+/// Parses a serialized origin (RFC 6454 §6.1) into its scheme, host and port
+/// triple (RFC 6454 §4).
+///
+/// A serialized origin is `http://` or `https://` followed by a host and an
+/// optional port, and nothing else. The scheme and host are case-insensitive
+/// and a missing port stands for the scheme's default. The resolve endpoint
+/// reads both the request's `Origin` and each
+/// `[ec] resolve_allowed_origins` entry with this parse, and the
+/// settings refuse an entry it rejects, so an entry that loads is one a
+/// request can match.
+///
+/// # Errors
+///
+/// Returns the [`NotAnOrigin`] reason for any other value.
+pub(crate) fn parse_serialized_origin(value: &str) -> Result<url::Origin, NotAnOrigin> {
+    if value.is_empty() {
+        return Err(NotAnOrigin::Empty);
+    }
+    let authority = ["https://", "http://"]
+        .into_iter()
+        .find_map(|prefix| {
+            let (scheme, rest) = value.split_at_checked(prefix.len())?;
+            scheme.eq_ignore_ascii_case(prefix).then_some(rest)
+        })
+        .ok_or(NotAnOrigin::Scheme)?;
+    // The host and port end at the first of these, and an origin has nothing
+    // after them. The URL parser reads a backslash as a slash in these schemes.
+    match authority
+        .chars()
+        .find(|c| matches!(c, '/' | '\\' | '?' | '#' | '@'))
+    {
+        Some('@') => return Err(NotAnOrigin::Userinfo),
+        Some('?') => return Err(NotAnOrigin::Query),
+        Some('#') => return Err(NotAnOrigin::Fragment),
+        Some(_) => return Err(NotAnOrigin::Path),
+        None => {}
+    }
+    // The URL parser drops surrounding spaces and any tab or newline, so they
+    // are refused here rather than silently read as a different value.
+    if authority
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(NotAnOrigin::Host);
+    }
+    let url = url::Url::parse(value).map_err(|_| NotAnOrigin::Host)?;
+    Ok(url.origin())
 }
 
 /// Whether the request's `Content-Type` is one a resolve payload may use.
@@ -947,6 +1018,26 @@ mod tests {
             assert!(
                 !origins_match(candidate, allowed),
                 "{candidate} and {allowed} should not be the same origin"
+            );
+        }
+    }
+
+    #[test]
+    fn origins_match_refuses_what_the_settings_refuse() {
+        // The URL parser reads each of these as a tuple origin, but none is a
+        // serialized origin, so none matches even itself.
+        for value in [
+            "https://user@www.example.com",
+            "https://@www.example.com",
+            "ftp://www.example.com",
+            "wss://www.example.com",
+            "https://www.example.com/.",
+            "https://www.example.com\\",
+            "https:www.example.com",
+        ] {
+            assert!(
+                !origins_match(value, value),
+                "{value} is not a serialized origin, so it should match nothing"
             );
         }
     }
