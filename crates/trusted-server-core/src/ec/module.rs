@@ -867,13 +867,13 @@ impl EdgeCookieModule for HostSignalModule {
 
 /// The fixed, known word shared by [`ClientFixedProvider`] and its page script.
 ///
-/// Kept cookie-safe (no characters [`set_provider_ec_cookie`] would reject) so
+/// Kept cookie-safe (no characters [`set_ec_cookie`] would reject) so
 /// it can be used as the Edge Cookie value verbatim. The page script posts this
 /// exact string; the module creates only when the posted value matches. The
 /// client copy lives in
 /// `crates/trusted-server-js/lib/src/integrations/ec_client_fixed`.
 ///
-/// [`set_provider_ec_cookie`]: super::cookies::set_provider_ec_cookie
+/// [`set_ec_cookie`]: super::cookies::set_ec_cookie
 #[cfg(any(test, feature = "client-fixed-demo"))]
 const EXPECTED_VALUE: &str = "an-ec";
 
