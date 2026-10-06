@@ -539,6 +539,78 @@ mod tests {
         );
     }
 
+    /// Answers `ec_key`, refuses to be asked for that key's value as though it
+    /// were a key name, and otherwise answers as [`UnifiedSecretStore`] does.
+    struct RefusesAValueAsAKey;
+
+    const CROSS_NAMED_PASSPHRASE: &str = "resolved-cross-named-passphrase-32-bytes";
+
+    impl PlatformSecretStore for RefusesAValueAsAKey {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            match key {
+                "ec_key" => Ok(CROSS_NAMED_PASSPHRASE.as_bytes().to_vec()),
+                CROSS_NAMED_PASSPHRASE => Err(Report::new(PlatformError::SecretStore)),
+                _ => UnifiedSecretStore.get_bytes(store_name, key),
+            }
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    /// A block named after one built-in implementation that configures the
+    /// other is on the fixed secret list already, so its passphrase is
+    /// resolved once and not read back as a key name.
+    #[test]
+    fn a_built_in_block_naming_the_other_built_in_resolves_its_passphrase_once() {
+        use crate::secret_resolution::ConfiguredSecretFields as _;
+
+        for (name, implementation) in [("hmac", "host_signals"), ("host_signals", "hmac")] {
+            let mut data =
+                serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+            data["ec"] = serde_json::json!({
+                "module": name,
+                (name): { "implementation": implementation, "passphrase": "ec_key" },
+            });
+
+            let listed = TrustedServerAppConfig::configured_secret_fields(&data);
+            let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+            let envelope_json =
+                serde_json::to_string(&envelope).expect("should serialize envelope");
+            let reconstructed = settings_from_config_blob(
+                &envelope_json,
+                &RefusesAValueAsAKey,
+                &StoreName::from("ts_secrets"),
+            )
+            .unwrap_or_else(|error| panic!("[ec.{name}] should load: {error:?}"));
+
+            assert!(
+                listed.is_empty(),
+                "[ec.{name}] is on the fixed list, so it is not listed again"
+            );
+            let written =
+                serde_json::to_value(&reconstructed).expect("should serialize the loaded settings");
+            assert_eq!(
+                written["ec"][name]["passphrase"], CROSS_NAMED_PASSPHRASE,
+                "[ec.{name}] should carry the stored passphrase"
+            );
+        }
+    }
+
     #[test]
     fn omitted_s3_secret_references_resolve_default_store_keys() {
         let mut original = test_settings();

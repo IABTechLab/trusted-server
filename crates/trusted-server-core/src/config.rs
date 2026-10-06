@@ -208,8 +208,9 @@ impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig
 /// The names of the `[ec.<name>]` blocks in a serialized configuration that
 /// configure a module built into core under a label.
 ///
-/// A block named after the implementation it configures is the fixed path
-/// `secret_fields` already lists, and a block naming any other implementation
+/// A block named after either built-in implementation is a fixed path
+/// `secret_fields` already lists, whichever of the two it configures, so it is
+/// left out rather than listed twice. A block naming any other implementation
 /// holds that implementation's settings, which core does not read.
 fn labeled_provider_block_names(data: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
     data.get("ec")
@@ -223,8 +224,8 @@ fn labeled_provider_block_names(data: &serde_json::Value) -> impl Iterator<Item 
             else {
                 return false;
             };
-            (implementation == HMAC_MODULE_KEY || implementation == HOST_SIGNALS_PROVIDER_KEY)
-                && name.as_str() != implementation
+            let built_in = |key: &str| key == HMAC_MODULE_KEY || key == HOST_SIGNALS_PROVIDER_KEY;
+            built_in(implementation) && !built_in(name.as_str())
         })
         .map(|(name, _)| name.clone())
 }
