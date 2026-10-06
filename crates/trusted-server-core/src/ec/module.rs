@@ -139,12 +139,6 @@ pub const HOST_SIGNALS_MODULE_KEY: &str = "host_signals";
 /// `ClientFixedProvider`'s `id`.
 pub const CLIENT_FIXED_PROVIDER_KEY: &str = "client_fixed";
 
-/// A spelling of [`CLIENT_FIXED_PROVIDER_KEY`] that
-/// `check_named_provider_configuration` refuses, as the selector or as a block
-/// name, with a message naming the spelling to write, rather than asking for
-/// an `[ec.client-fixed]` block for a module that needs none.
-pub(crate) const RETIRED_CLIENT_FIXED_PROVIDER_KEY: &str = "client-fixed";
-
 /// The implementation ids core supplies itself, one per resolution arm in
 /// [`resolve_named_module`].
 ///
@@ -2415,56 +2409,6 @@ mod tests {
             CLIENT_FIXED_PROVIDER_KEY,
             "the built provider should be the one the selector names"
         );
-    }
-
-    #[test]
-    fn the_old_client_fixed_spelling_fails_at_startup_and_names_the_new_one() {
-        // The demonstration provider was renamed to `client_fixed` under the
-        // rule that every name an operator types into configuration is
-        // `snake_case`. A deployment still configured with the old spelling
-        // has to stop when settings load, which every adapter does before it
-        // serves a request, and the error has to name the spelling to write
-        // instead.
-        let selecting = |selector: &str| {
-            crate::test_support::tests::crate_test_settings_str_with_ec_section(&format!(
-                "[ec]\nmodule = \"{selector}\"\n"
-            ))
-        };
-
-        let old = selecting(RETIRED_CLIENT_FIXED_PROVIDER_KEY);
-        let err = crate::settings::Settings::from_toml(&old)
-            .expect_err("the old spelling should fail when settings load");
-        assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::Configuration { .. }
-            ),
-            "the old spelling should be a configuration error, got: {:?}",
-            err.current_context()
-        );
-        assert!(
-            err.to_string().contains(CLIENT_FIXED_PROVIDER_KEY),
-            "the error should name `client_fixed`, got: {err}"
-        );
-
-        // A block configured under the old name does not let it through as a
-        // vendor provider, because the old spelling is refused before any
-        // block is looked for.
-        let old_with_block =
-            crate::test_support::tests::crate_test_settings_str_with_ec_section(&format!(
-                "[ec]\nmodule = \"{RETIRED_CLIENT_FIXED_PROVIDER_KEY}\"\n\n\
-                 [ec.{RETIRED_CLIENT_FIXED_PROVIDER_KEY}]\nsetting = \"x\"\n"
-            ));
-        let err = crate::settings::Settings::from_toml(&old_with_block)
-            .expect_err("a block under the old name should not make the old name valid");
-        assert!(
-            err.to_string().contains(CLIENT_FIXED_PROVIDER_KEY),
-            "the error should still name `client_fixed`, got: {err}"
-        );
-
-        // The same configuration written with the new spelling loads.
-        crate::settings::Settings::from_toml(&selecting(CLIENT_FIXED_PROVIDER_KEY))
-            .expect("the `client_fixed` spelling should load with no provider block");
     }
 
     #[test]

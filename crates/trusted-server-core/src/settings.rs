@@ -22,8 +22,7 @@ use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::ec::module::{
-    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, RETIRED_CLIENT_FIXED_PROVIDER_KEY,
-    check_named_provider_configuration,
+    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, check_named_provider_configuration,
 };
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
@@ -743,10 +742,6 @@ impl Ec {
     /// one place that knows both the implementations built into core and the
     /// one this deployment's adapter injects.
     ///
-    /// The demonstration module's old name, `client-fixed`, is refused here
-    /// before any block is looked for, so an operator whose configuration
-    /// still carries that spelling is told the name to write instead.
-    ///
     /// Whether this build compiles an implementation in at all is answered by
     /// `check_named_provider_configuration` in [`crate::ec::module`], beside
     /// the resolution it belongs to, rather than here, because the settings
@@ -755,33 +750,14 @@ impl Ec {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selector is the
-    /// old `client-fixed` spelling, when a module name or implementation is
-    /// not `snake_case`, when a block is configured with no selector or
-    /// alongside `"none"`, when the selector names a key `[ec]` reads as its
-    /// own setting, when the selected implementation is not compiled into this
-    /// build, when a block the selector does not name is configured, or when
-    /// the selected module resolves to an implementation that needs settings
-    /// and has no block.
+    /// Returns [`TrustedServerError::Configuration`] when a module name or
+    /// implementation is not `snake_case`, when a block is configured with no
+    /// selector or alongside `"none"`, when the selector names a key `[ec]`
+    /// reads as its own setting, when the selected implementation is not
+    /// compiled into this build, when a block the selector does not name is
+    /// configured, or when the selected module resolves to an implementation
+    /// that needs settings and has no block.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        // The old spelling of the demonstration module's name is refused before
-        // any other question is asked, as the selector and as a block name, so
-        // an operator still carrying it is told the spelling to write rather
-        // than being handed the general `snake_case` rule below, which the old
-        // spelling also breaks. A block left behind under the old name is read
-        // as the block of a module the adapter injects, so without the refusal
-        // the old selector would find that block, pass the checks below, and
-        // fail later in module resolution with a message about an adapter that
-        // supplies no such module.
-        if self.names_retired_provider(RETIRED_CLIENT_FIXED_PROVIDER_KEY) {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "[ec] module = \"client-fixed\" is no longer accepted. The \
-                          demonstration module is now named \"client_fixed\", so set [ec] \
-                          module = \"client_fixed\" instead"
-                    .to_owned(),
-            }));
-        }
-
         for (name, block) in self.module_blocks.iter() {
             Self::validate_module_name(name)?;
             if let Some(implementation) = &block.implementation {
@@ -870,17 +846,6 @@ impl Ec {
                 ),
             }))
         }
-    }
-
-    /// Whether the configuration still names a module by `retired`, its
-    /// spelling before the `snake_case` rule, either as the selector or as a
-    /// block left behind under that name.
-    fn names_retired_provider(&self, retired: &str) -> bool {
-        let selected = matches!(
-            self.module.as_ref(),
-            Some(EcModuleSelection::Named(name)) if name == retired
-        );
-        selected || self.module_blocks.contains_key(retired)
     }
 
     /// Validates one module name or implementation id.
