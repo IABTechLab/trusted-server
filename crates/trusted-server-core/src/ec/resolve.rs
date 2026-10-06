@@ -849,51 +849,52 @@ mod tests {
         );
     }
 
+    /// A resolve that creates nothing answers 204 and sets no cookie, whatever
+    /// stopped it.
     #[test]
-    fn resolve_returns_204_when_not_allowed() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        let response = handle_ec_resolve(
-            &settings,
-            post(FIXED_WORD),
-            &gated(&settings, false),
-            Some(&graph),
-        )
-        .expect("should handle resolve");
+    fn resolve_answers_204_with_no_cookie_when_it_creates_nothing() {
+        let mut no_provider = create_test_settings();
+        no_provider.ec.provider = None;
+        for (case, settings, body, allowed, has_graph) in [
+            (
+                "the permission gate is closed",
+                settings_with_client_fixed(),
+                FIXED_WORD,
+                false,
+                true,
+            ),
+            ("no provider is configured", no_provider, "123", true, true),
+            (
+                "there is no identity graph to hold the row, so a cookie would be a \
+                 phantom identity",
+                settings_with_client_fixed(),
+                FIXED_WORD,
+                true,
+                false,
+            ),
+            (
+                "the posted value fails verification",
+                settings_with_client_fixed(),
+                "not-the-word",
+                true,
+                true,
+            ),
+        ] {
+            let graph = in_memory_graph();
+            let response = handle_ec_resolve(
+                &settings,
+                post(body),
+                &gated(&settings, allowed),
+                has_graph.then_some(&graph),
+            )
+            .expect("should handle resolve");
 
-        assert_eq!(
-            response.status(),
-            StatusCode::NO_CONTENT,
-            "a closed permission gate should return 204"
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "a closed gate should set no cookie"
-        );
-    }
-
-    #[test]
-    fn resolve_returns_204_when_no_provider_configured() {
-        let mut settings = create_test_settings();
-        settings.ec.provider = None;
-        let graph = in_memory_graph();
-        let response = handle_ec_resolve(
-            &settings,
-            post("123"),
-            &gated(&settings, true),
-            Some(&graph),
-        )
-        .expect("should handle resolve");
-
-        assert_eq!(
-            response.status(),
-            StatusCode::NO_CONTENT,
-            "no configured provider should return 204"
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "no configured provider should set no cookie"
-        );
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{case}");
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{case}: should set no cookie"
+            );
+        }
     }
 
     /// A context read the way a composition root builds one, with the selected
@@ -962,95 +963,79 @@ mod tests {
         );
     }
 
+    /// A request the endpoint cannot take is refused, and sets no cookie.
     #[test]
-    fn resolve_rejects_oversized_body() {
+    fn resolve_refuses_a_request_it_cannot_take() {
         let settings = settings_with_client_fixed();
-        let big = "x".repeat(MAX_BODY_SIZE + 1);
-        let graph = in_memory_graph();
-        let response =
-            handle_ec_resolve(&settings, post(&big), &gated(&settings, true), Some(&graph))
-                .expect("should handle resolve");
-
-        assert_eq!(
-            response.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "an oversized body should be rejected with 413"
-        );
-    }
-
-    #[test]
-    fn resolve_rejects_a_missing_or_foreign_origin() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        for origin in [None, Some("https://attacker.example")] {
-            let request = post_with(origin, Some("text/plain"), FIXED_WORD);
-            let response =
-                handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
-                    .expect("should handle resolve");
-            assert_eq!(
-                response.status(),
+        let oversized = "x".repeat(MAX_BODY_SIZE + 1);
+        let own = Some("https://test-publisher.com");
+        let text = Some("text/plain");
+        for (case, origin, content_type, body, status) in [
+            (
+                "no Origin, because identity is set only from the publisher's own site",
+                None,
+                text,
+                FIXED_WORD,
                 StatusCode::FORBIDDEN,
-                "an identity-setting POST must come from the publisher's own site"
-            );
+            ),
+            (
+                "a foreign origin",
+                Some("https://attacker.example"),
+                text,
+                FIXED_WORD,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "a sibling subdomain, which would set identity that lands on the apex",
+                Some("https://www.test-publisher.com"),
+                text,
+                FIXED_WORD,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "plain http, because the scheme is part of the origin",
+                Some("http://test-publisher.com"),
+                text,
+                FIXED_WORD,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "a port, because the port is part of the origin",
+                Some("https://test-publisher.com:8443"),
+                text,
+                FIXED_WORD,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "a form body, because only text and JSON are resolve payloads",
+                own,
+                Some("application/x-www-form-urlencoded"),
+                FIXED_WORD,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "a body over the limit",
+                own,
+                text,
+                oversized.as_str(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let graph = in_memory_graph();
+            let response = handle_ec_resolve(
+                &settings,
+                post_with(origin, content_type, body),
+                &gated(&settings, true),
+                Some(&graph),
+            )
+            .expect("should handle resolve");
+
+            assert_eq!(response.status(), status, "{case}");
             assert!(
                 response.headers().get(header::SET_COOKIE).is_none(),
-                "a rejected origin must set no cookie"
+                "{case}: should set no cookie"
             );
         }
-    }
-
-    #[test]
-    fn resolve_rejects_a_publisher_subdomain_origin() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        let request = post_with(
-            Some("https://www.test-publisher.com"),
-            Some("text/plain"),
-            FIXED_WORD,
-        );
-        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
-            .expect("should handle resolve");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "a sibling subdomain should not be able to set identity that lands on the apex"
-        );
-    }
-
-    #[test]
-    fn resolve_rejects_a_plain_http_origin() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        let request = post_with(
-            Some("http://test-publisher.com"),
-            Some("text/plain"),
-            FIXED_WORD,
-        );
-        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
-            .expect("should handle resolve");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "the scheme is part of the origin, so http should not match the https default"
-        );
-    }
-
-    #[test]
-    fn resolve_rejects_a_non_default_port_origin() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        let request = post_with(
-            Some("https://test-publisher.com:8443"),
-            Some("text/plain"),
-            FIXED_WORD,
-        );
-        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
-            .expect("should handle resolve");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "a port is part of the origin, so it should not be discarded before comparing"
-        );
     }
 
     #[test]
@@ -1133,24 +1118,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_an_unexpected_content_type() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        let request = post_with(
-            Some("https://test-publisher.com"),
-            Some("application/x-www-form-urlencoded"),
-            FIXED_WORD,
-        );
-        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
-            .expect("should handle resolve");
-        assert_eq!(
-            response.status(),
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "only text/plain and application/json bodies are resolve payloads"
-        );
-    }
-
-    #[test]
     fn resolve_conflicts_when_a_different_identity_already_exists() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
@@ -1167,46 +1134,6 @@ mod tests {
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "a conflict must set no cookie"
-        );
-    }
-
-    #[test]
-    fn resolve_mints_nothing_without_an_identity_graph() {
-        let settings = settings_with_client_fixed();
-        let response =
-            handle_ec_resolve(&settings, post(FIXED_WORD), &gated(&settings, true), None)
-                .expect("should handle resolve");
-        assert_eq!(
-            response.status(),
-            StatusCode::NO_CONTENT,
-            "with no graph there is no row to persist, so nothing is created"
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "a cookie without a graph row would be a phantom identity"
-        );
-    }
-
-    #[test]
-    fn resolve_sets_no_cookie_for_unmatched_word() {
-        let settings = settings_with_client_fixed();
-        let graph = in_memory_graph();
-        let response = handle_ec_resolve(
-            &settings,
-            post("not-the-word"),
-            &gated(&settings, true),
-            Some(&graph),
-        )
-        .expect("should handle resolve");
-
-        assert_eq!(
-            response.status(),
-            StatusCode::NO_CONTENT,
-            "a value that fails verification should yield no cookie and a 204"
-        );
-        assert!(
-            response.headers().get(header::SET_COOKIE).is_none(),
-            "an unmatched value should set no cookie"
         );
     }
 }
