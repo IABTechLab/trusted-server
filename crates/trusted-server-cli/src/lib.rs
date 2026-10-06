@@ -19,5 +19,8 @@ pub use run::{RunOutcome, run_from_env};
 // Public commands let native integration tests exercise the shared proxy.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod commands;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// Console output wrappers. Gated to non-wasm hosts rather than the proxy's
+// macOS/Linux targets: `ts dev sandbox-probe` builds on every host target and
+// needs it too.
+#[cfg(not(target_arch = "wasm32"))]
 mod output;

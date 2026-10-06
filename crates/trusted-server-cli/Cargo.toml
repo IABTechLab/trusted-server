@@ -28,7 +28,7 @@ log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 rpassword = { workspace = true }
-# Also in the macOS block for the dev proxy; needed on every host so the probe can install
+# Also in the macOS/Linux block for the dev proxy; needed on every host so the probe can install
 # the process-level crypto provider its `-no-provider` reqwest build expects.
 rustls = { workspace = true }
 # Declared directly rather than inherited from the workspace, to control the rustls
@@ -60,6 +60,17 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 which = { workspace = true }
+
+# `ts dev sandbox-probe` needs a real HTTP/1.1 client with keep-alive. These
+# are shared with the macOS/Linux proxy but scoped to every non-wasm host, so
+# the probe builds on any host target. The exclusion still keeps
+# `tokio`/`ring` off the repo-default `wasm32-wasip1` target.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "client"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 
 # The shared proxy engine supports macOS and Linux only.
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
