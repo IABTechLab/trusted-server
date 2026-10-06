@@ -240,7 +240,7 @@ through their names, which is what the optional `implementation` line is for.
 The `adserver_mock` ad server is selected the same way, by
 `[adserver] provider`, and supplies an ad server implementation rather than a
 demand one. See [Configuration Rules](/guide/configuration-rules) for the
-syntax every provider type shares.
+syntax every type shares.
 
 ## Auction Strategies
 
@@ -747,7 +747,7 @@ endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [integration.prebid]
 timeout_ms = 1000
@@ -848,8 +848,8 @@ The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
 override existing scalar leaves. The pinned EdgeZero loader does not create
 missing leaves or replace arrays, tables, maps, or rules. Existing configs must add
 `rewrite_creatives = true` and `sanitize_creatives = false` before relying on
-those scalar overrides. Edit and re-push TOML for other values. Every provider
-name is snake_case, so a name maps straight onto a path segment:
+those scalar overrides. Edit and re-push TOML for other values. Every selected
+name is snake_case, so it maps straight onto a path segment:
 
 ```bash
 export TRUSTED_SERVER__AUCTION__ENABLED=true
@@ -860,7 +860,7 @@ export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
 ts config validate
 ```
 
-A `provider` list is an array, so `[demand] provider` and
+A selector list is an array, so `[demand] provider` and
 `[adserver] provider` cannot be set this way. Edit the TOML and push it.
 
 Before rolling back to a binary that does not know a creative-processing field,

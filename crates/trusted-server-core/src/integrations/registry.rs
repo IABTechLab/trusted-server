@@ -660,23 +660,23 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
-    /// Geo provider this module supplies, selectable by `[geo] provider`.
+    /// Geo module this module supplies, selectable by `[geo] module`.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to resolve location when `[geo] provider` names this module's id.
-    pub geo_provider: Option<Arc<dyn PlatformGeo>>,
-    /// Edge Cookie provider this module supplies, selectable by `[ec] provider`.
+    /// to resolve location when `[geo] module` names this module's id.
+    pub geo_module: Option<Arc<dyn PlatformGeo>>,
+    /// Edge Cookie module this module supplies, selectable by `[ec] module`.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to create an identifier when `[ec] provider` names this module's id. This
+    /// to create an identifier when `[ec] module` names this module's id. This
     /// is the same route geo takes, so identity is not a second extension
     /// mechanism sitting beside the integration system.
     pub ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    /// Device provider this module supplies, selectable by `[device] provider`.
+    /// Device module this module supplies, selectable by `[device] module`.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to classify a request when `[device] provider` names this module's id.
-    pub device_provider: Option<Arc<dyn DeviceModule>>,
+    /// to classify a request when `[device] module` names this module's id.
+    pub device_module: Option<Arc<dyn DeviceModule>>,
 }
 
 impl IntegrationRegistration {
@@ -705,9 +705,9 @@ impl IntegrationRegistrationBuilder {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
-                geo_provider: None,
+                geo_module: None,
                 ec_module: None,
-                device_provider: None,
+                device_module: None,
             },
         }
     }
@@ -754,36 +754,36 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
-    /// Declare the geo provider this module supplies.
+    /// Declare the geo module this module supplies.
     ///
-    /// The provider only resolves location when `[geo] provider` names this
-    /// module's id, and a declared provider the selector does not choose is
+    /// The module only resolves location when `[geo] module` names this
+    /// module's id, and a declared module the selector does not choose is
     /// logged as a warning when the registry is built.
     #[must_use]
-    pub fn with_geo_provider(mut self, provider: Arc<dyn PlatformGeo>) -> Self {
-        self.registration.geo_provider = Some(provider);
+    pub fn with_geo_module(mut self, module: Arc<dyn PlatformGeo>) -> Self {
+        self.registration.geo_module = Some(module);
         self
     }
 
-    /// Declare the Edge Cookie provider this module supplies.
+    /// Declare the Edge Cookie module this module supplies.
     ///
-    /// The provider only creates identifiers when `[ec] provider` names this
-    /// module's id, and a declared provider the selector does not choose is
+    /// The module only creates identifiers when `[ec] module` names this
+    /// module's id, and a declared module the selector does not choose is
     /// logged as a warning when the registry is built, the same as geo.
     #[must_use]
-    pub fn with_ec_provider(mut self, provider: Arc<dyn EdgeCookieModule>) -> Self {
-        self.registration.ec_module = Some(provider);
+    pub fn with_ec_module(mut self, module: Arc<dyn EdgeCookieModule>) -> Self {
+        self.registration.ec_module = Some(module);
         self
     }
 
-    /// Declare the device provider this module supplies.
+    /// Declare the device module this module supplies.
     ///
-    /// The provider only classifies requests when `[device] provider` names
-    /// this module's id, and a declared provider the selector does not choose
+    /// The module only classifies requests when `[device] module` names
+    /// this module's id, and a declared module the selector does not choose
     /// is logged as a warning when the registry is built, the same as geo.
     #[must_use]
-    pub fn with_device_provider(mut self, provider: Arc<dyn DeviceModule>) -> Self {
-        self.registration.device_provider = Some(provider);
+    pub fn with_device_module(mut self, module: Arc<dyn DeviceModule>) -> Self {
+        self.registration.device_module = Some(module);
         self
     }
 
@@ -868,21 +868,21 @@ struct IntegrationRegistryInner {
     extra_js_module_ids: Vec<&'static str>,
     // Preparers from every builder, named or not, in registration order.
     request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
-    // Geo providers declared by the registrations that run, in registration
+    // Geo modules declared by the registrations that run, in registration
     // order. Declaring one does not activate it.
-    geo_providers: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
-    // Edge Cookie providers each declaring module supplies, in registration
-    // order. `[ec] provider` picks at most one of them.
-    ec_providers: Vec<(&'static str, Arc<dyn EdgeCookieModule>)>,
-    // Device providers each declaring module supplies, in registration order.
-    // `[device] provider` picks at most one of them.
-    device_providers: Vec<(&'static str, Arc<dyn DeviceModule>)>,
-    // The provider `[geo] provider` resolved to, or `None` when the selector
+    geo_modules: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
+    // Edge Cookie modules each declaring module supplies, in registration
+    // order. `[ec] module` picks at most one of them.
+    ec_modules: Vec<(&'static str, Arc<dyn EdgeCookieModule>)>,
+    // Device modules each declaring module supplies, in registration order.
+    // `[device] module` picks at most one of them.
+    device_modules: Vec<(&'static str, Arc<dyn DeviceModule>)>,
+    // The module `[geo] module` resolved to, or `None` when the selector
     // is `platform` and the adapter's own host lookup stands. Unset and `none`
-    // both resolve the disabled provider.
-    geo_provider: Option<Arc<dyn PlatformGeo>>,
+    // both resolve the disabled module.
+    geo_module: Option<Arc<dyn PlatformGeo>>,
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    device_provider: Option<Arc<dyn DeviceModule>>,
+    device_module: Option<Arc<dyn DeviceModule>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -909,40 +909,40 @@ impl Default for IntegrationRegistryInner {
             request_filters: Vec::new(),
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
-            geo_providers: Vec::new(),
-            ec_providers: Vec::new(),
-            device_providers: Vec::new(),
-            geo_provider: None,
+            geo_modules: Vec::new(),
+            ec_modules: Vec::new(),
+            device_modules: Vec::new(),
+            geo_module: None,
             ec_module: None,
-            device_provider: None,
+            device_module: None,
         }
     }
 }
 
-/// Reserved value of `[geo] provider` that resolves no location at all.
-const GEO_PROVIDER_NONE: &str = "none";
+/// Reserved value of `[geo] module` that resolves no location at all.
+const GEO_MODULE_NONE: &str = "none";
 
-/// `[geo] provider` value opting in to the adapter's own host geo lookup.
-const GEO_PROVIDER_PLATFORM: &str = "platform";
+/// `[geo] module` value opting in to the adapter's own host geo lookup.
+const GEO_MODULE_PLATFORM: &str = "platform";
 
-/// `[device] provider` value naming the User-Agent-only provider core supplies.
+/// `[device] module` value naming the User-Agent-only module core supplies.
 ///
 /// The same choice as leaving the selector unset, spelled explicitly.
-const DEVICE_PROVIDER_BUILTIN: &str = "builtin";
+const DEVICE_MODULE_BUILTIN: &str = "builtin";
 
-/// `[device] provider` value opting in to the host provider the adapter builds.
+/// `[device] module` value opting in to the host module the adapter builds.
 ///
 /// Resolved by `build_device_module` in [`device`](crate::ec::device) rather
 /// than by a module, so the registry supplies nothing for it.
-const DEVICE_PROVIDER_FASTLY: &str = "fastly";
+const DEVICE_MODULE_FASTLY: &str = "fastly";
 
-/// Resolves the Edge Cookie provider `[ec] provider` names, when a module
+/// Resolves the Edge Cookie module `[ec] module` names, when a module
 /// supplies it.
 ///
-/// Unlike geo, identity has providers built into core, so a selector naming one
+/// Unlike geo, identity has modules built into core, so a selector naming one
 /// of those is not an error here. This returns `Some` only when a registered
-/// module declared a provider under that name, and core resolves the rest.
-fn resolve_ec_provider(
+/// module declared a module under that name, and core resolves the rest.
+fn resolve_ec_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
 ) -> Option<Arc<dyn EdgeCookieModule>> {
@@ -954,16 +954,16 @@ fn resolve_ec_provider(
     };
     let resolved = selector.and_then(|key| {
         inner
-            .ec_providers
+            .ec_modules
             .iter()
             .find(|(id, _)| *id == key)
-            .map(|(_, provider)| Arc::clone(provider))
+            .map(|(_, module)| Arc::clone(module))
     });
 
-    for (id, _) in &inner.ec_providers {
+    for (id, _) in &inner.ec_modules {
         if selector != Some(*id) {
             log::warn!(
-                "integration module `{id}` declares an Edge Cookie provider that `[ec] provider` does not select"
+                "integration module `{id}` declares an Edge Cookie module that `[ec] module` does not select"
             );
         }
     }
@@ -971,43 +971,43 @@ fn resolve_ec_provider(
     resolved
 }
 
-/// Resolves the device provider `[device] provider` names, when a module
+/// Resolves the device module `[device] module` names, when a module
 /// supplies it.
 ///
-/// As with identity, core has a built-in device provider, so a selector naming
+/// As with identity, core has a built-in device module, so a selector naming
 /// it is not an error here.
-fn resolve_device_provider(
+fn resolve_device_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
 ) -> Result<Option<Arc<dyn DeviceModule>>, Report<TrustedServerError>> {
     let selector = settings.device.module.as_deref();
     let resolved = match selector {
-        // Unset and `builtin` both name the provider core supplies itself, and
-        // `fastly` names the host provider the adapter builds, so the registry
+        // Unset and `builtin` both name the module core supplies itself, and
+        // `fastly` names the host module the adapter builds, so the registry
         // supplies nothing for any of the three.
-        None | Some(DEVICE_PROVIDER_BUILTIN) | Some(DEVICE_PROVIDER_FASTLY) => None,
-        Some(module_id) => Some(module_device_provider(module_id, inner)?),
+        None | Some(DEVICE_MODULE_BUILTIN) | Some(DEVICE_MODULE_FASTLY) => None,
+        Some(module_id) => Some(declared_device_module(module_id, inner)?),
     };
 
-    // A module-supplied device provider may declare the permissions its data
+    // A module-supplied device module may declare the permissions its data
     // use requires, but nothing enforces that declaration yet. Device
     // classification runs before the permission set for the request is
     // assembled, so there is no per-request gate to check it against. Selecting
-    // a provider is an operator decision and not a per-request permission
+    // a module is an operator decision and not a per-request permission
     // decision, so honoring the declaration by silently ignoring it would let a
     // vendor state a requirement that never binds. Refuse the selection instead,
     // loudly and at startup, until a real per-request device gate exists.
-    if let Some(provider) = resolved.as_ref()
-        && provider.required_permissions() != crate::permissions::PermissionSet::none()
+    if let Some(module) = resolved.as_ref()
+        && module.required_permissions() != crate::permissions::PermissionSet::none()
     {
-        let declared = provider
+        let declared = module
             .required_permissions()
             .iter()
             .map(crate::permissions::Permission::as_str)
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!(
-            "integration module `{}` declares a device provider requiring `{declared}`, \
+            "integration module `{}` declares a device module requiring `{declared}`, \
              and Trusted Server has no per-request gate that can enforce that yet, so the \
              selection is refused rather than silently ignored",
             selector.unwrap_or_default(),
@@ -1015,10 +1015,10 @@ fn resolve_device_provider(
         return Err(Report::new(TrustedServerError::Configuration { message }));
     }
 
-    for (id, _) in &inner.device_providers {
+    for (id, _) in &inner.device_modules {
         if selector != Some(*id) {
             log::warn!(
-                "integration module `{id}` declares a device provider that `[device] provider` does not select"
+                "integration module `{id}` declares a device module that `[device] module` does not select"
             );
         }
     }
@@ -1026,26 +1026,22 @@ fn resolve_device_provider(
     Ok(resolved)
 }
 
-/// Looks up the device provider declared by the module `module_id`.
+/// Looks up the device module declared by the module `module_id`.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] naming the module and the
-/// capability when the module declares no device provider, is supplied by a
-/// builder `[integration] provider` does not name, or is not registered at
+/// capability when the module declares no device module, is supplied by a
+/// builder `[integration] module` does not name, or is not registered at
 /// all. Without this a mistyped selector would fall back to core's built-in
-/// provider with nothing said, which is the silent wrong answer the geo
+/// module with nothing said, which is the silent wrong answer the geo
 /// selector already refuses to give.
-fn module_device_provider(
+fn declared_device_module(
     module_id: &str,
     inner: &IntegrationRegistryInner,
 ) -> Result<Arc<dyn DeviceModule>, Report<TrustedServerError>> {
-    if let Some((_, provider)) = inner
-        .device_providers
-        .iter()
-        .find(|(id, _)| *id == module_id)
-    {
-        return Ok(Arc::clone(provider));
+    if let Some((_, module)) = inner.device_modules.iter().find(|(id, _)| *id == module_id) {
+        return Ok(Arc::clone(module));
     }
 
     let message = if inner
@@ -1055,17 +1051,17 @@ fn module_device_provider(
         .any(|id| id == module_id)
     {
         format!(
-            "`[device] module` selects integration module `{module_id}`, which declares no device provider"
+            "`[device] module` selects integration module `{module_id}`, which declares no device module"
         )
     } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
         format!(
-            "`[device] module` selects integration module `{module_id}`, which `[integration] provider` does not name, so its device provider is unavailable"
+            "`[device] module` selects integration module `{module_id}`, which `[integration] module` does not name, so its device module is unavailable"
         )
     } else {
         format!(
-            "`[device] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device provider are [{}]",
+            "`[device] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device module are [{}]",
             inner
-                .device_providers
+                .device_modules
                 .iter()
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>()
@@ -1076,11 +1072,11 @@ fn module_device_provider(
     Err(Report::new(TrustedServerError::Configuration { message }))
 }
 
-/// Resolves `[geo] provider` against the modules that declared a geo provider.
+/// Resolves `[geo] module` against the modules that declared a geo module.
 ///
-/// Returns the disabled provider when the selector is unset or `none`, `None`
+/// Returns the disabled module when the selector is unset or `none`, `None`
 /// when it is `platform` so the adapter's own host lookup stands, and the
-/// module's provider otherwise. A module that declares a geo provider the
+/// module's module otherwise. A module that declares a geo module the
 /// selector does not choose is logged as a warning when the registry is built,
 /// so an operator can see a module shipping a capability the deployment never
 /// uses.
@@ -1089,8 +1085,8 @@ fn module_device_provider(
 ///
 /// Returns [`TrustedServerError::Configuration`] when the selector names a
 /// module that is not registered, is supplied by a builder `[integration]
-/// provider` does not name, or runs and declares no geo provider.
-fn resolve_geo_provider(
+/// module` does not name, or runs and declares no geo module.
+fn resolve_geo_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
 ) -> Result<Option<Arc<dyn PlatformGeo>>, Report<TrustedServerError>> {
@@ -1099,17 +1095,17 @@ fn resolve_geo_provider(
         // Unset resolves nothing and makes no host geo call, so a default
         // deployment is not tied to any host geo service. `none` spells the
         // same choice explicitly.
-        None | Some(GEO_PROVIDER_NONE) => Some(Arc::new(DisabledGeo) as Arc<dyn PlatformGeo>),
+        None | Some(GEO_MODULE_NONE) => Some(Arc::new(DisabledGeo) as Arc<dyn PlatformGeo>),
         // `platform` opts in to the adapter's own host lookup, so the registry
-        // supplies nothing and the adapter's provider stands.
-        Some(GEO_PROVIDER_PLATFORM) => None,
-        Some(module_id) => Some(module_geo_provider(module_id, inner)?),
+        // supplies nothing and the adapter's module stands.
+        Some(GEO_MODULE_PLATFORM) => None,
+        Some(module_id) => Some(declared_geo_module(module_id, inner)?),
     };
 
-    for (id, _) in &inner.geo_providers {
+    for (id, _) in &inner.geo_modules {
         if selector != Some(*id) {
             log::warn!(
-                "integration module `{id}` declares a geo provider that `[geo] provider` does not select"
+                "integration module `{id}` declares a geo module that `[geo] module` does not select"
             );
         }
     }
@@ -1117,23 +1113,23 @@ fn resolve_geo_provider(
     Ok(resolved)
 }
 
-/// Looks up the geo provider declared by the module `module_id`.
+/// Looks up the geo module declared by the module `module_id`.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] naming the module and the
-/// capability when the module declares no geo provider, is supplied by a
-/// builder `[integration] provider` does not name, or is not registered at
+/// capability when the module declares no geo module, is supplied by a
+/// builder `[integration] module` does not name, or is not registered at
 /// all.
-fn module_geo_provider(
+fn declared_geo_module(
     module_id: &str,
     inner: &IntegrationRegistryInner,
 ) -> Result<Arc<dyn PlatformGeo>, Report<TrustedServerError>> {
-    if let Some((_, provider)) = inner.geo_providers.iter().find(|(id, _)| *id == module_id) {
-        return Ok(Arc::clone(provider));
+    if let Some((_, module)) = inner.geo_modules.iter().find(|(id, _)| *id == module_id) {
+        return Ok(Arc::clone(module));
     }
 
-    // Only a module `[integration] provider` names reaches the collection
+    // Only a module `[integration] module` names reaches the collection
     // loop, so a module that exists but is not named must say so rather than
     // read as a module that never declared the capability.
     let message = if inner
@@ -1143,17 +1139,17 @@ fn module_geo_provider(
         .any(|id| id == module_id)
     {
         format!(
-            "`[geo] module` selects integration module `{module_id}`, which declares no geo provider"
+            "`[geo] module` selects integration module `{module_id}`, which declares no geo module"
         )
     } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
         format!(
-            "`[geo] module` selects integration module `{module_id}`, which `[integration] provider` does not name, so its geo provider is unavailable"
+            "`[geo] module` selects integration module `{module_id}`, which `[integration] module` does not name, so its geo module is unavailable"
         )
     } else {
         format!(
-            "`[geo] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo provider are [{}]",
+            "`[geo] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo module are [{}]",
             inner
-                .geo_providers
+                .geo_modules
                 .iter()
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>()
@@ -1326,7 +1322,7 @@ impl IntegrationRegistry {
                 inner.request_preparers.push(prepare);
             }
 
-            // Only a builder `[integration] provider` names is built, so an
+            // Only a builder `[integration] module` names is built, so an
             // integration runs exactly when an operator names it, whatever its
             // builder would otherwise make of the settings.
             if !settings.integration.is_selected(builder.id()) {
@@ -1350,7 +1346,7 @@ impl IntegrationRegistry {
         // check, because a vendor crate the CLI never links may supply the id.
         let unknown = settings
             .integration
-            .provider
+            .module
             .iter()
             .filter(|selected| {
                 !inner
@@ -1363,7 +1359,7 @@ impl IntegrationRegistry {
         if !unknown.is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "[integration] provider names `{}`, which no builder in this deployment \
+                    "[integration] module names `{}`, which no builder in this deployment \
                      supplies. It supplies [{}]",
                     unknown.join("`, `"),
                     inner
@@ -1438,20 +1434,18 @@ impl IntegrationRegistry {
                 .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
-            if let Some(provider) = registration.geo_provider {
+            if let Some(module) = registration.geo_module {
                 inner
-                    .geo_providers
-                    .push((registration.integration_id, provider));
+                    .geo_modules
+                    .push((registration.integration_id, module));
             }
-            if let Some(provider) = registration.ec_module {
-                inner
-                    .ec_providers
-                    .push((registration.integration_id, provider));
+            if let Some(module) = registration.ec_module {
+                inner.ec_modules.push((registration.integration_id, module));
             }
-            if let Some(provider) = registration.device_provider {
+            if let Some(module) = registration.device_module {
                 inner
-                    .device_providers
-                    .push((registration.integration_id, provider));
+                    .device_modules
+                    .push((registration.integration_id, module));
             }
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
@@ -1498,10 +1492,10 @@ impl IntegrationRegistry {
         {
             inner.extra_js_module_ids.push("ec_client_fixed");
         }
-        let geo_provider = resolve_geo_provider(settings, &inner)?;
-        inner.ec_module = resolve_ec_provider(settings, &inner);
-        inner.device_provider = resolve_device_provider(settings, &inner)?;
-        inner.geo_provider = geo_provider;
+        let geo_module = resolve_geo_module(settings, &inner)?;
+        inner.ec_module = resolve_ec_module(settings, &inner);
+        inner.device_module = resolve_device_module(settings, &inner)?;
+        inner.geo_module = geo_module;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -1517,26 +1511,26 @@ impl IntegrationRegistry {
             .is_some_and(|owned| Arc::ptr_eq(owned, plan))
     }
 
-    /// The geo provider `[geo] provider` selected, or `None` when the selector
+    /// The geo module `[geo] module` selected, or `None` when the selector
     /// is `platform` and the adapter's own host lookup stands. Unset and `none`
-    /// both resolve the disabled provider.
+    /// both resolve the disabled module.
     #[must_use]
-    pub fn geo_provider(&self) -> Option<Arc<dyn PlatformGeo>> {
-        self.inner.geo_provider.clone()
+    pub fn geo_module(&self) -> Option<Arc<dyn PlatformGeo>> {
+        self.inner.geo_module.clone()
     }
 
-    /// The Edge Cookie provider `[ec] provider` selected from a module, or
-    /// `None` when the selector names a provider built into core or nothing.
+    /// The Edge Cookie module `[ec] module` selected from a module, or
+    /// `None` when the selector names a module built into core or nothing.
     #[must_use]
     pub fn ec_module(&self) -> Option<Arc<dyn EdgeCookieModule>> {
         self.inner.ec_module.clone()
     }
 
-    /// The device provider `[device] provider` selected from a module, or
-    /// `None` when the selector names a provider built into core or nothing.
+    /// The device module `[device] module` selected from a module, or
+    /// `None` when the selector names a module built into core or nothing.
     #[must_use]
-    pub fn device_provider(&self) -> Option<Arc<dyn DeviceModule>> {
-        self.inner.device_provider.clone()
+    pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
+        self.inner.device_module.clone()
     }
 
     /// Every integration id the registry was built from, named or not, in
@@ -1903,7 +1897,7 @@ impl IntegrationRegistry {
     }
 
     /// Ids of modules that run and are served standalone only. Only a
-    /// registration `[integration] provider` names reaches the construction
+    /// registration `[integration] module` names reaches the construction
     /// loop, so every id here runs.
     #[must_use]
     pub fn js_standalone_ids(&self) -> Vec<&'static str> {
@@ -2038,12 +2032,12 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
-                geo_providers: Vec::new(),
-                ec_providers: Vec::new(),
-                device_providers: Vec::new(),
-                geo_provider: None,
+                geo_modules: Vec::new(),
+                ec_modules: Vec::new(),
+                device_modules: Vec::new(),
+                geo_module: None,
                 ec_module: None,
-                device_provider: None,
+                device_module: None,
             }),
             plan: None,
         }
@@ -2079,12 +2073,12 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
-                geo_providers: Vec::new(),
-                ec_providers: Vec::new(),
-                device_providers: Vec::new(),
-                geo_provider: None,
+                geo_modules: Vec::new(),
+                ec_modules: Vec::new(),
+                device_modules: Vec::new(),
+                geo_module: None,
                 ec_module: None,
-                device_provider: None,
+                device_module: None,
             }),
             plan: None,
         }
@@ -2116,12 +2110,12 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
-                geo_providers: Vec::new(),
-                ec_providers: Vec::new(),
-                device_providers: Vec::new(),
-                geo_provider: None,
+                geo_modules: Vec::new(),
+                ec_modules: Vec::new(),
+                device_modules: Vec::new(),
+                geo_module: None,
                 ec_module: None,
-                device_provider: None,
+                device_module: None,
             }),
             plan: None,
         }
@@ -2193,12 +2187,12 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
-                geo_providers: Vec::new(),
-                ec_providers: Vec::new(),
-                device_providers: Vec::new(),
-                geo_provider: None,
+                geo_modules: Vec::new(),
+                ec_modules: Vec::new(),
+                device_modules: Vec::new(),
+                geo_module: None,
                 ec_module: None,
-                device_provider: None,
+                device_module: None,
             }),
             plan: None,
         }
@@ -3282,7 +3276,7 @@ mod tests {
         let mut settings = crate::test_support::tests::create_test_settings();
         // The shared fixture names prebid, and this asks what the registry
         // serves when it does not.
-        settings.integration.provider.clear();
+        settings.integration.module.clear();
         settings.integration.remove("prebid");
 
         let registry = IntegrationRegistry::with_plan(
@@ -3386,7 +3380,7 @@ mod tests {
         Ok(Some(IntegrationRegistration::builder("lockr").build()))
     }
 
-    /// The shared fixture with `id` named in `[integration] provider`, so a
+    /// The shared fixture with `id` named in `[integration] module`, so a
     /// test builder is built the way any integration an operator names is.
     fn settings_naming(id: &str) -> Settings {
         let mut settings = crate::test_support::tests::create_test_settings();
@@ -3922,12 +3916,12 @@ mod tests {
         );
     }
 
-    /// Example country code returned by the test geo provider. `ZZ` is the
+    /// Example country code returned by the test geo module. `ZZ` is the
     /// user-assigned code, so it names no real place.
     const GEO_PROBE_COUNTRY: &str = "ZZ";
 
-    /// A geo provider that resolves one fixed location, so a test can tell the
-    /// module's provider apart from the "no location" one.
+    /// A geo module that resolves one fixed location, so a test can tell the
+    /// module's module apart from the "no location" one.
     #[derive(Debug)]
     struct FixedCountryGeo;
 
@@ -3951,18 +3945,18 @@ mod tests {
         }
     }
 
-    /// Builds a `geo-probe` registration that declares a geo provider.
+    /// Builds a `geo-probe` registration that declares a geo module.
     fn geo_probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("geo-probe")
-                .with_geo_provider(Arc::new(FixedCountryGeo))
+                .with_geo_module(Arc::new(FixedCountryGeo))
                 .build(),
         ))
     }
 
-    /// A device provider that declares it needs a permission, which nothing can
+    /// A device module that declares it needs a permission, which nothing can
     /// enforce per request yet.
     #[derive(Debug)]
     struct PermissionDemandingDevice;
@@ -3999,7 +3993,7 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("device-probe")
-                .with_device_provider(Arc::new(PermissionDemandingDevice))
+                .with_device_module(Arc::new(PermissionDemandingDevice))
                 .build(),
         ))
     }
@@ -4014,13 +4008,13 @@ mod tests {
     }
 
     #[test]
-    fn a_module_device_provider_declaring_permissions_is_refused_at_startup() {
+    fn a_modules_device_module_declaring_permissions_is_refused_at_startup() {
         let mut settings = settings_naming("device-probe");
         settings.device.module = Some("device-probe".to_owned());
 
         let error = IntegrationRegistry::with_registrations(&settings, &device_probe_builders())
             .err()
-            .expect("should refuse a device provider whose permissions nothing can enforce");
+            .expect("should refuse a device module whose permissions nothing can enforce");
 
         let rendered = format!("{error:?}");
         assert!(
@@ -4045,55 +4039,55 @@ mod tests {
         )]
     }
 
-    /// Settings whose `[geo] provider` names `provider`, which may be a value
+    /// Settings whose `[geo] module` names `module`, which may be a value
     /// core resolves itself, such as `none` or `platform`.
-    fn settings_selecting_geo_provider(provider: &str) -> Settings {
+    fn settings_with_geo_selector(module: &str) -> Settings {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.geo.module = Some(provider.to_owned());
+        settings.geo.module = Some(module.to_owned());
         settings
     }
 
     /// The same, with the module run as well, which is what a deployment
-    /// selecting a module's geo provider writes.
+    /// selecting a module's geo module writes.
     fn settings_selecting_geo_module(module_id: &str) -> Settings {
-        let mut settings = settings_selecting_geo_provider(module_id);
+        let mut settings = settings_with_geo_selector(module_id);
         settings.integration.select(module_id);
         settings
     }
 
     #[tokio::test]
-    async fn geo_provider_resolves_the_provider_declared_by_the_selected_module() {
+    async fn geo_selector_resolves_the_geo_module_the_selected_module_declares() {
         let settings = settings_selecting_geo_module("geo-probe");
 
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
-            .expect("should build registry with a module geo provider");
+            .expect("should build registry with a module geo module");
 
-        let provider = registry
-            .geo_provider()
-            .expect("should resolve the module's geo provider");
-        let resolved = provider
+        let module = registry
+            .geo_module()
+            .expect("should resolve the module's geo module");
+        let resolved = module
             .lookup(None, &noop_services())
             .await
             .expect("should look up without failing")
             .expect("should resolve a location");
         assert_eq!(
             resolved.country, GEO_PROBE_COUNTRY,
-            "should resolve through the module's own provider"
+            "should resolve through the module's own module"
         );
     }
 
     #[tokio::test]
-    async fn geo_provider_none_resolves_no_location() {
-        let settings = settings_selecting_geo_provider("none");
+    async fn geo_module_none_resolves_no_location() {
+        let settings = settings_with_geo_selector("none");
 
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
-            .expect("should build registry with the disabled geo provider");
+            .expect("should build registry with the disabled geo module");
 
-        let provider = registry
-            .geo_provider()
-            .expect("should resolve the disabled geo provider");
+        let module = registry
+            .geo_module()
+            .expect("should resolve the disabled geo module");
         assert!(
-            provider
+            module
                 .lookup(None, &noop_services())
                 .await
                 .expect("should look up without failing")
@@ -4103,9 +4097,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unset_geo_selector_resolves_the_disabled_provider_and_platform_opts_in() {
+    async fn an_unset_geo_selector_resolves_the_disabled_module_and_platform_opts_in() {
         // Unset is the permission model's privacy default: it resolves the
-        // disabled provider, so no client IP ever reaches a host geo service.
+        // disabled module, so no client IP ever reaches a host geo service.
         // It is deliberately not the same as leaving the adapter's own lookup
         // in place, which is what `platform` now spells.
         let settings = crate::test_support::tests::create_test_settings();
@@ -4117,32 +4111,32 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
             .expect("should build registry with an unset geo selector");
 
-        let provider = registry
-            .geo_provider()
-            .expect("an unset selector should resolve the disabled provider, not nothing");
+        let module = registry
+            .geo_module()
+            .expect("an unset selector should resolve the disabled module, not nothing");
         assert!(
-            provider
+            module
                 .lookup(None, &noop_services())
                 .await
                 .expect("should look up without failing")
                 .is_none(),
-            "the disabled provider should resolve no location and make no host call"
+            "the disabled module should resolve no location and make no host call"
         );
 
         // `platform` is the explicit opt-in to the adapter's own lookup, and it
-        // is the one case that resolves nothing here so the adapter's provider
+        // is the one case that resolves nothing here so the adapter's module
         // stands.
-        let platform = settings_selecting_geo_provider(GEO_PROVIDER_PLATFORM);
+        let platform = settings_with_geo_selector(GEO_MODULE_PLATFORM);
         let registry = IntegrationRegistry::with_registrations(&platform, &geo_probe_builders())
             .expect("should build registry with the platform geo selector");
         assert!(
-            registry.geo_provider().is_none(),
+            registry.geo_module().is_none(),
             "`platform` should leave the adapter's own host lookup in place"
         );
     }
 
     #[test]
-    fn geo_provider_rejects_a_module_that_declares_no_geo_provider() {
+    fn geo_selector_rejects_a_module_that_declares_no_geo_module() {
         let settings = settings_selecting_geo_module("probe");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "probe",
@@ -4153,20 +4147,20 @@ mod tests {
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
-            .expect("should reject a module that declares no geo provider");
+            .expect("should reject a module that declares no geo module");
 
         let message = error.to_string();
         assert!(
-            message.contains("probe") && message.contains("geo provider"),
+            message.contains("probe") && message.contains("geo module"),
             "error should name the module and the capability: {message}"
         );
     }
 
     #[test]
-    fn geo_provider_rejects_a_module_the_provider_list_does_not_name() {
-        // The module is registered, but `[integration] provider` does not name
-        // it, so its geo provider is not there to select.
-        let settings = settings_selecting_geo_provider("probe-unnamed");
+    fn geo_selector_rejects_a_module_the_integration_list_does_not_name() {
+        // The module is registered, but `[integration] module` does not name
+        // it, so its geo module is not there to select.
+        let settings = settings_with_geo_selector("probe-unnamed");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "probe-unnamed",
             "seam-probe",
@@ -4176,13 +4170,13 @@ mod tests {
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
-            .expect("should reject a module the provider list does not name");
+            .expect("should reject a module the module list does not name");
 
         let message = error.to_string();
         assert!(
             message.contains("probe-unnamed")
-                && message.contains("[integration] provider")
-                && message.contains("geo provider"),
+                && message.contains("[integration] module")
+                && message.contains("geo module"),
             "error should name the module, the list, and the capability: {message}"
         );
     }
@@ -4230,10 +4224,10 @@ mod tests {
     }
 
     #[test]
-    fn geo_provider_rejects_a_module_that_is_not_registered() {
-        // Nothing supplies the module, so naming it in the provider list would
+    fn geo_selector_rejects_a_module_that_is_not_registered() {
+        // Nothing supplies the module, so naming it in the module list would
         // be refused before the geo selector is resolved.
-        let settings = settings_selecting_geo_provider("absent-module");
+        let settings = settings_with_geo_selector("absent-module");
 
         let error = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
             .err()

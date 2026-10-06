@@ -1807,8 +1807,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// A geo provider that resolves the country from the config store it is
-    /// handed, the geo counterpart of [`ConfigReadingProvider`].
+    /// A geo module that resolves the country from the config store it is
+    /// handed, the geo counterpart of [`ConfigReadingModule`].
     #[derive(Debug)]
     struct ConfigReadingGeo;
 
@@ -1830,14 +1830,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_geo_provider_reads_a_platform_service_through_the_services_it_is_given() {
+    async fn a_geo_module_reads_a_platform_service_through_the_services_it_is_given() {
         use crate::platform::test_support::FixedConfigStore;
 
         // The geo half of the seam acceptance test. Geo runs ahead of the
-        // permission model and feeds it the country, so a vendor geo provider
+        // permission model and feeds it the country, so a vendor geo module
         // that resolves location from a backend or a store needs the platform
-        // services exactly as an Edge Cookie provider does. `DE` can only
-        // appear here if the provider read it through the services this call
+        // services exactly as an Edge Cookie module does. `DE` can only
+        // appear here if the module read it through the services this call
         // supplied.
         let settings = create_test_settings();
         let req = create_test_request(&[]);
@@ -1862,20 +1862,20 @@ pub(crate) mod tests {
         assert_eq!(
             ec.geo_info().map(|info| info.country.as_str()),
             Some("DE"),
-            "the resolved country must come from the value the geo provider read              through the services it was handed"
+            "the resolved country must come from the value the geo module read              through the services it was handed"
         );
     }
 
-    /// A provider that derives its identifier from a value it reads out of the
-    /// config store at generate time, which is the whole point of handing providers
+    /// A module that derives its identifier from a value it reads out of the
+    /// config store at generate time, which is the whole point of handing modules
     /// the platform services. Nothing about the value is known when the
-    /// provider is constructed, so an identifier carrying it can only come from
+    /// module is constructed, so an identifier carrying it can only come from
     /// a real read through the services passed to `generate`.
     #[derive(Debug)]
-    struct ConfigReadingProvider;
+    struct ConfigReadingModule;
 
     #[async_trait::async_trait(?Send)]
-    impl EdgeCookieModule for ConfigReadingProvider {
+    impl EdgeCookieModule for ConfigReadingModule {
         fn id(&self) -> &'static str {
             "config-reading"
         }
@@ -1895,7 +1895,7 @@ pub(crate) mod tests {
                 .get(&crate::platform::StoreName::from("vendor_store"), "tenant")
                 .map_err(|error| {
                     error.change_context(TrustedServerError::EdgeCookie {
-                        message: "config-reading provider could not read its tenant".to_owned(),
+                        message: "config-reading module could not read its tenant".to_owned(),
                     })
                 })?;
             Ok(GeneratedEdgeCookie {
@@ -1910,27 +1910,27 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_provider_reads_a_platform_service_through_the_services_it_is_given() {
+    async fn a_module_reads_a_platform_service_through_the_services_it_is_given() {
         use crate::platform::test_support::{
-            FixedConfigStore, services_with_ec_provider_and_config_store,
+            FixedConfigStore, services_with_ec_module_and_config_store,
         };
 
-        // The acceptance test for the asynchronous provider seam. Before
-        // providers were handed the platform services, a provider could not
+        // The acceptance test for the asynchronous module seam. Before
+        // modules were handed the platform services, a module could not
         // reach a config store, a key-value store, a secret or a backend at
-        // all, which made every real vendor provider impossible to write. This
+        // all, which made every real vendor module impossible to write. This
         // proves the services that arrive at `generate` are the caller's real
-        // ones: the identifier can only carry `acme` if the provider actually
+        // ones: the identifier can only carry `acme` if the module actually
         // read it out of the store on this request, because nothing gives the
-        // provider that value at construction time.
-        let provider = Arc::new(ConfigReadingProvider);
+        // module that value at construction time.
+        let module = Arc::new(ConfigReadingModule);
         let mut settings = create_test_settings();
         settings.ec.module = Some(EcModuleSelection::from("config-reading"));
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
 
-        let services = services_with_ec_provider_and_config_store(
-            provider.clone(),
+        let services = services_with_ec_module_and_config_store(
+            module.clone(),
             Arc::new(FixedConfigStore {
                 store: "vendor_store",
                 key: "tenant",
@@ -1942,12 +1942,12 @@ pub(crate) mod tests {
 
         ec.generate_if_needed(&settings, None, &services)
             .await
-            .expect("the provider should create an identifier from the config value it read");
+            .expect("the module should create an identifier from the config value it read");
 
         assert_eq!(
             ec.ec_value(),
             Some("t0cr~tenant-acme"),
-            "the identifier must carry the value the provider read through the              services it was handed, which proves the seam delivers them"
+            "the identifier must carry the value the module read through the              services it was handed, which proves the seam delivers them"
         );
     }
 

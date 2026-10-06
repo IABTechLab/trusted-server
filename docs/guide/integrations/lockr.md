@@ -42,7 +42,7 @@ Add Lockr configuration to `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["lockr"]
+module = ["lockr"]
 
 [integration.lockr]
 api_endpoint = "https://api.lockr.io"

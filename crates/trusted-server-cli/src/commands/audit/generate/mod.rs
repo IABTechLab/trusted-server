@@ -466,7 +466,7 @@ fn build_draft_config_with_generator(
         .map(|integration| integration.id.as_str())
         .collect::<BTreeSet<_>>();
 
-    // An integration runs when `[integration] provider` names it, so the audit
+    // An integration runs when `[integration] module` names it, so the audit
     // writes that list rather than a switch inside each block. Only the
     // integrations it can configure on its own are named here, and the rest go
     // to manual review below.
@@ -490,7 +490,7 @@ fn build_draft_config_with_generator(
     }
     selected.sort_unstable();
 
-    let provider = selected
+    let module = selected
         .iter()
         .map(|id| format!("\"{id}\""))
         .collect::<Vec<_>>()
@@ -498,8 +498,8 @@ fn build_draft_config_with_generator(
     draft = replace_key_in_section(
         &draft,
         "integration",
-        "provider",
-        &format!("provider = [{provider}]"),
+        "module",
+        &format!("module = [{module}]"),
     )?;
 
     // The template documents every integration as a commented example, so the
@@ -536,7 +536,7 @@ fn build_draft_config_with_generator(
             draft.push_str(&format!(
                 "# - Detected {integration}; review the `[integration.{integration}]` \
                  settings in this file, then add \"{integration}\" to \
-                 [integration] provider to run it.\n"
+                 [integration] module to run it.\n"
             ));
         }
     }
@@ -2695,14 +2695,14 @@ mod tests {
         assert!(draft.contains("origin_url = \"https://www.publisher.example:8443\""));
         assert!(draft.contains("Detected prebid"));
         let parsed = toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
-        let provider = parsed["integration"]["provider"]
+        let module = parsed["integration"]["module"]
             .as_array()
-            .expect("should write the provider list")
+            .expect("should write the module list")
             .iter()
             .filter_map(|id| id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            provider,
+            module,
             vec!["google_tag_manager", "gpt"],
             "should name the integrations it can configure, and leave Prebid to manual review"
         );
@@ -2734,9 +2734,9 @@ mod tests {
 
         let parsed = toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
         assert!(
-            parsed["integration"]["provider"]
+            parsed["integration"]["module"]
                 .as_array()
-                .expect("should write the provider list")
+                .expect("should write the module list")
                 .is_empty(),
             "should not name GTM without a container to configure it with"
         );

@@ -24,7 +24,7 @@ pub struct OsanoConfig {}
 impl IntegrationConfig for OsanoConfig {}
 
 /// Validates the Osano configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -36,7 +36,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register the Osano JS integration when `[integration] provider` names it.
+/// Register the Osano JS integration when `[integration] module` names it.
 ///
 /// # Errors
 ///
@@ -62,7 +62,7 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
 
     #[test]
-    fn register_returns_none_when_the_provider_list_does_not_name_it() {
+    fn register_returns_none_when_the_integration_list_does_not_name_it() {
         let settings = create_test_settings();
 
         let registration = register(&settings).expect("should read an unnamed integration");

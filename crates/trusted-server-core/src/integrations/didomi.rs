@@ -379,7 +379,7 @@ fn build(
 }
 
 /// Validates the Didomi configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -392,7 +392,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 }
 
 /// Register the Didomi consent notice integration when `[integration]
-/// provider` names it.
+/// module` names it.
 ///
 /// # Errors
 ///

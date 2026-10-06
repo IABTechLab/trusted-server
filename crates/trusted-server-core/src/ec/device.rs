@@ -145,8 +145,8 @@ pub trait DeviceModule: Send + Sync {
     /// Device signals gate identity operations and must always yield a value,
     /// so this is infallible: a module that cannot determine a signal returns
     /// the unknown variant rather than failing the request.
-    /// Asynchronous because a device provider may reach a backend, a
-    /// key-value store or a secret to classify a request, and a provider that
+    /// Asynchronous because a device module may reach a backend, a
+    /// key-value store or a secret to classify a request, and a module that
     /// cannot make those calls cannot be written at all. The built-in
     /// User-Agent provider does no I/O and returns immediately.
     async fn detect(

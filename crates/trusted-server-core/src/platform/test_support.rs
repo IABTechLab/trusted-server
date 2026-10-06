@@ -1020,7 +1020,7 @@ impl PlatformConfigStore for FixedConfigStore {
 /// Build a [`RuntimeServices`] carrying both an Edge Cookie module and a
 /// config store the module is expected to read through, so a test can prove
 /// the services reaching the module are the ones the caller supplied.
-pub(crate) fn services_with_ec_provider_and_config_store(
+pub(crate) fn services_with_ec_module_and_config_store(
     ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
     config_store: Arc<dyn PlatformConfigStore>,
 ) -> RuntimeServices {

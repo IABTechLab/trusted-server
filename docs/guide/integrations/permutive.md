@@ -16,7 +16,7 @@ Permutive is a real-time data platform that helps publishers build and activate 
 
 ```toml
 [integration]
-provider = ["permutive"]
+module = ["permutive"]
 
 [integration.permutive]
 organization_id = "your-org-id"

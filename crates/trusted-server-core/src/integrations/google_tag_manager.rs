@@ -883,7 +883,7 @@ fn build(
 }
 
 /// Validates the Google Tag Manager configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -896,7 +896,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 }
 
 /// Register the Google Tag Manager integration when `[integration]
-/// provider` names it.
+/// module` names it.
 ///
 /// # Errors
 ///
@@ -3068,7 +3068,7 @@ module = "hmac"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integration]
-provider = ["google_tag_manager"]
+module = ["google_tag_manager"]
 
 [integration.google_tag_manager]
 container_id = "GTM-PARSED"

@@ -304,7 +304,7 @@ publisher-specific settings, then run:
 ts config validate
 ```
 
-The draft also names in `[integration] provider` the integrations it can
+The draft also names in `[integration] module` the integrations it can
 configure from what it found, and writes their blocks. Where it found
 third-party scripts it writes `[integration.js_asset_proxy]` with each one
 `proxy = "disabled"`, so they are inventory only, and nothing is served or
@@ -677,7 +677,7 @@ APIs.
 
 ```toml
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [integration.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "kargoBidAdapter"]

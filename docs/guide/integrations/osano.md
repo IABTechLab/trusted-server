@@ -30,7 +30,7 @@ Add the following to `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["osano"]
+module = ["osano"]
 ```
 
 No additional server-side settings are required for the initial Osano integration.

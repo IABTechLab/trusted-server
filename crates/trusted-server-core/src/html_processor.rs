@@ -960,7 +960,7 @@ mod tests {
         );
         assert!(
             !without_gpt.contains("data-ts-gam-attribution"),
-            "should leave a bundle unmarked when [integration] provider does not name gpt"
+            "should leave a bundle unmarked when [integration] module does not name gpt"
         );
 
         let head_insert_index = attributed

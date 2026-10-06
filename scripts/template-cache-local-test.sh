@@ -290,7 +290,7 @@ s = replace_once(
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
-    '[integration]\nprovider = []',
+    '[integration]\nmodule = []',
     '[integration]\nprovider = ["prebid"]',
     "integration selector",
 )

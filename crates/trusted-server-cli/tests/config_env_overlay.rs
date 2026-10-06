@@ -57,13 +57,13 @@ fn migrated_project() -> MigratedProject {
     // The demand source `pbs_main` and the bidder route `example-bidder`
     // that names it come from the fixture itself, so the map-shaped overlays
     // below have leaves to replace.
-    // An integration reads its settings only when the provider list names it,
+    // An integration reads its settings only when the module list names it,
     // and the overlay cannot create a leaf, so the GPT block carries the one
     // the override replaces.
-    let mut provider = Array::new();
-    provider.push("gpt_diagnostics");
-    provider.push("gpt");
-    document["integration"]["provider"] = value(provider);
+    let mut module = Array::new();
+    module.push("gpt_diagnostics");
+    module.push("gpt");
+    document["integration"]["module"] = value(module);
     document["integration"]["gpt"] = toml_edit::table();
     document["integration"]["gpt"]["gam_attribution_enabled"] = value(false);
     fs::write(&config_path, document.to_string()).expect("should write migrated config");

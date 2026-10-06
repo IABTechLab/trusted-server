@@ -54,7 +54,7 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
     geo: Arc<dyn PlatformGeo>,
-    /// The services a geo provider is given for the response-side lookup.
+    /// The services a geo module is given for the response-side lookup.
     /// Built once with the application and cloned per request with that
     /// request's client metadata applied.
     services: RuntimeServices,
@@ -62,7 +62,7 @@ pub struct FinalizeResponseMiddleware {
 
 impl FinalizeResponseMiddleware {
     /// Creates a new [`FinalizeResponseMiddleware`] with the given settings,
-    /// geo lookup service, and the services graph handed to the geo provider.
+    /// geo lookup service, and the services graph handed to the geo module.
     pub fn new(
         settings: Arc<Settings>,
         geo: Arc<dyn PlatformGeo>,
@@ -578,7 +578,7 @@ mod tests {
         );
     }
 
-    /// The services graph the finalize middleware hands its geo provider,
+    /// The services graph the finalize middleware hands its geo module,
     /// built the same way the router builds it so the tests exercise the
     /// production shape rather than a stand-in.
     fn test_finalize_services() -> RuntimeServices {

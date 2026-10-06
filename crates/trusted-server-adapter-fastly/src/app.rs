@@ -254,7 +254,7 @@ pub(crate) fn build_state_from_settings(
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this adapter, when the auction plan does not compile or cannot run on this
 /// adapter, or when the auction orchestrator or the integration registry fail
 /// to initialize, which includes two builders claiming the same integration
@@ -357,10 +357,10 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 ///
-/// Applies the module-supplied providers selected by `[geo]`, `[ec]` and
-/// `[device] provider` on top of the base services. Unset and `none` resolve
-/// the disabled geo provider, `platform` leaves the Fastly lookup standing,
-/// and any other key names a module's provider. Identity and device are
+/// Applies the module-supplied modules selected by `[geo]`, `[ec]` and
+/// `[device] module` on top of the base services. Unset and `none` resolve
+/// the disabled geo module, `platform` leaves the Fastly lookup standing,
+/// and any other key names a module's module. Identity and device are
 /// applied the same way when a module supplies them.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
@@ -425,26 +425,26 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 
     // Unset and `"none"` both resolve nothing, so no client IP reaches a host
     // geo service. `"platform"` opts in to the Fastly lookup below, and any
-    // other key names an integration module that declares a geo provider.
+    // other key names an integration module that declares a geo module.
     let mut services = services;
-    if let Some(provider) = state.registry.geo_provider() {
-        services = services.with_geo(provider);
+    if let Some(module) = state.registry.geo_module() {
+        services = services.with_geo(module);
     }
-    if let Some(provider) = state.registry.ec_module() {
-        services = services.with_ec_provider(provider);
+    if let Some(module) = state.registry.ec_module() {
+        services = services.with_ec_module(module);
     }
-    if let Some(provider) = state.registry.device_provider() {
-        services = services.with_device_provider(provider);
+    if let Some(module) = state.registry.device_module() {
+        services = services.with_device_module(module);
     }
     services
 }
 
-/// Builds the services graph handed to a provider on a response-side finalize
+/// Builds the services graph handed to a module on a response-side finalize
 /// path.
 ///
 /// The finalize paths run after the handler, where the per-request services
 /// built by [`build_per_request_services`] are already out of scope, but a geo
-/// provider still needs real platform services to resolve a location. The
+/// module still needs real platform services to resolve a location. The
 /// middleware builds this once and clones it per request with
 /// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
 /// call.
@@ -503,7 +503,7 @@ pub(crate) struct EcFinalizeState {
     pub(crate) is_real_browser: bool,
     /// Per-request services carried to the entry point so the pull-sync
     /// dispatcher can reuse the same platform HTTP client, and so finalization
-    /// can hand them to the selected Edge Cookie provider when it replaces an
+    /// can hand them to the selected Edge Cookie module when it replaces an
     /// orphaned identifier.
     pub(crate) services: RuntimeServices,
 }
@@ -1763,7 +1763,7 @@ mod tests {
             secret_store_id = "test-secret-store-id"
 
             [integration]
-            provider = ["prebid"]
+            module = ["prebid"]
 
             [integration.prebid]
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
@@ -1840,7 +1840,7 @@ mod tests {
             None,
             registry.ec_module(),
         )
-        .expect("should resolve the Edge Cookie provider selection");
+        .expect("should resolve the Edge Cookie module selection");
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,

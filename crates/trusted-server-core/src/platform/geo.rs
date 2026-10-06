@@ -4,9 +4,9 @@ use error_stack::Report;
 
 use super::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
 
-/// A geo provider that resolves nothing.
+/// A geo module that resolves nothing.
 ///
-/// Installed when the `[geo] provider` selector is unset, and when it is set to
+/// Installed when the `[geo] module` selector is unset, and when it is set to
 /// `"none"`, which spells the same choice explicitly. A client IP is then never
 /// sent to any host geo service, so a default deployment is not tied to any host
 /// geo capability. Every geo consumer already treats [`GeoInfo`] as optional, so

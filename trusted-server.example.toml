@@ -19,17 +19,18 @@
 # so replace them with your real endpoints in your private config, not in this
 # template.
 #
-# Everything this deployment can switch on is a provider, and every provider
-# type is written the same way:
+# Everything this deployment can switch on is selected the same way. The ec,
+# geo, device, permission_signal and integration tables take a `module` key,
+# and the auction's demand and adserver tables take a `provider` key:
 #
 #   [<type>]
-#   provider = "<name>"   # a string where one runs, a list where several run
+#   module = "<name>"     # a string where one runs, a list where several run
 #
-#   [<type>.<name>]       # only when that provider has settings
+#   [<type>.<name>]       # only when that name has settings
 #   setting = "value"
 #
 # The types are ec, geo, device, permission_signal, demand, adserver and
-# integration. A settings table its type's `provider` does not name refuses
+# integration. A settings table its type's selector does not name refuses
 # startup, so there is no stale block to misread. The complete rules, and what
 # is checked when, are in docs/guide/configuration-rules.md.
 #
@@ -166,8 +167,8 @@ pull_sync_concurrency = 3
 # host's own lookup, which is what every adapter ships with today.
 # [geo]
 # `none` resolves no location at all, or name a registered module that declares
-# a geo provider to have that module resolve location instead of the host.
-# provider = "none"
+# a geo module to have that module resolve location instead of the host.
+# module = "none"
 
 
 # =============================================================================
@@ -301,7 +302,7 @@ pull_sync_concurrency = 3
 # documented in crates/trusted-server-core/src/permission_signal/README.md
 # and in the Permission Signals guide.
 
-# Page integration. [integration] provider lists the ones that run, and each
+# Page integration. [integration] module lists the ones that run, and each
 # one that has settings gets its own [integration.<name>] table. An
 # integration that is not on the list does not run, and a settings table the
 # list does not name refuses startup. The built-in names are datadome,
@@ -310,7 +311,7 @@ pull_sync_concurrency = 3
 # this deployment needs to the list below and uncomment their tables further
 # down.
 [integration]
-provider = []
+module = []
 
 # First-party proxying of named third-party scripts. Add "js_asset_proxy" to
 # the list above to switch it on.
@@ -640,7 +641,7 @@ auction_timeout_ms = 500
 # =============================================================================
 # OPTIONAL - Integration settings
 # =============================================================================
-# Every integration is off by default, because [integration] provider above is
+# Every integration is off by default, because [integration] module above is
 # empty. To switch one on, add its name to that list and uncomment its settings
 # table below. An integration with nothing to set needs no table at all. A
 # table the list does not name refuses startup, so a block left behind after an
@@ -706,7 +707,7 @@ auction_timeout_ms = 500
 # rewrite_scripts = true
 
 # Didomi CMP SDK/API first-party proxy. `ts audit` adds "didomi" to the
-# [integration] provider list and uncomments this table when it detects Didomi
+# [integration] module list and uncomments this table when it detects Didomi
 # on the audited page.
 # [integration.didomi]
 # geo_query_parameters = false
@@ -724,7 +725,7 @@ auction_timeout_ms = 500
 # auth_cookie_name = "sp_auth"      # optional: forward a custom authCookie upstream
 
 # Osano consent management. It has nothing to set, so naming "osano" in the
-# [integration] provider list above is the whole configuration and it needs no
+# [integration] module list above is the whole configuration and it needs no
 # table of its own.
 
 # Permutive DMP. `organization_id` and `workspace_id` are required.
@@ -744,7 +745,7 @@ auction_timeout_ms = 500
 # rewrite_sdk = true
 
 # DataDome bot protection. Proxies tags.js + signal-collection API first-party.
-# `ts audit` adds "datadome" to the [integration] provider list and uncomments
+# `ts audit` adds "datadome" to the [integration] module list and uncomments
 # this table when it detects DataDome.
 # [integration.datadome]
 # sdk_origin = "https://sdk.example.com"
@@ -774,7 +775,7 @@ auction_timeout_ms = 500
 # credential_secret_name = "datadome_protection_test_bypass"
 
 # Google Publisher Tag (GPT) first-party proxy. `ts audit` adds "gpt" to the
-# [integration] provider list and uncomments this table when it detects GPT.
+# [integration] module list and uncomments this table when it detects GPT.
 # GAM attribution stays off until `gam_attribution_enabled` is set true. The
 # environment overlay cannot create a missing leaf, so uncomment the line
 # before relying on TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED.
@@ -787,11 +788,11 @@ auction_timeout_ms = 500
 # GPT runtime diagnostics browser overlay. Selected manually rather than by
 # `ts audit`, it serves a diagnostics module gated behind an activation query
 # param and a session cookie. It has nothing to set, so naming
-# "gpt_diagnostics" in the [integration] provider list above is the whole
+# "gpt_diagnostics" in the [integration] module list above is the whole
 # configuration.
 
 # Google Tag Manager first-party proxy. `ts audit` adds "google_tag_manager" to
-# the [integration] provider list, uncomments this table and fills container_id
+# the [integration] module list, uncomments this table and fills container_id
 # when it detects GTM. `container_id` is required.
 # [integration.google_tag_manager]
 # Invalid placeholder on purpose, because selecting GTM without a real

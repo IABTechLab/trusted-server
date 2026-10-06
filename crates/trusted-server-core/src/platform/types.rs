@@ -204,7 +204,7 @@ pub struct RuntimeServices {
     /// path resolves the selection itself, which is what a deployment that
     /// selects no module, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    pub(crate) device_provider: Option<Arc<dyn DeviceModule>>,
+    pub(crate) device_module: Option<Arc<dyn DeviceModule>>,
     /// The permission signal modules this deployment runs, in the order
     /// they are asked, selected at the composition root from the scheme
     /// crates the adapter links. Empty when the adapter offers none, in which
@@ -332,11 +332,11 @@ impl RuntimeServices {
         &self.permission_signal_modules
     }
 
-    /// The device provider a module supplied, when `[device] provider` selected
+    /// The device module a module supplied, when `[device] module` selected
     /// one. `None` leaves core's own device classification in place.
     #[must_use]
-    pub fn device_provider(&self) -> Option<Arc<dyn DeviceModule>> {
-        self.device_provider.clone()
+    pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
+        self.device_module.clone()
     }
 
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
@@ -378,11 +378,11 @@ impl RuntimeServices {
         }
     }
 
-    /// Returns a clone of this instance with the geo provider replaced by
+    /// Returns a clone of this instance with the geo module replaced by
     /// `geo`.
     ///
-    /// Adapters use this to apply the module-supplied geo provider selected by
-    /// `[geo] provider`, so a vendor module can resolve location in place of
+    /// Adapters use this to apply the module-supplied geo module selected by
+    /// `[geo] module`, so a vendor module can resolve location in place of
     /// the host's own lookup without the rest of the runtime services graph
     /// being rebuilt.
     #[must_use]
@@ -395,7 +395,7 @@ impl RuntimeServices {
     ///
     /// A response-side path that builds the rest of the services graph once and
     /// varies only the client metadata per request uses this to apply the real
-    /// client data without rebuilding the graph. A provider called from such a
+    /// client data without rebuilding the graph. A module called from such a
     /// path still needs that data.
     #[must_use]
     pub fn with_client_info(self, client_info: ClientInfo) -> Self {
@@ -405,30 +405,30 @@ impl RuntimeServices {
         }
     }
 
-    /// Returns a clone of this instance with the Edge Cookie provider replaced.
+    /// Returns a clone of this instance with the Edge Cookie module replaced.
     ///
-    /// Adapters use this to apply the module-supplied provider selected by
-    /// `[ec] provider`, the same way they apply a module's geo provider, so a
+    /// Adapters use this to apply the module-supplied module selected by
+    /// `[ec] module`, the same way they apply a module's geo module, so a
     /// vendor declares identity on its registration rather than through a
     /// second extension mechanism. The registry already matched the selector
-    /// against the registered modules, so the module's provider is the
+    /// against the registered modules, so the module's module is the
     /// resolved answer and lands on the one seam the request path reads.
     #[must_use]
-    pub fn with_ec_provider(self, ec_module: Arc<dyn EdgeCookieModule>) -> Self {
+    pub fn with_ec_module(self, ec_module: Arc<dyn EdgeCookieModule>) -> Self {
         Self {
             resolved_ec_module: Some(ec_module),
             ..self
         }
     }
 
-    /// Returns a clone of this instance with the device provider replaced.
+    /// Returns a clone of this instance with the device module replaced.
     ///
-    /// Adapters use this to apply the module-supplied provider selected by
-    /// `[device] provider`.
+    /// Adapters use this to apply the module-supplied module selected by
+    /// `[device] module`.
     #[must_use]
-    pub fn with_device_provider(self, device_provider: Arc<dyn DeviceModule>) -> Self {
+    pub fn with_device_module(self, device_module: Arc<dyn DeviceModule>) -> Self {
         Self {
-            device_provider: Some(device_provider),
+            device_module: Some(device_module),
             ..self
         }
     }
@@ -480,7 +480,7 @@ pub struct RuntimeServicesBuilder {
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    device_provider: Option<Arc<dyn DeviceModule>>,
+    device_module: Option<Arc<dyn DeviceModule>>,
     permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
 }
 
@@ -499,7 +499,7 @@ impl RuntimeServicesBuilder {
             client_info: None,
             host_signals: None,
             resolved_ec_module: None,
-            device_provider: None,
+            device_module: None,
             permission_signal_modules: Arc::default(),
         }
     }
@@ -664,7 +664,7 @@ impl RuntimeServicesBuilder {
                 .expect("should set client_info before building RuntimeServices"),
             host_signals: self.host_signals,
             resolved_ec_module: self.resolved_ec_module,
-            device_provider: self.device_provider,
+            device_module: self.device_module,
             permission_signal_modules: self.permission_signal_modules,
         }
     }

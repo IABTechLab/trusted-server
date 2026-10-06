@@ -817,7 +817,7 @@ formats = [{ width = 300, height = 250 }]
             ("[integration.sourcepoint]", "sourcepoint"),
         ] {
             let toml = uncomment_block(&base, header)
-                .replace("provider = []", &format!("provider = [\"{id}\"]"));
+                .replace("module = []", &format!("module = [\"{id}\"]"));
             let settings = Settings::from_toml(&toml)
                 .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
 
@@ -1501,7 +1501,7 @@ password = "production-admin-password-32-bytes"
         );
     }
 
-    /// A block written for an integration the provider list does not name is
+    /// A block written for an integration the module list does not name is
     /// refused by deploy validation, so `ts config validate` reports it before
     /// the configuration reaches a deployment.
     #[test]
@@ -1517,7 +1517,8 @@ password = "production-admin-password-32-bytes"
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[integration.adserver_mock]") && rendered.contains("provider"),
+            rendered.contains("[integration.adserver_mock]")
+                && rendered.contains("[integration] module"),
             "should name the block and where to name the integration: {rendered}"
         );
     }

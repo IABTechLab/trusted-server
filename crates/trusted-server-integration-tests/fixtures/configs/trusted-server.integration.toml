@@ -46,10 +46,10 @@ secret_store_id = "secrets"
 
 # Only the GPT diagnostics overlay runs, which is what the browser tests need.
 # Every other integration used to sit here as an `enabled = false` stub. A
-# settings table its type's `provider` does not name now refuses startup, so
+# settings table its type's `module` does not name now refuses startup, so
 # the stubs are gone instead of sitting unselected.
 [integration]
-provider = ["gpt_diagnostics"]
+module = ["gpt_diagnostics"]
 
 [proxy]
 certificate_check = false

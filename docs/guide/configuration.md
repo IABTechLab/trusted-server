@@ -10,16 +10,18 @@ Trusted Server uses a flexible configuration system based on:
 2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **EdgeZero Stores** - Config and secret stores for the pushed blob and runtime secret values
 
-Everything the deployment can switch on is a provider, and every provider type
-is written the same way. Read
+Everything the deployment can switch on is selected the same way, with a
+`module` key, or a `provider` key for the auction's demand sources and ad
+server. Read
 [Configuration Rules](/guide/configuration-rules) first. It is short, and it
 is the pattern every section below follows:
 
 ```toml
 [<type>]
-provider = "<name>"            # or a list, where several run
+module = "<name>"            # provider = ... for demand and adserver,
+                             # and a list where several run
 
-[<type>.<name>]                # only when the provider has settings
+[<type>.<name>]                # only when the selected name has settings
 setting = "value"
 ```
 
@@ -72,8 +74,8 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
-- `ec.hmac.passphrase`, when `[ec] provider = "hmac"`
-- `ec.host_signals.passphrase`, when `[ec] provider = "host_signals"`
+- `ec.hmac.passphrase`, when `[ec] module = "hmac"`
+- `ec.host_signals.passphrase`, when `[ec] module = "host_signals"`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
@@ -150,7 +152,7 @@ Migrate an existing deployment in this order:
 4. Restart/redeploy instances as needed to load the new values. Rotation is
    startup-scoped; changing a store value does not alter already-built state.
 
-Keep `publisher.proxy_secret` and the selected Edge Cookie provider's
+Keep `publisher.proxy_secret` and the selected Edge Cookie module's
 passphrase stable unless intentionally rotating signed URLs or EC identifiers.
 On Spin, the app-config blob is stored
 under the `trusted_server_config` key in Spin's built-in `default` key-value
@@ -212,34 +214,35 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-7 of these sections are provider types. Each takes a `provider` key
-and gives each selected provider its own `[<type>.<name>]` settings table, as
+7 of these sections select what runs. Five take a `module` key, the two
+auction tables take a `provider` key, and each gives every selected name its
+own `[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
 
-| Section                    | Provider type | Purpose                                                     |
-| -------------------------- | ------------- | ----------------------------------------------------------- |
-| `[adserver]`               | yes, one      | The ad server that picks the winner                         |
-| `[auction]`                | no            | Auction orchestration, bidder routes, and mediation         |
-| `[cache]`                  | no            | Static and rehosted asset cache policy                      |
-| `[consent]`                | no            | Consent interpretation, forwarding, and conflict resolution |
-| `[creative_opportunities]` | no            | Server-side page ad opportunities and templates             |
-| `[debug]`                  | no            | Explicit non-production diagnostics                         |
-| `[demand]`                 | yes, several  | The auction's demand sources                                |
-| `[device]`                 | yes, one      | Device classification                                       |
-| `[ec]`                     | yes, one      | Edge Cookie identity, persistence, and partner sync         |
-| `[geo]`                    | yes, one      | Which provider resolves location, if any                    |
-| `[[handlers]]`             | no            | Ordered HTTP Basic-auth rules                               |
-| `[image_optimizer]`        | no            | Reusable Fastly Image Optimizer profiles                    |
-| `[integration]`            | yes, several  | Partner and browser integrations                            |
-| `[permission_signal]`      | yes, several  | Which permission signals are acted on, in order             |
-| `[proxy]`                  | no            | Proxy allowlist, TLS policy, and asset routes               |
-| `[publisher]`              | no            | Publisher domain, origin, and proxy signing key             |
-| `[request_signing]`        | no            | Outbound Ed25519 request signing and management-store IDs   |
-| `[response_headers]`       | no            | Headers added to Trusted Server responses                   |
-| `[rewrite]`                | no            | First-party URL rewrite exclusions                          |
-| `[tester_cookie]`          | no            | Optional tester-cookie endpoints                            |
-| `[tinybird]`               | no            | Direct Tinybird auction telemetry                           |
-| `[trusted_client_ip]`      | no            | Authenticated front-door client-IP forwarding               |
+| Section                    | Selects           | Purpose                                                     |
+| -------------------------- | ----------------- | ----------------------------------------------------------- |
+| `[adserver]`               | one provider      | The ad server that picks the winner                         |
+| `[auction]`                | nothing           | Auction orchestration, bidder routes, and mediation         |
+| `[cache]`                  | nothing           | Static and rehosted asset cache policy                      |
+| `[consent]`                | nothing           | Consent interpretation, forwarding, and conflict resolution |
+| `[creative_opportunities]` | nothing           | Server-side page ad opportunities and templates             |
+| `[debug]`                  | nothing           | Explicit non-production diagnostics                         |
+| `[demand]`                 | several providers | The auction's demand sources                                |
+| `[device]`                 | one module        | Device classification                                       |
+| `[ec]`                     | one module        | Edge Cookie identity, persistence, and partner sync         |
+| `[geo]`                    | one module        | Which module resolves location, if any                      |
+| `[[handlers]]`             | nothing           | Ordered HTTP Basic-auth rules                               |
+| `[image_optimizer]`        | nothing           | Reusable Fastly Image Optimizer profiles                    |
+| `[integration]`            | several modules   | Partner and browser integrations                            |
+| `[permission_signal]`      | several modules   | Which permission signals are acted on, in order             |
+| `[proxy]`                  | nothing           | Proxy allowlist, TLS policy, and asset routes               |
+| `[publisher]`              | nothing           | Publisher domain, origin, and proxy signing key             |
+| `[request_signing]`        | nothing           | Outbound Ed25519 request signing and management-store IDs   |
+| `[response_headers]`       | nothing           | Headers added to Trusted Server responses                   |
+| `[rewrite]`                | nothing           | First-party URL rewrite exclusions                          |
+| `[tester_cookie]`          | nothing           | Optional tester-cookie endpoints                            |
+| `[tinybird]`               | nothing           | Direct Tinybird auction telemetry                           |
+| `[trusted_client_ip]`      | nothing           | Authenticated front-door client-IP forwarding               |
 
 ## Example: Production Setup
 
@@ -265,7 +268,7 @@ config_store_id = "01GXXX"
 secret_store_id = "01GYYY"
 
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [integration.prebid]
 client_side_bidders = ["example-browser-bidder"]
@@ -322,11 +325,11 @@ TRUSTED_SERVER__SECTION__SUBSECTION__FIELD
 - Separator: `__` (double underscore)
 - Case: UPPERCASE
 - Sections: Match TOML hierarchy
-- Provider names are snake_case, so a provider table maps
+- Selected names are snake_case, so a settings table maps
   straight onto a path segment. `[demand.pbs_main] debug` is
   `TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG`.
 
-A provider setting overrides like any other scalar leaf:
+A setting in one of those tables overrides like any other scalar leaf:
 
 ```bash
 export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
@@ -335,7 +338,8 @@ ts config validate
 
 This example changes an existing scalar leaf. Edit TOML and run `ts config
 validate` followed by `ts config push` when changing an array, table, map, or
-rule. A `provider` list is an array, so it cannot be overridden this way.
+rule. A `module` or `provider` list is an array, so it cannot be overridden
+this way.
 
 ## Publisher Configuration
 
@@ -669,15 +673,15 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 ### `[ec]`
 
-| Field                     | Type           | Required | Description                                                                                                                                                                                                                                                                                           |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | String or null | No       | Name of the active Edge Cookie provider: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or a provider an integration supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration provider needs the `client-fixed-demo` build feature |
-| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                                                                                  |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                                                                       |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                                                                            |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                                                                                   |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                       |
-| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                       |
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                                                                     |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                  | String or null | No       | Name of the active Edge Cookie module: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or a module an integration supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration module needs the `client-fixed-demo` build feature |
+| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                                                                            |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                                                                 |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                                                                      |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                                                                             |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                 |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                 |
 
 Each module that has settings is configured in its own `[ec.<name>]` table, and the `module` selector names which table is active. A table may set `implementation = "<id>"` to say which module it configures, which makes the table name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. Module names and implementation ids are `snake_case`.
 
@@ -708,7 +712,7 @@ must be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 
 ### `[ec.host_signals]`
 
-The built-in provider that derives the identifier from the host's TLS JA4 and
+The built-in module that derives the identifier from the host's TLS JA4 and
 HTTP/2 signals together with the client address, so it needs a host that
 supplies those signals. It takes a `passphrase` on the same terms as
 `[ec.hmac]`.
@@ -756,7 +760,7 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 **Purpose**: Names the active Edge Cookie module. Omit to run statelessly with no Edge Cookie.
 
-**Validation**: Application startup fails if the name is not `snake_case`, if it names a key the `[ec]` section reads as its own setting, if the selected provider has no `[ec.<name>]` table where it needs one, if it names a provider this build does not have, or if a table the selector does not name is configured. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
+**Validation**: Application startup fails if the name is not `snake_case`, if it names a key the `[ec]` section reads as its own setting, if the selected module has no `[ec.<name>]` table where it needs one, if it names a module this build does not have, or if a table the selector does not name is configured. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
 
 #### `hmac.passphrase`
 
@@ -779,9 +783,9 @@ Selects how a request is classified into the coarse device signals the Edge Cook
 
 ### `[device]`
 
-| Field      | Type           | Required | Description                                                                                                                                                                                                              |
-| ---------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `provider` | String or null | No       | Name of the device-detection provider: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or a provider an integration supplies |
+| Field    | Type           | Required | Description                                                                                                                                                                                                          |
+| -------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module` | String or null | No       | Name of the device-detection module: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or a module an integration supplies |
 
 The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, so neither needs a `[device.<name>]` table. Selecting a module this build does not have fails at startup.
 
@@ -804,10 +808,10 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 
 ### `[geo]`
 
-| Field                        | Type           | Required        | Description                                                                                                                                                                                                      |
-| ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                   | String or null | No              | Name of the geo provider: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or a provider an integration supplies                               |
-| `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
+| Field                        | Type           | Required        | Description                                                                                                                                                                                                |
+| ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                     | String or null | No              | Name of the geo module: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or a module an integration supplies                             |
+| `assume_single_jurisdiction` | Boolean        | See description | With no geo module, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie module without a geo module acknowledges that by setting this to `true`. |
 
 `assume_single_jurisdiction` is a setting of the job rather than of one
 module, so it sits directly in `[geo]`.
@@ -837,8 +841,8 @@ opinion decides.
 
 ### `[permission_signal]`
 
-| Field      | Type          | Required | Description                                                                                                    |
-| ---------- | ------------- | -------- | -------------------------------------------------------------------------------------------------------------- |
+| Field    | Type          | Required | Description                                                                                                |
+| -------- | ------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
 | `module` | Array[String] | No       | The modules to act on, in order. Omit it to act on every module this build links, in the order shown below |
 
 The modules that ship are `gpc` (the `Sec-GPC` request header),
@@ -1622,7 +1626,7 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 
-`[integration] provider` lists the integrations that run, and each one that has
+`[integration] module` lists the integrations that run, and each one that has
 settings gets its own `[integration.<name>]` table. There is no `enabled` flag,
 because an integration that is not on the list does not run. The full rule set
 is in [Configuration Rules](/guide/configuration-rules). Every integration that
@@ -1650,7 +1654,7 @@ deploy validation knows is listed below.
 
 ```toml
 [integration]
-provider = ["prebid", "gpt", "nextjs"]
+module = ["prebid", "gpt", "nextjs"]
 ```
 
 The integrations this repository ships are `datadome`, `didomi`,
@@ -1867,7 +1871,7 @@ routes and injected into the browser. There is no second server bidder list in
 
 ```toml
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [integration.prebid]
 timeout_ms = 1000
@@ -1925,8 +1929,8 @@ env 'TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=1000' \
   ts config validate
 ```
 
-Environment overlays only replace existing scalar leaves. Keep the `provider`
-lists, `client_side_bidders`, bidder-parameter overrides and rules in TOML,
+Environment overlays only replace existing scalar leaves. Keep the `module`
+and `provider` lists, `client_side_bidders`, bidder-parameter overrides and rules in TOML,
 then validate and push the edited file.
 
 **Managed User ID modules**:
@@ -2006,7 +2010,7 @@ conflicts.
 
 ```toml
 [integration]
-provider = ["nextjs"]
+module = ["nextjs"]
 
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]
@@ -2025,14 +2029,14 @@ Edit `rewrite_attributes` in TOML because the overlay cannot replace arrays.
 
 **Section**: `[integration.osano]`
 
-Osano has nothing to set, so naming it in `[integration] provider` is the whole
+Osano has nothing to set, so naming it in `[integration] module` is the whole
 configuration and it needs no table.
 
 **Example**:
 
 ```toml
 [integration]
-provider = ["osano"]
+module = ["osano"]
 ```
 
 The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
@@ -2055,7 +2059,7 @@ The Osano mirror runs in the browser, so consent cookies it writes are available
 
 ```toml
 [integration]
-provider = ["permutive"]
+module = ["permutive"]
 
 [integration.permutive]
 organization_id = "org-12345"
@@ -2096,7 +2100,7 @@ See [Sourcepoint](/guide/integrations/sourcepoint).
 
 ```toml
 [integration]
-provider = ["testlight"]
+module = ["testlight"]
 
 [integration.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"
@@ -2110,7 +2114,7 @@ An auction is configured by three tables. `[demand]` selects the demand sources
 and gives each its settings, `[adserver]` selects the ad server that picks the
 winner, and `[auction]` holds the settings that belong to the auction itself,
 including `[auction.bidders.<code>]`, the only client-visible bidder route map.
-`[auction]` is not a provider type and takes no `provider` key.
+`[auction]` selects nothing and takes no `provider` key of its own.
 
 ### `[auction]`
 
@@ -2182,8 +2186,8 @@ because every implementation states its own wire format. `profile` becomes
 `implementation`, so `"standard"` becomes `"openrtb"`, `"prebid-server"`
 becomes `"prebid_server"`, and `"aps"` stays `"aps"`. Everything that was
 inside `profile_config` moves up into the table itself, flat beside
-`endpoint`, `timeout_ms`, `routing` and `notifications`. Provider IDs that
-carried a hyphen, such as `pbs-main`, become snake_case, such as `pbs_main`,
+`endpoint`, `timeout_ms`, `routing` and `notifications`. Demand source names
+that carried a hyphen, such as `pbs-main`, become snake_case, such as `pbs_main`,
 and so does every `[auction.bidders.<code>] provider` value that points at
 one.
 
@@ -2407,8 +2411,8 @@ env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
   ts config validate
 ```
 
-A `provider` list is an array, so `[demand] provider` and
-`[integration] provider` cannot be changed by an overlay. Edit the TOML, then
+A selector list is an array, so `[demand] provider` and
+`[integration] module` cannot be changed by an overlay. Edit the TOML, then
 validate and push.
 
 ## Creative Opportunities Configuration
@@ -3210,7 +3214,7 @@ Everything above runs again on the loaded configuration, and these join it:
 - Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
   or a weak handler password fails here
 - The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`
-  acknowledgment an Edge Cookie provider needs when no geo provider is selected
+  acknowledgment an Edge Cookie module needs when no geo module is selected
 - The checks only the host can make, being backend name prediction and
   collisions, and whether the adapter can call more than one demand source at
   once

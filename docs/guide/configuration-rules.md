@@ -5,27 +5,31 @@ for the people who write the code that reads it. It sets out the few rules
 every part of the file follows, what Trusted Server checks before it serves a
 request, and why the file is built this way.
 
-## One rule for every provider
+## One rule for every type
 
-Almost everything Trusted Server can switch on is a provider: the Edge Cookie
-identity provider, the location and device providers, the permission signals,
-the demand sources in an auction, the ad server that picks the winner, and the
-page integrations. Every one of them is configured the same way.
+Almost everything Trusted Server can switch on is selected the same way. The
+Edge Cookie identity, the location and device lookups, the permission signals
+and the page integrations are modules, selected with a `module` key. The
+demand sources in an auction and the ad server that picks the winner are the
+auction's providers, selected with a `provider` key, which is the one meaning
+that word keeps. Everything else about the two is the same.
 
 ```toml
 [<type>]
-provider = "<name>"            # or a list, where several run
+module = "<name>"              # provider = ... for demand and adserver,
+                               # and a list where several run
 
-[<type>.<name>]                # only when the provider has settings
+[<type>.<name>]                # only when the selected name has settings
 setting = "value"
 ```
 
 1. **The type is the job.** Each type is one top-level table, named for what
-   its providers do: `ec`, `geo`, `device`, `permission_signal`, `demand`,
-   `adserver` and `integration`.
-2. **`provider` chooses what runs.** A type that runs one provider takes a
-   string. A type that runs several takes a list.
-3. **`[<type>.<name>]` holds the settings.** A provider with nothing to set
+   it selects. `ec`, `geo`, `device`, `permission_signal` and `integration`
+   select modules, and `demand` and `adserver` select the auction's providers.
+2. **The selector chooses what runs.** It is `module` for the five module
+   types and `provider` for the two auction types. A type that runs one takes
+   a string. A type that runs several takes a list.
+3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
    needs no table at all.
 4. **The name is the implementation.** `[ec.hmac]` configures the `hmac`
    implementation. To run an implementation under a name of your own, add an
@@ -34,37 +38,37 @@ setting = "value"
 6. **Secrets are key names.** A secret setting holds the name of a key in
    `trusted_server_secrets`, never the secret itself.
 
-| Type                | Runs              | `provider` is | Implementations in this repository                                                                                                                                    |
-| ------------------- | ----------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ec`                | one               | a string      | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity                                                               |
-| `geo`               | one               | a string      | `platform`, `none`, or an integration that supplies location                                                                                                          |
-| `device`            | one               | a string      | `builtin` (the default), `fastly`, or an integration that supplies device signals                                                                                     |
-| `permission_signal` | several, in order | a list        | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`                                                                                                                        |
-| `demand`            | several           | a list        | `openrtb`, `prebid_server`, `aps`                                                                                                                                     |
-| `adserver`          | one               | a string      | `adserver_mock`                                                                                                                                                       |
-| `integration`       | several           | a list        | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
+| Type                | Runs              | Selector             | Implementations in this repository                                                                                                                                    |
+| ------------------- | ----------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ec`                | one               | `module`, a string   | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity                                                               |
+| `geo`               | one               | `module`, a string   | `platform`, `none`, or an integration that supplies location                                                                                                          |
+| `device`            | one               | `module`, a string   | `builtin` (the default), `fastly`, or an integration that supplies device signals                                                                                     |
+| `permission_signal` | several, in order | `module`, a list     | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`                                                                                                                        |
+| `demand`            | several           | `provider`, a list   | `openrtb`, `prebid_server`, `aps`                                                                                                                                     |
+| `adserver`          | one               | `provider`, a string | `adserver_mock`                                                                                                                                                       |
+| `integration`       | several           | `module`, a list     | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
 
 `openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
 only. They are not page integrations and cannot be named in
-`[integration] provider`.
+`[integration] module`.
 
-A provider that an integration supplies needs that integration named in
-`[integration] provider` too, because the module has to be registered before
+A module that an integration supplies needs that integration named in
+`[integration] module` too, because the module has to be registered before
 another type can select what it offers.
 
-A few types keep settings of their own beside `provider`, where the setting
-belongs to the job rather than to one provider. `[ec]` holds `ec_store`, the
+A few types keep settings of their own beside the selector, where the setting
+belongs to the job rather than to one name. `[ec]` holds `ec_store`, the
 partner registry and the cluster thresholds, and `[geo]` holds
 `assume_single_jurisdiction`. Those keys sit directly in the type's table.
 
-### Leaving `provider` out
+### Leaving the selector out
 
-| Type                | With no `provider` line                                   |
+| Type                | With no `module` or `provider` line                       |
 | ------------------- | --------------------------------------------------------- |
 | `ec`                | no Edge Cookie is created                                 |
 | `geo`               | no location is resolved and no host geo service is called |
 | `device`            | `builtin` runs, which reads the User-Agent only           |
-| `permission_signal` | every linked provider runs, in the order shown above      |
+| `permission_signal` | every linked module runs, in the order shown above        |
 | `demand`            | no demand source is called                                |
 | `adserver`          | the highest bid wins, with no ad server                   |
 | `integration`       | no integration runs                                       |
@@ -75,18 +79,19 @@ Every rule below refuses startup, and the message names the table and the fix.
 Some are caught earlier, when the configuration is validated or pushed, and
 the two lists say which.
 
-- A `[<type>.<name>]` table that its type's `provider` does not name. A block
-  left behind after a provider is switched off is caught, rather than sitting
+- A `[<type>.<name>]` table that its type's selector does not name. A block
+  left behind after a module is switched off is caught, rather than sitting
   unused and misleading the next reader.
-- A `provider` entry, or an `implementation` line, that names an
+- A selector entry, or an `implementation` line, that names an
   implementation this build does not have. The message lists the ones it does.
-- A selected provider that needs a setting its table does not give, such as
+- A selected module that needs a setting its table does not give, such as
   `hmac` with no `passphrase`.
-- A setting a provider does not know. Every provider rejects unknown keys, so
+- A setting the selected name does not know. Every module and provider
+  rejects unknown keys, so
   a misspelled setting fails instead of being ignored.
 - A name that is not snake_case, or a name selected twice.
-- A key in a type's table that is neither `provider`, one of that type's own
-  settings, nor a named provider table.
+- A key in a type's table that is neither the selector, one of that type's
+  own settings, nor a named settings table.
 - A `demand` or `adserver` endpoint that is not HTTPS. Plain HTTP is allowed
   only to `127.0.0.1`, `::1` or `localhost`, so a local test stack runs
   without certificates and nothing leaves the machine unencrypted. An endpoint
@@ -106,7 +111,7 @@ implementations compiled into the CLI.
   demand source `[demand] provider` does not select, and any setting the
   chosen implementation rejects.
 - Every selected integration's own settings, and the refusal of a block for an
-  integration `[integration] provider` does not name, of an `enabled` key left
+  integration `[integration] module` does not name, of an `enabled` key left
   behind in a block, and of the removed `[integrations]` table.
 - Every secret setting holding a non-empty key name rather than a value, with a
   secret store declared to hold it.
@@ -118,29 +123,29 @@ implementations compiled into the CLI.
 Everything above runs again, on the configuration the instance actually
 loaded, and these join it.
 
-- Which providers `[ec]`, `[geo]`, `[device]` and `[permission_signal]`
+- Which modules `[ec]`, `[geo]`, `[device]` and `[permission_signal]`
   select. Those four are settled where the adapter composes the build, so a
   name this build does not have, a missing settings table, or a table the
   selector does not name, stops the service on its next start rather than the
   push. **A passing `ts config validate` is not proof that a change to those
   four will start.** Start an instance on the new configuration to find out.
 - Assembling the integration registry, which is where a module that supplies an
-  identity, location or device provider is matched to the type that selected
-  it, and where an `[integration] provider` entry no builder in this build
-  supplies is refused. A module declaring an identity or device provider that
+  identity, location or device module is matched to the type that selected
+  it, and where an `[integration] module` entry no builder in this build
+  supplies is refused. A module declaring an identity or device module that
   no type selects is logged as a warning here.
 - The resolved secret values, which a key name alone cannot show. A weak or
   placeholder password fails here.
 - The compiled `permissions.yaml` policy, and the acknowledgment an Edge
-  Cookie provider needs when no geo provider is selected.
+  Cookie module needs when no geo module is selected.
 - The checks only the host can make, being backend name prediction and
   collisions, and whether the adapter can call more than one demand source at
   once.
 
-## Settings that are not providers
+## Settings that select nothing
 
-The other tables configure Trusted Server itself rather than choose a provider.
-They keep their own keys and have no `provider` line.
+The other tables configure Trusted Server itself rather than choose what runs.
+They keep their own keys and have no selector.
 
 | Table                                                      | Configures                                                            |
 | ---------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -155,19 +160,19 @@ They keep their own keys and have no `provider` line.
 ## Why the file works this way
 
 **For the people who run it.** There is one pattern to learn. Whether a
-section chooses an identity provider or the demand sources for an auction, the
+section chooses an identity module or the demand sources for an auction, the
 question "what runs, and how is it set up" is answered the same way, in the
-same place. A change reads plainly in review, because switching a provider is
-a change to one `provider` line. And mistakes are caught when the
+same place. A change reads plainly in review, because switching what runs is
+a change to one selector line. And mistakes are caught when the
 configuration is validated or the server starts, not when a visitor's request
 takes an unexpected path. A leftover table, a misspelled setting or a name the
 build does not know all stop the deployment with a message that names the
 fix.
 
-**For the people who write the code.** A provider plugs in through one
+**For the people who write the code.** A module plugs in through one
 registration and inherits the checks above without writing them again. Core
-code does not name any vendor, so adding a provider does not mean editing core,
-and a vendor's crate can supply its own provider on the same terms as the ones
+code does not name any vendor, so adding a module does not mean editing core,
+and a vendor's crate can supply its own module on the same terms as the ones
 in this repository.
 
 **For everyone.** A configuration that cannot hold a silent mistake is one
@@ -193,7 +198,7 @@ proxy_secret = "publisher_proxy_secret"    # key name
 allowed_domains = ["assets.example.com"]
 
 [integration]
-provider = ["prebid", "gpt"]
+module = ["prebid", "gpt"]
 
 [integration.prebid]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
@@ -203,20 +208,20 @@ timeout_ms = 1500                          # the browser's Prebid timeout
 gam_attribution_enabled = true
 
 [ec]
-provider = "hmac"
+module = "hmac"
 ec_store = "ec_identity_store"
 
 [ec.hmac]
 passphrase = "ec_passphrase"               # key name
 
 [geo]
-provider = "platform"
+module = "platform"
 
 [device]
-provider = "builtin"
+module = "builtin"
 
 [permission_signal]
-provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+module = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
 
 [demand]
 provider = ["pbs_main"]
@@ -274,9 +279,9 @@ endpoint = "https://house.example.com/openrtb2/auction"
 
 | Previous                                                                   | Now                                                                                                 |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `[integrations.<id>]` with `enabled = true`                                | `<id>` in `[integration] provider`, and `[integration.<id>]` only for settings                      |
+| `[integrations.<id>]` with `enabled = true`                                | `<id>` in `[integration] module`, and `[integration.<id>]` only for settings                        |
 | `[ec.providers.<name>]`                                                    | `[ec.<name>]`                                                                                       |
-| `[permission_signal] sources`                                              | `[permission_signal] provider`                                                                      |
+| `[permission_signal] sources`                                              | `[permission_signal] module`                                                                        |
 | `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `us-privacy`           | `host_signals`, `client_fixed`, `gpp_sale_opt_out`, `us_privacy`                                    |
 | `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config` | `[demand] provider` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
 | `profile = "standard"`                                                     | `implementation = "openrtb"`                                                                        |
@@ -292,8 +297,8 @@ in configuration, and the auction response metadata that read
 configuration still carrying either is refused with a message naming where the
 setting moved to.
 
-## For developers adding a provider
+## For developers adding a module
 
-A provider is registered by its integration builder, and the configuration
+A module is registered by its integration builder, and the configuration
 rules above apply to it without any extra code. See the
 [integration guide](/guide/integration-guide) for the registration itself.

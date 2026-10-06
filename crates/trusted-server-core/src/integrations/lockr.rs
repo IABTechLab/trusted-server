@@ -306,7 +306,7 @@ fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<Tr
 }
 
 /// Validates the Lockr configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -707,7 +707,7 @@ mod tests {
             register(&settings).expect("an unnamed integration should read no settings");
         assert!(
             registration.is_none(),
-            "an integration [integration] provider does not name should not register"
+            "an integration [integration] module does not name should not register"
         );
     }
 }

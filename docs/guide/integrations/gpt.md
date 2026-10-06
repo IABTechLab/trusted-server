@@ -52,7 +52,7 @@ Add GPT configuration to `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["gpt"]
+module = ["gpt"]
 
 [integration.gpt]
 gam_attribution_enabled = false
@@ -156,7 +156,7 @@ value `ts=true`. It is applied before publisher GPT initialization and remains
 for the browser document's lifetime, so initial, lazy, refresh, publisher-owned,
 and SPA-route requests inherit it unless another targeting consumer clears or
 overrides the key. The attribution switch is independently controlled and
-defaults to `false`, but `[integration] provider` must also name `gpt`, which
+defaults to `false`, but `[integration] module` must also name `gpt`, which
 be `true`.
 
 This key is distinct from the existing slot-level `ts_initial=1` value.

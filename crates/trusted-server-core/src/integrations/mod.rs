@@ -290,13 +290,13 @@ pub(crate) async fn collect_response_bounded(
 /// Builds an integration's registration from settings, or `None` when the
 /// settings give it nothing to register.
 ///
-/// The registry calls this only for an integration `[integration] provider`
+/// The registry calls this only for an integration `[integration] module`
 /// names, so an integration runs exactly when an operator names it.
 pub type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
 
 /// Validates an integration's configuration for deployment and reports
-/// whether `[integration] provider` names it.
+/// whether `[integration] module` names it.
 ///
 /// Runs for every builder, named or not, so one builder's rules cannot be
 /// skipped by the order the builders happen to be in. At deploy time secret
@@ -307,7 +307,7 @@ pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedSer
 /// Prepares a request before routing, for every routed request except the
 /// health check.
 ///
-/// Runs whether or not `[integration] provider` names the integration, so one
+/// Runs whether or not `[integration] module` names the integration, so one
 /// can strip its own reserved query or cookie in a deployment that does not
 /// run it.
 pub type IntegrationPrepareRequestFn =
@@ -344,8 +344,8 @@ pub const CORE_SOURCE: &str = "trusted-server-core";
 ///
 /// # fn demo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
 /// let builder = IntegrationBuilder::new("example", "example-crate", build, validate);
-/// // The registry builds an integration `[integration] provider` names, so a
-/// // deployment that wants this one writes `provider = ["example"]`.
+/// // The registry builds an integration `[integration] module` names, so a
+/// // deployment that wants this one writes `module = ["example"]`.
 /// let mut settings = settings.clone();
 /// settings.integration.select("example");
 /// let plan = Arc::new(compile_auction_plan(&settings)?);
@@ -491,7 +491,7 @@ impl IntegrationBuilder {
     }
 
     /// Validates the integration's configuration for deployment and reports
-    /// whether `[integration] provider` names the integration.
+    /// whether `[integration] module` names the integration.
     ///
     /// # Errors
     ///
@@ -560,7 +560,7 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     )
     .with_request_preparer(gpt_diagnostics::prepare_request_hook),
     // Implementations `[demand]` and `[adserver]` can name. None of them is a
-    // page integration, so none can be named in `[integration] provider`.
+    // page integration, so none can be named in `[integration] module`.
     IntegrationBuilder::implementations(openrtb::OPENRTB_ID, CORE_SOURCE)
         .with_demand(&openrtb::DEMAND),
     IntegrationBuilder::implementations(prebid_server::PREBID_SERVER_ID, CORE_SOURCE)

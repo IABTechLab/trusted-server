@@ -24,7 +24,7 @@
 //!
 //! ```toml
 //! [integration]
-//! provider = ["datadome"]
+//! module = ["datadome"]
 //!
 //! [integration.datadome]
 //! sdk_origin = "https://js.datadome.co"        # SDK script origin
@@ -967,7 +967,7 @@ fn build(
 }
 
 /// Validates the `DataDome` configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///

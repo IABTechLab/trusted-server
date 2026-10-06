@@ -168,7 +168,7 @@ fn build_state_with_settings(
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this adapter, when the auction plan does not compile or cannot run on this
 /// adapter, or when the auction orchestrator or the integration registry fail
 /// to initialize, which includes two builders claiming the same integration
@@ -207,7 +207,7 @@ fn build_state_with_registrations_and_services(
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. The registry is
-    // built first because a module can supply the vendor Edge Cookie provider
+    // built first because a module can supply the vendor Edge Cookie module
     // the selector names, and resolving without it would reject a selection
     // this deployment can in fact satisfy. A caller supplying its own
     // `RuntimeServices` may have resolved one already, and that one comes first
@@ -270,7 +270,7 @@ impl AppState {
     /// For geo, unset and `"none"` both resolve nothing, so no client IP
     /// reaches a host geo service. `"platform"` opts in to this adapter's own
     /// lookup, and any other key names an integration module that declares a
-    /// geo provider. Identity and device are applied the same way when a module
+    /// geo module. Identity and device are applied the same way when a module
     /// supplies them.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         let mut services = self
@@ -280,14 +280,14 @@ impl AppState {
                 build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
             })
             .with_resolved_ec_module(self.resolved_ec_module.clone());
-        if let Some(module) = self.registry.geo_provider() {
+        if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
         }
         if let Some(module) = self.registry.ec_module() {
-            services = services.with_ec_provider(module);
+            services = services.with_ec_module(module);
         }
-        if let Some(module) = self.registry.device_provider() {
-            services = services.with_device_provider(module);
+        if let Some(module) = self.registry.device_module() {
+            services = services.with_device_module(module);
         }
         services
     }
@@ -742,7 +742,7 @@ impl TrustedServerApp {
     ///
     /// # Errors
     ///
-    /// Returns an error when the selected Edge Cookie provider cannot be built
+    /// Returns an error when the selected Edge Cookie module cannot be built
     /// for this adapter, when the auction plan does not compile or cannot run
     /// on this adapter, or when the auction orchestrator or the integration
     /// registry fail to initialize, which includes two builders claiming the

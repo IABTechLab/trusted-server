@@ -453,7 +453,7 @@ fn build(
 }
 
 /// Validates the JavaScript asset proxy configuration for deployment and
-/// reports whether `[integration] provider` names the integration.
+/// reports whether `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -1042,7 +1042,7 @@ mod tests {
             secret_store_id = "test-secret-store-id"
 
             [integration]
-            provider = ["js_asset_proxy"]
+            module = ["js_asset_proxy"]
 
             [[integration.js_asset_proxy.assets]]
             path = "/assets/vendor.js"

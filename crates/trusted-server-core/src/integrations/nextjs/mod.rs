@@ -55,7 +55,7 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
 }
 
 /// Validates the Next.js configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -67,7 +67,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register the Next.js integration when `[integration] provider` names it.
+/// Register the Next.js integration when `[integration] module` names it.
 ///
 /// # Errors
 ///
@@ -84,7 +84,7 @@ pub fn register(
         );
         config
     } else {
-        log::info!("NextJS integration not registered ([integration] provider does not name it)");
+        log::info!("NextJS integration not registered ([integration] module does not name it)");
         return Ok(None);
     };
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.

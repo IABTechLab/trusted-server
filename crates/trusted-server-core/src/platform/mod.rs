@@ -99,7 +99,7 @@ use crate::settings::Settings;
 /// Any other value names an integration module that declares a geo module.
 /// This function returns [`DisabledGeo`] for one, because it cannot see the
 /// registry, and the adapter then replaces it with the module's module from
-/// `IntegrationRegistry::geo_provider`. So the value returned here is the base
+/// `IntegrationRegistry::geo_module`. So the value returned here is the base
 /// the adapter starts from, not necessarily what serves the request. A selector
 /// naming a module that supplies no geo module is rejected when the registry
 /// is built, which is the only layer that can tell.

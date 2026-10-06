@@ -101,16 +101,16 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         }
     }
 
-    // An integration runs when `[integration] provider` names it, so that list
+    // An integration runs when `[integration] module` names it, so that list
     // decides whether DataDome's secrets are live. A block for an integration
     // the list does not name is refused once the settings are deserialized,
     // and clearing its references here means that refusal is what an operator
     // sees rather than a secret lookup failing first.
     let datadome_runs = data
-        .pointer("/integration/provider")
+        .pointer("/integration/module")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|provider| {
-            provider
+        .is_some_and(|module| {
+            module
                 .iter()
                 .any(|id| id.as_str() == Some(DATADOME_INTEGRATION_ID))
         });
@@ -798,7 +798,7 @@ mod tests {
         );
     }
 
-    /// A block for an integration `[integration] provider` does not name is
+    /// A block for an integration `[integration] module` does not name is
     /// refused, and its secret references are dropped before resolution, so
     /// the operator reads the block's own fault rather than a secret-store
     /// failure that follows from it.
@@ -822,11 +822,12 @@ mod tests {
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
         )
-        .expect_err("should refuse a block nothing on the provider list names");
+        .expect_err("should refuse a block nothing on the module list names");
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[integration.datadome]") && rendered.contains("provider"),
+            rendered.contains("[integration.datadome]")
+                && rendered.contains("[integration] module"),
             "should name the block and the list: {rendered}"
         );
         assert!(

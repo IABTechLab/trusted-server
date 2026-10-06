@@ -467,7 +467,7 @@ module, which does nothing with identity and contacts no vendor until the
 promise resolves. If nothing arrived by `DOMContentLoaded` the promise resolves
 with the empty state, which a module reads as nothing set. The `client_fixed`
 demo page script does exactly this. It declares the same Data Use its
-server-side provider requires, `necessary.operations.storage`, and posts to the
+server-side module requires, `necessary.operations.storage`, and posts to the
 resolve endpoint only when the promise resolves with that Data Use in the set,
 so it is the pattern a vendor page module follows. Wiring the other existing
 integration scripts to wait on the promise is follow-up work.

@@ -132,7 +132,7 @@ fn build_state_with_settings(
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this adapter, when the auction plan does not compile or cannot run on this
 /// adapter, or when the auction orchestrator or the integration registry fail
 /// to initialize, which includes two builders claiming the same integration
@@ -210,26 +210,26 @@ fn build_state_with_registrations_and_services(
 
 impl AppState {
     /// Build per-request [`RuntimeServices`], applying the module-supplied geo,
-    /// Edge Cookie and device providers selected by `[geo]`, `[ec]` and
-    /// `[device] provider`.
+    /// Edge Cookie and device modules selected by `[geo]`, `[ec]` and
+    /// `[device] module`.
     ///
     /// Unset and `"none"` both resolve nothing for geo, so no client IP reaches
     /// a host geo service. `"platform"` opts in to this adapter's own lookup,
     /// and any other key names an integration module that declares a geo
-    /// provider. Identity and device are applied the same way when a module
+    /// module. Identity and device are applied the same way when a module
     /// supplies them.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         let mut services = self.services.clone().unwrap_or_else(|| {
             build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
         });
-        if let Some(module) = self.registry.geo_provider() {
+        if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
         }
         if let Some(module) = self.registry.ec_module() {
-            services = services.with_ec_provider(module);
+            services = services.with_ec_module(module);
         }
-        if let Some(module) = self.registry.device_provider() {
-            services = services.with_device_provider(module);
+        if let Some(module) = self.registry.device_module() {
+            services = services.with_device_module(module);
         }
         services
     }
@@ -797,7 +797,7 @@ impl TrustedServerApp {
     ///
     /// # Errors
     ///
-    /// Returns an error when the selected Edge Cookie provider cannot be built
+    /// Returns an error when the selected Edge Cookie module cannot be built
     /// for this adapter, when the auction plan does not compile or cannot run
     /// on this adapter, or when the auction orchestrator or the integration
     /// registry fail to initialize, which includes two builders claiming the

@@ -742,7 +742,7 @@ fn build(
 }
 
 /// Validates the Sourcepoint configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -754,7 +754,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register the Sourcepoint integration when `[integration] provider` names it.
+/// Register the Sourcepoint integration when `[integration] module` names it.
 ///
 /// # Errors
 ///

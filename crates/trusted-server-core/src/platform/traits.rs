@@ -141,9 +141,9 @@ pub trait PlatformBackend: Send + Sync {
 
 /// Object-safe geo lookup.
 ///
-/// Asynchronous because a geo provider may reach a backend, a key-value store
-/// or a secret to resolve a location, and a provider that cannot make those
-/// calls cannot be written at all. A provider that resolves from data already
+/// Asynchronous because a geo module may reach a backend, a key-value store
+/// or a secret to resolve a location, and a module that cannot make those
+/// calls cannot be written at all. A module that resolves from data already
 /// in hand still declares an async method and returns immediately.
 ///
 /// Uses `#[async_trait(?Send)]` for the same reason as

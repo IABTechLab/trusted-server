@@ -1,8 +1,8 @@
 //! An integration that lives outside `trusted-server-core` and exercises every
 //! part of the integration seam from a vendor crate's position.
 //!
-//! One registration carries a browser module, a proxy route, a geo provider,
-//! an Edge Cookie identity provider and a device provider, alongside its own
+//! One registration carries a browser module, a proxy route, a geo module,
+//! an Edge Cookie identity module and a device module, alongside its own
 //! configuration block, and the builder adds a request preparer. The round-trip
 //! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each
 //! of those through a real adapter, so the seam is proven by a caller that core
@@ -40,8 +40,8 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
 /// Integration id, which is also the key of the probe's configuration block
-/// (`[integration.seam_probe]`) and the value `[geo] provider` names to
-/// select the probe's geo provider.
+/// (`[integration.seam_probe]`) and the value `[geo] module` names to
+/// select the probe's geo module.
 pub const SEAM_PROBE_ID: &str = "seam_probe";
 
 /// Source label the registry uses in duplicate-id errors.
@@ -135,16 +135,16 @@ pub struct SeamProbePrepared {
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct SeamProbeConfig {
-    /// Country the probe's geo provider resolves for every request.
+    /// Country the probe's geo module resolves for every request.
     ///
     /// Rejected by [`validate`] when it is not two letters, which is the
     /// vendor-owned rule the deploy validation round trip exercises.
     #[serde(default = "default_country")]
     pub country: String,
-    /// Whether the registration declares the probe's geo provider.
+    /// Whether the registration declares the probe's geo module.
     ///
     /// Set this to `false` to build a selected module that supplies no geo
-    /// provider, which is what `[geo] provider = "seam_probe"` must reject at
+    /// module, which is what `[geo] module = "seam_probe"` must reject at
     /// startup.
     #[serde(default = "default_declares_geo")]
     pub declares_geo: bool,
@@ -161,30 +161,30 @@ const fn default_declares_geo() -> bool {
     true
 }
 
-/// Geo provider that resolves the country the probe's configuration names,
+/// Geo module that resolves the country the probe's configuration names,
 /// whatever the client address is.
 pub struct SeamProbeGeo {
     country: String,
 }
 
 impl SeamProbeGeo {
-    /// Creates a provider that resolves `country` for every request.
+    /// Creates a module that resolves `country` for every request.
     #[must_use]
     pub const fn new(country: String) -> Self {
         Self { country }
     }
 }
 
-/// The probe's Edge Cookie provider, declared on its registration so identity
+/// The probe's Edge Cookie module, declared on its registration so identity
 /// reaches core the same way location does.
 ///
 /// It derives a value from the request evidence rather than a constant, so a
-/// test can tell the difference between the module's provider running and
+/// test can tell the difference between the module's module running and
 /// core's built-in one running.
 #[derive(Debug)]
 pub struct SeamProbeEc;
 
-/// The four-character code core stamps on identifiers this provider owns.
+/// The four-character code core stamps on identifiers this module owns.
 const SEAM_PROBE_EC_CODE: ModuleCode = trusted_server_core::module_code!("sprb");
 
 #[async_trait::async_trait(?Send)]
@@ -204,7 +204,7 @@ impl EdgeCookieModule for SeamProbeEc {
         _services: &trusted_server_core::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         // Derived from evidence so the test can prove this ran rather than the
-        // built-in provider, and prove the evidence actually arrived.
+        // built-in module, and prove the evidence actually arrived.
         let ip = request_info.client_ip();
         let id = format!("seam-probe-{}", if ip.is_empty() { "no-ip" } else { ip });
         Ok(GeneratedEdgeCookie {
@@ -218,7 +218,7 @@ impl EdgeCookieModule for SeamProbeEc {
     }
 }
 
-/// The probe's device provider, declared on the same registration.
+/// The probe's device module, declared on the same registration.
 #[derive(Debug)]
 pub struct SeamProbeDevice;
 
@@ -330,7 +330,7 @@ fn check_country(country: &str) -> Result<(), Report<TrustedServerError>> {
 }
 
 /// Reads the probe's configuration block, or `None` when `[integration]
-/// provider` does not name the probe.
+/// module` does not name the probe.
 ///
 /// # Errors
 ///
@@ -340,7 +340,7 @@ fn read_config(settings: &Settings) -> Result<Option<SeamProbeConfig>, Report<Tr
     settings.integration_config::<SeamProbeConfig>(SEAM_PROBE_ID)
 }
 
-/// Builds the probe's registration, or `None` when `[integration] provider`
+/// Builds the probe's registration, or `None` when `[integration] module`
 /// does not name the probe.
 ///
 /// # Errors
@@ -363,14 +363,14 @@ pub fn register(
             sha256: PROBE_JS_SHA256,
         });
     if config.declares_geo {
-        registration = registration.with_geo_provider(Arc::new(SeamProbeGeo::new(config.country)));
+        registration = registration.with_geo_module(Arc::new(SeamProbeGeo::new(config.country)));
     }
     {
         // Identity and device are declared the same way location is, so one
         // module supplies all three and there is no second mechanism.
         registration = registration
-            .with_ec_provider(Arc::new(SeamProbeEc))
-            .with_device_provider(Arc::new(SeamProbeDevice));
+            .with_ec_module(Arc::new(SeamProbeEc))
+            .with_device_module(Arc::new(SeamProbeDevice));
     }
 
     Ok(Some(registration.build()))
@@ -558,7 +558,7 @@ mod tests {
                 assume_single_jurisdiction = true
 
                 [integration]
-                provider = ["seam_probe"]
+                module = ["seam_probe"]
 
                 [integration.seam_probe]
                 {body}
@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_reports_not_selected_without_a_provider_entry() {
+    fn validate_reports_not_selected_without_a_module_entry() {
         let settings = Settings::from_toml(
             r#"
                 [[handlers]]
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_declares_no_geo_provider_when_the_block_turns_it_off() {
+    fn registration_declares_no_geo_module_when_the_block_turns_it_off() {
         let settings = settings_with_probe("country = \"ZZ\"\ndeclares_geo = false");
 
         let registration = register(&settings)
@@ -657,17 +657,17 @@ mod tests {
             .expect("should be selected");
 
         assert!(
-            registration.geo_provider.is_none(),
-            "should declare no geo provider when declares_geo is false"
+            registration.geo_module.is_none(),
+            "should declare no geo module when declares_geo is false"
         );
     }
 
     #[tokio::test]
-    async fn geo_provider_resolves_the_configured_country() {
-        let provider = SeamProbeGeo::new("ZZ".to_string());
+    async fn geo_module_resolves_the_configured_country() {
+        let module = SeamProbeGeo::new("ZZ".to_string());
         let services = build_probe_services();
 
-        let geo = provider
+        let geo = module
             .lookup(None, &services)
             .await
             .expect("should resolve location")

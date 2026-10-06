@@ -223,14 +223,14 @@ impl Publisher {
 /// Which integrations run, and the settings each one is given.
 ///
 /// Mapped from the `[integration]` TOML section, which follows the convention
-/// every provider type uses, where [`provider`](Self::provider) names what runs
-/// and a named block holds one provider's settings. Here that block is
+/// every selectable type uses, where [`module`](Self::module) names what runs
+/// and a named block holds one module's settings. Here that block is
 /// `[integration.<id>]`, and it is written only for an integration that has
 /// settings to give.
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     /// The integrations that run, named by id, for example
-    /// `provider = ["gpt", "prebid"]`.
+    /// `module = ["gpt", "prebid"]`.
     ///
     /// An integration runs when, and only when, its id is on this list, so
     /// there is no second switch inside its own block and leaving the list out
@@ -242,9 +242,9 @@ pub struct IntegrationSettings {
     ///
     /// The order of the list carries no meaning, because integrations run in
     /// the order their builders are registered. This is unlike
-    /// `[permission_signal] provider`, where the order is the policy.
+    /// `[permission_signal] module`, where the order is the policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provider: Vec<String>,
+    pub module: Vec<String>,
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
 }
@@ -255,7 +255,7 @@ impl std::fmt::Debug for IntegrationSettings {
         integration_ids.sort_unstable();
         formatter
             .debug_struct("IntegrationSettings")
-            .field("provider", &self.provider)
+            .field("module", &self.module)
             .field("integration_ids", &integration_ids)
             .finish()
     }
@@ -265,19 +265,19 @@ impl std::fmt::Debug for IntegrationSettings {
 ///
 /// The type states which settings the integration takes and how they are
 /// validated, and nothing else. Whether the integration runs is not its
-/// business, because `[integration] provider` names what runs.
+/// business, because `[integration] module` names what runs.
 pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 impl IntegrationSettings {
-    /// Whether `integration_id` is named in `[integration] provider`.
+    /// Whether `integration_id` is named in `[integration] module`.
     #[must_use]
     pub fn is_selected(&self, integration_id: &str) -> bool {
-        self.provider
+        self.module
             .iter()
             .any(|selected| selected == integration_id)
     }
 
-    /// Names `integration_id` in `[integration] provider`, so it runs.
+    /// Names `integration_id` in `[integration] module`, so it runs.
     ///
     /// Naming one that is already on the list changes nothing, so a caller
     /// never has to check first.
@@ -285,12 +285,12 @@ impl IntegrationSettings {
     pub fn select(&mut self, integration_id: impl Into<String>) {
         let integration_id = integration_id.into();
         if !self.is_selected(&integration_id) {
-            self.provider.push(integration_id);
+            self.module.push(integration_id);
         }
     }
 
     /// Selects an integration and stores the settings it runs with, which is
-    /// what naming it in `[integration] provider` and writing its
+    /// what naming it in `[integration] module` and writing its
     /// `[integration.<id>]` block do together.
     ///
     /// # Errors
@@ -333,11 +333,11 @@ impl IntegrationSettings {
     /// and the fix for them.
     pub fn validate_selection(&self) -> Result<(), Report<TrustedServerError>> {
         let mut named = HashSet::new();
-        for integration_id in &self.provider {
+        for integration_id in &self.module {
             if !named.insert(integration_id.as_str()) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "[integration] provider names `{integration_id}` more than once. \
+                        "[integration] module names `{integration_id}` more than once. \
                          Name each integration that runs exactly once"
                     ),
                 }));
@@ -363,7 +363,7 @@ impl IntegrationSettings {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "[integration.{}] sets `enabled`, which is no longer read. An integration \
-                     runs when its id is named in [integration] provider, so remove the key \
+                     runs when its id is named in [integration] module, so remove the key \
                      and name the integration there instead",
                     carries_enabled.join("] and [integration."),
                 ),
@@ -373,7 +373,7 @@ impl IntegrationSettings {
         if !unselected.is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "[integration.{}] is configured but not named in [integration] provider. \
+                    "[integration.{}] is configured but not named in [integration] module. \
                      Add the integration to that list to run it, or remove the block",
                     unselected.join("] and [integration."),
                 ),
@@ -407,7 +407,7 @@ impl IntegrationSettings {
     }
 
     /// Reads and validates a selected integration's typed configuration, or
-    /// returns `None` when `[integration] provider` does not name it.
+    /// returns `None` when `[integration] module` does not name it.
     ///
     /// A selected integration with no block of its own is read from an empty
     /// one, so an integration that takes no settings runs on its id alone and
@@ -1409,7 +1409,7 @@ impl DeviceConfig {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] never, today. The error
-    /// type is kept because the caller treats provider validation uniformly
+    /// type is kept because the caller treats module validation uniformly
     /// across the three capabilities.
     pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
         Ok(())
@@ -3617,13 +3617,13 @@ fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
 // An unconfigured section is omitted for the same reason the selector tables
 // above are.
 fn is_default_integration_config(value: &IntegrationSettings) -> bool {
-    value.provider.is_empty() && value.entries.is_empty()
+    value.module.is_empty() && value.entries.is_empty()
 }
 
 /// Message a configuration still carrying the removed `[integrations]` table
 /// is rejected with.
 const REMOVED_INTEGRATIONS_TABLE_MESSAGE: &str = "Configuration table `[integrations]` was removed. Move each `[integrations.<id>]` block to \
-     `[integration.<id>]`, name the integrations that run in `[integration] provider`, and delete \
+     `[integration.<id>]`, name the integrations that run in `[integration] module`, and delete \
      every `enabled` key, as described in the CHANGELOG.md breaking migration";
 
 /// The removed `[integrations]` table.
@@ -4456,7 +4456,7 @@ impl Settings {
 
     /// Retrieves a selected integration's configuration of a specific type.
     ///
-    /// Hands back `None` when `[integration] provider` does not name the
+    /// Hands back `None` when `[integration] module` does not name the
     /// integration, so a caller that reads its own configuration is also
     /// asking whether it runs.
     ///
@@ -4984,7 +4984,7 @@ mod tests {
         // predates the selector rejects the key during rollout or rollback.
         //
         // The shared fixture writes a `[geo]` table (it acknowledges running
-        // with no geo provider), so the assertion is about the selector key
+        // with no geo module), so the assertion is about the selector key
         // rather than the table, which is what the blob's compatibility
         // actually turns on.
         let settings = Settings::from_toml(&crate_test_settings_str())
@@ -4994,21 +4994,21 @@ mod tests {
 
         let geo = value
             .get("geo")
-            .expect("the geo table is written because the fixture acknowledges no geo provider");
+            .expect("the geo table is written because the fixture acknowledges no geo module");
         assert!(
-            geo.get("provider").is_none(),
+            geo.get("module").is_none(),
             "an unset geo selector should not be serialized, got {geo}"
         );
         assert!(
             value
                 .get("device")
-                .is_none_or(|device| device.get("provider").is_none()),
+                .is_none_or(|device| device.get("module").is_none()),
             "an unset device selector should not be serialized, got {value}"
         );
     }
 
     #[test]
-    fn a_selected_geo_provider_stays_in_the_serialized_config() {
+    fn a_selected_geo_module_stays_in_the_serialized_config() {
         // The shared test settings already carry a `[geo]` table, so the
         // selector is set inside that table rather than in a second one, which
         // TOML rejects as a duplicate key.
@@ -5026,7 +5026,7 @@ module = \"none\"",
                 .pointer("/geo/module")
                 .and_then(serde_json::Value::as_str),
             Some("none"),
-            "a selected geo provider should survive serialization"
+            "a selected geo module should survive serialization"
         );
     }
 
@@ -5927,10 +5927,10 @@ module = \"none\"",
                 .integration_config::<NextJsIntegrationConfig>("nextjs")
                 .expect("Next.js config query should succeed")
                 .is_none(),
-            "an integration the provider list does not name should not run"
+            "an integration the module list does not name should not run"
         );
         assert_eq!(
-            settings.integration.provider,
+            settings.integration.module,
             vec!["prebid".to_owned()],
             "the fixture should run exactly the integration it names"
         );
@@ -6737,13 +6737,13 @@ module = \"none\"",
             .expect("a module id should be accepted by settings validation");
 
         // And as with geo, the rejection happens at registry build, so a
-        // mistyped selector cannot fall back to the built-in provider in
+        // mistyped selector cannot fall back to the built-in module in
         // silence.
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.device.module = Some("acme".to_owned());
         let error = match crate::integrations::IntegrationRegistry::new(&settings) {
             Ok(_) => {
-                panic!("a device provider no module supplies should be rejected at registry build")
+                panic!("a device module no module supplies should be rejected at registry build")
             }
             Err(error) => error,
         };
@@ -6905,7 +6905,7 @@ passphrase = "another-test-secret-key-32-bytes"
         // rather than `expect_err`.
         let error = match crate::integrations::IntegrationRegistry::new(&settings) {
             Ok(_) => {
-                panic!("a geo provider no module supplies should be rejected at registry build")
+                panic!("a geo module no module supplies should be rejected at registry build")
             }
             Err(error) => error,
         };
@@ -8231,7 +8231,7 @@ source_domain = "partner.example.com"
         );
     }
 
-    /// An integration `[integration] provider` does not name has no
+    /// An integration `[integration] module` does not name has no
     /// configuration, whatever else the settings hold.
     #[test]
     fn an_integration_that_is_not_named_has_no_configuration() {
@@ -8324,15 +8324,15 @@ source_domain = "partner.example.com"
         }
     }
 
-    /// A block written for an integration the provider list does not name is
+    /// A block written for an integration the module list does not name is
     /// refused, rather than sitting in the configuration doing nothing.
     #[test]
     fn a_block_for_an_integration_that_is_not_named_is_refused() {
         let toml = format!(
             "{}\n[integration.osano]\n",
             crate_test_settings_str().replace(
-                "provider = [\"prebid\"]",
-                "provider = [\"prebid\"]\n\n[integration.nextjs]\nrewrite_attributes = [\"href\"]",
+                "module = [\"prebid\"]",
+                "module = [\"prebid\"]\n\n[integration.nextjs]\nrewrite_attributes = [\"href\"]",
             )
         );
 
@@ -8345,7 +8345,7 @@ source_domain = "partner.example.com"
             "should name every block that is not on the list: {rendered}"
         );
         assert!(
-            rendered.contains("provider"),
+            rendered.contains("[integration] module"),
             "should say where to name the integration instead: {rendered}"
         );
     }
@@ -8368,7 +8368,7 @@ source_domain = "partner.example.com"
             "should name the block and the key: {rendered}"
         );
         assert!(
-            rendered.contains("[integration] provider"),
+            rendered.contains("[integration] module"),
             "should say what switches an integration on instead: {rendered}"
         );
     }
@@ -8377,10 +8377,8 @@ source_domain = "partner.example.com"
     /// it twice, so it is refused.
     #[test]
     fn naming_an_integration_twice_is_refused() {
-        let toml = crate_test_settings_str().replace(
-            "provider = [\"prebid\"]",
-            "provider = [\"prebid\", \"prebid\"]",
-        );
+        let toml = crate_test_settings_str()
+            .replace("module = [\"prebid\"]", "module = [\"prebid\", \"prebid\"]");
 
         let error = Settings::from_toml(&toml).expect_err("should reject a repeated id");
 
@@ -8400,7 +8398,7 @@ source_domain = "partner.example.com"
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[integration.<id>]") && rendered.contains("[integration] provider"),
+            rendered.contains("[integration.<id>]") && rendered.contains("[integration] module"),
             "should say where the blocks moved: {rendered}"
         );
         assert!(
@@ -8427,7 +8425,7 @@ source_domain = "partner.example.com"
             Settings::from_json_value(value).expect_err("should reject the removed table in JSON");
 
         assert!(
-            format!("{error:?}").contains("[integration] provider"),
+            format!("{error:?}").contains("[integration] module"),
             "should say where the blocks moved: {error:?}"
         );
     }

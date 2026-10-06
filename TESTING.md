@@ -39,7 +39,7 @@ profile_config = { account_id = "example-aps-account", debug = false }
 provider = "pbs-main"
 
 [integration]
-provider = ["adserver_mock"]
+module = ["adserver_mock"]
 
 [integration.adserver_mock]
 endpoint = "https://mediator.example.com/mediate"

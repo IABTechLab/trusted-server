@@ -37,7 +37,7 @@ ts --help
 # Create local config, then edit placeholders before validation
 ts config init
 # Edit trusted-server.toml. Every pluggable component follows one syntax:
-# [<type>] provider = "<name>" with settings in [<type>.<name>]. See the
+# [<type>] module = "<name>" with settings in [<type>.<name>]. See the
 # Configuration Rules guide linked above.
 ts config validate
 

@@ -217,7 +217,7 @@ struct ConsoleCookieState {
 }
 
 /// Validates the GPT diagnostics configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///
@@ -229,7 +229,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
         .map(|config| config.is_some())
 }
 
-/// Register GPT diagnostics when `[integration] provider` names it.
+/// Register GPT diagnostics when `[integration] module` names it.
 ///
 /// # Errors
 ///
@@ -251,7 +251,7 @@ pub fn register(
     ))
 }
 
-/// Whether `[integration] provider` names the diagnostics integration.
+/// Whether `[integration] module` names the diagnostics integration.
 ///
 /// This says whether the deployment runs diagnostics at all, rather than the
 /// per-document activation state, so a caller that only needs to know whether

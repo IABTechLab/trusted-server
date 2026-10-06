@@ -608,7 +608,7 @@ mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
 
-    /// The services graph a provider is handed, built the same way the request
+    /// The services graph a module is handed, built the same way the request
     /// path builds it so the tests exercise the production shape.
     fn test_services() -> RuntimeServices {
         let req = edgezero_core::http::request_builder()

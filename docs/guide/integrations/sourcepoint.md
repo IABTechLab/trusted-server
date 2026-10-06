@@ -18,7 +18,7 @@ Add the following to `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["sourcepoint"]
+module = ["sourcepoint"]
 
 [integration.sourcepoint]
 rewrite_sdk = true
@@ -29,7 +29,7 @@ cache_ttl_seconds = 3600
 ```
 
 ::: warning Migration note
-The Sourcepoint browser module is now opt-in through `[integration] provider`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should name `sourcepoint` there before upgrading.
+The Sourcepoint browser module is now opt-in through `[integration] module`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should name `sourcepoint` there before upgrading.
 :::
 
 ### Configuration Options

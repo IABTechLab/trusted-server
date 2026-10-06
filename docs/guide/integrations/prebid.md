@@ -19,16 +19,16 @@ Prebid configuration has two independent owners:
 - `[integration.prebid]` owns browser Prebid.js behavior, being bundle
   selection and injection, browser timeout and debug, account injection,
   script interception, client-side bidders, and refresh exclusions. It runs
-  when `prebid` is named in `[integration] provider`.
+  when `prebid` is named in `[integration] module`.
 - A `[demand.<name>]` table that sets `implementation = "prebid_server"`, its
   `notifications`, and `[auction.bidders]` own every Prebid Server request.
   Prebid Server is a demand implementation, not a page integration, so it is
-  never named in `[integration] provider`. See
+  never named in `[integration] module`. See
   [Configuration Rules](/guide/configuration-rules).
 
 ```toml
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [integration.prebid]
 timeout_ms = 1000

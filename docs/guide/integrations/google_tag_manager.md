@@ -35,7 +35,7 @@ Add the GTM configuration to `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["google_tag_manager"]
+module = ["google_tag_manager"]
 
 [integration.google_tag_manager]
 container_id = "GTM-XXXXXX"

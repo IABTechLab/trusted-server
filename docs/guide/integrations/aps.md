@@ -26,7 +26,7 @@ The integration does not implement:
 ## Configuration
 
 APS is a demand implementation, not a page integration, so it is never named in
-`[integration] provider`. Everything APS owns, including rendering ownership,
+`[integration] module`. Everything APS owns, including rendering ownership,
 lives in the `[demand.<name>]` table that names `implementation = "aps"`. APS
 renderer support is registered whenever the compiled auction plan contains an
 APS demand source. See [Configuration Rules](/guide/configuration-rules) for

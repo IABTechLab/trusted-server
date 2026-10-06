@@ -1,7 +1,7 @@
-//! The table every provider type shares.
+//! The table the auction's `[demand]` and `[adserver]` share.
 //!
-//! A provider type is one top-level table. Its `provider` key selects what
-//! runs, and every other key is one named provider's settings table:
+//! Each is one top-level table. Its `provider` key selects what runs, and
+//! every other key is one named provider's settings table:
 //!
 //! ```toml
 //! [demand]

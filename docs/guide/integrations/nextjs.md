@@ -27,7 +27,7 @@ Next.js applications generate framework-specific JSON data (`__NEXT_DATA__`) and
 
 ```toml
 [integration]
-provider = ["nextjs"]
+module = ["nextjs"]
 
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url"]
@@ -146,7 +146,7 @@ Name it only if you're using Next.js:
 
 ```toml
 [integration]
-provider = ["nextjs"]
+module = ["nextjs"]
 ```
 
 ### 2. Configure Rewrite Attributes
@@ -155,7 +155,7 @@ Add custom attributes if your Next.js app uses non-standard fields:
 
 ```toml
 [integration]
-provider = ["nextjs"]
+module = ["nextjs"]
 
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "customImageUrl"]

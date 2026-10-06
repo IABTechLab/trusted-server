@@ -487,7 +487,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     let device_signals = match settings_snapshot.as_deref() {
         Some(settings) => {
             // The entry point is synchronous host code, so it drives the async
-            // provider seam at the same boundary it already drives the router.
+            // module seam at the same boundary it already drives the router.
             let services = build_finalize_services(settings, entry_point_kv_store(&app_state));
             futures::executor::block_on(derive_device_signals(settings, &req, &services))
         }
@@ -636,12 +636,12 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-/// The key-value store a provider called from the entry point is given.
+/// The key-value store a module called from the entry point is given.
 ///
 /// The entry-point paths run whether or not application state was built, so a
 /// deployment whose state failed to build offers the unavailable store rather
-/// than no services at all. A provider that needs the store then fails its own
-/// call instead of the entry point silently skipping the provider.
+/// than no services at all. A module that needs the store then fails its own
+/// call instead of the entry point silently skipping the module.
 fn entry_point_kv_store(app_state: &Option<Arc<AppState>>) -> Arc<dyn PlatformKvStore> {
     app_state.as_ref().map_or_else(
         || Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>,
@@ -1199,7 +1199,7 @@ mod tests {
             secret_store_id = "test-secret-store-id"
 
             [integration]
-            provider = ["gpt_diagnostics"]
+            module = ["gpt_diagnostics"]
             "#,
         )
         .expect("should parse diagnostics settings")
@@ -1310,7 +1310,7 @@ mod tests {
             .expect("should build response");
 
         // The predicate is what stops the lookup, so assert on it directly:
-        // a `true` here would send the client IP to the geo provider on a
+        // a `true` here would send the client IP to the geo module on a
         // response that never authenticated.
         assert!(
             !geo_allowed_for_response(&response),

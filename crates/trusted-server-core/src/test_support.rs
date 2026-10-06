@@ -32,7 +32,7 @@ pub mod tests {
             assume_single_jurisdiction = true
 
             [integration]
-            provider = ["prebid"]
+            module = ["prebid"]
 
             [integration.prebid]
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
@@ -54,13 +54,13 @@ pub mod tests {
     }
 
     /// The shared fixture TOML with `integration_id` named in
-    /// `[integration] provider` as well, for a test that appends that
+    /// `[integration] module` as well, for a test that appends that
     /// integration's own block.
     #[must_use]
     pub fn crate_test_settings_str_running(integration_id: &str) -> String {
         crate_test_settings_str().replace(
-            "provider = [\"prebid\"]",
-            &format!("provider = [\"prebid\", \"{integration_id}\"]"),
+            "module = [\"prebid\"]",
+            &format!("module = [\"prebid\", \"{integration_id}\"]"),
         )
     }
 
@@ -206,7 +206,7 @@ pub mod nextjs_auction {
             # selection the jurisdiction is unknown, and a server-side auction
             # fails closed on an unknown jurisdiction.
             [geo]
-            provider = "platform"
+            module = "platform"
             "#,
         )
         .expect("should parse Next.js auction fixture settings");

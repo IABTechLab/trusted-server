@@ -1326,7 +1326,7 @@ fn build(
     Ok(Some(PrebidIntegration::try_new(config)?))
 }
 
-/// Register the Prebid integration when `[integration] provider` names it.
+/// Register the Prebid integration when `[integration] module` names it.
 ///
 /// # Errors
 ///
@@ -3956,7 +3956,7 @@ mod tests {
     /// naming the integration whose block each fixture appends.
     const TOML_BASE: &str = r#"
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [[handlers]]
 path = "^/_ts/admin"
@@ -4019,7 +4019,7 @@ analytics = ["atsAnalyticsAdapter"]
     #[test]
     fn browser_config_rejects_removed_and_unknown_bundle_fields() {
         // There is no `enabled` flag to vary, because an integration runs when
-        // `[integration] provider` names it, so each field is checked once.
+        // `[integration] module` names it, so each field is checked once.
         for (section, field, value) in [
             ("bundle", "adapters", "[\"rubicon\"]"),
             ("bundle", "user_id_modules", "[\"sharedIdSystem\"]"),

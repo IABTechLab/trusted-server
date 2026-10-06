@@ -33,7 +33,7 @@ Add the following to your `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [integration.datadome]
 
@@ -101,7 +101,7 @@ Set `client_side_key` to have Trusted Server inject the DataDome browser tag int
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [integration.datadome]
 client_side_key = "YOUR_DATADOME_JS_KEY"
@@ -122,7 +122,7 @@ If your site already manages the DataDome tag, disable auto-injection:
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [integration.datadome]
 inject_client_side_tag = false
@@ -167,7 +167,7 @@ When `enable_protection = true`, Trusted Server calls DataDome before normal rou
 
 A request is protected when all of the following are true:
 
-1. `[integration] provider` names the DataDome integration.
+1. `[integration] module` names the DataDome integration.
 2. `enable_protection = true`.
 3. The method is not listed in `protection_excluded_methods`.
 4. The path is not one of Trusted Server's internal routes.
@@ -189,7 +189,7 @@ Protection API:
 ```toml
 # Runtime activation also requires FASTLY_IS_STAGING=1.
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [integration.datadome.protection_test_bypass]
 enabled = true
@@ -272,7 +272,7 @@ Use structured rules for all DataDome protection exclusions. Each rule has an `i
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [[integration.datadome.protection_exclusion_rules]]
 id = "legacy-static-get-head"
@@ -305,7 +305,7 @@ Config Store-backed CIDR sources accept newline-, comma-, whitespace-, or JSON-a
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [[integration.datadome.protection_excluded_ip_cidr_sources]]
 config_store = "datadome-ip-bypass"
@@ -407,11 +407,11 @@ This keeps DataDome scripts routed through first-party context, even when insert
 
 ### Script not loading
 
-Check that `[integration] provider` names the integration:
+Check that `[integration] module` names the integration:
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 ```
 
 If you rely on auto-injection, verify `client_side_key` is non-empty and `inject_client_side_tag = true`.
@@ -430,7 +430,7 @@ Check that both fields are configured:
 
 ```toml
 [integration]
-provider = ["datadome"]
+module = ["datadome"]
 
 [integration.datadome]
 enable_protection = true

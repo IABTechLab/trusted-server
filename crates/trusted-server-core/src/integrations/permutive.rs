@@ -297,7 +297,7 @@ fn build(
 }
 
 /// Validates the Permutive configuration for deployment and reports whether
-/// `[integration] provider` names the integration.
+/// `[integration] module` names the integration.
 ///
 /// # Errors
 ///

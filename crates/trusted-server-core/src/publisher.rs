@@ -9804,7 +9804,7 @@ mod tests {
                     }),
                 );
             } else {
-                settings.integration.provider.clear();
+                settings.integration.module.clear();
                 settings.integration.remove("prebid");
             }
             settings
@@ -19871,7 +19871,7 @@ mod tests {
         let mut settings = create_test_settings();
         // The shared fixture names prebid, and this asks what is served when
         // it does not.
-        settings.integration.provider.clear();
+        settings.integration.module.clear();
         settings.integration.remove("prebid");
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -24900,7 +24900,7 @@ mod tests {
 
             settings
                 .integration
-                .provider
+                .module
                 .retain(|id| id != "gpt_diagnostics");
             assert_eq!(
                 winning_auction_id(&settings).await,

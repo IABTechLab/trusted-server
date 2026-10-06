@@ -42,10 +42,10 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// The settings baked into the binary carry placeholder secrets that
 /// `get_settings()` rejects by design, so every test states its own.
 fn settings_with(extra: &str) -> Settings {
-    // A request the geo provider leaves unmatched resolves at the top of the
+    // A request the geo module leaves unmatched resolves at the top of the
     // permissions.yaml rules tree, and a deployment that runs an Edge Cookie
-    // provider with no geo provider acknowledges that explicitly. Tests that
-    // select a geo provider write their own `[geo]` table, so only supply one
+    // module with no geo module acknowledges that explicitly. Tests that
+    // select a geo module write their own `[geo]` table, so only supply one
     // when the caller has not.
     let geo = if extra.contains("[geo]") {
         String::new()
@@ -83,7 +83,7 @@ assume_single_jurisdiction = true
 /// assertions expect.
 const PROBE_BLOCK: &str = r#"
             [integration]
-            provider = ["seam_probe"]
+            module = ["seam_probe"]
 
             [integration.seam_probe]
             country = "ZZ"
@@ -211,8 +211,8 @@ async fn carried_module_is_served_in_the_unified_bundle_under_its_composed_hash(
 // 2. A proxy route sees the module's geo and the preparer's marker
 // ---------------------------------------------------------------------------
 
-/// The probe's proxy route reports the country its own geo provider resolved,
-/// selected by `[geo] provider`, and the marker its request preparer left in
+/// The probe's proxy route reports the country its own geo module resolved,
+/// selected by `[geo] module`, and the marker its request preparer left in
 /// the request extensions.
 ///
 /// This is the first end-to-end proof that an adapter runs registry preparers
@@ -228,7 +228,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     let settings = settings_with(&format!(
         r#"
             [geo]
-            provider = "seam_probe"
+            module = "seam_probe"
             {PROBE_BLOCK}
         "#
     ));
@@ -252,7 +252,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     );
     assert_eq!(
         report["geo_country"], "ZZ",
-        "the route should see the country the module's own geo provider resolved: {body}"
+        "the route should see the country the module's own geo module resolved: {body}"
     );
     assert_eq!(
         report["request_preparer_runs"], 1,
@@ -321,7 +321,7 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
     let settings = settings_with(
         r#"
             [integration]
-            provider = ["seam_probe"]
+            module = ["seam_probe"]
 
             [integration.seam_probe]
             country = "ZZZ"
@@ -344,20 +344,20 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. A geo selector naming a module that supplies no provider fails at startup
+// 4. A geo selector naming a module that supplies no module fails at startup
 // ---------------------------------------------------------------------------
 
-/// `[geo] provider` naming an enabled module that declares no geo provider is
+/// `[geo] module` naming an enabled module that declares no geo module is
 /// a startup error, raised where the adapter builds its routes.
 #[test]
-fn geo_selector_naming_a_module_without_a_provider_fails_at_startup() {
+fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
     let settings = settings_with(
         r#"
             [geo]
-            provider = "seam_probe"
+            module = "seam_probe"
 
             [integration]
-            provider = ["seam_probe"]
+            module = ["seam_probe"]
 
             [integration.seam_probe]
             country = "ZZ"
@@ -367,11 +367,11 @@ fn geo_selector_naming_a_module_without_a_provider_fails_at_startup() {
 
     let error = TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()])
         .err()
-        .expect("should refuse to start when the selected module declares no geo provider");
+        .expect("should refuse to start when the selected module declares no geo module");
 
     let message = error.to_string();
     assert!(
-        message.contains("seam_probe") && message.contains("declares no geo provider"),
+        message.contains("seam_probe") && message.contains("declares no geo module"),
         "should name the module and the missing capability: {message}"
     );
 }
@@ -421,11 +421,11 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
     );
 }
 
-/// Settings selecting a module-supplied provider.
+/// Settings selecting a module-supplied module.
 ///
 /// These cannot use [`settings_with`], because that fixture carries the
 /// deprecated `[ec] passphrase`, and configuration validation rejects the old
-/// key and a provider selection together.
+/// key and a module selection together.
 fn settings_selecting_module(extra: &str) -> Settings {
     Settings::from_toml(&format!(
         r#"
@@ -448,28 +448,28 @@ fn settings_selecting_module(extra: &str) -> Settings {
             {PROBE_BLOCK}
         "#
     ))
-    .expect("should parse settings selecting a module-supplied provider")
+    .expect("should parse settings selecting a module-supplied module")
 }
 
 // ---------------------------------------------------------------------------
 // Identity and device declared on the registration
 // ---------------------------------------------------------------------------
 
-/// `[ec] provider` naming a module resolves to that module's Edge Cookie
-/// provider, so identity reaches core through the integration registration
+/// `[ec] module` naming a module resolves to that module's Edge Cookie
+/// module, so identity reaches core through the integration registration
 /// rather than through a second extension mechanism.
 ///
-/// This test proves the selection resolves the module's provider by its id.
-/// `ec_provider_generates_an_identifier_with_the_modules_prefix` then drives
-/// that resolved provider through `generate` and asserts the `seam-probe-`
-/// prefix the built-in HMAC provider can never produce, so the round trip is
+/// This test proves the selection resolves the module's module by its id.
+/// `ec_module_generates_an_identifier_with_the_modules_prefix` then drives
+/// that resolved module through `generate` and asserts the `seam-probe-`
+/// prefix the built-in HMAC module can never produce, so the round trip is
 /// proven there.
 #[test]
-fn ec_selector_naming_a_module_resolves_that_modules_provider() {
+fn ec_selector_naming_a_module_resolves_the_edge_cookie_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            provider = "seam_probe"
+            module = "seam_probe"
 
             [ec.seam_probe]
         "#,
@@ -477,19 +477,19 @@ fn ec_selector_naming_a_module_resolves_that_modules_provider() {
 
     let registry = registry_with_probe(&settings);
 
-    let provider = registry
+    let module = registry
         .ec_module()
-        .expect("`[ec] provider = \"seam_probe\"` should resolve the module's provider");
+        .expect("`[ec] module = \"seam_probe\"` should resolve the module's module");
 
     assert_eq!(
-        provider.id(),
+        module.id(),
         "seam_probe",
-        "the resolved provider should be the one the module declared"
+        "the resolved module should be the one the module declared"
     );
 }
 
-/// `[ec] provider` naming a module starts the adapter, because the startup
-/// check is handed the provider the module declared.
+/// `[ec] module` naming a module starts the adapter, because the startup
+/// check is handed the module the module declared.
 ///
 /// The selector tests around this one build the registry directly, so they
 /// cannot see a startup check in the adapter that runs before the registry
@@ -499,7 +499,7 @@ fn ec_selector_naming_a_module_starts_the_adapter() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            provider = "seam_probe"
+            module = "seam_probe"
 
             [ec.seam_probe]
         "#,
@@ -509,51 +509,51 @@ fn ec_selector_naming_a_module_starts_the_adapter() {
 
     assert!(
         started.is_ok(),
-        "the adapter should start with a module's Edge Cookie provider selected: {:?}",
+        "the adapter should start with a module's Edge Cookie module selected: {:?}",
         started.err()
     );
 }
 
-/// `[device] provider` naming a module resolves that module's device provider
+/// `[device] module` naming a module resolves that module's device module
 /// the same way, so all three capabilities travel one route.
 #[test]
-fn device_selector_naming_a_module_resolves_that_modules_provider() {
+fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [device]
-            provider = "seam_probe"
+            module = "seam_probe"
         "#,
     );
 
     let registry = registry_with_probe(&settings);
 
-    let provider = registry
-        .device_provider()
-        .expect("`[device] provider = \"seam_probe\"` should resolve the module's provider");
+    let module = registry
+        .device_module()
+        .expect("`[device] module = \"seam_probe\"` should resolve the module's module");
 
     assert_eq!(
-        provider.id(),
+        module.id(),
         "seam_probe",
-        "the resolved provider should be the one the module declared"
+        "the resolved module should be the one the module declared"
     );
 }
 
-/// `[ec] provider` naming a module resolves a provider that, when driven
-/// through `generate`, produces an identifier the built-in HMAC provider can
+/// `[ec] module` naming a module resolves a module that, when driven
+/// through `generate`, produces an identifier the built-in HMAC module can
 /// never make.
 ///
-/// The selection tests above prove the resolved provider is the module's by
-/// its id. This one drives that provider end to end: it hands the resolved
-/// provider a request and asserts the identifier it returns starts
-/// `seam-probe-`, a prefix only the module's provider produces, so the
-/// module's provider genuinely ran and read the evidence rather than core's
+/// The selection tests above prove the resolved module is the module's by
+/// its id. This one drives that module end to end: it hands the resolved
+/// module a request and asserts the identifier it returns starts
+/// `seam-probe-`, a prefix only the module's module produces, so the
+/// module's module genuinely ran and read the evidence rather than core's
 /// built-in one answering.
 #[tokio::test]
-async fn ec_provider_generates_an_identifier_with_the_modules_prefix() {
+async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            provider = "seam_probe"
+            module = "seam_probe"
 
             [ec.seam_probe]
         "#,
@@ -561,33 +561,33 @@ async fn ec_provider_generates_an_identifier_with_the_modules_prefix() {
 
     let registry = registry_with_probe(&settings);
 
-    let provider = registry
+    let module = registry
         .ec_module()
-        .expect("`[ec] provider = \"seam_probe\"` should resolve the module's provider");
+        .expect("`[ec] module = \"seam_probe\"` should resolve the module's module");
 
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
-    let generated = provider
+    let generated = module
         .generate(&request_info, &IdentityInput::default(), &stub_services())
         .await
-        .expect("the module's provider should generate an identifier");
+        .expect("the module's module should generate an identifier");
 
     let id = generated
         .id
-        .expect("the module's provider should return an identifier");
+        .expect("the module's module should return an identifier");
     assert!(
         id.starts_with("seam-probe-"),
-        "the identifier should carry the module provider's prefix, got `{id}`"
+        "the identifier should carry the module module's prefix, got `{id}`"
     );
     assert_eq!(
         id, "seam-probe-192.0.2.1",
-        "the module's provider should derive the identifier from the request evidence"
+        "the module's module should derive the identifier from the request evidence"
     );
 }
 
 /// Config store that answers nothing, so a test can build [`RuntimeServices`]
 /// without a real platform.
 ///
-/// The probe's Edge Cookie provider derives its identifier from the request
+/// The probe's Edge Cookie module derives its identifier from the request
 /// evidence and reads none of the services, so the store is never queried.
 struct StubConfigStore;
 
@@ -653,9 +653,9 @@ impl PlatformBackend for StubBackend {
     }
 }
 
-/// Builds a minimal [`RuntimeServices`] to hand a provider under test. Every
+/// Builds a minimal [`RuntimeServices`] to hand a module under test. Every
 /// service is a stub or a core-provided unavailable implementation because the
-/// probe's Edge Cookie provider reads only the request evidence.
+/// probe's Edge Cookie module reads only the request evidence.
 fn stub_services() -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(StubConfigStore))

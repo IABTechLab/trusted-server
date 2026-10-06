@@ -33,7 +33,7 @@ The module is unavailable unless the deployment names it:
 
 ```toml
 [integration]
-provider = ["gpt_diagnostics"]
+module = ["gpt_diagnostics"]
 ```
 
 Deployment configuration makes the module available; it does not activate any browser
@@ -477,7 +477,7 @@ trigger GPT or Prebid work, gate an auction, or delay delivery.
 
 ### The API or panel is absent
 
-1. Confirm `[integration] provider` names `gpt_diagnostics` in the deployed configuration.
+1. Confirm `[integration] module` names `gpt_diagnostics` in the deployed configuration.
 2. Activate the browser session with an exact recognized `ts_console` value.
 3. Confirm the Trusted Server script bundle loaded successfully.
 4. Use `ts_console=false` and then `ts_console=true` on a new document to reset

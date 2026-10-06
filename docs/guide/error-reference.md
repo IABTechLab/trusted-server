@@ -335,7 +335,7 @@ Next.js links still pointing to origin domain
 
 ```toml
 [integration]
-provider = ["nextjs"]
+module = ["nextjs"]
 
 [integration.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]  # Add keys you find
@@ -366,7 +366,7 @@ Failed to fetch Permutive SDK: 404 Not Found
 
 ```toml
 [integration]
-provider = ["permutive"]
+module = ["permutive"]
 
 [integration.permutive]
 organization_id = "myorg"
@@ -389,7 +389,7 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 No route matched for /integrations/custom/endpoint
 ```
 
-**Cause:** `[integration] provider` does not name the integration, or the route is not registered
+**Cause:** `[integration] module` does not name the integration, or the route is not registered
 
 **Solution:**
 
@@ -397,7 +397,7 @@ No route matched for /integrations/custom/endpoint
 
 ```toml
 [integration]
-provider = ["custom"]
+module = ["custom"]
 ```
 
 2. Verify integration is compiled in (check build logs)
@@ -654,7 +654,7 @@ Browser Prebid.js debug remains under `[integration.prebid]`:
 
 ```toml
 [integration]
-provider = ["prebid"]
+module = ["prebid"]
 
 [integration.prebid]
 debug = true

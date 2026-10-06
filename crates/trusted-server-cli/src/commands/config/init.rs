@@ -83,9 +83,9 @@ mod tests {
         let config = fs::read_to_string(&path).expect("should read initialized config");
         let parsed = toml::from_str::<toml::Value>(&config).expect("config should parse as TOML");
         assert!(
-            parsed["integration"]["provider"]
+            parsed["integration"]["module"]
                 .as_array()
-                .expect("starter config should carry the provider list")
+                .expect("starter config should carry the module list")
                 .is_empty(),
             "no integration should run until an operator names one"
         );

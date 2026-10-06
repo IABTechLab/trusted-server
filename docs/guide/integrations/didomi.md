@@ -27,7 +27,7 @@ Add the integration to the operator-owned `trusted-server.toml`:
 
 ```toml
 [integration]
-provider = ["didomi"]
+module = ["didomi"]
 
 [integration.didomi]
 geo_query_parameters = true
@@ -64,7 +64,7 @@ already exists in the TOML input.
 
 ```toml
 [integration]
-provider = ["didomi"]
+module = ["didomi"]
 
 [integration.didomi]
 geo_query_parameters = true
