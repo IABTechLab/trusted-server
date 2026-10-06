@@ -1072,6 +1072,22 @@ deployed HTTPS/CDN/CSP acceptance. Both existing draft PRs receive the correctio
 neither feature branch contains Python files. Frozen standalone v1 asset bytes
 remain unchanged by this corrective pass.
 
+Claude's re-review found no new runtime defects and identified one automated
+coverage gap: the ignored host-only emitted-script regression was not selected
+by CI. The existing Node-equipped Rust job now runs that exact core library test
+with an explicit Linux host target and `--ignored`; other ignored tests remain
+excluded. The equivalent command on the macOS host selects one test and passes.
+An independent reviewer approved the step with no findings. Workflow validation
+passes; the nine pre-existing ShellCheck quoting notices are unchanged.
+
+All four integration jobs on `b2930d7b9`, including framework browser tests and
+four-runtime trace acceptance, have now passed remotely. The unrelated generated
+Python CodeQL job and its aggregate check still fail because this feature branch
+contains no Python. Cloudflare's new-pin worker-build artifact and actual local
+browser/raw-boundary suites use Trusted Server's resolved worker 0.8.5 and
+wasm-bindgen 0.2.126; that consumer runtime check is complete. Deployed-platform
+and physical-device acceptance remain separate release gates.
+
 Bundle splitting remains a separate load-order/performance design. Preserve
 the build-input freshness guard and ordinary reserved-route/cache policy.
 Physical mobile and deployed CDN/HTTPS acceptance remain release gates.
