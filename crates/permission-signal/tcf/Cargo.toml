@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-permission-signal-tcf"
-description = "IAB TCF v2 as a permission signal provider, with the purpose mapping."
+description = "IAB TCF v2 as a permission signal module, with the purpose mapping."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

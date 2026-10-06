@@ -44,11 +44,6 @@ pub struct ConsentConfig {
     /// but disagree on consent status.
     #[serde(default)]
     pub conflict_resolution: ConflictResolutionConfig,
-    /// When set, consent data is persisted per Edge Cookie (EC) ID so that
-    /// returning users without consent cookies can still have their
-    /// consent preferences applied. Set to `None` to disable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consent_store: Option<String>,
 }
 
 impl Default for ConsentConfig {
@@ -59,7 +54,6 @@ impl Default for ConsentConfig {
             max_consent_age_days: MAX_CONSENT_AGE_DAYS,
             us_privacy_defaults: UsPrivacyDefaultsConfig::default(),
             conflict_resolution: ConflictResolutionConfig::default(),
-            consent_store: None,
         }
     }
 }

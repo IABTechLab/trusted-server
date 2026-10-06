@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-permission-signal-us-privacy"
-description = "The US Privacy string sale opt-out as a permission signal provider."
+description = "The US Privacy string sale opt-out as a permission signal module."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

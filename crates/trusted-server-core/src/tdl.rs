@@ -9,12 +9,12 @@
 //! read as permission.
 //!
 //! Nothing here interprets a document. Core carries the locators a
-//! [`PermissionSignalProvider`](crate::permission_signal::PermissionSignalProvider)
+//! [`PermissionSignalModule`](crate::permission_signal::PermissionSignalModule)
 //! declares for the request and makes them visible to what consumes the data,
-//! and the provider for a terms scheme decides which document applies. Model
+//! and the module for a terms scheme decides which document applies. Model
 //! Terms for Marketing (MTM) is the first such scheme to arrive and one of many
 //! rather than the only one, because a publisher, a trade body or a regulator
-//! can each publish terms and each set becomes a provider.
+//! can each publish terms and each set becomes a module.
 //!
 //! # The document must not change
 //!

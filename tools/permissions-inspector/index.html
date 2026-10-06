@@ -721,7 +721,7 @@ function render(){
   j.textContent="jurisdiction: "+jurisdiction; chain.appendChild(j);
 
   let why;
-  if (geoFail) why = "The geo provider reported an outright lookup failure, the one case that does not fall back to the top of the tree. Every permission resolves to the requires-signal floor and the jurisdiction to unknown.";
+  if (geoFail) why = "The geo module reported an outright lookup failure, the one case that does not fall back to the top of the tree. Every permission resolves to the requires-signal floor and the jurisdiction to unknown.";
   else if (!country) why = "No country resolved, so the top of the tree answers. Its group is the baseline and its jurisdiction is the consent handling for exactly this visitor.";
   else {
     const last = res.chain[res.chain.length-1];

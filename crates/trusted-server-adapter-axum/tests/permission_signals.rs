@@ -1,8 +1,8 @@
-//! The four shipped signal providers assembled together, as a deployment
+//! The four shipped signal modules assembled together, as a deployment
 //! runs them.
 //!
-//! Each provider crate tests its own scheme in isolation, in its own unit
-//! tests. What is tested here is what only shows when multiple providers
+//! Each module crate tests its own scheme in isolation, in its own unit
+//! tests. What is tested here is what only shows when multiple modules
 //! run in order through core's assembly: an answer to a prompt applying
 //! over an opt-out, one opt-out standing when another is removed, a scheme
 //! left off the list not running at all, and withdrawal being TCF's alone
@@ -14,7 +14,7 @@
 //! The consent records here are built by hand, so nothing in core's consent
 //! pipeline runs. In a deployment that pipeline also synthesizes a US Privacy
 //! opt-out from a Global Privacy Control header in a US state when the consent
-//! settings say to, and the `us_privacy` provider then acts on it, which is
+//! settings say to, and the `us_privacy` module then acts on it, which is
 //! why removing `gpc` from the list alone does not make that header inert.
 
 use std::sync::Arc;
@@ -24,48 +24,56 @@ use trusted_server_core::consent::{ConsentContext, PrivacyFlag};
 use trusted_server_core::ec::consent::{GeoStatus, assemble_permissions};
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::permission_signal::{
-    PermissionSignalProvider, build_permission_signal_providers,
+    PermissionSignalModule, build_permission_signal_modules,
 };
 use trusted_server_core::permissions::{Permission, PermissionState};
 use trusted_server_core::platform::GeoInfo;
 use trusted_server_core::settings::Settings;
-use trusted_server_permission_signal_gpc::GpcProvider;
-use trusted_server_permission_signal_gpp::GppSaleOptOutProvider;
-use trusted_server_permission_signal_tcf::TcfProvider;
-use trusted_server_permission_signal_us_privacy::UsPrivacyProvider;
+use trusted_server_permission_signal_gpc::GpcModule;
+use trusted_server_permission_signal_gpp::GppSaleOptOutModule;
+use trusted_server_permission_signal_mtm::MtmModule;
+use trusted_server_permission_signal_tcf::TcfModule;
+use trusted_server_permission_signal_us_privacy::UsPrivacyModule;
 
-/// The four providers an adapter offers, in the default order.
-fn all_four() -> Vec<Arc<dyn PermissionSignalProvider>> {
+/// The four IAB modules an adapter offers, in the default order. MTM is
+/// offered after them and is tested with them below.
+fn all_four() -> Vec<Arc<dyn PermissionSignalModule>> {
     vec![
-        Arc::new(GpcProvider::new()),
-        Arc::new(GppSaleOptOutProvider::new()),
-        Arc::new(UsPrivacyProvider::new()),
-        Arc::new(TcfProvider::new()),
+        Arc::new(GpcModule::new()),
+        Arc::new(GppSaleOptOutModule::new()),
+        Arc::new(UsPrivacyModule::new()),
+        Arc::new(TcfModule::new()),
     ]
 }
 
-/// Settings naming these identifiers in `[permission_signal] provider`.
+/// All five, as an adapter offers them.
+fn all_five() -> Vec<Arc<dyn PermissionSignalModule>> {
+    let mut modules = all_four();
+    modules.push(Arc::new(MtmModule::new()));
+    modules
+}
+
+/// Settings naming these identifiers in `[permission_signal] module`.
 fn settings_naming(names: &[&str]) -> Settings {
     let mut settings = Settings::default();
-    settings.permission_signal.provider =
-        Some(names.iter().map(|name| (*name).to_owned()).collect());
+    settings.permission_signal.module = Some(names.iter().map(|name| (*name).to_owned()).collect());
     settings
 }
 
-/// The providers a deployment gets from naming these identifiers in
-/// `[permission_signal] provider`, through the same entry point an adapter's
+/// The modules a deployment gets from naming these identifiers in
+/// `[permission_signal] module`, through the same entry point an adapter's
 /// composition root uses.
-fn configured(names: &[&str]) -> Arc<[Arc<dyn PermissionSignalProvider>]> {
-    build_permission_signal_providers(&settings_naming(names), &all_four())
-        .expect("should select providers this build offers")
+fn configured(names: &[&str]) -> Arc<[Arc<dyn PermissionSignalModule>]> {
+    build_permission_signal_modules(&settings_naming(names), &all_four())
+        .expect("should select modules this build offers")
 }
 
-/// Every provider except the one named, in the default order, as a
+/// Every module except the one named, in the default order, as a
 /// publisher removes one from configuration.
-fn all_but(excluded: &str) -> Arc<[Arc<dyn PermissionSignalProvider>]> {
+fn all_but(excluded: &str) -> Arc<[Arc<dyn PermissionSignalModule>]> {
     let names: Vec<&str> = all_four()
         .iter()
-        .map(|provider| provider.id())
+        .map(|module| module.id())
         .filter(|id| *id != excluded)
         .collect();
     configured(&names)
@@ -78,9 +86,9 @@ fn no_evidence() -> OwnedRequestInfo {
 fn assembled(
     consent: &ConsentContext,
     geo: GeoStatus<'_>,
-    providers: &[Arc<dyn PermissionSignalProvider>],
+    modules: &[Arc<dyn PermissionSignalModule>],
 ) -> PermissionState {
-    assemble_permissions(consent, &no_evidence(), geo, providers)
+    assemble_permissions(consent, &no_evidence(), geo, modules)
 }
 
 /// Builds a minimal decoded TCF record consenting to the given 1-indexed
@@ -142,36 +150,35 @@ fn us_ca_geo() -> GeoInfo {
 }
 
 // ----------------------------------------------------------------------
-// Which providers run.
+// Which modules run.
 // ----------------------------------------------------------------------
 
 #[test]
-fn the_documented_names_select_every_shipped_provider_in_order() {
+fn the_documented_names_select_every_shipped_module_in_order() {
     // The names the guide and the example configuration list, which must be
     // the identifiers the shipped crates answer to.
     let documented = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"];
     let selected: Vec<&str> = configured(&documented)
         .iter()
-        .map(|provider| provider.id())
+        .map(|module| module.id())
         .collect();
     assert_eq!(
         selected, documented,
-        "each documented name selects the shipped provider it names, in the order written"
+        "each documented name selects the shipped module it names, in the order written"
     );
 }
 
 #[test]
 fn an_old_hyphenated_name_is_refused_naming_the_names_available() {
     for old in ["gpp-sale-opt-out", "us-privacy"] {
-        let Err(error) = build_permission_signal_providers(&settings_naming(&[old]), &all_four())
+        let Err(error) = build_permission_signal_modules(&settings_naming(&[old]), &all_four())
         else {
             panic!("should refuse the hyphenated name `{old}`");
         };
         let message = format!("{error:?}");
         assert!(
             message.contains(&format!("`{old}` is not available in this build"))
-                && message
-                    .contains("Available providers are gpc, gpp_sale_opt_out, us_privacy, tcf"),
+                && message.contains("Available modules are gpc, gpp_sale_opt_out, us_privacy, tcf"),
             "the refusal names the old name and the names to write instead: {message}"
         );
     }
@@ -195,7 +202,7 @@ fn gpc_revokes_the_granted_baseline_in_a_us_opt_out_state() {
 }
 
 #[test]
-fn a_provider_left_off_the_list_does_not_run() {
+fn a_module_left_off_the_list_does_not_run() {
     let consent = ConsentContext {
         gpc: true,
         ..ConsentContext::default()
@@ -205,20 +212,20 @@ fn a_provider_left_off_the_list_does_not_run() {
     let everything = assembled(&consent, GeoStatus::Located(&geo), &all_four());
     assert!(
         !everything.is_set(Permission::StoreOnDevice),
-        "with every provider running, the header takes storage away"
+        "with every module running, the header takes storage away"
     );
 
     let pruned = assembled(&consent, GeoStatus::Located(&geo), &all_but("gpc"));
     assert!(
         pruned.is_set(Permission::StoreOnDevice),
         "a publisher who does not want to act on Global Privacy Control removes it from \
-         the list, and the provider that read the header then does not run"
+         the list, and the module that read the header then does not run"
     );
 }
 
 #[test]
 fn removing_one_opt_out_leaves_the_others_working() {
-    // The reason the three opt-outs are separate providers rather than one.
+    // The reason the three opt-outs are separate modules rather than one.
     let consent = ConsentContext {
         us_privacy: Some(us_privacy_opted_out()),
         ..ConsentContext::default()
@@ -245,20 +252,20 @@ fn gpc_suppresses_storage_even_when_us_privacy_reports_no_opt_out() {
     let state = assembled(&consent, GeoStatus::Located(&geo), &all_four());
     assert!(
         !state.is_set(Permission::StoreOnDevice),
-        "any one opt-out provider should suppress, whatever the others say"
+        "any one opt-out module should suppress, whatever the others say"
     );
 }
 
 // ----------------------------------------------------------------------
 // Opt-out and prompt precedence.
 //
-// The providers are asked in order and each amends what the ones before it
-// settled, so a later provider can amend an opt-out. The default order asks
+// The modules are asked in order and each amends what the ones before it
+// settled, so a later module can amend an opt-out. The default order asks
 // Global Privacy Control first, being a browser setting with no interface of
 // its own, and the schemes carrying a choice someone made through an
 // interface after, which is why an answer given at a prompt amends the
 // header the visitor arrived with. A deployment wanting the opposite puts
-// the provider it wants to win last.
+// the module it wants to win last.
 // ----------------------------------------------------------------------
 
 #[test]
@@ -317,8 +324,8 @@ fn the_opt_out_wins_when_a_deployment_puts_it_last() {
         ..ConsentContext::default()
     };
     let geo = us_ca_geo();
-    let providers = configured(&["tcf", "gpc"]);
-    let state = assembled(&consent, GeoStatus::Located(&geo), &providers);
+    let modules = configured(&["tcf", "gpc"]);
+    let state = assembled(&consent, GeoStatus::Located(&geo), &modules);
     assert!(
         !state.is_set(Permission::StoreOnDevice),
         "the same request, with the order reversed in configuration, lets the header win"
@@ -447,9 +454,9 @@ fn no_signal_is_not_a_withdrawal() {
 }
 
 #[test]
-fn a_withdrawal_needs_the_tcf_provider_to_be_running() {
+fn a_withdrawal_needs_the_tcf_module_to_be_running() {
     // The withdrawal is TCF's answer, so a deployment that removed the TCF
-    // provider from the list has no scheme left that can withdraw.
+    // module from the list has no scheme left that can withdraw.
     let consent = ConsentContext {
         tcf: Some(tcf_with_purposes(&[4])),
         ..ConsentContext::default()
@@ -462,11 +469,11 @@ fn a_withdrawal_needs_the_tcf_provider_to_be_running() {
 }
 
 // ----------------------------------------------------------------------
-// Unreadable and expired records, assembled with the real providers.
+// Unreadable and expired records, assembled with the real modules.
 // ----------------------------------------------------------------------
 
 #[test]
-fn a_malformed_tcf_record_blocks_baseline_grants() {
+fn an_unreadable_tcf_record_is_the_tcf_modules_refusal() {
     let consent = ConsentContext {
         raw_tc_string: Some("not-a-tc-string".to_owned()),
         ..ConsentContext::default()
@@ -481,20 +488,45 @@ fn a_malformed_tcf_record_blocks_baseline_grants() {
         !state.storage_withdrawn(),
         "and it fails closed by suppression, never destructively"
     );
+    assert!(
+        state.signals().is_empty(),
+        "and the string is not a valid signal, so nothing downstream sees it"
+    );
+    let state = assembled(&consent, GeoStatus::Located(&geo), &all_but("tcf"));
+    assert!(
+        state.is_set(Permission::StoreOnDevice),
+        "a scheme that does not run answers nothing, readable or not"
+    );
 }
 
 #[test]
-fn a_readable_tcf_record_does_not_cure_an_unreadable_gpp_string() {
+fn an_unreadable_gpp_string_is_the_gpp_modules_opt_out_and_the_order_decides() {
+    // The GPP module reads its own unreadable string as the opt-out it
+    // may have carried. Asked after it, a readable TCF record consenting to
+    // storage amends that, because the order is the policy. Nothing in
+    // core answers ahead of the modules any more.
     let consent = ConsentContext {
         tcf: Some(tcf_with_purposes(&[1, 4])),
+        raw_tc_string: Some("CPreadable".to_owned()),
         raw_gpp_string: Some("this is not a GPP string".to_owned()),
         ..ConsentContext::default()
     };
     let geo = us_ca_geo();
+    assert!(
+        !assembled(&consent, GeoStatus::Located(&geo), &all_but("tcf"))
+            .is_set(Permission::StoreOnDevice),
+        "without TCF the GPP module's reading of its unreadable string stands"
+    );
     let state = assembled(&consent, GeoStatus::Located(&geo), &all_four());
     assert!(
-        !state.is_set(Permission::StoreOnDevice),
-        "one scheme arriving unreadable is not cured by another scheme arriving readable"
+        state.is_set(Permission::StoreOnDevice),
+        "asked last, the readable TCF record amends the GPP module's answer"
+    );
+    let schemes: Vec<&str> = state.signals().iter().map(|s| s.scheme).collect();
+    assert_eq!(
+        schemes,
+        vec!["tcf"],
+        "only the readable string is vouched for, so only it goes any further"
     );
 }
 
@@ -510,5 +542,128 @@ fn an_expired_tcf_record_is_not_treated_as_malformed() {
     assert!(
         state.is_set(Permission::StoreOnDevice),
         "expiry is its own explicit state, deliberately distinct from malformed"
+    );
+}
+
+#[test]
+fn a_visitor_in_the_eu_with_no_record_is_awaiting_what_tcf_could_grant() {
+    let geo = GeoInfo {
+        city: String::new(),
+        country: "FR".to_owned(),
+        continent: String::new(),
+        latitude: 0.0,
+        longitude: 0.0,
+        metro_code: 0,
+        region: None,
+        asn: None,
+    };
+    let state = assembled(
+        &ConsentContext::default(),
+        GeoStatus::Located(&geo),
+        &all_four(),
+    );
+    assert!(
+        state.is_awaited(Permission::StoreOnDevice)
+            && state.is_awaited(Permission::SelectPersonalisedAds),
+        "a prompt that has not run leaves the TCF-mapped Data Uses awaited"
+    );
+    let email = Permission::all()
+        .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+        .expect("the taxonomy should carry the email channel");
+    assert!(
+        !state.is_awaited(email),
+        "a channel no module can grant is not awaited"
+    );
+    let state = assembled(
+        &ConsentContext {
+            tcf: Some(tcf_with_purposes(&[1])),
+            ..ConsentContext::default()
+        },
+        GeoStatus::Located(&geo),
+        &all_four(),
+    );
+    assert!(
+        state.is_set(Permission::StoreOnDevice) && !state.is_awaited(Permission::StoreOnDevice),
+        "an answered prompt settles what it granted"
+    );
+    assert!(
+        !state.is_awaited(Permission::SelectPersonalisedAds)
+            && !state.is_set(Permission::SelectPersonalisedAds),
+        "a record refusing a purpose is a refusal, not an awaited answer"
+    );
+}
+
+#[test]
+fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them() {
+    use trusted_server_core::constants::COOKIE_MTM_PREF;
+
+    let geo = GeoInfo {
+        city: String::new(),
+        country: "FR".to_owned(),
+        continent: String::new(),
+        latitude: 0.0,
+        longitude: 0.0,
+        metro_code: 0,
+        region: None,
+        asn: None,
+    };
+    let evidence = |word: &str| {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("{COOKIE_MTM_PREF}={word}")
+                .parse()
+                .expect("should build a cookie header"),
+        );
+        OwnedRequestInfo::new(String::new(), headers)
+    };
+    let standard = assemble_permissions(
+        &ConsentContext::default(),
+        &evidence("standard"),
+        GeoStatus::Located(&geo),
+        &all_five(),
+    );
+    assert!(
+        standard.is_set(Permission::StoreOnDevice)
+            && standard.is_set(Permission::SelectBasicAds)
+            && !standard.is_set(Permission::SelectPersonalisedAds)
+            && !standard.is_awaited(Permission::SelectPersonalisedAds),
+        "standard grants storage and contextual advertising and refuses targeting"
+    );
+    assert_eq!(
+        standard.signals(),
+        &[trusted_server_core::permissions::ValidSignal::new(
+            "mtm", "mtm", "standard"
+        )],
+        "the word is the valid signal, as received"
+    );
+    assert_eq!(
+        standard
+            .tdls()
+            .iter()
+            .map(trusted_server_core::tdl::Tdl::as_str)
+            .collect::<Vec<_>>(),
+        vec!["https://m4ow.uk/mtm/2.txt"],
+        "an answer is given under the versioned Model Terms"
+    );
+    let personalized = assemble_permissions(
+        &ConsentContext::default(),
+        &evidence("personalized"),
+        GeoStatus::Located(&geo),
+        &all_five(),
+    );
+    assert!(
+        personalized.is_set(Permission::SelectPersonalisedAds),
+        "personalized grants targeting too"
+    );
+    let unanswered = assemble_permissions(
+        &ConsentContext::default(),
+        &no_evidence(),
+        GeoStatus::Located(&geo),
+        &all_five(),
+    );
+    assert!(
+        unanswered.is_awaited(Permission::SelectPersonalisedAds) && unanswered.tdls().is_empty(),
+        "with no answer the question is still open and no terms are declared"
     );
 }

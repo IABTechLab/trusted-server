@@ -5,7 +5,7 @@
 [local_server]
 
     # Maps the loopback client to California, United States, so the platform
-    # geo provider resolves a real place and the permission model applies the
+    # geo module resolves a real place and the permission model applies the
     # US/CA rules from the permissions.yaml tree. This replaces the retired
     # [geo] default_country lever with the genuine lookup path.
     [local_server.geolocation]
@@ -135,7 +135,7 @@
         [local_server.config_stores.edgezero_runtime_env.contents]
             EDGEZERO__SERVICES__0000000000000000000000__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME = "ts_secrets"
 
-        # Generated integration configs inject the trusted_server_config blob
+        # Generated integration configs inject the manifest-default app-config blob
         # into the store required by the Fastly entry point.
         # GENERATED_TRUSTED_SERVER_CONFIG_STORES
 

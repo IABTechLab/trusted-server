@@ -18,7 +18,7 @@ use crate::platform::{PlatformSecretStore, StoreName};
 /// [`AppConfigMeta::secret_fields`] is an associated function of the type, so
 /// every path it can return is fixed, and `EdgeZero`'s path segments have no
 /// way to say "whatever name the operator chose". A configuration can hold
-/// secrets under such a name, as an Edge Cookie provider block under a label
+/// secrets under such a name, as an Edge Cookie module block under a label
 /// does, and an implementation of this trait finds those by reading the
 /// configuration being loaded.
 pub trait ConfiguredSecretFields: AppConfigMeta {

@@ -14,13 +14,13 @@ proxy_secret = "integration_proxy_secret"
 # supplies the baseline the permission model uses.
 [geo]
 # Viceroy maps the loopback client to US/CA (see viceroy-template.toml), so
-# the platform geo provider resolves a real place and the EC lifecycle
+# the platform geo module resolves a real place and the EC lifecycle
 # scenarios exercise the US state opt-out machinery, the same posture the
 # retired default_country setting pointed at, now through the real lookup.
-provider = "platform"
+module = "platform"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 

@@ -974,7 +974,7 @@ dependencies = [
  "icu_collections",
  "icu_normalizer_data",
  "icu_properties",
- "icu_provider",
+ "icu_module",
  "smallvec",
  "zerovec",
 ]
@@ -995,7 +995,7 @@ dependencies = [
  "icu_collections",
  "icu_locale_core",
  "icu_properties_data",
- "icu_provider",
+ "icu_module",
  "zerotrie",
  "zerovec",
 ]
@@ -1007,7 +1007,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e590f038c1464a96894fd6d10127e90a8be4509f56ff7ecef851b15cee0b7caa"
 
 [[package]]
-name = "icu_provider"
+name = "icu_module"
 version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d27bbb9d3abbefac45d55f647c9de1d44aafcd1186eb91879afef17c396c3e73"

@@ -7,7 +7,7 @@
 //! - [`UsPrivacy`] / [`PrivacyFlag`] — decoded US Privacy (CCPA) 4-char string
 //! - [`TcfConsent`] — decoded TCF v2 core consent data
 //! - [`GppConsent`] — decoded GPP consent data
-//! - [`ConsentSource`] — how consent was sourced (cookie, KV store, etc.)
+//! - [`ConsentSource`] — how consent was sourced (cookie or policy default)
 
 use core::fmt;
 
@@ -149,19 +149,26 @@ pub struct ConsentContext {
 }
 
 impl ConsentContext {
-    /// Whether any consent record is present in raw form but failed to decode.
+    /// Keeps only the raw strings a configured module vouched for, so a
+    /// signal that was absent, unreadable, expired or not acted on is never
+    /// forwarded in a bid request or anywhere else this context is read.
     ///
-    /// A malformed record is not the same as no record: the visitor expressed
-    /// a preference that could not be read, so the permission mapping blocks
-    /// baseline grants (fail-closed) instead of degrading to the no-signal
-    /// baseline. An expired TCF record is excluded because expiry is its own
-    /// explicit state ([`expired`](Self::expired)): the raw string is kept for
-    /// proxy forwarding while the decoded record is deliberately cleared.
-    #[must_use]
-    pub fn has_malformed_record(&self) -> bool {
-        (self.raw_tc_string.is_some() && self.tcf.is_none() && !self.expired)
-            || (self.raw_gpp_string.is_some() && self.gpp.is_none())
-            || (self.raw_us_privacy.is_some() && self.us_privacy.is_none())
+    /// `signals` are the [`ValidSignal`]s on the assembled permission state,
+    /// matched by scheme. The decoded records are left alone, because a
+    /// decoded record only exists where the raw string was readable and the
+    /// modules have already read it.
+    pub fn keep_only(&mut self, signals: &[crate::permissions::ValidSignal]) {
+        let vouched = |scheme: &str| signals.iter().any(|signal| signal.scheme == scheme);
+        if !vouched("tcf") {
+            self.raw_tc_string = None;
+        }
+        if !vouched("gpp") {
+            self.raw_gpp_string = None;
+            self.gpp_section_ids = None;
+        }
+        if !vouched("us_privacy") {
+            self.raw_us_privacy = None;
+        }
     }
 
     /// Returns `true` when no consent signals are present.
@@ -394,8 +401,6 @@ impl fmt::Display for UsPrivacy {
 pub enum ConsentSource {
     /// Read from cookies on the incoming request.
     Cookie,
-    /// Loaded from KV store via Edge Cookie (EC) ID lookup.
-    KvStore,
     /// Applied from explicit publisher policy defaults.
     PolicyDefault,
     /// No consent data available.

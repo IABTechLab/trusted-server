@@ -64,7 +64,7 @@ pub fn handle_identify(
     // Identify returns the partner's UID for this visitor, which is sharing
     // the identity beyond the edge, so it needs the same permission pair as
     // bidstream EIDs (storage plus personalised-ad selection), not only the
-    // provider's storage permission.
+    // module's storage permission.
     if !ec_context.ec_sharing_allowed() {
         return json_response_with_origin(
             StatusCode::FORBIDDEN,
@@ -90,11 +90,11 @@ pub fn handle_identify(
     let mut uid: Option<String> = None;
     let mut cluster_size: Option<u32> = None;
 
-    // Read the identity-graph row under the provider's canonical form of the
+    // Read the identity-graph row under the module's canonical form of the
     // identifier, the same key generation wrote, rather than under the value the
     // browser carries. The two are the same string for the built-in HMAC
-    // provider and differ for any provider whose canonical form is not the
-    // cookie value. `None` means no provider this deployment reads owns the
+    // module and differ for any module whose canonical form is not the
+    // cookie value. `None` means no module this deployment reads owns the
     // identifier, so there is no row to look for and the response is not
     // degraded.
     if let Some(kv_key) = ec_context.ec_kv_key() {
@@ -773,8 +773,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_identify_reads_the_row_under_the_providers_canonical_key() {
-        // A provider whose canonical form is not the cookie value keys its row
+    fn handle_identify_reads_the_row_under_the_modules_canonical_key() {
+        // A module whose canonical form is not the cookie value keys its row
         // under the canonical form at generation. Identify has to look there,
         // or every such deployment reads a miss for every request and reports
         // no partner UID at all.
@@ -798,9 +798,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
         let ec_context = make_ec_context(true, Some(CANONICAL_COOKIE_VALUE))
-            .with_provider_for_test(std::sync::Arc::new(
-                crate::ec::tests::CanonicalizingProvider,
-            ));
+            .with_module_for_test(std::sync::Arc::new(crate::ec::tests::CanonicalizingModule));
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should build identify response");
@@ -816,7 +814,7 @@ mod tests {
         );
         assert_eq!(
             body["uid"], "partner-uid-123",
-            "should find the row generation keyed by the provider's canonical form"
+            "should find the row generation keyed by the module's canonical form"
         );
         assert_eq!(
             body["degraded"],

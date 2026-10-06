@@ -4,7 +4,7 @@
 #
 # The vocabulary is not ours. The permissions are the IAB Tech Lab Privacy
 # Taxonomy Data Uses, with the IAB TCF Europe purposes mapped onto them where
-# no Data Use exists yet. That is deliberate, because a permission a provider
+# no Data Use exists yet. That is deliberate, because a permission a module
 # declares should be stated in the industry's own terms rather than in a
 # vocabulary this project invented, so a reader can check it against the
 # taxonomy rather than against us.
@@ -57,7 +57,7 @@
 # applies there. A node that names none inherits the nearest one above it. The
 # top of the tree must name both `group` and `jurisdiction`, so inheritance
 # always ends somewhere, and the top node is also the answer for a visitor whose
-# place the geo provider could not resolve at all.
+# place the geo module could not resolve at all.
 #
 # A `jurisdiction` is one of:
 #   gdpr           the EU, EEA and UK regime
@@ -67,12 +67,12 @@
 #   non-regulated  a place with no matching regulation
 #   unknown        declining to name one
 #
-# Place codes are the codes a geo provider returns, matched without regard to
+# Place codes are the codes a geo module returns, matched without regard to
 # upper or lower case:
 #   country  ISO 3166-1 alpha-2 (for example FR, US, GB)
 #   region   ISO 3166-2 subdivision, with no country prefix (for example CA for
 #            California, written under US)
-# The Fastly geo provider emits these codes directly, and any other provider
+# The Fastly geo module emits these codes directly, and any other module
 # must do the same. Those codes are at most three letters long, so a place code
 # can never be confused with the reserved words `group`, `jurisdiction` and
 # `permissions`. Where the tree puts a code also tells the two DE codes apart,
@@ -84,9 +84,9 @@
 # otherwise on their country, otherwise on the top of the tree. So the top node
 # is also the answer for a country nobody has written a rule for.
 #
-# A geo provider that reports an outright lookup failure is the exception. It
+# A geo module that reports an outright lookup failure is the exception. It
 # resolves every permission to the requires-signal floor, and its jurisdiction
-# to unknown, rather than to the top of the tree, though no geo provider shipped
+# to unknown, rather than to the top of the tree, though no geo module shipped
 # today reports one.
 # A permission flag is one of:
 #   granted          set without any signal (for example strictly necessary)
@@ -357,7 +357,7 @@ groups:
 # `group:` line and the rest beside it. See the header for the full format.
 rules:
   # The whole world. `group` is the baseline for a visitor whose place the geo
-  # provider could not resolve, and `jurisdiction` is the consent handling for
+  # module could not resolve, and `jurisdiction` is the consent handling for
   # that same visitor. Both are required, and every country below inherits the
   # jurisdiction unless it names its own.
   group: gdpr-eu
@@ -511,27 +511,27 @@ rules:
 #
 # What a scheme's own signal means is not here. Which TCF purpose grants which
 # Data Use is the TCF scheme's knowledge and lives in the TCF permission signal
-# provider crate, crates/permission-signal/tcf, so a deployment that runs no
+# module crate, crates/permission-signal/tcf, so a deployment that runs no
 # TCF carries no table of another scheme's numbers. Which schemes run at all,
-# and in what order, is [permission_signal] provider in trusted-server.toml.
+# and in what order, is [permission_signal] module in trusted-server.toml.
 signals:
   # A present TCF v2 record (a standalone TC string, or the EU TCF section of a
   # GPP string). With authoritative true, the record's consent to a purpose
-  # grants the Data Uses the TCF provider maps to that purpose, and its refusal
+  # grants the Data Uses the TCF module maps to that purpose, and its refusal
   # revokes them, whereas with authoritative false the record is ignored.
   # The flag governs only whether the record answers. Whether its answer
   # stands over an opt-out signal below, or the opt-out over it, is the order
-  # the providers are asked in, [permission_signal] provider in
-  # trusted-server.toml, where the last provider with an opinion decides. The
+  # the modules are asked in, [permission_signal] module in
+  # trusted-server.toml, where the last module with an opinion decides. The
   # default order asks Global Privacy Control first, being a browser setting
   # with no interface of its own, and the schemes carrying a choice someone
   # made through an interface after.
   tcf:
     authoritative: true
   # US-style opt-out of sale or sharing. It applies when any listed source is
-  # set, and its provider revokes the Data Uses listed here. Whether that
+  # set, and its module revokes the Data Uses listed here. Whether that
   # revoke stands when a TCF record consents to the same Data Use depends on
-  # the provider order, see above. The list below models the US state opt-out
+  # the module order, see above. The list below models the US state opt-out
   # scope, being sale, sharing, targeted advertising, and device storage as
   # the conservative reading, so an opted-out visitor gets no Edge Cookie
   # written and no identifier shared, while contextual advertising and

@@ -1,10 +1,10 @@
-//! Provider permissions: a technical permission model gating provider execution.
+//! Module permissions: a technical permission model gating module execution.
 //!
-//! A provider advertises the [`Permission`]s its data use *requires*. Trusted
+//! A module advertises the [`Permission`]s its data use *requires*. Trusted
 //! Server resolves which permissions are currently *set* from the session's
 //! signals and the country it resolves to, and refuses to run the Edge Cookie
-//! provider when its required permissions are not set. The device and geo
-//! providers declare their requirements through the same method, and the
+//! module when its required permissions are not set. The device and geo
+//! modules declare their requirements through the same method, and the
 //! built-in ones require none; gating their execution on that declaration is
 //! follow-up work.
 //!
@@ -26,15 +26,14 @@
 //!
 //! Resolution takes the most specific match and falls back to the node above:
 //! the request's region when it is listed, otherwise its country, otherwise
-//! the top of the tree. So a request with no country at all (no geo provider,
+//! the top of the tree. So a request with no country at all (no geo module,
 //! or a lookup that resolved nothing), and a request whose country has no rule,
 //! both resolve to the top node's group. The top node also declares the
 //! `jurisdiction` the consent gates use for a visitor whose place could not be
-//! resolved (see [`PermissionMaps::default_jurisdiction`]). A geo provider that
+//! resolved (see [`PermissionMaps::default_jurisdiction`]). A geo module that
 //! reports an outright lookup failure is the exception, resolving every
 //! permission to the requires-signal floor rather than the top node (see
-//! [`PermissionMaps::floor_with`]), though no geo provider shipped today
-//! reports one.
+//! [`PermissionMaps::floor_with`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -45,18 +44,17 @@ use serde_yaml_ng::Value;
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::tdl::Tdl;
 
-/// A technical permission a provider may require, labeled with its IAB Privacy
+/// A technical permission a module may require, labeled with its IAB Privacy
 /// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
 ///
 /// Only the identifier is used, with no TCF or taxonomy policy implemented. Every
 /// named variant with a TCF purpose in `permissions.yaml` is resolved against
 /// the session's signals. Only [`Permission::StoreOnDevice`] (and
-/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped provider
-/// today.
+/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
-    /// TCF Purpose 1, store and/or access information on a device. It gates the
-    /// built-in Edge Cookie provider today. No IAB Privacy Taxonomy Data Use exists
+    /// TCF Purpose 1, store and/or access information on a device. It gates
+    /// every shipped Edge Cookie module. No IAB Privacy Taxonomy Data Use exists
     /// for device storage yet, so this uses a proposed `necessary.operations`
     /// key pending an upstream addition.
     StoreOnDevice,
@@ -80,11 +78,12 @@ pub enum Permission {
     DevelopServices,
     /// TCF Purpose 11, use limited data to select content. No IAB Privacy
     /// Taxonomy Data Use exists for limited-data content selection yet, so this
-    /// keeps its TCF identifier and is proposed upstream. Not gated today.
+    /// keeps its TCF identifier and is proposed upstream. No shipped module
+    /// gates on it.
     SelectBasicContent,
     /// An IAB Privacy Taxonomy Data Use with no dedicated variant, identified by
     /// its index into [`EXTRA_DATA_USES`]. These carry a policy flag in
-    /// `permissions.yaml` for completeness; no provider gates on them today.
+    /// `permissions.yaml` for completeness, and no shipped module gates on them.
     Extra(u8),
 }
 
@@ -105,8 +104,8 @@ const NAMED_DATA_USES: [&str; 11] = [
 ];
 
 /// Every other IAB Privacy Taxonomy Data Use, carried so `permissions.yaml` can
-/// set a policy flag for the whole taxonomy (bit index 11..). No provider gates
-/// on these today; they exist for completeness, testing, and demonstration.
+/// set a policy flag for the whole taxonomy (bit index 11..). No shipped module
+/// gates on these. They exist for completeness, testing, and demonstration.
 const EXTRA_DATA_USES: [&str; 53] = [
     "advertising_marketing",
     "advertising_marketing.communications",
@@ -239,7 +238,7 @@ impl core::fmt::Display for Permission {
 /// A set of [`Permission`]s, stored as a bitset keyed by each permission's bit
 /// index.
 ///
-/// Used both for what a provider requires and for what Trusted Server has set.
+/// Used both for what a module requires and for what Trusted Server has set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PermissionSet(u128);
 
@@ -274,9 +273,21 @@ impl PermissionSet {
         self.0 & other.0 == other.0
     }
 
+    /// The permissions in both this set and `other`.
+    #[must_use]
+    pub const fn intersect(self, other: PermissionSet) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The permissions in either this set or `other`.
+    #[must_use]
+    pub const fn union(self, other: PermissionSet) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// Iterates the permissions in the set, in bit-index order.
     ///
-    /// The built-ins read nothing from the full set; this serves a provider or
+    /// The built-ins read nothing from the full set; this serves a module or
     /// diagnostic path that enumerates what is present.
     pub fn iter(self) -> impl Iterator<Item = Permission> {
         Permission::all().filter(move |p| self.contains(*p))
@@ -292,7 +303,7 @@ impl FromIterator<Permission> for PermissionSet {
 
 /// How a permission is acquired in a given country.
 ///
-/// This is intentionally country-keyed, not provider-keyed: a provider only
+/// This is intentionally country-keyed, not module-keyed: a module only
 /// advertises *which* permissions it needs, and the country's rules decide *how*
 /// each is obtained.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -381,18 +392,18 @@ enum RevokeSet {
 /// `signals` section of `permissions.yaml`.
 ///
 /// The permission model holds this as data so a deployment changes it without
-/// changing a provider. It is jurisdiction-free, and it carries only the
+/// changing a module. It is jurisdiction-free, and it carries only the
 /// decisions that are a deployment's to make: whether a TCF record answers at
 /// all, which signals count as a US-style opt-out, and what an opt-out takes
 /// away. What each scheme's own signal means, such as which TCF purpose grants
-/// which Data Use, is that scheme's provider crate's, not this policy's. The
+/// which Data Use, is that scheme's module crate's, not this policy's. The
 /// country/region baseline decides the rest.
 #[derive(Debug, Clone, Default)]
 pub struct SignalPolicy {
     /// Whether a present TCF record's grants and revokes apply. Whether a
     /// consenting record then stands over an opt-out, or the opt-out over it,
-    /// is decided by the order the providers are asked in, which is
-    /// `[permission_signal] provider`, not by this flag.
+    /// is decided by the order the modules are asked in, which is
+    /// `[permission_signal] module`, not by this flag.
     tcf_authoritative: bool,
     /// The signals that constitute a US-style opt-out.
     opt_out_sources: Vec<OptOutSource>,
@@ -457,7 +468,7 @@ fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsEr
 
 /// The place tree from `permissions.yaml`, flattened for lookup.
 ///
-/// `by_country` is keyed on the ISO 3166-1 alpha-2 code a geo provider returns
+/// `by_country` is keyed on the ISO 3166-1 alpha-2 code a geo module returns
 /// (upper-cased). `by_region` keeps the finer rules written under a country,
 /// keyed by country and region (for example a US state), which take precedence
 /// over the country entry. `default_rules` is the top node's group, the answer
@@ -502,8 +513,8 @@ impl PermissionMaps {
     /// `permissions.yaml`. The consent mapping reads this rather than encoding
     /// any signal policy in the code.
     #[must_use]
-    // Public because the permission signal provider crates live outside core
-    // and read the deployment's policy, in their tests and where a provider
+    // Public because the permission signal module crates live outside core
+    // and read the deployment's policy, in their tests and where a module
     // needs the shipped decisions rather than a policy built by hand.
     pub fn signals(&self) -> &SignalPolicy {
         &self.signals
@@ -517,7 +528,7 @@ impl PermissionMaps {
     }
 
     /// Registers explicit rules for a region within a country, keyed by the ISO
-    /// 3166-1 alpha-2 country and the geo provider's region code (for example
+    /// 3166-1 alpha-2 country and the geo module's region code (for example
     /// `US` and `CA`).
     ///
     /// A region entry takes precedence over the country entry, so a deployer can
@@ -551,7 +562,7 @@ impl PermissionMaps {
     }
 
     /// The jurisdiction the policy declares for a visitor whose place the geo
-    /// provider could not resolve, taken from the top of the `rules:` tree.
+    /// module could not resolve, taken from the top of the `rules:` tree.
     ///
     /// The consent gates resolve a jurisdiction from the request's place, so
     /// with no place they would resolve [`Jurisdiction::Unknown`] and fail
@@ -673,7 +684,7 @@ impl PermissionMaps {
     /// Resolves the permission state for a request: the place baseline
     /// augmented by a session signal.
     ///
-    /// `country` and `region` are what a geo provider returns (`region` may be
+    /// `country` and `region` are what a geo module returns (`region` may be
     /// `None`). Whatever the tree does not answer falls back to the node above,
     /// ending at the top node, so an unlisted country and a request with no
     /// country at all both resolve to the top node's group. `signal` maps each
@@ -695,7 +706,7 @@ impl PermissionMaps {
     /// Resolves every permission at the requires-signal floor, whatever the
     /// policy tree says.
     ///
-    /// This is the state for a geo provider that reported an outright lookup
+    /// This is the state for a geo module that reported an outright lookup
     /// failure. The request's place is unknown in a way the policy's top node
     /// must not paper over, so nothing is set unless the session's signals
     /// grant it.
@@ -714,22 +725,27 @@ impl PermissionMaps {
     ) -> PermissionState {
         let acquisition =
             |permission| rules.map_or(Acquisition::RequiresSignal, |r| r.rule_for(permission));
-        let set = Permission::all()
-            .filter(|&permission| {
-                // The baseline is passed to the signal as well as applied to
-                // its answer, because a source amends the place rules and
-                // cannot amend what it cannot see.
-                let baseline = acquisition(permission);
-                match (baseline, signal(permission, baseline)) {
-                    (Acquisition::Denied, _) => false,
-                    (Acquisition::Granted, ConsentSignal::Revoke) => false,
-                    (Acquisition::Granted, _) => true,
-                    (Acquisition::RequiresSignal, ConsentSignal::Grant) => true,
-                    (Acquisition::RequiresSignal, _) => false,
+        let mut set = PermissionSet::none();
+        let mut awaiting = PermissionSet::none();
+        for permission in Permission::all() {
+            // The baseline is passed to the signal as well as applied to its
+            // answer, because a source amends the place rules and cannot
+            // amend what it cannot see.
+            let baseline = acquisition(permission);
+            match (baseline, signal(permission, baseline)) {
+                (Acquisition::Denied, _) => {}
+                (Acquisition::Granted, ConsentSignal::Revoke) => {}
+                (Acquisition::Granted, _) => set = set.with(permission),
+                (Acquisition::RequiresSignal, ConsentSignal::Grant) => set = set.with(permission),
+                (Acquisition::RequiresSignal, ConsentSignal::Revoke) => {}
+                // Requires a signal and nobody gave one. Not set, and not
+                // refused either, which the page has to be able to tell apart.
+                (Acquisition::RequiresSignal, ConsentSignal::Neutral) => {
+                    awaiting = awaiting.with(permission);
                 }
-            })
-            .collect();
-        PermissionState::new(set)
+            }
+        }
+        PermissionState::new(set).with_awaiting(awaiting)
     }
 
     /// The baseline permission state for a country and region with no session
@@ -762,13 +778,48 @@ impl PermissionMaps {
     }
 }
 
+/// A signal a module read from the request and found valid, as it was
+/// received.
+///
+/// The permission state carries one of these for every signal a configured
+/// module used, so whatever reads the state can rely on exactly those
+/// signals and no other. A signal that was absent, could not be read, or
+/// that no configured module acts on is not here, and nothing says why,
+/// because the module for that scheme has already decided what its
+/// absence means for the permissions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ValidSignal {
+    /// The module that read and used the signal, by its configured id.
+    pub module: &'static str,
+    /// The scheme the signal belongs to, for example `tcf` or `gpp`, so a
+    /// reader can find a scheme without knowing which module read it.
+    pub scheme: &'static str,
+    /// The signal as it was received.
+    pub value: String,
+}
+
+impl ValidSignal {
+    /// A valid signal of `scheme`, read by `module`, as received.
+    #[must_use]
+    pub fn new(module: &'static str, scheme: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            module,
+            scheme,
+            value: value.into(),
+        }
+    }
+}
+
 /// The permissions Trusted Server currently has set for a request.
 ///
-/// A provider executes only when [`all_set`](Self::all_set) of its required
+/// A module executes only when [`all_set`](Self::all_set) of its required
 /// permissions returns `true`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PermissionState {
     set: PermissionSet,
+    /// The permissions whose baseline requires a signal and for which no
+    /// configured module gave one. See [`awaiting`](Self::awaiting).
+    awaiting: PermissionSet,
     /// Whether the request explicitly withdrew device storage, as opposed to
     /// storage merely not being set. See
     /// [`storage_withdrawn`](Self::storage_withdrawn).
@@ -777,6 +828,9 @@ pub struct PermissionState {
     /// [`tdls`](Self::tdls). Shared rather than owned because the state is
     /// cloned along the request path and the list is the same list.
     tdls: Arc<[Tdl]>,
+    /// The signals the configured modules read and found valid. See
+    /// [`signals`](Self::signals).
+    signals: Arc<[ValidSignal]>,
 }
 
 impl PermissionState {
@@ -787,13 +841,57 @@ impl PermissionState {
     pub fn new(set: PermissionSet) -> Self {
         Self {
             set,
+            awaiting: PermissionSet::none(),
             storage_withdrawn: false,
             tdls: Arc::default(),
+            signals: Arc::default(),
         }
     }
 
+    /// The same state, recording which permissions are still waiting for a
+    /// signal. Set by resolution from the baseline and the modules' answers.
+    #[must_use]
+    pub fn with_awaiting(self, awaiting: PermissionSet) -> Self {
+        Self { awaiting, ..self }
+    }
+
+    /// The same state, awaiting only the permissions in `answerable`.
+    ///
+    /// Resolution records every permission that requires a signal and got
+    /// none. Some of those no configured module could ever grant, for
+    /// example a marketing channel opt-in in a deployment whose modules can
+    /// grant none, and a page told to wait for them would wait for ever. So
+    /// the assembly narrows the list to what some module declares it can
+    /// grant, and the rest are simply not set.
+    #[must_use]
+    pub fn awaiting_only(self, answerable: PermissionSet) -> Self {
+        Self {
+            awaiting: self.awaiting.intersect(answerable),
+            ..self
+        }
+    }
+
+    /// The permissions whose baseline requires a signal and for which every
+    /// configured module answered neutral, so nobody has answered yet.
+    ///
+    /// This is different from a permission that is not set. A refused
+    /// permission and one nobody has answered look the same in
+    /// [`permissions`](Self::permissions), and a page that cannot tell them
+    /// apart treats a prompt that never ran as a visitor who said no. A
+    /// permission is never both set and awaited.
+    #[must_use]
+    pub const fn awaiting(&self) -> PermissionSet {
+        self.awaiting
+    }
+
+    /// Whether a permission is still waiting for a signal.
+    #[must_use]
+    pub const fn is_awaited(&self, permission: Permission) -> bool {
+        self.awaiting.contains(permission)
+    }
+
     /// The same state, recording whether device storage was explicitly
-    /// withdrawn. Set by assembly from what the signal providers answered,
+    /// withdrawn. Set by assembly from what the signal modules answered,
     /// scoped to the jurisdiction's storage baseline.
     #[must_use]
     pub fn with_storage_withdrawn(self, storage_withdrawn: bool) -> Self {
@@ -804,15 +902,35 @@ impl PermissionState {
     }
 
     /// The same state, carrying the terms documents the data for this request
-    /// is available under. Set by assembly from what the signal providers
+    /// is available under. Set by assembly from what the signal modules
     /// declared, in the order they are asked.
     #[must_use]
     pub fn with_tdls(self, tdls: Arc<[Tdl]>) -> Self {
         Self { tdls, ..self }
     }
 
+    /// The same state, carrying the signals the modules read and found
+    /// valid. Set by assembly, in the order the modules are asked.
+    #[must_use]
+    pub fn with_signals(self, signals: Arc<[ValidSignal]>) -> Self {
+        Self { signals, ..self }
+    }
+
+    /// The signals the configured modules read from the request and
+    /// found valid, each as it was received.
+    ///
+    /// This is the list a page, a bid request or a person reading the state
+    /// relies on. A signal that is not here was absent, could not be read, or
+    /// is one no configured module acts on, and the module for its
+    /// scheme has already decided what that means for the permissions, so
+    /// nothing downstream needs to reason about the signal itself.
+    #[must_use]
+    pub fn signals(&self) -> &[ValidSignal] {
+        &self.signals
+    }
+
     /// The terms documents the data for this request is available under, in
-    /// the order the providers were asked.
+    /// the order the modules were asked.
     ///
     /// Whoever receives the data reads these to decide whether the terms are
     /// ones they accept, and whether they may pass the data on. An empty list
@@ -831,7 +949,7 @@ impl PermissionState {
     /// permission that is simply not set strips the Edge Cookie response
     /// headers and leaves an already-issued identifier alone, so a returning
     /// visitor is not permanently withdrawn before they ever get to answer.
-    /// Which scheme can withdraw is each provider's to say, and only where the
+    /// Which scheme can withdraw is each module's to say, and only where the
     /// jurisdiction's storage baseline did not grant storage outright.
     #[must_use]
     pub const fn storage_withdrawn(&self) -> bool {
@@ -845,13 +963,13 @@ impl PermissionState {
     }
 
     /// Whether every permission in `required` is set. An empty requirement is
-    /// always satisfied, so a provider that requires nothing always runs.
+    /// always satisfied, so a module that requires nothing always runs.
     #[must_use]
     pub const fn all_set(&self, required: PermissionSet) -> bool {
         self.set.contains_all(required)
     }
 
-    /// The full set of permissions that are set, for a provider that adapts its
+    /// The full set of permissions that are set, for a module that adapts its
     /// behavior to whatever is present.
     #[must_use]
     pub const fn permissions(&self) -> PermissionSet {
@@ -863,12 +981,18 @@ impl PermissionState {
     ///
     /// Names are the [`Permission::as_str`] Data Use identifiers, sorted so the
     /// same state always serializes to the same bytes whatever order the set
-    /// was built in. `tdls` carries the terms documents the data is available
-    /// under, in the order the providers were asked, so a page module reads the
-    /// terms alongside the permissions. An empty state renders as
-    /// `{"set":[],"tdls":[]}`, and both are answers (nothing is set, no terms
-    /// were declared) rather than missing values, so page code never has to
-    /// tell the two apart.
+    /// was built in. `awaiting` names the permissions still waiting for a
+    /// signal, so a page can hold what depends on them rather than read
+    /// "nobody has answered" as "refused". `tdls` carries the terms documents
+    /// the data is available under, in the order the modules were asked, so
+    /// a page module reads the terms alongside the permissions. `signals`
+    /// carries the signals the modules read and found valid, each as it was
+    /// received, so a page relies on exactly what the state was built from.
+    /// An empty state renders as
+    /// `{"awaiting":[],"set":[],"signals":[],"tdls":[]}`, and all four are
+    /// answers (nothing is set, nothing is awaited, no signal was valid, no
+    /// terms were declared) rather than missing values, so page code never
+    /// has to tell them apart.
     ///
     /// This is the only place the page shape is spelled, so no caller writes
     /// the JSON by hand.
@@ -885,20 +1009,29 @@ impl PermissionState {
     /// );
     /// assert_eq!(
     ///     state.page_json(),
-    ///     r#"{"set":["necessary.operations.storage"],"tdls":[]}"#
+    ///     r#"{"awaiting":[],"set":["necessary.operations.storage"],"signals":[],"tdls":[]}"#
     /// );
     ///
     /// assert_eq!(
     ///     PermissionState::default().page_json(),
-    ///     r#"{"set":[],"tdls":[]}"#
+    ///     r#"{"awaiting":[],"set":[],"signals":[],"tdls":[]}"#
     /// );
     /// ```
     #[must_use]
     pub fn page_json(&self) -> String {
         let mut names: Vec<&'static str> = self.set.iter().map(Permission::as_str).collect();
         names.sort_unstable();
+        let mut awaiting: Vec<&'static str> =
+            self.awaiting.iter().map(Permission::as_str).collect();
+        awaiting.sort_unstable();
         let tdls: Vec<&str> = self.tdls.iter().map(Tdl::as_str).collect();
-        serde_json::json!({ "set": names, "tdls": tdls }).to_string()
+        serde_json::json!({
+            "set": names,
+            "awaiting": awaiting,
+            "signals": &*self.signals,
+            "tdls": tdls,
+        })
+        .to_string()
     }
 }
 
@@ -940,7 +1073,7 @@ struct SignalsSpec {
 ///
 /// Only whether a TCF record answers for this deployment. Which purpose grants
 /// which Data Use is the TCF scheme's own knowledge and lives in the TCF
-/// permission signal provider crate, so this file carries no table of another
+/// permission signal module crate, so this file carries no table of another
 /// scheme's numbers and a deployment running no TCF configures none.
 #[derive(Debug, Deserialize)]
 struct TcfSignalSpec {
@@ -1193,7 +1326,7 @@ fn parse_jurisdiction(
 /// neither is stored carrying what it inherits from the node above it. The top
 /// node must name both, which is what makes inheritance always terminate.
 ///
-/// The tree is three levels deep, because a geo provider returns a country and
+/// The tree is three levels deep, because a geo module returns a country and
 /// a region and nothing finer, so a place written under a region is rejected
 /// rather than silently ignored.
 fn build_rules_tree(
@@ -1309,9 +1442,9 @@ pub enum PermissionsError {
     /// A node of the `rules` tree was neither a group name nor a block.
     #[display("the rule for `{path}` must be a group name or a block with a `group:` line")]
     InvalidRule { path: String },
-    /// A place was written under a region, deeper than a geo provider resolves.
+    /// A place was written under a region, deeper than a geo module resolves.
     #[display(
-        "the rule for `{path}` has places written under it; the tree stops at a region, because that is the finest place a geo provider returns"
+        "the rule for `{path}` has places written under it; the tree stops at a region, because that is the finest place a geo module returns"
     )]
     NestedTooDeep { path: String },
     /// The YAML was malformed or did not match the expected shape.
@@ -1406,6 +1539,8 @@ mod tests {
                     "advertising_marketing.first_party.contextual",
                     "necessary.operations.storage",
                 ],
+                "awaiting": [],
+                "signals": [],
                 "tdls": [],
             })
             .to_string(),
@@ -1431,6 +1566,8 @@ mod tests {
             json,
             json!({
                 "set": ["necessary.operations.storage"],
+                "awaiting": [],
+                "signals": [],
                 "tdls": ["https://terms.example.com/marketing/2.txt"],
             })
             .to_string(),
@@ -1449,9 +1586,83 @@ mod tests {
         // Assert
         assert_eq!(
             json,
-            json!({ "set": [], "tdls": [] }).to_string(),
+            json!({ "set": [], "awaiting": [], "signals": [], "tdls": [] }).to_string(),
             "an empty state should render as an empty set and no declared terms,              not as nothing"
         );
+    }
+
+    #[test]
+    fn a_permission_requiring_a_signal_that_nobody_gave_is_awaited() {
+        // Arrange: the requires-signal floor, where every permission needs a
+        // signal, and modules that answer nothing.
+        let state = PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral);
+
+        // Assert: nothing is set and everything is awaited, which is the
+        // state a page must hold on rather than read as a refusal.
+        assert!(
+            state.permissions().is_empty(),
+            "should set nothing without a signal"
+        );
+        assert!(
+            state.is_awaited(Permission::StoreOnDevice),
+            "should record that storage is still waiting for a signal"
+        );
+        assert_eq!(
+            state.page_json(),
+            json!({
+                "set": [],
+                "awaiting": Permission::all().map(Permission::as_str).collect::<std::collections::BTreeSet<_>>(),
+                "signals": [],
+                "tdls": [],
+            })
+            .to_string(),
+            "the page should be told which permissions are still awaited"
+        );
+    }
+
+    #[test]
+    fn awaiting_is_narrowed_to_what_a_module_could_still_grant() {
+        // Arrange: the floor, where everything is awaited, and a deployment
+        // whose modules can only ever grant storage.
+        let state = PermissionMaps::floor_with(|_, _| ConsentSignal::Neutral)
+            .awaiting_only(PermissionSet::none().with(Permission::StoreOnDevice));
+
+        // Assert: storage is still awaited, and a permission nobody could
+        // grant is not, because no page should wait for it.
+        assert!(state.is_awaited(Permission::StoreOnDevice));
+        assert!(
+            !state.is_awaited(Permission::SelectPersonalisedAds),
+            "should not await a permission no configured module can grant"
+        );
+        assert!(
+            state.permissions().is_empty(),
+            "narrowing what is awaited should set nothing"
+        );
+    }
+
+    #[test]
+    fn an_answered_or_baselined_permission_is_never_awaited() {
+        // Arrange: the floor again, with a module that grants storage and
+        // revokes personalised advertising.
+        let state = PermissionMaps::floor_with(|permission, _| match permission {
+            Permission::StoreOnDevice => ConsentSignal::Grant,
+            Permission::SelectPersonalisedAds => ConsentSignal::Revoke,
+            _ => ConsentSignal::Neutral,
+        });
+
+        // Assert: a grant is set and not awaited, a refusal is neither set
+        // nor awaited, and a permission nobody answered is awaited.
+        assert!(state.is_set(Permission::StoreOnDevice));
+        assert!(
+            !state.is_awaited(Permission::StoreOnDevice),
+            "a grant is an answer"
+        );
+        assert!(!state.is_set(Permission::SelectPersonalisedAds));
+        assert!(
+            !state.is_awaited(Permission::SelectPersonalisedAds),
+            "a refusal is an answer too, and must not look like no answer"
+        );
+        assert!(state.is_awaited(Permission::SelectBasicAds));
     }
 
     #[test]
@@ -1560,7 +1771,7 @@ mod tests {
 
         assert!(
             state.all_set(PermissionSet::none()),
-            "a provider requiring nothing always runs"
+            "a module requiring nothing always runs"
         );
         assert!(
             state.all_set(PermissionSet::none().with(Permission::StoreOnDevice)),
@@ -1835,110 +2046,174 @@ rules:
         );
     }
 
+    /// Every way `PermissionMaps::from_yaml` refuses a policy, each with the
+    /// error it must report.
     #[test]
-    fn from_yaml_rejects_a_block_without_a_group() {
-        let yaml = format!(
-            "{TEST_GROUPS}\
-rules:
-  group: g
-  jurisdiction: gdpr
-  US:
-    jurisdiction: non-regulated
-"
-        );
-        let err =
-            PermissionMaps::from_yaml(&yaml).expect_err("a block with no group should be rejected");
-        assert!(
-            matches!(&err, PermissionsError::MissingGroup { path } if path == "US"),
-            "should report the missing group for US, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_top_node_without_a_group() {
-        let yaml = format!("{TEST_GROUPS}rules:\n  jurisdiction: gdpr\n  US: g\n");
-        let err = PermissionMaps::from_yaml(&yaml)
-            .expect_err("a top node with no group should be rejected");
-        assert!(
-            matches!(err, PermissionsError::MissingGroup { .. }),
-            "should report the missing top group, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_top_node_without_a_jurisdiction() {
-        let yaml = format!("{TEST_GROUPS}rules:\n  group: g\n  US: g\n");
-        let err = PermissionMaps::from_yaml(&yaml)
-            .expect_err("a top node with no jurisdiction should be rejected");
-        assert!(
-            matches!(err, PermissionsError::MissingJurisdiction),
-            "should report the missing top jurisdiction, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_an_unknown_jurisdiction() {
-        let yaml = format!("{TEST_GROUPS}rules:\n  group: g\n  jurisdiction: ccpa\n");
-        let err = PermissionMaps::from_yaml(&yaml)
-            .expect_err("an unknown jurisdiction should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownJurisdiction { .. }),
-            "should report the unknown jurisdiction, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_us_state_above_a_region() {
-        // `us-state` names no code of its own, so only a region can carry it.
-        let top = format!("{TEST_GROUPS}rules:\n  group: g\n  jurisdiction: us-state\n");
-        assert!(
-            matches!(
-                PermissionMaps::from_yaml(&top)
-                    .expect_err("us-state at the top should be rejected"),
-                PermissionsError::MisplacedUsState { .. }
+    fn from_yaml_rejects_each_malformed_policy() {
+        type Refusal = fn(&PermissionsError) -> bool;
+        // A policy given one YAML line to an element, with or without the test
+        // groups ahead of it.
+        let tree = |lines: &[&str]| format!("{TEST_GROUPS}{}\n", lines.join("\n"));
+        let policy = |lines: &[&str]| format!("{}\n", lines.join("\n"));
+        let cases: [(&str, String, Refusal); 15] = [
+            (
+                "a block without a group",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US:",
+                    "    jurisdiction: non-regulated",
+                ]),
+                |err| matches!(err, PermissionsError::MissingGroup { path } if path == "US"),
             ),
-            "the top of the tree names no state"
-        );
-        let country = format!(
-            "{TEST_GROUPS}\
-rules:
-  group: g
-  jurisdiction: gdpr
-  US:
-    group: g
-    jurisdiction: us-state
-"
-        );
-        assert!(
-            matches!(
-                PermissionMaps::from_yaml(&country)
-                    .expect_err("us-state on a country should be rejected"),
-                PermissionsError::MisplacedUsState { .. }
+            (
+                "a top node without a group",
+                tree(&["rules:", "  jurisdiction: gdpr", "  US: g"]),
+                |err| matches!(err, PermissionsError::MissingGroup { .. }),
             ),
-            "a country names no state"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_place_written_under_a_region() {
-        let yaml = format!(
-            "{TEST_GROUPS}\
-rules:
-  group: g
-  jurisdiction: gdpr
-  US:
-    group: g
-    CA:
-      group: g
-      LA:
-        group: g
-"
-        );
-        let err = PermissionMaps::from_yaml(&yaml).expect_err("a fourth level should be rejected");
-        assert!(
-            matches!(err, PermissionsError::NestedTooDeep { .. }),
-            "should report the tree being too deep, got {err:?}"
-        );
+            (
+                "a top node without a jurisdiction",
+                tree(&["rules:", "  group: g", "  US: g"]),
+                |err| matches!(err, PermissionsError::MissingJurisdiction),
+            ),
+            (
+                "an unknown jurisdiction",
+                tree(&["rules:", "  group: g", "  jurisdiction: ccpa"]),
+                |err| matches!(err, PermissionsError::UnknownJurisdiction { .. }),
+            ),
+            (
+                // `us-state` names no code of its own, so only a region can
+                // carry it.
+                "us-state at the top of the tree",
+                tree(&["rules:", "  group: g", "  jurisdiction: us-state"]),
+                |err| matches!(err, PermissionsError::MisplacedUsState { .. }),
+            ),
+            (
+                "us-state on a country",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US:",
+                    "    group: g",
+                    "    jurisdiction: us-state",
+                ]),
+                |err| matches!(err, PermissionsError::MisplacedUsState { .. }),
+            ),
+            (
+                "a place written under a region",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US:",
+                    "    group: g",
+                    "    CA:",
+                    "      group: g",
+                    "      LA:",
+                    "        group: g",
+                ]),
+                |err| matches!(err, PermissionsError::NestedTooDeep { .. }),
+            ),
+            (
+                "a rule naming a group that is not defined",
+                tree(&["rules:", "  group: missing", "  jurisdiction: gdpr"]),
+                |err| matches!(err, PermissionsError::UnknownGroup { name } if name == "missing"),
+            ),
+            (
+                "a rule that is neither a group name nor a block",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US: [1, 2]",
+                ]),
+                |err| matches!(err, PermissionsError::InvalidRule { path } if path == "US"),
+            ),
+            (
+                // A group with no `default` must list every permission, so this
+                // one, naming only storage, is rejected rather than silently
+                // leaving every other permission unset.
+                "an incomplete group without a default",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    necessary.operations.storage: granted",
+                    "rules: {}",
+                ]),
+                |err| matches!(err, PermissionsError::IncompleteGroup { .. }),
+            ),
+            (
+                "an unknown permission",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: granted",
+                    "    not-a-permission: denied",
+                    "rules: {}",
+                ]),
+                |err| matches!(err, PermissionsError::UnknownPermission { .. }),
+            ),
+            (
+                "an unknown acquisition",
+                policy(&["groups:", "  g:", "    default: maybe", "rules: {}"]),
+                |err| matches!(err, PermissionsError::UnknownAcquisition { .. }),
+            ),
+            (
+                "an override that is not an acquisition",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: granted",
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: unknown",
+                    "  US:",
+                    "    group: g",
+                    "    permissions:",
+                    "      necessary.operations.storage: enabled",
+                ]),
+                |err| matches!(err, PermissionsError::UnknownAcquisition { .. }),
+            ),
+            (
+                "two spellings of one country",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: granted",
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: unknown",
+                    "  us: g",
+                    "  US: g",
+                ]),
+                |err| matches!(err, PermissionsError::DuplicateRule { .. }),
+            ),
+            (
+                "an unknown revoke keyword",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: requires_signal",
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  FR: g",
+                    "signals:",
+                    "  us_opt_out:",
+                    "    sources: [gpc]",
+                    "    revokes: everything",
+                ]),
+                |err| matches!(err, PermissionsError::UnknownRevoke { .. }),
+            ),
+        ];
+        for (case, yaml, refusal) in cases {
+            let Err(err) = PermissionMaps::from_yaml(&yaml) else {
+                panic!("{case} should be rejected");
+            };
+            assert!(refusal(&err), "{case}: wrong refusal, got {err:?}");
+        }
     }
 
     #[test]
@@ -2154,20 +2429,6 @@ rules:
     }
 
     #[test]
-    fn from_yaml_rejects_an_incomplete_group_without_default() {
-        // A group with no `default` must list every permission, so this one
-        // (only necessary.operations.storage) is rejected rather than silently leaving the
-        // other ten unset.
-        let yaml = "groups:\n  g:\n    necessary.operations.storage: granted\nrules: {}\n";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("an incomplete group without a default should be rejected");
-        assert!(
-            matches!(err, PermissionsError::IncompleteGroup { .. }),
-            "should report an incomplete group, got {err:?}"
-        );
-    }
-
-    #[test]
     fn from_yaml_accepts_an_explicit_group_listing_every_permission() {
         // The shipped style: no `default`, every permission spelled out.
         let mut group = String::from("groups:\n  everything:\n");
@@ -2182,50 +2443,6 @@ rules:
             maps.baseline(Some("US"), None)
                 .is_set(Permission::MarketResearch),
             "every listed permission should take its flag"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_unknown_permission() {
-        let yaml = "groups:\n  g:\n    default: granted\n    not-a-permission: denied\nrules: {}\n";
-        let err =
-            PermissionMaps::from_yaml(yaml).expect_err("an unknown permission should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownPermission { .. }),
-            "should report an unknown permission, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_unknown_acquisition() {
-        let yaml = "groups:\n  g:\n    default: maybe\nrules: {}\n";
-        let err =
-            PermissionMaps::from_yaml(yaml).expect_err("an unknown acquisition should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownAcquisition { .. }),
-            "should report an unknown acquisition, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_non_acquisition_override_value() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  US:\n    group: g\n    permissions:\n      necessary.operations.storage: enabled\n";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("an unknown acquisition value should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownAcquisition { .. }),
-            "should report an unknown acquisition, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_duplicate_rule_keys_differing_only_by_case() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  us: g\n  US: g\n";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("two spellings of one country should be rejected");
-        assert!(
-            matches!(err, PermissionsError::DuplicateRule { .. }),
-            "should report the duplicate rule, got {err:?}"
         );
     }
 
@@ -2297,29 +2514,6 @@ signals:
         assert!(
             !signals.opt_out_revokes(Permission::StoreOnDevice),
             "an unlisted Data Use is not revoked by the opt-out"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_an_unknown_revoke_keyword() {
-        let yaml = "\
-groups:
-  g:
-    default: requires_signal
-rules:
-  group: g
-  jurisdiction: gdpr
-  FR: g
-signals:
-  us_opt_out:
-    sources: [gpc]
-    revokes: everything
-";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("an unknown revoke keyword should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownRevoke { .. }),
-            "should report an unknown revoke rule, got {err:?}"
         );
     }
 }
