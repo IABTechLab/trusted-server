@@ -1200,8 +1200,10 @@ mod tests {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let existing = format!("{}.ABC123", "e".repeat(64));
-        let ec_context =
-            EcContext::new_for_test_gated(Some(existing), ConsentContext::default(), true);
+        let ec_context = with_selected_module(
+            &settings,
+            EcContext::new_for_test_gated(Some(existing), ConsentContext::default(), true),
+        );
         let response = handle_ec_resolve(&settings, post(FIXED_WORD), &ec_context, Some(&graph))
             .expect("should handle resolve");
         assert_eq!(
