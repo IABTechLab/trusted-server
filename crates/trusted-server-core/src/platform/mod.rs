@@ -53,8 +53,8 @@ pub use backend_naming::{
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult, UnavailableHttpClient,
+    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
@@ -70,7 +70,7 @@ pub use template_cache::{
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
     TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
     TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
-    UnavailableTemplateCache, VaryHeaderValues, VarySpec,
+    UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
@@ -111,7 +111,7 @@ impl PlatformGeo for DisabledGeo {
 /// `provider = "none"` returns [`DisabledGeo`] instead, so a client IP is
 /// never sent to any host geo service. A selected-but-unknown provider is
 /// rejected at startup by
-/// [`GeoConfig::validate_provider_selection`](crate::settings::GeoConfig::validate_provider_selection).
+/// [`GeoConfig::validate_module_selection`](crate::settings::GeoConfig::validate_module_selection).
 #[must_use]
 pub fn build_geo_provider(
     settings: &Settings,

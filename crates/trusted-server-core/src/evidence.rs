@@ -1,10 +1,10 @@
-//! Request evidence passed to providers.
+//! Request evidence passed to modules.
 //!
-//! A provider is constructed once, from its own configuration block or by the
+//! A module is constructed once, from its own configuration block or by the
 //! adapter that injects it, and is handed the current request's evidence as a
 //! borrowed `&dyn` view on every call, for example the `request_info` argument
-//! of [`generate`](crate::ec::provider::EdgeCookieProvider::generate). Nothing
-//! per-request is stored on the provider, so the same provider serves every
+//! of [`generate`](crate::ec::module::EdgeCookieModule::generate). Nothing
+//! per-request is stored on the module, so the same module serves every
 //! request.
 //!
 //! These traits are those views. Request-scoped data outlives the live request
@@ -17,7 +17,7 @@ use http::HeaderMap;
 /// Read-only access to the current request's basic information.
 ///
 /// The request data any host can supply: the normalized client IP, the
-/// User-Agent, and request headers. A provider receives it by reference at call
+/// User-Agent, and request headers. A module receives it by reference at call
 /// time (`generate`), reads what it needs, and does not retain it.
 pub trait RequestInfo: Send + Sync + core::fmt::Debug {
     /// The normalized client IP, or `""` when the host cannot determine it.
@@ -29,10 +29,10 @@ pub trait RequestInfo: Send + Sync + core::fmt::Debug {
     /// An arbitrary request header by name (case-insensitive), or `None`.
     ///
     /// Request cookies are read through this, from the `Cookie` header (a
-    /// provider that stores values in cookies parses them from it).
+    /// module that stores values in cookies parses them from it).
     fn header(&self, name: &str) -> Option<&str>;
 
-    /// The names of all request headers present, for a provider that enumerates
+    /// The names of all request headers present, for a module that enumerates
     /// evidence (for example to forward client hints). The default is empty.
     fn header_names(&self) -> Vec<&str> {
         Vec::new()
@@ -41,7 +41,7 @@ pub trait RequestInfo: Send + Sync + core::fmt::Debug {
     /// The request path (the URL path, without the query string), or `""` when
     /// request info was built without a URL.
     ///
-    /// A provider reads the request target through this together with
+    /// A module reads the request target through this together with
     /// [`query`](Self::query); `RequestInfo` is the evidence abstraction, so more
     /// request accessors can be added here (as defaulted methods) without
     /// breaking existing implementations.
@@ -52,7 +52,7 @@ pub trait RequestInfo: Send + Sync + core::fmt::Debug {
     /// The raw request query string (the part after `?`, without the leading
     /// `?`), or `""` when the request carried none.
     ///
-    /// A provider reads request parameters through this, or the
+    /// A module reads request parameters through this, or the
     /// [`query_param`](Self::query_param) convenience. The default is empty, for
     /// request info built without a URL.
     fn query(&self) -> &str {
@@ -110,7 +110,7 @@ impl OwnedRequestInfo {
     }
 
     /// Attaches the request target (URL path and query string) to this snapshot,
-    /// so a provider can read request parameters through
+    /// so a module can read request parameters through
     /// [`query_param`](RequestInfo::query_param).
     #[must_use]
     pub fn with_request_target(mut self, path: String, query: String) -> Self {
@@ -153,11 +153,11 @@ impl RequestInfo for OwnedRequestInfo {
 ///
 /// Built at generate time from the normalized client IP and an optional borrow
 /// of the request-header snapshot core captured at read time, then passed to a
-/// provider by shared reference at call time (`generate`). It borrows rather
-/// than owns, so it must not outlive the request. A provider reads it during the
+/// module by shared reference at call time (`generate`). It borrows rather
+/// than owns, so it must not outlive the request. A module reads it during the
 /// call and does not retain it. `BorrowedRequestInfo` itself allocates nothing;
 /// the one header clone is the snapshot core takes at read time, and only when a
-/// provider is configured and the request carries no usable identifier.
+/// module is configured and the request carries no usable identifier.
 #[derive(Debug)]
 pub struct BorrowedRequestInfo<'a> {
     client_ip: &'a str,
@@ -193,7 +193,7 @@ impl<'a> BorrowedRequestInfo<'a> {
     }
 
     /// Attaches the borrowed request target (URL path and query string), so a
-    /// provider can read request parameters through
+    /// module can read request parameters through
     /// [`query_param`](RequestInfo::query_param).
     #[must_use]
     pub fn with_request_target(mut self, path: &'a str, query: &'a str) -> Self {
@@ -254,6 +254,41 @@ pub trait HostSignals: Send + Sync + core::fmt::Debug {
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_info_lists_every_attached_header_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            "ExampleAgent/1.0"
+                .parse()
+                .expect("should parse a User-Agent value"),
+        );
+        headers.insert(
+            http::header::ACCEPT_LANGUAGE,
+            "en".parse().expect("should parse an Accept-Language value"),
+        );
+        let owned = OwnedRequestInfo::new(String::new(), headers.clone());
+        let borrowed = BorrowedRequestInfo::new("", Some(&headers));
+
+        for (case, mut names) in [
+            ("the owned snapshot", owned.header_names()),
+            ("the borrowed view", borrowed.header_names()),
+        ] {
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                vec!["accept-language", "user-agent"],
+                "{case} should list every attached header name"
+            );
+        }
+        assert!(
+            BorrowedRequestInfo::new("203.0.113.5", None)
+                .header_names()
+                .is_empty(),
+            "a borrowed view built without headers should list none"
+        );
+    }
+
     fn headers_with_cookie() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -304,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_reads_cookies_from_the_header() {
+    fn a_module_reads_cookies_from_the_header() {
         let info = OwnedRequestInfo::new("203.0.113.5".to_owned(), headers_with_cookie());
         assert_eq!(
             info.header("cookie"),

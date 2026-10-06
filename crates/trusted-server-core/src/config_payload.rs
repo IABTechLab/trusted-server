@@ -17,8 +17,19 @@ use crate::settings::Settings;
 /// Canonical logical secret store used by Trusted Server app-config secrets.
 pub const DEFAULT_SECRET_STORE_ID: &str = "trusted_server_secrets";
 
+/// Default logical config-store id, from `[stores.config].default` in `edgezero.toml`.
+///
+/// Derived at build time so every adapter uses the repository manifest's default.
+pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID");
+
 /// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
+///
+/// Intentionally matches the logical store ID: an ordinary `ts config push`
+/// writes there unless `--key` selects another key. This constant does not apply
+/// runtime overrides; use [`crate::settings_data::config_key`] with the adapter's
+/// runtime configuration, or [`crate::settings_data::default_config_key`] for
+/// process-environment overrides.
+pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///
@@ -128,7 +139,7 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::provider::{HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
+    use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY};
     use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
@@ -136,8 +147,7 @@ mod tests {
         AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
     };
     use crate::test_support::tests::{
-        crate_test_settings_str, hmac_passphrase, select_hmac_provider,
-        select_host_signals_provider,
+        crate_test_settings_str, hmac_passphrase, select_hmac_module, select_host_signals_provider,
     };
 
     fn test_settings() -> Settings {
@@ -505,7 +515,7 @@ mod tests {
         let mut data =
             serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
         data["ec"] = serde_json::json!({
-            "provider": "primary",
+            "module": "primary",
             "primary": {
                 "implementation": "hmac",
                 "passphrase": "labeled-passphrase-key",
@@ -781,9 +791,9 @@ mod tests {
         let mut original = test_settings();
         original.publisher.proxy_secret =
             Redacted::new("12345678901234567890123456789012".to_string());
-        select_hmac_provider(
+        select_hmac_module(
             &mut original.ec,
-            HMAC_PROVIDER_KEY,
+            HMAC_MODULE_KEY,
             "12345678901234567890123456789012",
         );
         original.handlers[0].password = Redacted::new("true".to_string());
@@ -797,8 +807,8 @@ mod tests {
             "numeric-looking proxy secret should remain a string"
         );
         assert_eq!(
-            hmac_passphrase(&reconstructed.ec, HMAC_PROVIDER_KEY),
-            hmac_passphrase(&original.ec, HMAC_PROVIDER_KEY),
+            hmac_passphrase(&reconstructed.ec, HMAC_MODULE_KEY),
+            hmac_passphrase(&original.ec, HMAC_MODULE_KEY),
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(
@@ -840,7 +850,7 @@ mod tests {
     #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
-        select_hmac_provider(&mut settings.ec, HMAC_PROVIDER_KEY, "short_key");
+        select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "short_key");
 
         let err = load_settings(&envelope_json(&settings))
             .expect_err("should reject a short resolved passphrase");
@@ -870,9 +880,9 @@ mod tests {
         assert_eq!(
             reconstructed
                 .ec
-                .provider_blocks
+                .module_blocks
                 .get(HOST_SIGNALS_PROVIDER_KEY)
-                .and_then(crate::settings::EcProviderBlock::host_signals_settings)
+                .and_then(crate::settings::EcModuleBlock::host_signals_settings)
                 .map(|config| config.passphrase.expose().as_str()),
             Some("resolved-host-signals-passphrase-32-bytes-ok")
         );

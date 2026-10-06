@@ -35,7 +35,7 @@ use super::current_timestamp;
 pub struct PullSyncContext {
     /// The EC ID as issued, which partners receive.
     ec_id: String,
-    /// The identity-graph key for `ec_id`, the owning provider's canonical form
+    /// The identity-graph key for `ec_id`, the owning module's canonical form
     /// of it, which every identity-graph read and write in pull sync uses.
     kv_key: String,
     snapshot: EcKvSnapshot,
@@ -61,29 +61,39 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when consent denies EC, there is no active EC ID, or no
-/// provider this deployment reads owns the active EC ID.
+/// Returns `None` when there are no pull-enabled partners, when consent denies
+/// EC, when there is no active EC ID or no module this deployment reads owns
+/// it, or when the request snapshot holds no consented row that is still
+/// missing at least one pull-partner UID.
 #[must_use]
-pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
-    if !ec_context.ec_allowed() {
+pub fn build_pull_sync_context(
+    ec_context: &EcContext,
+    registry: &PartnerRegistry,
+) -> Option<PullSyncContext> {
+    if registry.pull_enabled_partners().is_empty() || !ec_context.ec_allowed() {
         return None;
     }
 
-    // Accept an identifier from whichever provider this deployment reads,
-    // dispatched by the identifier's provider code, rather than only the
-    // built-in HMAC shape. A host-signal or vendor provider's identifiers are
+    // Accept an identifier from whichever module this deployment reads,
+    // dispatched by the identifier's module code, rather than only the
+    // built-in HMAC shape. A host-signal or vendor module's identifiers are
     // valid here for the same reason they are valid in the organic path. The
-    // owning provider also supplies the identity-graph key, its canonical form
+    // owning module also supplies the identity-graph key, its canonical form
     // of the identifier, and every identity-graph read and write in
     // `dispatch_pull_sync` uses that key rather than the identifier as issued.
     let ec_id = ec_context.ec_value()?;
     let Some(kv_key) = ec_context.kv_key_for(ec_id) else {
         log::debug!(
             "Pull sync: skipping dispatch because the active EC ID is not one this \
-             deployment's providers accept"
+             deployment's modules accept"
         );
         return None;
     };
+
+    let entry = ec_context.kv_snapshot().entry_for(&kv_key)?;
+    if !entry.consent.ok || entry_is_pull_complete(entry, registry) {
+        return None;
+    }
 
     Some(PullSyncContext {
         ec_id: ec_id.to_owned(),
@@ -97,7 +107,7 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
 /// This function is best-effort: all errors are logged and swallowed.
 ///
 /// The request snapshot lookup, the revalidation read and the write-back all
-/// use the context's identity-graph key, the owning provider's canonical form
+/// use the context's identity-graph key, the owning module's canonical form
 /// of the EC ID, because that is the key the row is stored under. Partners
 /// still receive the EC ID as issued, and the per-partner rate limit key uses
 /// `ec_hash` of that EC ID.
@@ -127,6 +137,12 @@ pub fn dispatch_pull_sync(
     services: &RuntimeServices,
 ) {
     let now = current_timestamp();
+    let mut pull_partners = registry.pull_enabled_partners();
+
+    if pull_partners.is_empty() {
+        return;
+    }
+
     let Some(request_entry) = context.snapshot.entry_for(&context.kv_key) else {
         log::debug!(
             "Pull sync: skipping dispatch for '{}' because the request captured no usable \
@@ -139,8 +155,6 @@ pub fn dispatch_pull_sync(
         return;
     }
 
-    let mut pull_partners = registry.pull_enabled_partners();
-
     // Sort by source domain for deterministic ordering, then apply a rotating
     // hourly offset so that different partners get dispatch priority (§10.3).
     pull_partners.sort_by(|a, b| a.source_domain.cmp(&b.source_domain));
@@ -149,10 +163,6 @@ pub fn dispatch_pull_sync(
         "Pull sync: {} pull-enabled partners after filtering",
         pull_partners.len(),
     );
-
-    if pull_partners.is_empty() {
-        return;
-    }
 
     // Rotate the partner list so that the starting partner changes each
     // hour. This ensures fair distribution when max_concurrency limits
@@ -300,6 +310,18 @@ pub fn dispatch_pull_sync(
             );
         }
     }
+}
+
+/// Returns whether a consented live entry holds an ID for every pull-enabled
+/// partner. Always returns `false` when there are no pull-enabled partners.
+#[must_use]
+pub(crate) fn entry_is_pull_complete(entry: &KvEntry, registry: &PartnerRegistry) -> bool {
+    let pull_partners = registry.pull_enabled_partners();
+    !pull_partners.is_empty()
+        && entry.consent.ok
+        && pull_partners
+            .iter()
+            .all(|partner| !is_partner_pull_eligible(partner, Some(entry)))
 }
 
 fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>) -> bool {
@@ -562,9 +584,13 @@ mod tests {
             ..ConsentContext::default()
         };
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
 
-        let context = build_pull_sync_context(&ec_context)
+        let context = build_pull_sync_context(&ec_context, &registry)
             .expect("should build pull sync context for valid EC");
         assert_eq!(
             context.ec_id(),
@@ -573,50 +599,16 @@ mod tests {
         );
     }
 
-    /// A non-HMAC provider whose identifiers are opaque, modeling the
-    /// host-signal provider PR #1044 adds: valid identifiers that the built-in
-    /// HMAC grammar rejects outright.
-    #[derive(Debug)]
-    struct OpaqueProvider;
-
-    impl crate::ec::provider::EdgeCookieProvider for OpaqueProvider {
-        fn id(&self) -> &'static str {
-            "opaque"
-        }
-
-        fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::provider_code!("t0op")
-        }
-
-        fn generate(
-            &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::provider::IdentityInput<'_>,
-        ) -> Result<
-            crate::ec::provider::GeneratedEdgeCookie,
-            error_stack::Report<crate::error::TrustedServerError>,
-        > {
-            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
-        }
-
-        fn accepts_id(&self, value: &str) -> bool {
-            !value.is_empty()
-        }
-    }
-
     #[test]
-    fn build_pull_sync_context_accepts_the_active_non_hmac_provider() {
-        // A deployment whose active provider is not the built-in HMAC one must
-        // still dispatch pull sync for the identifiers that provider created.
-        // The built-in grammar rejected every non-`hmac` code, so these
-        // identifiers worked in the organic path and were silently skipped
-        // here.
+    fn build_pull_sync_context_accepts_the_active_non_hmac_module() {
+        // An identifier the active non-HMAC module owns is dispatched, under
+        // the key that module gives it, exactly as the organic path reads it.
         const OPAQUE_ID: &str = "t0op~Opaque_Value_MixedCase";
 
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from("opaque"));
-        let services = crate::platform::test_support::noop_services_with_ec_provider(
-            std::sync::Arc::new(OpaqueProvider),
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from("opaque"));
+        let services = crate::platform::test_support::noop_services_with_ec_module(
+            std::sync::Arc::new(crate::ec::tests::OpaqueModule),
         );
         let req = http::Request::builder()
             .method("GET")
@@ -635,7 +627,7 @@ mod tests {
             asn: None,
         };
 
-        let ec_context =
+        let mut ec_context =
             EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
                 .expect("should read EC context");
         assert_eq!(
@@ -643,13 +635,26 @@ mod tests {
             Some(OPAQUE_ID),
             "the opaque identifier should read back before pull sync sees it"
         );
+        // Pull sync dispatches for a consented row still missing a pull
+        // partner's UID, under the key the owning module derives.
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let kv_key = ec_context
+            .kv_key_for(OPAQUE_ID)
+            .expect("the opaque module should key its own identifier");
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &kv_key));
 
-        let context = build_pull_sync_context(&ec_context)
-            .expect("should dispatch pull sync for the active provider's identifier");
+        let context = build_pull_sync_context(&ec_context, &registry)
+            .expect("should dispatch pull sync for the active module's identifier");
         assert_eq!(
             context.ec_id(),
             OPAQUE_ID,
             "should carry the identifier through unchanged"
+        );
+        assert_eq!(
+            context.kv_key, OPAQUE_ID,
+            "the opaque module's identifier should be its own identity-graph key"
         );
     }
 
@@ -660,11 +665,50 @@ mod tests {
             ..ConsentContext::default()
         };
         let ec_context = EcContext::new_for_test(Some("invalid-ec".to_owned()), consent);
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
 
-        let context = build_pull_sync_context(&ec_context);
+        let context = build_pull_sync_context(&ec_context, &registry);
         assert!(
             context.is_none(),
             "should reject pull sync context when EC ID format is invalid"
+        );
+    }
+
+    #[test]
+    fn build_pull_sync_context_skips_empty_registry_and_complete_snapshot() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let mut snapshot = seed_present_snapshot(&graph, &ec_id);
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+
+        assert!(
+            build_pull_sync_context(&ec_context, &PartnerRegistry::empty()).is_none(),
+            "no pull partners should skip before graph construction"
+        );
+        assert!(
+            build_pull_sync_context(&ec_context, &registry).is_none(),
+            "an unread snapshot should skip before graph construction"
+        );
+
+        if let EcKvSnapshot::Present { entry, .. } = &mut snapshot {
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                crate::ec::kv_types::KvPartnerId {
+                    uid: "uid".to_owned(),
+                },
+            );
+        }
+        ec_context.set_kv_snapshot(snapshot);
+        assert!(
+            build_pull_sync_context(&ec_context, &registry).is_none(),
+            "a complete snapshot should skip post-send work"
         );
     }
 
@@ -687,6 +731,33 @@ mod tests {
         assert!(
             !is_partner_pull_eligible(&partner, Some(&entry)),
             "should skip dispatch when partner already has a stored UID"
+        );
+    }
+
+    #[test]
+    fn completeness_requires_all_pull_partner_ids() {
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("a.example.com"),
+            pull_enabled_ec_partner("b.example.com"),
+        ])
+        .expect("should build registry");
+        let mut entry = KvEntry::minimal("a.example.com", "uid-a", 1_000);
+
+        assert!(
+            !entry_is_pull_complete(&entry, &registry),
+            "entry missing a pull partner ID should be incomplete"
+        );
+
+        entry.ids.insert(
+            "b.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "uid-b".to_owned(),
+            },
+        );
+
+        assert!(
+            entry_is_pull_complete(&entry, &registry),
+            "entry with every pull partner ID should be complete"
         );
     }
 
@@ -867,16 +938,23 @@ mod tests {
     }
 
     #[test]
-    fn build_pull_sync_context_accepts_a_minted_coded_ec_id() {
+    fn build_pull_sync_context_accepts_a_created_coded_ec_id() {
         let consent = ConsentContext {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
         };
-        // The form the creation path produces since the provider-code envelope.
+        // The form the creation path produces, under the module code.
         let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
-        let ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let kv_key = ec_context
+            .kv_key_for(&ec_id)
+            .expect("the built-in grammar should key a coded identifier");
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &kv_key));
 
-        let context = build_pull_sync_context(&ec_context)
+        let context = build_pull_sync_context(&ec_context, &registry)
             .expect("should build pull sync context for a coded HMAC identifier");
         assert_eq!(
             context.ec_id(),
@@ -890,7 +968,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::ec::kv::TombstoneOutcome;
-    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
     use crate::error::TrustedServerError;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::EcPartner;
@@ -993,6 +1071,70 @@ mod tests {
             generation, 2,
             "two partner responses across batches must persist in exactly one bulk write"
         );
+    }
+
+    #[test]
+    fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+        ])
+        .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(
+                &ec_id,
+                &KvEntry::minimal("alpha.example.com", "existing-alpha", 1_000),
+            )
+            .expect("should seed partial entry");
+        let snapshot = graph.load_snapshot(&ec_id);
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"uid":"new-beta"}"#.to_vec());
+        let services = build_services_with_http_client(stub.clone());
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            kv_key: ec_id.clone(),
+            snapshot,
+        };
+
+        dispatch_pull_sync(
+            &settings,
+            &graph,
+            &registry,
+            &AllowAllRateLimiter,
+            &context,
+            &services,
+        );
+
+        assert_eq!(
+            stub.recorded_backend_names().len(),
+            1,
+            "should call only the missing partner"
+        );
+        let (entry, generation) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("entry should exist");
+        assert_eq!(
+            entry
+                .ids
+                .get("alpha.example.com")
+                .map(|partner_id| partner_id.uid.as_str()),
+            Some("existing-alpha"),
+            "existing UID should remain unchanged"
+        );
+        assert_eq!(
+            entry
+                .ids
+                .get("beta.example.com")
+                .map(|partner_id| partner_id.uid.as_str()),
+            Some("new-beta"),
+            "missing UID should persist"
+        );
+        assert_eq!(generation, 2, "missing UID should use one bulk CAS write");
     }
 
     #[test]
@@ -1189,11 +1331,10 @@ mod tests {
 
     #[test]
     fn dispatch_pull_sync_reads_and_writes_the_canonical_row() {
-        // The row lives under the owning provider's canonical form of the
-        // identifier, and the request snapshot is bound to that key. Keyed by
-        // the identifier as issued, pull sync found no snapshot entry for a
-        // provider whose canonical form differs from the cookie value, so it
-        // skipped every partner and wrote nothing.
+        // The row lives under the owning module's canonical form of the
+        // identifier, and the request snapshot is bound to that key, so pull
+        // sync reads and writes that key even when the canonical form differs
+        // from the cookie value.
         let mut settings = create_test_settings();
         settings.ec.pull_sync_concurrency = 4;
         let registry =
@@ -1206,15 +1347,15 @@ mod tests {
         };
         let mut ec_context =
             EcContext::new_for_test(Some(CANONICAL_COOKIE_VALUE.to_owned()), consent)
-                .with_provider_for_test(Arc::new(CanonicalizingProvider));
+                .with_module_for_test(Arc::new(CanonicalizingModule));
         ec_context.set_kv_snapshot(seed_present_snapshot(&graph, CANONICAL_KV_KEY));
 
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, br#"{"uid":"synced-uid"}"#.to_vec());
         let services = build_services_with_http_client(stub.clone());
 
-        let context = build_pull_sync_context(&ec_context)
-            .expect("should build pull sync context for the canonicalizing provider");
+        let context = build_pull_sync_context(&ec_context, &registry)
+            .expect("should build pull sync context for the canonicalizing module");
         dispatch_pull_sync(
             &settings,
             &graph,

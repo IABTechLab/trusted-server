@@ -16,7 +16,7 @@ proxy_secret = "integration_proxy_secret"
 provider = "platform"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 

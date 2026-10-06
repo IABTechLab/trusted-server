@@ -179,7 +179,7 @@ impl DeviceProvider for BuiltinDeviceProvider {
 /// Fastly entry point still reads the TLS and HTTP/2 signals on every request to
 /// build the host-signal service and client info. A
 /// selected-but-unknown provider is rejected at startup by
-/// [`DeviceConfig::validate_provider_selection`](crate::settings::DeviceConfig::validate_provider_selection),
+/// [`DeviceConfig::validate_module_selection`](crate::settings::DeviceConfig::validate_module_selection),
 /// so this falls back to the built-in provider for that case.
 #[must_use]
 pub fn build_device_provider(

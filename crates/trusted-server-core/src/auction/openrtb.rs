@@ -16,7 +16,7 @@ use super::profile::{
 use super::routing::{
     PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
 };
-use super::types::{AdFormat, AuctionResponse, Bid};
+use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
 use crate::openrtb::{
@@ -154,11 +154,20 @@ pub(crate) type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
 
 /// Build the requested-dimension index once for one provider response.
 pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+    build_bid_dimension_index_from_slots(input.slots().iter().map(ProviderSlotInput::slot))
+}
+
+/// Build the requested-dimension index from plain [`AdSlot`]s.
+///
+/// The first slot wins when several share an ID.
+pub(crate) fn build_bid_dimension_index_from_slots<'a>(
+    slots: impl IntoIterator<Item = &'a AdSlot>,
+) -> BidDimensionIndex {
     let mut index = BidDimensionIndex::new();
-    for slot in input.slots() {
+    for slot in slots {
         index
-            .entry(slot.slot().id.clone())
-            .or_insert_with(|| SlotBidDimensions::from_formats(slot.slot().formats.as_slice()));
+            .entry(slot.id.clone())
+            .or_insert_with(|| SlotBidDimensions::from_formats(slot.formats.as_slice()));
     }
     index
 }
@@ -263,6 +272,9 @@ pub(crate) fn build_request(
         return Ok(OpenRtbBuildOutcome::NoImpressions);
     }
     policy.augment_request(&mut request, input, routed)?;
+    if request.imp.is_empty() {
+        return Ok(OpenRtbBuildOutcome::NoImpressions);
+    }
     finalize_request(&mut request, policy, finalization)?;
     Ok(OpenRtbBuildOutcome::Ready(request))
 }
@@ -477,40 +489,50 @@ fn apply_prebid(
     _routed: &RoutedAuction,
     plan: &PrebidProfilePlan,
 ) -> Result<(), Report<TrustedServerError>> {
+    // Routing admits only slots with positive banner dimensions that fit in i32,
+    // so build_imp produces one impression per routed slot, in the same order.
     debug_assert_eq!(
         request.imp.len(),
         input.slots().len(),
         "should keep one impression per routed slot"
     );
-    for (imp, slot) in request.imp.iter_mut().zip(input.slots()) {
-        let bidder = slot
-            .bidder_params()
-            .iter()
-            .filter_map(|(bidder, params)| {
-                let mut params = params.clone();
-                plan.override_engine
-                    .apply_routed(bidder.as_str(), slot.prebid_zone(), &mut params);
-                params
-                    .as_object()
-                    .is_some_and(|params| !params.is_empty())
-                    .then(|| (bidder.as_str().to_string(), params))
-            })
-            .collect::<Map<_, _>>();
-        let mut prebid = Map::new();
-        if !bidder.is_empty() {
-            prebid.insert("bidder".to_string(), Value::Object(bidder));
-        } else if slot.has_trusted_stored_request() || !slot.bidder_params().is_empty() {
-            prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
-        }
-        debug_assert!(
-            !prebid.is_empty(),
-            "should never route a demandless slot to prebid-server"
-        );
-        imp.ext = Some(Map::from_iter([(
-            "prebid".to_string(),
-            Value::Object(prebid),
-        )]));
-    }
+    // Filter paired impressions and slots together so later demand keeps its slot ID.
+    request.imp = std::mem::take(&mut request.imp)
+        .into_iter()
+        .zip(input.slots())
+        .filter_map(|(mut imp, slot)| {
+            let bidder = slot
+                .bidder_params()
+                .iter()
+                .filter_map(|(bidder, params)| {
+                    let mut params = params.clone();
+                    plan.override_engine.apply_routed(
+                        bidder.as_str(),
+                        slot.prebid_zone(),
+                        &mut params,
+                    );
+                    params
+                        .as_object()
+                        .is_some_and(|params| !params.is_empty())
+                        .then(|| (bidder.as_str().to_string(), params))
+                })
+                .collect::<Map<_, _>>();
+            let mut prebid = Map::new();
+            if !bidder.is_empty() {
+                prebid.insert("bidder".to_string(), Value::Object(bidder));
+            } else if slot.allows_stored_fallback() {
+                prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
+            }
+            if prebid.is_empty() {
+                return None;
+            }
+            imp.ext = Some(Map::from_iter([(
+                "prebid".to_string(),
+                Value::Object(prebid),
+            )]));
+            Some(imp)
+        })
+        .collect();
     let mut prebid_request = Map::new();
     if plan.debug {
         prebid_request.insert("debug".to_string(), Value::Bool(true));

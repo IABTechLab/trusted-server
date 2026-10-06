@@ -33,7 +33,7 @@ fn test_settings() -> trusted_server_core::settings::Settings {
             proxy_secret = "integration-test-proxy-secret"
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
@@ -872,13 +872,13 @@ async fn first_party_proxy_rebuild_is_routed() {
 }
 
 // ---------------------------------------------------------------------------
-// Edge Cookie provider availability
+// Edge Cookie module availability
 // ---------------------------------------------------------------------------
 
-/// Test settings selecting a vendor Edge Cookie provider this adapter does not
-/// inject, with the `[ec.acme]` block that provider's settings live in.
+/// Test settings selecting a vendor Edge Cookie module this adapter does not
+/// inject, with the `[ec.acme]` block that module's settings live in.
 /// `acme` is a fictional vendor key.
-const UNINJECTED_PROVIDER_TOML: &str = r#"
+const UNINJECTED_MODULE_TOML: &str = r#"
     [[handlers]]
     path = "^/_ts/admin"
     username = "admin"
@@ -891,34 +891,34 @@ const UNINJECTED_PROVIDER_TOML: &str = r#"
     proxy_secret = "integration-test-proxy-secret"
 
     [ec]
-    provider = "acme"
+    module = "acme"
 
     [ec.acme]
     endpoint = "https://ec.acme.example.com"
 "#;
 
-/// A provider selection this adapter can never supply must fail while the
+/// A module selection this adapter can never supply must fail while the
 /// application state is built, before any request is served.
 ///
 /// Configuration validation accepts this selection, because only the adapter
-/// that injects a provider knows what that provider needs, and the Axum dev
-/// server injects no vendor Edge Cookie provider, so only the composition root
+/// that injects a module knows what that module needs, and the Axum dev
+/// server injects no vendor Edge Cookie module, so only the composition root
 /// can catch it. Without the startup check the deployment would come up and
 /// answer every request.
 #[test]
-fn selecting_a_provider_this_adapter_cannot_supply_fails_at_startup() {
-    let settings = trusted_server_core::settings::Settings::from_toml(UNINJECTED_PROVIDER_TOML)
-        .expect("should parse settings selecting an uninjected provider");
+fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
+    let settings = trusted_server_core::settings::Settings::from_toml(UNINJECTED_MODULE_TOML)
+        .expect("should parse settings selecting an uninjected module");
 
     // `RouterService` is not `Debug`, so take the error side directly rather
     // than through `expect_err`.
     let error = trusted_server_adapter_axum::app::TrustedServerApp::routes_with_settings(settings)
         .err()
-        .expect("building state with an uninjected provider should fail");
+        .expect("building state with an uninjected module should fail");
 
     assert!(
         error.to_string().contains("acme"),
-        "the startup error should name the selected provider, got: {error}"
+        "the startup error should name the selected module, got: {error}"
     );
 }
 

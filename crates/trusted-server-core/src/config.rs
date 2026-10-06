@@ -13,7 +13,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
-use crate::ec::provider::{HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
+use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_PROVIDER_KEY};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -34,7 +34,7 @@ use crate::integrations::{
     testlight::TestlightConfig,
 };
 use crate::settings::{
-    AssetOriginAuth, Ec, IntegrationConfig, PROVIDER_IMPLEMENTATION_KEY, Settings,
+    AssetOriginAuth, Ec, IntegrationConfig, MODULE_IMPLEMENTATION_KEY, Settings,
 };
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
@@ -120,7 +120,7 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
 impl Validate for TrustedServerAppConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = self.settings.validate().err().unwrap_or_default();
-        remove_labeled_provider_secret_errors(&mut errors, &self.settings.ec);
+        remove_labeled_module_secret_errors(&mut errors, &self.settings.ec);
         if let Err(report) = validate_settings_for_deploy(&self.settings) {
             errors.add(
                 DEPLOY_VALIDATION_FIELD,
@@ -135,7 +135,7 @@ impl Validate for TrustedServerAppConfig {
     }
 }
 
-/// Removes the passphrase checks on Edge Cookie provider blocks written under
+/// Removes the passphrase checks on Edge Cookie module blocks written under
 /// a label.
 ///
 /// Push-time validation reads a configuration whose secret fields hold
@@ -147,17 +147,17 @@ impl Validate for TrustedServerAppConfig {
 /// operator's choosing has no fixed path that list can hold, so its check is
 /// removed here instead. The check itself is unchanged, and runs wherever
 /// settings are loaded with their secrets resolved.
-fn remove_labeled_provider_secret_errors(errors: &mut ValidationErrors, ec: &Ec) {
+fn remove_labeled_module_secret_errors(errors: &mut ValidationErrors, ec: &Ec) {
     let Some(ValidationErrorsKind::Struct(ec_errors)) = errors.errors_mut().get_mut("ec") else {
         return;
     };
     let labeled = ec
-        .provider_blocks
+        .module_blocks
         .hmac_blocks()
         .map(|(name, _)| name)
-        .filter(|name| *name != HMAC_PROVIDER_KEY)
+        .filter(|name| *name != HMAC_MODULE_KEY)
         .chain(
-            ec.provider_blocks
+            ec.module_blocks
                 .host_signals_blocks()
                 .map(|(name, _)| name)
                 .filter(|name| *name != HOST_SIGNALS_PROVIDER_KEY),
@@ -181,13 +181,13 @@ fn remove_labeled_provider_secret_errors(errors: &mut ValidationErrors, ec: &Ec)
 }
 
 impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig {
-    /// The passphrase of every Edge Cookie provider block that configures a
-    /// provider built into core under a label.
+    /// The passphrase of every Edge Cookie module block that configures a
+    /// module built into core under a label.
     ///
     /// [`secret_fields`](edgezero_core::app_config::AppConfigMeta::secret_fields)
     /// lists the passphrases of the `[ec.hmac]` and `[ec.host_signals]`
-    /// blocks, the one path each of those providers' blocks has when its name
-    /// is its implementation. The same provider under a label of the
+    /// blocks, the one path each of those modules' blocks has when its name
+    /// is its implementation. The same module under a label of the
     /// operator's choosing holds that secret at `ec.<label>.passphrase`, which
     /// is only knowable from the configuration itself.
     fn configured_secret_fields(data: &serde_json::Value) -> Vec<SecretField> {
@@ -206,7 +206,7 @@ impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig
 }
 
 /// The names of the `[ec.<name>]` blocks in a serialized configuration that
-/// configure a provider built into core under a label.
+/// configure a module built into core under a label.
 ///
 /// A block named after the implementation it configures is the fixed path
 /// `secret_fields` already lists, and a block naming any other implementation
@@ -218,12 +218,12 @@ fn labeled_provider_block_names(data: &serde_json::Value) -> impl Iterator<Item 
         .flatten()
         .filter(|(name, block)| {
             let Some(implementation) = block
-                .get(PROVIDER_IMPLEMENTATION_KEY)
+                .get(MODULE_IMPLEMENTATION_KEY)
                 .and_then(serde_json::Value::as_str)
             else {
                 return false;
             };
-            (implementation == HMAC_PROVIDER_KEY || implementation == HOST_SIGNALS_PROVIDER_KEY)
+            (implementation == HMAC_MODULE_KEY || implementation == HOST_SIGNALS_PROVIDER_KEY)
                 && name.as_str() != implementation
         })
         .map(|(name, _)| name.clone())
@@ -243,9 +243,9 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
         vec![
             field(vec![object("publisher"), object("proxy_secret")], false),
             field(vec![object("ec"), object("passphrase")], true),
-            // The `[ec.hmac]` and `[ec.host_signals]` blocks, the providers
+            // The `[ec.hmac]` and `[ec.host_signals]` blocks, the modules
             // built into core configured under their own names, are the
-            // provider blocks with fixed paths. The same providers under a
+            // module blocks with fixed paths. The same modules under a
             // label of the operator's choosing are reached by
             // `ConfiguredSecretFields`, which reads the names out of the
             // configuration.
@@ -509,10 +509,10 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
     if let Some(passphrase) = &settings.ec.passphrase {
         validate_secret_key_reference("ec.passphrase", passphrase.expose())?;
     }
-    for (name, hmac) in settings.ec.provider_blocks.hmac_blocks() {
+    for (name, hmac) in settings.ec.module_blocks.hmac_blocks() {
         validate_secret_key_reference(&format!("ec.{name}.passphrase"), hmac.passphrase.expose())?;
     }
-    for (name, host_signals) in settings.ec.provider_blocks.host_signals_blocks() {
+    for (name, host_signals) in settings.ec.module_blocks.host_signals_blocks() {
         validate_secret_key_reference(
             &format!("ec.{name}.passphrase"),
             host_signals.passphrase.expose(),
@@ -646,9 +646,10 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
     use crate::test_support::tests::{
-        crate_test_settings_str, crate_test_settings_str_with_ec_section, select_hmac_provider,
+        crate_test_settings_str, crate_test_settings_str_with_ec_section, select_hmac_module,
     };
     use edgezero_core::app_config::AppConfigMeta;
+    use edgezero_core::blob_envelope::BlobEnvelope;
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -703,6 +704,70 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    #[test]
+    fn settings_collections_produce_stable_envelope_hashes_across_parses() {
+        let mut source = serde_json::to_value(valid_settings()).expect("should serialize settings");
+        source["response_headers"] = serde_json::json!({"x-example-b": "b", "x-example-a": "a"});
+        source["image_optimizer"] = serde_json::json!({"profile_sets": {
+            "secondary": {"profiles": {"default": "width=200", "small": "width=100"}},
+            "primary": {"profiles": {"default": "width=400", "small": "width=200"}}
+        }});
+        source["auction"]["allowed_context_keys"] = serde_json::json!([
+            "zeta", "alpha", "gamma", "beta", "epsilon", "delta", "alpha"
+        ]);
+        source["auction"]["providers"] = serde_json::json!({
+            "secondary": {
+                "protocol": "openrtb-2.6", "endpoint": "https://secondary.example.com/auction",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
+                "profile_config": {"second": 2, "first": 1}
+            },
+            "primary": {
+                "protocol": "openrtb-2.6", "endpoint": "https://primary.example.com/auction",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
+                "profile_config": {"second": 2, "first": 1}
+            }
+        });
+        source["auction"]["bidders"] = serde_json::json!({
+            "bidder-b": {"provider": "secondary"}, "bidder-a": {"provider": "primary"}
+        });
+        source["creative_opportunities"] = serde_json::json!({
+            "gam_network_id": "99999",
+            "slot": [{
+                "id": "example-slot", "page_patterns": ["/*"],
+                "formats": [{"width": 300, "height": 250}],
+                "targeting": {"section": "example", "category": "news"},
+                "providers": {"prebid": {"bidders": {
+                    "bidder-b": {"placement": "b", "account": "example"},
+                    "bidder-a": {"placement": "a", "account": "example"}
+                }}}
+            }]
+        });
+        // The base fixture also has two integrations with multiple config entries.
+        // Exercise fresh hash seeds on every parse, including nested maps.
+        let parse = || {
+            serde_json::from_value::<TrustedServerAppConfig>(source.clone())
+                .expect("should parse collection-rich settings")
+        };
+        let serialize = |config: &TrustedServerAppConfig| {
+            serde_json::to_value(config).expect("should serialize typed config")
+        };
+        let first = serialize(&parse());
+        let expected_sha = BlobEnvelope::new(first, "2026-01-01T00:00:00Z".to_owned()).sha256;
+        for _ in 0..32 {
+            let value = serialize(&parse());
+            assert_eq!(
+                value["auction"]["allowed_context_keys"],
+                serde_json::json!(["alpha", "beta", "delta", "epsilon", "gamma", "zeta"]),
+                "should sort and deduplicate allowlist keys"
+            );
+            assert_eq!(
+                BlobEnvelope::new(value, "2026-01-01T00:00:00Z".to_owned()).sha256,
+                expected_sha,
+                "should produce one envelope hash for equal settings"
+            );
+        }
     }
 
     fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
@@ -864,7 +929,7 @@ formats = [{ width = 300, height = 250 }]
     fn push_validation_accepts_secret_key_names() {
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
-        select_hmac_provider(&mut settings.ec, HMAC_PROVIDER_KEY, "ec_key");
+        select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "ec_key");
         settings.handlers[0].password = Redacted::new("handler_password".to_owned());
         settings.handlers[1].password = Redacted::new("admin_password".to_owned());
         let app_config = TrustedServerAppConfig::new(settings)
@@ -876,11 +941,11 @@ formats = [{ width = 300, height = 250 }]
         assert!(!serialized.contains("unit-test-proxy-secret"));
     }
 
-    /// The crate test configuration selecting the built-in HMAC provider
+    /// The crate test configuration selecting the built-in HMAC module
     /// under the label `primary`, with `passphrase` as the block's passphrase.
     fn labeled_hmac_settings_str(passphrase: &str) -> String {
         crate_test_settings_str_with_ec_section(&format!(
-            "[ec]\nprovider = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\npassphrase = \"{passphrase}\"\n"
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\npassphrase = \"{passphrase}\"\n"
         ))
     }
 
@@ -891,7 +956,7 @@ formats = [{ width = 300, height = 250 }]
         // the key name. `ec_key` is far shorter than any passphrase.
         let toml = labeled_hmac_settings_str("ec_key");
         let app_config: TrustedServerAppConfig =
-            toml::from_str(&toml).expect("should deserialize a labeled provider block");
+            toml::from_str(&toml).expect("should deserialize a labeled module block");
         let mut settings = app_config.into_settings();
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
 
@@ -914,7 +979,7 @@ formats = [{ width = 300, height = 250 }]
 
         let data = serde_json::json!({
             "ec": {
-                "provider": "primary",
+                "module": "primary",
                 "ec_store": "ec_identity_store",
                 "hmac": { "passphrase": "ec_key" },
                 "primary": { "implementation": "hmac", "passphrase": "labeled_ec_key" },
@@ -936,10 +1001,46 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn push_validation_keeps_the_sections_other_errors_for_a_labeled_block() {
+        // A block under a label has no fixed secret path, so push validation
+        // strips the error that judged its key name as a passphrase, and only
+        // that one: another error in the Edge Cookie section is still reported.
+        let toml = labeled_hmac_settings_str("ec_key");
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize a labeled module block");
+        let mut settings = app_config.into_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Example partner",
+                "source_domain": "https://partner.example",
+            }))
+            .expect("should deserialize a partner"),
+        ];
+
+        // Read from the section's own errors, because deploy validation
+        // reports a bad partner as well.
+        let errors = TrustedServerAppConfig { settings }
+            .validate()
+            .expect_err("an error beside the passphrase should still be reported");
+        let Some(ValidationErrorsKind::Struct(ec)) = errors.errors().get("ec") else {
+            panic!("the Edge Cookie section should keep its error: {errors}");
+        };
+        assert!(
+            ec.errors().contains_key("partners"),
+            "the partner error should be reported: {errors}"
+        );
+        assert!(
+            !ec.errors().contains_key("primary"),
+            "the key name should not be judged as a passphrase: {errors}"
+        );
+    }
+
+    #[test]
     fn push_validation_rejects_an_empty_key_name_in_a_labeled_hmac_block() {
         let toml = labeled_hmac_settings_str("");
         let app_config: TrustedServerAppConfig =
-            toml::from_str(&toml).expect("should deserialize a labeled provider block");
+            toml::from_str(&toml).expect("should deserialize a labeled module block");
         let mut settings = app_config.into_settings();
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
 
@@ -957,13 +1058,13 @@ formats = [{ width = 300, height = 250 }]
         // registered secret path, so push validation has to skip the passphrase
         // check under that name.
         let mut settings = valid_settings();
-        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
             HOST_SIGNALS_PROVIDER_KEY,
         ));
-        settings.ec.provider_blocks.clear();
-        settings.ec.provider_blocks.insert(
+        settings.ec.module_blocks.clear();
+        settings.ec.module_blocks.insert(
             HOST_SIGNALS_PROVIDER_KEY.to_owned(),
-            crate::settings::EcProviderBlock::from(crate::settings::HostSignalsProviderConfig {
+            crate::settings::EcModuleBlock::from(crate::settings::HostSignalsProviderConfig {
                 passphrase: Redacted::new("host_signals_key".to_owned()),
             }),
         );
@@ -1271,7 +1372,7 @@ origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
-provider = "hmac"
+module = "hmac"
 
 [ec.hmac]
 passphrase = "production-secret-key-32-bytes-min"
