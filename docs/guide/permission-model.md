@@ -175,10 +175,10 @@ advertise a set in the same way, and nothing gates them on it yet, so the table
 below lists only the module whose declaration currently decides whether it
 runs.
 
-| Module                  | Requires                       | Effect when not set       |
+| Module                    | Requires                       | Effect when not set       |
 | ------------------------- | ------------------------------ | ------------------------- |
 | Built-in HMAC Edge Cookie | `necessary.operations.storage` | No Edge Cookie is created |
-| A vendor-neutral module | nothing                        | Always runs               |
+| A vendor-neutral module   | nothing                        | Always runs               |
 
 The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.storage`
 (Purpose 1), because writing the cookie stores information on the device.
@@ -424,12 +424,8 @@ the `permissions.yaml` keys and `Permission::as_str()`.
     "necessary.operations.storage",
     "analytics.ad_reporting.market_research"
   ],
-  "awaiting": [
-    "advertising_marketing.first_party.targeted"
-  ],
-  "signals": [
-    { "module": "tcf", "scheme": "tcf", "value": "CP..." }
-  ],
+  "awaiting": ["advertising_marketing.first_party.targeted"],
+  "signals": [{ "module": "tcf", "scheme": "tcf", "value": "CP..." }],
   "tdls": []
 }
 ```

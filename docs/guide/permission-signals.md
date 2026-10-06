@@ -112,12 +112,12 @@ question about a jurisdiction and a publisher.
 
 ## The modules that ship
 
-| Identifier         | Crate                                 | Reads                                             |
-| ------------------ | ------------------------------------- | ------------------------------------------------- |
-| `gpc`              | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control      |
-| `gpp_sale_opt_out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string       |
-| `us_privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string           |
-| `tcf`              | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code |
+| Identifier         | Crate                                 | Reads                                                                 |
+| ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
+| `gpc`              | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                          |
+| `gpp_sale_opt_out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string                           |
+| `us_privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string                               |
+| `tcf`              | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code                     |
 | `mtm`              | `crates/permission-signal/mtm`        | The PMP answer, one of two words, under the Model Terms for Marketing |
 
 The three opt-outs are separate so that a publisher who does not act on Global
