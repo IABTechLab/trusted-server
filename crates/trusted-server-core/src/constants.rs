@@ -7,6 +7,13 @@ pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
+/// The Model Terms for Marketing preference, one of the three words
+/// `standard`, `personalized` and `non-marketing`, written as a first party
+/// cookie by whatever preference platform asked the visitor and read by the
+/// Model Terms for Marketing signal provider. Not a Trusted Server name, so
+/// that anyone can build a platform that sets it. Trusted Server reads this
+/// cookie and never writes it.
+pub const COOKIE_MTM_PREF: &str = "__mtm_pref";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");

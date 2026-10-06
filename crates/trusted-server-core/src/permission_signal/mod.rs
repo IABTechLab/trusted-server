@@ -216,7 +216,7 @@ pub trait PermissionSignalProvider: Send + Sync {
     ///
     /// A locator tells whoever receives the data what terms cover it, so
     /// they can decide whether those are terms they accept and whether they
-    /// may pass the data on. The four schemes that ship carry no terms of
+    /// may pass the data on. Four of the five schemes that ship carry no terms of
     /// their own and leave this at its default, and a provider for a terms
     /// scheme returns the document that applies to this request. Model Terms
     /// for Marketing (MTM) is the first such scheme and one of many rather
@@ -520,7 +520,7 @@ mod tests {
     }
 
     /// A provider that declares a terms document, which is what a scheme like
-    /// Model Terms for Marketing does and none of the four that ship do.
+    /// Model Terms for Marketing does and the four IAB schemes do not.
     struct Declaring(&'static str, &'static str);
 
     impl PermissionSignalProvider for Declaring {
@@ -670,7 +670,7 @@ mod tests {
         );
         assert!(
             declared.is_empty(),
-            "should declare nothing, because the four shipped schemes carry no terms"
+            "should declare nothing, because the IAB schemes carry no terms"
         );
     }
 

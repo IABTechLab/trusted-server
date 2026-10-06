@@ -21,7 +21,7 @@ browsers and standards bodies compete on it, and schemes come and go.
 Compiling a closed list of schemes into the core would settle that competition
 in code, because the schemes built in would be the only ones a deployment
 could act on, and the core maintainers would be deciding which privacy schemes
-exist. So the four that ship are crates like any other, none of them
+exist. So the five that ship are crates like any other, none of them
 privileged by being the one that happens to be built in, and a scheme the core
 has never heard of plugs in the same way.
 
@@ -35,14 +35,14 @@ lists it in full. Two purposes have no Data Use yet, so the crate carries a
 proposed key for one and the TCF identifier for the other until the taxonomy
 adds them.
 
-A scheme that is not one of the four is added the same way, as a crate that
+A scheme that is not one of the five is added the same way, as a crate that
 reads its own signal from the request, without a change to the core. The next one
 is Model Terms for Marketing (MTM), where a publisher and the parties it passes
 data to agree to be bound by a published set of terms, and what a provider
 reads is whether that agreement covers this request. MTM arrives in a following
 pull request, and it is one of many terms schemes rather than the only one,
 because a publisher, a trade body or a regulator can each publish terms and
-each set becomes a provider. The four here are a starting set and not the list.
+each set becomes a provider. The five here are a starting set and not the list.
 
 ## How a request resolves
 
@@ -74,7 +74,7 @@ deployment's to set, not the code's to assume.
 
 ```toml
 [permission_signal]
-provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf", "mtm"]
 ```
 
 A provider not on the list does not run, and there is no separate switch. A
@@ -97,7 +97,7 @@ once at startup.
 
 Providers are named in `snake_case`, lowercase words joined by underscores. A
 provider that gains settings will take them in a `[permission_signal.<name>]`
-block named for it. None of the four that ship has settings, so `provider` is
+block named for it. None of the five that ship has settings, so `provider` is
 the only key the section accepts, and a block or any other key is refused as
 an unknown field rather than ignored.
 
@@ -118,6 +118,7 @@ question about a jurisdiction and a publisher.
 | `gpp_sale_opt_out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string       |
 | `us_privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string           |
 | `tcf`              | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code |
+| `mtm`              | `crates/permission-signal/mtm`        | The PMP answer, one of two words, under the Model Terms for Marketing |
 
 The three opt-outs are separate so that a publisher who does not act on Global
 Privacy Control can remove it and keep the other two. What an opt-out takes
@@ -149,7 +150,7 @@ and no other.
 A signal that was absent, could not be read, has expired, or that no
 configured provider acts on is not in the list, and nothing says which. What
 each of those means for the permissions is the decision of the provider for
-that scheme, taken silently. The four that ship read their own unreadable
+that scheme, taken silently. The shipped providers read their own unreadable
 record as the refusal it may have carried, on the permissions their scheme
 covers, and say nothing about any other scheme. Nothing in the core answers
 ahead of the providers, so the configured order decides what a readable record
@@ -186,10 +187,10 @@ its address. A document that can be rewritten tomorrow means a recipient can
 never prove what it agreed to, and one edit silently rewrites the basis of every
 transaction already sent under it.
 
-None of the four schemes that ship carries terms, so the list is empty until a
-terms scheme runs. Model Terms for Marketing (MTM) is the first of many rather
-than the only one, since a publisher, a trade body or a regulator can each
-publish terms and each set becomes a provider.
+Of the five schemes that ship only MTM carries terms, declaring the versioned
+Model Terms document whenever a PMP answer is present. It is the first of many
+rather than the only one, since a publisher, a trade body or a regulator can
+each publish terms and each set becomes a provider.
 
 ## Withdrawal is a separate question
 
@@ -201,7 +202,7 @@ already issued identifier alone, so a returning visitor is not permanently
 withdrawn before they get to answer.
 
 Most schemes have no such notion, a browser setting and a sale opt-out
-included, and of the four that ship only TCF answers it. The core then scopes
+included, and of the five that ship only TCF answers it. The core then scopes
 the answer to the jurisdiction, so a refusal only withdraws where the storage
 baseline did not grant storage outright, because where it did the identifier
 never depended on the record.

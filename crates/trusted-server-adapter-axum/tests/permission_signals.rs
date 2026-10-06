@@ -31,10 +31,12 @@ use trusted_server_core::platform::GeoInfo;
 use trusted_server_core::settings::Settings;
 use trusted_server_permission_signal_gpc::GpcProvider;
 use trusted_server_permission_signal_gpp::GppSaleOptOutProvider;
+use trusted_server_permission_signal_mtm::MtmProvider;
 use trusted_server_permission_signal_tcf::TcfProvider;
 use trusted_server_permission_signal_us_privacy::UsPrivacyProvider;
 
-/// The four providers an adapter offers, in the default order.
+/// The four IAB providers an adapter offers, in the default order. MTM is
+/// offered after them and is tested with them below.
 fn all_four() -> Vec<Arc<dyn PermissionSignalProvider>> {
     vec![
         Arc::new(GpcProvider::new()),
@@ -42,6 +44,13 @@ fn all_four() -> Vec<Arc<dyn PermissionSignalProvider>> {
         Arc::new(UsPrivacyProvider::new()),
         Arc::new(TcfProvider::new()),
     ]
+}
+
+/// All five, as an adapter offers them.
+fn all_five() -> Vec<Arc<dyn PermissionSignalProvider>> {
+    let mut providers = all_four();
+    providers.push(Arc::new(MtmProvider::new()));
+    providers
 }
 
 /// Settings naming these identifiers in `[permission_signal] provider`.
@@ -583,5 +592,80 @@ fn a_visitor_in_the_eu_with_no_record_is_awaiting_what_tcf_could_grant() {
         !state.is_awaited(Permission::SelectPersonalisedAds)
             && !state.is_set(Permission::SelectPersonalisedAds),
         "a record refusing a purpose is a refusal, not an awaited answer"
+    );
+}
+
+#[test]
+fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them() {
+    use trusted_server_core::constants::COOKIE_MTM_PREF;
+
+    let geo = GeoInfo {
+        city: String::new(),
+        country: "FR".to_owned(),
+        continent: String::new(),
+        latitude: 0.0,
+        longitude: 0.0,
+        metro_code: 0,
+        region: None,
+        asn: None,
+    };
+    let evidence = |word: &str| {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("{COOKIE_MTM_PREF}={word}")
+                .parse()
+                .expect("should build a cookie header"),
+        );
+        OwnedRequestInfo::new(String::new(), headers)
+    };
+    let standard = assemble_permissions(
+        &ConsentContext::default(),
+        &evidence("standard"),
+        GeoStatus::Located(&geo),
+        &all_five(),
+    );
+    assert!(
+        standard.is_set(Permission::StoreOnDevice)
+            && standard.is_set(Permission::SelectBasicAds)
+            && !standard.is_set(Permission::SelectPersonalisedAds)
+            && !standard.is_awaited(Permission::SelectPersonalisedAds),
+        "standard grants storage and contextual advertising and refuses targeting"
+    );
+    assert_eq!(
+        standard.signals(),
+        &[trusted_server_core::permissions::ValidSignal::new(
+            "mtm", "mtm", "standard"
+        )],
+        "the word is the valid signal, as received"
+    );
+    assert_eq!(
+        standard
+            .tdls()
+            .iter()
+            .map(trusted_server_core::tdl::Tdl::as_str)
+            .collect::<Vec<_>>(),
+        vec!["https://m4ow.uk/mtm/2.txt"],
+        "an answer is given under the versioned Model Terms"
+    );
+    let personalized = assemble_permissions(
+        &ConsentContext::default(),
+        &evidence("personalized"),
+        GeoStatus::Located(&geo),
+        &all_five(),
+    );
+    assert!(
+        personalized.is_set(Permission::SelectPersonalisedAds),
+        "personalized grants targeting too"
+    );
+    let unanswered = assemble_permissions(
+        &ConsentContext::default(),
+        &no_evidence(),
+        GeoStatus::Located(&geo),
+        &all_five(),
+    );
+    assert!(
+        unanswered.is_awaited(Permission::SelectPersonalisedAds) && unanswered.tdls().is_empty(),
+        "with no answer the question is still open and no terms are declared"
     );
 }

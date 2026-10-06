@@ -300,6 +300,7 @@ fn shipped_signal_providers()
         Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
         Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
         Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmProvider::new()),
     ]
 }
 

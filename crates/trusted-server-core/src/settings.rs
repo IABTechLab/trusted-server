@@ -1282,7 +1282,7 @@ impl DeviceConfig {
 pub struct PermissionSignalConfig {
     /// The providers to run, in order, named by the identifier each provider
     /// crate declares, for example `gpc`, `gpp_sale_opt_out`, `us_privacy` and
-    /// `tcf` for the four that ship.
+    /// `tcf` and `mtm` for the five that ship.
     ///
     /// Absent means every provider the adapter offers, in the order it offers
     /// them. A publisher who does not want to act on one removes it from the

@@ -19,7 +19,7 @@ Core holds the trait, the ordering, the country baseline, and the policy
 vocabulary for what a deployment decides about the shipped schemes, being
 whether a TCF record answers, which signals count as a US-style opt-out and
 what an opt-out takes away. It holds no scheme's wire format and no scheme's
-meaning. Every scheme lives in its own crate outside core, including the four
+meaning. Every scheme lives in its own crate outside core, including the five
 that ship by default, so none of them is privileged by being the one that
 happens to be built in. Core does not know what a TCF purpose is, because the
 mapping from purpose to Data Use lives in the TCF crate, and a deployment
@@ -31,14 +31,16 @@ in full. Two purposes have no Data Use yet, so the crate carries a proposed
 key for one and the TCF identifier for the other until the taxonomy adds
 them.
 
-A scheme that is not one of the four is added the same way, as a crate that
-reads its own signal from the request, without a change to core. The next one
-is Model Terms for Marketing (MTM), where a publisher and the parties it passes
-data to agree to be bound by a published set of terms, and what a provider
-reads is whether that agreement covers this request. MTM arrives in a following
-pull request, and it is one of many terms schemes rather than the only one,
-because a publisher, a trade body or a regulator can each publish terms and
-each set becomes a provider. The four here are a starting set and not the list.
+A scheme that is not one of the five is added the same way, as a crate that
+reads its own signal from the request, without a change to core. The fifth,
+Model Terms for Marketing (MTM), is the first terms scheme, where a publisher
+and the parties it passes data to agree to be bound by a published set of
+terms, and what the provider reads is the visitor's answer to a preference
+platform, one of three words in the first party cookie
+`__mtm_pref`, a name any platform may set. It is one of many terms schemes
+rather than the only one, because a publisher, a trade body or a regulator can
+each publish terms and each set becomes a provider. The five here are a
+starting set and not the list.
 
 ## The hierarchy
 
@@ -78,7 +80,7 @@ a deployment's to set, not this code's to assume.
 
 ```toml
 [permission_signal]
-provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+provider = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf", "mtm"]
 ```
 
 A provider not on the list does not run, and there is no separate switch. A
@@ -96,7 +98,7 @@ a scheme being honored.
 
 Providers are named in `snake_case`, lowercase words joined by underscores. A
 provider that gains settings will take them in a `[permission_signal.<name>]`
-block named for it. None of the four here has settings, so `provider` is the
+block named for it. None of the five here has settings, so `provider` is the
 only key the section accepts, and a block or any other key is refused as an
 unknown field rather than ignored.
 
@@ -143,9 +145,9 @@ transaction already sent under it. That is a property of how the document is
 published, so the [`Tdl`](crate::tdl::Tdl) type refuses only an address nothing
 could fetch.
 
-None of the four schemes here carries terms, so the list is empty until a terms
-scheme runs, Model Terms for Marketing (MTM) being the first of many rather than
-the only one. The name matches the `tdl` member the Data Labels work puts on a
+Of the five schemes here only MTM carries terms, declaring the versioned Model
+Terms document whenever a PMP answer is present, and it is the first of many
+rather than the only one. The name matches the `tdl` member the Data Labels work puts on a
 node of an `OpenRTB` request, which is where these travel once a bid request
 carries them.
 
@@ -178,7 +180,7 @@ configured provider acts on is not in the list, and nothing says which. What
 each of those means for the permissions is the decision of the provider for
 that scheme, taken in `signal` and taken silently. Nothing is logged, because
 an unreadable record is a visitor's preference and not an operational fault.
-The four shipped providers read their own unreadable record as the refusal it
+The shipped providers read their own unreadable record as the refusal it
 may have carried, on the permissions their scheme covers, and say nothing
 about any other scheme. Core answers nothing ahead of the providers, so the
 order decides what a readable record from one scheme means beside an
@@ -230,8 +232,8 @@ from configuration.
 
 ## The providers supplied
 
-Four crates ship, under `crates/permission-signal/`, and a deployment
-configuring nothing gets all four in this order:
+Five crates ship, under `crates/permission-signal/`, and a deployment
+configuring nothing gets all five in this order:
 
 | Identifier         | Crate        | Reads                                             |
 | ------------------ | ------------ | ------------------------------------------------- |
@@ -239,6 +241,7 @@ configuring nothing gets all four in this order:
 | `gpp_sale_opt_out` | `gpp`        | The US sale opt-out in a GPP string               |
 | `us_privacy`       | `us-privacy` | The sale opt-out in a US Privacy string           |
 | `tcf`              | `tcf`        | A TCF v2 record, with its purpose mapping in code |
+| `mtm`              | `mtm`        | The PMP answer, under the Model Terms for Marketing |
 
 The three opt-outs are separate rather than one so that a publisher who does
 not act on Global Privacy Control can remove it and keep the other two.

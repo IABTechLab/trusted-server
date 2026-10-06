@@ -14,6 +14,8 @@
 
 mod mapping;
 
+use std::sync::OnceLock;
+
 pub use mapping::purpose_for;
 
 #[cfg(test)]
@@ -92,9 +94,7 @@ impl PermissionSignalProvider for TcfProvider {
         if !policy.tcf_authoritative() {
             return PermissionSet::none();
         }
-        Permission::all()
-            .filter(|permission| mapping::purpose_for(*permission).is_some())
-            .collect()
+        mapped()
     }
 
     /// The standalone TC string, when it decoded and has not expired. A record
@@ -126,6 +126,17 @@ impl PermissionSignalProvider for TcfProvider {
         }
         effective_tcf(input.consent).is_some_and(|record| !record.has_storage_consent())
     }
+}
+
+/// Every Data Use a purpose maps to, computed once rather than on every
+/// request, because the mapping is a constant of this crate.
+fn mapped() -> PermissionSet {
+    static MAPPED: OnceLock<PermissionSet> = OnceLock::new();
+    *MAPPED.get_or_init(|| {
+        Permission::all()
+            .filter(|permission| mapping::purpose_for(*permission).is_some())
+            .collect()
+    })
 }
 
 /// Whether a TC string arrived that could not be decoded, expiry aside.

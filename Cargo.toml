@@ -5,6 +5,7 @@ members = [
     "crates/geo/fastly",
     "crates/permission-signal/gpc",
     "crates/permission-signal/gpp",
+    "crates/permission-signal/mtm",
     "crates/permission-signal/tcf",
     "crates/permission-signal/us-privacy",
     "crates/trusted-server-adapter-axum",
@@ -124,6 +125,7 @@ trusted-server-device-fastly = { path = "crates/device/fastly" }
 trusted-server-geo-fastly = { path = "crates/geo/fastly" }
 trusted-server-permission-signal-gpc = { path = "crates/permission-signal/gpc" }
 trusted-server-permission-signal-gpp = { path = "crates/permission-signal/gpp" }
+trusted-server-permission-signal-mtm = { path = "crates/permission-signal/mtm" }
 trusted-server-permission-signal-tcf = { path = "crates/permission-signal/tcf" }
 trusted-server-permission-signal-us-privacy = { path = "crates/permission-signal/us-privacy" }
 trusted-server-js = { path = "crates/trusted-server-js" }
