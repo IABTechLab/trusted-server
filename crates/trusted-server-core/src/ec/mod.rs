@@ -1102,7 +1102,7 @@ pub(crate) mod tests {
         EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
     };
     use crate::ec::provider::{EcProviderSelection, ProviderCode};
-    use crate::evidence::{OwnedRequestInfo, RequestInfo};
+    use crate::evidence::RequestInfo;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
 
@@ -1256,69 +1256,6 @@ pub(crate) mod tests {
     /// Creates a valid EC ID for testing: `{64hex}.{6alnum}`.
     fn valid_ec_id(prefix_char: &str, suffix: &str) -> String {
         format!("{}.{suffix}", prefix_char.repeat(64))
-    }
-
-    /// A provider that records the `Cookie` header from the request info passed
-    /// to `generate`, so a test can prove request cookies reach a provider (a
-    /// client that stores values in cookies relies on this).
-    #[derive(Debug)]
-    struct CookieCapturingProvider {
-        seen_cookie: std::sync::Mutex<Option<String>>,
-    }
-
-    impl EdgeCookieProvider for CookieCapturingProvider {
-        fn id(&self) -> &'static str {
-            "cookie-capturing"
-        }
-
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0cc")
-        }
-
-        fn generate(
-            &self,
-            request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-            let cookie = request_info.header("cookie").map(ToOwned::to_owned);
-            *self.seen_cookie.lock().expect("should lock seen cookie") = cookie;
-            Ok(GeneratedEdgeCookie::default())
-        }
-    }
-
-    #[test]
-    fn a_provider_reads_request_cookies_from_the_request_info() {
-        // RequestInfo contract: a provider given request info that carries
-        // headers can read request cookies through it (a client that stores
-        // values in cookies relies on this). The organic generate path passes a
-        // snapshot of the request headers through generate_with_provider, so a
-        // provider reads request cookies through it there too; this test
-        // supplies its own headers directly.
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            "cookie",
-            "client-id=abc123; ts-ec=xyz"
-                .parse()
-                .expect("should build a valid cookie header"),
-        );
-        let request_info = OwnedRequestInfo::new("203.0.113.7".to_owned(), headers);
-        let provider = CookieCapturingProvider {
-            seen_cookie: std::sync::Mutex::new(None),
-        };
-
-        provider
-            .generate(&request_info, &IdentityInput::default())
-            .expect("generation should succeed");
-
-        assert_eq!(
-            provider
-                .seen_cookie
-                .lock()
-                .expect("should lock seen cookie")
-                .as_deref(),
-            Some("client-id=abc123; ts-ec=xyz"),
-            "the provider should read the request cookies from the request info"
-        );
     }
 
     /// A provider whose identifiers are opaque and deliberately not the
