@@ -1634,8 +1634,6 @@ deploy validation knows is listed below.
 
 | Section                            | Reference                                                          |
 | ---------------------------------- | ------------------------------------------------------------------ |
-| `[integration.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)                |
-| `[integration.aps]`                | [APS](/guide/integrations/aps)                                     |
 | `[integration.datadome]`           | [DataDome](/guide/integrations/datadome)                           |
 | `[integration.didomi]`             | [Didomi](/guide/integrations/didomi)                               |
 | `[integration.google_tag_manager]` | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
@@ -1671,34 +1669,6 @@ named here. Their settings live in `[demand.<name>]` and `[adserver.<name>]`.
 
 The sections below cover Prebid, Next.js, Osano, Permutive and Testlight. For
 the others, see the relevant integration guides.
-
-### Ad Server Mock Integration
-
-**Section**: `[integration.adserver_mock]`
-
-This integration is the optional auction mediator selected by
-`auction.mediator = "adserver_mock"`; it is not an OpenRTB provider.
-
-| Field                  | Type           | Default  | Contract                                          |
-| ---------------------- | -------------- | -------- | ------------------------------------------------- |
-| `enabled`              | Boolean        | `false`  | Enable mediator registration                      |
-| `endpoint`             | URL            | Required | Mediation service URL                             |
-| `timeout_ms`           | Integer        | `500`    | `1..=60000` milliseconds                          |
-| `price_floor`          | Number or null | `null`   | Optional minimum accepted CPM                     |
-| `context_query_params` | Object         | `{}`     | Maps admitted auction-context keys to query names |
-
-### APS Browser Integration
-
-**Section**: `[integration.aps]`
-
-| Field            | Type    | Default            | Contract                               |
-| ---------------- | ------- | ------------------ | -------------------------------------- |
-| `enabled`        | Boolean | `false`            | Enable browser-side APS behavior       |
-| `rendering_mode` | String  | `"trusted_server"` | `trusted_server` or `publisher_native` |
-
-Server endpoint, timeout, account, inventory, and debug settings belong to an
-`aps` provider and its `profile_config`, not this browser section. See
-[APS](/guide/integrations/aps).
 
 ### DataDome Integration
 

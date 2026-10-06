@@ -40,14 +40,14 @@ curl --fail-with-body \
 
 Check the response and logs for these invariants:
 
-- a disabled auction returns a no-bid response without provider dispatch;
-- `routing = "explicit"` sends a slot only to its mapped provider;
+- a disabled auction returns a no-bid response without demand dispatch;
+- `routing = "explicit"` sends a slot only to its mapped demand source;
 - `routing = "all_eligible"` sends eligible banner slots without leaking
-  another provider's bidder parameters;
-- provider-local failures do not fabricate bids;
-- with no mediator, the orchestrator selects the highest valid bid per slot;
-- with `mediator = "adserver_mock"`, the configured mediator owns final
-  selection; and
+  another demand source's bidder parameters;
+- a failure local to one demand source does not fabricate bids;
+- with no ad server, the orchestrator selects the highest valid bid per slot;
+- with `[adserver] provider = "adserver_mock"`, the configured ad server owns
+  final selection; and
 - APS winners use `ext.trusted_server.renderer` rather than raw `adm`.
 
 ## Run automated coverage

@@ -94,15 +94,13 @@ credentials or fragment:
 
 ```toml
 # ❌ Wrong
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "prebid.example.com/openrtb2/auction"
 
 # ✅ Correct
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 ```
 
@@ -118,12 +116,12 @@ Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
 
 **Cause:** Environment variable format doesn't match expected type
 
-**Solution:** Override an existing scalar leaf with the expected type. Provider
-map keys preserve hyphens, so shell users must invoke the CLI through `env`:
+**Solution:** Override an existing scalar leaf with the expected type. Demand
+source names are snake_case, so each maps straight onto a path segment:
 
 ```bash
 env 'TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__TIMEOUT_MS=1000' \
   ts config validate
 ```
 
@@ -179,9 +177,9 @@ TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 Backend not found: prebid-server
 ```
 
-**Cause:** Dynamic backend creation for a configured provider endpoint failed.
-Provider backends are derived from `[auction.providers.<id>]`; they are not
-manually named static Fastly backends.
+**Cause:** Dynamic backend creation for a configured demand endpoint failed.
+Demand backends are derived from `[demand.<name>]`; they are not manually
+named static Fastly backends.
 
 **Solution:**
 
@@ -230,10 +228,10 @@ Upstream request timeout after 1000ms
 
 **Solution:**
 
-1. Increase the affected server provider timeout:
+1. Increase the affected demand source's timeout:
 
 ```toml
-[auction.providers.pbs-main]
+[demand.pbs_main]
 timeout_ms = 2000
 ```
 
@@ -292,11 +290,11 @@ Prebid Server returned 400: Invalid OpenRTB request
 
 **Solution:**
 
-1. Enable debug mode on the Prebid Server profile:
+1. Enable debug mode on the Prebid Server demand source:
 
 ```toml
-[auction.providers.pbs-main]
-profile_config = { debug = true }
+[demand.pbs_main]
+debug = true
 ```
 
 `[integration.prebid].debug` controls browser Prebid.js only.
@@ -660,11 +658,11 @@ module = ["prebid"]
 debug = true
 ```
 
-For Prebid Server diagnostics, enable debug in that provider's profile:
+For Prebid Server diagnostics, enable debug on that demand source:
 
 ```toml
-[auction.providers.pbs-main]
-profile_config = { debug = true }
+[demand.pbs_main]
+debug = true
 ```
 
 **Check Fastly logs:**

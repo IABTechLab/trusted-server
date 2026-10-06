@@ -1066,65 +1066,68 @@ All integration modules are built at compile time. At runtime, the server concat
 
 Every row below records a compiled integration registration predicate.
 An integration with no HTTP route can still contribute a browser module,
-rewriter, injector, post-processor, request filter, or auction mediator.
+rewriter, injector, post-processor, request filter, or ad server. In the
+predicates below, `named` means the integration's id is in
+`[integration] module`.
 
-| Integration          | Registration predicate                                           | HTTP routes                                       |
-| -------------------- | ---------------------------------------------------------------- | ------------------------------------------------- |
-| `adserver_mock`      | `auction.mediator=adserver_mock;enabled=true`                    | None                                              |
-| `aps`                | `plan.has_profile(aps);rendering_mode=publisher_native`          | None                                              |
-| `aps`                | `plan.has_profile(aps);rendering_mode=trusted_server`            | `GET /integrations/aps/renderer`                  |
-| `creative`           | `always`                                                         | None                                              |
-| `datadome`           | `enabled=true;enable_protection=false`                           | `GET /integrations/datadome/js/*`                 |
-| `datadome`           | `enabled=true;enable_protection=false`                           | `GET /integrations/datadome/js/`                  |
-| `datadome`           | `enabled=true;enable_protection=false`                           | `GET /integrations/datadome/tags.js`              |
-| `datadome`           | `enabled=true;enable_protection=false`                           | `POST /integrations/datadome/js/*`                |
-| `datadome`           | `enabled=true;enable_protection=false`                           | `POST /integrations/datadome/js/`                 |
-| `datadome`           | `enabled=true;enable_protection=true`                            | `GET /integrations/datadome/js/*`                 |
-| `datadome`           | `enabled=true;enable_protection=true`                            | `GET /integrations/datadome/js/`                  |
-| `datadome`           | `enabled=true;enable_protection=true`                            | `GET /integrations/datadome/tags.js`              |
-| `datadome`           | `enabled=true;enable_protection=true`                            | `POST /integrations/datadome/js/*`                |
-| `datadome`           | `enabled=true;enable_protection=true`                            | `POST /integrations/datadome/js/`                 |
-| `didomi`             | `enabled=true;prefix=proxy_path\|\|/integrations/didomi/consent` | `GET <prefix>/*`                                  |
-| `didomi`             | `enabled=true;prefix=proxy_path\|\|/integrations/didomi/consent` | `POST <prefix>/*`                                 |
-| `google_tag_manager` | `enabled=true`                                                   | `GET /integrations/google_tag_manager/collect`    |
-| `google_tag_manager` | `enabled=true`                                                   | `GET /integrations/google_tag_manager/g/collect`  |
-| `google_tag_manager` | `enabled=true`                                                   | `GET /integrations/google_tag_manager/gtag.js`    |
-| `google_tag_manager` | `enabled=true`                                                   | `GET /integrations/google_tag_manager/gtag/js`    |
-| `google_tag_manager` | `enabled=true`                                                   | `GET /integrations/google_tag_manager/gtm.js`     |
-| `google_tag_manager` | `enabled=true`                                                   | `POST /integrations/google_tag_manager/collect`   |
-| `google_tag_manager` | `enabled=true`                                                   | `POST /integrations/google_tag_manager/g/collect` |
-| `gpt_diagnostics`    | `enabled=true`                                                   | None                                              |
-| `js_asset_proxy`     | `enabled=true;asset.proxy=enabled`                               | `GET <asset.path>` per configured asset           |
-| `gpt`                | `enabled=true`                                                   | `GET /integrations/gpt/pagead/*`                  |
-| `gpt`                | `enabled=true`                                                   | `GET /integrations/gpt/script`                    |
-| `gpt`                | `enabled=true`                                                   | `GET /integrations/gpt/tag/*`                     |
-| `lockr`              | `enabled=true`                                                   | `GET /integrations/lockr/api/*`                   |
-| `lockr`              | `enabled=true`                                                   | `GET /integrations/lockr/sdk`                     |
-| `lockr`              | `enabled=true`                                                   | `POST /integrations/lockr/api/*`                  |
-| `nextjs`             | `enabled=true`                                                   | None                                              |
-| `osano`              | `enabled=true`                                                   | None                                              |
-| `permutive`          | `enabled=true`                                                   | `GET /integrations/permutive/api/*`               |
-| `permutive`          | `enabled=true`                                                   | `GET /integrations/permutive/cdn/*`               |
-| `permutive`          | `enabled=true`                                                   | `GET /integrations/permutive/events/*`            |
-| `permutive`          | `enabled=true`                                                   | `GET /integrations/permutive/sdk`                 |
-| `permutive`          | `enabled=true`                                                   | `GET /integrations/permutive/secure-signal/*`     |
-| `permutive`          | `enabled=true`                                                   | `GET /integrations/permutive/sync/*`              |
-| `permutive`          | `enabled=true`                                                   | `POST /integrations/permutive/api/*`              |
-| `permutive`          | `enabled=true`                                                   | `POST /integrations/permutive/events/*`           |
-| `permutive`          | `enabled=true`                                                   | `POST /integrations/permutive/secure-signal/*`    |
-| `permutive`          | `enabled=true`                                                   | `POST /integrations/permutive/sync/*`             |
-| `prebid`             | `enabled=true;script_patterns=config-derived`                    | `GET /integrations/prebid/bundle.js`              |
-| `prebid`             | `enabled=true;script_patterns=config-derived`                    | `GET <integration.prebid.script_patterns[]>`      |
-| `sourcepoint`        | `enabled=true`                                                   | `GET /integrations/sourcepoint/cdn/*`             |
-| `sourcepoint`        | `enabled=true`                                                   | `HEAD /integrations/sourcepoint/cdn/*`            |
-| `sourcepoint`        | `enabled=true`                                                   | `OPTIONS /integrations/sourcepoint/cdn/*`         |
-| `sourcepoint`        | `enabled=true`                                                   | `POST /integrations/sourcepoint/cdn/*`            |
-| `testlight`          | `enabled=true`                                                   | `POST /integrations/testlight/auction`            |
+| Integration          | Registration predicate                                      | HTTP routes                                       |
+| -------------------- | ----------------------------------------------------------- | ------------------------------------------------- |
+| `adserver_mock`      | `[adserver] provider = "adserver_mock"`                     | None                                              |
+| `aps`                | `demand implementation=aps;rendering_mode=publisher_native` | None                                              |
+| `aps`                | `demand implementation=aps;rendering_mode=trusted_server`   | `GET /integrations/aps/renderer`                  |
+| `creative`           | `always`                                                    | None                                              |
+| `datadome`           | `named;enable_protection=false`                             | `GET /integrations/datadome/js/*`                 |
+| `datadome`           | `named;enable_protection=false`                             | `GET /integrations/datadome/js/`                  |
+| `datadome`           | `named;enable_protection=false`                             | `GET /integrations/datadome/tags.js`              |
+| `datadome`           | `named;enable_protection=false`                             | `POST /integrations/datadome/js/*`                |
+| `datadome`           | `named;enable_protection=false`                             | `POST /integrations/datadome/js/`                 |
+| `datadome`           | `named;enable_protection=true`                              | `GET /integrations/datadome/js/*`                 |
+| `datadome`           | `named;enable_protection=true`                              | `GET /integrations/datadome/js/`                  |
+| `datadome`           | `named;enable_protection=true`                              | `GET /integrations/datadome/tags.js`              |
+| `datadome`           | `named;enable_protection=true`                              | `POST /integrations/datadome/js/*`                |
+| `datadome`           | `named;enable_protection=true`                              | `POST /integrations/datadome/js/`                 |
+| `didomi`             | `named;prefix=proxy_path\|\|/integrations/didomi/consent`   | `GET <prefix>/*`                                  |
+| `didomi`             | `named;prefix=proxy_path\|\|/integrations/didomi/consent`   | `POST <prefix>/*`                                 |
+| `google_tag_manager` | `named`                                                     | `GET /integrations/google_tag_manager/collect`    |
+| `google_tag_manager` | `named`                                                     | `GET /integrations/google_tag_manager/g/collect`  |
+| `google_tag_manager` | `named`                                                     | `GET /integrations/google_tag_manager/gtag.js`    |
+| `google_tag_manager` | `named`                                                     | `GET /integrations/google_tag_manager/gtag/js`    |
+| `google_tag_manager` | `named`                                                     | `GET /integrations/google_tag_manager/gtm.js`     |
+| `google_tag_manager` | `named`                                                     | `POST /integrations/google_tag_manager/collect`   |
+| `google_tag_manager` | `named`                                                     | `POST /integrations/google_tag_manager/g/collect` |
+| `gpt_diagnostics`    | `named`                                                     | None                                              |
+| `js_asset_proxy`     | `named;asset.proxy=enabled`                                 | `GET <asset.path>` per configured asset           |
+| `gpt`                | `named`                                                     | `GET /integrations/gpt/pagead/*`                  |
+| `gpt`                | `named`                                                     | `GET /integrations/gpt/script`                    |
+| `gpt`                | `named`                                                     | `GET /integrations/gpt/tag/*`                     |
+| `lockr`              | `named`                                                     | `GET /integrations/lockr/api/*`                   |
+| `lockr`              | `named`                                                     | `GET /integrations/lockr/sdk`                     |
+| `lockr`              | `named`                                                     | `POST /integrations/lockr/api/*`                  |
+| `nextjs`             | `named`                                                     | None                                              |
+| `osano`              | `named`                                                     | None                                              |
+| `permutive`          | `named`                                                     | `GET /integrations/permutive/api/*`               |
+| `permutive`          | `named`                                                     | `GET /integrations/permutive/cdn/*`               |
+| `permutive`          | `named`                                                     | `GET /integrations/permutive/events/*`            |
+| `permutive`          | `named`                                                     | `GET /integrations/permutive/sdk`                 |
+| `permutive`          | `named`                                                     | `GET /integrations/permutive/secure-signal/*`     |
+| `permutive`          | `named`                                                     | `GET /integrations/permutive/sync/*`              |
+| `permutive`          | `named`                                                     | `POST /integrations/permutive/api/*`              |
+| `permutive`          | `named`                                                     | `POST /integrations/permutive/events/*`           |
+| `permutive`          | `named`                                                     | `POST /integrations/permutive/secure-signal/*`    |
+| `permutive`          | `named`                                                     | `POST /integrations/permutive/sync/*`             |
+| `prebid`             | `named;script_patterns=config-derived`                      | `GET /integrations/prebid/bundle.js`              |
+| `prebid`             | `named;script_patterns=config-derived`                      | `GET <integration.prebid.script_patterns[]>`      |
+| `sourcepoint`        | `named`                                                     | `GET /integrations/sourcepoint/cdn/*`             |
+| `sourcepoint`        | `named`                                                     | `HEAD /integrations/sourcepoint/cdn/*`            |
+| `sourcepoint`        | `named`                                                     | `OPTIONS /integrations/sourcepoint/cdn/*`         |
+| `sourcepoint`        | `named`                                                     | `POST /integrations/sourcepoint/cdn/*`            |
+| `testlight`          | `named`                                                     | `POST /integrations/testlight/auction`            |
 
 ### Integration proxy contracts
 
 All integration routes are registered only when the documented predicate is
-true. A disabled integration registers no route, so its path continues through
+true. An integration `[integration] module` does not name registers no route,
+so its path continues through
 normal routing and can reach the publisher fallback. Duplicate registrations
 are startup errors. None of these routes has built-in caller authentication or
 an in-process rate limiter; `[[handlers]]` and platform controls remain
@@ -1132,7 +1135,7 @@ available when a deployment needs either.
 
 | Route family      | Request and success contract                                                                                                                                           | Errors, cache, and CORS                                                                                                                                                                       | Example                                                                                                                                   |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| APS renderer      | `GET /integrations/aps/renderer`; no body; `200 text/html` static opaque-frame renderer with CSP, `nosniff`, and `no-referrer`                                         | Present only for an enabled APS profile in `trusted_server` rendering mode; no dedicated cache/CORS headers                                                                                   | Browser-internal iframe target; curl is not a meaningful auction test                                                                     |
+| APS renderer      | `GET /integrations/aps/renderer`; no body; `200 text/html` static opaque-frame renderer with CSP, `nosniff`, and `no-referrer`                                         | Present only for an APS demand source in `trusted_server` rendering mode; no dedicated cache/CORS headers                                                                                     | Browser-internal iframe target; curl is not a meaningful auction test                                                                     |
 | DataDome tag      | `GET /integrations/datadome/tags.js`; query forwarded; successful upstream `200` is rewritten and returned as JavaScript                                               | Non-200 upstream status is preserved; rewritten `200` uses `cache_ttl_seconds`; upstream `Access-Control-Allow-Origin` is copied when present                                                 | `curl -i https://edge.example.com/integrations/datadome/tags.js`                                                                          |
 | DataDome signals  | `GET` or `POST /integrations/datadome/js/` and `/js/*`; method, query, bounded POST body, and selected browser headers forwarded to `api_origin`                       | Upstream status/body/headers preserved; transport or size failures use shared integration errors; no added cache/CORS policy                                                                  | Browser SDK traffic; manual payload is upstream-schema-specific                                                                           |
 | Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                   | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |

@@ -18,31 +18,34 @@ providers, routes bidder codes, executes supported provider fan-out, applies an
 optional mediator, and returns the winning bids. When auctions are disabled,
 the endpoint returns a no-bid response without contacting a provider.
 
-## Shipped demand and mediation
+## Shipped demand and the ad server
 
-Provider instances are declared under `[auction.providers.<id>]`. The shipped
-profiles are:
+Demand sources are declared under `[demand.<name>]`, each naming the
+implementation it runs. The shipped implementations are:
 
-- `standard` for a generic OpenRTB 2.6 endpoint;
-- `prebid-server` for Prebid Server request controls; and
+- `openrtb` for a generic OpenRTB 2.6 endpoint;
+- `prebid_server` for Prebid Server request controls; and
 - `aps` for the APS OpenRTB contract and typed renderer response.
 
 Browser-visible bidder codes are mapped separately under
-`[auction.bidders.<id>]`. `adserver_mock` is the only registered mediator; it
-is optional and is configured under `[integrations.adserver_mock]`.
+`[auction.bidders.<id>]`. `adserver_mock` is the only shipped ad server; it
+is optional, selected by `[adserver] provider` and configured under
+`[adserver.adserver_mock]`.
 
 ```toml
 [auction]
 enabled = true
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+provider = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "prebid_server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [auction.bidders.example-bidder]
-provider = "pbs-main"
+provider = "pbs_main"
 ```
 
 Deploy validation compiles this configuration before publication. Adapter
