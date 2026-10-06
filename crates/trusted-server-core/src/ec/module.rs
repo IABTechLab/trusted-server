@@ -2067,36 +2067,46 @@ mod tests {
     }
 
     #[test]
-    fn client_fixed_mints_when_posted_word_matches() {
-        let input = ClientResolveInput {
-            payload: EXPECTED_VALUE.as_bytes(),
-            permissions: None,
-            consent: None,
-        };
-        let generated = ClientFixedProvider
-            .resolve_from_client(&input)
-            .expect("should resolve");
-        assert_eq!(
-            generated.id.as_deref(),
-            Some(EXPECTED_VALUE),
-            "the known shared word should verify and create the Edge Cookie"
-        );
-    }
+    fn resolve_from_client_creates_only_from_a_verified_payload() {
+        // `client_fixed` creates the Edge Cookie only from the known shared
+        // word. `HmacModule` does not override `resolve_from_client`, so it
+        // inherits the no-op default, because a server-side module takes no
+        // part in the client cycle.
+        /// One case: its name, the module, the posted payload and the
+        /// identifier the module should create.
+        type Case<'a> = (&'a str, &'a dyn EdgeCookieModule, &'a [u8], Option<&'a str>);
 
-    #[test]
-    fn client_fixed_rejects_unknown_word() {
-        let input = ClientResolveInput {
-            payload: b"not-the-word",
-            permissions: None,
-            consent: None,
-        };
-        let generated = ClientFixedProvider
-            .resolve_from_client(&input)
-            .expect("should resolve");
-        assert!(
-            generated.id.is_none(),
-            "a value that does not match the known word should create no Edge Cookie"
-        );
+        let hmac = HmacModule::new(test_passphrase());
+        let cases: [Case<'_>; 3] = [
+            (
+                "client_fixed with the known word",
+                &ClientFixedProvider,
+                EXPECTED_VALUE.as_bytes(),
+                Some(EXPECTED_VALUE),
+            ),
+            (
+                "client_fixed with another word",
+                &ClientFixedProvider,
+                b"not-the-word",
+                None,
+            ),
+            ("hmac with any payload", &hmac, b"anything", None),
+        ];
+        for (case, module, payload, expected) in cases {
+            let input = ClientResolveInput {
+                payload,
+                permissions: None,
+                consent: None,
+            };
+            let generated = module
+                .resolve_from_client(&input)
+                .unwrap_or_else(|err| panic!("{case}: should resolve, got: {err}"));
+            assert_eq!(
+                generated.id.as_deref(),
+                expected,
+                "{case}: should create exactly what the module verifies"
+            );
+        }
     }
 
     #[test]
@@ -2106,24 +2116,6 @@ mod tests {
                 .required_permissions()
                 .contains(Permission::StoreOnDevice),
             "`client_fixed` writes a cookie, so it requires necessary.operations.storage"
-        );
-    }
-
-    #[test]
-    fn server_side_provider_inherits_no_op_resolve_from_client() {
-        // HmacModule does not override resolve_from_client, so it inherits the
-        // no-op default: a server-side module does not participate in the
-        // client cycle.
-        let module = HmacModule::new(test_passphrase());
-        let input = ClientResolveInput {
-            payload: b"anything",
-            permissions: None,
-            consent: None,
-        };
-        let generated = module.resolve_from_client(&input).expect("should resolve");
-        assert!(
-            generated.id.is_none(),
-            "a server-side module inherits the no-op resolve_from_client default"
         );
     }
 
