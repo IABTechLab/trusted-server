@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -188,6 +188,38 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
         guard.clear();
+    }
+}
+
+/// Per-document buffer for script text fragments split across chunks.
+///
+/// `lol_html` can deliver one text node as several chunks, so a rewriter that
+/// needs the whole script must accumulate until `is_last_in_text_node`.
+///
+/// This lives in [`IntegrationDocumentState`] rather than on the rewriter.
+/// Rewriters are registered once as `Arc<dyn IntegrationScriptRewriter>` and
+/// live as long as the [`IntegrationRegistry`], so a buffer owned by a
+/// rewriter is shared by every document that registry serves. A document whose
+/// stream ends before the final fragment — client disconnect, origin error,
+/// truncated body — leaves its partial script in that buffer, and the next
+/// document prepends the residue to its own accumulation. That corrupts the
+/// response and can disclose the previous document's content.
+///
+/// Keyed per integration id, so each integration gets its own buffer, and
+/// dropped with the document state at end of document.
+#[derive(Debug, Default)]
+pub struct ScriptTextAccumulator {
+    buffer: Mutex<String>,
+}
+
+impl ScriptTextAccumulator {
+    /// Locks the buffer.
+    ///
+    /// Recovers from poisoning rather than panicking: a poisoned buffer holds
+    /// at worst a partial script, and the caller's `is_last_in_text_node`
+    /// handling already tolerates unexpected contents.
+    pub fn buffer(&self) -> MutexGuard<'_, String> {
+        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -724,7 +756,7 @@ struct IntegrationRegistryInner {
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
-    /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
+    /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
     extra_js_module_ids: Vec<&'static str>,
 }
 
@@ -913,14 +945,17 @@ impl IntegrationRegistry {
             }
         }
 
-        // A client-cycle Edge Cookie provider ships a page script that posts its
+        // A client-cycle Edge Cookie module ships a page script that posts its
         // result to the resolve endpoint. The script rides the tsjs bundle, so
-        // include its module when that provider is selected. The same module
+        // include its module when that module is selected. The same module
         // list drives both the served bundle and the injected `<script>` hash,
         // so they stay consistent.
-        if settings.ec.provider.as_ref().is_some_and(|selection| {
-            selection.key() == crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY
-        }) {
+        if settings
+            .ec
+            .module
+            .as_ref()
+            .is_some_and(|selection| selection.key() == crate::ec::module::CLIENT_FIXED_MODULE_KEY)
+        {
             inner.extra_js_module_ids.push("ec_client_fixed");
         }
 
@@ -1222,7 +1257,7 @@ impl IntegrationRegistry {
         }
 
         // Modules not tied to a registered integration, for example the
-        // client-cycle provider's page script.
+        // client-cycle module's page script.
         for id in &self.inner.extra_js_module_ids {
             if !ids.contains(id) {
                 ids.push(id);
@@ -2388,10 +2423,10 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_include_client_fixed_when_provider_selected() {
+    fn js_module_ids_include_client_fixed_when_module_selected() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from(
-            crate::ec::provider::CLIENT_FIXED_PROVIDER_KEY,
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
+            crate::ec::module::CLIENT_FIXED_MODULE_KEY,
         ));
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
 
@@ -2399,7 +2434,7 @@ mod tests {
             registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "selecting the `client_fixed` provider should inject its demo page script"
+            "selecting the `client_fixed` module should inject its demo page script"
         );
     }
 
@@ -2442,7 +2477,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_client_fixed_without_provider() {
+    fn js_module_ids_exclude_client_fixed_without_module() {
         let registry =
             IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
                 .expect("should create registry");
@@ -2451,7 +2486,7 @@ mod tests {
             !registry
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
-            "the demo page script should not ship unless the `client_fixed` provider is selected"
+            "the demo page script should not ship unless the `client_fixed` module is selected"
         );
     }
 

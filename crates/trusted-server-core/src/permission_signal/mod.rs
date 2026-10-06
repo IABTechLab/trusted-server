@@ -7,55 +7,57 @@ use error_stack::Report;
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
-use crate::permissions::{Acquisition, ConsentSignal, Permission, SignalPolicy};
+use crate::permissions::{
+    Acquisition, ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
+};
 use crate::settings::Settings;
 use crate::tdl::Tdl;
 
-/// What a signal provider may read about a request.
+/// What a signal module may read about a request.
 ///
-/// A struct rather than a parameter list, so a provider needing something new
+/// A struct rather than a parameter list, so a module needing something new
 /// does not change every implementation.
 pub struct SignalInput<'a> {
     /// The decoded consent record for this request.
     ///
     /// Offered because the schemes that ship by default already decode into
     /// it, core keeps it against the Edge Cookie identifier between requests,
-    /// and the rest of the system reads it. A provider is not required to use
+    /// and the rest of the system reads it. A module is not required to use
     /// it, and a scheme core has never heard of will not appear in it. Such a
-    /// provider reads [`evidence`](Self::evidence) instead and decodes whatever
+    /// module reads [`evidence`](Self::evidence) instead and decodes whatever
     /// its scheme needs.
     pub consent: &'a ConsentContext,
     /// The request itself, as evidence.
     ///
     /// This is the open half of the seam, and it is [`RequestInfo`], the same
-    /// abstraction the Edge Cookie and device providers already read. A
-    /// provider asks for the header, cookie, path or query parameter its own
+    /// abstraction the Edge Cookie and device modules already read. A
+    /// module asks for the header, cookie, path or query parameter its own
     /// scheme uses, so core holds no list of which evidence a scheme may read.
     pub evidence: &'a dyn RequestInfo,
     /// The policy from `permissions.yaml`, which decides what a signal means
-    /// rather than leaving each provider to invent its own meaning.
+    /// rather than leaving each module to invent its own meaning.
     pub policy: &'a SignalPolicy,
     /// What the country and region rules say about this permission, before any
-    /// provider is asked. A provider amends this rather than deciding alone.
+    /// module is asked. A module amends this rather than deciding alone.
     pub baseline: Acquisition,
-    /// What the providers asked before this one settled on.
+    /// What the modules asked before this one settled on.
     ///
     /// [`ConsentSignal::Neutral`] means none of them had an opinion, so the
     /// baseline still stands.
     pub settled: ConsentSignal,
-    /// Every provider in configured order, this one included.
-    providers: &'a [Arc<dyn PermissionSignalProvider>],
-    /// Where in that order the provider being asked sits.
+    /// Every module in configured order, this one included.
+    modules: &'a [Arc<dyn PermissionSignalModule>],
+    /// Where in that order the module being asked sits.
     position: usize,
-    /// Whether this provider may consult a peer.
+    /// Whether this module may consult a peer.
     ///
-    /// False while answering a consultation, which is what stops two providers
+    /// False while answering a consultation, which is what stops two modules
     /// that consult each other from looping.
     may_ask: bool,
 }
 
 impl<'a> SignalInput<'a> {
-    /// An input for a provider asked on its own, outside an ordered run.
+    /// An input for a module asked on its own, outside an ordered run.
     #[must_use]
     pub fn new(
         consent: &'a ConsentContext,
@@ -69,68 +71,68 @@ impl<'a> SignalInput<'a> {
             policy,
             baseline,
             settled: ConsentSignal::Neutral,
-            providers: &[],
+            modules: &[],
             position: 0,
             may_ask: true,
         }
     }
 
-    /// Every provider in configured order, this one included.
+    /// Every module in configured order, this one included.
     ///
-    /// A provider consults the list to decide whether a peer it cares about is
+    /// A module consults the list to decide whether a peer it cares about is
     /// configured at all, and where it sits relative to this one.
     #[must_use]
-    pub fn providers(&self) -> &[Arc<dyn PermissionSignalProvider>] {
-        self.providers
+    pub fn modules(&self) -> &[Arc<dyn PermissionSignalModule>] {
+        self.modules
     }
 
-    /// Where the provider being asked sits in that order.
+    /// Where the module being asked sits in that order.
     #[must_use]
     pub const fn position(&self) -> usize {
         self.position
     }
 
-    /// Whether a provider with this identifier is configured.
+    /// Whether a module with this identifier is configured.
     #[must_use]
     pub fn has(&self, id: &str) -> bool {
-        self.providers.iter().any(|provider| provider.id() == id)
+        self.modules.iter().any(|module| module.id() == id)
     }
 
     /// What a peer makes of `permission`, asked directly.
     ///
     /// The peer answers as if it were first, so the reply is that peer's own
     /// opinion rather than what the run has settled on so far. That is the
-    /// useful question, because a provider wanting to know whether the prior
+    /// useful question, because a module wanting to know whether the prior
     /// value came from a particular peer asks that peer what it says.
     ///
-    /// Returns `None` when no provider carries the identifier, when the caller
+    /// Returns `None` when no module carries the identifier, when the caller
     /// names itself, and when this input is itself answering a consultation.
-    /// A provider must handle `None` rather than assume a peer is present.
+    /// A module must handle `None` rather than assume a peer is present.
     #[must_use]
     pub fn ask(&self, id: &str, permission: Permission) -> Option<ConsentSignal> {
         if !self.may_ask {
             return None;
         }
-        let (position, provider) = self
-            .providers
+        let (position, module) = self
+            .modules
             .iter()
             .enumerate()
-            .find(|(position, provider)| provider.id() == id && *position != self.position)?;
+            .find(|(position, module)| module.id() == id && *position != self.position)?;
         let input = Self {
             consent: self.consent,
             evidence: self.evidence,
             policy: self.policy,
             baseline: self.baseline,
             settled: ConsentSignal::Neutral,
-            providers: self.providers,
+            modules: self.modules,
             position,
             may_ask: false,
         };
-        Some(provider.signal(permission, &input))
+        Some(module.signal(permission, &input))
     }
 }
 
-/// A provider of permission signals.
+/// A module of permission signals.
 ///
 /// An implementation answers for one signaling scheme. It reads the request,
 /// applies whatever the policy says about its own scheme, and returns how it
@@ -138,21 +140,40 @@ impl<'a> SignalInput<'a> {
 ///
 /// # Contract
 ///
-/// Answer [`ConsentSignal::Neutral`] for a permission this provider has no
+/// Answer [`ConsentSignal::Neutral`] for a permission this module has no
 /// opinion on, including when the signal it reads is absent from the request.
 /// Returning [`ConsentSignal::Revoke`] for an absent signal would turn silence
 /// into refusal and revoke the permission on every request that did not carry
 /// this scheme.
-pub trait PermissionSignalProvider: Send + Sync {
+pub trait PermissionSignalModule: Send + Sync {
     /// Stable identifier, used in configuration, in logs, and by a peer
-    /// looking this provider up through [`SignalInput::ask`].
+    /// looking this module up through [`SignalInput::ask`].
     ///
     /// Written in `snake_case`, lowercase words joined by underscores, for
     /// example `gpp_sale_opt_out`.
     fn id(&self) -> &'static str;
 
-    /// How this provider would amend `permission` for this request.
+    /// How this module would amend `permission` for this request.
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal;
+
+    /// The permissions this module can ever answer [`ConsentSignal::Grant`]
+    /// for under `policy`, so a permission a signal could still set can be
+    /// told from one nothing in this deployment will ever set.
+    ///
+    /// Resolution records a permission that requires a signal and got none as
+    /// awaited, and a page holds what depends on an awaited permission until
+    /// an answer arrives. That is right only for a permission some configured
+    /// module could grant. For any other, waiting is waiting for ever, so
+    /// the assembly narrows the awaited list to the union of these
+    /// declarations.
+    ///
+    /// A scheme that only ever revokes, which is every opt-out, leaves this
+    /// at its default of nothing. A scheme that grants declares exactly what
+    /// it maps, under the policy it is given, so a record the policy does not
+    /// let answer declares nothing either.
+    fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+        PermissionSet::none()
+    }
 
     /// Whether the request carries an explicit withdrawal of `permission`
     /// under this scheme, as opposed to merely not granting it.
@@ -172,17 +193,34 @@ pub trait PermissionSignalProvider: Send + Sync {
         false
     }
 
-    /// The terms documents this provider says the request's data is
+    /// The signal this module read from the request and used, as it was
+    /// received, or `None` when there is none it can use.
+    ///
+    /// Absent, unreadable, expired and not-acted-on all answer `None`, and
+    /// nothing here says which. What each of those means for the
+    /// permissions is this module's decision in [`signal`](Self::signal),
+    /// taken silently. Core carries what every module vouched for on the
+    /// permission state, and a signal nobody vouched for is dropped from
+    /// everything Trusted Server sends on, so a corrupt record never reaches
+    /// a page or a bid request.
+    fn valid_signal(
+        &self,
+        _consent: &ConsentContext,
+        _evidence: &dyn RequestInfo,
+    ) -> Option<ValidSignal> {
+        None
+    }
+
+    /// The terms documents this module says the request's data is
     /// available under, empty when it declares none.
     ///
     /// A locator tells whoever receives the data what terms cover it, so
     /// they can decide whether those are terms they accept and whether they
-    /// may pass the data on. The four schemes that ship carry no terms of
-    /// their own and leave this at its default, and a provider for a terms
-    /// scheme returns the document that applies to this request. Model Terms
-    /// for Marketing (MTM) is the first such scheme and one of many rather
-    /// than the only one. Core does
-    /// not read the documents, it carries the locators, so what a document
+    /// may pass the data on. Most schemes carry no terms of their own and
+    /// leave this at its default, and a module for a terms scheme returns the
+    /// document that applies to this request. Model Terms for Marketing (MTM)
+    /// is the first such scheme and one of many rather than the only one. Core
+    /// does not read the documents, it carries the locators, so what a document
     /// says stays between the parties bound by it.
     ///
     /// A locator must point at a document that is never edited once
@@ -192,13 +230,13 @@ pub trait PermissionSignalProvider: Send + Sync {
     }
 }
 
-/// Asks every provider in order and returns what they settle on together.
+/// Asks every module in order and returns what they settle on together.
 ///
 /// See the module documentation for the layering and why the order is the
 /// configuration.
 #[must_use]
 pub(crate) fn combine(
-    providers: &[Arc<dyn PermissionSignalProvider>],
+    modules: &[Arc<dyn PermissionSignalModule>],
     permission: Permission,
     consent: &ConsentContext,
     evidence: &dyn RequestInfo,
@@ -206,21 +244,21 @@ pub(crate) fn combine(
     baseline: Acquisition,
 ) -> ConsentSignal {
     let mut settled = ConsentSignal::Neutral;
-    for (position, provider) in providers.iter().enumerate() {
+    for (position, module) in modules.iter().enumerate() {
         let input = SignalInput {
             consent,
             evidence,
             policy,
             baseline,
             settled,
-            providers,
+            modules,
             position,
             may_ask: true,
         };
-        // Every provider is asked, because a later one may amend what an
+        // Every module is asked, because a later one may amend what an
         // earlier one settled. Stopping at the first answer would make the
         // order mean the opposite of what it says.
-        match provider.signal(permission, &input) {
+        match module.signal(permission, &input) {
             ConsentSignal::Neutral => {}
             answer => settled = answer,
         }
@@ -236,13 +274,13 @@ pub(crate) fn combine(
 /// declining the very signal the permission depended on, so it is
 /// destructive. Under a `granted` baseline the permission never depended on
 /// the record, so the same refusal suppresses use for the request without
-/// destroying anything. Any one provider answering [`withdraws`] is enough,
-/// and no provider answering it, or none configured, is never a withdrawal.
+/// destroying anything. Any one module answering [`withdraws`] is enough,
+/// and no module answering it, or none configured, is never a withdrawal.
 ///
-/// [`withdraws`]: PermissionSignalProvider::withdraws
+/// [`withdraws`]: PermissionSignalModule::withdraws
 #[must_use]
 pub(crate) fn withdrawn(
-    providers: &[Arc<dyn PermissionSignalProvider>],
+    modules: &[Arc<dyn PermissionSignalModule>],
     permission: Permission,
     consent: &ConsentContext,
     evidence: &dyn RequestInfo,
@@ -252,36 +290,36 @@ pub(crate) fn withdrawn(
     if matches!(baseline, Acquisition::Granted) {
         return false;
     }
-    providers.iter().enumerate().any(|(position, provider)| {
+    modules.iter().enumerate().any(|(position, module)| {
         let input = SignalInput {
             consent,
             evidence,
             policy,
             baseline,
             settled: ConsentSignal::Neutral,
-            providers,
+            modules,
             position,
             may_ask: true,
         };
-        provider.withdraws(permission, &input)
+        module.withdraws(permission, &input)
     })
 }
 
-/// The terms documents the configured providers declare for this request.
+/// The terms documents the configured modules declare for this request.
 ///
-/// Asked in the same order the providers answer in, so the list reads the
-/// way the deployment is configured, and a document named by two providers
-/// is carried once. No provider declaring anything leaves the list empty,
+/// Asked in the same order the modules answer in, so the list reads the
+/// way the deployment is configured, and a document named by two modules
+/// is carried once. No module declaring anything leaves the list empty,
 /// which says no terms were declared rather than that any terms apply.
 #[must_use]
 pub(crate) fn tdls(
-    providers: &[Arc<dyn PermissionSignalProvider>],
+    modules: &[Arc<dyn PermissionSignalModule>],
     consent: &ConsentContext,
     evidence: &dyn RequestInfo,
 ) -> Arc<[Tdl]> {
     let mut declared: Vec<Tdl> = Vec::new();
-    for provider in providers {
-        for tdl in provider.tdls(consent, evidence) {
+    for module in modules {
+        for tdl in module.tdls(consent, evidence) {
             if !declared.contains(&tdl) {
                 declared.push(tdl);
             }
@@ -290,10 +328,42 @@ pub(crate) fn tdls(
     Arc::from(declared)
 }
 
-/// The providers a deployment named, in the order it named them, drawn from
+/// Every permission some module in `modules` declares it can grant under
+/// `policy`, which is the most a signal arriving later could still set.
+#[must_use]
+pub fn answerable(
+    modules: &[Arc<dyn PermissionSignalModule>],
+    policy: &SignalPolicy,
+) -> PermissionSet {
+    modules
+        .iter()
+        .map(|module| module.grants(policy))
+        .fold(PermissionSet::none(), PermissionSet::union)
+}
+
+/// The signals the configured modules read and found valid, in the order
+/// the modules are asked.
+///
+/// Each module vouches for at most one signal, its own scheme's, so the
+/// list reads the way the deployment is configured. No module vouching
+/// for anything leaves the list empty, which says the request carried
+/// nothing a configured module could use.
+#[must_use]
+pub(crate) fn signals(
+    modules: &[Arc<dyn PermissionSignalModule>],
+    consent: &ConsentContext,
+    evidence: &dyn RequestInfo,
+) -> Arc<[ValidSignal]> {
+    modules
+        .iter()
+        .filter_map(|module| module.valid_signal(consent, evidence))
+        .collect()
+}
+
+/// The modules a deployment named, in the order it named them, drawn from
 /// the ones the build makes available.
 ///
-/// `None` means nothing was configured, which runs every available provider
+/// `None` means nothing was configured, which runs every available module
 /// in the order the adapter offered them. That is deliberate, so a publisher
 /// gets every scheme the build knows about until they say otherwise and a
 /// signal is never quietly ignored because someone forgot to list it. An
@@ -301,13 +371,13 @@ pub(crate) fn tdls(
 ///
 /// # Errors
 ///
-/// A name matching no available provider, or a name given twice, is refused
+/// A name matching no available module, or a name given twice, is refused
 /// rather than ignored, so a typo cannot silently stop a scheme being honored
 /// and a scheme cannot run twice at two places in the order.
 pub(crate) fn select(
-    available: &[Arc<dyn PermissionSignalProvider>],
+    available: &[Arc<dyn PermissionSignalModule>],
     configured: Option<&[String]>,
-) -> Result<Vec<Arc<dyn PermissionSignalProvider>>, Report<TrustedServerError>> {
+) -> Result<Vec<Arc<dyn PermissionSignalModule>>, Report<TrustedServerError>> {
     let Some(names) = configured else {
         return Ok(available.to_vec());
     };
@@ -316,30 +386,30 @@ pub(crate) fn select(
         if names[..position].contains(name) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "Permission signal provider `{name}` is named more than once in \
-                     [permission_signal] provider. Each provider runs once, at one place \
+                    "Permission signal module `{name}` is named more than once in \
+                     [permission_signal] module. Each module runs once, at one place \
                      in the order"
                 ),
             }));
         }
-        let Some(provider) = available.iter().find(|provider| provider.id() == name) else {
+        let Some(module) = available.iter().find(|module| module.id() == name) else {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "Permission signal provider `{name}` is not available in this build. \
-                     Available providers are {}",
+                    "Permission signal module `{name}` is not available in this build. \
+                     Available modules are {}",
                     ids(available).join(", ")
                 ),
             }));
         };
-        selected.push(Arc::clone(provider));
+        selected.push(Arc::clone(module));
     }
     Ok(selected)
 }
 
-/// The available providers a configured list leaves out, for the startup log.
+/// The available modules a configured list leaves out, for the startup log.
 #[must_use]
 pub(crate) fn omitted<'a>(
-    available: &'a [Arc<dyn PermissionSignalProvider>],
+    available: &'a [Arc<dyn PermissionSignalModule>],
     configured: Option<&[String]>,
 ) -> Vec<&'a str> {
     let Some(names) = configured else {
@@ -347,21 +417,21 @@ pub(crate) fn omitted<'a>(
     };
     available
         .iter()
-        .map(|provider| provider.id())
+        .map(|module| module.id())
         .filter(|id| !names.iter().any(|name| name == id))
         .collect()
 }
 
-/// The identifiers of `providers`, in order.
+/// The identifiers of `modules`, in order.
 #[must_use]
-pub(crate) fn ids(providers: &[Arc<dyn PermissionSignalProvider>]) -> Vec<&str> {
-    providers.iter().map(|provider| provider.id()).collect()
+pub(crate) fn ids(modules: &[Arc<dyn PermissionSignalModule>]) -> Vec<&str> {
+    modules.iter().map(|module| module.id()).collect()
 }
 
-/// Selects the providers a deployment runs from the ones an adapter makes
+/// Selects the modules a deployment runs from the ones an adapter makes
 /// available, and says so in the log once at startup.
 ///
-/// This is the adapter's composition point. Core supplies no provider of its
+/// This is the adapter's composition point. Core supplies no module of its
 /// own, so an adapter hands in every scheme crate it links, in the order that
 /// stands when configuration names none, and receives back the ordered list
 /// the request path asks. The list is shared rather than owned, so handing it
@@ -372,20 +442,20 @@ pub(crate) fn ids(providers: &[Arc<dyn PermissionSignalProvider>]) -> Vec<&str> 
 /// A configured name that matches nothing available, or a name given twice,
 /// fails startup with a message naming what is available, so a typo cannot
 /// silently stop a scheme being honored.
-pub fn build_permission_signal_providers(
+pub fn build_permission_signal_modules(
     settings: &Settings,
-    available: &[Arc<dyn PermissionSignalProvider>],
-) -> Result<Arc<[Arc<dyn PermissionSignalProvider>]>, Report<TrustedServerError>> {
-    let configured = settings.permission_signal.provider.as_deref();
+    available: &[Arc<dyn PermissionSignalModule>],
+) -> Result<Arc<[Arc<dyn PermissionSignalModule>]>, Report<TrustedServerError>> {
+    let configured = settings.permission_signal.module.as_deref();
     let selected = select(available, configured)?;
     match configured {
         None => log::info!(
-            "Permission signals: acting on every provider this build offers, [{}], no \
-             [permission_signal] provider configured",
+            "Permission signals: acting on every module this build offers, [{}], no \
+             [permission_signal] module configured",
             ids(&selected).join(", ")
         ),
         Some([]) => log::info!(
-            "Permission signals: acting on no provider, [permission_signal] provider is \
+            "Permission signals: acting on no module, [permission_signal] module is \
              empty, so every permission stays at its country and region baseline"
         ),
         Some(_) => log::info!(
@@ -397,7 +467,7 @@ pub fn build_permission_signal_providers(
     if !left_out.is_empty() {
         log::warn!(
             "Permission signals: not acting on [{}], which are not in [permission_signal] \
-             provider. A signal this deployment does not act on is read from the request \
+             module. A signal this deployment does not act on is read from the request \
              and then ignored",
             left_out.join(", ")
         );
@@ -412,11 +482,11 @@ mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
 
-    /// A provider that always answers the same thing, for testing the rule
+    /// A module that always answers the same thing, for testing the rule
     /// rather than any particular scheme.
     struct Fixed(&'static str, ConsentSignal);
 
-    impl PermissionSignalProvider for Fixed {
+    impl PermissionSignalModule for Fixed {
         fn id(&self) -> &'static str {
             self.0
         }
@@ -426,21 +496,21 @@ mod tests {
         }
     }
 
-    /// A provider that answers by consulting a peer, which is the behavior the
+    /// A module that answers by consulting a peer, which is the behavior the
     /// peer visibility exists for.
     struct Consulting {
         id: &'static str,
         peer: &'static str,
     }
 
-    impl PermissionSignalProvider for Consulting {
+    impl PermissionSignalModule for Consulting {
         fn id(&self) -> &'static str {
             self.id
         }
 
         fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
             match input.ask(self.peer, permission) {
-                // The peer refused, and this provider takes the opposite view
+                // The peer refused, and this module takes the opposite view
                 // of the same request, which is the override the seam allows.
                 Some(ConsentSignal::Revoke) => ConsentSignal::Grant,
                 _ => ConsentSignal::Neutral,
@@ -448,11 +518,11 @@ mod tests {
         }
     }
 
-    /// A provider that declares a terms document, which is what a scheme like
-    /// Model Terms for Marketing does and none of the four that ship do.
+    /// A module that declares a terms document, which is what a scheme like
+    /// Model Terms for Marketing does and most schemes do not.
     struct Declaring(&'static str, &'static str);
 
-    impl PermissionSignalProvider for Declaring {
+    impl PermissionSignalModule for Declaring {
         fn id(&self) -> &'static str {
             self.0
         }
@@ -466,10 +536,10 @@ mod tests {
         }
     }
 
-    /// A provider that withdraws storage, for testing the scoping rule.
+    /// A module that withdraws storage, for testing the scoping rule.
     struct Withdrawing;
 
-    impl PermissionSignalProvider for Withdrawing {
+    impl PermissionSignalModule for Withdrawing {
         fn id(&self) -> &'static str {
             "withdrawing"
         }
@@ -487,12 +557,110 @@ mod tests {
         OwnedRequestInfo::new(String::new(), HeaderMap::new())
     }
 
-    fn fixed(id: &'static str, signal: ConsentSignal) -> Arc<dyn PermissionSignalProvider> {
+    fn fixed(id: &'static str, signal: ConsentSignal) -> Arc<dyn PermissionSignalModule> {
         Arc::new(Fixed(id, signal))
     }
 
+    /// A module that declares it can grant one permission, whatever it then
+    /// answers, standing in for a scheme with a mapping.
+    struct Granting(&'static str, Permission);
+
+    impl PermissionSignalModule for Granting {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+            PermissionSet::none().with(self.1)
+        }
+    }
+
     #[test]
-    fn a_provider_declaring_no_terms_leaves_the_list_empty() {
+    fn a_module_declares_nothing_grantable_unless_it_says_otherwise() {
+        // An opt-out only ever revokes, so the default declaration is empty
+        // and a deployment of opt-outs alone can grant nothing.
+        let policy = SignalPolicy::default();
+        assert!(
+            fixed("opt_out", ConsentSignal::Revoke)
+                .grants(&policy)
+                .is_empty()
+        );
+        assert!(answerable(&[fixed("a", ConsentSignal::Grant)], &policy).is_empty());
+    }
+
+    #[test]
+    fn what_is_answerable_is_the_union_of_every_declaration() {
+        let policy = SignalPolicy::default();
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
+            Arc::new(Granting("storage", Permission::StoreOnDevice)),
+            fixed("opt_out", ConsentSignal::Revoke),
+            Arc::new(Granting("profiling", Permission::CreateAdsProfile)),
+        ];
+        assert_eq!(
+            answerable(&modules, &policy),
+            PermissionSet::none()
+                .with(Permission::StoreOnDevice)
+                .with(Permission::CreateAdsProfile),
+            "should collect what every module declares, in any order"
+        );
+    }
+
+    /// A module that vouches for a signal, standing in for a scheme that
+    /// read its string and could decode it.
+    struct Vouching(&'static str, &'static str);
+
+    impl PermissionSignalModule for Vouching {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn valid_signal(
+            &self,
+            _consent: &ConsentContext,
+            _evidence: &dyn RequestInfo,
+        ) -> Option<ValidSignal> {
+            Some(ValidSignal::new(self.0, self.0, self.1))
+        }
+    }
+
+    #[test]
+    fn the_valid_signals_are_what_each_module_vouched_for_in_order() {
+        let consent = ConsentContext::default();
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
+            Arc::new(Vouching("first", "one")),
+            fixed("silent", ConsentSignal::Revoke),
+            Arc::new(Vouching("second", "two")),
+        ];
+        let valid = signals(&modules, &consent, &no_evidence());
+        assert_eq!(
+            &*valid,
+            &[
+                ValidSignal::new("first", "first", "one"),
+                ValidSignal::new("second", "second", "two"),
+            ],
+            "should carry what was vouched for, in configured order, and nothing else"
+        );
+        assert!(
+            signals(
+                &[fixed("silent", ConsentSignal::Grant)],
+                &consent,
+                &no_evidence()
+            )
+            .is_empty(),
+            "a module vouches for nothing unless it says otherwise"
+        );
+    }
+
+    #[test]
+    fn a_module_declaring_no_terms_leaves_the_list_empty() {
         let consent = ConsentContext::default();
         let declared = tdls(
             &[fixed("quiet", ConsentSignal::Grant)],
@@ -501,19 +669,19 @@ mod tests {
         );
         assert!(
             declared.is_empty(),
-            "should declare nothing, because the four shipped schemes carry no terms"
+            "should declare nothing, because the IAB schemes carry no terms"
         );
     }
 
     #[test]
-    fn terms_are_collected_in_the_order_the_providers_are_asked() {
+    fn terms_are_collected_in_the_order_the_modules_are_asked() {
         let consent = ConsentContext::default();
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
             fixed("quiet", ConsentSignal::Neutral),
             Arc::new(Declaring("second", "https://terms.example.com/b/1.txt")),
         ];
-        let declared = tdls(&providers, &consent, &no_evidence());
+        let declared = tdls(&modules, &consent, &no_evidence());
         let addresses: Vec<&str> = declared.iter().map(Tdl::as_str).collect();
         assert_eq!(
             addresses,
@@ -526,28 +694,28 @@ mod tests {
     }
 
     #[test]
-    fn one_document_named_by_two_providers_is_carried_once() {
+    fn one_document_named_by_two_modules_is_carried_once() {
         let consent = ConsentContext::default();
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
             Arc::new(Declaring("second", "https://terms.example.com/a/1.txt")),
         ];
-        let declared = tdls(&providers, &consent, &no_evidence());
+        let declared = tdls(&modules, &consent, &no_evidence());
         assert_eq!(
             declared.len(),
             1,
-            "should carry the same document once, not once per provider naming it"
+            "should carry the same document once, not once per module naming it"
         );
     }
 
     #[test]
     fn versions_of_one_document_are_both_carried() {
         let consent = ConsentContext::default();
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
             Arc::new(Declaring("second", "https://terms.example.com/a/2.txt")),
         ];
-        let declared = tdls(&providers, &consent, &no_evidence());
+        let declared = tdls(&modules, &consent, &no_evidence());
         assert_eq!(
             declared.len(),
             2,
@@ -556,19 +724,19 @@ mod tests {
     }
 
     #[test]
-    fn no_providers_declare_nothing() {
+    fn no_modules_declare_nothing() {
         let consent = ConsentContext::default();
         assert!(
             tdls(&[], &consent, &no_evidence()).is_empty(),
-            "should declare nothing when no provider runs, rather than implying terms"
+            "should declare nothing when no module runs, rather than implying terms"
         );
     }
 
-    fn combined(providers: &[Arc<dyn PermissionSignalProvider>]) -> ConsentSignal {
+    fn combined(modules: &[Arc<dyn PermissionSignalModule>]) -> ConsentSignal {
         let consent = ConsentContext::default();
         let policy = SignalPolicy::default();
         combine(
-            providers,
+            modules,
             Permission::StoreOnDevice,
             &consent,
             &no_evidence(),
@@ -577,23 +745,20 @@ mod tests {
         )
     }
 
-    /// The same, for a run whose providers differ only in what they answer.
+    /// The same, for a run whose modules differ only in what they answer.
     fn combined_signals(signals: &[ConsentSignal]) -> ConsentSignal {
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = signals
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = signals
             .iter()
             .map(|signal| fixed("test", *signal))
             .collect();
-        combined(&providers)
+        combined(&modules)
     }
 
-    fn withdrawn_under(
-        providers: &[Arc<dyn PermissionSignalProvider>],
-        baseline: Acquisition,
-    ) -> bool {
+    fn withdrawn_under(modules: &[Arc<dyn PermissionSignalModule>], baseline: Acquisition) -> bool {
         let consent = ConsentContext::default();
         let policy = SignalPolicy::default();
         withdrawn(
-            providers,
+            modules,
             Permission::StoreOnDevice,
             &consent,
             &no_evidence(),
@@ -611,16 +776,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn no_providers_leaves_the_place_baseline_alone() {
+    fn no_modules_leaves_the_place_baseline_alone() {
         assert_eq!(
             combined_signals(&[]),
             ConsentSignal::Neutral,
-            "with no provider configured nothing amends the place baseline"
+            "with no module configured nothing amends the place baseline"
         );
     }
 
     #[test]
-    fn the_last_provider_with_an_opinion_decides() {
+    fn the_last_module_with_an_opinion_decides() {
         assert_eq!(
             combined_signals(&[ConsentSignal::Revoke, ConsentSignal::Grant]),
             ConsentSignal::Grant,
@@ -636,13 +801,13 @@ mod tests {
 
     #[test]
     fn silence_leaves_an_earlier_answer_standing() {
-        // The failure this guards is a later provider overwriting a settled
-        // answer with its own absence, which would let adding a provider nobody
+        // The failure this guards is a later module overwriting a settled
+        // answer with its own absence, which would let adding a module nobody
         // uses undo the one that was working.
         assert_eq!(
             combined_signals(&[ConsentSignal::Grant, ConsentSignal::Neutral]),
             ConsentSignal::Grant,
-            "a later provider with no opinion leaves an earlier grant standing"
+            "a later module with no opinion leaves an earlier grant standing"
         );
         assert_eq!(
             combined_signals(&[ConsentSignal::Revoke, ConsentSignal::Neutral]),
@@ -652,22 +817,22 @@ mod tests {
     }
 
     #[test]
-    fn silence_from_every_provider_is_not_a_refusal() {
-        // The failure this guards is a provider that reads an absent signal as
+    fn silence_from_every_module_is_not_a_refusal() {
+        // The failure this guards is a module that reads an absent signal as
         // a refusal. It would revoke the permission on every request that did
         // not carry that scheme, which is most of them.
         assert_eq!(
             combined_signals(&[ConsentSignal::Neutral, ConsentSignal::Neutral]),
             ConsentSignal::Neutral,
-            "no provider having an opinion is not a refusal"
+            "no module having an opinion is not a refusal"
         );
     }
 
     #[test]
-    fn a_provider_sees_what_the_earlier_ones_settled() {
+    fn a_module_sees_what_the_earlier_ones_settled() {
         struct Recording;
 
-        impl PermissionSignalProvider for Recording {
+        impl PermissionSignalModule for Recording {
             fn id(&self) -> &'static str {
                 "recording"
             }
@@ -676,10 +841,10 @@ mod tests {
                 assert_eq!(
                     input.settled,
                     ConsentSignal::Revoke,
-                    "a provider is asked with the value the providers before it settled on"
+                    "a module is asked with the value the modules before it settled on"
                 );
                 assert_eq!(input.position(), 1, "and with its own place in the order");
-                assert_eq!(input.providers().len(), 2, "and with the whole list");
+                assert_eq!(input.modules().len(), 2, "and with the whole list");
                 assert_eq!(
                     input.baseline,
                     Acquisition::RequiresSignal,
@@ -689,20 +854,20 @@ mod tests {
             }
         }
 
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> =
+        let modules: Vec<Arc<dyn PermissionSignalModule>> =
             vec![fixed("opt-out", ConsentSignal::Revoke), Arc::new(Recording)];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Revoke,
-            "the recording provider has no opinion, so the opt-out stands"
+            "the recording module has no opinion, so the opt-out stands"
         );
     }
 
     #[test]
-    fn a_provider_can_override_a_peer_by_consulting_it() {
-        // The worked example from the README: a later provider overrides a
+    fn a_module_can_override_a_peer_by_consulting_it() {
+        // The worked example from the README: a later module overrides a
         // refusal because of who made it, not merely that one was made.
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             fixed("gpc", ConsentSignal::Revoke),
             Arc::new(Consulting {
                 id: "prompt",
@@ -710,14 +875,14 @@ mod tests {
             }),
         ];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Grant,
-            "a later provider overrides a refusal made by the peer it consulted"
+            "a later module overrides a refusal made by the peer it consulted"
         );
 
-        // The same provider leaves the refusal alone when it came from a peer
+        // The same module leaves the refusal alone when it came from a peer
         // it was not told to override.
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             fixed("other", ConsentSignal::Revoke),
             Arc::new(Consulting {
                 id: "prompt",
@@ -725,7 +890,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Revoke,
             "and leaves a refusal from any other peer standing"
         );
@@ -733,9 +898,9 @@ mod tests {
 
     #[test]
     fn asking_reaches_a_peer_wherever_it_sits_in_the_order() {
-        // A provider may consult one configured after it, not only before, so
-        // a reordering does not silently change what a provider can see.
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        // A module may consult one configured after it, not only before, so
+        // a reordering does not silently change what a module can see.
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             Arc::new(Consulting {
                 id: "prompt",
                 peer: "gpc",
@@ -743,17 +908,17 @@ mod tests {
             fixed("gpc", ConsentSignal::Revoke),
         ];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Revoke,
             "the consultation succeeded, and the later opt-out then settled it"
         );
     }
 
     #[test]
-    fn asking_for_a_provider_that_is_not_configured_answers_nothing() {
+    fn asking_for_a_module_that_is_not_configured_answers_nothing() {
         struct Absent;
 
-        impl PermissionSignalProvider for Absent {
+        impl PermissionSignalModule for Absent {
             fn id(&self) -> &'static str {
                 "absent"
             }
@@ -761,7 +926,7 @@ mod tests {
             fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
                 assert!(
                     input.ask("not-configured", permission).is_none(),
-                    "a provider must be able to tell a missing peer from a silent one"
+                    "a module must be able to tell a missing peer from a silent one"
                 );
                 assert!(
                     !input.has("not-configured"),
@@ -772,19 +937,19 @@ mod tests {
             }
         }
 
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(Absent)];
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(Absent)];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Neutral,
-            "a provider that finds its peer missing leaves the permission unsettled"
+            "a module that finds its peer missing leaves the permission unsettled"
         );
     }
 
     #[test]
-    fn a_provider_cannot_consult_itself() {
+    fn a_module_cannot_consult_itself() {
         struct SelfAsking;
 
-        impl PermissionSignalProvider for SelfAsking {
+        impl PermissionSignalModule for SelfAsking {
             fn id(&self) -> &'static str {
                 "self-asking"
             }
@@ -793,26 +958,26 @@ mod tests {
                 // Without the guard this recurses until the stack is gone.
                 assert!(
                     input.ask("self-asking", permission).is_none(),
-                    "a provider asking itself gets no answer"
+                    "a module asking itself gets no answer"
                 );
                 ConsentSignal::Grant
             }
         }
 
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(SelfAsking)];
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(SelfAsking)];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Grant,
-            "a provider refused its own consultation still answers for itself"
+            "a module refused its own consultation still answers for itself"
         );
     }
 
     #[test]
-    fn two_providers_that_consult_each_other_do_not_loop() {
+    fn two_modules_that_consult_each_other_do_not_loop() {
         // Each consults the other, and the one answering a consultation is
         // refused a consultation of its own, so the pair settles instead of
         // recursing.
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![
             Arc::new(Consulting {
                 id: "first",
                 peer: "second",
@@ -823,9 +988,9 @@ mod tests {
             }),
         ];
         assert_eq!(
-            combined(&providers),
+            combined(&modules),
             ConsentSignal::Neutral,
-            "two providers consulting each other settle instead of looping"
+            "two modules consulting each other settle instead of looping"
         );
     }
 
@@ -835,47 +1000,47 @@ mod tests {
 
     #[test]
     fn a_withdrawal_counts_only_where_the_baseline_did_not_grant() {
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> = vec![Arc::new(Withdrawing)];
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(Withdrawing)];
         assert!(
-            withdrawn_under(&providers, Acquisition::RequiresSignal),
+            withdrawn_under(&modules, Acquisition::RequiresSignal),
             "refusing the signal the permission depended on is destructive"
         );
         assert!(
-            withdrawn_under(&providers, Acquisition::Denied),
+            withdrawn_under(&modules, Acquisition::Denied),
             "and so is refusing under a baseline that never allowed it"
         );
         assert!(
-            !withdrawn_under(&providers, Acquisition::Granted),
+            !withdrawn_under(&modules, Acquisition::Granted),
             "where the permission never depended on the record, the refusal suppresses \
              without destroying"
         );
     }
 
     #[test]
-    fn a_provider_that_merely_revokes_does_not_withdraw() {
+    fn a_module_that_merely_revokes_does_not_withdraw() {
         // Revoke and withdraw are different questions. A sale opt-out revokes
         // and must never destroy an identifier.
-        let providers: Vec<Arc<dyn PermissionSignalProvider>> =
+        let modules: Vec<Arc<dyn PermissionSignalModule>> =
             vec![fixed("opt-out", ConsentSignal::Revoke)];
         assert!(
-            !withdrawn_under(&providers, Acquisition::RequiresSignal),
-            "a provider that only revokes never withdraws"
+            !withdrawn_under(&modules, Acquisition::RequiresSignal),
+            "a module that only revokes never withdraws"
         );
     }
 
     #[test]
-    fn no_providers_never_withdraw() {
+    fn no_modules_never_withdraw() {
         assert!(
             !withdrawn_under(&[], Acquisition::RequiresSignal),
-            "with no provider configured nothing can withdraw"
+            "with no module configured nothing can withdraw"
         );
     }
 
     // ------------------------------------------------------------------
-    // Selecting which providers run.
+    // Selecting which modules run.
     // ------------------------------------------------------------------
 
-    fn four() -> Vec<Arc<dyn PermissionSignalProvider>> {
+    fn four() -> Vec<Arc<dyn PermissionSignalModule>> {
         vec![
             fixed("gpc", ConsentSignal::Neutral),
             fixed("gpp_sale_opt_out", ConsentSignal::Neutral),
@@ -885,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn naming_nothing_runs_every_available_provider_in_the_offered_order() {
+    fn naming_nothing_runs_every_available_module_in_the_offered_order() {
         let selected = select(&four(), None).expect("should accept no configuration");
         assert_eq!(
             ids(&selected),
@@ -909,46 +1074,46 @@ mod tests {
     #[test]
     fn an_empty_list_is_acting_on_no_signal_and_is_accepted() {
         let selected = select(&four(), Some(&[])).expect("should accept an empty list");
-        assert!(selected.is_empty(), "an empty list selects no provider");
+        assert!(selected.is_empty(), "an empty list selects no module");
         assert_eq!(
             omitted(&four(), Some(&[])).len(),
             4,
-            "and every provider is reported left out"
+            "and every module is reported left out"
         );
     }
 
     #[test]
-    fn a_name_matching_no_available_provider_is_refused() {
+    fn a_name_matching_no_available_module_is_refused() {
         // Matched rather than `expect_err`, because the success type holds
         // trait objects that are deliberately not `Debug`.
-        let Err(error) = select(&four(), Some(&names(&["gpc", "not-a-provider"]))) else {
+        let Err(error) = select(&four(), Some(&names(&["gpc", "not-a-module"]))) else {
             panic!("should refuse a name this build does not offer");
         };
         let message = format!("{error:?}");
         assert!(
-            message.contains("not-a-provider") && message.contains("gpc, gpp_sale_opt_out"),
+            message.contains("not-a-module") && message.contains("gpc, gpp_sale_opt_out"),
             "the refusal names the bad entry and what is available: {message}"
         );
     }
 
     #[test]
-    fn naming_a_provider_twice_is_refused() {
+    fn naming_a_module_twice_is_refused() {
         let Err(error) = select(&four(), Some(&names(&["gpc", "tcf", "gpc"]))) else {
-            panic!("should refuse a provider named twice");
+            panic!("should refuse a module named twice");
         };
         assert!(
             format!("{error:?}").contains("more than once"),
-            "a provider runs once, at one place in the order"
+            "a module runs once, at one place in the order"
         );
     }
 
     #[test]
-    fn a_left_out_provider_is_reported_as_omitted() {
+    fn a_left_out_module_is_reported_as_omitted() {
         let configured = names(&["gpc", "tcf"]);
         assert_eq!(
             omitted(&four(), Some(&configured)),
             vec!["gpp_sale_opt_out", "us_privacy"],
-            "the providers the list leaves out are reported in the offered order"
+            "the modules the list leaves out are reported in the offered order"
         );
         assert!(
             omitted(&four(), None).is_empty(),

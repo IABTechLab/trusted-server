@@ -9,10 +9,11 @@ use error_stack::{Report, ResultExt as _};
 use rand::rngs::OsRng;
 
 use super::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+    StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -254,7 +255,7 @@ pub(crate) struct StubHttpClient {
     streaming_responses_supported: std::sync::atomic::AtomicBool,
     pending_streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
-    cache_bypass_flags: Mutex<Vec<bool>>,
+    cache_intents: Mutex<Vec<PlatformCacheIntent>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
@@ -286,7 +287,7 @@ impl StubHttpClient {
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
-            cache_bypass_flags: Mutex::new(Vec::new()),
+            cache_intents: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
@@ -446,11 +447,11 @@ impl StubHttpClient {
             .clone()
     }
 
-    /// Return cache-bypass flags captured per `send` or `send_async` call, in order.
-    pub(crate) fn recorded_cache_bypass_flags(&self) -> Vec<bool> {
-        self.cache_bypass_flags
+    /// Return the cache intent captured per `send` or `send_async` call, in order.
+    pub(crate) fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
+        self.cache_intents
             .lock()
-            .expect("should lock cache bypass flags")
+            .expect("should lock cache intents")
             .clone()
     }
 
@@ -528,10 +529,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock image optimizer options")
             .push(request.image_optimizer.clone());
-        self.cache_bypass_flags
+        self.cache_intents
             .lock()
-            .expect("should lock cache bypass flags")
-            .push(request.bypass_cache);
+            .expect("should lock cache intents")
+            .push(request.cache_intent.clone());
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
@@ -627,10 +628,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(backend_name.clone());
-        self.cache_bypass_flags
+        self.cache_intents
             .lock()
-            .expect("should lock cache bypass flags")
-            .push(request.bypass_cache);
+            .expect("should lock cache intents")
+            .push(request.cache_intent.clone());
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
@@ -940,7 +941,7 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
-/// Build a [`RuntimeServices`] with an injected geo provider, so a test can
+/// Build a [`RuntimeServices`] with an injected geo module, so a test can
 /// drive a geo outcome through the [`PlatformGeo`] seam rather than
 /// constructing the resolved status by hand.
 ///
@@ -958,56 +959,35 @@ pub(crate) fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServi
         .build()
 }
 
-/// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
-/// exercise the seam an opaque-identifier vendor provider reaches core through.
-pub(crate) fn noop_services_with_ec_provider(
-    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+/// Build a [`RuntimeServices`] carrying an Edge Cookie module, threaded the
+/// way a composition root threads the module it resolved, so a test can
+/// exercise the seam a vendor module reaches core through and check that the
+/// request path reuses that instance.
+pub(crate) fn noop_services_with_ec_module(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
 ) -> RuntimeServices {
-    // A fixed client IP, so a provider that reads one (the built-in HMAC
-    // provider does) can run.
-    noop_services_with_ec_provider_and_ip(
-        ec_provider,
+    // A fixed client IP, so a module that reads one (the built-in HMAC
+    // module does) can run.
+    noop_services_with_ec_module_and_ip(
+        ec_module,
         Some("203.0.113.10".parse().expect("should parse test client IP")),
     )
 }
 
-/// Build a [`RuntimeServices`] with an injected Edge Cookie provider and no
+/// Build a [`RuntimeServices`] with an injected Edge Cookie module and no
 /// client IP, modeling a host that cannot determine one.
 ///
-/// Whether that matters is the provider's decision, so this exists to test both
-/// answers: a provider reading other evidence still creates an identifier, and
+/// Whether that matters is the module's decision, so this exists to test both
+/// answers: a module reading other evidence still creates an identifier, and
 /// one that needs the IP refuses.
-pub(crate) fn noop_services_with_ec_provider_without_client_ip(
-    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+pub(crate) fn noop_services_with_ec_module_without_client_ip(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
 ) -> RuntimeServices {
-    noop_services_with_ec_provider_and_ip(ec_provider, None)
+    noop_services_with_ec_module_and_ip(ec_module, None)
 }
 
-/// Build a [`RuntimeServices`] carrying an Edge Cookie provider that a
-/// composition root already resolved, the way a production adapter threads it.
-///
-/// Use this to check that the request path reuses that instance rather than
-/// resolving `[ec] provider` for itself.
-pub(crate) fn noop_services_with_resolved_ec_provider(
-    resolved: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
-            ..ClientInfo::default()
-        })
-        .resolved_ec_provider(resolved)
-        .build()
-}
-
-fn noop_services_with_ec_provider_and_ip(
-    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+fn noop_services_with_ec_module_and_ip(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
     client_ip: Option<IpAddr>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
@@ -1021,7 +1001,7 @@ fn noop_services_with_ec_provider_and_ip(
             client_ip,
             ..ClientInfo::default()
         })
-        .resolved_ec_provider(ec_provider)
+        .resolved_ec_module(ec_module)
         .build()
 }
 
@@ -1198,9 +1178,9 @@ mod tests {
             "should record the backend name"
         );
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![false],
-            "should record the default cache-bypass flag"
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Default],
+            "should record the default cache intent"
         );
     }
 
@@ -1289,9 +1269,9 @@ mod tests {
             "should record both send_async calls in order"
         );
         assert_eq!(
-            stub.recorded_cache_bypass_flags(),
-            vec![false, true],
-            "should record both send_async cache-bypass flags in order"
+            stub.recorded_cache_intents(),
+            vec![PlatformCacheIntent::Default, PlatformCacheIntent::Bypass],
+            "should record both send_async cache intents in order"
         );
     }
 

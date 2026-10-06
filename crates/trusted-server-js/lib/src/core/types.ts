@@ -372,7 +372,7 @@ export interface GptSlotHandoff {
  * server for this request.
  *
  * `tdls` are the terms documents the data for this request is available under,
- * as declared by the permission signal providers the deployment runs, in the
+ * as declared by the permission signal modules the deployment runs, in the
  * order they were asked. Each entry addresses a published document a person can
  * read. An empty list says no terms were declared, which is not the same as
  * terms that permit anything, so page code that needs a basis and finds none
@@ -380,6 +380,18 @@ export interface GptSlotHandoff {
  */
 export interface PermissionsSnapshot {
   set: string[];
+  /**
+   * Permissions still waiting for a signal. Not set, and not refused
+   * either, which page code must tell apart from `set` being empty.
+   */
+  awaiting: string[];
+  /**
+   * The signals the server's modules read and found valid, each as it
+   * was received. A signal absent from this list was missing, could not be
+   * read, or is one the deployment does not act on, and page code relies
+   * on exactly these and no other.
+   */
+  signals: ValidSignal[];
   tdls: string[];
 }
 
@@ -403,7 +415,10 @@ export interface FirstImpressionSlotClaim {
   element: HTMLElement;
   owner: FirstImpressionOwner;
   phase: FirstImpressionPhase;
+  /** Publisher fallback deadline; TS claims remain owned until render or retirement. */
   expiresAt: number;
+  /** One historical snapshot if initial TS rendering is still pending after five seconds. */
+  pendingRenderDiagnostic?: { phase: FirstImpressionPhase; ageMs: number };
   publisherAuctions: Record<string, FirstImpressionPublisherAuction>;
   /** No later publisher auction may join this TS-owned first impression. */
   publisherRegistrationClosed?: boolean;
@@ -416,6 +431,16 @@ export interface FirstImpressionState {
   nextToken: number;
   slots: Record<string, FirstImpressionSlotClaim>;
   fallbackSlots: Record<string, HTMLElement>;
+}
+
+/** One signal a server-side module read and found valid. */
+export interface ValidSignal {
+  /** The module that read it, by its configured id. */
+  module: string;
+  /** The scheme it belongs to, for example `tcf` or `gpp`. */
+  scheme: string;
+  /** The signal as received. */
+  value: string;
 }
 
 export interface TsjsApi {

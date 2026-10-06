@@ -187,13 +187,13 @@ impl IntegrationProxy for TestlightIntegration {
         // Read the EC ID from the ts-ec cookie forwarded by the client. The
         // registry strips x-ts-ec before dispatching, so only the cookie is
         // available here. The value goes into the proxied body as `user.id` and
-        // leaves the edge, so only one the selected provider recognizes is
+        // leaves the edge, so only one the selected module recognizes is
         // accepted, and a stateless deployment supplies none.
         let ec_id = recognized_ec_id(settings, services, &req)
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "No EC ID this deployment's Edge Cookie provider recognizes was found \
+                    "No EC ID this deployment's Edge Cookie module recognizes was found \
                      in the ts-ec cookie",
                 ))
             })?;
@@ -474,7 +474,7 @@ mod tests {
         });
     }
 
-    /// A well-formed identifier carrying a provider code no deployment here
+    /// A well-formed identifier carrying a module code no deployment here
     /// reads, the shape a partner or another deployment would hand back.
     const FOREIGN_CODED_EC_ID: &str = "zz00~someone-elses-identifier";
 
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_refuses_to_egress_an_ec_id_the_provider_does_not_recognize() {
+    fn handle_refuses_to_egress_an_ec_id_the_module_does_not_recognize() {
         futures::executor::block_on(async {
             // The identifier ends up in the proxied body as `user.id` and leaves
             // the edge, so a value this deployment did not issue must stop here
@@ -521,7 +521,7 @@ mod tests {
                     testlight_auction_request(FOREIGN_CODED_EC_ID),
                 )
                 .await
-                .expect_err("a foreign provider code should not be proxied upstream");
+                .expect_err("a foreign module code should not be proxied upstream");
             drop(refused);
 
             assert!(
@@ -539,11 +539,11 @@ mod tests {
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
-            // The value is one the built-in provider would recognize, so only
-            // the absence of a selected provider can withhold it.
+            // The value is one the built-in module would recognize, so only
+            // the absence of a selected module can withhold it.
             let mut settings = create_test_settings();
-            settings.ec.provider = None;
-            settings.ec.provider_blocks.clear();
+            settings.ec.module = None;
+            settings.ec.module_blocks.clear();
 
             let refused = testlight_integration()
                 .handle(

@@ -9,9 +9,9 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
-use crate::ec::provider::EdgeCookieProvider;
+use crate::ec::module::EdgeCookieModule;
 use crate::evidence::HostSignals;
-use crate::permission_signal::PermissionSignalProvider;
+use crate::permission_signal::PermissionSignalModule;
 
 /// Geographic information extracted from a request.
 ///
@@ -174,7 +174,7 @@ pub struct RuntimeServices {
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
-    /// per request rather than failing. Spike-only; see
+    /// per request rather than failing. See
     /// [`crate::platform::template_cache`].
     pub(crate) template_cache: Arc<dyn super::PlatformTemplateCache>,
     /// Platform-specific cold-response template assembler.
@@ -193,23 +193,23 @@ pub struct RuntimeServices {
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
     /// Host-computed client signals (TLS JA4, HTTP/2), when the host
-    /// supplies them. `None` on a host that exposes none, so a provider that
+    /// supplies them. `None` on a host that exposes none, so a module that
     /// requires them cannot be built and the request stops.
     pub(crate) host_signals: Option<Arc<dyn HostSignals>>,
-    /// The Edge Cookie provider this deployment already resolved from
-    /// `[ec] provider` while it built application state.
+    /// The Edge Cookie module this deployment already resolved from
+    /// `[ec] module` while it built application state.
     ///
     /// `None` when the adapter resolved nothing here, in which case the request
     /// path resolves the selection itself, which is what a deployment that
-    /// selects no provider, the Axum adapter, and the core tests all do.
-    pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    /// The permission signal providers this deployment runs, in the order
+    /// selects no module, the Axum adapter, and the core tests all do.
+    pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules this deployment runs, in the order
     /// they are asked, selected at the composition root from the scheme
     /// crates the adapter links. Empty when the adapter offers none, in which
     /// case every permission stays at its country and region baseline. Shared,
     /// so building the services for a request bumps a reference count rather
     /// than copying the list, and cloning the services does the same.
-    pub(crate) permission_signal_providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+    pub(crate) permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
 }
 
 impl RuntimeServices {
@@ -255,7 +255,7 @@ impl RuntimeServices {
         &*self.kv_store
     }
 
-    /// The shared transformed-template cache. Spike-only.
+    /// The shared transformed-template cache.
     #[must_use]
     pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
         &*self.template_cache
@@ -300,34 +300,34 @@ impl RuntimeServices {
     /// Returns the host-computed client signals, when the host supplies
     /// them.
     ///
-    /// A provider that derives identity from the TLS JA4 or HTTP/2 signals
+    /// A module that derives identity from the TLS JA4 or HTTP/2 signals
     /// takes these as an injected service. The result is `None` on a host that
-    /// exposes none, so such a provider cannot be built there and the request
+    /// exposes none, so such a module cannot be built there and the request
     /// stops rather than creating a degraded identifier.
     #[must_use]
     pub fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
         self.host_signals.clone()
     }
 
-    /// Returns the Edge Cookie provider the composition root already resolved,
+    /// Returns the Edge Cookie module the composition root already resolved,
     /// when the adapter threaded one through.
     ///
-    /// Resolving `[ec] provider` reads no request data, so the answer is the
+    /// Resolving `[ec] module` reads no request data, so the answer is the
     /// same for every request and an adapter that resolves it once while it
     /// builds application state can hand the result here instead of the
     /// request path resolving the same settings again. `None` means nothing was
     /// threaded, so the request path resolves for itself. Read this through
-    /// [`request_provider`](crate::ec::provider::request_provider) rather than
+    /// [`request_module`](crate::ec::module::request_module) rather than
     /// directly, so both answers are handled in one place.
     #[must_use]
-    pub fn resolved_ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
-        self.resolved_ec_provider.clone()
+    pub fn resolved_ec_module(&self) -> Option<Arc<dyn EdgeCookieModule>> {
+        self.resolved_ec_module.clone()
     }
 
-    /// The permission signal providers this deployment runs, in order.
+    /// The permission signal modules this deployment runs, in order.
     #[must_use]
-    pub fn permission_signal_providers(&self) -> &[Arc<dyn PermissionSignalProvider>] {
-        &self.permission_signal_providers
+    pub fn permission_signal_modules(&self) -> &[Arc<dyn PermissionSignalModule>] {
+        &self.permission_signal_modules
     }
 
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
@@ -350,28 +350,26 @@ impl RuntimeServices {
         }
     }
 
-    /// Returns a clone of this instance with the resolved Edge Cookie provider
+    /// Returns a clone of this instance with the resolved Edge Cookie module
     /// replaced.
     ///
     /// Adapters that build their per-request services through a shared helper
-    /// with no application state in hand use this to thread the provider the
+    /// with no application state in hand use this to thread the module the
     /// composition root resolved. `None` leaves the request path to resolve
-    /// `[ec] provider` for itself, which is what the Axum adapter and a
-    /// deployment selecting no provider both do.
+    /// `[ec] module` for itself, which is what the Axum adapter and a
+    /// deployment selecting no module both do.
     #[must_use]
-    pub fn with_resolved_ec_provider(
+    pub fn with_resolved_ec_module(
         self,
-        resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+        resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
     ) -> Self {
         Self {
-            resolved_ec_provider,
+            resolved_ec_module,
             ..self
         }
     }
 
     /// Returns a clone of this instance with the template cache replaced.
-    ///
-    /// Spike-only (#1009).
     #[must_use]
     pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         Self {
@@ -417,8 +415,8 @@ pub struct RuntimeServicesBuilder {
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
-    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    permission_signal_providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+    resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    permission_signal_modules: Arc<[Arc<dyn PermissionSignalModule>]>,
 }
 
 impl RuntimeServicesBuilder {
@@ -435,8 +433,8 @@ impl RuntimeServicesBuilder {
             auction_telemetry_sink: None,
             client_info: None,
             host_signals: None,
-            resolved_ec_provider: None,
-            permission_signal_providers: Arc::default(),
+            resolved_ec_module: None,
+            permission_signal_modules: Arc::default(),
         }
     }
 
@@ -454,7 +452,7 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the shared transformed-template cache. Spike-only.
+    /// Set the shared transformed-template cache.
     #[must_use]
     pub fn template_cache(mut self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         self.template_cache = Some(cache);
@@ -519,7 +517,7 @@ impl RuntimeServicesBuilder {
     /// Set the host-computed client signals service.
     ///
     /// Optional: a host that exposes no TLS or HTTP/2 signals leaves this
-    /// unset, so a provider that requires them cannot be built and the request
+    /// unset, so a module that requires them cannot be built and the request
     /// stops.
     #[must_use]
     pub fn host_signals(mut self, host_signals: Arc<dyn HostSignals>) -> Self {
@@ -527,34 +525,34 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the Edge Cookie provider the composition root already resolved.
+    /// Set the Edge Cookie module the composition root already resolved.
     ///
-    /// Optional. This is the provider the selector actually chose, so setting
+    /// Optional. This is the module the selector actually chose, so setting
     /// it keeps the request path from resolving the same settings a second
     /// time. It is the single seam through which a vendor or host Edge Cookie
-    /// provider reaches the request path.
+    /// module reaches the request path.
     #[must_use]
-    pub fn resolved_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
-        self.resolved_ec_provider = Some(provider);
+    pub fn resolved_ec_module(mut self, module: Arc<dyn EdgeCookieModule>) -> Self {
+        self.resolved_ec_module = Some(module);
         self
     }
 
-    /// Set the permission signal providers this deployment runs, in the order
+    /// Set the permission signal modules this deployment runs, in the order
     /// they are asked.
     ///
     /// Optional, and empty when unset. An adapter hands in the shared list
-    /// [`build_permission_signal_providers`] selected from the scheme crates it
-    /// links, so the request path asks exactly the providers configuration
+    /// [`build_permission_signal_modules`] selected from the scheme crates it
+    /// links, so the request path asks exactly the modules configuration
     /// named, in that order, and core supplies none of its own.
     ///
-    /// [`build_permission_signal_providers`]:
-    ///     crate::permission_signal::build_permission_signal_providers
+    /// [`build_permission_signal_modules`]:
+    ///     crate::permission_signal::build_permission_signal_modules
     #[must_use]
-    pub fn permission_signal_providers(
+    pub fn permission_signal_modules(
         mut self,
-        providers: Arc<[Arc<dyn PermissionSignalProvider>]>,
+        modules: Arc<[Arc<dyn PermissionSignalModule>]>,
     ) -> Self {
-        self.permission_signal_providers = providers;
+        self.permission_signal_modules = modules;
         self
     }
 
@@ -599,8 +597,8 @@ impl RuntimeServicesBuilder {
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
             host_signals: self.host_signals,
-            resolved_ec_provider: self.resolved_ec_provider,
-            permission_signal_providers: self.permission_signal_providers,
+            resolved_ec_module: self.resolved_ec_module,
+            permission_signal_modules: self.permission_signal_modules,
         }
     }
 }

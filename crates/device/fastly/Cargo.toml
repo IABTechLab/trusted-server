@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-device-fastly"
-description = "Fastly host device provider exposing opt-in TLS and HTTP/2 signals."
+description = "Fastly host device module exposing opt-in TLS and HTTP/2 signals."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

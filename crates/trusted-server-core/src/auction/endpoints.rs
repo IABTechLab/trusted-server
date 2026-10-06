@@ -305,7 +305,7 @@ pub async fn handle_auction(
     // EC and both KV and partner stores are available. Gate the read on a
     // present registry: without one, `resolve_auction_eids` yields no
     // server-side EIDs, so the snapshot would be an unused billable KV read.
-    // The row is read under the owning provider's canonical form of the
+    // The row is read under the owning module's canonical form of the
     // identifier, the key it is stored under, rather than under the identifier
     // as issued.
     let auction_kv_snapshot = match (kv, ec_id.as_deref(), registry) {
@@ -458,7 +458,7 @@ pub(crate) fn resolve_auction_eids(
     let ec_id = ec_context.ec_value()?;
 
     // Callers read the snapshot under the identity-graph key, the owning
-    // provider's canonical form of the identifier, so the entry is looked up
+    // module's canonical form of the identifier, so the entry is looked up
     // under that key rather than under the identifier as issued.
     let Some(entry) = ec_context
         .kv_key_for(ec_id)
@@ -636,7 +636,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
-    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingProvider};
+    use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
@@ -794,6 +794,7 @@ mod tests {
             "the endpoint must hand its snapshot to the request context"
         );
 
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
@@ -823,9 +824,9 @@ mod tests {
 
     #[tokio::test]
     async fn auction_endpoint_loads_the_row_under_the_canonical_key() {
-        // The identity graph stores a row under the owning provider's
+        // The identity graph stores a row under the owning module's
         // canonical form of the identifier. Loaded and resolved under the
-        // identifier as issued, a provider whose canonical form differs from
+        // identifier as issued, a module whose canonical form differs from
         // the cookie value found no row, so the auction carried no server-side
         // EIDs and the context kept a snapshot bound to the wrong key.
         let settings = create_test_settings();
@@ -854,7 +855,7 @@ mod tests {
             )
             .expect("should seed the row under the canonical key");
         let mut ec_context = make_non_regulated_ec_context(Some(CANONICAL_COOKIE_VALUE))
-            .with_provider_for_test(Arc::new(CanonicalizingProvider));
+            .with_module_for_test(Arc::new(CanonicalizingModule));
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")

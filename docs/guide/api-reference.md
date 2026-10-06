@@ -211,6 +211,63 @@ curl -X POST https://edge.example.com/auction \
   -d '{"adUnits":[{"code":"banner","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
+#### PBS stored-request intent
+
+The reserved `trustedServer` bid accepts `storedRequest` inside `params`, beside
+`bidderParams` and `zone`. It does not accept provider IDs, endpoints, or stored IDs.
+Bidder keys still resolve through the server's `[auction.bidders]` routes.
+
+| `params.storedRequest` | PBS behavior                                                                                                                                                                                                         |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false`                | Disable stored fallback for this slot on every PBS provider. Usable inline demand still runs.                                                                                                                        |
+| `true`                 | Permit stored fallback using the slot `code` as the stored impression ID. Usable inline params take precedence within each provider.                                                                                 |
+| Omitted                | Preserve legacy inference for existing callers and server-generated opportunities. Missing, `null`, or empty `bidderParams` permits stored demand; routed empty bidder objects also retain fallback after overrides. |
+
+`storedRequest: null` is invalid, as are strings, numbers, arrays, and objects.
+JavaScript `undefined` is removed by JSON serialization, so the server receives an
+omitted value and applies legacy inference. An invalid serialized value rejects the
+whole envelope, including its inline params and zone, and increments the
+malformed-envelope diagnostic. Independent valid direct bidder entries and eligible
+non-PBS providers still run; this is not whole-request HTTP rejection. An absent or
+empty `bids` list also retains legacy stored inference.
+
+PBS applies provider-local overrides before checking inline demand. If no usable
+inline params remain, it uses stored demand only when permitted, otherwise it
+omits the impression. If none remain, it makes no PBS request. Eligible APS and
+standard providers are unaffected.
+
+A generated envelope that should not request PBS stored demand:
+
+```json
+{
+  "bidder": "trustedServer",
+  "params": { "bidderParams": {}, "storedRequest": false }
+}
+```
+
+An intentional stored request, posted to `https://edge.example.com/auction`:
+
+```json
+{
+  "adUnits": [
+    {
+      "code": "homepage-banner",
+      "mediaTypes": { "banner": { "sizes": [[728, 90]] } },
+      "bids": [
+        {
+          "bidder": "trustedServer",
+          "params": { "bidderParams": {}, "storedRequest": true }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Stored demand retains existing PBS fanout. Each participating PBS instance must
+have the requested slot-code ID. This filtering does not prevent errors from
+unrelated invalid bidder params. See [deployment ordering](/guide/integrations/prebid#stored-intent-deployment).
+
 ### GET /\_ts/page-bids and GET /\_\_ts/page-bids
 
 Runs the page-level auction used by the TSJS single-page-application hook. The
@@ -297,7 +354,7 @@ re-evaluated within the recheck window).
 
 ### POST /\_ts/api/v1/batch-sync
 
-Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps. Valid mappings use idempotent last-write-wins semantics.
+Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps.
 
 **Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
 
@@ -309,6 +366,32 @@ item reasons are `invalid_ec_id`, `invalid_partner_uid`, `ineligible`, or
 rate exhaustion returns `429`; an oversized body returns `413`; too many
 mappings returns `400`. The endpoint emits JSON but defines no dedicated cache
 or CORS headers. It is Fastly-only and requires the EC KV store.
+
+**Batch processing behavior:**
+
+- Every mapping is validated before any KV update. Validation errors retain their
+  original input index.
+- Valid mappings are grouped by normalized EC ID: only the 64-character hex
+  prefix is lowercased; the six-character suffix remains case-sensitive.
+- Groups are processed in first-valid-occurrence order, with one call to the
+  CAS-protected KV update path per distinct normalized EC ID. Within a group, the
+  last valid `partner_uid` in request order is persisted. An invalid mapping
+  never replaces a group's final UID.
+- A successful or unchanged update accepts every valid mapping in its group.
+  Missing and withdrawn EC entries reject every valid mapping in their group as
+  `ineligible`.
+- If a KV infrastructure failure occurs, every valid mapping in the failing
+  group and each unprocessed valid group is rejected as `kv_unavailable`; no
+  later group is updated. Already processed groups keep their outcomes, and
+  validation errors are preserved.
+- Each input receives exactly one outcome, so `accepted + rejected` equals the
+  number of submitted mappings. `errors` is sorted by original input index. The
+  endpoint returns `200 OK` only when all mappings are accepted; otherwise it
+  returns `207 Multi-Status`.
+
+Groupwise failure behavior is intentional: for `A(valid), B(valid), A(valid)`,
+if A's group succeeds and B's group has an infrastructure failure, both A
+mappings are accepted even though the second A appears after B in the input.
 
 **Request Body:**
 
@@ -342,13 +425,13 @@ or CORS headers. It is Fastly-only and requires the EC KV store.
 
 ### POST /\_ts/api/v1/ec/resolve
 
-Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client_fixed` demo). Server-side providers such as HMAC do not use it.
+Resolve endpoint for client-side Edge Cookie modules. The page posts a value that the module verifies and creates the Edge Cookie value. Used only when a client-side module is selected (for example the `client_fixed` demo). Server-side modules such as HMAC do not use it.
 
-**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
+**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The module is responsible for verifying the posted value before trusting it.
 
-**Request Body:** the provider's value, opaque to the core. For the `client_fixed` demo this is the fixed known word sent as `text/plain`.
+**Request Body:** the module's value, opaque to the core. For the `client_fixed` demo this is the fixed known word sent as `text/plain`.
 
-**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side module is configured, no identity graph is available, or the module produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
 
 ---
 
@@ -791,13 +874,13 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the provider this deployment selects, such as the built-in HMAC provider's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC provider also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no provider selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID created by the module this deployment selects, such as the built-in HMAC module's `hmac~{64 hex}.{6 alphanumeric}` form. The built-in HMAC module also still reads the bare legacy `{64 hex}.{6 alphanumeric}` form, and a deployment with no module selected accepts both of those forms. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 
 **Response fields:**
 
-- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC provider issued. `store` and `generation` identify the raw KV lookup.
+- `ec_id` is the EC ID as requested, and `kv_key` is the identity-graph key the record was read from. The key is `ec_id` in the normalized form the identity graph stores, which is the same string as `ec_id` for an identifier the built-in HMAC module issued. `store` and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
 - `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.

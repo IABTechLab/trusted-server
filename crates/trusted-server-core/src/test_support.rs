@@ -1,10 +1,8 @@
 #[cfg(test)]
 pub mod tests {
-    use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
+    use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::redacted::Redacted;
-    use crate::settings::{
-        Ec, EcProviderBlock, HmacProviderConfig, HostSignalsProviderConfig, Settings,
-    };
+    use crate::settings::{Ec, EcModuleBlock, HmacModuleConfig, HostSignalsModuleConfig, Settings};
 
     #[must_use]
     pub fn crate_test_settings_str() -> String {
@@ -29,7 +27,7 @@ pub mod tests {
             # A gdpr-eu country, where every permission requires a signal. This
             # reproduces the prior no-default floor, so existing tests are
             # unaffected by the now-required default.
-            # Tests run with no geo provider, so single-jurisdiction operation
+            # Tests run with no geo module, so single-jurisdiction operation
             # is acknowledged the same way a deployment would.
             assume_single_jurisdiction = true
 
@@ -45,7 +43,7 @@ pub mod tests {
             rewrite_attributes = ["href", "link", "url"]
 
             [ec]
-            provider = "hmac"
+            module = "hmac"
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
@@ -58,7 +56,7 @@ pub mod tests {
     }
 
     /// The crate test configuration with its whole `[ec]` section replaced by
-    /// `ec_section`, which carries its own `[ec]` header and any provider
+    /// `ec_section`, which carries its own `[ec]` header and any module
     /// blocks.
     ///
     /// # Panics
@@ -90,32 +88,32 @@ pub mod tests {
         settings
     }
 
-    /// Selects the built-in HMAC provider under `name` with `passphrase`,
-    /// replacing whatever Edge Cookie provider the settings carried.
+    /// Selects the built-in HMAC module under `name` with `passphrase`,
+    /// replacing whatever Edge Cookie module the settings carried.
     ///
     /// A `name` other than `hmac` is a label, so the block names the
     /// implementation it configures.
-    pub fn select_hmac_provider(ec: &mut Ec, name: &str, passphrase: &str) {
-        let mut block = EcProviderBlock::from(HmacProviderConfig {
+    pub fn select_hmac_module(ec: &mut Ec, name: &str, passphrase: &str) {
+        let mut block = EcModuleBlock::from(HmacModuleConfig {
             passphrase: Redacted::new(passphrase.to_owned()),
         });
-        if name != HMAC_PROVIDER_KEY {
-            block.implementation = Some(HMAC_PROVIDER_KEY.to_owned());
+        if name != HMAC_MODULE_KEY {
+            block.implementation = Some(HMAC_MODULE_KEY.to_owned());
         }
-        ec.provider = Some(EcProviderSelection::from(name));
-        ec.provider_blocks.clear();
-        ec.provider_blocks.insert(name.to_owned(), block);
+        ec.module = Some(EcModuleSelection::from(name));
+        ec.module_blocks.clear();
+        ec.module_blocks.insert(name.to_owned(), block);
     }
 
-    /// Selects the built-in host-signal provider under its own name with
-    /// `passphrase`, replacing whatever Edge Cookie provider the settings
+    /// Selects the built-in host-signal module under its own name with
+    /// `passphrase`, replacing whatever Edge Cookie module the settings
     /// carried.
-    pub fn select_host_signals_provider(ec: &mut Ec, passphrase: &str) {
-        ec.provider = Some(EcProviderSelection::from(HOST_SIGNALS_PROVIDER_KEY));
-        ec.provider_blocks.clear();
-        ec.provider_blocks.insert(
-            HOST_SIGNALS_PROVIDER_KEY.to_owned(),
-            EcProviderBlock::from(HostSignalsProviderConfig {
+    pub fn select_host_signals_module(ec: &mut Ec, passphrase: &str) {
+        ec.module = Some(EcModuleSelection::from(HOST_SIGNALS_MODULE_KEY));
+        ec.module_blocks.clear();
+        ec.module_blocks.insert(
+            HOST_SIGNALS_MODULE_KEY.to_owned(),
+            EcModuleBlock::from(HostSignalsModuleConfig {
                 passphrase: Redacted::new(passphrase.to_owned()),
             }),
         );
@@ -126,13 +124,13 @@ pub mod tests {
     /// # Panics
     ///
     /// Panics if `name` has no block, or if its block configures another
-    /// provider.
+    /// module.
     #[must_use]
     pub fn hmac_passphrase<'a>(ec: &'a Ec, name: &str) -> &'a str {
-        ec.provider_blocks
+        ec.module_blocks
             .get(name)
-            .and_then(EcProviderBlock::hmac_settings)
-            .unwrap_or_else(|| panic!("settings should configure the hmac provider under `{name}`"))
+            .and_then(EcModuleBlock::hmac_settings)
+            .unwrap_or_else(|| panic!("settings should configure the hmac module under `{name}`"))
             .passphrase
             .expose()
     }
@@ -195,7 +193,7 @@ pub mod nextjs_auction {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             # The fixture serves one publisher in one place, so it says so
-            # rather than selecting a geo provider it has no use for.
+            # rather than selecting a geo module it has no use for.
             [geo]
             assume_single_jurisdiction = true
             "#,

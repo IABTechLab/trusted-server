@@ -18,7 +18,7 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::provider::ensure_provider_available;
+use trusted_server_core::ec::module::ensure_module_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -52,33 +52,34 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
-    /// The permission signal providers `[permission_signal] provider` selects
+    /// The permission signal modules `[permission_signal] module` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
-    permission_signal_providers:
-        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
 }
 
-/// The permission signal providers this adapter links, in the order they run
+/// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
 /// carry a choice someone made through an interface follow, so an answer
 /// given at a prompt amends the header the visitor arrived with.
 ///
-/// Core supplies no provider of its own, so this is where a deployment's
+/// Core supplies no module of its own, so this is where a deployment's
 /// schemes are decided. A scheme is added by linking its crate here, and a
 /// scheme core has never heard of plugs in the same way.
-fn shipped_signal_providers()
--> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
     vec![
-        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
-        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
-        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
-        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
     ]
 }
 
@@ -105,7 +106,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
 /// fail to initialize.
 fn build_state_with_settings(
@@ -118,41 +119,41 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    // Composition root: reject a provider selection this adapter can never
+    // Composition root: reject a module selection this adapter can never
     // supply, once, before any request is served. A caller supplying its own
-    // `RuntimeServices` may already have resolved a provider, so the check is
+    // `RuntimeServices` may already have resolved a module, so the check is
     // given whatever those services carry, which is what `EcContext` sees per
     // request.
     //
     // This adapter checks rather than keeps what the check resolved, unlike the
     // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
     // whose application state is built once at start-up while theirs is rebuilt
-    // for every request. With no services supplied it threads no provider, so
+    // for every request. With no services supplied it threads no module, so
     // `EcContext` resolves the selection itself on every request, building a
-    // fresh built-in provider that reads no request data. It supplies no host
+    // fresh built-in module that reads no request data. It supplies no host
     // signals either, so the `host_signals` argument is `None`.
-    ensure_provider_available(
+    ensure_module_available(
         &settings.ec,
         None,
         services
             .as_ref()
-            .and_then(RuntimeServices::resolved_ec_provider),
+            .and_then(RuntimeServices::resolved_ec_module),
     )?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
-    let permission_signal_providers =
-        trusted_server_core::permission_signal::build_permission_signal_providers(
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
-            &shipped_signal_providers(),
+            &shipped_signal_modules(),
         )?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        permission_signal_providers,
+        permission_signal_modules,
         services,
     }))
 }
@@ -160,7 +161,7 @@ fn build_state_with_services(
 impl AppState {
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services.clone().unwrap_or_else(|| {
-            build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+            build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
         })
     }
 }
@@ -251,7 +252,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this request, or when the request's `Cookie` header is not valid UTF-8.
 fn build_ec_context(
     state: &AppState,
@@ -356,6 +357,7 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
+    CachePurgeNotSupported,
     AdminEcNotSupported,
     AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
@@ -385,7 +387,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 16] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -409,6 +411,14 @@ fn named_routes() -> [NamedRoute; 16] {
             path: "/_ts/admin/keys/deactivate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Every method, for the same reason as the Fastly adapter: a method this route
+        // does not claim falls through to the publisher with the caller's `Authorization`
+        // header still attached.
+        NamedRoute {
+            path: "/_ts/admin/cache/purge",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::CachePurgeNotSupported,
         },
         // Admin EC lookup routes. Registered explicitly (like the key routes
         // above) so they never fall through to the publisher fallback, and
@@ -509,6 +519,22 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::VerifySignature => {
                         handle_verify_signature(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::CachePurgeNotSupported => {
+                        // The Axum dev server has no template cache to purge. 501 rather
+                        // than a fallthrough 404, so a CMS webhook can tell "not supported
+                        // here" from "endpoint does not exist".
+                        let body = edgezero_core::body::Body::from(
+                            "Template cache purge is not supported on the Axum dev server.\n\
+                             Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+                        );
+                        let mut resp = Response::new(body);
+                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        Ok(resp)
                     }
                     NamedRouteHandler::AdminNotSupported => {
                         // Config/secret-store writes are backed by read-only env vars on the
@@ -759,10 +785,10 @@ mod tests {
 
     use super::*;
 
-    /// Settings selecting a vendor Edge Cookie provider this adapter does not
-    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// Settings selecting a vendor Edge Cookie module this adapter does not
+    /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
-    const UNINJECTED_PROVIDER_TOML: &str = r#"
+    const UNINJECTED_MODULE_TOML: &str = r#"
         [[handlers]]
         path = "^/_ts/admin"
         username = "admin"
@@ -775,13 +801,13 @@ mod tests {
         proxy_secret = "unit-test-proxy-secret"
 
         [ec]
-        provider = "acme"
+        module = "acme"
 
         [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
-        # An Edge Cookie provider is configured, so single-jurisdiction
-        # operation is acknowledged because no geo provider is selected.
+        # An Edge Cookie module is configured, so single-jurisdiction
+        # operation is acknowledged because no geo module is selected.
         [geo]
         assume_single_jurisdiction = true
     "#;
@@ -789,9 +815,9 @@ mod tests {
     /// Builds application state directly, bypassing the composition root's
     /// startup check, so the per-request behavior can be exercised with a
     /// selection the adapter cannot supply.
-    fn state_with_uninjected_provider() -> AppState {
-        let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
-            .expect("should parse settings selecting an uninjected provider");
+    fn state_with_uninjected_module() -> AppState {
+        let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)
+            .expect("should parse settings selecting an uninjected module");
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
         let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)
             .expect("should build orchestrator");
@@ -801,9 +827,9 @@ mod tests {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
-            // These tests exercise the Edge Cookie provider path, and a
-            // request with no signal provider resolves at the place baseline.
-            permission_signal_providers: Arc::default(),
+            // These tests exercise the Edge Cookie module path, and a
+            // request with no signal module resolves at the place baseline.
+            permission_signal_modules: Arc::default(),
             // This test drives the per-request path, which builds its services
             // from the request context.
             services: None,
@@ -814,12 +840,12 @@ mod tests {
     /// default context.
     ///
     /// This adapter used to log the failure and continue with
-    /// `EcContext::default()`, so a deployment whose selected provider could not
+    /// `EcContext::default()`, so a deployment whose selected module could not
     /// be built served every request with no identity. The call sites propagate
     /// the error to `http_error`, matching the Fastly adapter.
     #[test]
-    fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
-        let state = state_with_uninjected_provider();
+    fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
+        let state = state_with_uninjected_module();
         let req = request_builder()
             .method("POST")
             .uri("https://test-publisher.example.com/auction")
@@ -827,15 +853,15 @@ mod tests {
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
         let services =
-            build_runtime_services(&ctx, &state.settings, &state.permission_signal_providers);
+            build_runtime_services(&ctx, &state.settings, &state.permission_signal_modules);
         let req = ctx.into_request();
 
         let error = build_ec_context(&state, &services, &req)
-            .expect_err("an unavailable Edge Cookie provider must fail the request");
+            .expect_err("an unavailable Edge Cookie module must fail the request");
 
         assert!(
             error.to_string().contains("acme"),
-            "the error should name the selected provider, got: {error}"
+            "the error should name the selected module, got: {error}"
         );
     }
 }

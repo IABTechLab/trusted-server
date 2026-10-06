@@ -1,6 +1,6 @@
 [package]
 name = "trusted-server-permission-signal-gpc"
-description = "Global Privacy Control as a permission signal provider."
+description = "Global Privacy Control as a permission signal module."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

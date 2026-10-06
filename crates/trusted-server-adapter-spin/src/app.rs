@@ -24,7 +24,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::provider::{EdgeCookieProvider, build_reusable_provider};
+use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -68,22 +68,22 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
-    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    /// The Edge Cookie module `[ec] module` selects, resolved once here.
     ///
     /// This adapter runs a fresh instance per request, so application state and
     /// the request path used to resolve the same selection twice for every
     /// request, once to check it could be satisfied and once to use it.
     /// Resolving reads no request data, so the result is kept and handed to
     /// every request through
-    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
-    /// `None` for a deployment that selects no provider.
-    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
-    /// The permission signal providers `[permission_signal] provider` selects
+    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
+    /// `None` for a deployment that selects no module.
+    ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules `[permission_signal] module` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
-    permission_signal_providers:
-        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>]>,
+    permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -146,7 +146,7 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
 /// fail to initialize.
 fn build_state_with_settings(
@@ -159,72 +159,73 @@ fn build_state_with_services(
     settings: Settings,
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    // Composition root: resolve the provider selection once, before any request
+    // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. This adapter
     // supplies no host signals, so that argument is `None`, and injects no
-    // vendor Edge Cookie provider of its own, so the only injected provider is
+    // vendor Edge Cookie module of its own, so the only injected module is
     // one a caller put into the services it supplied.
-    let ec_provider = build_reusable_provider(
+    let ec_module = build_reusable_module(
         &settings.ec,
         None,
         services
             .as_ref()
-            .and_then(RuntimeServices::resolved_ec_provider),
+            .and_then(RuntimeServices::resolved_ec_module),
     )?;
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
-    let permission_signal_providers =
-        trusted_server_core::permission_signal::build_permission_signal_providers(
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
-            &shipped_signal_providers(),
+            &shipped_signal_modules(),
         )?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        ec_provider,
-        permission_signal_providers,
+        ec_module,
+        permission_signal_modules,
         services,
     }))
 }
 
-/// The permission signal providers this adapter links, in the order they run
+/// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
 /// carry a choice someone made through an interface follow, so an answer
 /// given at a prompt amends the header the visitor arrived with.
 ///
-/// Core supplies no provider of its own, so this is where a deployment's
+/// Core supplies no module of its own, so this is where a deployment's
 /// schemes are decided. A scheme is added by linking its crate here, and a
 /// scheme core has never heard of plugs in the same way.
-fn shipped_signal_providers()
--> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalProvider>> {
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
     vec![
-        Arc::new(trusted_server_permission_signal_gpc::GpcProvider::new()),
-        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutProvider::new()),
-        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyProvider::new()),
-        Arc::new(trusted_server_permission_signal_tcf::TcfProvider::new()),
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
     ]
 }
 
 impl AppState {
-    /// Builds the per-request services, carrying the Edge Cookie provider the
+    /// Builds the per-request services, carrying the Edge Cookie module the
     /// composition root already resolved so the request path does not resolve
-    /// `[ec] provider` a second time. Nothing is carried when the composition
+    /// `[ec] module` a second time. Nothing is carried when the composition
     /// root found nothing safe to keep, and the request path resolves for
     /// itself.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
             .unwrap_or_else(|| {
-                build_runtime_services(ctx, &self.settings, &self.permission_signal_providers)
+                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
             })
-            .with_resolved_ec_provider(self.ec_provider.clone())
+            .with_resolved_ec_module(self.ec_module.clone())
     }
 }
 
@@ -298,7 +299,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -307,6 +308,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
         ("/_ts/admin/ec", &[Method::GET]),
         ("/_ts/admin/ec/{id}", &[Method::GET]),
         ("/_ts/admin/eids", &[Method::GET]),
+        ("/_ts/admin/cache/purge", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
@@ -502,7 +504,7 @@ fn health_response() -> Response {
 ///
 /// # Errors
 ///
-/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// Returns an error when the selected Edge Cookie module cannot be built for
 /// this request, or when the request's `Cookie` header is not valid UTF-8.
 fn build_ec_context(
     settings: &Settings,
@@ -510,6 +512,20 @@ fn build_ec_context(
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
     EcContext::read_from_request_resolving_geo(settings, req, services)
+}
+
+fn cache_purge_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Template cache purge is not supported on Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn admin_key_management_not_supported() -> Response {
@@ -706,6 +722,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
 
+        let cache_purge_unsupported_handler =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(cache_purge_not_supported()) };
+
         let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
         };
@@ -782,7 +801,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     return Ok(http_error(&error));
                 }
                 // Identity could not be established (for example the selected
-                // Edge Cookie provider is unavailable). Answer with an error
+                // Edge Cookie module is unavailable). Answer with an error
                 // rather than re-running the auction with no identity.
                 let mut ec_context = match build_ec_context(&s.settings, &services, &req) {
                     Ok(context) => context,
@@ -911,7 +930,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     })
             } else {
                 // Identity could not be established (for example the selected
-                // Edge Cookie provider is unavailable). Answer with an error
+                // Edge Cookie module is unavailable). Answer with an error
                 // rather than serving the page with no identity.
                 let mut ec_context = match build_ec_context(&state.settings, &services, &req) {
                     Ok(context) => context,
@@ -1021,6 +1040,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/first-party/sign", fp_sign_post_handler)
             .get("/first-party/proxy-rebuild", fp_rebuild_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route(
+                "/_ts/admin/cache/purge",
+                method.clone(),
+                cache_purge_unsupported_handler,
+            );
+        }
 
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
@@ -1181,10 +1208,10 @@ mod tests {
         );
     }
 
-    /// Settings selecting a vendor Edge Cookie provider this adapter does not
-    /// inject, with the `[ec.acme]` block that provider's settings live in.
+    /// Settings selecting a vendor Edge Cookie module this adapter does not
+    /// inject, with the `[ec.acme]` block that module's settings live in.
     /// `acme` is a fictional vendor key.
-    const UNINJECTED_PROVIDER_TOML: &str = r#"
+    const UNINJECTED_MODULE_TOML: &str = r#"
         [[handlers]]
         path = "^/_ts/admin"
         username = "admin"
@@ -1197,13 +1224,13 @@ mod tests {
         proxy_secret = "unit-test-proxy-secret"
 
         [ec]
-        provider = "acme"
+        module = "acme"
 
         [ec.acme]
         endpoint = "https://ec.acme.example.com"
 
-        # An Edge Cookie provider is configured, so single-jurisdiction
-        # operation is acknowledged because no geo provider is selected.
+        # An Edge Cookie module is configured, so single-jurisdiction
+        # operation is acknowledged because no geo module is selected.
         [geo]
         assume_single_jurisdiction = true
     "#;
@@ -1212,34 +1239,34 @@ mod tests {
     /// default context.
     ///
     /// This adapter used to log the failure and continue with
-    /// `EcContext::default()`, so a deployment whose selected provider could not
+    /// `EcContext::default()`, so a deployment whose selected module could not
     /// be built served every request with no identity. The call sites propagate
     /// the error to `http_error`, matching the Fastly adapter. The settings are
     /// parsed directly, bypassing the composition root's startup check, so the
     /// per-request behavior can be exercised with a selection the adapter
     /// cannot supply.
     #[test]
-    fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
-        let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
-            .expect("should parse settings selecting an uninjected provider");
+    fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
+        let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)
+            .expect("should parse settings selecting an uninjected module");
         let req = request_builder()
             .method("POST")
             .uri("https://test-publisher.example.com/auction")
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        // No resolved provider is threaded here, so the request path resolves
+        // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
         let services = build_runtime_services(&ctx, &settings, &Arc::default());
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)
-            .expect_err("an unavailable Edge Cookie provider must fail the request");
+            .expect_err("an unavailable Edge Cookie module must fail the request");
 
         assert!(
             error.to_string().contains("acme"),
-            "the error should name the selected provider, got: {error}"
+            "the error should name the selected module, got: {error}"
         );
     }
 
