@@ -1,4 +1,4 @@
-# Design Spec: Client-Cycle Edge Cookie Providers and the Resolve Endpoint
+# Design Spec: Client-Cycle Edge Cookie Modules and the Resolve Endpoint
 
 **Status:** Proposed. PR #1046 carries the implementation (hardened v1, on
 the threat model below) and is not yet merged to main.
@@ -6,16 +6,17 @@ The full anti-replay reservation machinery (§3.9) and the vendor envelope
 verification it serves are deliberately not in v1: they land with the first
 real vendor scheme, which brings the concrete envelope format the
 reservation design must fit. §8 records exactly what v1 implements, what it
-defers, and why the feature is normative rather than deferred.
+defers, and why the feature is normative rather than deferred. Updated on
+2026-10-06 to say module where it said provider, as the code does.
 **Author:** Engineering (revised against the implementation, 2026-08-25)
 **Issue references:** #778 (series), successor spec of the 2026-07-31 draft
 **Related specs:** `2026-07-30-pluggable-providers-design.md`
-**Last updated:** 2026-09-01
+**Last updated:** 2026-10-06
 
-> **Context.** PR #838 shipped, undeclared and unspec'd, a second provider
-> _type_: a "client-cycle" EC provider whose identifier is established by a
+> **Context.** PR #838 shipped, undeclared and unspec'd, a second module
+> _type_: a "client-cycle" EC module whose identifier is established by a
 > browser POST to a new public endpoint (`POST /_ts/api/v1/ec/resolve`),
-> plus a demo provider (`client_fixed`) and a JS bundle. Review found the
+> plus a demo module (`client_fixed`) and a JS bundle. Review found the
 > endpoint accepted cross-origin identity-setting posts with no origin
 > check, created cookies with no identity-graph row (violating an invariant
 > the organic path enforces explicitly), was registered on only one of four
@@ -32,13 +33,13 @@ defers, and why the feature is normative rather than deferred.
 
 ## 1. Overview
 
-A **client-cycle** EC provider establishes the identifier via a browser
+A **client-cycle** EC module establishes the identifier via a browser
 round trip, where server-injected first-party JS obtains or derives a value in the
 page (typically a signed envelope from a vendor identity system), posts it to
-a Trusted Server endpoint, and the endpoint, after provider-specific
+a Trusted Server endpoint, and the endpoint, after module-specific
 verification, sets the first-party `ts-ec` cookie.
 
-This differs from server-side providers in one security-critical way: **the
+This differs from server-side modules in one security-critical way: **the
 identifier is attacker-influenceable input**, not server-derived evidence.
 Everything in this spec follows from that.
 
@@ -47,7 +48,7 @@ vendor integration this project targets works client-side by design, since the
 page script talks to the vendor's identity system and hands the result to
 the edge, so the server-side path alone cannot carry it. The 2026-07-31
 draft deferred the feature for lack of a consumer. The consumer now exists
-as a planned vendor provider, and v1 builds the endpoint that provider will
+as a planned vendor module, and v1 builds the endpoint that module will
 verify against.
 
 ## 2. Threat model
@@ -57,7 +58,7 @@ verify against.
 | **Cross-site identity fixation** | `text/plain` POST is a CORS-simple request: any page on the web can `fetch(resolveUrl, {method: "POST", credentials: "include", body: payload})` with no preflight | An attacker pins a chosen identity onto a victim's first-party cookie jar, a login-CSRF for the ad-identity layer, and the victim's activity accretes to an attacker-controlled ID                                                                               |
 | **Replay**                       | A captured valid payload (from the attacker's own session or a leak) replayed against another browser                                                              | Same as fixation, without needing to create payloads                                                                                                                                                                                                             |
 | **Phantom identity**             | Endpoint sets the cookie without an identity-graph row                                                                                                             | Later requests carry an EC that the KV graph has never seen. Downstream sync and withdrawal logic operate on an identity that half-exists (the organic generation path explicitly refuses to write a cookie when the graph write fails, for exactly this reason) |
-| **Un-tombstoneable identity**    | Core does not recognize the provider's identifier shape                                                                                                            | Withdrawal cannot expire or tombstone the identity, which is a compliance failure and not only a bug                                                                                                                                                             |
+| **Un-tombstoneable identity**    | Core does not recognize the module's identifier shape                                                                                                              | Withdrawal cannot expire or tombstone the identity, which is a compliance failure and not only a bug                                                                                                                                                             |
 | **Amplification**                | The page script cannot observe an HttpOnly cookie, so it cannot know the cookie is already set                                                                     | A POST on every page view of every session (PR #838's JS gated on reading a cookie its own server marked HttpOnly, making the guard permanently false)                                                                                                           |
 
 ## 3. Requirements on the endpoint
@@ -82,26 +83,26 @@ verify against.
    suffix match on `publisher.domain` an earlier revision of this spec
    described, which admitted every subdomain of the apex including ones
    the publisher may not control. The origin check is defense in depth
-   and not the primary control. The primary control is the provider's
+   and not the primary control. The primary control is the module's
    envelope verification with audience and session binding, which §3.9
    parks and which still has to land with the vendor scheme.
-2. **Verify the payload per provider.** The endpoint hands the posted
-   payload to the selected provider's `resolve_from_client` and creates only
-   what the provider returns. Whether the payload is trustworthy is the
-   provider's responsibility, stated on the trait. A real vendor provider
+2. **Verify the payload per module.** The endpoint hands the posted
+   payload to the selected module's `resolve_from_client` and creates only
+   what the module returns. Whether the payload is trustworthy is the
+   module's responsibility, stated on the trait. A real vendor module
    verifies a signed, audience-bound, expiring envelope. The draft's
    session-binding and replay analysis (see §3.9) is the bar that
-   verification must clear when the vendor scheme lands. The demo provider
+   verification must clear when the vendor scheme lands. The demo module
    verifies a fixed constant and is compiled out of production builds
    (§5). `resolve_from_client` is normative in v1, with a no-op default so
-   server-side providers are untouched.
+   server-side modules are untouched.
 3. **Preserve the identity-graph invariant.** Implemented. The graph row is
-   written before the cookie is set, keyed by the provider's
+   written before the cookie is set, keyed by the module's
    `normalize_id_for_kv` canonical form, exactly like the organic create
    path. No graph available → no create (`204`), same as organic generation;
    a graph write failure → `503`, no cookie.
 4. **Round-trip through the lifecycle contract.** Implemented. Read-back
-   goes through the selected provider's `accepts_id`, the KV key through
+   goes through the selected module's `accepts_id`, the KV key through
    `normalize_id_for_kv`, and withdrawal reaches the row like any other
    identity. A round-trip test drives an opaque client identifier through
    organic deferral, resolve, cookie set, and verbatim read-back.
@@ -116,9 +117,9 @@ verify against.
    draft's stronger ask, identical startup rejection of the client-cycle
    selection on adapters that cannot serve it, is the agreed follow-up
    when the portability adapters gain KV (§7.4).
-6. **Be uncacheable and permission-gated on the provider's full
+6. **Be uncacheable and permission-gated on the module's full
    declaration.** Implemented. Every response carries `Cache-Control:
-no-store`, and the gate is the selected provider's complete
+no-store`, and the gate is the selected module's complete
    `required_permissions()` through the same resolved permission state as
    organic creating, not a hard-coded storage check.
 7. **Bound every input.** Implemented. Request body at most 65,536 bytes, where
@@ -130,14 +131,14 @@ no-store`, and the gate is the selected provider's complete
    passes); anything else → `415`. The created identifier must fit the
    global identifier bounds (at most 256 bytes, cookie-safe alphabet,
    shared with every other create path); violation → `400`, never a rewrite.
-   Core then applies the provider's registered code envelope
+   Core then applies the module's registered code envelope
    (`provider-code-registry.md`): the cookie and the identity-graph key
    carry `{code}~value`, so a client-set identity is namespaced to its
-   provider exactly like an edge-created one (the demo's cookie value is
+   module exactly like an edge-created one (the demo's cookie value is
    `cfix~an-ec`). Status codes are part of the contract: `400` out-of-bounds identifier,
    `403` origin rejection, `409` different-identity conflict, `413` body,
    `415` content type, `503` graph-write failure, `204` closed gate / no
-   provider / no graph / unverified payload. Tests exercise each rejection.
+   module / no graph / unverified payload. Tests exercise each rejection.
 8. **Define behavior against an existing identity, with no silent
    replacement.** Implemented. Resolving to the same identity refreshes
    idempotently. Resolving to a different identity while the request
@@ -154,7 +155,7 @@ no-store`, and the gate is the selected provider's complete
    primitive no production adapter exposes today. Designing the
    reservation against a hypothetical envelope would repeat the mistake
    this series exists to fix. v1's stance is that the endpoint is safe without it
-   for the providers v1 ships (the demo creates a constant, feature-gated
+   for the modules v1 ships (the demo creates a constant, feature-gated
    out of production), and the reservation lands with the first vendor
    scheme, designed against its real envelope, with the draft's §3.9 as
    the starting bar. Until then the draft's text is preserved below as the
@@ -189,32 +190,32 @@ the bar for the vendor-scheme implementation:
   marker shares the Edge Cookie's scope and lifetime and is expired
   together with it on withdrawal, so a visitor who later re-establishes
   the permission can resolve again.
-- **The marker must not outlive the provider that set it.** The marker
+- **The marker must not outlive the module that set it.** The marker
   carries no identity, so unlike the `ts-ec` cookie it is not namespaced
-  by the provider code envelope, and a long `Max-Age` that only
-  withdrawal expires would leave it standing across a provider switch.
+  by the module code envelope, and a long `Max-Age` that only
+  withdrawal expires would leave it standing across a module switch.
   The visitor would then hold a marker saying a resolve has already
   succeeded with no identity behind it, and the page script would
   suppress the re-post that would start a new one, so the visitor sits
   with no identity rather than a restarted one. Core therefore expires
-  the marker on any request that carries a `ts-ec` the selected provider
+  the marker on any request that carries a `ts-ec` the selected module
   does not own, which is the same `{code}~` ownership test core already
   applies to the identifier itself. A switch then restarts the client
   cycle instead of stalling it.
 - **The page leg is permission-gated before vendor contact.** The demo
   module contacts no vendor (it posts a constant), but it follows the rule
   a vendor module will follow: it declares the Data Use its server-side
-  provider requires (`necessary.operations.storage`, kept in step by a Rust
+  module requires (`necessary.operations.storage`, kept in step by a Rust
   test), waits on `tsjs.whenPermissions()`, and posts only when that Data
   Use is in the set. With no permission state on the page it does not
   post. The draft's live-CMP re-check binds the first vendor module rather
   than v1, because the demo has no vendor contact to re-check before. A
   vendor module must not derive identity or
   contact the vendor for a visitor whose resolved permissions do not
-  satisfy the provider's declaration, must re-check immediately before
+  satisfy the module's declaration, must re-check immediately before
   vendor contact (consent can change between document delivery and
   asynchronous vendor contact, including BFCache restoration), and its
-  injection is keyed off the provider selection exactly as the demo's is
+  injection is keyed off the module selection exactly as the demo's is
   today.
 - **How the resolved permissions reach the browser is now chosen.** The
   requirement above assumes the page can read the server's decision, and
@@ -247,8 +248,8 @@ the bar for the vendor-scheme implementation:
   existing integration page scripts to wait on the promise is follow-up
   work once these PRs are on main.
 - The JS module ships through the standard integration bundle mechanism,
-  loaded only when a client-cycle provider is the selected EC provider.
-  The interaction between provider-keyed bundle content and content-hash /
+  loaded only when a client-cycle module is the selected EC module.
+  The interaction between module-keyed bundle content and content-hash /
   SRI pinning remains open (§7.6).
 - **Any constant shared between Rust and TS is asserted equal by a test.**
   Implemented. A Rust test reads the page-script source and asserts the
@@ -256,13 +257,13 @@ the bar for the vendor-scheme implementation:
   rename on either side fails the build instead of silently breaking the
   round trip.
 
-## 5. Demo providers
+## 5. Demo modules
 
-Implemented as required. The `client_fixed` demonstration provider (fixed
+Implemented as required. The `client_fixed` demonstration module (fixed
 identifier, constant-equality verification) is compiled only behind the
 `client-fixed-demo` cargo feature. In a production build the settings
 validator rejects the selection at startup with a direct message, and the
-provider builder rejects it again as defense in depth. A fixed shared word
+module builder rejects it again as defense in depth. A fixed shared word
 is not an identity. The demo exists to exercise verify-before-create end to
 end in tests and demonstrations.
 
@@ -277,7 +278,7 @@ end in tests and demonstrations.
   of a success.
 - A round-trip test drives a client identifier through organic deferral,
   resolve, cookie set, and verbatim read-back recognition.
-- A test asserts that a request carrying a `ts-ec` the selected provider
+- A test asserts that a request carrying a `ts-ec` the selected module
   does not own expires the `ts-ecr` marker.
 - The cross-language constant test pins the endpoint's shared constants to
   the page-script source.
@@ -306,7 +307,7 @@ end in tests and demonstrations.
    `https://{publisher.domain}` and an optional operator-configured list
    of further exact origins for the `www` or other-domain case, so the
    question is settled rather than carried.
-6. How JS module selection keyed off EC provider configuration coexists
+6. How JS module selection keyed off EC module configuration coexists
    with content-hashed/SRI-pinned bundles, meaning per-config hashes, cache
    keying, and the config-push story for them.
 
@@ -314,9 +315,9 @@ end in tests and demonstrations.
 
 | Draft position                                                                  | v1 (PR #1046)                                                                                                                                                                                                                                     | Why                                                                                                                                                                                                                                              |
 | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Feature deferred, `resolve_from_client` de-normalized                           | Feature normative. Trait method kept with a no-op default                                                                                                                                                                                         | The first vendor integration works client-side by design, so the endpoint is on the critical path for the series' first real provider                                                                                                            |
+| Feature deferred, `resolve_from_client` de-normalized                           | Feature normative. Trait method kept with a no-op default                                                                                                                                                                                         | The first vendor integration works client-side by design, so the endpoint is on the critical path for the series' first real module                                                                                                              |
 | Origin check via new allowlist config + CSRF token                              | RFC 6454 same-origin comparison of the scheme, host and port triple. Default accepted set is the single origin `https://{publisher.domain}`, plus an optional operator-configured list of further exact origins. Missing/foreign `Origin` → `403` | The draft's exact allowlist is adopted. An earlier revision of this spec allowed any suffix match on the apex, which admitted every subdomain including ones the publisher may not control, and its justification did not hold. This closes §7.5 |
-| Marker cookie survives whatever happens to the identity it marks                | Core expires the `ts-ecr` marker on any request carrying a `ts-ec` the selected provider does not own                                                                                                                                             | The marker is not namespaced by the provider code envelope, so without this a provider switch leaves a visitor with a marker, no identity, and a page script that will not re-post                                                               |
+| Marker cookie survives whatever happens to the identity it marks                | Core expires the `ts-ecr` marker on any request carrying a `ts-ec` the selected module does not own                                                                                                                                               | The marker is not namespaced by the module code envelope, so without this a module switch leaves a visitor with a marker, no identity, and a page script that will not re-post                                                                   |
 | §3.9 reservation/replay machinery required before code                          | Deferred to the vendor scheme. Draft text retained verbatim as the bar                                                                                                                                                                            | The design needs the real envelope's unique id and session binding, and a CAS-class primitive no production adapter exposes today                                                                                                                |
 | Identical behavior or identical startup refusal, 4 ways                         | Fastly routes it (bot-gated graph). Portability adapters documented as deliberately not routing, like identify                                                                                                                                    | Same platform-KV constraint as the existing EC API routes. Startup rejection follow-up recorded (§7.4)                                                                                                                                           |
 | Marker cookie or injected variable (design must pick)                           | Marker cookie (`ts-ecr`), expired with the EC cookie                                                                                                                                                                                              | The draft's own first option. Testable and observable                                                                                                                                                                                            |

@@ -5,13 +5,14 @@ documentation set only. The hook was removed from the earlier draft of that
 PR because it has no consumer, which is this spec's own §-rule for
 speculative surface. The spec is retained as the design bar for the hook
 when its first consumer arrives (an integration that must set response
-headers such as Accept-CH or detection results). Revised 2026-08-25.
+headers such as Accept-CH or detection results). Revised 2026-08-25, and
+on 2026-10-06 for the module wording.
 **Author:** Engineering
 **Issue references:** #782
 **Related specs:** `2026-07-30-pluggable-providers-design.md` and the
 baseline DataDome design
 `2026-06-11-datadome-server-side-protection-design.md`
-**Last updated:** 2026-08-25
+**Last updated:** 2026-10-06
 
 > **Context.** Issue #782 already specifies this feature well; its done-when
 > is the contract. PR #838 shipped the trait and registry wiring with **no
@@ -525,8 +526,8 @@ exception. The path-only `Request` remains publisher-originated data and is
 explicitly covered by vendor retention/DSR sign-off. Query strings and full
 referrers are never in the security view. Every degree of freedom is closed:
 
-- **Host evidence is not a back door to the device provider.**
-  `[device] provider = "fastly"` is an explicit opt-in selection (#1044) and
+- **Host evidence is not a back door to the device module.**
+  `[device] module = "fastly"` is an explicit opt-in selection (#1044) and
   the hook does not widen it, and no JA4-derived classification is stored by a
   mutator. If DataDome's Protection API is allowed to receive
   request-scoped `TlsProtocol`/`JA4` evidence, its registration enumerates each field,
@@ -961,7 +962,7 @@ byte-to-string replacement is forbidden:
   in `crates/trusted-server-core/src/integrations/datadome.rs` and the
   `crates/trusted-server-core/src/integrations/datadome/` directory. Vendor
   detection logic of this kind belongs in the vendor's own module rather
-  than in core, and the integration provider seam
+  than in core, and the integration module seam
   (`2026-08-27-integration-provider-seam-design.md`) is where that move is
   designed. This is a direction for that migration rather than a complaint
   about the code as it stands.
@@ -1216,7 +1217,7 @@ different evidence.
 ## 5. Size and sequencing
 
 The ordinary mutator API in §2 to §3 is a modest headers-only feature with no
-provider or permission-model coupling. It lands only with the real consumer
+module or permission-model coupling. It lands only with the real consumer
 required by §4 item 3; without one, scaffolding does not ship. The separately
 typed security channel in §4a is already that consumer's PR-specific contract:
 it owns DataDome cookie operations and intentionally couples configuration
