@@ -44,6 +44,8 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
 | Viceroy     | 0.17.0 (from `.tool-versions`)           |
 | Wasmtime    | 44.0.1 (from `.tool-versions`)           |
+| AWS CLI     | 2.36.45 (from `.tool-versions`)          |
+| Terraform   | 1.16.2 (from `.tool-versions`)           |
 
 ---
 
@@ -105,6 +107,7 @@ spin up --from crates/trusted-server-adapter-spin
 # See .cargo/config.toml; default-members = [fastly] so Viceroy can locate
 # the binary via `cargo run --bin`.
 cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-fastly-reuse # Fastly adapter with the reusable-sandbox feature on
 cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
@@ -368,8 +371,8 @@ deployment selects an implementation and the core stays neutral:
 
 | Capability            | Trait                                    | Selector            | Built-in (core)                         | Vendor / host crates         |
 | --------------------- | ---------------------------------------- | ------------------- | --------------------------------------- | ---------------------------- |
-| Edge Cookie identity  | `EdgeCookieProvider` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
-| Device detection      | `DeviceProvider` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
+| Edge Cookie identity  | `EdgeCookieModule` (`ec/provider.rs`)  | `[ec] provider`     | HMAC, client-fixed (opt-in, no default) | `crates/edgecookie/<vendor>` |
+| Device detection      | `DeviceModule` (`ec/device.rs`)        | `[device] provider` | User-Agent only (default)               | `crates/device/<vendor>`     |
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)     | `[geo] provider`    | Disabled, no location (default)         | `crates/geo/<vendor>`        |
 | Permission signals    | `PermissionSignalProvider` (`permission_signal/mod.rs`) | `[permission_signal] provider` (an ordered list) | None, and with no provider every permission stays at its country and region baseline | `crates/permission-signal/<scheme>` |
 
@@ -377,8 +380,8 @@ Principles for adding or changing a provider:
 
 - **Core stays neutral.** The trait and the host-neutral default live in
   `trusted-server-core`. Host-specific and vendor implementations live in their
-  own crates and are injected by the adapter (for example `build_device_provider`
-  and `build_geo_provider`), so core never depends on a host SDK or a vendor, and
+  own crates and are injected by the adapter (for example `build_device_module`
+  and `build_geo_module`), so core never depends on a host SDK or a vendor, and
   the default request path makes no host-specific calls.
 - **Providers read request evidence, not a fixed parameter set.** A provider must
   be able to see everything about the request it needs (User-Agent, headers, and
@@ -426,14 +429,14 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File                  | Purpose                                                    |
-| --------------------- | ---------------------------------------------------------- |
-| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
-| `fastly.toml`                   | Fastly service configuration and build settings                 |
-| `trusted-server.example.toml`   | Source-controlled app-config template (includes the `[ec]` / `[geo]` / `[device]` provider selectors and the `[permission_signal] provider` list) |
-| `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
-| `.env.dev`                      | Local development environment variables                         |
+| File                          | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                 |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                   |
+| `trusted-server.example.toml` | Source-controlled app-config template, which carries the `[ec]`, `[geo]` and `[device]` module selectors and the `[permission_signal] module` list |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
+| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
+| `.env.dev`                    | Local development environment variables                                                           |
 
 ---
 
@@ -443,11 +446,12 @@ Every PR must pass:
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm && cargo clippy-cli && cargo clippy-codegen`
-3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+3. `cargo test-fastly && cargo test-fastly-reuse && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 7. Docs format (`cd docs && npm run format`)
+8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 
 ---
 
@@ -536,18 +540,18 @@ both runtime behavior and build/tooling changes.
 
 ## Key Files
 
-| File                                         | Purpose                                           |
-| -------------------------------------------- | ------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`            |
-| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
-| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
-| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
+| File                                                      | Purpose                                              |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/registry.rs` | IntegrationRegistry, `js_module_ids()`               |
+| `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs                |
+| `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start                 |
+| `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules        |
 | `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
-| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
-| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
-| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
-| `crates/trusted-server-js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/trusted-server-js/src/bundle.rs`                    | Module map, concatenation, hashing                |
+| `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
+| `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
+| `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
+| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---
 

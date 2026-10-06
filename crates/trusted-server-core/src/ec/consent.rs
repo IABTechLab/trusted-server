@@ -315,7 +315,7 @@ mod tests {
         // necessary.operations.storage. The policy's top node resolves storage
         // as requires-signal, so with no provider granting it the permission is
         // not set and the provider's requirement is not met.
-        let provider = crate::ec::provider::build_provider(&settings.ec, None, None)
+        let provider = crate::ec::module::build_module(&settings.ec, None, None)
             .expect("should build the configured provider")
             .expect("should select the hmac provider");
         let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);

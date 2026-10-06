@@ -240,7 +240,7 @@ fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bo
 }
 
 /// Cache policy for the outbound Workers `fetch` derived from
-/// [`PlatformHttpRequest::bypass_cache`].
+/// [`PlatformHttpRequest::cache_intent`].
 ///
 /// Workers subrequests are eligible for Cloudflare's cache by default, so an
 /// ad-stack navigation could otherwise be satisfied from cache (or revalidated
@@ -262,8 +262,12 @@ enum OutboundCacheMode {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn outbound_cache_mode(bypass_cache: bool) -> OutboundCacheMode {
-    if bypass_cache {
+fn outbound_cache_mode(
+    intent: &trusted_server_core::platform::PlatformCacheIntent,
+) -> OutboundCacheMode {
+    // Workers has no surrogate-key concept, so `Shared` falls in with `Default`: let the
+    // runtime apply its own behavior rather than pretending to honor a key it cannot use.
+    if intent.is_bypass() {
         OutboundCacheMode::NoStore
     } else {
         OutboundCacheMode::RuntimeDefault
@@ -305,7 +309,7 @@ impl CloudflareHttpClient {
             ));
         }
 
-        let cache_mode = outbound_cache_mode(request.bypass_cache);
+        let cache_mode = outbound_cache_mode(&request.cache_intent);
 
         let uri = request.request.uri().to_string();
         // http::Method always stores uppercase; worker 0.7 implements From<String> only.
@@ -631,9 +635,9 @@ pub fn build_runtime_services(
 
     // Geo: read Cloudflare-injected headers — no #[cfg] needed; headers are
     // simply absent on the native host target, producing Ok(None) from lookup().
-    // Routed through the [geo] provider selector like the Fastly adapter, so
+    // Routed through the [geo] module selector like the Fastly adapter, so
     // the selector behaves the same on every adapter.
-    let geo = trusted_server_core::platform::build_geo_provider(settings, Arc::new(build_geo(ctx)));
+    let geo = trusted_server_core::platform::build_geo_module(settings, Arc::new(build_geo(ctx)));
 
     RuntimeServices::builder()
         .config_store(config_store)
@@ -1029,18 +1033,18 @@ mod tests {
     #[test]
     fn outbound_cache_mode_maps_bypass_to_no_store() {
         assert_eq!(
-            outbound_cache_mode(true),
+            outbound_cache_mode(&trusted_server_core::platform::PlatformCacheIntent::Bypass),
             OutboundCacheMode::NoStore,
-            "bypass_cache should force the Workers `no-store` cache mode"
+            "a bypass intent should force the Workers `no-store` cache mode"
         );
     }
 
     #[test]
     fn outbound_cache_mode_leaves_default_when_not_bypassing() {
         assert_eq!(
-            outbound_cache_mode(false),
+            outbound_cache_mode(&trusted_server_core::platform::PlatformCacheIntent::Default),
             OutboundCacheMode::RuntimeDefault,
-            "requests without bypass_cache should keep the runtime default cache behavior"
+            "a default intent should keep the runtime default cache behavior"
         );
     }
 }

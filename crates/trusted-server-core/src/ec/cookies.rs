@@ -25,7 +25,7 @@ const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 /// Maximum length in bytes of an Edge Cookie identifier.
 ///
 /// A global bound enforced wherever an identifier enters the system (creation,
-/// cookie read-back, cookie write), so no provider can emit a value the cookie
+/// cookie read-back, cookie write), so no module can emit a value the cookie
 /// layer, logs, or the KV key space cannot carry.
 pub(crate) const MAX_EC_ID_LEN: usize = 256;
 
@@ -34,9 +34,9 @@ fn is_allowed_ec_id_char(c: char) -> bool {
 }
 
 // Identifier allowlist: [A-Za-z0-9._~-], the cookie-safe alphabet every
-// Edge Cookie identifier must fit regardless of which provider created it.
+// Edge Cookie identifier must fit regardless of which module created it.
 // This is intentionally broader than the built-in format validator
-// (`generation::is_valid_ec_id`), which enforces the HMAC provider's
+// (`generation::is_valid_ec_id`), which enforces the HMAC module's
 // `<64-hex>.<6-alphanumeric>` structure, either bare or under the `hmac~`
 // envelope; an opaque vendor identifier only has to fit the alphabet and the
 // length bound.
@@ -77,7 +77,7 @@ pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 /// Validates `ec_id` against the identifier alphabet and length bound before
 /// interpolation. An identifier that fails validation is rejected and the
 /// cookie is not set, with an error logged; the value is never rewritten, so
-/// a provider identifier survives byte for byte or not at all. This also
+/// a module identifier survives byte for byte or not at all. This also
 /// prevents an attacker from injecting spurious cookie attributes via a
 /// controlled ID value.
 ///
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn the_ec_cookie_lifetime_is_one_year() {
         // The legacy bare-identifier reader's retirement condition (see
-        // `provider_owns_id`) is written in terms of this lifetime and the
+        // `module_owns_id`) is written in terms of this lifetime and the
         // identity-graph `ENTRY_TTL`, which `kv::tests::constants_have_expected_values`
         // pins to the same figure. Changing either moves the earliest safe
         // retirement, so neither may drift unnoticed.

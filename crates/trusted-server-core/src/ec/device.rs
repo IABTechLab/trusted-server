@@ -1,7 +1,7 @@
 //! Device signal derivation for bot detection and browser classification.
 //!
 //! The [`DeviceSignals`] derivation here is pure computation, with no KV I/O or
-//! Fastly SDK calls. A [`DeviceProvider`] is wired by dependency injection. It
+//! Fastly SDK calls. A [`DeviceModule`] is wired by dependency injection. It
 //! reads the [`RequestInfo`] for the User-Agent from the borrowed argument
 //! passed to `detect` at call time, and on a host that supplies them the
 //! [`HostSignals`](crate::evidence::HostSignals) for the TLS and HTTP/2 signals
@@ -42,8 +42,8 @@ pub struct DeviceSignals {
     /// `true` = known browser, `false` = known bot, `None` = unknown.
     pub known_browser: Option<bool>,
     /// Whether the request looks like a real browser, used to gate Edge Cookie
-    /// writes. Computed by the producing provider: the built-in provider uses a
-    /// User-Agent-only heuristic, while the Fastly provider strengthens it with
+    /// writes. Computed by the producing module: the built-in module uses a
+    /// User-Agent-only heuristic, while the Fastly module strengthens it with
     /// the TLS and HTTP/2 signals.
     pub looks_like_browser: bool,
 }
@@ -77,7 +77,7 @@ impl DeviceSignals {
     /// `ua` is the `User-Agent` header value. `ja4` is the full JA4 hash
     /// from `req.get_tls_ja4()`. `h2_fp` is the raw H2 SETTINGS string
     /// from `req.get_client_h2_fingerprint()`. These signals are
-    /// host-specific (Fastly), so only the opt-in Fastly device provider
+    /// host-specific (Fastly), so only the opt-in Fastly device module
     /// uses this path, and the browser/bot gate then requires a TLS signal.
     #[must_use]
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self {
@@ -119,16 +119,16 @@ impl DeviceSignals {
 /// A strategy for classifying a request into [`DeviceSignals`].
 ///
 /// Implementations are selected by configuration. The built-in
-/// [`BuiltinDeviceProvider`] is the default; a deployment can switch to another
-/// provider without changing call sites.
+/// [`BuiltinDeviceModule`] is the default; a deployment can switch to another
+/// module without changing call sites.
 ///
 /// These signals serve identity gating and bot detection, not bid enrichment.
 /// [`DeviceSignals`] deliberately carries only the coarse browser and bot
 /// classification the Edge Cookie gate needs, not a full device-detection
 /// result such as make, model, OS version, or screen size. A richer device
 /// model for the ad request is a separate concern.
-pub trait DeviceProvider: Send + Sync {
-    /// Returns the stable identifier for this provider, used in configuration
+pub trait DeviceModule: Send + Sync {
+    /// Returns the stable identifier for this module, used in configuration
     /// and logs.
     fn id(&self) -> &'static str;
 
@@ -137,7 +137,7 @@ pub trait DeviceProvider: Send + Sync {
     /// host signals injected into its constructor).
     ///
     /// Device signals gate identity operations and must always yield a value,
-    /// so this is infallible: a provider that cannot determine a signal returns
+    /// so this is infallible: a module that cannot determine a signal returns
     /// the unknown variant rather than failing the request.
     fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals;
 
@@ -150,24 +150,24 @@ pub trait DeviceProvider: Send + Sync {
     }
 }
 
-/// The built-in device provider, the default.
+/// The built-in device module, the default.
 ///
 /// Derives [`DeviceSignals`] from the User-Agent alone via
 /// [`DeviceSignals::derive_ua_only`], touching no host-specific API. It reads
 /// only [`RequestInfo::user_agent`] and never a host signal, so device
 /// classification stays host-neutral by default.
 #[derive(Debug, Default)]
-pub struct BuiltinDeviceProvider;
+pub struct BuiltinDeviceModule;
 
-impl BuiltinDeviceProvider {
-    /// Creates the built-in provider.
+impl BuiltinDeviceModule {
+    /// Creates the built-in module.
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 }
 
-impl DeviceProvider for BuiltinDeviceProvider {
+impl DeviceModule for BuiltinDeviceModule {
     fn id(&self) -> &'static str {
         "builtin"
     }
@@ -177,26 +177,26 @@ impl DeviceProvider for BuiltinDeviceProvider {
     }
 }
 
-/// Selects the device provider named by the `[device] provider` selector.
+/// Selects the device module named by the `[device] module` selector.
 ///
-/// Returns the built-in User-Agent-only provider unless the `fastly` selector is
-/// set, in which case it builds the host-specific provider through the
+/// Returns the built-in User-Agent-only module unless the `fastly` selector is
+/// set, in which case it builds the host-specific module through the
 /// `build_fastly` factory the adapter supplies. The factory runs only when that
-/// provider is selected, so device classification itself reads no host signals
-/// by default (see [`BuiltinDeviceProvider`] for the host-neutral default). The
+/// module is selected, so device classification itself reads no host signals
+/// by default (see [`BuiltinDeviceModule`] for the host-neutral default). The
 /// Fastly entry point still reads the TLS and HTTP/2 signals on every request to
 /// build the host-signal service and client info. A
-/// selected-but-unknown provider is rejected at startup by
-/// [`DeviceConfig::validate_provider_selection`](crate::settings::DeviceConfig::validate_provider_selection),
-/// so this falls back to the built-in provider for that case.
+/// selected-but-unknown module is rejected at startup by
+/// [`DeviceConfig::validate_module_selection`](crate::settings::DeviceConfig::validate_module_selection),
+/// so this falls back to the built-in module for that case.
 #[must_use]
-pub fn build_device_provider(
+pub fn build_device_module(
     settings: &Settings,
-    build_fastly: impl FnOnce() -> Box<dyn DeviceProvider>,
-) -> Box<dyn DeviceProvider> {
-    match settings.device.provider_key() {
+    build_fastly: impl FnOnce() -> Box<dyn DeviceModule>,
+) -> Box<dyn DeviceModule> {
+    match settings.device.module_key() {
         "fastly" => build_fastly(),
-        _ => Box::new(BuiltinDeviceProvider::new()),
+        _ => Box::new(BuiltinDeviceModule::new()),
     }
 }
 
@@ -261,7 +261,7 @@ fn parse_platform_class(ua: &str) -> Option<String> {
 ///
 /// This is the default, host-neutral gate. It filters obvious non-browser
 /// traffic but does not resist a bot that forges a complete browser
-/// User-Agent. The opt-in Fastly device provider strengthens the gate with the
+/// User-Agent. The opt-in Fastly device module strengthens the gate with the
 /// TLS and HTTP/2 signals for deployments that need it.
 #[must_use]
 fn looks_like_browser_from_ua(ua: &str, platform_class: Option<&str>) -> bool {
@@ -775,26 +775,26 @@ mod tests {
     }
 
     #[test]
-    fn builtin_device_provider_is_ua_only() {
-        let provider = BuiltinDeviceProvider::new();
-        assert_eq!(provider.id(), "builtin");
+    fn builtin_device_module_is_ua_only() {
+        let module = BuiltinDeviceModule::new();
+        assert_eq!(module.id(), "builtin");
 
-        // The built-in provider classifies from the User-Agent in the request
+        // The built-in module classifies from the User-Agent in the request
         // info passed to `detect` alone, recording no host signal.
         let request_info = request_info_with_ua(CHROME_MAC_UA);
-        let signals = provider.detect(&request_info);
+        let signals = module.detect(&request_info);
         assert_eq!(
             signals,
             DeviceSignals::derive_ua_only(CHROME_MAC_UA),
-            "the built-in provider should classify from the User-Agent only"
+            "the built-in module should classify from the User-Agent only"
         );
         assert!(
             signals.ja4_class.is_none(),
-            "the built-in provider must not record a JA4 class"
+            "the built-in module must not record a JA4 class"
         );
     }
 
-    /// Builds request info carrying the given User-Agent, for provider tests.
+    /// Builds request info carrying the given User-Agent, for module tests.
     fn request_info_with_ua(user_agent: &str) -> OwnedRequestInfo {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -805,11 +805,11 @@ mod tests {
         OwnedRequestInfo::new(String::new(), headers)
     }
 
-    /// A stand-in for the host-specific provider the adapter injects, so the
-    /// selection logic can be tested in core without the Fastly provider crate.
-    struct StubFastlyProvider;
+    /// A stand-in for the host-specific module the adapter injects, so the
+    /// selection logic can be tested in core without the Fastly module crate.
+    struct StubFastlyModule;
 
-    impl DeviceProvider for StubFastlyProvider {
+    impl DeviceModule for StubFastlyModule {
         fn id(&self) -> &'static str {
             "fastly"
         }
@@ -822,33 +822,31 @@ mod tests {
     #[test]
     fn builtin_device_provider_requires_no_permissions() {
         assert!(
-            BuiltinDeviceProvider::new()
-                .required_permissions()
-                .is_empty(),
-            "the built-in User-Agent-only device provider requires no permissions"
+            BuiltinDeviceModule::new().required_permissions().is_empty(),
+            "the built-in User-Agent-only device module requires no permissions"
         );
     }
 
     #[test]
-    fn build_device_provider_defaults_to_builtin_and_selects_injected() {
-        // The default selector returns the built-in provider, ignoring the
+    fn build_device_module_defaults_to_builtin_and_selects_injected() {
+        // The default selector returns the built-in module, ignoring the
         // injected candidate.
         let settings = crate::settings::Settings::default();
-        let default = build_device_provider(&settings, || {
-            Box::new(StubFastlyProvider) as Box<dyn DeviceProvider>
+        let default = build_device_module(&settings, || {
+            Box::new(StubFastlyModule) as Box<dyn DeviceModule>
         });
         assert_eq!(default.id(), "builtin", "no selector should be UA-only");
 
-        // The `fastly` selector returns the provider the adapter's factory builds.
+        // The `fastly` selector returns the module the adapter's factory builds.
         let mut fastly = crate::settings::Settings::default();
-        fastly.device.provider = Some("fastly".to_owned());
-        let selected = build_device_provider(&fastly, || {
-            Box::new(StubFastlyProvider) as Box<dyn DeviceProvider>
+        fastly.device.module = Some("fastly".to_owned());
+        let selected = build_device_module(&fastly, || {
+            Box::new(StubFastlyModule) as Box<dyn DeviceModule>
         });
         assert_eq!(
             selected.id(),
             "fastly",
-            "the fastly selector should use the injected provider"
+            "the fastly selector should use the injected module"
         );
     }
 }

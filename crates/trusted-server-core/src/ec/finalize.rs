@@ -6,23 +6,23 @@
 use std::collections::HashSet;
 
 use edgezero_core::body::Body as EdgeBody;
-use error_stack::Report;
 use http::Response;
 
 use crate::constants::EC_RESPONSE_HEADERS;
-use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::kv::{
-    CreateIfAbsentOutcome, KvIdentityGraph, TombstoneOutcome, apply_partner_id_updates,
+    CreateIfAbsentOutcome, EidCookieSyncOutcome, KvIdentityGraph, PartnerIdUpdate,
+    apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
+use super::module::{apply_module_response_headers, module_kv_key};
 use super::prebid_eids::collect_eid_cookie_updates;
-use super::provider::{apply_provider_response_headers, provider_kv_key};
+use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
-use super::{EcKvSnapshot, current_timestamp, log_id};
+use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 
 /// Finalizes EC response behavior for all routes.
 ///
@@ -48,26 +48,33 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    // Apply any response headers the active provider asked for during
+    // Apply any response headers the active module asked for during
     // generation (for example to request more client evidence). This is empty
-    // unless a provider produced headers, so it is safe on every path. Each
+    // unless a module produced headers, so it is safe on every path. Each
     // one was checked against core's reserved response surface at capture
     // time in `EcContext::candidate_id`, so nothing here can set a
     // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
     // header. They accumulate with whatever the origin returned rather than
     // replacing it, for the reasons on
-    // `provider::apply_provider_response_headers`.
-    apply_provider_response_headers(
+    // `module::apply_module_response_headers`.
+    apply_module_response_headers(
         response.headers_mut(),
         ec_context.response_headers().iter().cloned(),
     );
 
+    ec_context.validate_pull_sync_marker(settings, registry);
     let ec_permitted = ec_context.ec_allowed();
 
     if !ec_permitted {
         // The providers answer withdrawal when the permissions are assembled, so
         // the answer is read here rather than decoded again from the consent record.
         let storage_withdrawn = ec_context.storage_withdrawn();
+        // Expire the request-local marker independently of the EC cookie: a
+        // withdrawal must stop any pending pull-sync disclosure window.
+        if storage_withdrawn && ec_context.pull_sync_marker().was_present() {
+            expire_marker(ec_context.pull_sync_marker_mut(), response);
+        }
+
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -81,20 +88,18 @@ pub fn ec_finalize_response(
 
     // Returning user: EC is permitted and came from the request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && ec_permitted {
-        // Key the snapshot, EID ingestion and orphan recovery by the provider's
+        // Key the snapshot, EID ingestion and orphan recovery by the module's
         // canonical form of the identifier, the key the identity-graph row is
         // stored under, so an ingested EID lands on the live row rather than on
-        // a second row keyed by the value the browser carries. When there are
-        // updates to write, a snapshot the request preloaded under a different
-        // key is refreshed under this one first.
+        // a second row keyed by the value the browser carries.
         if let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) {
-            let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
-            let snapshot = graph.upsert_partner_ids_from_snapshot(
-                &kv_key,
-                &updates,
-                ec_context.kv_snapshot().clone(),
-            );
-            ec_context.set_kv_snapshot(snapshot);
+            let source = ec_context.eid_sync_source();
+            let updates = source
+                .map(|_| collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry))
+                .unwrap_or_default();
+            if let Some(source) = source {
+                sync_eid_cookie_updates(graph, ec_context, &kv_key, &updates, source);
+            }
             if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. })
                 && ec_context.recovery_eligible()
             {
@@ -103,6 +108,8 @@ pub fn ec_finalize_response(
                 );
             }
         }
+
+        reconcile_pull_sync_marker(settings, registry, ec_context, response);
 
         // Ordinary returning-user page views no longer refresh the browser
         // cookie, emit the EC header, or update KV TTL.
@@ -118,25 +125,107 @@ pub fn ec_finalize_response(
                 "Skipping generated EC response write because the KV graph or the \
                  identity-graph key is unavailable"
             );
+            reconcile_pull_sync_marker(settings, registry, ec_context, response);
             return;
         };
 
         let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
-        let snapshot = graph.upsert_partner_ids_from_snapshot(
-            &kv_key,
-            &updates,
-            ec_context.kv_snapshot().clone(),
-        );
-        ec_context.set_kv_snapshot(snapshot);
+        sync_eid_cookie_updates(graph, ec_context, &kv_key, &updates, EidSyncSource::NewEc);
         if ec_context.kv_snapshot().entry_for(&kv_key).is_some() {
             set_ec_cookie_on_response(settings, ec_context, response);
         } else {
             log::warn!("Skipping generated EC cookie because backing row is not authoritative");
         }
     }
+
+    reconcile_pull_sync_marker(settings, registry, ec_context, response);
 }
 
-/// Rotates an orphaned identifier to a new one created by the selected provider.
+fn sync_eid_cookie_updates(
+    graph: &KvIdentityGraph,
+    ec_context: &mut EcContext,
+    ec_id: &str,
+    updates: &[PartnerIdUpdate],
+    source: EidSyncSource,
+) {
+    if updates.is_empty() {
+        return;
+    }
+
+    let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+        ec_id,
+        updates,
+        ec_context.kv_snapshot().clone(),
+    );
+    ec_context.set_kv_snapshot(snapshot);
+    record_eid_sync_terminal(source, outcome);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EidSyncMeasurement {
+    source: EidSyncSource,
+    outcome: EidCookieSyncOutcome,
+    already_matched: u8,
+    written: u8,
+    conflict_duplicate: u8,
+    deferred: u8,
+}
+
+impl EidSyncMeasurement {
+    fn new(source: EidSyncSource, outcome: EidCookieSyncOutcome) -> Self {
+        Self {
+            source,
+            outcome,
+            already_matched: u8::from(matches!(outcome, EidCookieSyncOutcome::AlreadyMatched)),
+            written: u8::from(matches!(
+                outcome,
+                EidCookieSyncOutcome::Written | EidCookieSyncOutcome::WrittenWithDeferredFreshness
+            )),
+            conflict_duplicate: u8::from(matches!(outcome, EidCookieSyncOutcome::ConflictMatched)),
+            deferred: u8::from(matches!(
+                outcome,
+                EidCookieSyncOutcome::WrittenWithDeferredFreshness
+                    | EidCookieSyncOutcome::DeferredConflict
+                    | EidCookieSyncOutcome::DeferredFreshness
+                    | EidCookieSyncOutcome::DeferredStaleRead
+            )),
+        }
+    }
+}
+
+fn record_eid_sync_terminal(source: EidSyncSource, outcome: EidCookieSyncOutcome) {
+    let measurement = EidSyncMeasurement::new(source, outcome);
+    log::info!(
+        "EID sync measurement: source={} outcome={} attempted=1 already_matched={} written={} \
+         conflict_duplicate={} deferred={}",
+        measurement.source,
+        measurement.outcome,
+        measurement.already_matched,
+        measurement.written,
+        measurement.conflict_duplicate,
+        measurement.deferred,
+    );
+}
+
+fn reconcile_pull_sync_marker(
+    settings: &Settings,
+    registry: &PartnerRegistry,
+    ec_context: &mut EcContext,
+    response: &mut Response<EdgeBody>,
+) {
+    let ec_id = ec_context.ec_value().map(str::to_owned);
+    let snapshot = ec_context.kv_snapshot().clone();
+    reconcile_marker(
+        settings,
+        registry,
+        ec_id.as_deref(),
+        &snapshot,
+        ec_context.pull_sync_marker_mut(),
+        response,
+    );
+}
+
+/// Rotates an orphaned identifier to a new one created by the selected module.
 ///
 /// Called only once [`confirm_then_recover_orphaned_ec`] has proved the
 /// orphan's row absent. The replacement goes through the same checks as a new
@@ -151,22 +240,20 @@ fn recover_orphaned_ec(
     updates: &[super::kv::PartnerIdUpdate],
     response: &mut Response<EdgeBody>,
 ) {
-    // A deployment with no provider selected has nothing to rotate to.
-    let Some(provider) = ec_context.selected_provider() else {
+    // A deployment with no module selected has nothing to rotate to.
+    let Some(module) = ec_context.selected_module() else {
         return;
     };
 
-    // Ask the selected provider rather than the built-in generator, so a
+    // Ask the selected module rather than the built-in generator, so a
     // vendor deployment never rotates an orphaned cookie into a built-in
-    // identifier. Whether the client IP is needed is that provider's decision.
+    // identifier. Whether the client IP is needed is that module's decision.
     const MAX_RECOVERY_ATTEMPTS: usize = 5;
     for _attempt in 0..MAX_RECOVERY_ATTEMPTS {
-        let ec_id = match ec_context.candidate_id(provider.as_ref()) {
+        let ec_id = match ec_context.candidate_id(module.as_ref()) {
             Ok(Some(ec_id)) => ec_id,
             Ok(None) => {
-                log::info!(
-                    "Orphan EC recovery skipped because the provider produced no identifier"
-                );
+                log::info!("Orphan EC recovery skipped because the module produced no identifier");
                 ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
                     ec_id: orphan_kv_key.to_owned(),
                 });
@@ -180,7 +267,7 @@ fn recover_orphaned_ec(
                 return;
             }
         };
-        let kv_key = provider_kv_key(provider.as_ref(), &ec_id);
+        let kv_key = module_kv_key(module.as_ref(), &ec_id);
         let mut entry = KvEntry::new(
             ec_context.consent(),
             ec_context.geo_info(),
@@ -201,9 +288,9 @@ fn recover_orphaned_ec(
                 };
                 ec_context.replace_with_generated(ec_id, snapshot);
                 // A returning visitor runs no generation earlier in the
-                // request, so these are only the headers the provider asked
+                // request, so these are only the headers the module asked
                 // for while creating the replacement.
-                apply_provider_response_headers(
+                apply_module_response_headers(
                     response.headers_mut(),
                     ec_context.response_headers().iter().cloned(),
                 );
@@ -258,8 +345,14 @@ fn confirm_then_recover_orphaned_ec(
         EcKvSnapshot::Present { .. } => {
             // The row became visible after the origin round trip: adopt it and
             // merge any pending updates rather than rotating a valid identity.
-            let merged = graph.upsert_partner_ids_from_snapshot(kv_key, updates, confirmed);
-            ec_context.set_kv_snapshot(merged);
+            ec_context.set_kv_snapshot(confirmed);
+            sync_eid_cookie_updates(
+                graph,
+                ec_context,
+                kv_key,
+                updates,
+                EidSyncSource::Navigation,
+            );
         }
         EcKvSnapshot::Missing { .. } => match graph.key_exists_confirmed(kv_key) {
             Ok(false) => {
@@ -363,58 +456,41 @@ fn finalize_unusable_consent(
             // the context, such as pull sync, which discloses the raw EC ID to
             // partners, sees the tombstone that was just written. Only the
             // active identifier has a snapshot in the context to correct.
-            let outcome = graph.write_withdrawal_tombstone(kv_key, |snapshot| {
-                if active_kv_key.as_deref() == Some(kv_key) {
-                    ec_context.set_kv_snapshot(snapshot);
-                }
-            });
-            log_tombstone_outcome(kv_key, outcome);
+            let initial = if ec_context.kv_snapshot().belongs_to(kv_key) {
+                ec_context.kv_snapshot().clone()
+            } else {
+                EcKvSnapshot::NotRead
+            };
+            let outcome = graph.tombstone_existing_from_snapshot(kv_key, initial);
+            // The browser cookie is already cleared, so a failed tombstone
+            // leaves a live row that server-side consumers still read as
+            // consented. Report every failure, including the non-active cookie
+            // key whose outcome is not retained on the request context.
+            if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+                log::warn!(
+                    "EC withdrawal tombstone failed for '{}': the identity-graph row may \
+                     still be live with consent granted",
+                    log_id(kv_key)
+                );
+            }
+            if active_kv_key.as_deref() == Some(kv_key) {
+                ec_context.set_kv_snapshot(outcome);
+            }
         });
-    }
-}
-
-/// Records what happened to one withdrawal tombstone.
-///
-/// An unknown identity is expected traffic rather than a fault: the identifier
-/// comes from a client-supplied cookie, so it may name something this
-/// deployment never issued. An error is different: nothing was recorded, so a
-/// real row may have gone unmarked, and that is logged as a fault. The browser
-/// cookie is expired in every case, and that is the primary enforcement.
-fn log_tombstone_outcome(
-    ec_id: &str,
-    outcome: Result<TombstoneOutcome, Report<TrustedServerError>>,
-) {
-    match outcome {
-        Ok(TombstoneOutcome::Written) => {}
-        Ok(TombstoneOutcome::UnknownIdentity) => {
-            log::debug!(
-                "Skipping withdrawal tombstone for unknown EC ID '{}'",
-                log_id(ec_id),
-            );
-        }
-        Err(err) => {
-            // Covers both a failed write and a check that could not determine
-            // whether the identity exists. Either way no marker was recorded,
-            // so a withdrawal may go unrecorded for the batch-sync window; the
-            // browser cookie is expired regardless.
-            log::error!(
-                "Could not record the withdrawal of EC ID '{}', so it may go unrecorded \
-                 for the batch-sync window; the browser cookie is still expired: {err:?}",
-                log_id(ec_id),
-            );
-        }
     }
 }
 
 /// The identity-graph keys a withdrawal must tombstone.
 ///
 /// Both the `ts-ec` cookie the request carried and the active identifier are
-/// turned into keys by the provider that owns them, so the tombstone lands on
+/// turned into keys by the module that owns them, so the tombstone lands on
 /// the row the live identifier is stored under rather than on the raw cookie
-/// value. An identifier no provider this deployment reads owns produces no key
-/// and is dropped, which is the same filtering the previous shape check did.
-/// The two collapse to one key when they are the same identity written two
-/// ways.
+/// value. An identifier no module this deployment reads owns produces no key
+/// and is dropped, and with no module selected the built-in HMAC grammar
+/// decides, as
+/// [`AcceptedModules::canonical_kv_key`](super::module::AcceptedModules::canonical_kv_key)
+/// does. The two collapse to one key when they are the same identity written
+/// two ways.
 fn withdrawal_kv_keys(ec_context: &EcContext) -> HashSet<String> {
     let mut keys = HashSet::new();
 
@@ -529,9 +605,7 @@ mod tests {
             consent,
             ec_allowed,
         )
-        .with_provider_for_test(std::sync::Arc::new(
-            crate::ec::tests::CanonicalizingProvider,
-        ))
+        .with_module_for_test(std::sync::Arc::new(crate::ec::tests::CanonicalizingModule))
     }
 
     fn graph_with_live_canonical_row() -> KvIdentityGraph {
@@ -573,80 +647,48 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_kv_keys_returns_cookie_ec_only_when_active_missing() {
-        let cookie_ec = sample_ec_id("cook1e");
-        let ec_context = make_context(
-            None,
-            Some(&cookie_ec),
-            true,
-            false,
-            Jurisdiction::Unknown,
-            false,
-        );
-
-        let ids = withdrawal_kv_keys(&ec_context);
-
-        assert_eq!(ids.len(), 1, "should include exactly one EC ID");
-        assert!(
-            ids.contains(&cookie_ec),
-            "should include the cookie EC value"
-        );
-    }
-
-    #[test]
-    fn withdrawal_kv_keys_deduplicates_matching_cookie_and_active_ec() {
-        let ec_id = sample_ec_id("same01");
-        let ec_context = make_context(
-            Some(&ec_id),
-            Some(&ec_id),
-            true,
-            false,
-            Jurisdiction::Unknown,
-            false,
-        );
-
-        let ids = withdrawal_kv_keys(&ec_context);
-
-        assert_eq!(ids.len(), 1, "should deduplicate identical EC IDs");
-        assert!(ids.contains(&ec_id), "should retain the shared EC ID");
-    }
-
-    #[test]
-    fn withdrawal_kv_keys_includes_both_cookie_and_active_when_different() {
-        let active_ec = sample_ec_id("activ1");
-        let cookie_ec = sample_ec_id("cook1e");
-        let ec_context = make_context(
-            Some(&active_ec),
-            Some(&cookie_ec),
-            true,
-            false,
-            Jurisdiction::Unknown,
-            false,
-        );
-
-        let ids = withdrawal_kv_keys(&ec_context);
-
-        assert_eq!(ids.len(), 2, "should include both distinct EC IDs");
-        assert!(ids.contains(&active_ec), "should include active EC ID");
-        assert!(ids.contains(&cookie_ec), "should include cookie EC ID");
-    }
-
-    #[test]
-    fn withdrawal_kv_keys_filters_invalid_values() {
-        let valid_ec = sample_ec_id("valid1");
-        let ec_context = make_context(
-            Some(&valid_ec),
-            Some("not-an-ec-id"),
-            true,
-            false,
-            Jurisdiction::Unknown,
-            false,
-        );
-
-        let ids = withdrawal_kv_keys(&ec_context);
-
-        assert_eq!(ids.len(), 1, "should ignore malformed EC values");
-        assert!(ids.contains(&valid_ec), "should keep the valid EC ID");
+    fn withdrawal_kv_keys_covers_the_cookie_and_the_active_identifier() {
+        let active = sample_ec_id("activ1");
+        let cookie = sample_ec_id("cook1e");
+        let same = sample_ec_id("same01");
+        let valid = sample_ec_id("valid1");
+        for (case, active_ec, cookie_ec, expected) in [
+            (
+                "the cookie alone when no identifier is active",
+                None,
+                Some(cookie.as_str()),
+                vec![cookie.as_str()],
+            ),
+            (
+                "one key when the cookie and the active identifier match",
+                Some(same.as_str()),
+                Some(same.as_str()),
+                vec![same.as_str()],
+            ),
+            (
+                "both keys when the cookie and the active identifier differ",
+                Some(active.as_str()),
+                Some(cookie.as_str()),
+                vec![active.as_str(), cookie.as_str()],
+            ),
+            (
+                "no key for a malformed value",
+                Some(valid.as_str()),
+                Some("not-an-ec-id"),
+                vec![valid.as_str()],
+            ),
+        ] {
+            let ec_context = make_context(
+                active_ec,
+                cookie_ec,
+                true,
+                false,
+                Jurisdiction::Unknown,
+                false,
+            );
+            let expected: HashSet<String> = expected.into_iter().map(str::to_owned).collect();
+            assert_eq!(withdrawal_kv_keys(&ec_context), expected, "{case}");
+        }
     }
 
     #[test]
@@ -772,6 +814,7 @@ mod tests {
         )
         .expect("should seed the identity");
         ec_context.set_kv_snapshot(kv.load_snapshot(&ec_id));
+        ec_context.set_eid_sync_source(EidSyncSource::Auction);
         assert!(matches!(
             ec_context.kv_snapshot(),
             EcKvSnapshot::Missing { .. }
@@ -1101,7 +1144,7 @@ mod tests {
             consent,
             Some("192.0.2.10".to_owned()),
         )
-        .with_provider_for_test(crate::ec::tests::hmac_provider());
+        .with_module_for_test(crate::ec::tests::hmac_module());
         ec_context.set_recovery_eligible(true);
         ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
             ec_id: orphaned_ec.clone(),
@@ -1135,11 +1178,290 @@ mod tests {
     }
 
     #[test]
-    fn finalize_named_route_transient_miss_still_persists_eid_updates() {
-        // `/auction` and `/_ts/page-bids` save their first lookup into the
-        // context and are never recovery eligible, so a stale miss there has no
-        // later chance to retry. Finalization must revalidate before dropping
-        // the collected partner IDs.
+    fn valid_marker_with_unread_snapshot_defers_orphan_recovery() {
+        let settings = create_test_settings();
+        let orphaned_ec = sample_ec_id("orphn2");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(orphaned_ec.clone()),
+            consent,
+            Some("192.0.2.10".to_owned()),
+        );
+        ec_context.set_recovery_eligible(true);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Valid { expires_at: 4_600 },
+        );
+        let mut partner = make_partner("pull.example.com");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
+        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(orphaned_ec.as_str()),
+            "an unread snapshot should defer orphan rotation until marker expiry"
+        );
+        assert!(
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
+            "a marker-skipped request should leave the snapshot unread"
+        );
+        assert!(
+            response.headers().get(http::header::SET_COOKIE).is_none(),
+            "bounded orphan deferral should not rewrite browser identity state"
+        );
+    }
+
+    #[test]
+    fn finalize_returning_user_subresource_does_not_persist_eid_updates() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("subeid");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row");
+        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), false);
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert!(
+            !stored.ids.contains_key("sharedid.org"),
+            "a subresource response must not persist request EID cookies"
+        );
+    }
+
+    #[test]
+    fn finalize_navigation_routes_persist_returning_user_eid_updates() {
+        for (source, suffix, cookie_id) in [
+            (EidSyncSource::Navigation, "naveid", "navigation-cookie-id"),
+            (EidSyncSource::PageBids, "spaeid", "page-bids-cookie-id"),
+        ] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id(suffix);
+            let graph = KvIdentityGraph::in_memory("test_store");
+            let live = KvEntry::new(
+                &granting_consent(),
+                None,
+                current_timestamp(),
+                &settings.publisher.domain,
+            );
+            graph
+                .create(&ec_id, &live)
+                .expect("should seed the live row");
+            let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
+            ec_context.set_eid_sync_source(source);
+            let partners = vec![make_partner("sharedid.org")];
+            let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+            let mut response = empty_response();
+
+            ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &registry,
+                None,
+                Some(cookie_id),
+                &mut response,
+            );
+
+            let (stored, _) = graph
+                .get(&ec_id)
+                .expect("should read store")
+                .expect("row should remain");
+            assert_eq!(
+                stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+                Some(cookie_id),
+                "{source} should persist the returning-user EID cookie"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_generated_ec_persists_eid_updates() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("geneid");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed generated row");
+        let mut ec_context = make_context(
+            Some(&ec_id),
+            None,
+            false,
+            true,
+            Jurisdiction::NonRegulated,
+            true,
+        );
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("generated-cookie-id"),
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert_eq!(
+            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            Some("generated-cookie-id")
+        );
+    }
+
+    #[test]
+    fn eid_sync_measurement_dimensions_are_bounded_and_identity_free() {
+        let sources = [
+            EidSyncSource::Navigation,
+            EidSyncSource::Auction,
+            EidSyncSource::PageBids,
+            EidSyncSource::NewEc,
+        ];
+        let outcomes = [
+            EidCookieSyncOutcome::AlreadyMatched,
+            EidCookieSyncOutcome::Written,
+            EidCookieSyncOutcome::WrittenWithDeferredFreshness,
+            EidCookieSyncOutcome::ConflictMatched,
+            EidCookieSyncOutcome::DeferredConflict,
+            EidCookieSyncOutcome::DeferredFreshness,
+            EidCookieSyncOutcome::DeferredStaleRead,
+            EidCookieSyncOutcome::Missing,
+            EidCookieSyncOutcome::ConsentWithdrawn,
+            EidCookieSyncOutcome::Failed,
+        ];
+
+        assert_eq!(
+            sources.map(|source| source.to_string()),
+            ["navigation", "auction", "page_bids", "new_ec"]
+        );
+        assert_eq!(
+            outcomes.map(|outcome| outcome.to_string()),
+            [
+                "already_matched",
+                "written",
+                "written_with_deferred_freshness",
+                "conflict_matched",
+                "deferred_conflict",
+                "deferred_freshness",
+                "deferred_stale_read",
+                "missing",
+                "consent_withdrawn",
+                "failed",
+            ]
+        );
+
+        assert_eq!(
+            EidSyncMeasurement::new(
+                EidSyncSource::Navigation,
+                EidCookieSyncOutcome::AlreadyMatched,
+            ),
+            EidSyncMeasurement {
+                source: EidSyncSource::Navigation,
+                outcome: EidCookieSyncOutcome::AlreadyMatched,
+                already_matched: 1,
+                written: 0,
+                conflict_duplicate: 0,
+                deferred: 0,
+            }
+        );
+        assert_eq!(
+            EidSyncMeasurement::new(
+                EidSyncSource::Auction,
+                EidCookieSyncOutcome::WrittenWithDeferredFreshness,
+            ),
+            EidSyncMeasurement {
+                source: EidSyncSource::Auction,
+                outcome: EidCookieSyncOutcome::WrittenWithDeferredFreshness,
+                already_matched: 0,
+                written: 1,
+                conflict_duplicate: 0,
+                deferred: 1,
+            }
+        );
+        assert_eq!(
+            EidSyncMeasurement::new(EidSyncSource::NewEc, EidCookieSyncOutcome::ConflictMatched,),
+            EidSyncMeasurement {
+                source: EidSyncSource::NewEc,
+                outcome: EidCookieSyncOutcome::ConflictMatched,
+                already_matched: 0,
+                written: 0,
+                conflict_duplicate: 1,
+                deferred: 0,
+            }
+        );
+        assert_eq!(
+            EidSyncMeasurement::new(
+                EidSyncSource::PageBids,
+                EidCookieSyncOutcome::DeferredStaleRead,
+            ),
+            EidSyncMeasurement {
+                source: EidSyncSource::PageBids,
+                outcome: EidCookieSyncOutcome::DeferredStaleRead,
+                already_matched: 0,
+                written: 0,
+                conflict_duplicate: 0,
+                deferred: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn finalize_auction_transient_miss_still_persists_eid_updates() {
+        // `/auction` saves its first lookup into the context and is never
+        // recovery eligible, so a stale miss there has no later chance to
+        // retry. Finalization must revalidate before dropping collected IDs.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("named1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1159,6 +1481,7 @@ mod tests {
             },
             false,
         );
+        ec_context.set_eid_sync_source(EidSyncSource::Auction);
         let partners = vec![make_partner("sharedid.org")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut response = empty_response();
@@ -1186,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_named_route_confirmed_miss_does_not_create_a_row() {
+    fn finalize_auction_confirmed_miss_does_not_create_a_row() {
         // The same path with a genuinely absent row must stay a no-op: a route
         // without orphan recovery must never mint an identity-graph entry.
         let settings = create_test_settings();
@@ -1199,6 +1522,7 @@ mod tests {
             },
             false,
         );
+        ec_context.set_eid_sync_source(EidSyncSource::Auction);
         let partners = vec![make_partner("sharedid.org")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut response = empty_response();
@@ -1382,6 +1706,217 @@ mod tests {
         );
     }
 
+    /// A returning visitor's context on a recovery-eligible navigation whose
+    /// row is missing, with `module` selected.
+    fn orphan_context(
+        orphan: &str,
+        client_ip: Option<&str>,
+        module: std::sync::Arc<dyn crate::ec::module::EdgeCookieModule>,
+    ) -> EcContext {
+        let mut ec = EcContext::new_for_test_with_ip(
+            Some(orphan.to_owned()),
+            granting_consent(),
+            client_ip.map(str::to_owned),
+        )
+        .with_module_for_test(module);
+        ec.set_recovery_eligible(true);
+        ec.set_kv_snapshot(EcKvSnapshot::Missing {
+            ec_id: orphan.to_owned(),
+        });
+        ec
+    }
+
+    /// A store that holds no row and refuses every write, so a proven-absent
+    /// orphan reaches the replacement write and that write fails.
+    struct EmptyUnwritableEcKv;
+
+    impl crate::ec::kv_backend::EcKvStore for EmptyUnwritableEcKv {
+        fn store_name(&self) -> &str {
+            "empty-unwritable-store"
+        }
+
+        fn lookup(
+            &self,
+            _key: &str,
+        ) -> Result<
+            Option<crate::ec::kv_backend::EcKvLookup>,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(None)
+        }
+
+        fn key_exists(
+            &self,
+            _key: &str,
+        ) -> Result<bool, error_stack::Report<crate::error::TrustedServerError>> {
+            Ok(false)
+        }
+
+        fn insert(
+            &self,
+            _key: &str,
+            _write: crate::ec::kv_backend::EcKvWrite<'_>,
+        ) -> Result<
+            crate::ec::kv_backend::EcKvWriteOutcome,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Err(error_stack::Report::new(
+                crate::error::TrustedServerError::KvStore {
+                    store_name: "empty-unwritable-store".to_owned(),
+                    message: "the test store refuses every write".to_owned(),
+                },
+            ))
+        }
+
+        fn list_keys_with_prefix(
+            &self,
+            _prefix: &str,
+            _limit: u32,
+        ) -> Result<Vec<String>, error_stack::Report<crate::error::TrustedServerError>> {
+            Ok(Vec::new())
+        }
+
+        fn delete(
+            &self,
+            _key: &str,
+        ) -> Result<(), error_stack::Report<crate::error::TrustedServerError>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_orphan_recovery_that_cannot_rotate_leaves_a_failed_snapshot() {
+        // Recovery runs only once the orphan's row is proven absent. Each of
+        // these exits gives up without a replacement, and each must leave the
+        // orphan in place, write no cookie and record a failed snapshot for
+        // the orphan's key, so nothing later treats the miss as authoritative.
+        let settings = create_test_settings();
+        let hmac_orphan = sample_ec_id("orphn2");
+        let cases: [(&str, EcContext, KvIdentityGraph); 3] = [
+            (
+                "the HMAC module with no client IP",
+                orphan_context(&hmac_orphan, None, crate::ec::tests::hmac_module()),
+                KvIdentityGraph::in_memory("test_store"),
+            ),
+            (
+                "a store whose replacement write fails",
+                orphan_context(
+                    &hmac_orphan,
+                    Some("192.0.2.10"),
+                    crate::ec::tests::hmac_module(),
+                ),
+                KvIdentityGraph::new(EmptyUnwritableEcKv),
+            ),
+            (
+                "a replacement that always collides",
+                orphan_context(
+                    &hmac_orphan,
+                    Some("192.0.2.10"),
+                    crate::ec::tests::hmac_module(),
+                ),
+                KvIdentityGraph::new(crate::ec::tests::AddCollidingEcKv::new(u32::MAX)),
+            ),
+        ];
+        for (case, mut ec_context, graph) in cases {
+            let orphan = ec_context
+                .ec_value()
+                .expect("the context should carry the orphan")
+                .to_owned();
+            let orphan_kv_key = ec_context
+                .ec_kv_key()
+                .expect("the selected module should own the orphan");
+            let mut response = empty_response();
+
+            ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
+
+            assert_eq!(
+                ec_context.ec_value(),
+                Some(orphan.as_str()),
+                "{case}: the orphan must not rotate"
+            );
+            assert!(
+                !ec_context.ec_generated(),
+                "{case}: nothing should be marked as generated"
+            );
+            assert!(
+                get_header(&response, "set-cookie").is_none(),
+                "{case}: no replacement cookie should be written"
+            );
+            assert_eq!(
+                ec_context.kv_snapshot(),
+                &EcKvSnapshot::Failed {
+                    ec_id: orphan_kv_key,
+                },
+                "{case}: the orphan's key should carry a failed snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn an_orphan_rotation_applies_the_replacement_modules_response_headers() {
+        // A returning visitor runs no generation earlier in the request, so the
+        // headers the module asks for while creating the replacement reach
+        // the response through the rotation alone.
+        let settings = create_test_settings();
+        let mut ec_context = orphan_context(
+            "t0eh~orphaned-value",
+            Some("192.0.2.10"),
+            std::sync::Arc::new(EvidenceHeaderModule),
+        );
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            ec_context.ec_value(),
+            Some("t0eh~evidence-id"),
+            "the orphan should rotate to the module's replacement"
+        );
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should render set-cookie as utf-8"))
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("vendor-ev=abc")),
+            "the module's cookie should reach the response, got {cookies:?}"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec=t0eh~evidence-id")),
+            "the replacement Edge Cookie should be written, got {cookies:?}"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(http::header::VARY)
+                .iter()
+                .any(|value| value == "sec-ch-ua"),
+            "the module's Vary should reach the response"
+        );
+    }
+
     #[test]
     fn finalize_does_not_rotate_when_the_existence_check_fails() {
         // Absence is unprovable when the list itself errors. Rotation abandons a
@@ -1545,40 +2080,53 @@ mod tests {
     }
 
     #[test]
-    fn closed_permission_gate_writes_no_ec_cookie() {
-        // The gate: with the permission gate closed (ec_allowed = false), no
-        // ts-ec cookie is written, even when an EC value and a generated flag are
-        // present. The permission model is what suppresses the cookie.
+    fn the_permission_gate_decides_whether_a_generated_ec_cookie_is_written() {
+        // The generated identifier has a backing row and a snapshot bound to
+        // it, so the backing-row guard would let the cookie through and the
+        // permission gate is the only thing that can withhold it.
         let settings = create_test_settings();
-        let ec_id = sample_ec_id("gated1");
-        let mut ec_context = make_context(
-            Some(&ec_id),
-            None,
-            false,
-            true,
-            Jurisdiction::NonRegulated,
-            false,
-        );
-        let mut response = empty_response();
+        for (case, gate_open) in [("an open gate", true), ("a closed gate", false)] {
+            let ec_id = sample_ec_id("gated1");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(&ec_id, &live_entry())
+                .expect("should seed the generated identifier's row");
+            let mut ec_context = make_context(
+                Some(&ec_id),
+                None,
+                false,
+                true,
+                Jurisdiction::NonRegulated,
+                gate_open,
+            );
+            ec_context.set_kv_snapshot(EcKvSnapshot::Present {
+                ec_id: ec_id.clone(),
+                entry: Box::new(live_entry()),
+                generation: None,
+            });
+            let mut response = empty_response();
 
-        // Pass a KV graph so the missing-graph guard cannot be the reason the
-        // cookie is suppressed; the closed gate must be doing the work.
-        let kv = KvIdentityGraph::failing("test_store");
-        let test_registry = PartnerRegistry::empty();
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&kv),
-            &test_registry,
-            None,
-            None,
-            &mut response,
-        );
+            ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
 
-        assert!(
-            get_header(&response, "set-cookie").is_none(),
-            "a closed permission gate must not write a ts-ec cookie"
-        );
+            let wrote_ec_cookie = response
+                .headers()
+                .get_all(http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|cookie| cookie.starts_with("ts-ec=") && cookie.contains(&ec_id));
+            assert_eq!(
+                wrote_ec_cookie, gate_open,
+                "{case}: the ts-ec cookie should be written only when the permission gate is open"
+            );
+        }
     }
 
     #[test]
@@ -1586,7 +2134,7 @@ mod tests {
         // The tombstone is the authoritative revocation marker, so it has to
         // land on the key the live row uses. Written under the raw cookie
         // value it creates a second row nothing reads, and the revocation
-        // never takes effect for a provider whose canonical form differs.
+        // never takes effect for a module whose canonical form differs.
         //
         // Destructive withdrawal is narrow, so the trigger here is a TCF record
         // refusing storage, the same one
@@ -1635,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn eid_ingestion_keys_by_the_providers_canonical_form() {
+    fn eid_ingestion_keys_by_the_modules_canonical_form() {
         // An ingested EID must join the row the identifier already has. Keyed
         // by the raw cookie value the upsert finds no row and the partner ID
         // is dropped.
@@ -1649,6 +2197,7 @@ mod tests {
             ..Default::default()
         };
         let mut ec_context = canonicalizing_context(true, false, consent, true);
+        ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -1679,30 +2228,30 @@ mod tests {
         );
     }
 
-    /// A provider that sets one cookie of its own and one `Vary` entry, the
-    /// two response effects a provider realistically asks for, so a test can
+    /// A module that sets one cookie of its own and one `Vary` entry, the
+    /// two response effects a module realistically asks for, so a test can
     /// watch both land on a response the origin already wrote headers to.
     #[derive(Debug)]
-    struct EvidenceHeaderProvider;
+    struct EvidenceHeaderModule;
 
-    impl crate::ec::provider::EdgeCookieProvider for EvidenceHeaderProvider {
+    impl crate::ec::module::EdgeCookieModule for EvidenceHeaderModule {
         fn id(&self) -> &'static str {
             "evidence-header"
         }
 
-        fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::provider_code!("t0eh")
+        fn code(&self) -> crate::ec::module::ModuleCode {
+            crate::module_code!("t0eh")
         }
 
         fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::provider::IdentityInput<'_>,
+            _input: &crate::ec::module::IdentityInput<'_>,
         ) -> Result<
-            crate::ec::provider::GeneratedEdgeCookie,
+            crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
         > {
-            Ok(crate::ec::provider::GeneratedEdgeCookie {
+            Ok(crate::ec::module::GeneratedEdgeCookie {
                 id: Some("evidence-id".to_owned()),
                 response_headers: vec![
                     (
@@ -1724,24 +2273,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_response_headers_reach_the_response_without_dropping_the_origins() {
+    fn module_response_headers_reach_the_response_without_dropping_the_origins() {
         // The response finalization runs on is the finished one, so it already
-        // carries the publisher origin's own headers. A provider effect must
+        // carries the publisher origin's own headers. A module effect must
         // add to those, never replace them: replacing `Set-Cookie` would drop
         // the publisher's session and sign-in cookies, and replacing `Vary`
         // would break the caching the origin asked for.
         let settings = create_test_settings();
-        let graph = KvIdentityGraph::in_memory("finalize-provider-headers-store");
+        let graph = KvIdentityGraph::in_memory("finalize-module-headers-store");
         let consent = ConsentContext {
             jurisdiction: Jurisdiction::NonRegulated,
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
-            .with_provider_for_test(std::sync::Arc::new(EvidenceHeaderProvider));
+            .with_module_for_test(std::sync::Arc::new(EvidenceHeaderModule));
         ec_context
             .generate_if_needed(&settings, Some(&graph))
-            .expect("should create the identifier through the provider");
+            .expect("should create the identifier through the module");
 
         // What the publisher's origin returned, before EC finalization runs.
         let mut response = empty_response();
@@ -1774,13 +2323,13 @@ mod tests {
             cookies
                 .iter()
                 .any(|cookie| cookie.starts_with("publisher_session=origin-value")),
-            "the origin's own cookie must survive a provider effect, got {cookies:?}"
+            "the origin's own cookie must survive a module effect, got {cookies:?}"
         );
         assert!(
             cookies
                 .iter()
                 .any(|cookie| cookie.starts_with("vendor-ev=abc")),
-            "the provider's cookie must reach the response, got {cookies:?}"
+            "the module's cookie must reach the response, got {cookies:?}"
         );
         assert!(
             cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
@@ -1795,37 +2344,37 @@ mod tests {
             .collect();
         assert!(
             vary.contains(&"accept-encoding"),
-            "the origin's Vary must survive a provider effect, got {vary:?}"
+            "the origin's Vary must survive a module effect, got {vary:?}"
         );
         assert!(
             vary.contains(&"sec-ch-ua"),
-            "the provider's Vary must reach the response, got {vary:?}"
+            "the module's Vary must reach the response, got {vary:?}"
         );
     }
 
-    /// A provider standing in for the one a deployment switched *to*, with a
-    /// different registered code from the provider that created the live row.
+    /// A module standing in for the one a deployment switched *to*, with a
+    /// different registered code from the module that created the live row.
     #[derive(Debug)]
-    struct SwitchedProvider;
+    struct SwitchedModule;
 
-    impl crate::ec::provider::EdgeCookieProvider for SwitchedProvider {
+    impl crate::ec::module::EdgeCookieModule for SwitchedModule {
         fn id(&self) -> &'static str {
             "switched"
         }
 
-        fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::provider_code!("t0sw")
+        fn code(&self) -> crate::ec::module::ModuleCode {
+            crate::module_code!("t0sw")
         }
 
         fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::provider::IdentityInput<'_>,
+            _input: &crate::ec::module::IdentityInput<'_>,
         ) -> Result<
-            crate::ec::provider::GeneratedEdgeCookie,
+            crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
         > {
-            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+            Ok(crate::ec::module::GeneratedEdgeCookie::default())
         }
 
         fn accepts_id(&self, value: &str) -> bool {
@@ -1838,15 +2387,10 @@ mod tests {
     }
 
     #[test]
-    fn switching_provider_leaves_the_previous_providers_row_beyond_withdrawal() {
-        // Pins what a provider switch really does, which the switching
-        // section of the pluggable-providers spec now states plainly. The
-        // retired provider's identifier is owned by nobody this deployment
+    fn switching_module_leaves_the_previous_modules_row_beyond_withdrawal() {
+        // A retired module's identifier is owned by nobody this deployment
         // reads, so a later withdrawal expires the browser cookie but cannot
-        // tombstone the row, and the identifier is never adopted either. If
-        // the deferred `legacy_providers` reader list ever lands, this test
-        // is meant to fail, so that the spec sentence a deployer acts on is
-        // revisited in the same change.
+        // tombstone the row, and the identifier is never adopted either.
         let settings = create_test_settings();
         let graph = graph_with_live_canonical_row();
         // A TCF record consenting to nothing, under GDPR, so the request
@@ -1874,8 +2418,8 @@ mod tests {
             source: ConsentSource::Cookie,
             ..Default::default()
         };
-        // The browser still carries the identifier the previous provider
-        // created, but the deployment now runs a provider with a different
+        // The browser still carries the identifier the previous module
+        // created, but the deployment now runs a module with a different
         // code, so read-back treats the cookie as absent and the active
         // identifier is empty.
         // The TCF provider answers the withdrawal at assembly, and core links
@@ -1888,7 +2432,7 @@ mod tests {
             consent,
             false,
         )
-        .with_provider_for_test(std::sync::Arc::new(SwitchedProvider))
+        .with_module_for_test(std::sync::Arc::new(SwitchedModule))
         .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
 
@@ -1904,16 +2448,16 @@ mod tests {
 
         assert!(
             ec_context.ec_value().is_none(),
-            "the retired provider's identifier must never be adopted by the new one"
+            "the retired module's identifier must never be adopted by the new one"
         );
 
         let (row, _) = graph
             .get(CANONICAL_KV_KEY)
-            .expect("should read the previous provider's row")
-            .expect("the previous provider's row should still exist");
+            .expect("should read the previous module's row")
+            .expect("the previous module's row should still exist");
         assert!(
             row.consent.ok,
-            "withdrawal cannot reach a retired provider's row without the provider that owns the code"
+            "withdrawal cannot reach a retired module's row without the module that owns the code"
         );
 
         let cookies: Vec<&str> = response
@@ -1952,7 +2496,7 @@ mod tests {
             granting_consent(),
             Some("192.0.2.10".to_owned()),
         )
-        .with_provider_for_test(crate::ec::tests::hmac_provider());
+        .with_module_for_test(crate::ec::tests::hmac_module());
         ec.set_recovery_eligible(recovery_eligible);
         ec.set_kv_snapshot(snapshot);
         ec
@@ -2130,6 +2674,290 @@ mod tests {
         assert!(
             graph.get(&cookie_ec).expect("should read store").is_none(),
             "a missing second ID must never be created by withdrawal"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_tombstones_both_present_ids_once() {
+        let settings = create_test_settings();
+        let active_ec = sample_ec_id("activ3");
+        let cookie_ec = sample_ec_id("cook3e");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(
+            Some(&active_ec),
+            Some(&cookie_ec),
+            true,
+            false,
+            consent,
+            false,
+        )
+        .with_storage_withdrawn_for_test(true);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        graph
+            .create(
+                &active_ec,
+                &KvEntry::minimal("active.example.com", "active-uid", 1_000),
+            )
+            .expect("should seed active row");
+        graph
+            .create(
+                &cookie_ec,
+                &KvEntry::minimal("cookie.example.com", "cookie-uid", 1_000),
+            )
+            .expect("should seed cookie row");
+        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let (active_tombstone, active_generation) = graph
+            .get(&active_ec)
+            .expect("should read active row")
+            .expect("should retain active tombstone");
+        let (cookie_tombstone, cookie_generation) = graph
+            .get(&cookie_ec)
+            .expect("should read cookie row")
+            .expect("should retain cookie tombstone");
+        assert!(
+            !active_tombstone.consent.ok,
+            "active row should be withdrawn"
+        );
+        assert!(
+            active_tombstone.ids.is_empty(),
+            "active IDs should be cleared"
+        );
+        assert!(
+            !cookie_tombstone.consent.ok,
+            "cookie row should be withdrawn"
+        );
+        assert!(
+            cookie_tombstone.ids.is_empty(),
+            "cookie IDs should be cleared"
+        );
+
+        let mut repeated_response = empty_response();
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut repeated_response,
+        );
+
+        assert_eq!(
+            graph
+                .get(&active_ec)
+                .expect("should read active row")
+                .expect("should retain active tombstone")
+                .1,
+            active_generation,
+            "repeated finalization should not rewrite active tombstone"
+        );
+        assert_eq!(
+            graph
+                .get(&cookie_ec)
+                .expect("should read cookie row")
+                .expect("should retain cookie tombstone")
+                .1,
+            cookie_generation,
+            "repeated finalization should not rewrite cookie tombstone"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_keeps_cookie_deletion_on_kv_failure() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("failw1");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
+        );
+        let graph = KvIdentityGraph::failing("unavailable-store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            response.status(),
+            200,
+            "KV failure should not change response status"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| { cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0") }),
+            "KV failure should not prevent EC cookie deletion"
+        );
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
+            }),
+            "KV failure should not prevent marker deletion"
+        );
+    }
+
+    #[test]
+    fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("compl1");
+        let mut partner = make_partner("ssp.example.com");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
+        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let mut ec_context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::NonRegulated,
+            true,
+        );
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "partner-uid".to_owned(),
+            },
+        );
+        ec_context.set_kv_snapshot(EcKvSnapshot::Present {
+            ec_id,
+            entry: Box::new(entry),
+            generation: Some(1),
+        });
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec-pull-complete=v1.")),
+            "complete snapshot should issue the marker"
+        );
+    }
+
+    #[test]
+    fn explicit_withdrawal_without_marker_or_ec_cookie_does_not_set_cookie() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent, false);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            response.headers().get(http::header::SET_COOKIE).is_none(),
+            "withdrawal without browser identity state should not add a cookie"
+        );
+    }
+
+    #[test]
+    fn explicit_withdrawal_expires_marker_without_ec_cookie() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent, false)
+            .with_storage_withdrawn_for_test(true);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
+            }),
+            "withdrawal should expire the marker independently of EC cookie state"
+        );
+        assert!(
+            cookies.iter().all(|cookie| !cookie.starts_with("ts-ec=;")),
+            "missing EC cookie should not add an EC-cookie expiry"
         );
     }
 

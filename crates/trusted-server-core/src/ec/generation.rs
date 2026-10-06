@@ -1,7 +1,8 @@
 //! Edge Cookie (EC) ID generation using HMAC.
 //!
-//! This module generates EC IDs from the client IP address and a configured
-//! secret key.
+//! This module creates EC IDs as an HMAC, keyed by a configured secret, over
+//! one or more request parts such as the client IP, and holds the format
+//! helpers for the built-in HMAC identifier.
 
 use std::net::IpAddr;
 
@@ -10,7 +11,7 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
-use crate::ec::provider::{HMAC_PROVIDER_CODE, PROVIDER_CODE_SEPARATOR, split_provider_code};
+use crate::ec::module::{HMAC_MODULE_CODE, MODULE_CODE_SEPARATOR, split_module_code};
 use crate::error::TrustedServerError;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -73,7 +74,7 @@ fn generate_random_suffix(length: usize) -> String {
 /// the client IP address, then appends a random suffix for additional
 /// uniqueness. The resulting format is `{64hex}.{6alnum}`.
 ///
-/// **Important:** `client_ip` must be pre-normalized via [`extract_client_ip`].
+/// **Important:** `client_ip` must be pre-normalized with `normalize_ip`.
 /// Raw IPv6 addresses produce different hashes than their normalized /64
 /// form, which would create duplicate identity graph entries.
 ///
@@ -92,9 +93,10 @@ pub fn generate_ec_id(
 ///
 /// The parts are joined with a unit separator (`\u{1f}`), which cannot appear in
 /// a client IP, User-Agent, or TLS and HTTP/2 signal, so distinct part lists
-/// cannot collide. A provider that derives identity from multiple request
-/// signals (for example a Fastly provider over JA4, H2, IP, and UA) passes them
-/// as separate parts. Each part must be pre-normalized by the caller.
+/// cannot collide. A module that derives identity from multiple request
+/// signals, for example a TLS fingerprint, HTTP/2 settings and the client IP,
+/// passes them as separate parts. Each part must be pre-normalized by the
+/// caller.
 ///
 /// # Errors
 ///
@@ -141,18 +143,18 @@ pub fn ec_hash(ec_id: &str) -> &str {
 /// defense-in-depth measure for EC IDs submitted by external partners
 /// (via batch sync) that may use uppercase hex.
 ///
-/// An identifier this function creates carries the built-in provider's code
-/// envelope (`hmac~` before the value, see
-/// [`PROVIDER_CODE_SEPARATOR`](super::provider::PROVIDER_CODE_SEPARATOR)),
+/// A created identifier carries the built-in module's code envelope
+/// (`hmac~` before the value, see
+/// [`MODULE_CODE_SEPARATOR`](super::module::MODULE_CODE_SEPARATOR)),
 /// and partners echo that form back, so the envelope is kept and only the
 /// value inside it is lowercased. That keeps the key identical to the one
-/// written at creation. An identifier under any other provider's code is not
-/// HMAC-shaped and is returned unchanged, because only that provider knows
+/// written at creation. An identifier under any other module's code is not
+/// HMAC-shaped and is returned unchanged, because only that module knows
 /// how to normalize it.
 #[must_use]
 pub fn normalize_ec_id_for_kv(ec_id: &str) -> String {
-    let (code, bare) = match split_provider_code(ec_id) {
-        (Some(code), bare) if code == HMAC_PROVIDER_CODE.as_str() => (Some(code), bare),
+    let (code, bare) = match split_module_code(ec_id) {
+        (Some(code), bare) if code == HMAC_MODULE_CODE.as_str() => (Some(code), bare),
         (Some(_), _) => return ec_id.to_owned(),
         (None, bare) => (None, bare),
     };
@@ -161,7 +163,7 @@ pub fn normalize_ec_id_for_kv(ec_id: &str) -> String {
     let suffix = parts.next().unwrap_or_default();
     match code {
         Some(code) => format!(
-            "{code}{PROVIDER_CODE_SEPARATOR}{}.{}",
+            "{code}{MODULE_CODE_SEPARATOR}{}.{}",
             hash.to_ascii_lowercase(),
             suffix
         ),
@@ -190,21 +192,21 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 /// the random suffix allows mixed-case alphanumeric characters by
 /// construction.
 ///
-/// An identifier this provider creates carries the provider-code envelope,
+/// An identifier this module creates carries the module-code envelope,
 /// `hmac~` before the bare value, so both the enveloped and the legacy bare
-/// form are accepted here. An identifier under any other provider's code is
+/// form are accepted here. An identifier under any other module's code is
 /// not an HMAC identifier and is rejected.
 ///
-/// This is the built-in provider's grammar, not the deployment's. The
+/// This is the built-in module's grammar, not the deployment's. The
 /// partner-facing paths (pull sync, batch sync, the admin lookup) dispatch by
-/// provider code through
-/// [`AcceptedProviders`](super::provider::AcceptedProviders), which reaches
-/// this only for an identifier the built-in provider owns, or as the fallback
-/// for a stateless deployment that has selected no provider at all.
+/// module code through
+/// [`AcceptedModules`](super::module::AcceptedModules), which reaches
+/// this only for an identifier the built-in module owns, or as the fallback
+/// for a stateless deployment that has selected no module at all.
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
-    let bare = match split_provider_code(value) {
-        (Some(code), bare) if code == HMAC_PROVIDER_CODE.as_str() => bare,
+    let bare = match split_module_code(value) {
+        (Some(code), bare) if code == HMAC_MODULE_CODE.as_str() => bare,
         (Some(_), _) => return false,
         (None, bare) => bare,
     };
@@ -371,63 +373,36 @@ mod tests {
     }
 
     #[test]
-    fn is_valid_ec_id_accepts_valid() {
-        let value = format!("{}.Ab12z9", "a".repeat(64));
-        assert!(is_valid_ec_id(&value), "should accept a valid EC ID format");
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_missing_suffix() {
-        let missing_suffix = "a".repeat(64);
-        assert!(
-            !is_valid_ec_id(&missing_suffix),
-            "should reject missing suffix"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_invalid_hex() {
-        let invalid_hex = format!("{}.Ab12z9", "a".repeat(63) + "g");
-        assert!(
-            !is_valid_ec_id(&invalid_hex),
-            "should reject non-hex HMAC content"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_invalid_suffix() {
-        let invalid_suffix = format!("{}.ab-129", "a".repeat(64));
-        assert!(
-            !is_valid_ec_id(&invalid_suffix),
-            "should reject non-alphanumeric suffix"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_extra_segments() {
-        let extra_segment = format!("{}.Ab12z9.zz", "a".repeat(64));
-        assert!(
-            !is_valid_ec_id(&extra_segment),
-            "should reject extra segments"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_accepts_the_hmac_envelope() {
-        let coded = format!("hmac~{}.ABC123", "a".repeat(64));
-        assert!(
-            is_valid_ec_id(&coded),
-            "should accept a created identifier carrying the hmac code"
-        );
-    }
-
-    #[test]
-    fn is_valid_ec_id_rejects_other_provider_codes() {
-        let coded = format!("t0op~{}.ABC123", "a".repeat(64));
-        assert!(
-            !is_valid_ec_id(&coded),
-            "should reject an identifier carrying another provider's code"
-        );
+    fn is_valid_ec_id_accepts_only_the_hmac_grammar() {
+        let hash = "a".repeat(64);
+        for (input, expected, reason) in [
+            (format!("{hash}.Ab12z9"), true, "a valid EC ID format"),
+            (hash.clone(), false, "a missing suffix"),
+            (
+                format!("{}.Ab12z9", "a".repeat(63) + "g"),
+                false,
+                "non-hex HMAC content",
+            ),
+            (format!("{hash}.ab-129"), false, "a non-alphanumeric suffix"),
+            (format!("{hash}.Ab12z9.zz"), false, "an extra segment"),
+            (
+                format!("hmac~{hash}.ABC123"),
+                true,
+                "a created identifier carrying the hmac code",
+            ),
+            (
+                format!("t0op~{hash}.ABC123"),
+                false,
+                "an identifier carrying another module's code",
+            ),
+        ] {
+            assert_eq!(
+                is_valid_ec_id(&input),
+                expected,
+                "{reason} should be {}: {input}",
+                if expected { "accepted" } else { "rejected" }
+            );
+        }
     }
 
     #[test]
@@ -441,7 +416,7 @@ mod tests {
         assert_eq!(
             normalize_ec_id_for_kv("t0op~MixedCase"),
             "t0op~MixedCase",
-            "should leave another provider's identifier unchanged"
+            "should leave another module's identifier unchanged"
         );
     }
 }
