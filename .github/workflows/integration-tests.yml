@@ -1,4 +1,4 @@
-name: "Integration Tests"
+name: 'Integration Tests'
 
 permissions:
   contents: read
@@ -30,11 +30,14 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "false"
-          build-cloudflare: "true"
+          install-viceroy: 'false'
+          build-cloudflare: 'true'
 
       - name: Generate integration Viceroy configs
-        run: ./scripts/generate-integration-viceroy-configs.sh
+        run: |
+          ./scripts/generate-integration-viceroy-configs.sh
+          INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace.toml INTEGRATION_BIDDER_ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" ARTIFACTS_DIR="$ARTIFACTS_DIR/trace" ./scripts/generate-integration-viceroy-configs.sh
+          INTEGRATION_APP_CONFIG_PATH=crates/trusted-server-integration-tests/fixtures/configs/trusted-server.trace-auth.toml ARTIFACTS_DIR="$ARTIFACTS_DIR/trace-auth" ./scripts/generate-integration-viceroy-configs.sh
         env:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
 
@@ -68,10 +71,10 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "true"
-          build-wasm: "false"
-          build-axum: "false"
-          build-test-images: "false"
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-axum: 'false'
+          build-test-images: 'false'
 
       - name: Download integration test artifacts
         uses: actions/download-artifact@v4
@@ -105,6 +108,7 @@ jobs:
           --target x86_64-unknown-linux-gnu
           -- --include-ignored
           --skip test_wordpress_fastly --skip test_nextjs_fastly
+          --skip trace_browser_workflow --skip trace_runtime_boundary
           --test-threads=1
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
@@ -127,9 +131,9 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "true"
-          build-wasm: "false"
-          build-test-images: "false"
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-test-images: 'false'
 
       - name: Download integration test artifacts
         uses: actions/download-artifact@v4
@@ -152,6 +156,83 @@ jobs:
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
 
+  trace-runtime-tests:
+    name: trace runtime and browser acceptance
+    needs: prepare-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up trace test runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-axum: 'false'
+          build-test-images: 'false'
+
+      - name: Download integration test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      - name: Restore runtime binaries and framework images
+        run: |
+          chmod +x "$AXUM_ARTIFACT_PATH"
+          mkdir -p crates/trusted-server-adapter-cloudflare/build
+          cp -r "$CF_BUILD_ARTIFACT_PATH/." crates/trusted-server-adapter-cloudflare/build/
+          docker load --input "$DOCKER_ARTIFACT_PATH"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-integration-tests/browser/package-lock.json
+            crates/trusted-server-js/lib/package-lock.json
+
+      - name: Install browser dependencies
+        run: |
+          npm ci --prefix crates/trusted-server-js/lib
+          npm ci --prefix crates/trusted-server-integration-tests/browser
+          cd crates/trusted-server-integration-tests/browser
+          npx playwright install --with-deps chromium
+          npm install -g wrangler@4.83.0
+
+      - name: Install the verified Spin runtime
+        run: |
+          trace_spin_dir="$RUNNER_TEMP/trace-spin"
+          mkdir -p "$trace_spin_dir"
+          curl --fail --location --silent --show-error https://github.com/spinframework/spin/releases/download/v4.0.0/spin-v4.0.0-linux-amd64.tar.gz --output "$trace_spin_dir/spin.tar.gz"
+          tar -xzf "$trace_spin_dir/spin.tar.gz" -C "$trace_spin_dir" spin
+          echo "$trace_spin_dir" >> "$GITHUB_PATH"
+
+      - name: Build the production Spin component
+        run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+      - name: Run trace acceptance against prepared runtimes
+        run: |
+          cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --test integration trace_runtime_boundary -- --ignored --test-threads=1 --nocapture
+          cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --target x86_64-unknown-linux-gnu --test integration trace_browser_workflow -- --ignored --test-threads=1 --nocapture
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
+          CLOUDFLARE_WRANGLER_DIR: ${{ github.workspace }}/crates/trusted-server-adapter-cloudflare
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+
+      - name: Upload trace browser evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-runtime-browser-evidence
+          path: crates/trusted-server-integration-tests/browser/test-results/trace-runtime-*/
+          retention-days: 7
+
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
@@ -165,9 +246,9 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          install-viceroy: "true"
-          build-wasm: "false"
-          build-test-images: "false"
+          install-viceroy: 'true'
+          build-wasm: 'false'
+          build-test-images: 'false'
 
       - name: Download integration test artifacts
         uses: actions/download-artifact@v4
@@ -204,6 +285,10 @@ jobs:
         working-directory: crates/trusted-server-integration-tests/browser
         run: node --test initial-render/pages.test.cjs
 
+      - name: Test trace fixture cleanup
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: node --test trace-fixture.test.cjs
+
       - name: Test initial render ownership
         working-directory: crates/trusted-server-integration-tests/browser
         # Let the runner build its Rubicon + Shared ID artifact; the bidder-only
@@ -225,6 +310,8 @@ jobs:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
+          TRACE_VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/trace/configs/viceroy.toml
+          TRACE_AUTH_VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/trace-auth/configs/viceroy.toml
           TEST_FRAMEWORK: nextjs
           PLAYWRIGHT_HTML_REPORT: playwright-report-nextjs
         run: npx playwright test
@@ -244,6 +331,8 @@ jobs:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
+          TRACE_VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/trace/configs/viceroy.toml
+          TRACE_AUTH_VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/trace-auth/configs/viceroy.toml
           TEST_FRAMEWORK: wordpress
           PLAYWRIGHT_HTML_REPORT: playwright-report-wordpress
         run: npx playwright test

@@ -22,10 +22,12 @@ use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{
     BidExt, BidTrustedServerExt, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt,
-    to_openrtb_i32,
+    TraceResponseExt, to_openrtb_i32,
 };
 use crate::platform::RuntimeServices;
+use crate::response_privacy::enforce_terminal_private_cache_privacy;
 use crate::settings::Settings;
+use crate::trace::{TraceAuctionCarry, TraceAuctionTransportV1, TraceClientSlotRefs};
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
@@ -177,7 +179,11 @@ pub fn convert_tsjs_to_auction_request(
 
     // Convert ad units to slots
     let mut slots = Vec::new();
-    for unit in &body.ad_units {
+    let trace_refs = req.extensions().get::<TraceClientSlotRefs>();
+    if let Some(refs) = trace_refs {
+        refs.begin_conversion();
+    }
+    for (input_index, unit) in body.ad_units.iter().enumerate() {
         if let Some(media_types) = &unit.media_types
             && let Some(banner) = &media_types.banner
         {
@@ -212,6 +218,9 @@ pub fn convert_tsjs_to_auction_request(
                 targeting: HashMap::new(),
                 bidders,
             });
+            if let Some(refs) = trace_refs {
+                refs.record_accepted(input_index);
+            }
         }
     }
 
@@ -348,6 +357,16 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     settings: &Settings,
     auction_request: &AuctionRequest,
     ec_allowed: bool,
+) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
+    convert_to_openrtb_response_with_trace(result, settings, auction_request, ec_allowed, None)
+}
+
+pub(crate) fn convert_to_openrtb_response_with_trace(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+    trace: Option<&TraceAuctionCarry>,
 ) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
     let rewrite_creatives = settings.auction.rewrite_creatives;
@@ -495,10 +514,20 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         .map(ProviderSummary::from)
         .collect();
 
+    let trusted_server = trace.map(|carry| {
+        carry.observe_delivery(&result.winning_bids, &delivery.delivered_winner_slots);
+        TraceResponseExt {
+            trace_auction: carry
+                .transport()
+                .unwrap_or_else(TraceAuctionTransportV1::unavailable),
+        }
+    });
+
     let response_body = OpenRtbResponse {
         id: Some(auction_request.id.to_string()),
         seatbid: seatbids,
         ext: ResponseExt {
+            trusted_server,
             orchestrator: OrchestratorExt {
                 strategy: strategy_name.to_string(),
                 providers: result.provider_responses.len(),
@@ -546,6 +575,10 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 .headers_mut()
                 .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
         }
+    }
+
+    if trace.is_some() {
+        enforce_terminal_private_cache_privacy(&mut response);
     }
 
     Ok(OpenRtbResponseConversion { response, delivery })
@@ -1919,6 +1952,166 @@ mod tests {
         assert!(bid.get("w").is_none(), "should omit out-of-range width");
         assert!(bid.get("h").is_none(), "should omit out-of-range height");
     }
+    mod trace_slot_conversion_api_transport_tests {
+        use super::*;
+        use crate::response_privacy::TerminalPrivateResponse;
+        use crate::trace::{TraceAuctionSource, TraceAuctionTerminalStatus, TraceProviderRole};
+
+        fn observed(request: &AuctionRequest, result: &OrchestrationResult) -> TraceAuctionCarry {
+            let carry = TraceAuctionCarry::capture_if_enabled(
+                true,
+                TraceAuctionSource::AuctionApi,
+                &request.slots,
+            )
+            .expect("should capture the active API auction");
+            for response in &result.provider_responses {
+                let call = carry.launch_provider(TraceProviderRole::Bidder);
+                carry.observe_response(call, response);
+            }
+            carry.finish(TraceAuctionTerminalStatus::Completed, None);
+            carry
+        }
+
+        #[test]
+        fn trace_slot_conversion_api_uses_actual_delivery_dispositions_and_preserves_bids() {
+            for deliverable in [false, true] {
+                let settings = make_settings();
+                let auction = make_auction_request();
+                let mut bid = make_bid("div-gpt-top", "private-bidder-sentinel", Some(1.0));
+                if !deliverable {
+                    bid.creative = None;
+                }
+                let result = make_result(bid);
+                let carry = observed(&auction, &result);
+                let token = carry.token();
+                let baseline = response_json(
+                    convert_to_openrtb_response(&result, &settings, &auction, false)
+                        .expect("should produce ordinary baseline bids"),
+                );
+
+                let conversion = convert_to_openrtb_response_with_trace(
+                    &result,
+                    &settings,
+                    &auction,
+                    false,
+                    Some(&carry),
+                )
+                .expect("should preserve ordinary response conversion");
+
+                assert_eq!(
+                    conversion
+                        .response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|header| header.to_str().ok()),
+                    Some("no-store, private"),
+                    "should make evidence-bearing API responses terminal-private"
+                );
+                assert!(
+                    conversion
+                        .response
+                        .extensions()
+                        .get::<TerminalPrivateResponse>()
+                        .is_some(),
+                    "should retain ordinary ads/identity finalization with terminal privacy"
+                );
+                let actual = response_json(conversion.response);
+                assert_eq!(
+                    actual["seatbid"], baseline["seatbid"],
+                    "should preserve actual bids and seats"
+                );
+                assert_eq!(
+                    actual["ext"]["orchestrator"], baseline["ext"]["orchestrator"],
+                    "should preserve existing orchestrator extension"
+                );
+                let transport = &actual["ext"]["trusted_server"]["trace_auction"];
+                assert_eq!(
+                    transport["evidence"]["diagnostic_auction_id"],
+                    token.as_str(),
+                    "should publish the original pre-dispatch token"
+                );
+                assert_eq!(
+                    transport["evidence"]["slots"][0]["candidate"],
+                    if deliverable {
+                        "selected"
+                    } else {
+                        "selected_unrenderable"
+                    },
+                    "should use the definitive conversion delivery set"
+                );
+                assert!(
+                    !transport.to_string().contains("private-bidder-sentinel"),
+                    "should exclude ordinary bidder identities from evidence"
+                );
+            }
+        }
+
+        #[test]
+        fn trace_slot_conversion_api_projection_failure_preserves_normal_bids() {
+            let settings = make_settings();
+            let mut auction = make_auction_request();
+            // The ordinary auction may retain its full work; only public trace
+            // omission-counter overflow fails the diagnostic projection.
+            auction.slots[0].formats = vec![
+                AdFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner
+                };
+                usize::from(u16::MAX) + 17
+            ];
+            let result = make_result(make_bid("div-gpt-top", "fictional-bidder", Some(1.0)));
+            let carry = observed(&auction, &result);
+            let baseline = response_json(
+                convert_to_openrtb_response(&result, &settings, &auction, false)
+                    .expect("should preserve ordinary bids without trace"),
+            );
+
+            let conversion = convert_to_openrtb_response_with_trace(
+                &result,
+                &settings,
+                &auction,
+                false,
+                Some(&carry),
+            )
+            .expect("should not fail bids on trace projection failure");
+
+            let actual = response_json(conversion.response);
+            assert_eq!(
+                actual["seatbid"], baseline["seatbid"],
+                "should preserve ordinary bids after bounded projection fails"
+            );
+            assert_eq!(
+                actual["ext"]["trusted_server"]["trace_auction"],
+                json!({"schema_version":1,"unavailable_reason":"evidence_projection_failed"}),
+                "should publish only the exact exclusive unavailable envelope"
+            );
+        }
+
+        #[test]
+        fn trace_slot_conversion_api_absent_gate_keeps_ordinary_response_and_headers() {
+            let settings = make_settings();
+            let auction = make_auction_request();
+            let result = make_empty_result();
+
+            let conversion =
+                convert_to_openrtb_response_with_trace(&result, &settings, &auction, false, None)
+                    .expect("should preserve trace-off conversion");
+
+            assert!(
+                !conversion
+                    .response
+                    .headers()
+                    .contains_key(header::CACHE_CONTROL),
+                "should not change ordinary cache policy when trace is absent"
+            );
+            let actual = response_json(conversion.response);
+            assert!(
+                actual["ext"].get("trusted_server").is_none(),
+                "should allocate no public trace member when the base gate is absent"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2099,5 +2292,174 @@ mod convert_tests {
             result.is_err(),
             "3-element banner size should return an error"
         );
+    }
+}
+
+#[cfg(test)]
+mod trace_slot_conversion_tests {
+    use super::*;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::create_test_settings;
+    use crate::trace::{TraceClientSlotRefs, TraceSlotRef};
+    use serde_json::json;
+
+    const FIRST: &str = "ts-slot-00000000-0000-4000-8000-000000000001";
+    const SECOND: &str = "ts-slot-00000000-0000-4000-8000-000000000002";
+
+    fn convert(raw: &[u8]) -> (AuctionRequest, Vec<Option<TraceSlotRef>>) {
+        let body: AdRequest =
+            serde_json::from_slice(raw).expect("should preserve ordinary request acceptance");
+        let settings = create_test_settings();
+        let services = noop_services();
+        let mut request = Request::new(EdgeBody::empty());
+        let baseline = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &request,
+            ConsentContext::default(),
+            None,
+            None,
+        )
+        .expect("should accept the ordinary request");
+        let refs = TraceClientSlotRefs::from_raw(raw);
+        request.extensions_mut().insert(refs.clone());
+
+        let converted = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &request,
+            ConsentContext::default(),
+            None,
+            None,
+        )
+        .expect("should not reject optional trace input");
+
+        assert_eq!(
+            serde_json::to_value(&converted.slots).expect("should serialize converted slots"),
+            serde_json::to_value(&baseline.slots).expect("should serialize baseline slots"),
+            "should keep ordinary slot acceptance, ordering, formats and bidder params"
+        );
+        let accepted = refs
+            .accepted_refs()
+            .expect("should retain request-local occurrence observations");
+        assert_eq!(
+            accepted.len(),
+            converted.slots.len(),
+            "should bind in the exact accepted slots.push branch"
+        );
+        (converted, accepted)
+    }
+
+    #[test]
+    fn trace_slot_conversion_follows_accepted_occurrences_after_filtering_and_grouping() {
+        let raw = serde_json::to_vec(&json!({"adUnits":[
+            {"code":"filtered","mediaTypes":{"video":{}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}},
+            {"code":"duplicate-code","mediaTypes":{"banner":{"sizes":[[300,250]]}},"bids":[{"bidder":"fictional-a","params":{"zone":1}},{"bidder":"fictional-b","params":{"zone":2}}],"ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
+            {"code":"filtered-again","ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
+            {"code":"duplicate-code","mediaTypes":{"banner":{"sizes":[]}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}}
+        ]})).expect("should serialize final grouped units");
+
+        let (auction, refs) = convert(&raw);
+
+        assert_eq!(
+            auction.slots.len(),
+            2,
+            "should keep only accepted banner occurrences"
+        );
+        assert_eq!(
+            auction.slots[0].bidders.len(),
+            2,
+            "should preserve grouping of ordinary bidder params"
+        );
+        assert_eq!(
+            refs,
+            vec![
+                Some(TraceSlotRef::parse(FIRST).expect("should parse the first client ref")),
+                Some(TraceSlotRef::parse(SECOND).expect("should parse the second client ref"))
+            ],
+            "should use exact accepted source occurrences despite duplicate ordinary keys"
+        );
+    }
+
+    #[test]
+    fn trace_slot_conversion_malformed_optional_shapes_preserve_ordinary_acceptance() {
+        for ext in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("private-string"),
+            json!([]),
+            json!({}),
+            json!({"trusted_server":null}),
+            json!({"trusted_server":true}),
+            json!({"trusted_server":[]}),
+            json!({"trusted_server":"private-string"}),
+            json!({"trusted_server":{"trace_slot_ref":null}}),
+            json!({"trusted_server":{"trace_slot_ref":42}}),
+            json!({"trusted_server":{"trace_slot_ref":true}}),
+            json!({"trusted_server":{"trace_slot_ref":{}}}),
+            json!({"trusted_server":{"trace_slot_ref":[]}}),
+            json!({"trusted_server":{"trace_slot_ref":format!(" {FIRST}")}}),
+        ] {
+            let raw = serde_json::to_vec(&json!({"adUnits":[{"code":"example-slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":ext}]})).expect("should serialize a malformed optional extension");
+            let (_, refs) = convert(&raw);
+            assert_eq!(
+                refs,
+                vec![None],
+                "should decline only optional association for malformed input"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_slot_conversion_oversized_optional_number_declines_only_one_occurrence() {
+        // This numeric JSON literal cannot be represented by json! or Value.
+        for ext in [
+            r#"1e999"#,
+            r#"{"trusted_server":1e999}"#,
+            r#"{"trusted_server":{"trace_slot_ref":1e999}}"#,
+        ] {
+            let raw = format!(
+                r#"{{"adUnits":[{{"code":"first","mediaTypes":{{"banner":{{"sizes":[[300,250]]}}}},"ext":{{"trusted_server":{{"trace_slot_ref":"{FIRST}"}}}}}},{{"code":"invalid","mediaTypes":{{"banner":{{"sizes":[[300,250]]}}}},"ext":{ext}}},{{"code":"last","mediaTypes":{{"banner":{{"sizes":[[300,250]]}}}},"ext":{{"trusted_server":{{"trace_slot_ref":"{SECOND}"}}}}}}]}}"#
+            );
+            let (_, refs) = convert(raw.as_bytes());
+            assert_eq!(
+                refs,
+                vec![
+                    Some(TraceSlotRef::parse(FIRST).expect("should parse first ref")),
+                    None,
+                    Some(TraceSlotRef::parse(SECOND).expect("should parse last ref"))
+                ],
+                "should isolate malformed optional numeric association to its source occurrence"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_slot_conversion_duplicate_members_decline_only_the_affected_occurrence() {
+        // Duplicate object members cannot be expressed by json! or Value.
+        for ext in [
+            r#""ext":{"trusted_server":{"trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001"}},"ext":{"trusted_server":{"trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001"}}"#,
+            r#""ext":{"trusted_server":{"trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001"},"trusted_server":{"trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001"}}"#,
+            r#""ext":{"trusted_server":{"trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001","trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001"}}"#,
+            r#""ext":{"trusted_server":{"trace_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001","\u0074race_slot_ref":"ts-slot-00000000-0000-4000-8000-000000000001"}}"#,
+        ] {
+            let raw = format!(
+                r#"{{"adUnits":[{{"code":"example-slot","mediaTypes":{{"banner":{{"sizes":[[300,250]]}}}},{ext}}},{{"code":"other-slot","mediaTypes":{{"banner":{{"sizes":[[300,250]]}}}},"ext":{{"trusted_server":{{"trace_slot_ref":"{SECOND}"}}}}}}]}}"#
+            );
+            let (_, refs) = convert(raw.as_bytes());
+            assert_eq!(
+                refs,
+                vec![
+                    None,
+                    Some(
+                        TraceSlotRef::parse(SECOND).expect("should retain the unrelated valid ref")
+                    )
+                ],
+                "should detect decoded duplicate members without rejecting or poisoning other units"
+            );
+        }
     }
 }

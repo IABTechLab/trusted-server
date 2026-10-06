@@ -6,6 +6,8 @@ export type {
   GptDiagnosticsRequestCycle,
   TsjsApi,
 } from './types';
+import { installTraceRuntime } from '../trace/runtime';
+
 import type { TsjsApi } from './types';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';
@@ -44,6 +46,7 @@ api.adSlots ??= [];
 api.bids ??= {};
 // Point global tsjs
 w.tsjs = api;
+installTraceRuntime(api, w);
 
 // Single shared queue
 installQueue(api, w);

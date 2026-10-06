@@ -629,9 +629,11 @@ gam_attribution_enabled = false
 
 # GPT runtime diagnostics browser overlay. Optional and enabled manually (not
 # flipped by `ts audit`); serves a diagnostics module gated behind an activation
-# query param + session cookie.
+# query param + host-only cookie. Explicit activation lasts 30 minutes;
+# ordinary requests do not extend it. Mobile trace remains off by default.
 # [integrations.gpt_diagnostics]
 # enabled = true
+# trace_page_enabled = false
 
 # APS browser renderer ownership. Server-side APS behavior belongs under an
 # [auction.providers] entry with profile = "aps".

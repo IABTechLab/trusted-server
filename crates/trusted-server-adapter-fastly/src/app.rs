@@ -125,7 +125,7 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformGeo as _, PlatformKvStore, RuntimeServices, StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -143,6 +143,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -1287,6 +1288,10 @@ impl TrustedServerApp {
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+                Arc::clone(&state.settings),
+                Arc::new(trace_metadata),
+            )))
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
                 Arc::new(FastlyPlatformGeo),
@@ -1324,6 +1329,26 @@ impl TrustedServerApp {
 
         router.build()
     }
+}
+
+fn trace_metadata(request: &Request) -> TraceMetadata {
+    let client_info = request
+        .extensions()
+        .get::<ClientInfo>()
+        .cloned()
+        .unwrap_or_else(|| ClientInfo {
+            client_ip: FastlyRequestContext::get(request).and_then(|context| context.client_ip),
+            ..ClientInfo::default()
+        });
+    let geo = client_info.client_ip.and_then(|client_ip| {
+        FastlyPlatformGeo
+            .lookup(Some(client_ip))
+            .unwrap_or_else(|_| {
+                log::warn!("trace_geo_unavailable");
+                None
+            })
+    });
+    TraceMetadata { client_info, geo }
 }
 
 impl Hooks for TrustedServerApp {
@@ -1656,6 +1681,139 @@ mod tests {
     /// [`RequestFilterInput`], so a test can assert the entry-point-captured
     /// bot-protection metadata reaches integration filters like `DataDome`.
     struct ClientInfoCapturingFilter(Arc<Mutex<Option<ClientInfo>>>);
+
+    struct TraceCountingKv(Arc<AtomicUsize>);
+
+    impl TraceCountingKv {
+        fn unavailable(&self) -> edgezero_core::key_value_store::KvError {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            edgezero_core::key_value_store::KvError::Unavailable
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformKvStore for TraceCountingKv {
+        async fn get_bytes(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Bytes>, edgezero_core::key_value_store::KvError> {
+            Err(self.unavailable())
+        }
+        async fn put_bytes(
+            &self,
+            _key: &str,
+            _value: Bytes,
+        ) -> Result<(), edgezero_core::key_value_store::KvError> {
+            Err(self.unavailable())
+        }
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), edgezero_core::key_value_store::KvError> {
+            Err(self.unavailable())
+        }
+        async fn delete(&self, _key: &str) -> Result<(), edgezero_core::key_value_store::KvError> {
+            Err(self.unavailable())
+        }
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<edgezero_core::key_value_store::KvPage, edgezero_core::key_value_store::KvError>
+        {
+            Err(self.unavailable())
+        }
+    }
+
+    struct TraceCountingTelemetry(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait(?Send)]
+    impl trusted_server_core::auction::AuctionTelemetrySink for TraceCountingTelemetry {
+        fn is_enabled(&self) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        async fn emit_auction_events(
+            &self,
+            _services: &RuntimeServices,
+            _batch: trusted_server_core::auction::AuctionEventBatch,
+        ) -> Result<(), Report<TrustedServerError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trace_dispatch_bypasses_fastly_identity_filters_and_telemetry() {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should configure trace");
+        let mut state = build_state_from_settings(settings).expect("should build trace state");
+        let kv = Arc::new(AtomicUsize::new(0));
+        let telemetry = Arc::new(AtomicUsize::new(0));
+        let filter = Arc::new(Mutex::new(None));
+        let mutable = Arc::get_mut(&mut state)
+            .expect("should retain unique test state before router construction");
+        mutable.default_kv_store = Arc::new(TraceCountingKv(Arc::clone(&kv)));
+        mutable.auction_telemetry_sink = Arc::new(TraceCountingTelemetry(Arc::clone(&telemetry)));
+        mutable.registry = Arc::new(IntegrationRegistry::from_request_filters(vec![Arc::new(
+            ClientInfoCapturingFilter(Arc::clone(&filter)),
+        )]));
+        let router = TrustedServerApp::routes_for_state(&state);
+        for (method, path, status) in [
+            (Method::GET, "/_ts/trace/state", StatusCode::OK),
+            (Method::GET, "/_ts/trace", StatusCode::OK),
+            (Method::GET, "/_ts/trace/assets/v1.js", StatusCode::OK),
+            (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
+            (Method::PATCH, "/_ts/trace", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let response = route(&router, empty_request(method, path));
+            assert_eq!(
+                response.status(),
+                status,
+                "should serve trace through the terminal dispatcher"
+            );
+            assert!(
+                response
+                    .extensions()
+                    .get::<RequestFilterEffects>()
+                    .is_none(),
+                "should not assemble ordinary filter effects"
+            );
+            assert!(
+                response
+                    .extensions()
+                    .get::<super::EcFinalizeState>()
+                    .is_none(),
+                "should not enter identity finalization"
+            );
+        }
+        assert_eq!(
+            kv.load(Ordering::SeqCst),
+            0,
+            "should never touch identity KV for trace"
+        );
+        assert_eq!(
+            telemetry.load(Ordering::SeqCst),
+            0,
+            "should never inspect or emit auction telemetry for trace"
+        );
+        assert!(
+            filter
+                .lock()
+                .expect("should inspect filter counter")
+                .is_none(),
+            "should never run integration request filters for trace"
+        );
+    }
 
     #[async_trait::async_trait(?Send)]
     impl IntegrationRequestFilter for ClientInfoCapturingFilter {
@@ -3344,6 +3502,117 @@ mod tests {
         assert!(
             !recovery_eligible_of(&response),
             "an origin-start failure must not authorize orphan recovery"
+        );
+    }
+}
+#[cfg(test)]
+mod trace_dispatch_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use trusted_server_core::trace::TraceTerminalResponse;
+
+    fn router(enabled: bool) -> RouterService {
+        let settings = Settings::from_toml(&format!(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "example-user"
+            password = "example-password"
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret"
+            [ec]
+            passphrase = "fictional-passphrase-at-least-32-bytes"
+            [request_signing]
+            enabled = false
+            config_store_id = "fictional-config"
+            secret_store_id = "fictional-secrets"
+            [integrations.gpt_diagnostics]
+            enabled = true
+            trace_page_enabled = {enabled}
+        "#
+        ))
+        .expect("should parse trace settings");
+        TrustedServerApp::routes_for_state(
+            &build_state_from_settings(settings).expect("should build Fastly state"),
+        )
+    }
+
+    #[test]
+    fn trace_dispatch_reserves_all_methods_before_ordinary_lifecycle() {
+        let router = router(true);
+        for (method, path, status) in [
+            (Method::GET, "/_ts/trace/state", StatusCode::OK),
+            (Method::HEAD, "/_ts/trace", StatusCode::OK),
+            (Method::GET, "/_ts/trace/assets/v1.js", StatusCode::OK),
+            (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
+            (
+                Method::PATCH,
+                "/_ts/trace/state",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::from_bytes(b"EXAMPLE-METHOD").expect("should parse extension method"),
+                "/_ts/trace",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (Method::GET, "/_ts/trace/extra", StatusCode::NOT_FOUND),
+            (Method::GET, "/%5Fts/trace", StatusCode::BAD_REQUEST),
+        ] {
+            let head = method == Method::HEAD;
+            let request = edgezero_core::http::request_builder()
+                .method(method)
+                .uri(format!("https://publisher.example.com{path}"))
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build trace request");
+            let response =
+                block_on(router.oneshot(request)).expect("should return local trace policy");
+            assert_eq!(response.status(), status, "should bypass ordinary dispatch");
+            assert!(
+                response
+                    .extensions()
+                    .get::<TraceTerminalResponse>()
+                    .is_some(),
+                "should mark terminal trace responses"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should never manufacture a mutation"
+            );
+            if head {
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer HEAD")
+                        .len(),
+                    0,
+                    "should remove HEAD bodies"
+                );
+            }
+        }
+        let response = block_on(
+            self::router(false).oneshot(
+                edgezero_core::http::request_builder()
+                    .uri("/_ts/trace/state")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build disabled request"),
+            ),
+        )
+        .expect("should reserve disabled namespace");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should hide disabled feature"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_some(),
+            "should harden disabled feature"
         );
     }
 }

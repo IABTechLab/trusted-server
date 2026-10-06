@@ -1598,9 +1598,18 @@ See [GPT](/guide/integrations/gpt).
 
 **Section**: `[integrations.gpt_diagnostics]`
 
-The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
-the standalone diagnostics tag is available, but individual browser sessions
-still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+Both fields default to `false`:
+
+| Field                | Type    | Contract                                                         |
+| -------------------- | ------- | ---------------------------------------------------------------- |
+| `enabled`            | Boolean | Make the GPT diagnostics module available for activated sessions |
+| `trace_page_enabled` | Boolean | Enable the mobile trace endpoint; requires `enabled = true`      |
+
+Individual browser sessions still require the activation flow in
+[GPT diagnostics](/guide/integrations/gpt-diagnostics). The mobile endpoint does
+not activate tracing on a GET. Before enabling it, accept the documented
+same-origin visibility and privacy implications of cookie health, masked network
+facts and browser-carried auction evidence.
 
 ### JS Asset Proxy Integration
 

@@ -1,6 +1,14 @@
 # Mobile Ad-Rendering Trace Endpoint Design
 
-**Status:** Proposed
+**Status:** Approved, including runtime-boundary amendment (2026-10-05)
+
+**Runtime-boundary amendment:** Version one evaluates the method, pathname,
+headers and body exposed at application dispatch. It does not require recovery
+of information discarded by an SDK/runtime or application responses to requests
+rejected before dispatch. Cookie ambiguity suppresses trace capture under the
+explicit rules in section 9.2. See section 8 for response scope and section 16
+for acceptance tests. This amends the original-path and original-wire promises;
+authentication, deliberate actions and response privacy remain required.
 
 **Issue:** [#1050 — Create debug endpoint for mobile user to trace ad rendering](https://github.com/IABTechLab/trusted-server/issues/1050)
 
@@ -163,7 +171,10 @@ to adopt the new lifetime. Cookie expiry also does not unload a running page
 or clear an existing report; report expiry is defined separately in section 9.5.
 
 The base trace gate requires both `trace_page_enabled = true` and exactly one
-valid incoming diagnostics cookie, inspected before cookie sanitation.
+valid incoming diagnostics cookie, inspected from frozen runtime-visible
+fields before cookie sanitation under section 9.2. An unavailable result,
+including `runtime_header_ambiguous`, keeps this gate false. Unknown or missing
+fidelity metadata alone does not invalidate a readable marker-free cookie.
 Publisher-document tracing additionally requires the existing effective
 `GptDiagnosticsRequestDecision.active` decision. Query disable or invalid
 directives, prefetches, bots, and other ineligible navigations therefore
@@ -418,12 +429,15 @@ Report GET /_ts/trace
 - Convert `ClientInfo` and available geo data into the public network allowlist.
 - Inject request context only into an active private diagnostics document.
 - Apply response privacy and security headers.
-- Ensure trace requests never reach the publisher origin.
+- Ensure requests classified within the application-visible trace namespace
+  never reach the publisher origin, including visible rejected aliases.
 
 ### 7.2 Adapter responsibilities
 
 - Invoke the reserved-route classifier at the earliest adapter dispatch point
-  with exact path and method handling.
+  with exact application-visible path and method handling. Runtime/SDK
+  normalization before this point is not reconstructed; original-target
+  metadata is optional and does not govern a second route or auth policy.
 - Populate optional `ClientInfo` fields available on the platform.
 - Fastly may supply bounded POP, HTTP version, TLS, and edge-server data when
   the SDK exposes them. JA4 and H2 fingerprints are excluded from version one.
@@ -451,6 +465,38 @@ Report GET /_ts/trace
 - Never upload diagnostic data or issue a telemetry query.
 
 ## 8. Route and configuration contract
+
+The version-one boundary is the request exposed by the runtime/SDK and
+successfully converted for application dispatch, before ordinary routing and
+middleware. Apply path classification to `Request::uri().path()` at that
+boundary, before additional Trusted Server normalization. Apply cookie
+inspection to the frozen incoming core headers, before sanitation. Distinguish
+three outcomes in tests and deployment evidence:
+
+| Outcome                                                                       | Version-one guarantee                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime rejects before application invocation                                 | No Trusted Server handler runs. Record runtime rejection separately; do not claim a local trace status, authentication challenge, `Allow` or hardening headers.                                       |
+| Runtime delivers but adapter bootstrap/conversion fails before trace dispatch | Preserve existing adapter failure behavior and record it separately. No successful trace action or capture is claimed; these failures must not perform trace-specific cookie writes or mint evidence. |
+| Conversion succeeds and trace dispatch runs                                   | Enforce this spec's authentication, method/action validation, local-response, privacy and no-publisher-fallback contracts against application-visible facts, including transformed facts.             |
+
+Normal accepted browser requests on a suitable same-origin deployment must
+support the complete workflow on Fastly, Axum, Cloudflare and Spin. The browser
+must permit the required Secure host-only cookie; plain HTTP development must
+not weaken its attributes or invent a trusted HTTPS scheme. Record an unsuitable
+test origin separately rather than claiming a passing browser journey.
+An unsupported malformed-wire case does not
+justify disabling an adapter's normal trace journey. Conversely, accepting a
+runtime rejection in the evidence does not prove a successful browser journey.
+Existing adapter startup/config/store initialization and body buffering remain
+outside the pre-dispatch hook; no new transport allocation/deadline promise is
+introduced. A deliberately broken converter is not a compliant normal path.
+
+Original target spelling and original header octets/counts may already be
+unavailable. Recovery is not a v1 prerequisite. `RequestIngress.target()` is
+optional capability evidence, never a second route/auth interpretation; a
+missing snapshot or whole-target capture cap does not invalidate an inspectable
+pathname. Trusted canonical origin for actions still comes from the adapter's
+validated `RequestIngress.origin()`, never from forwarded-header fallbacks.
 
 Add an explicit default-off option to the existing integration:
 
@@ -547,7 +593,8 @@ Rules (route responses below apply after configured authentication):
   the single parsed `Origin` header are serialized with lowercase host and
   default ports removed before exact comparison. Invalid or multi-valued host,
   authority, scheme, or origin input fails closed.
-- Unsupported methods on a shell or state-changing path return a local 405
+- Unsupported application-visible methods on shell/state/assets or a
+  state-changing path return a local 405
   Method Not Allowed response with the path-specific `Allow` header:
   `GET, HEAD` for shell/state/assets and `POST` for enable/end. Classification
   must intercept unsupported methods before router dispatch. The router's
@@ -556,27 +603,38 @@ Rules (route responses below apply after configured authentication):
   `dispatch_unregistered_method_returns_405_at_router_level` in the Fastly
   adapter. The trace responder itself supplies `Allow` and all section 12.3
   error-response hardening; it must not rely on router-generated errors.
+  If the runtime rejects a method before invocation, record that outcome as
+  runtime rejection instead of claiming an application-generated 405.
   Fastly entry-point finalization can add ordinary headers later, but does not
   establish this trace-specific contract on behalf of the router.
 - Disabled deployments return a local `404` for the complete trace route set,
   including assets, and never fall through to the publisher origin.
 - The `/_ts/trace` namespace is reserved. A trailing slash, extra path segment,
   unsupported asset name, repeated separator, or lookalike beneath that
-  namespace returns a local `404`; an encoded separator or ambiguous dot
-  segment returns a local `400`. None falls through to the publisher origin.
-  The adapter classifies from its canonical parsed path while retaining enough
-  raw-path information to reject ambiguous encodings consistently.
+  namespace returns a local `404`; an encoded namespace alias, encoded
+  separator, or ambiguous dot segment still visible at dispatch returns a
+  local `400` after authentication and the enabled-feature check. None of these
+  application-visible reserved requests falls through to the publisher origin.
+  Bounded percent-decoding identifies encoded aliases for rejection only; it
+  never turns an alias into a supported route or permits a trace action.
+  A path normalized by the runtime/SDK outside this namespace is ordinary
+  traffic, even if its unavailable original spelling mentioned trace. For
+  example, a Fastly request normalized to `/health` or `/_ts/debug/ja4` follows
+  that path's existing behavior, including its existing auth limitations.
+  A path normalized into an exact trace route must receive the full trace
+  authentication and validation contract. Additional original-target metadata
+  does not impose different v1 behavior on otherwise identical visible paths.
 
 Reuse the bounded percent-decode-to-fixed-point classification pattern from
 `deny_admin_diagnostic_fallback` in `crates/trusted-server-core/src/ec/admin.rs`
 (`MAX_PERCENT_DECODE_ROUNDS = 4`), moving trace classification before dispatch
 rather than relying on fallback. Register and intercept trace paths on Fastly,
-Axum, Cloudflare, and Spin from the first implementation PR; existing Fastly-only
+Axum, Cloudflare, and Spin from the first implementation phase; existing Fastly-only
 `/_ts/*` routes are not a parity precedent.
 
 Every adapter implements the following order:
 
-1. Parse the method, canonical host/origin, path, query, and bounded headers
+1. Read the application-visible method, trusted host/origin, path, query, and bounded headers
    required for route safety.
 2. Classify an exact Trusted Server reserved path.
 3. For a trace path, enforce the existing configured Basic Authentication
@@ -588,6 +646,13 @@ Every adapter implements the following order:
    read-only platform geo lookup, and terminate locally. This applies to the
    entire reserved namespace, assets, unsupported methods, and disabled routes;
    the route statuses below authentication are never an auth exemption.
+   Preserve existing first-match `Settings::handler_for_path(req.uri().path())`
+   selection. Do not decode the path again for authentication or combine rules
+   selected from alternative spellings. An encoded namespace alias such as
+   `/%5Fts/trace` is rejected, never served: a matching `^/` rule challenges it
+   first, while a `^/_ts` rule that does not match its visible spelling does not
+   create a challenge and the alias receives the hardened path error. This
+   grants neither setup data nor a trace action.
 4. For all other paths, continue through the adapter's ordinary event context,
    authentication, request filters, geo enrichment, EC/EID processing, named
    routes, auction handling, telemetry, and publisher fallback.
@@ -685,33 +750,61 @@ CookieHealth
     valid_ec_format | valid_eids_format | valid_tester_value
     | valid_diagnostics_value | malformed | oversized
     | unsupported_value | multiple_values
-    | header_too_large | header_not_utf8
+    | header_too_large | header_not_utf8 | runtime_header_ambiguous
 ```
 
 Details describe shape, never value. `absent` has no detail; `duplicate` uses
-`multiple_values`; `unavailable` uses `header_too_large` or `header_not_utf8`;
+`multiple_values`; `unavailable` uses `header_too_large`, `header_not_utf8`,
+or `runtime_header_ambiguous`;
 and a valid state uses its cookie-specific valid detail.
 
 The classifier uses this deterministic contract:
 
-- Inspect all `Cookie` header fields in wire order, up to a combined 16 KiB.
-  Exceeding the cap or encountering any non-UTF-8 header makes all four states
-  `unavailable`; no partial result is presented as authoritative.
+- Inspect all incoming runtime-visible `Cookie` fields, measuring a combined
+  16 KiB as the sum of their `HeaderValue::as_bytes().len()` values. Include
+  runtime-added separators; exactly 16,384 bytes is within the cap. This is a
+  visible-field bound, not a guarantee about discarded original bytes.
+- Apply aggregate failures in this fixed precedence: above the cap gives
+  `unavailable/header_too_large`; otherwise any actual invalid UTF-8 gives
+  `unavailable/header_not_utf8`; otherwise the ambiguity rules below give
+  `unavailable/runtime_header_ambiguous`. Each aggregate failure applies to
+  all four cookie states and prevents trace activation. Check the complete
+  bounded collection before presenting cookie-specific results. Decode with
+  `str::from_utf8(value.as_bytes())`, not `HeaderValue::to_str()`, which rejects
+  some valid non-ASCII UTF-8.
+- Read Cookie-specific fidelity with `RequestIngress::header_fidelity(&COOKIE)`.
+  When octets are not `Preserved`, any Unicode replacement character U+FFFD
+  anywhere in any Cookie field is ambiguous. When field multiplicity is not
+  `Preserved`, any literal comma anywhere in any Cookie field is ambiguous,
+  including unrelated or quoted values. Never comma-split, recover guessed
+  field counts, or select a valid-looking session from part of a folded field.
+  Apply these fallbacks to `Unknown`, `Transformed`, `Unavailable` and missing
+  metadata alike; never select them by platform name. A non-preserved status
+  alone does not reject readable marker-free fields. Same-name/global field
+  order is unnecessary for exact occurrence counting and duplicate precedence.
+- This deliberately treats original valid EF BF BD and runtime replacement of
+  invalid FF as the same ambiguity when preservation is unproved, rather than
+  falsely labeling valid UTF-8 `header_not_utf8`. If the applicable axis is
+  explicitly `Preserved`, its marker proceeds through the ordinary grammar;
+  a comma is never a field separator and canonical value validators still
+  apply. The per-name axes are independent. These rules cannot detect original
+  information erased without a visible marker, and make no such promise.
 - Split each readable header on semicolons and trim optional ASCII whitespace.
   A valid pair contains a non-empty RFC 6265 token name, one `=`, and the
   remaining bytes as its value; additional `=` bytes belong to the value. Empty
   segments and malformed pairs with an unrelated name are ignored. A segment
   with no `=` counts as one malformed reserved occurrence only when its first
   whitespace-delimited token is exactly a reserved name; a name such as
-  `ts-ec-extra` remains unrelated. No malformed unrelated pair poisons a
-  reserved-cookie result.
+  `ts-ec-extra` remains unrelated. After the aggregate size, UTF-8 and ambiguity
+  checks above, no malformed unrelated pair poisons a reserved-cookie result.
 - Count exact, case-sensitive reserved names before passing values to existing
   parsers. Zero occurrences is `absent`; more than one is `duplicate`,
   regardless of whether one value would otherwise be valid. Duplicate
   precedence is therefore diagnostic rather than first- or last-value
   selection.
 - Per-value limits are 512 bytes for `ts-ec`, 8 KiB for `ts-eids`, and 16 bytes
-  each for `ts-tester` and `__Host-ts-console`. Only the 8 KiB EID limit is
+  each for `ts-tester` and `__Host-ts-console`, measured in visible UTF-8 bytes.
+  Only the 8 KiB EID limit is
   inherited (`MAX_EIDS_COOKIE_BYTES` in `ec/prebid_eids.rs`); the other limits
   are new trace-inspection bounds. The 512-byte EC limit is an outer guard,
   above the exact 71-character format accepted by `is_valid_ec_id` in
@@ -728,12 +821,33 @@ The classifier uses this deterministic contract:
   details `malformed`, `oversized`, or `unsupported_value`. Parser error text
   and the value itself never enter the report or logs.
 
-The parser inspects the incoming request before diagnostics-cookie sanitation,
+The parser freezes incoming runtime-visible facts before diagnostics-cookie sanitation,
 while preserving existing authoritative-cookie and consent semantics. It must
 scan without using the current lossy `CookieJar` representation, which skips
 malformed pairs and cannot preserve duplicate evidence. Inspection is
 read-only: it must not generate an EC, touch the identity graph, sync partner
 IDs, or extend any cookie lifetime.
+
+State observation and capture eligibility both use this same frozen result:
+exactly one `present_valid/valid_diagnostics_value` session is active; absent,
+invalid, duplicate or unavailable is inactive. Never reread sanitized cookies.
+Cookie ambiguity does not change the deliberate enable/end action policy:
+valid authenticated same-origin empty-body actions may request a cookie write
+or clear, and a separate state request must observe the result. End remains
+available when cookies are ambiguous. Ambiguity may leave activation
+unconfirmed; the UI must not claim cookie absence or successful browser storage.
+Do not change ordinary EC/EID, consent or existing TS Console behavior because
+trace inspection was unavailable.
+
+Add `runtime_header_ambiguous` to the exact Rust/TypeScript cookie detail enums,
+setup/context/report validators and storage/export fixtures. It is allowed only
+with `unavailable`; unknown details and invalid state/detail pairs still reject.
+Render a plain explanation that the runtime-visible cookies could not be
+reliably inspected. Retain the same reason in download/copy/share and direct
+storage-failure export. Never expose fidelity metadata, raw values or parser
+errors. Existing report versions and byte/depth/string bounds remain unchanged;
+include the new detail in worst-case size fixtures before the unpublished v1
+assets are frozen.
 
 Only those four Trusted Server-owned cookie names are reported. Arbitrary
 cookie names and values are excluded. The endpoint cannot claim knowledge of
@@ -962,6 +1076,14 @@ telemetry and OpenRTB objects:
   called, timed out, or returned no bid for a particular slot. Only returned
   bids can contribute to a slot's `returned_bid_count`; the fixed coverage
   value makes the missing provider-to-slot no-bid relation explicit.
+- A slot's `returned_bid_count` counts actual returned bid records whose
+  ordinary internal routing key matches that accepted slot. Accepted slots with
+  duplicate routing keys retain distinct ordinals and opaque refs, but share
+  that observed count. These counts are non-disjoint and must not be summed as
+  unique bids. When existing winner/delivery data cannot distinguish those
+  accepted instances, their candidate is `unknown` and
+  `selected_creative_size` is omitted. No internal routing key is exposed and
+  no instance-specific winner or GPT association is inferred.
 - `total_time_ms` and `response_time_ms` use the server's auction-local monotonic
   durations. They are not request-relative milestones and are never
   arithmetically combined with browser timestamps.
@@ -1273,7 +1395,13 @@ characters or bidirectional override/isolate controls. This applies to browser
 source fields as well as platform fields and precedes rendering or export.
 
 The snapshot builder creates a new field-by-field projection and rejects an
-invalid source value rather than stringifying it. Server auctions are already
+invalid value consumed by that public projection rather than stringifying it.
+Source containers must have the exact current keys and own data properties;
+unknown fields and accessors are rejected. Contents explicitly excluded in
+section 9.3 are never accepted, copied, traversed or validated. The required
+source `page.pathname` is checked only as an own string property before literal
+replacement; its contents and raw length never enter the report.
+Server auctions are already
 bounded by core; the browser rejects an invalid inner model rather than
 truncating it. The builder retains the newest 16 server auctions in observation
 order, the newest 128 correlations in recorder emission order, and only the
@@ -1460,7 +1588,8 @@ event, user identity, or security incident.
 
 ### 12.3 Response hardening
 
-The HTML shell, enable/end responses, every active diagnostic publisher
+For application-generated trace handling within section 8's boundary, the
+HTML shell, enable/end responses, every active diagnostic publisher
 response, and every dynamic page-bids or `/auction` response carrying trace
 evidence are terminally `private, no-store`. The fixed versioned JS/CSS assets
 are the sole exception and may be publicly cached because they contain no
@@ -1557,20 +1686,31 @@ shell or actions.
 
 ## 13. Failure handling
 
+Local status/hardening rules below apply to application-visible trace handling
+as defined in section 8; earlier runtime and adapter failures are separate.
+
 - Configured authentication failure: local private/no-store `401` challenge
   before trace handling, including on disabled routes.
 - Disabled route after authentication: local privacy-safe `404`.
 - Unsupported method: local `405`; never publisher fallback.
+- Runtime rejects before invocation, or adapter bootstrap/conversion fails
+  before trace dispatch: record the separate outcome defined in section 8;
+  do not invent a local hardened trace response or cookie-health report.
 - Reserved-namespace path that is a trailing slash, extra segment, unsupported
   asset name, repeated separator, or lookalike: local `404`; an encoded
-  separator or ambiguous dot segment: local `400`. Never publisher fallback.
+  namespace alias, encoded separator, or ambiguous dot segment still visible
+  at dispatch: local `400` after authentication and the enabled-feature check.
+  Never publisher fallback for a classified reserved request. A runtime-normalized
+  path outside the namespace retains ordinary behavior.
 - Non-empty or unreadable activation/end body: local `413` for any body bytes,
   positive/invalid `Content-Length`, or `Transfer-Encoding`, and local `400`
   for a stream read error, both with no cookie mutation.
 - Rejected activation/end POST: local `403` with no state mutation.
 - Optional platform fact unavailable: omit the field and continue.
 - Bounded cookie inspection failure: report the contract-defined invalid or
-  unavailable state without a value or parser message.
+  unavailable state without a value or parser message. Runtime ambiguity uses
+  `runtime_header_ambiguous`, disables trace capture and leaves ordinary
+  advertising/console behavior intact; valid end actions remain available.
 - Diagnostics context serialization failure: omit the context, log a bounded
   server error, and preserve publisher delivery.
 - Server-auction evidence construction or serialization failure: omit only the
@@ -1661,6 +1801,12 @@ results, never a prerequisite for returning them.
 - Cookie-health scanner covers multiple header fields; zero, one, and duplicate
   occurrences; mixed valid/invalid duplicates; non-UTF-8; malformed pairs; and
   per-value and total-header limits without retaining values.
+  Cover actual invalid bytes separately from valid non-ASCII UTF-8; missing and
+  every non-preserved fidelity status; independent per-Cookie octet/multiplicity
+  overrides; commas/U+FFFD in unrelated and quoted values; marker-free normal
+  sessions under Unknown; explicit Preserved marker semantics; and aggregate
+  size > actual invalid UTF-8 > runtime-ambiguity precedence. Ambiguity makes
+  all four states unavailable and suppresses tokens, evidence and trace sidecars.
 - Request-context serializer masks IPv4/IPv6; enforces every string bound; and
   omits page paths, fingerprints, query, raw headers, IDs, and unsupported
   fields.
@@ -1711,16 +1857,25 @@ results, never a prerequisite for returning them.
   sources.
 - Axum, Cloudflare, and Spin return the common route/schema with unavailable
   fields omitted.
-- Trace-route failures never fall through to publisher origin, including HEAD
-  on each exact path, malformed reserved paths, and arbitrary unsupported
+- Application-visible trace-route failures never fall through to publisher origin, including HEAD
+  on each exact path, visible malformed reserved paths, and arbitrary unsupported
   methods intercepted before router dispatch. Assert path-specific `Allow`,
   bodyless HEAD errors, and hardening headers on local errors.
+  Separately exercise real runtime method/parser rejection, adapter conversion
+  failure and transformed application handling. Cloudflare wire 501 is not a
+  successful local 405; Spin invalid-byte rejection is not cookie-health output.
+  Paths normalized into trace routes require auth; paths normalized to health,
+  JA4 or publisher paths retain ordinary behavior. Missing/transformed/oversize
+  original-target metadata must not reject an inspectable normal pathname.
 - Broad `^/_ts` and `^/` authentication rules challenge every trace path
   (shell/state/actions/assets, disabled routes, and unsupported methods); valid
   credentials proceed to trace handling, while `^/_ts/admin` leaves trace
   routes public. Challenges expose no context or cookie mutation, and
   protected assets remain private/no-store. Also test an earlier narrow handler
   shadowing a broad rule to pin first-match-wins behavior.
+  For encoded namespace aliases, pin literal visible-path auth selection:
+  `/%5Fts/trace` challenges under `^/`, but under a lone `^/_ts` rule is locally
+  rejected without serving setup data or performing an action.
 - GET, HEAD, state-changing POST, and unsupported methods obey the same
   lifecycle contract across adapters.
 - Enable/end POSTs without `Content-Type` accept empty bodies and reject actual
@@ -1801,7 +1956,11 @@ results, never a prerequisite for returning them.
   correlated auctions, fails snapshot creation without dropping a slot's last
   cycle or offering a combined-report export.
 - Same-tab navigation occurs only after a successful write.
-- Viewer handles absent optional network facts and every cookie-health state.
+- Viewer handles absent optional network facts and every cookie-health state,
+  including the exact unavailable/runtime_header_ambiguous detail. Storage,
+  download, copy, share and direct export retain the same reason; invalid
+  state/detail pairs and unknown reasons reject. Worst-case size fixtures
+  include the new detail without expanding the existing report bounds.
 - Populate every excluded `adManager` field, `previousCreativeId`, slot
   `slotElementId`/`adUnitPath`, and callback/attribution issue `slotElementId`
   with distinct sentinel values, including a synthetic secret-bearing path.
@@ -1891,6 +2050,12 @@ fixture:
 observed`, `GPT filled/rendered`, and `Unknown` without understanding internal
   request-path names.
 - A failed share or download does not lose the visible report.
+- Record the all-adapter normal setup → enable → state observation → eligible
+  reload → capture → view/export → end → state observation journey on suitable
+  same-origin fixtures. Include marker-free cookies with Unknown fidelity.
+  Do not treat malformed-wire rejection or synthetic converter-only tests as
+  evidence that this browser journey succeeded. Mobile Safari/Chrome acceptance
+  uses the supported deployment origin and retains Secure cookie attributes.
 
 ## 15. Rollout and observability
 
@@ -1957,11 +2122,23 @@ observed`, `GPT filled/rendered`, and `Unknown` without understanding internal
     Trusted Server auction API ran; show its bounded provider and per-slot
     outcome; show subsequent GPT/creative evidence; and display `Unknown`
     rather than inventing a client-side winner or an unsupported correlation.
+16. The normal accepted journey works on all four adapters within the documented
+    application boundary. Visible reserved paths terminate locally with the
+    required authentication/hardening; runtime rejection, conversion failure and
+    normalized non-trace paths are recorded separately. No original-target SDK
+    accessor or byte-exact reconstruction is a v1 dependency.
+17. Cookie ambiguity is reported as unavailable/runtime_header_ambiguous and
+    cannot authorize capture. Unknown fidelity alone does not disable a normal
+    readable session. The reason survives strict Rust/JS validation, the viewer,
+    storage and every export path without exposing raw data or changing
+    ordinary advertising.
 
 ## 17. Implementation sequencing
 
-This design is one product flow, but its implementation is split into four
-independently reviewable plans and preferably four PRs:
+This design has one implementation plan with four reviewable phases. The first
+three together form the complete mandatory v1 release; phase four is optional.
+Keep one spec and one plan on the existing branch. Phase checkpoints do not
+authorize publishing a partial endpoint or creating separate plans:
 
 1. **Reserved route and privacy foundation:** configuration, shared early-route
    classification with operator authentication, same-origin enable/end lifecycle,
@@ -1970,7 +2147,7 @@ independently reviewable plans and preferably four PRs:
    `ClientInfo`/`GeoInfo` fields, response hardening, and adapter parity. Do not
    add speculative new platform fields in this change. Include the raw-config
    validation hook and method-independent dispatch on all four adapters in
-   this first PR; Fastly-only route registration does not satisfy the contract.
+   this first phase; Fastly-only route registration does not satisfy the contract.
 2. **Live server-auction evidence:** introduce the public diagnostic auction and
    slot tokens, project `TraceAuctionEvidenceV1` at the live observation
    boundary, transport it through initial navigation, page-bids, and both
@@ -1987,7 +2164,7 @@ independently reviewable plans and preferably four PRs:
    bounds. Adopt #1081 or #1074/#1076 later through a separately reviewed
    versioned compatibility change.
 
-Each plan must include its own adapter, privacy, cache, and failure tests. The
+Each phase must include its relevant adapter, privacy, cache, and failure tests. The
 implementation must not claim completion of #1081 or request-relative timing as
 part of #1050. Version one ships with minimal live server-auction evidence plus
 current GPT/render evidence and labels unavailable fields honestly.
@@ -2044,6 +2221,16 @@ length, history, logging, referrer, and accidental-sharing risks.
 
 ## 19. Known limitations
 
+- Original wire information is outside the v1 guarantee. Runtime/SDK path
+  normalization can turn an originally trace-like spelling into an ordinary
+  request, including Fastly health/JA4 behavior. Runtime rejection and adapter
+  conversion failures cannot provide application trace responses.
+- Cookie bounds and counts concern visible fields. Comma/replacement markers
+  conservatively suppress tracing when the applicable fidelity axis is not
+  Preserved, including valid unrelated values that happen to contain markers.
+  Transformations that erase ambiguity without a marker cannot be inferred.
+  Do not present an unavailable result as cookie absence or original-wire proof.
+  Resolved dependency/runtime changes require rerunning the semantic probes.
 - The user must reproduce the problem after enabling tracing.
 - Same-tab navigation is the supported workflow, but opener-created tabs and
   browser session restore may copy or retain session storage. JSON export is

@@ -1,4 +1,4 @@
-//! Query-activated, browser-session GPT runtime diagnostics integration.
+//! Query-activated GPT runtime diagnostics with a bounded session lifetime.
 //!
 //! Deployment configuration makes the standalone browser module available.
 //! Exact `ts_console` directives establish or clear a host-only session cookie;
@@ -8,7 +8,8 @@
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, Uri, header, uri::PathAndQuery};
 use serde::Deserialize;
-use validator::Validate;
+use std::borrow::Cow;
+use validator::{Validate, ValidationError};
 
 use edgezero_core::body::Body as EdgeBody;
 
@@ -24,20 +25,36 @@ use super::IntegrationRegistration;
 pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 /// Reserved activation query parameter.
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
-/// Host-only browser-session activation cookie.
+/// Host-only activation cookie with a 30-minute explicit-activation lifetime.
 pub const GPT_DIAGNOSTICS_COOKIE: &str = "__Host-ts-console";
 
-const SET_CONSOLE_COOKIE: &str = "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax";
+const SET_CONSOLE_COOKIE: &str =
+    "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1800";
 const CLEAR_CONSOLE_COOKIE: &str =
     "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
 
 /// Configuration for the GPT runtime diagnostics integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = "validate_trace_dependency"))]
 pub struct GptDiagnosticsConfig {
     /// Whether the GPT diagnostics browser module is available.
     #[serde(default)]
     pub enabled: bool,
+    /// Whether the mobile trace journey is available under operator auth rules.
+    ///
+    /// Requires [`Self::enabled`]. Defaults to false.
+    #[serde(default)]
+    pub trace_page_enabled: bool,
+}
+
+fn validate_trace_dependency(config: &GptDiagnosticsConfig) -> Result<(), ValidationError> {
+    if config.trace_page_enabled && !config.enabled {
+        let mut error = ValidationError::new("trace_requires_enabled");
+        error.message = Some(Cow::Borrowed("trace_page_enabled requires enabled = true"));
+        return Err(error);
+    }
+    Ok(())
 }
 
 impl IntegrationConfig for GptDiagnosticsConfig {
@@ -52,10 +69,21 @@ pub enum GptDiagnosticsCookieAction {
     /// Do not mutate the activation cookie.
     #[default]
     None,
-    /// Establish a host-only browser-session activation cookie.
+    /// Establish or renew the host-only 30-minute activation cookie.
     SetSession,
     /// Clear the activation cookie.
     ClearSession,
+}
+
+impl GptDiagnosticsCookieAction {
+    /// Return the shared host-only cookie policy for an explicit action.
+    pub(crate) fn set_cookie_header(self) -> Option<HeaderValue> {
+        match self {
+            Self::None => None,
+            Self::SetSession => Some(HeaderValue::from_static(SET_CONSOLE_COOKIE)),
+            Self::ClearSession => Some(HeaderValue::from_static(CLEAR_CONSOLE_COOKIE)),
+        }
+    }
 }
 
 /// Immutable request-scoped diagnostics decision.
@@ -320,16 +348,7 @@ pub fn finalize_response(
     decision: &GptDiagnosticsRequestDecision,
     response: &mut Response<EdgeBody>,
 ) {
-    let cookie = match decision.cookie_action {
-        GptDiagnosticsCookieAction::None => None,
-        GptDiagnosticsCookieAction::SetSession => {
-            Some(HeaderValue::from_static(SET_CONSOLE_COOKIE))
-        }
-        GptDiagnosticsCookieAction::ClearSession => {
-            Some(HeaderValue::from_static(CLEAR_CONSOLE_COOKIE))
-        }
-    };
-    if let Some(cookie) = cookie {
+    if let Some(cookie) = decision.cookie_action.set_cookie_header() {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
 
@@ -673,6 +692,67 @@ mod tests {
                 .is_none(),
             "should not mark an untouched response terminal-private"
         );
+    }
+
+    #[test]
+    fn explicit_activation_has_bounded_lifetime_even_when_trace_is_disabled() {
+        for trace_enabled in [false, true] {
+            let mut settings = settings(true);
+            if trace_enabled {
+                settings
+                    .integrations
+                    .insert_config(
+                        GPT_DIAGNOSTICS_INTEGRATION_ID,
+                        &json!({"enabled": true, "trace_page_enabled": true}),
+                    )
+                    .expect("should insert diagnostics trace flag");
+            }
+
+            for query in ["1", "true", "1"] {
+                let mut request = navigation(
+                    &format!("https://publisher.example/?ts_console={query}"),
+                    Some("__Host-ts-console=1"),
+                );
+                let decision = prepare_request(&settings, &mut request)
+                    .expect("should prepare deliberate activation");
+                let mut response = Response::new(EdgeBody::empty());
+                finalize_response(&decision, &mut response);
+                assert_eq!(
+                    response.headers()[header::SET_COOKIE],
+                    "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1800",
+                    "should renew bounded lifetime only on explicit activation"
+                );
+            }
+
+            let mut request = navigation(
+                "https://publisher.example/article",
+                Some("__Host-ts-console=1"),
+            );
+            let decision = prepare_request(&settings, &mut request)
+                .expect("should prepare an established session");
+            let mut response = Response::new(EdgeBody::empty());
+            finalize_response(&decision, &mut response);
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should not extend lifetime on ordinary requests"
+            );
+
+            for query in ["0", "false"] {
+                let mut request = navigation(
+                    &format!("https://publisher.example/?ts_console={query}"),
+                    Some("__Host-ts-console=1"),
+                );
+                let decision = prepare_request(&settings, &mut request)
+                    .expect("should prepare deliberate deactivation");
+                let mut response = Response::new(EdgeBody::empty());
+                finalize_response(&decision, &mut response);
+                assert_eq!(
+                    response.headers()[header::SET_COOKIE],
+                    "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+                    "should clear using the same host-only cookie scope"
+                );
+            }
+        }
     }
 
     #[test]

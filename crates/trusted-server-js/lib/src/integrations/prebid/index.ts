@@ -27,6 +27,8 @@ import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
+import { getActiveTraceCollector, prepareTraceAuctionRequest } from '../../trace/runtime';
+import { createTracePending, type TracePendingHandle } from '../../trace/pending';
 
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
@@ -999,7 +1001,11 @@ type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
   bidId?: string;
+  bidderRequestId?: string;
 };
+function traceHookBindings(bids: TrustedServerBidRequest[]) {
+  return bids.map((bid) => ({ bidId: bid.bidId ?? '', bidderRequestId: bid.bidderRequestId }));
+}
 type TrustedServerRequest = {
   method: 'POST';
   url: string;
@@ -1007,6 +1013,7 @@ type TrustedServerRequest = {
   options: { contentType: 'application/json' };
   bidRequests: TrustedServerBidRequest[];
   tsjsBidRequests: TrustedServerBidRequest[];
+  tracePending?: TracePendingHandle;
 };
 
 type PrebidUserIdEid = {
@@ -2344,11 +2351,60 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     log.warn('[tsjs-prebid] Prebid bundle lacks markWinningBidAsUsed; APS renderer bids disabled');
   }
 
+  const traceCollector = getActiveTraceCollector();
+  let tracePending = traceCollector
+    ? createTracePending({
+        timeout: () => pbjs.getConfig('bidderTimeout'),
+      })
+    : undefined;
+  if (tracePending) {
+    const pending = tracePending;
+    const retireTracePending = (event: PageTransitionEvent): void => {
+      if (event.persisted) pending.clear();
+      else {
+        pending.destroy();
+        try {
+          window.removeEventListener('pagehide', retireTracePending);
+        } catch {
+          /* Already retired diagnostic state cannot affect page cleanup. */
+        }
+      }
+    };
+    try {
+      window.addEventListener('pagehide', retireTracePending);
+    } catch {
+      pending.destroy();
+      tracePending = undefined;
+    }
+  }
+
+  const activeTracePending = tracePending;
+
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (pbjs as any).registerBidAdapter(undefined, ADAPTER_CODE, {
     code: ADAPTER_CODE,
     supportedMediaTypes: ['banner'],
+    ...(activeTracePending
+      ? {
+          onTimeout(timedOutBids: TrustedServerBidRequest[]) {
+            try {
+              if (timedOutBids.length <= 2048)
+                activeTracePending.failure(traceHookBindings(timedOutBids));
+            } catch {
+              /* Diagnostic hook input cannot interrupt Prebid callbacks. */
+            }
+          },
+          onBidderError(value: { bidderRequest?: { bids?: TrustedServerBidRequest[] } }) {
+            try {
+              const bids = value.bidderRequest?.bids ?? [];
+              if (bids.length <= 2048) activeTracePending.failure(traceHookBindings(bids));
+            } catch {
+              /* Error objects and response bodies are never inspected. */
+            }
+          },
+        }
+      : {}),
 
     isBidRequestValid(): boolean {
       return true; // All requests are valid — orchestrator handles filtering
@@ -2363,15 +2419,43 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         clearPrebidEidsCookie();
       }
       const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
+      const traceCarry = activeTracePending ? prepareTraceAuctionRequest(payload) : undefined;
+      let traceHandle: TracePendingHandle | undefined;
+      if (activeTracePending && traceCarry) {
+        try {
+          const refsByCode = new Map(
+            traceCarry.request.adUnits
+              .slice(0, 64)
+              .map((unit, index) => [unit.code, traceCarry.slotRefs[index]])
+          );
+          // Oversized ID collections keep exact readable-response capture, while
+          // declining unsupported hook association rather than guessing a prefix.
+          const bindings =
+            validBidRequests.length <= 2048
+              ? validBidRequests.map((bid) => ({
+                  bidId: bid.bidId ?? '',
+                  bidderRequestId: bid.bidderRequestId,
+                  slotRef: refsByCode.get(bid.adUnitCode ?? bid.code ?? ''),
+                }))
+              : undefined;
+          traceHandle = activeTracePending.add(bindings, {
+            collector: traceCarry.collector,
+            slotRefs: traceCarry.slotRefs,
+          });
+        } catch {
+          /* Retaining diagnostic state cannot change the ordinary request. */
+        }
+      }
       return {
         method: 'POST',
         url: auctionEndpoint,
-        data: JSON.stringify(payload),
+        data: JSON.stringify(traceCarry?.request ?? payload),
         options: { contentType: 'application/json' },
         // Keep bid requests on the request object so interpretResponse can
         // map bids without relying on shared mutable adapter state.
         bidRequests: requestScopedBidRequests,
         tsjsBidRequests: requestScopedBidRequests,
+        ...(traceHandle ? { tracePending: traceHandle } : {}),
       };
     },
 
@@ -2381,6 +2465,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       request?: Partial<TrustedServerRequest>
     ) {
       const body = serverResponse?.body;
+      try {
+        activeTracePending?.response(request?.tracePending, body);
+      } catch {
+        /* Optional diagnostic handles cannot interrupt ordinary bid parsing. */
+      }
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];

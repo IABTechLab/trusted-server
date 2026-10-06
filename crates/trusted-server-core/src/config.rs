@@ -22,7 +22,7 @@ use crate::integrations::{
     didomi::DidomiIntegrationConfig,
     google_tag_manager::GoogleTagManagerConfig,
     gpt::GptConfig,
-    gpt_diagnostics::GptDiagnosticsConfig,
+    gpt_diagnostics::{GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig},
     js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
     lockr::LockrConfig,
     nextjs::NextJsIntegrationConfig,
@@ -248,6 +248,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
+    validate_gpt_diagnostics_config(settings)?;
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
@@ -270,11 +271,34 @@ pub fn validate_settings_for_runtime(
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
+    validate_gpt_diagnostics_config(settings)?;
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
+}
+
+fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(raw_config) = settings.integrations.get(GPT_DIAGNOSTICS_INTEGRATION_ID) else {
+        return Ok(());
+    };
+    // Validate this dependency even when the normal integration lookup skips
+    // disabled integrations, including the default when enabled is omitted.
+    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: configuration could not be parsed: {error}"
+            ),
+        })
+    })?;
+    config.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: {error}"
+            ),
+        })
+    })
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -1092,6 +1116,80 @@ gam_network_id = "99999"
             err.to_string().contains("invalid_publisher_domain"),
             "error should identify the structural validation failure: {err:?}"
         );
+    }
+
+    #[test]
+    fn trace_config_requires_enabled_on_both_validation_paths() {
+        for raw in [
+            serde_json::json!({"enabled": false, "trace_page_enabled": true}),
+            serde_json::json!({"trace_page_enabled": true}),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert trace configuration");
+
+            for validation in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let error = validation(&settings)
+                    .expect_err("should reject trace without enabled diagnostics");
+                assert!(
+                    format!("{error:?}").contains("trace_page_enabled requires enabled = true"),
+                    "should identify the trace configuration dependency: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trace_config_accepts_valid_flags_and_rejects_disabled_unknown_fields() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": true, "trace_page_enabled": true}),
+            serde_json::json!({"enabled": true, "trace_page_enabled": false}),
+            serde_json::json!({"enabled": false, "trace_page_enabled": false}),
+            serde_json::json!({"trace_page_enabled": false}),
+            serde_json::json!({"enabled": true}),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert valid trace configuration");
+            validate_settings_for_deploy(&settings)
+                .expect("should accept valid trace configuration at deployment");
+            validate_settings_for_runtime(&settings)
+                .expect("should accept valid trace configuration at runtime");
+        }
+
+        for (raw, expected) in [
+            (
+                serde_json::json!({"enabled": false, "trace_page_enabeld": false}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"trace_page_enabeld": false}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"enabled": false, "trace_page_enabled": "false"}),
+                "boolean",
+            ),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert invalid trace configuration");
+            for validation in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let error = validation(&settings)
+                    .expect_err("should reject invalid disabled trace configuration");
+                assert!(
+                    format!("{error:?}").contains(expected),
+                    "should identify the configuration schema error"
+                );
+            }
+        }
     }
 
     #[test]
