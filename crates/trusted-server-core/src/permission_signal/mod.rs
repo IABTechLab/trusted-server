@@ -216,12 +216,11 @@ pub trait PermissionSignalModule: Send + Sync {
     ///
     /// A locator tells whoever receives the data what terms cover it, so
     /// they can decide whether those are terms they accept and whether they
-    /// may pass the data on. Four of the five schemes that ship carry no terms of
-    /// their own and leave this at its default, and a module for a terms
-    /// scheme returns the document that applies to this request. Model Terms
-    /// for Marketing (MTM) is the first such scheme and one of many rather
-    /// than the only one. Core does
-    /// not read the documents, it carries the locators, so what a document
+    /// may pass the data on. Most schemes carry no terms of their own and
+    /// leave this at its default, and a module for a terms scheme returns the
+    /// document that applies to this request. Model Terms for Marketing (MTM)
+    /// is the first such scheme and one of many rather than the only one. Core
+    /// does not read the documents, it carries the locators, so what a document
     /// says stays between the parties bound by it.
     ///
     /// A locator must point at a document that is never edited once
@@ -520,7 +519,7 @@ mod tests {
     }
 
     /// A module that declares a terms document, which is what a scheme like
-    /// Model Terms for Marketing does and the four IAB schemes do not.
+    /// Model Terms for Marketing does and most schemes do not.
     struct Declaring(&'static str, &'static str);
 
     impl PermissionSignalModule for Declaring {

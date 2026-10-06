@@ -33,8 +33,7 @@
 //! resolved (see [`PermissionMaps::default_jurisdiction`]). A geo module that
 //! reports an outright lookup failure is the exception, resolving every
 //! permission to the requires-signal floor rather than the top node (see
-//! [`PermissionMaps::floor_with`]), though no geo module shipped today
-//! reports one.
+//! [`PermissionMaps::floor_with`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -51,12 +50,11 @@ use crate::tdl::Tdl;
 /// Only the identifier is used, with no TCF or taxonomy policy implemented. Every
 /// named variant with a TCF purpose in `permissions.yaml` is resolved against
 /// the session's signals. Only [`Permission::StoreOnDevice`] (and
-/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped module
-/// today.
+/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
-    /// TCF Purpose 1, store and/or access information on a device. It gates the
-    /// built-in Edge Cookie module today. No IAB Privacy Taxonomy Data Use exists
+    /// TCF Purpose 1, store and/or access information on a device. It gates
+    /// every shipped Edge Cookie module. No IAB Privacy Taxonomy Data Use exists
     /// for device storage yet, so this uses a proposed `necessary.operations`
     /// key pending an upstream addition.
     StoreOnDevice,
@@ -80,11 +78,12 @@ pub enum Permission {
     DevelopServices,
     /// TCF Purpose 11, use limited data to select content. No IAB Privacy
     /// Taxonomy Data Use exists for limited-data content selection yet, so this
-    /// keeps its TCF identifier and is proposed upstream. Not gated today.
+    /// keeps its TCF identifier and is proposed upstream. No shipped module
+    /// gates on it.
     SelectBasicContent,
     /// An IAB Privacy Taxonomy Data Use with no dedicated variant, identified by
     /// its index into [`EXTRA_DATA_USES`]. These carry a policy flag in
-    /// `permissions.yaml` for completeness; no module gates on them today.
+    /// `permissions.yaml` for completeness, and no shipped module gates on them.
     Extra(u8),
 }
 
@@ -105,8 +104,8 @@ const NAMED_DATA_USES: [&str; 11] = [
 ];
 
 /// Every other IAB Privacy Taxonomy Data Use, carried so `permissions.yaml` can
-/// set a policy flag for the whole taxonomy (bit index 11..). No module gates
-/// on these today; they exist for completeness, testing, and demonstration.
+/// set a policy flag for the whole taxonomy (bit index 11..). No shipped module
+/// gates on these. They exist for completeness, testing, and demonstration.
 const EXTRA_DATA_USES: [&str; 53] = [
     "advertising_marketing",
     "advertising_marketing.communications",
@@ -860,10 +859,10 @@ impl PermissionState {
     ///
     /// Resolution records every permission that requires a signal and got
     /// none. Some of those no configured module could ever grant, for
-    /// example a marketing channel opt-in in a deployment that runs only the
-    /// four shipped schemes, and a page told to wait for them would wait for
-    /// ever. So the assembly narrows the list to what some module declares
-    /// it can grant, and the rest are simply not set.
+    /// example a marketing channel opt-in in a deployment whose modules can
+    /// grant none, and a page told to wait for them would wait for ever. So
+    /// the assembly narrows the list to what some module declares it can
+    /// grant, and the rest are simply not set.
     #[must_use]
     pub fn awaiting_only(self, answerable: PermissionSet) -> Self {
         Self {
@@ -2047,110 +2046,174 @@ rules:
         );
     }
 
+    /// Every way `PermissionMaps::from_yaml` refuses a policy, each with the
+    /// error it must report.
     #[test]
-    fn from_yaml_rejects_a_block_without_a_group() {
-        let yaml = format!(
-            "{TEST_GROUPS}\
-rules:
-  group: g
-  jurisdiction: gdpr
-  US:
-    jurisdiction: non-regulated
-"
-        );
-        let err =
-            PermissionMaps::from_yaml(&yaml).expect_err("a block with no group should be rejected");
-        assert!(
-            matches!(&err, PermissionsError::MissingGroup { path } if path == "US"),
-            "should report the missing group for US, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_top_node_without_a_group() {
-        let yaml = format!("{TEST_GROUPS}rules:\n  jurisdiction: gdpr\n  US: g\n");
-        let err = PermissionMaps::from_yaml(&yaml)
-            .expect_err("a top node with no group should be rejected");
-        assert!(
-            matches!(err, PermissionsError::MissingGroup { .. }),
-            "should report the missing top group, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_top_node_without_a_jurisdiction() {
-        let yaml = format!("{TEST_GROUPS}rules:\n  group: g\n  US: g\n");
-        let err = PermissionMaps::from_yaml(&yaml)
-            .expect_err("a top node with no jurisdiction should be rejected");
-        assert!(
-            matches!(err, PermissionsError::MissingJurisdiction),
-            "should report the missing top jurisdiction, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_an_unknown_jurisdiction() {
-        let yaml = format!("{TEST_GROUPS}rules:\n  group: g\n  jurisdiction: ccpa\n");
-        let err = PermissionMaps::from_yaml(&yaml)
-            .expect_err("an unknown jurisdiction should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownJurisdiction { .. }),
-            "should report the unknown jurisdiction, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_us_state_above_a_region() {
-        // `us-state` names no code of its own, so only a region can carry it.
-        let top = format!("{TEST_GROUPS}rules:\n  group: g\n  jurisdiction: us-state\n");
-        assert!(
-            matches!(
-                PermissionMaps::from_yaml(&top)
-                    .expect_err("us-state at the top should be rejected"),
-                PermissionsError::MisplacedUsState { .. }
+    fn from_yaml_rejects_each_malformed_policy() {
+        type Refusal = fn(&PermissionsError) -> bool;
+        // A policy given one YAML line to an element, with or without the test
+        // groups ahead of it.
+        let tree = |lines: &[&str]| format!("{TEST_GROUPS}{}\n", lines.join("\n"));
+        let policy = |lines: &[&str]| format!("{}\n", lines.join("\n"));
+        let cases: [(&str, String, Refusal); 15] = [
+            (
+                "a block without a group",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US:",
+                    "    jurisdiction: non-regulated",
+                ]),
+                |err| matches!(err, PermissionsError::MissingGroup { path } if path == "US"),
             ),
-            "the top of the tree names no state"
-        );
-        let country = format!(
-            "{TEST_GROUPS}\
-rules:
-  group: g
-  jurisdiction: gdpr
-  US:
-    group: g
-    jurisdiction: us-state
-"
-        );
-        assert!(
-            matches!(
-                PermissionMaps::from_yaml(&country)
-                    .expect_err("us-state on a country should be rejected"),
-                PermissionsError::MisplacedUsState { .. }
+            (
+                "a top node without a group",
+                tree(&["rules:", "  jurisdiction: gdpr", "  US: g"]),
+                |err| matches!(err, PermissionsError::MissingGroup { .. }),
             ),
-            "a country names no state"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_place_written_under_a_region() {
-        let yaml = format!(
-            "{TEST_GROUPS}\
-rules:
-  group: g
-  jurisdiction: gdpr
-  US:
-    group: g
-    CA:
-      group: g
-      LA:
-        group: g
-"
-        );
-        let err = PermissionMaps::from_yaml(&yaml).expect_err("a fourth level should be rejected");
-        assert!(
-            matches!(err, PermissionsError::NestedTooDeep { .. }),
-            "should report the tree being too deep, got {err:?}"
-        );
+            (
+                "a top node without a jurisdiction",
+                tree(&["rules:", "  group: g", "  US: g"]),
+                |err| matches!(err, PermissionsError::MissingJurisdiction),
+            ),
+            (
+                "an unknown jurisdiction",
+                tree(&["rules:", "  group: g", "  jurisdiction: ccpa"]),
+                |err| matches!(err, PermissionsError::UnknownJurisdiction { .. }),
+            ),
+            (
+                // `us-state` names no code of its own, so only a region can
+                // carry it.
+                "us-state at the top of the tree",
+                tree(&["rules:", "  group: g", "  jurisdiction: us-state"]),
+                |err| matches!(err, PermissionsError::MisplacedUsState { .. }),
+            ),
+            (
+                "us-state on a country",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US:",
+                    "    group: g",
+                    "    jurisdiction: us-state",
+                ]),
+                |err| matches!(err, PermissionsError::MisplacedUsState { .. }),
+            ),
+            (
+                "a place written under a region",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US:",
+                    "    group: g",
+                    "    CA:",
+                    "      group: g",
+                    "      LA:",
+                    "        group: g",
+                ]),
+                |err| matches!(err, PermissionsError::NestedTooDeep { .. }),
+            ),
+            (
+                "a rule naming a group that is not defined",
+                tree(&["rules:", "  group: missing", "  jurisdiction: gdpr"]),
+                |err| matches!(err, PermissionsError::UnknownGroup { name } if name == "missing"),
+            ),
+            (
+                "a rule that is neither a group name nor a block",
+                tree(&[
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  US: [1, 2]",
+                ]),
+                |err| matches!(err, PermissionsError::InvalidRule { path } if path == "US"),
+            ),
+            (
+                // A group with no `default` must list every permission, so this
+                // one, naming only storage, is rejected rather than silently
+                // leaving every other permission unset.
+                "an incomplete group without a default",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    necessary.operations.storage: granted",
+                    "rules: {}",
+                ]),
+                |err| matches!(err, PermissionsError::IncompleteGroup { .. }),
+            ),
+            (
+                "an unknown permission",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: granted",
+                    "    not-a-permission: denied",
+                    "rules: {}",
+                ]),
+                |err| matches!(err, PermissionsError::UnknownPermission { .. }),
+            ),
+            (
+                "an unknown acquisition",
+                policy(&["groups:", "  g:", "    default: maybe", "rules: {}"]),
+                |err| matches!(err, PermissionsError::UnknownAcquisition { .. }),
+            ),
+            (
+                "an override that is not an acquisition",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: granted",
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: unknown",
+                    "  US:",
+                    "    group: g",
+                    "    permissions:",
+                    "      necessary.operations.storage: enabled",
+                ]),
+                |err| matches!(err, PermissionsError::UnknownAcquisition { .. }),
+            ),
+            (
+                "two spellings of one country",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: granted",
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: unknown",
+                    "  us: g",
+                    "  US: g",
+                ]),
+                |err| matches!(err, PermissionsError::DuplicateRule { .. }),
+            ),
+            (
+                "an unknown revoke keyword",
+                policy(&[
+                    "groups:",
+                    "  g:",
+                    "    default: requires_signal",
+                    "rules:",
+                    "  group: g",
+                    "  jurisdiction: gdpr",
+                    "  FR: g",
+                    "signals:",
+                    "  us_opt_out:",
+                    "    sources: [gpc]",
+                    "    revokes: everything",
+                ]),
+                |err| matches!(err, PermissionsError::UnknownRevoke { .. }),
+            ),
+        ];
+        for (case, yaml, refusal) in cases {
+            let Err(err) = PermissionMaps::from_yaml(&yaml) else {
+                panic!("{case} should be rejected");
+            };
+            assert!(refusal(&err), "{case}: wrong refusal, got {err:?}");
+        }
     }
 
     #[test]
@@ -2366,20 +2429,6 @@ rules:
     }
 
     #[test]
-    fn from_yaml_rejects_an_incomplete_group_without_default() {
-        // A group with no `default` must list every permission, so this one
-        // (only necessary.operations.storage) is rejected rather than silently leaving the
-        // other ten unset.
-        let yaml = "groups:\n  g:\n    necessary.operations.storage: granted\nrules: {}\n";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("an incomplete group without a default should be rejected");
-        assert!(
-            matches!(err, PermissionsError::IncompleteGroup { .. }),
-            "should report an incomplete group, got {err:?}"
-        );
-    }
-
-    #[test]
     fn from_yaml_accepts_an_explicit_group_listing_every_permission() {
         // The shipped style: no `default`, every permission spelled out.
         let mut group = String::from("groups:\n  everything:\n");
@@ -2394,50 +2443,6 @@ rules:
             maps.baseline(Some("US"), None)
                 .is_set(Permission::MarketResearch),
             "every listed permission should take its flag"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_unknown_permission() {
-        let yaml = "groups:\n  g:\n    default: granted\n    not-a-permission: denied\nrules: {}\n";
-        let err =
-            PermissionMaps::from_yaml(yaml).expect_err("an unknown permission should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownPermission { .. }),
-            "should report an unknown permission, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_unknown_acquisition() {
-        let yaml = "groups:\n  g:\n    default: maybe\nrules: {}\n";
-        let err =
-            PermissionMaps::from_yaml(yaml).expect_err("an unknown acquisition should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownAcquisition { .. }),
-            "should report an unknown acquisition, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_a_non_acquisition_override_value() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  US:\n    group: g\n    permissions:\n      necessary.operations.storage: enabled\n";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("an unknown acquisition value should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownAcquisition { .. }),
-            "should report an unknown acquisition, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_duplicate_rule_keys_differing_only_by_case() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  us: g\n  US: g\n";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("two spellings of one country should be rejected");
-        assert!(
-            matches!(err, PermissionsError::DuplicateRule { .. }),
-            "should report the duplicate rule, got {err:?}"
         );
     }
 
@@ -2509,29 +2514,6 @@ signals:
         assert!(
             !signals.opt_out_revokes(Permission::StoreOnDevice),
             "an unlisted Data Use is not revoked by the opt-out"
-        );
-    }
-
-    #[test]
-    fn from_yaml_rejects_an_unknown_revoke_keyword() {
-        let yaml = "\
-groups:
-  g:
-    default: requires_signal
-rules:
-  group: g
-  jurisdiction: gdpr
-  FR: g
-signals:
-  us_opt_out:
-    sources: [gpc]
-    revokes: everything
-";
-        let err = PermissionMaps::from_yaml(yaml)
-            .expect_err("an unknown revoke keyword should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownRevoke { .. }),
-            "should report an unknown revoke rule, got {err:?}"
         );
     }
 }
