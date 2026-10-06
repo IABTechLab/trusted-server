@@ -545,12 +545,13 @@ mod tests {
     const HEADER_PROVIDER_ID: &str = "5c3a1b70-2f4d-4a19-9c6e-7b0d18e4a221";
 
     /// A **test-only** provider that returns caller-chosen response headers
-    /// from the client-resolve path, so a test can drive one provider response
-    /// effect at a time through this endpoint, with and without an identifier.
+    /// and identifier from the client-resolve path, so a test can drive one
+    /// provider response effect at a time through this endpoint, with and
+    /// without an identifier.
     #[derive(Debug)]
     struct ResolveHeaderProvider {
         headers: &'static [(&'static str, &'static str)],
-        mint: bool,
+        id: Option<&'static str>,
     }
 
     impl EdgeCookieModule for ResolveHeaderProvider {
@@ -575,7 +576,7 @@ mod tests {
             _input: &ClientResolveInput<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
-                id: self.mint.then(|| HEADER_PROVIDER_ID.to_owned()),
+                id: self.id.map(str::to_owned),
                 response_headers: self
                     .headers
                     .iter()
@@ -603,13 +604,24 @@ mod tests {
     /// whatever the handler produced.
     fn resolve_with_header_provider(
         headers: &'static [(&'static str, &'static str)],
-        mint: bool,
+        id: Option<&'static str>,
+        graph: Option<&crate::ec::kv::KvIdentityGraph>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        resolve_request_with_header_provider(headers, id, post(HEADER_PROVIDER_ID), graph)
+    }
+
+    /// Drives `request` through [`ResolveHeaderProvider`], threaded the way a
+    /// composition root threads a provider.
+    fn resolve_request_with_header_provider(
+        headers: &'static [(&'static str, &'static str)],
+        id: Option<&'static str>,
+        request: Request<EdgeBody>,
         graph: Option<&crate::ec::kv::KvIdentityGraph>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let mut settings = create_test_settings();
         settings.ec.provider = Some(EcModuleSelection::from("resolve-header"));
         let services =
-            noop_services_with_ec_module(Arc::new(ResolveHeaderProvider { headers, mint }));
+            noop_services_with_ec_module(Arc::new(ResolveHeaderProvider { headers, id }));
         let organic = Request::builder()
             .method(Method::GET)
             .uri("https://edge.example.com/")
@@ -617,18 +629,18 @@ mod tests {
             .expect("should build organic request");
         let ec = EcContext::read_from_request(&settings, &organic, &services)
             .expect("should read EC context");
-        handle_ec_resolve(&settings, post(HEADER_PROVIDER_ID), &ec, graph)
+        handle_ec_resolve(&settings, request, &ec, graph)
     }
 
     #[test]
-    fn resolve_rejects_a_reserved_response_effect_when_nothing_is_minted() {
-        // The 204 path applied provider headers with no check at all, so a
+    fn resolve_rejects_a_reserved_response_effect_when_nothing_is_created() {
+        // The 204 path applies provider headers too, so without the check a
         // browser-side provider could set the managed identity cookie while
         // returning no identifier, walking past the identifier bounds, the
-        // conflict check and the row-before-cookie rule below it.
+        // conflict check and the row-before-cookie rule.
         let outcome = resolve_with_header_provider(
             &[("set-cookie", "ts-ec=forged-value; Path=/")],
-            false,
+            None,
             None,
         );
 
@@ -640,12 +652,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_a_reserved_response_effect_on_the_minted_path() {
+    fn resolve_rejects_a_reserved_response_effect_on_the_created_path() {
         // The same check has to cover the 200 path, where the provider does
         // create and core is about to write its own cookie and headers.
         let graph = in_memory_graph();
-        let outcome =
-            resolve_with_header_provider(&[("x-ts-ec", "forged-value")], true, Some(&graph));
+        let outcome = resolve_with_header_provider(
+            &[("x-ts-ec", "forged-value")],
+            Some(HEADER_PROVIDER_ID),
+            Some(&graph),
+        );
 
         let err = outcome.expect_err("a reserved header effect should fail the request");
         assert!(
@@ -657,17 +672,17 @@ mod tests {
     #[test]
     fn resolve_accumulates_provider_response_headers_with_its_own() {
         // The provider's own cookies must add to what the handler already set,
-        // never replace it. Replacing collapsed a provider's own cookie list to
-        // whichever came last, and would drop the `Cache-Control: no-store` core
-        // writes onto every identity response (a provider cannot set
-        // `cache-control` itself, so core's directive is what has to survive).
+        // never replace it. Replacing would keep only the last of a provider's
+        // own cookies, and would drop the `Cache-Control: no-store` core writes
+        // onto every identity response (a provider cannot set `cache-control`
+        // itself, so core's directive is what has to survive).
         let graph = in_memory_graph();
         let response = resolve_with_header_provider(
             &[
                 ("set-cookie", "vendor-ev=abc; Path=/"),
                 ("set-cookie", "vendor-state=xyz; Path=/"),
             ],
-            true,
+            Some(HEADER_PROVIDER_ID),
             Some(&graph),
         )
         .expect("should handle resolve");
@@ -704,6 +719,77 @@ mod tests {
         assert!(
             cache_control.contains(&"no-store"),
             "a provider header must not drop the no-store an identity response carries, got {cache_control:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_an_identifier_outside_the_cookie_bounds() {
+        // An identifier the cookie cannot carry is refused, never rewritten,
+        // and leaves neither a cookie nor an identity-graph row behind.
+        let graph = in_memory_graph();
+        let response = resolve_with_header_provider(&[], Some("has a space"), Some(&graph))
+            .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an identifier outside the cookie-safe bounds should be refused with 400"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "a refused identifier must set no cookie"
+        );
+        assert!(
+            graph
+                .get("t0rh~has a space")
+                .expect("should read the graph")
+                .is_none(),
+            "a refused identifier must leave no identity-graph row"
+        );
+    }
+
+    #[test]
+    fn resolve_answers_503_when_the_identity_graph_write_fails() {
+        // The row is written before the cookie, so when the write fails no
+        // cookie is set, because withdrawal could not reach an identity with
+        // no row.
+        let graph = crate::ec::kv::KvIdentityGraph::failing("test-ec-store");
+        let response = resolve_with_header_provider(&[], Some(HEADER_PROVIDER_ID), Some(&graph))
+            .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a failed identity-graph write should answer 503"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "a failed identity-graph write must set no cookie"
+        );
+    }
+
+    #[test]
+    fn resolve_refuses_an_advertised_oversized_body_before_reading_it() {
+        // A `Content-Length` over the limit is refused before the body is read,
+        // whatever the body turns out to hold.
+        let mut request = post(HEADER_PROVIDER_ID);
+        request
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(MAX_BODY_SIZE + 1));
+        let graph = in_memory_graph();
+        let response = resolve_request_with_header_provider(
+            &[],
+            Some(HEADER_PROVIDER_ID),
+            request,
+            Some(&graph),
+        )
+        .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an advertised length over the limit should be refused with 413"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "a refused body must set no cookie"
         );
     }
 
@@ -767,9 +853,9 @@ mod tests {
             "the resolve should persist the identity-graph row, so withdrawal can reach it"
         );
 
-        // 3. A later request carries the EC cookie; the server reads the
-        //    identifier back verbatim. This is the step the built-in shape check
-        //    used to drop.
+        // 3. A later request carries the EC cookie, and the identifier reads
+        //    back verbatim because the provider's own `accepts_id` decides its
+        //    shape.
         let ret = Request::builder()
             .method(Method::GET)
             .uri("https://edge.example.com/")
