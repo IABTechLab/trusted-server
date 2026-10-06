@@ -506,8 +506,8 @@ streaming failed [instance=…0000 ordinal=2 request=…0001]
   key-construction or lookup helper would remove the duplication. The working
   implementation stays until such an API exists; the `TS__SANDBOX__*` suffixes
   and the limit-validation policy remain application-owned regardless.
-- **The pin is an unmerged branch revision.** Move to a release tag once one
-  contains the current pinned lifecycle revision (`35a72835`).
+- **The pin is an untagged `main` revision.** EdgeZero PR #379 merged as
+  `683202c6`; move to a release tag once one contains it.
 
 ## Review follow-up: measurement compatibility
 

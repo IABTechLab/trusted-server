@@ -56,9 +56,12 @@ Two properties of this path block naive reuse.
 
 ## Dependencies
 
-The workspace pins EdgeZero at `35a72835322fe0127beb2ce998e4988e95974373` on
-`feat/reusable-app-lifecycle`. (It briefly sat at `277544c4` on the same
-branch; that revision carried the CLI and Cloudflare fixes but no lifecycle
+The workspace pins EdgeZero at `683202c66948146ec360f490126f1d60f920288b`,
+the `main` squash-merge of EdgeZero PR #379 (reusable application
+lifecycles). Its tree is identical to the PR's final head, `1f07d20e`. No
+release tag contains it yet. (Before the merge it was pinned to branch
+revisions of `feat/reusable-app-lifecycle`, last `35a72835`, and briefly to
+`277544c4`, which carried the CLI and Cloudflare fixes but no lifecycle
 module.)
 
 The current revision also exposes registry-aware Fastly request conversion

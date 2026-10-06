@@ -1428,7 +1428,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "toml",
 ]
@@ -1436,7 +1436,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1464,7 +1464,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1487,7 +1487,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1516,7 +1516,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1543,7 +1543,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "chrono",
  "clap",
@@ -1568,7 +1568,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1599,7 +1599,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=35a72835322fe0127beb2ce998e4988e95974373#35a72835322fe0127beb2ce998e4988e95974373"
+source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
 dependencies = [
  "log",
  "proc-macro2",
@@ -4105,6 +4105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4122,6 +4133,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4566,6 +4587,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -5459,11 +5493,13 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "rpassword",
  "rustls",
  "rustls-pemfile",
  "scraper",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "similar",
  "temp-env",
  "tempfile",
@@ -5475,6 +5511,7 @@ dependencies = [
  "tracing",
  "trusted-server-core",
  "url",
+ "uuid",
  "webpki-roots",
  "which",
  "x509-parser",
@@ -5671,6 +5708,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
