@@ -16,7 +16,7 @@ use trusted_server_core::permissions::{Permission, PermissionMaps};
 use trusted_server_core::platform::GeoInfo;
 
 /// The signal modules the inspector asks, in the order every adapter offers
-/// them when `[permission_signal] module` names none.
+/// them when `[permission-signal] modules` names none.
 fn modules() -> Vec<Arc<dyn PermissionSignalModule>> {
     vec![
         Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),

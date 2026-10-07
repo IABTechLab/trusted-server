@@ -113,11 +113,13 @@ impl<'a> SignalInput<'a> {
         if !self.may_ask {
             return None;
         }
+        let names: Vec<&str> = self.modules.iter().map(|module| module.id()).collect();
+        let name = crate::module_name::resolve(MODULE_TYPE, id, &names)?;
         let (position, module) = self
             .modules
             .iter()
             .enumerate()
-            .find(|(position, module)| module.id() == id && *position != self.position)?;
+            .find(|(position, module)| module.id() == name && *position != self.position)?;
         let input = Self {
             consent: self.consent,
             evidence: self.evidence,
@@ -130,6 +132,17 @@ impl<'a> SignalInput<'a> {
         };
         Some(module.signal(permission, &input))
     }
+}
+
+/// The type folder of every permission signal crate, which a name written in
+/// `[permission-signal] modules` may leave off.
+pub const MODULE_TYPE: &str = "permission-signal";
+
+/// The name a module reports on the page and in logs, being its name without
+/// the type folder, such as `example` for `permission-signal.example`.
+#[must_use]
+pub fn short_name(module: &dyn PermissionSignalModule) -> &'static str {
+    crate::module_name::short_form(MODULE_TYPE, module.id())
 }
 
 /// A module of permission signals.
@@ -146,11 +159,12 @@ impl<'a> SignalInput<'a> {
 /// into refusal and revoke the permission on every request that did not carry
 /// this scheme.
 pub trait PermissionSignalModule: Send + Sync {
-    /// Stable identifier, used in configuration, in logs, and by a peer
+    /// The module's name, used in configuration, in logs, and by a peer
     /// looking this module up through [`SignalInput::ask`].
     ///
-    /// Written in `snake_case`, lowercase words joined by underscores, for
-    /// example `gpp_sale_opt_out`.
+    /// A module in a crate takes its crate folder's name through
+    /// [`crate::module_name!`], such as `permission-signal.example`, which
+    /// `[permission-signal] modules` may write as `example`.
     fn id(&self) -> &'static str;
 
     /// How this module would amend `permission` for this request.
@@ -387,17 +401,24 @@ pub(crate) fn select(
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Permission signal module `{name}` is named more than once in \
-                     [permission_signal] module. Each module runs once, at one place \
+                     [permission-signal] modules. Each module runs once, at one place \
                      in the order"
                 ),
             }));
         }
-        let Some(module) = available.iter().find(|module| module.id() == name) else {
+        let offered = ids(available);
+        let Some(module) = crate::module_name::resolve(MODULE_TYPE, name, &offered)
+            .and_then(|resolved| available.iter().find(|module| module.id() == resolved))
+        else {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "Permission signal module `{name}` is not available in this build. \
                      Available modules are {}",
-                    ids(available).join(", ")
+                    offered
+                        .iter()
+                        .map(|id| crate::module_name::short_form(MODULE_TYPE, id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             }));
         };
@@ -446,16 +467,16 @@ pub fn build_permission_signal_modules(
     settings: &Settings,
     available: &[Arc<dyn PermissionSignalModule>],
 ) -> Result<Arc<[Arc<dyn PermissionSignalModule>]>, Report<TrustedServerError>> {
-    let configured = settings.permission_signal.module.as_deref();
+    let configured = settings.permission_signal.modules.as_deref();
     let selected = select(available, configured)?;
     match configured {
         None => log::info!(
             "Permission signals: acting on every module this build offers, [{}], no \
-             [permission_signal] module configured",
+             [permission-signal] modules configured",
             ids(&selected).join(", ")
         ),
         Some([]) => log::info!(
-            "Permission signals: acting on no module, [permission_signal] module is \
+            "Permission signals: acting on no module, [permission-signal] modules is \
              empty, so every permission stays at its country and region baseline"
         ),
         Some(_) => log::info!(
@@ -466,8 +487,8 @@ pub fn build_permission_signal_modules(
     let left_out = omitted(available, configured);
     if !left_out.is_empty() {
         log::warn!(
-            "Permission signals: not acting on [{}], which are not in [permission_signal] \
-             module. A signal this deployment does not act on is read from the request \
+            "Permission signals: not acting on [{}], which are not in [permission-signal] \
+             modules. A signal this deployment does not act on is read from the request \
              and then ignored",
             left_out.join(", ")
         );
@@ -1043,8 +1064,8 @@ mod tests {
     fn four() -> Vec<Arc<dyn PermissionSignalModule>> {
         vec![
             fixed("gpc", ConsentSignal::Neutral),
-            fixed("gpp_sale_opt_out", ConsentSignal::Neutral),
-            fixed("us_privacy", ConsentSignal::Neutral),
+            fixed("gpp", ConsentSignal::Neutral),
+            fixed("us-privacy", ConsentSignal::Neutral),
             fixed("tcf", ConsentSignal::Neutral),
         ]
     }
@@ -1054,7 +1075,7 @@ mod tests {
         let selected = select(&four(), None).expect("should accept no configuration");
         assert_eq!(
             ids(&selected),
-            vec!["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"],
+            vec!["gpc", "gpp", "us-privacy", "tcf"],
             "a publisher who configures nothing acts on every scheme the build knows, so \
              one is never ignored because they forgot to list it"
         );
@@ -1062,11 +1083,11 @@ mod tests {
 
     #[test]
     fn the_configured_order_is_the_order_they_run_in() {
-        let reversed = names(&["tcf", "us_privacy", "gpp_sale_opt_out", "gpc"]);
+        let reversed = names(&["tcf", "us-privacy", "gpp", "gpc"]);
         let selected = select(&four(), Some(&reversed)).expect("should accept known names");
         assert_eq!(
             ids(&selected),
-            vec!["tcf", "us_privacy", "gpp_sale_opt_out", "gpc"],
+            vec!["tcf", "us-privacy", "gpp", "gpc"],
             "the list is the order, not merely the membership"
         );
     }
@@ -1091,7 +1112,7 @@ mod tests {
         };
         let message = format!("{error:?}");
         assert!(
-            message.contains("not-a-module") && message.contains("gpc, gpp_sale_opt_out"),
+            message.contains("not-a-module") && message.contains("gpc, gpp"),
             "the refusal names the bad entry and what is available: {message}"
         );
     }
@@ -1112,7 +1133,7 @@ mod tests {
         let configured = names(&["gpc", "tcf"]);
         assert_eq!(
             omitted(&four(), Some(&configured)),
-            vec!["gpp_sale_opt_out", "us_privacy"],
+            vec!["gpp", "us-privacy"],
             "the modules the list leaves out are reported in the offered order"
         );
         assert!(

@@ -27,9 +27,21 @@ use trusted_server_core::permissions::{
     ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
 };
 
-/// The stable identifier this module answers to in `[permission_signal]`
-/// `module`, in logs, and when a peer consults it.
-pub const ID: &str = "tcf";
+/// The name `[permission-signal] modules` selects this module by, from its
+/// crate folder.
+#[must_use]
+pub fn name() -> &'static str {
+    trusted_server_core::module_name!()
+}
+
+/// The name the page is told a signal came from, being the name without the
+/// type folder.
+fn short() -> &'static str {
+    trusted_server_core::module_name::short_form(
+        trusted_server_core::permission_signal::MODULE_TYPE,
+        name(),
+    )
+}
 
 /// TCF v2, when the policy says TCF answers for this deployment.
 ///
@@ -49,7 +61,7 @@ impl TcfModule {
 
 impl PermissionSignalModule for TcfModule {
     fn id(&self) -> &'static str {
-        ID
+        name()
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
@@ -107,7 +119,7 @@ impl PermissionSignalModule for TcfModule {
     ) -> Option<ValidSignal> {
         consent.tcf.as_ref()?;
         let raw = consent.raw_tc_string.as_deref()?;
-        Some(ValidSignal::new(ID, "tcf", raw))
+        Some(ValidSignal::new(short(), "tcf", raw))
     }
 
     /// Only a TCF record refusing storage withdraws, because only TCF records
@@ -210,7 +222,7 @@ mod tests {
     fn answers_to_its_identifier() {
         assert_eq!(
             TcfModule::new().id(),
-            ID,
+            name(),
             "the module answers to the identifier configuration names"
         );
     }
@@ -317,7 +329,7 @@ mod tests {
         };
         assert_eq!(
             TcfModule::new().valid_signal(&decoded, &evidence),
-            Some(ValidSignal::new(ID, "tcf", "CPreadable")),
+            Some(ValidSignal::new(short(), "tcf", "CPreadable")),
             "a decoded record vouches for the string as received"
         );
         let unreadable = ConsentContext {
