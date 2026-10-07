@@ -33,6 +33,14 @@ work_dir="$(cd "$2" && pwd)"
 printf '%s\n' "$base" > "$work_dir/base"
 relative_dir="${work_dir#"$root"/}"
 
+# Prints a prompt template with each `<work-dir>` replaced by the work
+# directory, relative to the repository root.
+render_prompt() {
+  local text
+  text="$(cat "$1")"
+  printf '%s\n' "${text//<work-dir>/"$relative_dir"}"
+}
+
 # Reads are always permitted; writes are allowed so Copilot can edit pages,
 # and publish.sh enforces which paths may actually change.
 run_copilot() {
@@ -47,7 +55,7 @@ run_copilot() {
 }
 
 {
-  cat "$here/prompt.md"
+  render_prompt "$here/prompt.md"
   printf '\n## Merged change\n\n- Commit: %s\n- Base: %s\n- Subject: %s\n\n' "$sha" "$base" "$(git log -1 --format=%s "$sha")"
   printf '## Sources of truth\n\n'
   awk '/^## Sources of truth/ { found = 1; next } /^## / { found = 0 } found' "$spec"
@@ -68,7 +76,7 @@ if [ ! -s "$work_dir/proposal.patch" ]; then
 fi
 
 {
-  cat "$here/evidence-prompt.md"
+  render_prompt "$here/evidence-prompt.md"
   printf '\n## Merged change\n\n- Commit: %s\n\n## Hunks\n\n```json\n' "$sha"
   git diff --cached --no-renames "$sha" -- docs | node "$here/hunks.mjs" list
   printf '```\n'

@@ -16,9 +16,9 @@ sources to documentation pages appear at the end of this file.
    bundles, or verification commands. Use the Sources of truth table to find
    the affected pages.
 3. If no reader-facing documentation is affected, change nothing and write
-   `.docs-proposal/rationale.md` containing one sentence explaining why.
+   `<work-dir>/rationale.md` containing one sentence explaining why.
 4. Otherwise edit only the affected pages, then write
-   `.docs-proposal/rationale.md` with one bullet per edited page naming the
+   `<work-dir>/rationale.md` with one bullet per edited page naming the
    page, what changed, and the merged source file that justifies it.
 
 ## Rules
@@ -34,4 +34,4 @@ sources to documentation pages appear at the end of this file.
 - Keep existing links and anchors working, and link to other pages with
   relative paths.
 - Do not edit files outside `docs/guide/`, `docs/index.md`, and
-  `.docs-proposal/`. Do not commit, push, or create branches.
+  `<work-dir>/`. Do not commit, push, or create branches.

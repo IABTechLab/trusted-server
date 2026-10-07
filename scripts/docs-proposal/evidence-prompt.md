@@ -4,7 +4,7 @@ The hunks at the end of this file are proposed edits to the Trusted Server
 documentation for the merged commit named there. For each hunk, find the merged
 source that justifies it.
 
-Write `.docs-proposal/evidence.json` with exactly this shape, and change no
+Write `<work-dir>/evidence.json` with exactly this shape, and change no
 other file:
 
 ```json

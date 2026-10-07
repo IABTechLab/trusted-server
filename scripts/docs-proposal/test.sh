@@ -261,6 +261,13 @@ assert_eq "$(run_propose "$merge_sha")" 0 "should propose for a multi-commit pus
 assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the push base"
 assert_contains "$(cat .docs-proposal/prompt.md)" "- Base: $merge_sha" "should inspect the whole push"
 assert_contains "$(cat "$STUB_LOG")" "copilot -p" "should run Copilot"
+assert_contains "$(cat .docs-proposal/prompt.md)" ".docs-proposal/rationale.md" "should name the work dir in the prompt"
+assert_eq "$(grep -c '<work-dir>' .docs-proposal/prompt.md || true)" 0 "should fill every work dir placeholder"
+
+rm -rf proposal-out
+"$here/propose.sh" "$second_sha" proposal-out "" > "$tmp/out.log" 2>&1
+assert_contains "$(cat proposal-out/prompt.md)" "proposal-out/rationale.md" "should name a custom work dir in the prompt"
+rm -rf proposal-out
 
 assert_eq "$(run_propose "")" 0 "should propose without a base"
 assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should default the base to the first parent"
