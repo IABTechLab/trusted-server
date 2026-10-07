@@ -145,7 +145,9 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
+use trusted_server_core::settings_data::{
+    DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store_with,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_device_fastly::FastlyHostSignals;
 
@@ -220,12 +222,17 @@ pub(crate) fn build_state(
 pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    get_settings_from_config_store(
+    // The settings are validated as they load, so the builders a deployment
+    // registered are supplied here as well as to the state build. Without
+    // them a `[demand]` or `[ad-server]` name one of them supplies is refused
+    // before the state that knows them is built.
+    get_settings_from_config_store_with(
         &FastlyPlatformConfigStore,
         &FastlyPlatformSecretStore,
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
+        registered_integrations(),
     )
 }
 

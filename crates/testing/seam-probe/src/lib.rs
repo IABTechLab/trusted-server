@@ -3,7 +3,8 @@
 //!
 //! One registration carries a browser module, a proxy route, a geo module,
 //! an Edge Cookie identity module and a device module, alongside its own
-//! configuration block, and the builder adds a request preparer. The round-trip
+//! configuration block, and the builder adds a request preparer and an ad
+//! server implementation `[ad-server]` can name. The round-trip
 //! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each
 //! of those through a real adapter, so the seam is proven by a caller that core
 //! does not know about.
@@ -25,6 +26,9 @@ use http::header::{self, HeaderValue};
 use http::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
+use trusted_server_core::auction::demand::AdServerImplementation;
+use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
 use trusted_server_core::ec::module::{
     EdgeCookieModule, GeneratedEdgeCookie, IdentityInput, ModuleCode,
@@ -35,7 +39,9 @@ use trusted_server_core::integrations::{
     CarriedJsModule, IntegrationBuilder, IntegrationEndpoint, IntegrationProxy,
     IntegrationRegistration,
 };
-use trusted_server_core::platform::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
+use trusted_server_core::platform::{
+    GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices,
+};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
@@ -271,6 +277,72 @@ impl PlatformGeo for SeamProbeGeo {
     }
 }
 
+/// The name an `[ad-server.<name>] implementation` line selects the probe's
+/// ad server by, which is the probe's module name.
+///
+/// A static cannot call [`module_name`], so the literal is written out and
+/// `ad_server_name_is_the_module_name` keeps it honest.
+pub const SEAM_PROBE_ADSERVER_NAME: &str = "testing.seam-probe";
+
+/// The probe's ad server implementation, registered on its builder.
+pub static SEAM_PROBE_ADSERVER: AdServerImplementation = AdServerImplementation {
+    id: SEAM_PROBE_ADSERVER_NAME,
+    build: build_adserver,
+};
+
+/// How long the orchestrator waits for the probe's ad server, in milliseconds.
+const SEAM_PROBE_ADSERVER_TIMEOUT_MS: u32 = 100;
+
+/// An ad server that answers at once and picks nothing, so the auction's ad
+/// server seam is reached from a crate core does not know.
+struct SeamProbeAdServer {
+    name: String,
+}
+
+/// Builds the probe's ad server under the name its table gave it.
+///
+/// # Errors
+///
+/// Never returns an error; the result type matches `BuildAdServerFn`.
+fn build_adserver(
+    name: &str,
+    _settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
+    Ok(Arc::new(SeamProbeAdServer {
+        name: name.to_owned(),
+    }))
+}
+
+#[async_trait(?Send)]
+impl AuctionProvider for SeamProbeAdServer {
+    fn provider_name(&self) -> &str {
+        &self.name
+    }
+
+    async fn request_bids(
+        &self,
+        _request: &AuctionRequest,
+        _context: &AuctionContext<'_>,
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+        Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
+            self.name.clone(),
+            0,
+        )))
+    }
+
+    async fn parse_response(
+        &self,
+        _response: PlatformResponse,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        Ok(AuctionResponse::no_bid(self.name.clone(), response_time_ms))
+    }
+
+    fn timeout_ms(&self) -> u32 {
+        SEAM_PROBE_ADSERVER_TIMEOUT_MS
+    }
+}
+
 /// Proxy that reports what the seam delivered to this request.
 pub struct SeamProbeProxy;
 
@@ -440,6 +512,7 @@ pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(SEAM_PROBE_ID, SEAM_PROBE_SOURCE, register, validate)
         .with_module_name(module_name())
         .with_request_preparer(prepare_request)
+        .with_adserver(&SEAM_PROBE_ADSERVER)
 }
 
 #[cfg(test)]
@@ -585,6 +658,15 @@ mod tests {
             hex::encode(Sha256::digest(PROBE_JS.as_bytes())),
             PROBE_JS_SHA256,
             "PROBE_JS_SHA256 should be the SHA-256 of js/probe.js; if the source is unchanged, check that the file was checked out with LF line endings as .gitattributes requires"
+        );
+    }
+
+    #[test]
+    fn ad_server_name_is_the_module_name() {
+        assert_eq!(
+            SEAM_PROBE_ADSERVER_NAME,
+            module_name(),
+            "the ad server is named as the crate's folder below `crates/` names it"
         );
     }
 

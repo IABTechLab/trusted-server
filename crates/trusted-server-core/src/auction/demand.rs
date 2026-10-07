@@ -229,8 +229,8 @@ pub type CompileDemandFn =
 pub type BuildAdServerFn =
     fn(&str, &Map<String, Value>) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>>;
 
-/// A demand implementation an integration registers, named by `[demand]`
-/// `provider` or by an `implementation` line.
+/// A demand implementation an integration registers, named by
+/// `[demand] modules` or by an `implementation` line.
 #[derive(Clone, Copy)]
 pub struct DemandImplementation {
     /// The implementation's name, its module path.

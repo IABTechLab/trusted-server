@@ -351,14 +351,23 @@ pub fn validate_settings_for_deploy_with(
     structural_settings.prepare_runtime()?;
     structural_settings.validate_admin_coverage()?;
 
-    let plan = crate::auction::compile_auction_plan(settings)?;
+    // The plan is compiled with the builders the blocks are validated
+    // against, so a `[demand]` or `[ad-server]` name one of them supplies
+    // compiles here.
+    let plan = crate::auction::compile_auction_plan_with(settings, extra_integrations)?;
     validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     settings.ec.validate_resolve_allowed_origins()?;
     Ok(())
 }
 
-/// Runs Trusted Server runtime validation after secret references are resolved.
+/// Runs Trusted Server runtime validation after secret references are
+/// resolved, against the built-in integrations only.
+///
+/// A deployment whose `[demand]` or `[ad-server]` names an implementation a
+/// builder of its own supplies calls [`validate_settings_for_runtime_with`]
+/// with that builder, because this function cannot see it and refuses the
+/// name as one no builder registers.
 ///
 /// # Errors
 ///
@@ -367,10 +376,29 @@ pub fn validate_settings_for_deploy_with(
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    validate_settings_for_runtime_with(settings, &[])
+}
+
+/// Runs runtime validation with the built-in integrations followed by the
+/// builders a deployment supplies.
+///
+/// This runs while the settings load, before any application state is built,
+/// so a deployment that composes builders supplies them here as well as to
+/// the state build. Each builder also validates its own table.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when resolved secrets or runtime-only
+/// configuration checks are invalid, or when a builder rejects its own
+/// configuration.
+pub fn validate_settings_for_runtime_with(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
     settings.validate_admin_handler_passwords()?;
-    let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_integration_blocks(settings, &plan, &[])?;
+    let plan = crate::auction::compile_auction_plan_with(settings, extra_integrations)?;
+    validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
@@ -1616,6 +1644,88 @@ password = "production-admin-password-32-bytes"
         Ok(false)
     }
 
+    /// The ad server implementation a crate outside core supplies.
+    static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
+        crate::auction::demand::AdServerImplementation {
+            id: "ad-server.example",
+            build: build_external_adserver,
+        };
+
+    fn build_external_adserver(
+        name: &str,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<
+        std::sync::Arc<dyn crate::auction::provider::AuctionProvider>,
+        Report<TrustedServerError>,
+    > {
+        Ok(std::sync::Arc::new(
+            crate::integrations::adserver_mock::AdServerMockProvider::new(
+                name,
+                crate::integrations::adserver_mock::AdServerMockSettings {
+                    endpoint: "https://external.example/mediate".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ))
+    }
+
+    /// The builder of the crate that supplies [`EXTERNAL_ADSERVER`].
+    fn external_adserver_builders() -> [IntegrationBuilder; 1] {
+        [
+            IntegrationBuilder::implementations("example-adserver", "example-crate")
+                .with_adserver(&EXTERNAL_ADSERVER),
+        ]
+    }
+
+    /// Settings whose `[ad-server] module` names the external ad server.
+    fn settings_naming_the_external_adserver() -> Settings {
+        let mut settings = valid_settings();
+        settings.adserver = crate::provider_table::ProviderChoice::new(
+            Some("example".to_string()),
+            std::collections::BTreeMap::from([("example".to_string(), serde_json::Map::new())]),
+        );
+        settings
+    }
+
+    /// Deploy validation compiles the plan with the builders it validates the
+    /// blocks against, so it and the running service agree on which ad server
+    /// names are valid. Both halves are asserted, so the test fails if the
+    /// built-in path stops refusing the name or the external path stops
+    /// accepting it.
+    #[test]
+    fn deploy_validation_accepts_an_external_ad_server_only_when_given_its_builder() {
+        let settings = settings_naming_the_external_adserver();
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        validate_settings_for_deploy_with(&settings, &external_adserver_builders())
+            .expect("the external builder's ad server should pass deploy validation");
+    }
+
+    /// Runtime validation runs while the settings load, before any application
+    /// state exists, so a deployment that composes a builder supplies it here
+    /// too. Both halves are asserted, so the test fails if the built-in path
+    /// stops refusing the name or the external path stops accepting it.
+    #[test]
+    fn runtime_validation_accepts_an_external_ad_server_only_when_given_its_builder() {
+        let settings = settings_naming_the_external_adserver();
+
+        let error = validate_settings_for_runtime(&settings)
+            .expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        validate_settings_for_runtime_with(&settings, &external_adserver_builders())
+            .expect("the external builder's ad server should pass runtime validation");
+    }
+
     /// Every builder handed to deploy validation has its `validate` run, and
     /// reporting disabled does not excuse a builder from validating.
     #[test]
@@ -1785,6 +1895,30 @@ password = "production-admin-password-32-bytes"
         .with_module_name("testing.seam-probe")];
 
         let err = validate_settings_for_deploy_with(&valid_settings(), &extra)
+            .expect_err("should surface the external integration builder's rejection");
+
+        assert!(
+            err.to_string().contains(EXTERNAL_REJECTION_MESSAGE),
+            "should keep the external builder's message intact: {err:?}"
+        );
+    }
+
+    /// A builder's own rules run when the settings load with that builder, so
+    /// a deployment that composes it is held to them at startup.
+    #[test]
+    fn runtime_validation_surfaces_an_external_integration_builders_rejection() {
+        let extra = [IntegrationBuilder::new(
+            "seam-probe",
+            "seam-probe-crate",
+            build_nothing,
+            reject_deploy,
+        )
+        .with_module_name("testing.seam-probe")];
+
+        validate_settings_for_runtime(&valid_settings())
+            .expect("the settings should pass without the external builder");
+
+        let err = validate_settings_for_runtime_with(&valid_settings(), &extra)
             .expect_err("should surface the external integration builder's rejection");
 
         assert!(
