@@ -325,6 +325,14 @@ hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pa
 `X-Forwarded-Host: <FROM>`, so first-party URL rewriting stays anchored to `FROM`
 **as long as the upstream preserves that header**.
 
+With `--rewrite-host`, the proxy also replaces a single same-origin
+`Origin: https://<FROM>` with the `TO` origin (`http://` with
+`--upstream-plaintext`, `https://` otherwise, plus any non-default port), so
+`Origin` names the same authority as `Host`. Upstream endpoints that verify a
+same-origin `Origin` against their own origin then accept proxied same-origin
+requests. Cross-site, `null`, and duplicated `Origin` values pass through
+unchanged.
+
 > **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
 > request paths strip inbound `X-Forwarded-Host` before routing, so with
 > `--rewrite-host` a real Trusted Server upstream falls back to `Host` (`TO`) and

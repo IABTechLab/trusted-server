@@ -712,6 +712,7 @@ fn rewrite_headers(
     // headers we stamp below as connection-specific and have them dropped.
     strip_hop_by_hop(headers);
     headers.insert(hyper::header::HOST, outcome.host_header.clone());
+    rewrite_first_party_origin(headers, outcome);
     // Tell the upstream the original first-party host (always `FROM`). Trusted
     // Server resolves the request host from `Forwarded` → `X-Forwarded-Host` →
     // `Host`, so a client-supplied `Forwarded` would outrank the value we inject.
@@ -747,6 +748,31 @@ fn rewrite_headers(
         headers.insert(hyper::header::AUTHORIZATION, auth.header_value().clone());
     }
     trailer_metadata.regenerate(headers);
+}
+
+/// With `--rewrite-host`, replaces a single same-origin `Origin: https://FROM`
+/// with the `TO` origin, so an upstream that compares `Origin` against its own
+/// origin (as Trusted Server's state-changing endpoints do) sees the same
+/// authority it receives in `Host`. Cross-site, opaque, or duplicated `Origin`
+/// values pass through unchanged for the upstream to judge.
+fn rewrite_first_party_origin(
+    headers: &mut hyper::HeaderMap,
+    outcome: &super::rewrite::RewriteOutcome,
+) {
+    let Some(upstream_origin) = &outcome.upstream_origin else {
+        return;
+    };
+    let is_single_first_party_origin = {
+        let mut origins = headers.get_all(hyper::header::ORIGIN).iter();
+        origins.next().is_some_and(|origin| {
+            origin
+                .as_bytes()
+                .eq_ignore_ascii_case(outcome.first_party_origin.as_bytes())
+        }) && origins.next().is_none()
+    };
+    if is_single_first_party_origin {
+        headers.insert(hyper::header::ORIGIN, upstream_origin.clone());
+    }
 }
 
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -791,7 +817,20 @@ mod tests {
             host_header: HeaderValue::from_static(host),
             orig_host: HeaderValue::from_static("www.example-publisher.com"),
             scheme_is_tls: true,
+            first_party_origin: HeaderValue::from_static("https://www.example-publisher.com"),
+            upstream_origin: Some(
+                HeaderValue::from_str(&format!("https://{host}"))
+                    .expect("should build upstream origin"),
+            ),
         }
+    }
+
+    fn origins(headers: &hyper::HeaderMap) -> Vec<&str> {
+        headers
+            .get_all(hyper::header::ORIGIN)
+            .iter()
+            .map(|value| value.to_str().expect("should encode origin"))
+            .collect()
     }
 
     fn head(method: &str, target: &str) -> RequestHead {
@@ -1021,6 +1060,73 @@ mod tests {
         assert!(
             !headers.contains_key("fastly-ssl"),
             "spoofable Fastly-SSL is stripped"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_maps_same_origin_origin_to_upstream_origin() {
+        let outcome = rewrite_outcome("to.edgecompute.app");
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::ORIGIN,
+            HeaderValue::from_static("https://WWW.example-publisher.com"),
+        );
+
+        rewrite_headers(&mut headers, &outcome, None);
+
+        assert_eq!(
+            origins(&headers),
+            ["https://to.edgecompute.app"],
+            "should present the same authority in Origin as in Host"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_keeps_foreign_opaque_and_duplicate_origins() {
+        let outcome = rewrite_outcome("to.edgecompute.app");
+        for values in [
+            &["https://evil.example.com"][..],
+            &["null"][..],
+            &["http://www.example-publisher.com"][..],
+            &[
+                "https://www.example-publisher.com",
+                "https://www.example-publisher.com",
+            ][..],
+        ] {
+            let mut headers = hyper::HeaderMap::new();
+            for value in values {
+                headers.append(hyper::header::ORIGIN, HeaderValue::from_static(value));
+            }
+
+            rewrite_headers(&mut headers, &outcome, None);
+
+            assert_eq!(
+                origins(&headers),
+                values,
+                "should forward a non-first-party or ambiguous Origin unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_headers_keeps_origin_without_rewrite_host() {
+        let outcome = RewriteOutcome {
+            host_header: HeaderValue::from_static("www.example-publisher.com"),
+            upstream_origin: None,
+            ..rewrite_outcome("www.example-publisher.com")
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::ORIGIN,
+            HeaderValue::from_static("https://www.example-publisher.com"),
+        );
+
+        rewrite_headers(&mut headers, &outcome, None);
+
+        assert_eq!(
+            origins(&headers),
+            ["https://www.example-publisher.com"],
+            "should keep Origin aligned with an unchanged Host"
         );
     }
 
