@@ -5,8 +5,8 @@ members = [
     "crates/geo/fastly",
     # Test fixture that proves the integration seam from outside core. A
     # workspace member so it shares workspace settings and lints; no default
-    # member and no adapter build reaches it, and only the Axum adapter's tests
-    # depend on it.
+    # member and no adapter build reaches it, and only the Axum and Fastly
+    # adapters' tests depend on it.
     "crates/testing/seam-probe",
     "crates/permission-signal/gpc",
     "crates/permission-signal/gpp",

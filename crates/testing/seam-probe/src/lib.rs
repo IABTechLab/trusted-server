@@ -6,15 +6,17 @@
 //! configuration block, and the builder adds a request preparer, a demand
 //! implementation `[demand]` can name and an ad server implementation
 //! `[ad-server]` can name. The round-trip
-//! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each
-//! of those through a real adapter, so the seam is proven by a caller that core
-//! does not know about.
+//! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` and
+//! `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive
+//! each of those through a real adapter, so the seam is proven by a caller that
+//! core does not know about.
 //!
 //! This crate is a test fixture and must never ship in a deployment. It
 //! reports internal request state over an unauthenticated route, serves a
 //! browser module that does nothing useful, and resolves location from static
 //! configuration rather than from the request. It is a development dependency
-//! of the Axum adapter only, so no adapter's production build reaches it.
+//! of the Axum and Fastly adapters only, so no adapter's production build
+//! reaches it.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
