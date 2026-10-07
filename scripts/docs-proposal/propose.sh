@@ -36,7 +36,6 @@ run_copilot() {
     --allow-tool='shell(git show:*)' \
     --allow-tool='shell(git diff:*)' \
     --allow-tool='shell(git log:*)' \
-    --allow-tool='shell(git grep:*)' \
     --deny-tool='shell(git push)' \
     --deny-tool='shell(git commit)'
 }

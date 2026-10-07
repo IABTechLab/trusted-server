@@ -69,8 +69,9 @@ Permissions: `contents: read`, `copilot-requests: write`.
       `git diff <base> <sha>`: a multi-commit push is covered in full, and a
       clean merge commit is not hidden by `git show`'s empty combined diff.
    2. Runs `copilot -p` with `--no-ask-user`, `--allow-tool=write`, and
-      `git show`, `git diff`, `git log`, and `git grep` shell tools; `git push`
-      and `git commit` are denied, and file reads need no permission. Copilot
+      `git show`, `git diff`, and `git log` shell tools; `git push` and
+      `git commit` are denied, and file reads need no permission. `git grep`
+      is not allowed because `--open-files-in-pager` runs a command. Copilot
       edits documentation only when the merged change alters reader-facing
       behavior, and writes `.docs-proposal/rationale.md`.
    3. Runs `npm ci` and `npm run format:write` in `docs/` so Prettier
