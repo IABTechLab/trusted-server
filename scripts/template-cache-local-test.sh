@@ -279,8 +279,7 @@ s = replace_once(
 # rules tree compiled into the binary. The Viceroy geolocation block appended
 # to the harness fastly.toml below maps the loopback client to US/CA, and the
 # platform geo module is selected here, so the auction runs under the US
-# state opt-out rules with no consent signal, which is what the retired
-# default_country lever used to arrange.
+# state opt-out rules with no consent signal.
 s = replace_once(
     s,
     chr(10) + '# module = "platform"' + chr(10),

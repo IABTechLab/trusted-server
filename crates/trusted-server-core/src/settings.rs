@@ -1499,9 +1499,9 @@ impl GeoConfig {
         ec: &Ec,
     ) -> Result<(), Report<TrustedServerError>> {
         let geo_disabled = !matches!(self.module.as_deref(), Some("platform"));
-        // The selector is a typed enum on this branch, so statelessness is the
-        // absent selector or the explicit `none`, matched rather than compared
-        // as a string.
+        // The selector is a typed enum, so statelessness is the absent
+        // selector or the explicit `none`, matched rather than compared as a
+        // string.
         let ec_active = !matches!(ec.module, None | Some(EcModuleSelection::None));
         if geo_disabled && ec_active && !self.assume_single_jurisdiction {
             return Err(Report::new(TrustedServerError::Configuration {
@@ -6512,8 +6512,8 @@ mod tests {
 
     #[test]
     fn an_unknown_key_in_the_hmac_module_block_is_rejected() {
-        // A mistyped key in a module block used to be dropped silently, which
-        // leaves the setting the operator meant to change at its default.
+        // A mistyped key dropped silently would leave the setting the
+        // operator meant to change at its default.
         let toml_str = crate_test_settings_str().replace(
             "passphrase = \"test-secret-key-32-bytes-minimum\"",
             "passphrase = \"test-secret-key-32-bytes-minimum\"\n            typo_key = \"x\"",

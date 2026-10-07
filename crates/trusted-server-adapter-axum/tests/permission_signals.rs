@@ -505,7 +505,7 @@ fn an_unreadable_gpp_string_is_the_gpp_modules_opt_out_and_the_order_decides() {
     // The GPP module reads its own unreadable string as the opt-out it
     // may have carried. Asked after it, a readable TCF record consenting to
     // storage amends that, because the order is the policy. Nothing in
-    // core answers ahead of the modules any more.
+    // core answers ahead of the modules.
     let consent = ConsentContext {
         tcf: Some(tcf_with_purposes(&[1, 4])),
         raw_tc_string: Some("CPreadable".to_owned()),
