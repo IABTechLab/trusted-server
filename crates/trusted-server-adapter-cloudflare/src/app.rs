@@ -77,12 +77,11 @@ pub struct AppState {
     registry: Arc<IntegrationRegistry>,
     /// The Edge Cookie module `[ec] module` selects, resolved once here.
     ///
-    /// This adapter runs a fresh instance per request, so application state and
-    /// the request path used to resolve the same selection twice for every
-    /// request, once to check it could be satisfied and once to use it.
-    /// Resolving reads no request data, so the result is kept and handed to
-    /// every request through
-    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
+    /// This adapter runs a fresh instance per request and resolving reads no
+    /// request data, so the selection is resolved when the state is built
+    /// and handed to every request through
+    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module),
+    /// rather than resolved again on the request path.
     /// `None` for a deployment that selects no module.
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
     /// The permission signal modules `[permission-signal] modules` selects
@@ -891,13 +890,12 @@ mod tests {
     /// The per-request Edge Cookie read must return its error rather than a
     /// default context.
     ///
-    /// This adapter used to log the failure and continue with
-    /// `EcContext::default()`, so a deployment whose selected module could not
-    /// be built served every request with no identity. The call sites propagate
-    /// the error to `http_error`, matching the Fastly adapter. The settings are
-    /// parsed directly, bypassing the composition root's startup check, so the
-    /// per-request behavior can be exercised with a selection the adapter
-    /// cannot supply.
+    /// Continuing with `EcContext::default()` would serve every request with
+    /// no identity when the selected module cannot be built. The call sites
+    /// propagate the error to `http_error`, matching the Fastly adapter. The
+    /// settings are parsed directly, bypassing the composition root's startup
+    /// check, so the per-request behavior can be exercised with a selection
+    /// the adapter cannot supply.
     #[test]
     fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
         let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)

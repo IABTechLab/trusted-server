@@ -189,12 +189,11 @@ pub(crate) struct AppState {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// The Edge Cookie module `[ec] module` selects, resolved once here.
     ///
-    /// This adapter runs a fresh instance per request, so application state and
-    /// the request path used to resolve the same selection twice for every
-    /// request, once to check it could be satisfied and once to use it.
-    /// Resolving reads no request data, so the result is kept and handed to
-    /// every request through
-    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
+    /// This adapter runs a fresh instance per request and resolving reads no
+    /// request data, so the selection is resolved when the state is built
+    /// and handed to every request through
+    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module),
+    /// rather than resolved again on the request path.
     /// `None` for a deployment that selects no module.
     pub(crate) ec_module: Option<Arc<dyn EdgeCookieModule>>,
     /// The permission signal modules `[permission-signal] modules` selects
