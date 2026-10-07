@@ -22,6 +22,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
         trusted_server_audience_permutive::builder(),
         trusted_server_identity_lockr::builder(),
+        trusted_server_cmp_didomi::builder(),
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
     ]
@@ -54,6 +55,7 @@ mod tests {
             [
                 "audience.permutive",
                 "identity.lockr",
+                "cmp.didomi",
                 "cmp.sourcepoint",
                 "cmp.osano",
             ],

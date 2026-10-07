@@ -16,7 +16,6 @@ use crate::settings::Settings;
 pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
-pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
@@ -577,7 +576,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     js_asset_proxy::BUILDER,
     testlight::BUILDER,
     nextjs::BUILDER,
-    didomi::BUILDER,
     google_tag_manager::BUILDER,
     datadome::BUILDER,
     gpt::BUILDER,

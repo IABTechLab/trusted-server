@@ -1,3 +1,14 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,29 +20,32 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::{Validate, ValidationError};
 
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
     ensure_integration_backend,
 };
-use crate::platform::{GeoInfo, PlatformHttpRequest, RuntimeServices};
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::platform::{GeoInfo, PlatformHttpRequest, RuntimeServices};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
 
 /// The name this module is selected by, in `[cmp]`.
 pub const MODULE: &str = "cmp.didomi";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         DIDOMI_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
-    .with_module_name(MODULE);
+    .with_module_name(MODULE)
+}
 const DIDOMI_DEFAULT_PREFIX: &str = "/integrations/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
@@ -361,7 +375,9 @@ impl DidomiIntegration {
             .body(EdgeBody::from("Didomi loader unavailable"))
             .expect("should build static Didomi geo failure response");
         Self::add_cors_headers(&mut response);
-        crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response);
+        trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy(
+            &mut response,
+        );
         response
     }
 
@@ -374,7 +390,9 @@ impl DidomiIntegration {
             .body(EdgeBody::empty())
             .change_context(Self::error("Failed to build Didomi geo redirect"))?;
         Self::add_cors_headers(&mut response);
-        crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response);
+        trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy(
+            &mut response,
+        );
         Ok(response)
     }
 }
@@ -529,7 +547,9 @@ impl IntegrationProxy for DidomiIntegration {
         if matches!(backend, DidomiBackend::Sdk) {
             Self::add_cors_headers(&mut response.response);
         } else {
-            crate::response_privacy::enforce_terminal_private_cache_privacy(&mut response.response);
+            trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy(
+                &mut response.response,
+            );
         }
 
         Ok(response.response)
@@ -572,15 +592,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
-    use crate::platform::PlatformCacheIntent;
-    use crate::platform::test_support::{
+    use http::Method;
+    use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use trusted_server_core::platform::PlatformCacheIntent;
+    use trusted_server_core::platform::test_support::{
         NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient,
         build_services_with_http_client,
     };
-    use crate::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo};
-    use crate::test_support::tests::{crate_test_settings_str_running, create_test_settings};
-    use http::Method;
+    use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformError, PlatformGeo};
+    use trusted_server_core::test_support::tests::{
+        crate_test_settings_str_running, create_test_settings,
+    };
 
     enum GeoResult {
         Value(Option<GeoInfo>),
@@ -1192,14 +1214,8 @@ mod tests {
             .insert_module_config("cmp", "cmp.didomi", &config())
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         assert!(registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/integrations/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
@@ -1293,14 +1309,8 @@ mod tests {
             .insert_module_config("cmp", "cmp.didomi", &custom_config)
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         assert!(registry.has_route(&Method::GET, "/my-custom-consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/my-custom-consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
@@ -1406,7 +1416,7 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"ok".to_vec());
         let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
         let integration = DidomiIntegration::new(Arc::new(config()));
@@ -1445,6 +1455,15 @@ mod tests {
         assert_eq!(
             inserts[0],
             r#"<script>window.__tsjs_didomi={"proxyPath":"/integrations/didomi/consent/"};</script>"#
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
         );
     }
 }

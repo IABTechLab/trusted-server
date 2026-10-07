@@ -17,6 +17,7 @@ members = [
     "crates/identity/lockr",
     "crates/audience/permutive",
     "crates/cmp/sourcepoint",
+    "crates/cmp/didomi",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -142,6 +143,7 @@ trusted-server-cmp-osano = { path = "crates/cmp/osano" }
 trusted-server-identity-lockr = { path = "crates/identity/lockr" }
 trusted-server-audience-permutive = { path = "crates/audience/permutive" }
 trusted-server-cmp-sourcepoint = { path = "crates/cmp/sourcepoint" }
+trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

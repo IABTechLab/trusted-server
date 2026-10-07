@@ -5564,6 +5564,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-cmp-didomi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-cmp-osano"
 version = "0.1.0"
 dependencies = [
@@ -5740,6 +5757,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "trusted-server-audience-permutive",
+ "trusted-server-cmp-didomi",
  "trusted-server-cmp-osano",
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",

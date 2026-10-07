@@ -179,7 +179,6 @@ fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
 mod tests {
     use super::*;
     use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
-    use crate::integrations::didomi::DidomiIntegrationConfig;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
     use crate::settings::{
@@ -408,32 +407,45 @@ mod tests {
         );
     }
 
+    /// The settings of an example module, with a flag that defaults to off.
+    #[derive(Debug, serde::Deserialize, serde::Serialize, validator::Validate)]
+    #[serde(deny_unknown_fields)]
+    struct ExampleModuleSettings {
+        #[serde(default)]
+        opted_in: bool,
+        endpoint: String,
+    }
+
+    impl crate::settings::IntegrationConfig for ExampleModuleSettings {}
+
     #[test]
-    fn didomi_geo_query_parameters_survive_blob_round_trip() {
+    fn a_module_s_table_survives_the_blob_round_trip() {
         let mut original = test_settings();
         original
             .insert_module_config(
-                "cmp",
-                "cmp.didomi",
-                &DidomiIntegrationConfig {
-                    geo_query_parameters: true,
-                    proxy_path: None,
-                    sdk_origin: "https://sdk.example.com".to_string(),
-                    api_origin: "https://api.example.com".to_string(),
+                "example",
+                "example.notice",
+                &ExampleModuleSettings {
+                    opted_in: true,
+                    endpoint: "https://api.example.com".to_string(),
                 },
             )
-            .expect("should insert Didomi configuration");
+            .expect("should insert the example module's table");
 
         let reconstructed =
             load_settings(&envelope_json(&original)).expect("should reconstruct settings");
         let config = reconstructed
-            .module_config::<DidomiIntegrationConfig>(crate::integrations::didomi::MODULE)
-            .expect("should read Didomi configuration")
-            .expect("should enable Didomi");
+            .module_config::<ExampleModuleSettings>("example.notice")
+            .expect("should read the example module's table")
+            .expect("should still select the example module");
 
         assert!(
-            config.geo_query_parameters,
-            "should preserve Didomi geo opt-in"
+            config.opted_in,
+            "should preserve a flag the table set away from its default"
+        );
+        assert_eq!(
+            config.endpoint, "https://api.example.com",
+            "should preserve the table's other settings"
         );
     }
 
