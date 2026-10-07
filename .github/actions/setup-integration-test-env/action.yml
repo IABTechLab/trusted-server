@@ -51,12 +51,22 @@ runs:
       # `.tool-versions` is the single source of truth for the Viceroy pin.
       run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
+    - name: Remove runner-image Rust toolchain
+      # rust-cache hashes every installed toolchain into its key, so the image's
+      # preinstalled stable would rotate the key on each runner-image rollout.
+      shell: bash
+      run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
     - name: Set up Rust toolchain
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: ${{ steps.rust-version.outputs.rust-version }}
         target: wasm32-wasip1
-        cache-shared-key: cargo-${{ runner.os }}
+        # Restore the axum job's main cache: it builds the same axum debug and
+        # Fastly release WASM artifacts. Integration tests run on PRs only, and
+        # PR caches are scoped to their ref and only evict main's shared caches.
+        cache-shared-key: cargo-axum-${{ runner.os }}
+        cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Cache Viceroy binary
       if: ${{ inputs.install-viceroy == 'true' }}

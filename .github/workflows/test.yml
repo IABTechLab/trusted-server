@@ -33,12 +33,20 @@ jobs:
         run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Remove runner-image Rust toolchain
+        # rust-cache hashes every installed toolchain into its key, so the image's
+        # preinstalled stable would rotate the key on each runner-image rollout.
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-fastly-${{ runner.os }}
+          # PR caches are scoped to their ref and only evict main's shared caches.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache Viceroy binary
         id: cache-viceroy
@@ -82,6 +90,12 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Remove runner-image Rust toolchain
+        # rust-cache hashes every installed toolchain into its key, so the image's
+        # preinstalled stable would rotate the key on each runner-image rollout.
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -89,7 +103,9 @@ jobs:
           # wasm32-wasip1 is required by the "Verify Fastly WASM release
           # build" step below; the axum build and tests are native.
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-axum-${{ runner.os }}
+          # PR caches are scoped to their ref and only evict main's shared caches.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Read pinned Node.js version for CLI fixtures
         id: node-version
@@ -133,12 +149,20 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Remove runner-image Rust toolchain
+        # rust-cache hashes every installed toolchain into its key, so the image's
+        # preinstalled stable would rotate the key on each runner-image rollout.
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-unknown-unknown
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-cloudflare-${{ runner.os }}
+          # PR caches are scoped to their ref and only evict main's shared caches.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
@@ -160,12 +184,20 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Remove runner-image Rust toolchain
+        # rust-cache hashes every installed toolchain into its key, so the image's
+        # preinstalled stable would rotate the key on each runner-image rollout.
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
       - name: Set up Rust toolchain (native + wasm32-wasip1)
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-spin-${{ runner.os }}
+          # PR caches are scoped to their ref and only evict main's shared caches.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -199,12 +231,20 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Remove runner-image Rust toolchain
+        # rust-cache hashes every installed toolchain into its key, so the image's
+        # preinstalled stable would rotate the key on each runner-image rollout.
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: clippy, rustfmt
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-parity-${{ runner.os }}
+          # PR caches are scoped to their ref and only evict main's shared caches.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
@@ -230,12 +270,20 @@ jobs:
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Remove runner-image Rust toolchain
+        # rust-cache hashes every installed toolchain into its key, so the image's
+        # preinstalled stable would rotate the key on each runner-image rollout.
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup toolchain uninstall stable; fi
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
+          # PR caches are scoped to their ref and only evict main's shared caches.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Read pinned Node.js version for CLI fixtures
         id: node-version
