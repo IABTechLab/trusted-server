@@ -168,8 +168,9 @@ curl -i "https://edge.example.com/_ts/clear-tester"
 
 Browser and programmatic auction endpoint. It accepts the Trusted Server ad-unit
 request shape and returns an OpenRTB response. Creative markup follows the
-independent `[auction].sanitize_creatives` and `[auction].rewrite_creatives`
-settings; sanitization is opt-in and rewriting is enabled by default.
+independent `[auction].sanitize_creatives`, `[auction].rewrite_creatives` and
+`[auction].rewrite_clicks` settings; sanitization is opt-in, asset rewriting is
+enabled by default, and click wrapping follows `rewrite_creatives` unless set.
 
 Configured provider IDs appear in response metadata and provider responses.
 Consumers that previously matched the literal provider name `prebid` must use

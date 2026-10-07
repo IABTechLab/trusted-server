@@ -161,7 +161,7 @@ sequenceDiagram
       Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     else Ordinary creative
       Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
-      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: accepted external URLs remain direct
+      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: asset URLs direct; clicks follow rewrite_clicks
     end
     deactivate Client
   end
@@ -195,7 +195,7 @@ AuctionOrchestrator.run_auction()
 Convert OrchestrationResult → OpenRTB 2.x Response
   │
   ├─[sanitize_creatives=true] Strip executable markup
-  ├─[rewrite_creatives=true] Rewrite URLs and inject creative TSJS
+  ├─[rewrite_creatives or rewrite_clicks] Rewrite assets and/or links, inject creative TSJS
   ├─ Add ext.orchestrator metadata
   └─ Set consent and optional EID response headers
 ```
@@ -638,8 +638,11 @@ HTML rewriter (`lol_html`) that converts eligible external resource and click
 URLs to signed first-party paths, adds `data-tsclick`, rewrites inline CSS
 `url(...)` values, removes bidder-supplied `<base>` elements, and injects the
 unified creative TSJS runtime exactly once, whether or not the bidder supplied a
-`<body>` element. In every mode, a creative
-larger than the 1 MiB per-creative cap is rejected and its `adm` is dropped.
+`<body>` element. `rewrite_clicks` (unset by default, following
+`rewrite_creatives`) controls click-through link wrapping separately; see
+[Creative Processing](/guide/creative-processing#assets-and-clicks). In every
+mode, a creative larger than the 1 MiB per-creative cap is rejected and its
+`adm` is dropped.
 
 ```toml
 [auction]
