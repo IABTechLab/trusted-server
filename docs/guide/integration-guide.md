@@ -294,6 +294,10 @@ An Edge Cookie module is declared under the name its own `id` returns.
 Startup refuses a registration where the two differ, and two registrations
 that supply a module of one type under one name.
 
+The Fastly adapter is the one adapter that classifies a request, so a device
+module is asked there and on no other adapter. It is shown the User-Agent and
+the request's cookies.
+
 The registry builds only the modules a section selects, so the module that
 supplies one of these has to be selected in its section as well. The probe
 is run with `[testing] modules = ["seam-probe"]` and its geo module is

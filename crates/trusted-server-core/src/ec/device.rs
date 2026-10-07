@@ -196,7 +196,8 @@ impl DeviceModule for BuiltinDeviceModule {
     }
 }
 
-/// Selects the device module named by the `[device] module` selector.
+/// The device module core or the adapter supplies for the `[device] module`
+/// selector.
 ///
 /// Returns the built-in User-Agent-only module unless the `fastly` selector is
 /// set, in which case it builds the host-specific module through the
@@ -204,10 +205,12 @@ impl DeviceModule for BuiltinDeviceModule {
 /// module is selected, so device classification itself reads no host signals
 /// by default (see [`BuiltinDeviceModule`] for the host-neutral default). The
 /// Fastly entry point still reads the TLS and HTTP/2 signals on every request to
-/// build the host-signal service and client info. A
-/// selected-but-unknown module is rejected at startup by
-/// [`DeviceConfig::validate_module_selection`](crate::settings::DeviceConfig::validate_module_selection),
-/// so this falls back to the built-in module for that case.
+/// build the host-signal service and client info.
+///
+/// A module a registration supplies is resolved by the integration registry,
+/// which refuses a name no module supplies when it is built. A caller uses
+/// this only when the registry resolved no module, so it never sees such a
+/// name.
 #[must_use]
 pub fn build_device_module(
     settings: &Settings,

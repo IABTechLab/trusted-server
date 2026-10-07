@@ -414,6 +414,60 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
     );
 }
 
+/// With `[device] module` naming the probe, the function this adapter's entry
+/// point calls for every request classifies the request with the probe's
+/// device module, and with the built-in module when the selector is unset.
+#[test]
+fn device_selector_naming_a_module_classifies_a_request_with_it() {
+    let request = || {
+        let mut request = fastly::Request::get("https://test-publisher.com/");
+        request.set_header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0");
+        request
+    };
+
+    let selected = state_with(
+        settings_with(&format!(
+            r#"
+        [device]
+        module = "testing.seam-probe"
+        {HMAC_BLOCK}
+        {PROBE_BLOCK}
+        "#
+        )),
+        &[seam_probe::builder()],
+    );
+    let services =
+        build_finalize_services(&selected.settings, Arc::clone(&selected.default_kv_store));
+    let signals = block_on(crate::derive_device_signals(
+        &selected.settings,
+        selected.registry.device_module(),
+        &request(),
+        &services,
+    ));
+    assert_eq!(
+        signals.platform_class.as_deref(),
+        Some("seam-probe"),
+        "the probe's device module should classify the request"
+    );
+
+    let unset = state_with(
+        settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}")),
+        &[seam_probe::builder()],
+    );
+    let services = build_finalize_services(&unset.settings, Arc::clone(&unset.default_kv_store));
+    let signals = block_on(crate::derive_device_signals(
+        &unset.settings,
+        unset.registry.device_module(),
+        &request(),
+        &services,
+    ));
+    assert_eq!(
+        signals.platform_class.as_deref(),
+        Some("linux"),
+        "the built-in module should classify the request when the selector is unset"
+    );
+}
+
 /// The builders a deployment registers through `run_with` reach the state the
 /// application hooks build, which takes no builders of its own.
 ///

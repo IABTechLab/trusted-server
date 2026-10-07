@@ -521,7 +521,12 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
             // The entry point is synchronous host code, so it drives the async
             // module seam at the same boundary it already drives the router.
             let services = build_finalize_services(settings, entry_point_kv_store(&app_state));
-            futures::executor::block_on(derive_device_signals(settings, &req, &services))
+            let registered = app_state
+                .as_deref()
+                .and_then(|state| state.registry.device_module());
+            futures::executor::block_on(derive_device_signals(
+                settings, registered, &req, &services,
+            ))
         }
         None => {
             log::warn!(
@@ -946,37 +951,52 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
     None
 }
 
-/// Derives device signals via the configured device-detection module.
+/// Derives device signals with the device module `[device]` selects.
 ///
-/// The modules read request data from injected services: device classification
-/// reads only the User-Agent, borrowed here through a `BorrowedRequestInfo`, while the
-/// Fastly module also reads the TLS/H2 signals captured into a
-/// [`FastlyHostSignals`]. The Fastly module, and so the signal capture, is
-/// built only when selected, so the default request path makes no Fastly-specific
-/// signal call.
+/// A module a registration supplies is the one the integration registry
+/// resolved, passed in as `registered`, and it is shown the User-Agent and
+/// the cookies, which carry what a page gathers in the browser. Otherwise
+/// [`build_device_module`] gives the built-in module, which reads only the
+/// User-Agent, or the Fastly module, which also reads the TLS/H2 signals
+/// captured into a [`FastlyHostSignals`]. The Fastly module, and so the
+/// signal capture, is built only when selected, so the default request path
+/// makes no Fastly-specific signal call.
 pub(crate) async fn derive_device_signals(
     settings: &Settings,
+    registered: Option<Arc<dyn DeviceModule>>,
     req: &FastlyRequest,
     services: &RuntimeServices,
 ) -> DeviceSignals {
     let mut headers = HeaderMap::new();
-    if let Some(value) = req
-        .get_header_str(header::USER_AGENT.as_str())
-        .and_then(|user_agent| HeaderValue::from_str(user_agent).ok())
-    {
-        headers.insert(header::USER_AGENT, value);
+    for (name, shown) in [
+        (header::USER_AGENT, true),
+        (header::COOKIE, registered.is_some()),
+    ] {
+        if shown
+            && let Some(value) = req
+                .get_header_str(name.as_str())
+                .and_then(|value| HeaderValue::from_str(value).ok())
+        {
+            headers.insert(name, value);
+        }
     }
     let client_ip = req
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
     let request_info = BorrowedRequestInfo::new(&client_ip, None).with_headers(&headers);
-    build_device_module(settings, || {
-        let host_signals: Arc<dyn HostSignals> = Arc::new(FastlyHostSignals::from_request(req));
-        Box::new(FastlyDeviceModule::new(host_signals)) as Box<dyn DeviceModule>
-    })
-    .detect(&request_info, services)
-    .await
+    match registered {
+        Some(module) => module.detect(&request_info, services).await,
+        None => {
+            build_device_module(settings, || {
+                let host_signals: Arc<dyn HostSignals> =
+                    Arc::new(FastlyHostSignals::from_request(req));
+                Box::new(FastlyDeviceModule::new(host_signals)) as Box<dyn DeviceModule>
+            })
+            .detect(&request_info, services)
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1018,6 +1038,74 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+    }
+
+    /// A device module standing in for one a registration supplies. It marks
+    /// the signals it returns with the cookie header it was shown, so a test
+    /// can tell both that it ran and what it saw.
+    struct MarkedDeviceModule;
+
+    #[async_trait::async_trait(?Send)]
+    impl DeviceModule for MarkedDeviceModule {
+        fn id(&self) -> &'static str {
+            "device.marked"
+        }
+
+        async fn detect(
+            &self,
+            request_info: &dyn trusted_server_core::evidence::RequestInfo,
+            _services: &RuntimeServices,
+        ) -> DeviceSignals {
+            let mut signals = DeviceSignals::derive_ua_only(request_info.user_agent());
+            signals.platform_class = Some(format!(
+                "marked:{}",
+                request_info.header("cookie").unwrap_or_default()
+            ));
+            signals
+        }
+    }
+
+    fn page_request() -> FastlyRequest {
+        let mut req = FastlyRequest::get("https://example.com/");
+        req.set_header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0");
+        req.set_header("cookie", "example_width=1280");
+        req
+    }
+
+    #[test]
+    fn the_device_module_the_registry_resolved_classifies_the_request() {
+        let settings = test_settings();
+        let services = build_finalize_services(&settings, Arc::new(UnavailableKvStore));
+        let registered: Arc<dyn DeviceModule> = Arc::new(MarkedDeviceModule);
+
+        let signals = futures::executor::block_on(derive_device_signals(
+            &settings,
+            Some(registered),
+            &page_request(),
+            &services,
+        ));
+
+        assert_eq!(
+            signals.platform_class.as_deref(),
+            Some("marked:example_width=1280"),
+            "the registered module should run and see the page's cookies"
+        );
+    }
+
+    #[test]
+    fn with_no_registered_module_the_built_in_module_classifies_the_request() {
+        let settings = test_settings();
+        let services = build_finalize_services(&settings, Arc::new(UnavailableKvStore));
+        let req = page_request();
+
+        let signals =
+            futures::executor::block_on(derive_device_signals(&settings, None, &req, &services));
+
+        assert_eq!(
+            signals,
+            DeviceSignals::derive_ua_only(req.get_header_str("user-agent").unwrap_or_default()),
+            "with nothing registered the built-in User-Agent module should answer"
+        );
     }
 
     #[test]
