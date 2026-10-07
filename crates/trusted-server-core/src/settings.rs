@@ -637,10 +637,23 @@ impl Ec {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Rewrite {
-    /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
-    /// URLs from these domains will not be proxied through first-party endpoints.
+    /// Hosts never rewritten, for assets and click-through links.
+    ///
+    /// Each entry is an exact host or `*.example.com`, which matches the apex
+    /// and any subdomain. Matching is case-insensitive. Wins over
+    /// [`Self::include_domains`].
     #[serde(default)]
     pub exclude_domains: Vec<String>,
+    /// When non-empty, the only hosts whose asset URLs are rewritten to
+    /// `/first-party/proxy`.
+    ///
+    /// Same pattern syntax as [`Self::exclude_domains`]. Empty (the default)
+    /// proxies every eligible asset URL. Never applies to click-through links.
+    /// The default is omitted from serialized config so older binaries, which
+    /// reject unknown fields, can still read it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[validate(custom(function = validate_include_domains))]
+    pub include_domains: Vec<String>,
 }
 
 impl Rewrite {
@@ -686,6 +699,11 @@ impl Rewrite {
                 "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
             );
         }
+        self.include_domains = self
+            .include_domains
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .collect();
     }
 }
 
@@ -3399,6 +3417,89 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+/// Rejects `rewrite.include_domains` entries that can never equal a URL host.
+///
+/// Runs after [`Rewrite::normalize`], so entries are already trimmed and
+/// lowercased. Entries are matched against [`Url::host_str`], so each one must
+/// be:
+///
+/// - a DNS name, optionally prefixed with `*.`: one or more `.`-separated,
+///   non-empty labels of ASCII `a-z`, `0-9` and `-`;
+/// - an IPv4 address in dotted-quad form, such as `192.0.2.1`; or
+/// - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+///
+/// A scheme, port, path, space, leading or trailing `.`, empty label, wildcard
+/// IP address or unbracketed IPv6 address is rejected with
+/// `invalid_rewrite_include_domain`. A non-ASCII (IDN) name is rejected with
+/// `non_ascii_rewrite_include_domain`; write it in punycode (`xn--`) form.
+fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> {
+    for pattern in patterns {
+        if !pattern.is_ascii() {
+            let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
+            err.add_param("value".into(), pattern);
+            err.message = Some(
+                "rewrite.include_domains entries must be ASCII; write internationalized domain names in punycode (xn--) form"
+                    .into(),
+            );
+            return Err(err);
+        }
+        if let Err(reason) = check_include_domain(pattern) {
+            let mut err = ValidationError::new("invalid_rewrite_include_domain");
+            err.add_param("value".into(), pattern);
+            err.add_param("reason".into(), &reason);
+            err.message = Some(
+                "rewrite.include_domains entries must be a host name, an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address"
+                    .into(),
+            );
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Checks one normalized ASCII `include_domains` entry, returning why it can
+/// never equal a URL host.
+fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
+    if let Some(bracketed) = pattern.strip_prefix('[') {
+        let address = bracketed
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+            .ok_or("not a bracketed IPv6 address")?;
+        if format!("[{address}]") != pattern {
+            return Err("IPv6 address not in compressed form");
+        }
+        return Ok(());
+    }
+    if pattern.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err("IPv6 address without brackets");
+    }
+
+    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if name.is_empty() {
+        return Err("no host");
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+    }) {
+        return Err("character outside a-z, 0-9, `-` and `.`");
+    }
+    if name.split('.').any(str::is_empty) {
+        return Err("leading or trailing `.` or empty label");
+    }
+
+    // A URL host whose last label is numeric is parsed as an IPv4 address, so
+    // such an entry only matches as an exact dotted-quad address.
+    let last_label = name.rsplit('.').next().unwrap_or(name);
+    let numeric_last_label =
+        last_label.bytes().all(|byte| byte.is_ascii_digit()) || last_label.starts_with("0x");
+    if numeric_last_label
+        && (name.len() != pattern.len() || name.parse::<std::net::Ipv4Addr>().is_err())
+    {
+        return Err("numeric host that is not a dotted-quad IPv4 address");
+    }
+    Ok(())
 }
 
 fn validate_publisher_domain(value: &str) -> Result<(), ValidationError> {
@@ -6614,6 +6715,107 @@ source_domain = "partner.example.com"
             settings.rewrite.exclude_domains,
             vec!["cdn.example.com".to_owned()],
             "should trim, lowercase, and drop inert entries when settings load"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_are_normalized_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            include_domains = ["*.CDN.Example.com", "  img.example.net "]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert_eq!(
+            settings.rewrite.include_domains,
+            vec!["*.cdn.example.com".to_owned(), "img.example.net".to_owned()],
+            "should trim and lowercase include_domains entries"
+        );
+    }
+
+    fn include_domains_toml(entry: &str) -> String {
+        crate_test_settings_str() + &format!("\n[rewrite]\ninclude_domains = [\"{entry}\"]\n")
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_malformed_entries() {
+        for entry in [
+            "",
+            "   ",
+            "*",
+            "*.",
+            "cdn.*.example.com",
+            "**.example.com",
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "cdn.example.com/x",
+            ".example.com",
+            "example.com.",
+            "cdn..example.com",
+            "cdn example.com",
+            "cdn_assets.example.com",
+            "::1",
+            "[::1",
+            "[2001:0db8::1]",
+            "*.192.0.2.1",
+            "192.0.2",
+            "256.0.2.1",
+        ] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject include_domains entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("invalid_rewrite_include_domain"),
+                "should report `{entry}` as an invalid include_domains entry: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint() {
+        for entry in ["bücher.example", "*.bücher.example"] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject non-ASCII entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("non_ascii_rewrite_include_domain"),
+                "should report `{entry}` as non-ASCII: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_accept_hosts_and_ip_literals() {
+        for entry in [
+            "cdn.example.com",
+            "*.example.com",
+            "xn--bcher-kva.example",
+            "192.0.2.1",
+            "[2001:db8::1]",
+            "[::1]",
+        ] {
+            let settings =
+                Settings::from_toml(&include_domains_toml(entry)).unwrap_or_else(|err| {
+                    panic!("should accept include_domains entry `{entry}`: {err:?}")
+                });
+
+            assert_eq!(
+                settings.rewrite.include_domains,
+                vec![entry.to_owned()],
+                "should keep accepted entry `{entry}` as written"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_default_to_empty() {
+        let settings = create_test_settings();
+
+        assert!(
+            settings.rewrite.include_domains.is_empty(),
+            "should default include_domains to an empty list"
         );
     }
 

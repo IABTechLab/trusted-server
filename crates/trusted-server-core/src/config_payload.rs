@@ -736,6 +736,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_rewrite_include_domains_loads_with_empty_list() {
+        let data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let rewrite = data
+            .get("rewrite")
+            .and_then(serde_json::Value::as_object)
+            .expect("should serialize rewrite settings as an object");
+        assert!(
+            !rewrite.contains_key("include_domains"),
+            "should omit the default include list from the payload"
+        );
+
+        let reconstructed = load_settings(&envelope_json(&test_settings()))
+            .expect("should reconstruct settings without include_domains");
+
+        assert!(
+            reconstructed.rewrite.include_domains.is_empty(),
+            "should load an empty include list from a blob without the key"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_survive_blob_round_trip() {
+        let mut original = test_settings();
+        original.rewrite.include_domains = vec!["*.cdn.example.com".to_owned()];
+
+        let reconstructed = load_settings(&envelope_json(&original))
+            .expect("should reconstruct settings with include_domains");
+
+        assert_eq!(
+            reconstructed.rewrite.include_domains,
+            vec!["*.cdn.example.com".to_owned()],
+            "should preserve the configured include list"
+        );
+    }
+
+    #[test]
     fn disabled_rewrite_creatives_survives_blob_round_trip() {
         let mut original = test_settings();
         original.auction.rewrite_creatives = false;
