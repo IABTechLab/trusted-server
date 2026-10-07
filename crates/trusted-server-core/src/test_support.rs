@@ -160,6 +160,14 @@ pub mod tests {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 }
 
+/// Page fixtures shared by core's tests and the tests of a module crate.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fixtures {
+    /// A publisher page carrying the tags of several vendors, as an origin
+    /// would serve it.
+    pub const PUBLISHER_PAGE_HTML: &str = include_str!("html_processor.test.html");
+}
+
 /// The operator-facing settings template, for tests that check what it
 /// documents.
 #[cfg(any(test, feature = "test-utils"))]

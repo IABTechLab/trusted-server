@@ -25,6 +25,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_cmp_didomi::builder(),
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
+        trusted_server_tag_google_tag_manager::builder(),
     ]
 }
 
@@ -58,6 +59,7 @@ mod tests {
                 "cmp.didomi",
                 "cmp.sourcepoint",
                 "cmp.osano",
+                "tag.google-tag-manager",
             ],
             "should offer the stock modules in the order their hooks run"
         );

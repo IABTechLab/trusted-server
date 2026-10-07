@@ -12,6 +12,18 @@
 //! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
 //! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -23,32 +35,37 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
-use crate::error::TrustedServerError;
-use crate::integrations::ScriptTextAccumulator;
-use crate::integrations::{
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::ScriptTextAccumulator;
+use trusted_server_core::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
     IntegrationScriptRewriter, ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
     collect_response_bounded,
 };
-use crate::platform::RuntimeServices;
-use crate::proxy::{FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS, ProxyRequestConfig, proxy_request};
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::proxy::{
+    FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS, ProxyRequestConfig, proxy_request,
+};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 
 /// The name this module is selected by, in `[tag]`.
 pub const MODULE: &str = "tag.google-tag-manager";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         GTM_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
-    .with_module_name(MODULE);
+    .with_module_name(MODULE)
+}
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 /// Host serving the GA beacon endpoints the `/collect` paths are pinned to.
 const GA_COLLECT_HOST: &str = "www.google-analytics.com";
@@ -822,7 +839,7 @@ impl GoogleTagManagerIntegration {
         // Explicitly strip X-Forwarded-For to prevent client IP leakage to Google.
         // The empty value will override any existing header during proxy forwarding.
         proxy_config = proxy_config.with_header(
-            crate::constants::HEADER_X_FORWARDED_FOR,
+            trusted_server_core::constants::HEADER_X_FORWARDED_FOR,
             http::HeaderValue::from_static(""),
         );
 
@@ -1101,15 +1118,19 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::{
+    use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use trusted_server_core::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
         IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
         IntegrationScriptRewriter, ScriptRewriteAction,
     };
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use crate::settings::Settings;
-    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+    use trusted_server_core::settings::Settings;
+    use trusted_server_core::streaming_processor::{
+        Compression, PipelineConfig, StreamingPipeline,
+    };
 
     #[test]
     fn container_id_validation_matches_gtm_pattern() {
@@ -1144,10 +1165,10 @@ mod tests {
         }
     }
 
-    use crate::platform::test_support::noop_services;
-    use crate::test_support::tests::create_test_settings;
     use http::Method;
     use std::io::Cursor;
+    use trusted_server_core::platform::test_support::noop_services;
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     fn build_http_request(method: Method, uri: &str, body: EdgeBody) -> http::Request<EdgeBody> {
         http::Request::builder()
@@ -1739,7 +1760,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response_with_headers(status, b"upstream body".to_vec(), headers);
             let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
             );
             let settings = create_test_settings();
             let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
@@ -1996,7 +2017,7 @@ mod tests {
             assert!(
                 domains
                     .iter()
-                    .any(|pattern| crate::proxy::is_host_allowed(host, pattern)),
+                    .any(|pattern| trusted_server_core::proxy::is_host_allowed(host, pattern)),
                 "should permit {host}: {domains:?}"
             );
         }
@@ -2010,7 +2031,7 @@ mod tests {
             assert!(
                 !domains
                     .iter()
-                    .any(|pattern| crate::proxy::is_host_allowed(host, pattern)),
+                    .any(|pattern| trusted_server_core::proxy::is_host_allowed(host, pattern)),
                 "should refuse {host}: {domains:?}"
             );
         }
@@ -2035,7 +2056,10 @@ mod tests {
         assert!(
             !domains
                 .iter()
-                .any(|pattern| crate::proxy::is_host_allowed("www.googletagmanager.com", pattern)),
+                .any(|pattern| trusted_server_core::proxy::is_host_allowed(
+                    "www.googletagmanager.com",
+                    pattern
+                )),
             "a custom upstream replaces the Google script host: {domains:?}"
         );
     }
@@ -2076,7 +2100,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(status, body.to_vec());
             let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
             );
             let settings = create_test_settings();
             let integration = GoogleTagManagerIntegration::new(config);
@@ -2957,7 +2981,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
                 EdgeBody::empty(),
             );
             req.headers_mut().insert(
-                crate::constants::HEADER_X_FORWARDED_FOR,
+                trusted_server_core::constants::HEADER_X_FORWARDED_FOR,
                 http::HeaderValue::from_static("198.51.100.42"),
             );
 
@@ -2975,9 +2999,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             // We check if X-Forwarded-For is explicitly overridden with an empty string,
             // which effectively strips it during proxy forwarding due to header override logic.
             let has_header_override = proxy_config.headers.iter().any(|(name, value)| {
-                name.as_str()
-                    .eq_ignore_ascii_case(crate::constants::HEADER_X_FORWARDED_FOR.as_str())
-                    && value.is_empty()
+                name.as_str().eq_ignore_ascii_case(
+                    trusted_server_core::constants::HEADER_X_FORWARDED_FOR.as_str(),
+                ) && value.is_empty()
             });
 
             assert!(
@@ -3153,14 +3177,8 @@ assume_single_jurisdiction = true
             )
             .expect("should update gtm config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -3199,14 +3217,8 @@ assume_single_jurisdiction = true
             .expect("should update gtm config");
 
         // 2. Setup Pipeline
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -3217,8 +3229,7 @@ assume_single_jurisdiction = true
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
         // 3. Load Fixture
-        // Path is relative to this file: ../html_processor.test.html
-        let html_content = include_str!("../html_processor.test.html");
+        let html_content = trusted_server_core::test_support::fixtures::PUBLISHER_PAGE_HTML;
 
         // 4. Run Pipeline
         let mut output = Vec::new();
@@ -3271,14 +3282,8 @@ assume_single_jurisdiction = true
             .expect("should update config");
 
         // Inlined Pipeline Creation
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -3658,14 +3663,8 @@ assume_single_jurisdiction = true
             )
             .expect("should update config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -3714,7 +3713,8 @@ assume_single_jurisdiction = true
                 }),
             )
             .expect("should update config");
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let mut pipeline = StreamingPipeline::new(
@@ -3754,8 +3754,10 @@ assume_single_jurisdiction = true
     /// that can't plausibly contain a GTM domain.
     #[test]
     fn fragmented_next_data_survives_with_gtm_enabled() {
-        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use std::io::Cursor;
+        use trusted_server_core::streaming_processor::{
+            Compression, PipelineConfig, StreamingPipeline,
+        };
 
         let mut settings = make_settings();
         settings
@@ -3777,14 +3779,8 @@ assume_single_jurisdiction = true
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -3825,8 +3821,10 @@ assume_single_jurisdiction = true
     /// rewritable origin URL appears later in the payload.
     #[test]
     fn fragmented_next_data_with_trailing_g_survives_gtm() {
-        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
         use std::io::Cursor;
+        use trusted_server_core::streaming_processor::{
+            Compression, PipelineConfig, StreamingPipeline,
+        };
 
         let mut settings = make_settings();
         settings
@@ -3848,14 +3846,8 @@ assume_single_jurisdiction = true
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -3927,5 +3919,14 @@ assume_single_jurisdiction = true
                 "`{text}` should not engage GTM accumulation"
             );
         }
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
     }
 }
