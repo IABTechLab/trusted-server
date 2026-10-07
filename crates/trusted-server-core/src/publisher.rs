@@ -9751,7 +9751,7 @@ mod tests {
                 ),
                 (
                     true,
-                    Some("__Host-ts-console=1; unrelated=example,value"),
+                    Some("__Host-ts-console=1, unrelated=example"),
                     "",
                     "document",
                     false,

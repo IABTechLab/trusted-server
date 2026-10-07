@@ -775,9 +775,15 @@ The classifier uses this deterministic contract:
 - Read Cookie-specific fidelity with `RequestIngress::header_fidelity(&COOKIE)`.
   When octets are not `Preserved`, any Unicode replacement character U+FFFD
   anywhere in any Cookie field is ambiguous. When field multiplicity is not
-  `Preserved`, any literal comma anywhere in any Cookie field is ambiguous,
-  including unrelated or quoted values. Never comma-split, recover guessed
-  field counts, or select a valid-looking session from part of a folded field.
+  `Preserved`, a literal comma is ambiguous when it could be a folded field
+  boundary that changes a reserved result: a comma inside a semicolon-delimited
+  segment whose name is reserved (it could truncate that value), or a comma
+  directly followed, after optional ASCII whitespace, by a reserved name (it
+  could hide an occurrence inside another cookie's value). Commas inside
+  unrelated values, such as JSON-valued third-party cookies, are not ambiguous
+  because they can neither hide nor truncate a reserved occurrence. Never
+  comma-split, recover guessed field counts, or select a valid-looking session
+  from part of a folded field.
   Apply these fallbacks to `Unknown`, `Transformed`, `Unavailable` and missing
   metadata alike; never select them by platform name. A non-preserved status
   alone does not reject readable marker-free fields. Same-name/global field
@@ -1815,7 +1821,8 @@ results, never a prerequisite for returning them.
   per-value and total-header limits without retaining values.
   Cover actual invalid bytes separately from valid non-ASCII UTF-8; missing and
   every non-preserved fidelity status; independent per-Cookie octet/multiplicity
-  overrides; commas/U+FFFD in unrelated and quoted values; marker-free normal
+  overrides; U+FFFD in unrelated and quoted values; commas bordering reserved
+  names versus commas inside unrelated JSON-like values; marker-free normal
   sessions under Unknown; explicit Preserved marker semantics; and aggregate
   size > actual invalid UTF-8 > runtime-ambiguity precedence. Ambiguity makes
   all four states unavailable and suppresses tokens, evidence and trace sidecars.

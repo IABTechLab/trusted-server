@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn trace_shell_off_state_preserves_end_and_recovery_accessibility() {
-        let html = render_setup_shell(&context("unrelated=comma,value; __Host-ts-console=1"))
+        let html = render_setup_shell(&context("unrelated=comma, __Host-ts-console=1"))
             .expect("should retain setup controls when cookie inspection is ambiguous");
         assert!(
             html.contains("data-observed-active=\"false\""),

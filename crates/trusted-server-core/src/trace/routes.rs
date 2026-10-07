@@ -960,7 +960,7 @@ mod tests {
             ("__Host-ts-console=invalid-example", false),
             ("__Host-ts-console", false),
             ("__Host-ts-console=1; __Host-ts-console=1", false),
-            ("__Host-ts-console=1; unrelated=a,b", false),
+            ("__Host-ts-console=1, unrelated=a", false),
             ("__Host-ts-console=1; unrelated=�", false),
             ("", false),
         ] {

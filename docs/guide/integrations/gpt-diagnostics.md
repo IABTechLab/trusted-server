@@ -227,9 +227,11 @@ a release prerequisite or a source of authentication decisions.
 
 The visible Cookie header is capped at 16384 bytes. Invalid visible text or size
 prevents health inspection. When runtime fidelity cannot guarantee preservation,
-ambiguous comma-folded values or replacement characters conservatively make all
-four cookie rows unavailable and suppress capture; marker-free headers with unknown
-fidelity can still activate tracing. This can produce false negatives rather than
+replacement characters, or commas that border a Trusted Server cookie name and
+could be folded field boundaries, conservatively make all four cookie rows
+unavailable and suppress capture. Commas inside unrelated cookie values, such as
+JSON-valued sign-in or consent cookies, do not block tracing; marker-free headers
+with unknown fidelity can still activate tracing. This can produce false negatives rather than
 guessing a session. End remains available for ambiguous cookie observations.
 
 Locally handled authentication, routing and control failures use bounded

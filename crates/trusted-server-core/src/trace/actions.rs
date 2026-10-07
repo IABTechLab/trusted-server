@@ -375,7 +375,7 @@ mod tests {
                 None,
                 Some("__Host-ts-console=invalid-example"),
                 Some("__Host-ts-console=1; __Host-ts-console=1"),
-                Some("__Host-ts-console=1; unrelated=a,b"),
+                Some("__Host-ts-console=1, unrelated=a"),
                 Some("__Host-ts-console=1; unrelated=�"),
             ] {
                 let mut request = request(action);

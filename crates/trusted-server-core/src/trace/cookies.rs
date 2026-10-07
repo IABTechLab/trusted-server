@@ -61,7 +61,7 @@ pub fn inspect_cookies(headers: &HeaderMap, ingress: Option<&RequestIngress>) ->
     };
     if text().any(|value| {
         (!octets_preserved && value.contains('\u{fffd}'))
-            || (!multiplicity_preserved && value.contains(','))
+            || (!multiplicity_preserved && comma_may_fold_reserved(value))
     }) {
         return unavailable(UnavailableCookieDetail::RuntimeHeaderAmbiguous);
     }
@@ -91,6 +91,29 @@ pub fn inspect_cookies(headers: &HeaderMap, ingress: Option<&RequestIngress>) ->
         1 => validate_value(index, first_values[index]),
         _ => CookieHealth::duplicate(),
     }))
+}
+
+/// Whether a comma could be a folded field boundary that changes a reserved
+/// result: a comma inside a reserved cookie's own segment could truncate its
+/// value, and a comma directly before a reserved name could hide an occurrence
+/// inside another cookie's value. Commas inside unrelated values, such as
+/// JSON-valued third-party cookies, can do neither.
+fn comma_may_fold_reserved(field: &str) -> bool {
+    field.split(';').any(|segment| {
+        let mut pieces = segment.split(',');
+        let head = pieces.next().unwrap_or_default();
+        segment.contains(',')
+            && (starts_with_reserved_name(head) || pieces.any(starts_with_reserved_name))
+    })
+}
+
+fn starts_with_reserved_name(piece: &str) -> bool {
+    let name = piece
+        .trim_start_matches(|character: char| character.is_ascii_whitespace())
+        .split(|character: char| character == '=' || character.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    COOKIE_NAMES.contains(&name)
 }
 
 fn unavailable(detail: UnavailableCookieDetail) -> TraceCookies {
@@ -274,7 +297,8 @@ mod tests {
             ("__Host-ts-console=invalid-example", false),
             ("__Host-ts-console", false),
             ("__Host-ts-console=1; __Host-ts-console=1", false),
-            ("__Host-ts-console=1; unrelated=a,b", false),
+            ("__Host-ts-console=1, unrelated=a", false),
+            ("__Host-ts-console=1; g_state={\"i_l\":0,\"i_ll\":1}", true),
             ("ts-tester=true", false),
             ("", false),
         ] {
@@ -475,8 +499,12 @@ mod tests {
                 "__Host-ts-console=1; unrelated=�",
                 "__Host-ts-console=1; unrelated=\"�\"",
                 "__Host-ts-console=1, __Host-ts-console=1",
-                "__Host-ts-console=1; unrelated=\"a,b\"",
-                "__Host-ts-console=1; malformed-unrelated,",
+                "__Host-ts-console=1, unrelated=a",
+                "unrelated=a, __Host-ts-console=1",
+                "unrelated=a,__Host-ts-console=1",
+                "unrelated=a, ts-ec=b; __Host-ts-console=1",
+                "ts-eids=a,b; __Host-ts-console=1",
+                "__Host-ts-console,unrelated=a",
             ] {
                 for metadata in [None, Some(&metadata)] {
                     assert_all(
@@ -485,6 +513,35 @@ mod tests {
                         Some("runtime_header_ambiguous"),
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn commas_inside_unrelated_values_keep_activation_without_comma_splitting() {
+        let metadata = ingress(
+            fidelity(Preservation::Unknown, Preservation::Unknown),
+            vec![],
+        );
+        for field in [
+            "g_state={\"i_l\":0,\"i_ll\":1700000000000}; __Host-ts-console=1",
+            "__Host-ts-console=1; unrelated=\"a,b\"",
+            "__Host-ts-console=1; malformed-unrelated,",
+            "unrelated=a, ts-ec-extra=b; __Host-ts-console=1",
+            "unrelated=a,  , ; __Host-ts-console=1",
+        ] {
+            for metadata in [None, Some(&metadata)] {
+                let actual = inspect(&headers(&[field.as_bytes()]), metadata);
+                assert_eq!(
+                    actual["diagnostics_session"],
+                    health("present_valid", Some("valid_diagnostics_value")),
+                    "should activate when no comma borders a reserved cookie: {field}"
+                );
+                assert_eq!(
+                    actual["ts_ec"],
+                    health("absent", None),
+                    "should never comma-split an unrelated value into a reserved cookie"
+                );
             }
         }
     }
@@ -501,7 +558,7 @@ mod tests {
             (
                 Preservation::Unknown,
                 Preservation::Preserved,
-                "__Host-ts-console=1; unrelated=a,b",
+                "unrelated=a, ts-tester=b; __Host-ts-console=1",
                 "present_valid",
             ),
             (
@@ -513,7 +570,7 @@ mod tests {
             (
                 Preservation::Preserved,
                 Preservation::Unknown,
-                "__Host-ts-console=1; unrelated=a,b",
+                "unrelated=a, ts-tester=b; __Host-ts-console=1",
                 "unavailable",
             ),
         ] {
