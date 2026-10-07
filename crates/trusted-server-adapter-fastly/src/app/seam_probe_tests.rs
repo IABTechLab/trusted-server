@@ -330,6 +330,41 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
     );
 }
 
+/// A demand source a crate outside core supplies builds this adapter's state,
+/// and the same settings are refused without that crate's builder.
+#[test]
+fn demand_source_a_module_supplies_builds_state_only_with_its_builder() {
+    let settings = || {
+        settings_with(&format!(
+            r#"
+        [demand]
+        modules = ["probe"]
+
+        [demand.probe]
+        implementation = "testing.seam-probe"
+        endpoint = "https://demand.example/openrtb2/auction"
+        {HMAC_BLOCK}
+        "#
+        ))
+    };
+
+    let built = build_state_with_registrations(settings(), &[seam_probe::builder()]);
+    assert!(
+        built.is_ok(),
+        "the state should build with the probe's demand source selected: {:?}",
+        built.err()
+    );
+
+    let error = build_state_with_registrations(settings(), &[])
+        .err()
+        .expect("should refuse a demand source no builder in the deployment supplies");
+    let message = error.to_string();
+    assert!(
+        message.contains("[demand] `probe` uses implementation `testing.seam-probe`"),
+        "should name the demand source and the implementation nothing supplies: {message}"
+    );
+}
+
 /// This adapter compiles the auction plan with the builders it is given, so
 /// an ad server a crate outside core supplies builds its state, and the same
 /// settings are refused without that crate's builder.

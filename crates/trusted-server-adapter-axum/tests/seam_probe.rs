@@ -424,8 +424,53 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. An ad server the probe supplies is known to the plan and to validation
+// 6. A demand source and an ad server the probe supplies are known to the
+//    plan and to validation
 // ---------------------------------------------------------------------------
+
+/// `[demand]` selecting the probe's demand source under a label of the
+/// operator's own, with nothing else of the probe's selected.
+const PROBE_DEMAND_BLOCK: &str = r#"
+            [demand]
+            modules = ["probe"]
+
+            [demand.probe]
+            implementation = "testing.seam-probe"
+            endpoint = "https://demand.example/openrtb2/auction"
+"#;
+
+/// A demand source a crate outside core supplies starts the adapter, and the
+/// same settings are refused without that crate's builder, by the adapter and
+/// by deploy validation alike.
+#[test]
+fn demand_source_a_module_supplies_is_known_only_with_its_builder() {
+    let started = TrustedServerApp::routes_with_registrations(
+        settings_with(PROBE_DEMAND_BLOCK),
+        &[seam_probe::builder()],
+    );
+    assert!(
+        started.is_ok(),
+        "the adapter should start with the probe's demand source selected: {:?}",
+        started.err()
+    );
+    validate_settings_for_deploy_with(&settings_with(PROBE_DEMAND_BLOCK), &[seam_probe::builder()])
+        .expect("should accept the probe's demand source when given the probe's builder");
+
+    let error = TrustedServerApp::routes_with_registrations(settings_with(PROBE_DEMAND_BLOCK), &[])
+        .err()
+        .expect("should refuse a demand source no builder in the deployment supplies");
+    let message = error.to_string();
+    assert!(
+        message.contains("[demand] `probe` uses implementation `testing.seam-probe`"),
+        "should name the demand source and the implementation nothing supplies: {message}"
+    );
+    let error = validate_settings_for_deploy_with(&settings_with(PROBE_DEMAND_BLOCK), &[])
+        .expect_err("should refuse the probe's demand source without the probe's builder");
+    assert!(
+        error.to_string().contains("testing.seam-probe"),
+        "should name the implementation nothing supplies: {error}"
+    );
+}
 
 /// `[ad-server]` selecting the probe's ad server under a label of the
 /// operator's own, with nothing else of the probe's selected.

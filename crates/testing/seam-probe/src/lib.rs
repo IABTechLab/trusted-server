@@ -3,8 +3,9 @@
 //!
 //! One registration carries a browser module, a proxy route, a geo module,
 //! an Edge Cookie identity module and a device module, alongside its own
-//! configuration block, and the builder adds a request preparer and an ad
-//! server implementation `[ad-server]` can name. The round-trip
+//! configuration block, and the builder adds a request preparer, a demand
+//! implementation `[demand]` can name and an ad server implementation
+//! `[ad-server]` can name. The round-trip
 //! tests in `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each
 //! of those through a real adapter, so the seam is proven by a caller that core
 //! does not know about.
@@ -26,7 +27,10 @@ use http::header::{self, HeaderValue};
 use http::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
-use trusted_server_core::auction::demand::AdServerImplementation;
+use trusted_server_core::auction::demand::{
+    AdServerImplementation, CompiledDemand, DemandFieldPolicy, DemandImplementation,
+    DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RequestExtensions, accept_endpoint,
+};
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
@@ -277,12 +281,75 @@ impl PlatformGeo for SeamProbeGeo {
     }
 }
 
-/// The name an `[ad-server.<name>] implementation` line selects the probe's
-/// ad server by, which is the probe's module name.
+/// The name an `[ad-server.<name>]` or `[demand.<name>]` `implementation`
+/// line selects the probe's ad server or demand source by, which is the
+/// probe's module name.
 ///
 /// A static cannot call [`module_name`], so the literal is written out and
-/// `ad_server_name_is_the_module_name` keeps it honest.
+/// `auction_implementations_are_named_as_the_module` keeps it honest.
 pub const SEAM_PROBE_ADSERVER_NAME: &str = "testing.seam-probe";
+
+/// The probe's demand implementation, registered on its builder.
+pub static SEAM_PROBE_DEMAND: DemandImplementation = DemandImplementation {
+    id: SEAM_PROBE_ADSERVER_NAME,
+    default_timeout: DemandTimeoutDefault::Auction,
+    allows_all_eligible: false,
+    serves_stored_requests: false,
+    canonicalize_endpoint: accept_endpoint,
+    compile: compile_demand,
+};
+
+/// A demand source that sends the standard request with nothing of its own
+/// and reads every answer as no bid, so the auction's demand seam is reached
+/// from a crate core does not know.
+struct SeamProbeDemand;
+
+/// Compiles the probe's demand source, which takes no settings of its own.
+///
+/// # Errors
+///
+/// Returns an error naming the first setting the table carries, because the
+/// source reads none.
+fn compile_demand(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
+    if let Some(key) = settings.keys().next() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("the seam probe's demand source takes no setting, and `{key}` is set"),
+        }));
+    }
+    Ok(Arc::new(SeamProbeDemand))
+}
+
+#[async_trait(?Send)]
+impl CompiledDemand for SeamProbeDemand {
+    fn field_policy(&self) -> DemandFieldPolicy {
+        DemandFieldPolicy::default()
+    }
+
+    fn augment_request(
+        &self,
+        _extensions: &mut RequestExtensions<'_>,
+        _input: &ProviderAuctionInput,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Ok(())
+    }
+
+    async fn parse_response(
+        &self,
+        context: DemandResponse<'_>,
+        _response: PlatformResponse,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        Ok(AuctionResponse::no_bid(
+            context.provider_id,
+            context.response_time_ms,
+        ))
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
 
 /// The probe's ad server implementation, registered on its builder.
 pub static SEAM_PROBE_ADSERVER: AdServerImplementation = AdServerImplementation {
@@ -512,6 +579,7 @@ pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(SEAM_PROBE_ID, SEAM_PROBE_SOURCE, register, validate)
         .with_module_name(module_name())
         .with_request_preparer(prepare_request)
+        .with_demand(&SEAM_PROBE_DEMAND)
         .with_adserver(&SEAM_PROBE_ADSERVER)
 }
 
@@ -662,11 +730,34 @@ mod tests {
     }
 
     #[test]
-    fn ad_server_name_is_the_module_name() {
+    fn auction_implementations_are_named_as_the_module() {
         assert_eq!(
-            SEAM_PROBE_ADSERVER_NAME,
+            SEAM_PROBE_ADSERVER.id,
             module_name(),
             "the ad server is named as the crate's folder below `crates/` names it"
+        );
+        assert_eq!(
+            SEAM_PROBE_DEMAND.id,
+            module_name(),
+            "the demand source is named as the crate's folder below `crates/` names it"
+        );
+    }
+
+    #[test]
+    fn the_demand_source_refuses_a_setting_it_does_not_read() {
+        let mut settings = serde_json::Map::new();
+        settings.insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+
+        assert!(
+            compile_demand(&serde_json::Map::new()).is_ok(),
+            "an empty table should compile"
+        );
+        let error = compile_demand(&settings)
+            .err()
+            .expect("should refuse a setting the source does not read");
+        assert!(
+            error.to_string().contains("`unexpected`"),
+            "should name the setting: {error}"
         );
     }
 
