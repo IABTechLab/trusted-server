@@ -144,7 +144,7 @@ code a page asks for onto one of the declared demand providers. Its
 | Concern     | Type     | Trait              | Default                     | Opt-in implementations                                                                                                      |
 | ----------- | -------- | ------------------ | --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | EC identity | `ec`     | `EdgeCookieModule` | none (stateless)            | `hmac` (HMAC over client IP, preserves today's identity), `host_signals` (see below), and `client_fixed` (demo builds only) |
-| Device      | `device` | `DeviceProvider`   | `builtin` (User-Agent only) | `fastly` (TLS JA4 and HTTP/2 signals through an injected `HostSignals` service)                                             |
+| Device      | `device` | `DeviceModule`     | `builtin` (User-Agent only) | `fastly` (TLS JA4 and HTTP/2 signals through an injected `HostSignals` service)                                             |
 | Geo         | `geo`    | `PlatformGeo`      | `none` (no location)        | `platform` (host geo lookup)                                                                                                |
 
 The geo trait is the existing `PlatformGeo` in `platform/traits.rs` rather
@@ -294,7 +294,7 @@ resolved in the implementation:
   permission state and consent context so a module can read them for
   behavior beyond gating. The gate itself has already run before `generate`
   is called, so a module cannot use the fields to authorize itself.
-- `required_permissions` on `DeviceProvider` and `PlatformGeo`: **present,
+- `required_permissions` on `DeviceModule` and `PlatformGeo`: **present,
   with an empty default. A module device declaration is refused rather than
   ignored, and a geo declaration is not consulted.** The draft removed the
   method from both traits because PR
@@ -427,7 +427,7 @@ structural:
   signal), not raw signals, and the neutral default persists
   neither because the builtin module produces no such fields.
 - **Device: a declared permission is refused at startup, not ignored at
-  request time.** `DeviceProvider::required_permissions` has no
+  request time.** `DeviceModule::required_permissions` has no
   enforcement point on the device path, so a declaration cannot be
   honored. Before the module seam that was inert, because core and the
   host supplied the only two device modules and both declare the empty
@@ -719,7 +719,7 @@ As landed:
    and KV normalization, the global identifier bounds, selection and
    validation, the vendor block capture, the deprecated-passphrase
    migration, and the round-trip proof with a non-default module.
-2. **PR #1044, device and geo selection.** `DeviceProvider` with the
+2. **PR #1044, device and geo selection.** `DeviceModule` with the
    builtin default and the opt-in Fastly host-evidence module,
    `PlatformGeo` selection with the no-geo default, all four adapters
    routed through the shared builders, and the opt-in `host_signals` EC

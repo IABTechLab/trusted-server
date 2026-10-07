@@ -336,22 +336,28 @@ core ends up naming no vendor while still shipping a default for each
 capability.
 
 - The registration builder gains three optional capabilities, at most one
-  of each per registration (names indicative, the shape is normative):
-  `.with_ec_module(Arc<dyn EdgeCookieModule>)`,
-  `.with_geo_provider(Arc<dyn PlatformGeo>)` and
-  `.with_device_provider(Arc<dyn DeviceProvider>)`. The traits are the ones
-  #1043 and #1044 define, unchanged.
+  of each per registration:
+  `.with_ec_module(name, Arc<dyn EdgeCookieModule>)`,
+  `.with_geo_module(name, Arc<dyn PlatformGeo>)` and
+  `.with_device_module(name, Arc<dyn DeviceModule>)`. Each is declared
+  under a name, which is the path under `crates/` of the crate the module
+  lives in, so one registration can supply a module of each type, each
+  under the name of its own crate. An Edge Cookie module is declared under
+  the name its own `id` returns. The traits are the ones #1043 and #1044
+  define, unchanged.
 - Selection keeps the select-exactly-one semantics of #986. `[ec] module`,
-  `[geo] module` and `[device] module` each name one implementation, and
-  every implementation reaches those selectors the same way, through an
-  integration builder's registration. Core names none of them. A selector
-  that names a registration which does not declare the matching capability,
-  or a name this build does not carry, is a startup error, and the message
-  lists the implementations the build does carry. A registration that
-  declares a capability no selector names is inert for that capability and
-  its other hooks still run, and startup logs a warning naming the
-  registration and the unused capability, so an operator can see a module
-  shipping script for a module that is not selected.
+  `[geo] module` and `[device] module` each name one implementation by the
+  name it was declared under, read the way a section reads a name, as
+  written or with the type folder (`edgecookie`, `geo` or `device`) in
+  front, and every implementation reaches those selectors the same way,
+  through an integration builder's registration. Core names none of them.
+  A `[geo] module` or `[device] module` that names a module which supplies
+  no module of that type, or a name no running module supplies, is a
+  startup error, and the message lists the modules of that type the
+  deployment runs. A registration that declares a capability no selector
+  names is inert for that capability and its other hooks still run, and
+  startup logs a warning naming the unused module, so an operator can see
+  a module shipping script for a module that is not selected.
 - No module is built into core. Everything goes through one method, so
   the HMAC identity module from #1043 and the User-Agent-only device
   module from #1044 become Tech Lab-owned crates under
@@ -369,9 +375,9 @@ capability.
 - Composition. The composition root resolves the selected module for
   each capability from the registry once at startup and places it in the
   per-request services, so the request path is unchanged from #1043 and
-  #1044. Adapters stop injecting vendor modules directly (the
-  `ec_provider` slot on the runtime services builder and the injected
-  closures in `build_device_module` and `build_geo_module` go). Host
+  #1044. Adapters stop injecting vendor modules directly (the Edge Cookie
+  module an adapter holds for itself and the injected closures in
+  `build_device_module` and `build_geo_module` go). Host
   defaults are still supplied by the adapter as platform services and are
   consumed by whichever implementation is selected, through the request
   evidence and host signal abstractions, exactly as now. A module that needs a host signal
@@ -697,7 +703,7 @@ defines, and both should land before the first vendor is asked to use it.
 ## 9. Sign-off
 
 | #   | Decision                                                                                                                                                                                                                                                                                                                                                   | Status               |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --- |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                                                                                                                                                                                                  | Proposed             |
 | 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                                                                                                                                                                                                     | Proposed, governance |
 | 3   | A registration may carry its own browser JavaScript                                                                                                                                                                                                                                                                                                        | Proposed             |
@@ -707,11 +713,11 @@ defines, and both should land before the first vendor is asked to use it.
 | 7   | Identity, geo and device modules are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                            | Proposed             |
 | 8   | No module is built into core, because HMAC and the User-Agent-only device module are Tech Lab-owned crates registered by an integration builder and selected by `[ec] module` and `[device] module`, neither being a page integration, and core keeps only `none`                                                                                          | Proposed             |
 | 9   | This spec and its core implementation precede #1043, so 51Degrees implements the core seam and the nine vendor moves in §4 stay one PR each                                                                                                                                                                                                                | Proposed             |
-| 10  | What an operator selects is a module, selected with `module` or `modules` in every type's table (§2)                                                                                                                                                                                                                                                       |                      |     |
-| 11  | The built-in integrations are discovered at build time, and an external crate registers through the adapter (§3.1)                                                                                                                                                                                                                                         |                      |     |
-| 12  | A page change is one middleware, run only where an ordered `[[fetch]]` or `[[serve]]` entry names it, in two phases (§3.7)                                                                                                                                                                                                                                 |                      |     |
-| 13  | A vendor crate pins its own dependency versions and releases without a pull request here, and Tech Lab reviews it (§2)                                                                                                                                                                                                                                     |                      |     |
-| 14  | A module is named by its crate folder, and a page integration is selected from the section of its type, so there is no `[integration]` section (§2)                                                                                                                                                                                                        |                      |     |
+| 10  | What an operator selects is a module, selected with `module` or `modules` in every type's table (§2)                                                                                                                                                                                                                                                       | Proposed             |
+| 11  | The built-in integrations are discovered at build time, and an external crate registers through the adapter (§3.1)                                                                                                                                                                                                                                         | Proposed             |
+| 12  | A page change is one middleware, run only where an ordered `[[fetch]]` or `[[serve]]` entry names it, in two phases (§3.7)                                                                                                                                                                                                                                 | Proposed             |
+| 13  | A vendor crate pins its own dependency versions and releases without a pull request here, and Tech Lab reviews it (§2)                                                                                                                                                                                                                                     | Proposed             |
+| 14  | A module is named by its crate folder, and a page integration is selected from the section of its type, so there is no `[integration]` section (§2)                                                                                                                                                                                                        | Proposed             |
 
 ## Revision record
 
@@ -730,7 +736,10 @@ defines, and both should land before the first vendor is asked to use it.
   their implementations by module path (§3.4, pluggable spec §2.1). The
   profile ids quoted from `main` in §3.4 are corrected to `standard` and
   `prebid-server`. The response header design names DataDome's settings
-  under `[bot-protection.datadome]`.
+  under `[bot-protection.datadome]`. A registration declares its Edge
+  Cookie, geo and device modules under a name, and the three selectors read
+  that name the way a section does (§3.6). The device trait is
+  `DeviceModule`, as the code names it (pluggable spec).
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
