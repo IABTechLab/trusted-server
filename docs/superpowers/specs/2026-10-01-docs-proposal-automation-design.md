@@ -167,9 +167,14 @@ Documented in `scripts/README.md`:
 
 ## Security
 
-- Copilot runs with a read-only `contents` token and an allowlist of read-only
+- Copilot runs with a read-only `contents` token and an allowlist of git
   shell tools; it has no network shell, no push, and no pull request
   permissions.
+- The tool allowlist is not the boundary. Copilot can write any file in the
+  checkout, and `propose.sh` then runs `npm` in `docs/`, so the `propose` job
+  is treated as able to run arbitrary code. Its token is read-only, neither it
+  nor `validate` restores or saves a dependency cache, and its artifact is
+  re-checked by `validate.sh` and `publish.sh`.
 - Input is code already merged to `main`, so no untrusted fork content reaches
   the agent.
 - The path allowlist is enforced by `validate.sh` and again by `publish.sh`,

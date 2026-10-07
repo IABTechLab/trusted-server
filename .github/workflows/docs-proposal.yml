@@ -40,6 +40,8 @@ env:
 
 jobs:
   # Copilot runs here with a read-only token; it cannot push or open PRs.
+  # Copilot can write files that later steps execute, so treat this job as
+  # untrusted: it uses no dependency cache that later runs would restore.
   propose:
     runs-on: ubuntu-latest
     permissions:
@@ -69,8 +71,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
-          cache-dependency-path: source/docs/package-lock.json
 
       - name: Install Copilot CLI
         run: npm install -g @github/copilot@1.0.90
@@ -90,7 +90,7 @@ jobs:
           if-no-files-found: error
 
   # VitePress executes Vue in Markdown during the build, so the docs gates run
-  # here with no write token or persisted credentials.
+  # here with no write token, persisted credentials, or dependency cache.
   validate:
     needs: propose
     runs-on: ubuntu-latest
@@ -120,8 +120,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
-          cache-dependency-path: source/docs/package-lock.json
 
       - name: Download proposal
         uses: actions/download-artifact@v4
