@@ -595,10 +595,10 @@ that the project pays for today, most recently in PR #1054.
 
 A probe integration built outside `trusted-server-core` and registered
 through an adapter exercised every seam end to end. Eight things surfaced
-that reading the code did not, and two more came from reading the settings
-loader for what a vendor with a secret, and a vendor with an ad server,
-would need. They are recorded here rather than left for each vendor to
-rediscover.
+that reading the code did not, and three more came from reading the
+settings loader and the Fastly entry point for what a vendor with a secret,
+an ad server or a device module would need. They are recorded here rather
+than left for each vendor to rediscover.
 
 1. **A vendor's own deploy rules do not run through the operator CLI.**
    `ts config validate` and `ts config push` reach validation through
@@ -712,6 +712,15 @@ rediscover.
     through deploy validation, and has the probe supply an ad server so the
     auction seam is reached from a crate core does not know. A demand
     source from such a crate is not yet proven the same way.
+11. **A device module is asked on Fastly alone.** Only the Fastly adapter
+    classifies a request and sets device signals, on `main` as in this
+    stack, so a device module a crate supplies runs there and on no other
+    adapter, where `[device] module` resolves it and nothing asks it. On
+    Fastly the entry point derives the signals before the request reaches
+    the application, so the implementation (#1094) hands it the module the
+    registry resolved. Acceptance item 2 asks that a request's device
+    signals be the test integration's, which can therefore be shown on
+    Fastly and not on the dev server.
 
 Items 1, 6 and 7 are the ones a vendor meets on its first day, item 9
 joins them for a vendor with a secret, and item 7 decides whether any of
@@ -772,7 +781,8 @@ use it.
   code names DataDome, and sign-off row 6 says what that means for the
   DataDome move. §8 item 6 says where a vendor's validate function now
   runs, and item 10 records that a deployment hands its builders to the
-  settings load.
+  settings load. Item 11 records that a device module is asked on Fastly
+  alone.
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
