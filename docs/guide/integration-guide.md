@@ -225,7 +225,7 @@ integration's own rules, and core never names the vendor.
 than something to deploy, and it exercises every part of the seam from a
 vendor crate's position. The round-trip tests in
 `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each part
-through a real adapter.
+through the Axum adapter, and the Fastly adapter carries the same round trip.
 
 ### What the crate provides
 
@@ -347,10 +347,21 @@ let router = TrustedServerApp::routes_with_registrations(settings, &builders)?;
 configuration envelope itself, and `validate_settings_for_deploy_with` is the
 deploy check with the same builders.
 
-The Fastly adapter is a binary rather than a library and its
-`build_state_with_registrations` is private to the crate, so a Fastly
-deployment that ships a vendor crate has to pass the builders inside that
-adapter.
+The Fastly adapter is a library with a thin binary over it, so a Fastly
+deployment that ships a vendor crate has a binary of its own. `run_with`
+records the builders before any request is served, and they are handed to
+the settings load and composed with the built-in ones when the application
+state is built.
+
+```rust
+fn main() {
+    trusted_server_adapter_fastly::run_with(vec![example_integration::builder()]);
+}
+```
+
+The round-trip tests in
+`crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive the
+probe through the Fastly adapter under Viceroy.
 
 ### Two traps a vendor will hit
 

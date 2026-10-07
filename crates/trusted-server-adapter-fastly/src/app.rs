@@ -45,7 +45,7 @@
 //! > **Note:** Methods not in the list above (e.g. `TRACE`, `CONNECT`, WebDAV verbs) return a
 //! > router-level 405. Legacy routing proxied *every* method through to the publisher origin.
 //! > This is a known intentional restriction of the EdgeZero router; the entry-point
-//! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
+//! > `apply_finalize_headers` call in `lib.rs` still adds TS headers to those 405 responses.
 //!
 //! # EC identity lifecycle
 //!
@@ -145,7 +145,9 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
+use trusted_server_core::settings_data::{
+    DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store_with,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 use trusted_server_device_fastly::FastlyHostSignals;
 
@@ -220,12 +222,17 @@ pub(crate) fn build_state(
 pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    get_settings_from_config_store(
+    // The settings are validated as they load, so the builders a deployment
+    // registered are supplied here as well as to the state build. Without
+    // them a `[demand]` or `[ad-server]` name one of them supplies is refused
+    // before the state that knows them is built.
+    get_settings_from_config_store_with(
         &FastlyPlatformConfigStore,
         &FastlyPlatformSecretStore,
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
+        registered_integrations(),
     )
 }
 
@@ -239,7 +246,29 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_with_registrations(settings, &[])
+    build_state_with_registrations(settings, registered_integrations())
+}
+
+/// The integration builders a deployment offered through
+/// [`crate::run_with`], set once before any request is served.
+///
+/// Held here rather than threaded through the build, because the state is
+/// built inside the `EdgeZero` application hooks, which take no arguments.
+/// [`IntegrationBuilder`] is `Copy` and holds only function pointers and
+/// static references, so nothing here can change once it is set.
+static REGISTERED_INTEGRATIONS: std::sync::OnceLock<Vec<IntegrationBuilder>> =
+    std::sync::OnceLock::new();
+
+/// Records the builders a deployment offers. The first call wins, and
+/// [`crate::run_with`] is the only caller, so nothing registers after serving
+/// has begun.
+pub(crate) fn register_integrations(builders: Vec<IntegrationBuilder>) {
+    let _ = REGISTERED_INTEGRATIONS.set(builders);
+}
+
+/// The builders a deployment registered, or none.
+fn registered_integrations() -> &'static [IntegrationBuilder] {
+    REGISTERED_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
 }
 
 /// Build the application state from explicit settings, composing the built-in
@@ -481,7 +510,7 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 // EC request state
 // ---------------------------------------------------------------------------
 
-/// EC state threaded from route handlers to the `main.rs` entry point via
+/// EC state threaded from route handlers to the `lib.rs` entry point via
 /// response extensions.
 ///
 /// `edgezero_main` pops this from the response after dispatch and runs
@@ -1207,7 +1236,7 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
 /// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
 /// mirroring [`crate::http_error_response`] exactly.
 ///
-/// The near-identical function in `main.rs` is intentional: the legacy path
+/// The near-identical function in `lib.rs` is intentional: the legacy path
 /// uses fastly HTTP types while this path uses `edgezero_core` types.
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
@@ -1578,6 +1607,9 @@ impl Hooks for TrustedServerApp {
         }
     }
 }
+
+#[cfg(test)]
+mod seam_probe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2927,7 +2959,7 @@ mod tests {
         // does not inject TS headers at this layer.
         //
         // The full-system guarantee (TS headers on ALL responses including these 405s)
-        // is maintained by the entry-point apply_finalize_headers call in main.rs.
+        // is maintained by the entry-point apply_finalize_headers call in lib.rs.
         let router = test_router();
         let req = empty_request(
             Method::from_bytes(b"TRACE").expect("should parse TRACE"),
@@ -2946,7 +2978,7 @@ mod tests {
                 .headers()
                 .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .is_none(),
-            "router-level 405 bypasses FinalizeResponseMiddleware; main.rs entry-point covers this"
+            "router-level 405 bypasses FinalizeResponseMiddleware; lib.rs entry-point covers this"
         );
     }
 
