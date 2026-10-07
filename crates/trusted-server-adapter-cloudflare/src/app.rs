@@ -85,7 +85,7 @@ pub struct AppState {
     /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
     /// `None` for a deployment that selects no module.
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    /// The permission signal modules `[permission_signal] module` selects
+    /// The permission signal modules `[permission-signal] modules` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.

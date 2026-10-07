@@ -53,15 +53,16 @@ fn all_five() -> Vec<Arc<dyn PermissionSignalModule>> {
     modules
 }
 
-/// Settings naming these identifiers in `[permission_signal] module`.
+/// Settings naming these identifiers in `[permission-signal] modules`.
 fn settings_naming(names: &[&str]) -> Settings {
     let mut settings = Settings::default();
-    settings.permission_signal.module = Some(names.iter().map(|name| (*name).to_owned()).collect());
+    settings.permission_signal.modules =
+        Some(names.iter().map(|name| (*name).to_owned()).collect());
     settings
 }
 
 /// The modules a deployment gets from naming these identifiers in
-/// `[permission_signal] module`, through the same entry point an adapter's
+/// `[permission-signal] modules`, through the same entry point an adapter's
 /// composition root uses.
 fn configured(names: &[&str]) -> Arc<[Arc<dyn PermissionSignalModule>]> {
     build_permission_signal_modules(&settings_naming(names), &all_four())
@@ -73,8 +74,8 @@ fn configured(names: &[&str]) -> Arc<[Arc<dyn PermissionSignalModule>]> {
 fn all_but(excluded: &str) -> Arc<[Arc<dyn PermissionSignalModule>]> {
     let names: Vec<&str> = all_four()
         .iter()
-        .map(|module| module.id())
-        .filter(|id| *id != excluded)
+        .map(|module| trusted_server_core::permission_signal::short_name(module.as_ref()))
+        .filter(|name| *name != excluded)
         .collect();
     configured(&names)
 }
@@ -156,11 +157,11 @@ fn us_ca_geo() -> GeoInfo {
 #[test]
 fn the_documented_names_select_every_shipped_module_in_order() {
     // The names the guide and the example configuration list, which must be
-    // the identifiers the shipped crates answer to.
-    let documented = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"];
+    // the names the shipped crates answer to within the section.
+    let documented = ["gpc", "gpp", "us-privacy", "tcf"];
     let selected: Vec<&str> = configured(&documented)
         .iter()
-        .map(|module| module.id())
+        .map(|module| trusted_server_core::permission_signal::short_name(module.as_ref()))
         .collect();
     assert_eq!(
         selected, documented,
@@ -169,16 +170,16 @@ fn the_documented_names_select_every_shipped_module_in_order() {
 }
 
 #[test]
-fn an_old_hyphenated_name_is_refused_naming_the_names_available() {
-    for old in ["gpp-sale-opt-out", "us-privacy"] {
+fn an_old_name_is_refused_naming_the_names_available() {
+    for old in ["gpp_sale_opt_out", "us_privacy"] {
         let Err(error) = build_permission_signal_modules(&settings_naming(&[old]), &all_four())
         else {
-            panic!("should refuse the hyphenated name `{old}`");
+            panic!("should refuse the old name `{old}`");
         };
         let message = format!("{error:?}");
         assert!(
             message.contains(&format!("`{old}` is not available in this build"))
-                && message.contains("Available modules are gpc, gpp_sale_opt_out, us_privacy, tcf"),
+                && message.contains("Available modules are gpc, gpp, us-privacy, tcf"),
             "the refusal names the old name and the names to write instead: {message}"
         );
     }

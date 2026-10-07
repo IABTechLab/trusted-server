@@ -73,8 +73,8 @@ The last module with an opinion decides, so the order is the policy. It is a
 deployment's to set, not the code's to assume.
 
 ```toml
-[permission_signal]
-module = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf", "mtm"]
+[permission-signal]
+modules = ["gpc", "gpp", "us-privacy", "tcf", "mtm"]
 ```
 
 A module not on the list does not run, and there is no separate switch. A
@@ -82,9 +82,9 @@ publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the module that reads the header then does not run. One
 caveat: the core's consent pipeline can also synthesize a US Privacy opt-out
 from that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us_privacy` module then acts on the record
+which they do by default, and the `us-privacy` module then acts on the record
 it produced. A publisher who wants the header to have no effect at all turns
-that setting off as well. Leaving `module` out, or the section entirely, runs
+that setting off as well. Leaving `modules` out, or the section entirely, runs
 every module the adapter offers, in the order it offers them, so a signal is
 never quietly ignored because someone forgot to list it. An empty list runs
 none of them, which is a publisher acting on no signal at all, and leaves every
@@ -95,9 +95,11 @@ refused at startup rather than ignored, so a typo cannot silently stop a
 scheme being honored. What ran, and what was left out, is written to the log
 once at startup.
 
-Modules are named in `snake_case`, lowercase words joined by underscores. A
-module that gains settings will take them in a `[permission_signal.<name>]`
-block named for it. None of the five that ship has settings, so `module` is
+A module is named by its crate folder below `crates/permission-signal`, so
+`gpp` and `us-privacy` are the folders those crates live in, and a name may
+also be written in full, as `permission-signal.gpp`. A module that gains
+settings will take them in a `[permission-signal.<name>]`
+block named for it. None of the five that ship has settings, so `modules` is
 the only key the section accepts, and a block or any other key is refused as
 an unknown field rather than ignored.
 
@@ -112,13 +114,13 @@ question about a jurisdiction and a publisher.
 
 ## The modules that ship
 
-| Identifier         | Crate                                 | Reads                                                                 |
-| ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
-| `gpc`              | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                          |
-| `gpp_sale_opt_out` | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string                           |
-| `us_privacy`       | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string                               |
-| `tcf`              | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code                     |
-| `mtm`              | `crates/permission-signal/mtm`        | The PMP answer, one of two words, under the Model Terms for Marketing |
+| Name         | Crate                                 | Reads                                                                 |
+| ------------ | ------------------------------------- | --------------------------------------------------------------------- |
+| `gpc`        | `crates/permission-signal/gpc`        | The `Sec-GPC` header, Global Privacy Control                          |
+| `gpp`        | `crates/permission-signal/gpp`        | The US sale opt-out carried in a GPP string                           |
+| `us-privacy` | `crates/permission-signal/us-privacy` | The sale opt-out in a US Privacy string                               |
+| `tcf`        | `crates/permission-signal/tcf`        | A TCF v2 record, with the purpose mapping in code                     |
+| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of two words, under the Model Terms for Marketing |
 
 The three opt-outs are separate so that a publisher who does not act on Global
 Privacy Control can remove it and keep the other two. What an opt-out takes
@@ -219,8 +221,8 @@ request carries for it.
 
 1. Create a crate that depends on `trusted-server-core` and implements
    `PermissionSignalModule` from `trusted_server_core::permission_signal`.
-   Give it a stable identifier in `snake_case`, which is the name
-   configuration uses.
+   Its name is its crate folder below `crates/permission-signal`, through
+   `module_name!()`, which is the name configuration uses.
 2. Answer neutral for a permission the scheme has no opinion on, including
    when its signal is absent from the request. Reading an absent signal as a
    refusal would revoke the permission on every request that did not carry
