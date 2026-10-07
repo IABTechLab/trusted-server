@@ -6635,6 +6635,32 @@ source_domain = "partner.example.com"
             !settings.auction.sanitize_creatives,
             "creative sanitization is opt-in when the setting is omitted"
         );
+        assert_eq!(
+            settings.auction.rewrite_clicks, None,
+            "click rewriting stays unset when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_clicks_accepts_explicit_values() {
+        for value in [true, false] {
+            let toml_str = crate_test_settings_str()
+                + &format!(
+                    r#"
+            [auction]
+            enabled = true
+            rewrite_clicks = {value}
+            "#
+                );
+
+            let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+            assert_eq!(
+                settings.auction.rewrite_clicks,
+                Some(value),
+                "should parse explicit rewrite_clicks = {value}"
+            );
+        }
     }
 
     #[test]
