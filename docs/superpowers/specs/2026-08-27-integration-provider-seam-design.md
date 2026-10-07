@@ -595,9 +595,10 @@ that the project pays for today, most recently in PR #1054.
 
 A probe integration built outside `trusted-server-core` and registered
 through an adapter exercised every seam end to end. Eight things surfaced
-that reading the code did not, and a ninth came from reading the settings
-loader for what a vendor with a secret would need. They are recorded here
-rather than left for each vendor to rediscover.
+that reading the code did not, and two more came from reading the settings
+loader for what a vendor with a secret, and a vendor with an ad server,
+would need. They are recorded here rather than left for each vendor to
+rediscover.
 
 1. **A vendor's own deploy rules do not run through the operator CLI.**
    `ts config validate` and `ts config push` reach validation through
@@ -655,16 +656,16 @@ rather than left for each vendor to rediscover.
    hand-written handlers through one wrapper, which is worth doing before a
    vendor depends on it.
 
-6. **A module's validate function runs nowhere in a real deployment.**
-   Building the registry calls only a builder's build function, and the
-   operator CLI calls deploy validation without the builders, so a vendor
-   whose checks live in `validate` has them enforced on no path at all. The
-   probe works around it by repeating its check inside its build function,
-   which every vendor would have to copy. Either the registry runs
-   `validate` when it builds, or the operator path carries the builders,
-   and the second is item 1. This is the same gap as item 1 seen from the
-   other side, and together they mean §3.3 is not yet delivered in
-   practice even though the hook exists.
+6. **A module's validate function runs only where a deployment hands the
+   settings load its builders.** Building the registry calls only a
+   builder's build function, and the operator CLI calls deploy validation
+   without the builders. Validation at startup runs while the settings
+   load, and the implementation (#1094) gives the load a form that takes a
+   deployment's builders, so a vendor's `validate` runs at startup for a
+   deployment that loads its settings with them. The probe still repeats
+   its check inside its build function, which covers a deployment that does
+   not. The operator path is item 1, and until it carries the builders §3.3
+   is delivered at startup and not when an operator pushes.
 7. **The Fastly adapter cannot take a vendor crate at all.** Its
    `build_state_with_registrations` is crate-private and it has no library
    target, so composing a module into a Fastly deployment means editing the
@@ -702,6 +703,15 @@ rather than left for each vendor to rediscover.
    resolved only when a section selects the module and refused when one
    points outside the module's own table. The DataDome move in §4 needs it
    first.
+10. **A deployment hands its builders to the settings load as well as to
+    the state build.** The settings are validated as they load, and that
+    validation compiles the auction plan. With the built-in implementations
+    alone it refuses a `[demand]` or `[ad-server]` name one of the
+    deployment's own builders supplies, before any adapter state is built.
+    The implementation (#1094) carries the builders through the load and
+    through deploy validation, and has the probe supply an ad server so the
+    auction seam is reached from a crate core does not know. A demand
+    source from such a crate is not yet proven the same way.
 
 Items 1, 6 and 7 are the ones a vendor meets on its first day, item 9
 joins them for a vendor with a secret, and item 7 decides whether any of
@@ -712,9 +722,11 @@ depends on which host the reporter runs.
 Taken together these say the seam is proven but not yet finished. A vendor
 can register a module, ship its browser code, declare a geo module and
 serve a route, all from its own crate and proven end to end. It cannot yet
-do that on Fastly, and its own configuration rules are not enforced
-anywhere. Both are small changes against what this document already
-defines, and both should land before the first vendor is asked to use it.
+do that on Fastly, and its own configuration rules are enforced at startup
+only for a deployment that loads its settings with its builders, and never
+when an operator pushes. Both are small changes against what this document
+already defines, and both should land before the first vendor is asked to
+use it.
 
 ## 9. Sign-off
 
@@ -758,7 +770,9 @@ defines, and both should land before the first vendor is asked to use it.
   `DeviceModule`, as the code names it (pluggable spec). §8 gains item 9,
   that a vendor crate cannot declare a secret setting and core's settings
   code names DataDome, and sign-off row 6 says what that means for the
-  DataDome move.
+  DataDome move. §8 item 6 says where a vendor's validate function now
+  runs, and item 10 records that a deployment hands its builders to the
+  settings load.
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
