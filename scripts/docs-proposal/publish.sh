@@ -29,6 +29,18 @@ if [ -n "$existing" ] && [ "$pr_state" != "OPEN" ]; then
   exit 0
 fi
 
+# Maintainers push to the proposal branch, and applying a review suggestion
+# commits there too. Never overwrite or delete commits beyond the generated
+# proposal, whose only parent is the merge commit.
+remote_head=""
+if git fetch --quiet origin "refs/heads/$branch" 2>/dev/null; then
+  remote_head="$(git rev-parse FETCH_HEAD)"
+fi
+if [ -n "$remote_head" ] && [ "$(git rev-parse "$remote_head^")" != "$sha" ]; then
+  printf '::warning::Proposal branch %s has commits beyond the generated proposal; not overwriting it.\n' "$branch"
+  exit 0
+fi
+
 if [ ! -s "$work_dir/proposal.patch" ]; then
   printf 'No documentation changes proposed for %s.\n' "$sha"
   if [ -n "$existing" ]; then
@@ -49,16 +61,13 @@ head_sha="$(git rev-parse HEAD)"
 
 # An identical tree means a previous run already pushed this proposal. Reuse
 # its commit instead of pushing, so a retry resumes any pull request or review
-# step that failed after the push.
-remote_head=""
-if git fetch --quiet origin "refs/heads/$branch" 2>/dev/null; then
-  remote_head="$(git rev-parse FETCH_HEAD)"
-fi
+# step that failed after the push. The lease refuses the push if the branch
+# moved after it was fetched.
 if [ -n "$remote_head" ] && [ "$(git rev-parse "$remote_head^{tree}")" = "$(git rev-parse 'HEAD^{tree}')" ]; then
   head_sha="$remote_head"
   printf 'Proposal branch for %s is unchanged; not pushing.\n' "$sha"
 else
-  git push --quiet --force origin "HEAD:refs/heads/$branch"
+  git push --quiet --force-with-lease="refs/heads/$branch:$remote_head" origin "HEAD:refs/heads/$branch"
 fi
 
 subject="$(git log -1 --format=%s "$sha")"

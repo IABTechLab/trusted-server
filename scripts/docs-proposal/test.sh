@@ -190,6 +190,24 @@ assert_eq "$(remote_head)" "$pushed_head" "should not push again when resuming"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" '"path": "docs/index.md"' "should review the new hunk"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" "\"commit_id\": \"$pushed_head\"" "should review the pushed commit"
 
+git fetch -q origin "refs/heads/$branch"
+git switch -q --detach FETCH_HEAD
+printf 'maintainer edit\n' >> docs/guide/cli.md
+git commit -q -am "Apply suggestion from review"
+git push -q origin "HEAD:refs/heads/$branch"
+maintainer_head="$(remote_head)"
+
+make_patch docs/guide/cli.md
+assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should succeed when a maintainer committed to the proposal"
+assert_eq "$(remote_head)" "$maintainer_head" "should not overwrite maintainer commits"
+assert_contains "$(cat "$tmp/out.log")" "commits beyond the generated proposal" "should warn about maintainer commits"
+assert_eq "$(grep -c 'pr edit\|--method POST' "$STUB_LOG" || true)" 0 "should leave a maintained proposal untouched"
+
+make_patch ""
+assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should succeed on an empty rerun of a maintained proposal"
+assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close or delete a maintained proposal"
+assert_eq "$(remote_head)" "$maintainer_head" "should keep the maintained proposal branch"
+
 assert_eq "$(STUB_PR="7 CLOSED" run_publish)" 0 "should succeed for a closed proposal"
 assert_eq "$(grep -c 'pr edit\|pr create' "$STUB_LOG" || true)" 0 "should never reopen or recreate a closed proposal"
 
