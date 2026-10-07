@@ -19,7 +19,8 @@
 - Empty `include_domains` keeps today's rewritten output byte-for-byte for every existing fixture.
 - `exclude_domains` wins over `include_domains`. `include_domains` never applies to `<a href>` or `<area href>`.
 - Pattern syntax for both lists: exact host, or `*.example.com` matching the apex and any subdomain. Case-insensitive, dot boundary, matched against `Url::host_str()` only.
-- Load-time normalization: trim and ASCII-lowercase both lists. `exclude_domains` drops `""` and `*` with a `log::warn!`. `include_domains` rejects `""`, `*`, `*.` and any `*` other than a leading `*.` with a validation error.
+- Load-time normalization: trim and ASCII-lowercase both lists. `exclude_domains` drops `""` and `*` with a `log::warn!`.
+- `include_domains` validation rejects every entry that can never equal `Url::host_str()`. After normalization an entry must be a DNS name of non-empty `[a-z0-9-]` labels with an optional leading `*.`, a dotted-quad IPv4 address, or a bracketed, compressed IPv6 address such as `[::1]`. Rejected entries include `""`, `*`, `*.`, a `*` other than a leading `*.`, a scheme, a port, a path, spaces or other characters outside `[a-z0-9.-]`, a leading or trailing `.`, an empty label, an unbracketed IPv6 address, and a wildcard or malformed IP address. These fail with `invalid_rewrite_include_domain`. Non-ASCII (IDN) entries fail with `non_ascii_rewrite_include_domain` and are not converted to punycode.
 - `/first-party/sign`: an excluded or off-list host returns `TrustedServerError::Proxy { message: "unsupported url" }` (`502`) for absolute and `//` input, through GET and POST. That check runs before `proxy.allowed_domains`; `403` stays reserved for `proxy.allowed_domains`.
 - No JS, adapter, routing or dependency changes.
 - Fictional data only: `example.com`, `example.net`, `example.org` hosts.
@@ -256,7 +257,11 @@ Every shared test builds `Rewrite` with `Rewrite::default()` and `.extend`/`.pus
 
 The `creative.rs` test module's `use super::{...}` list gains `normalize_creative_url` and `proxy_if_abs` and loses `to_abs`.
 
-CHANGELOG: the shared step's entry goes under `## [Unreleased]` › `### Fixed`.
+CHANGELOG: the shared step adds this entry as the first item under `## [Unreleased]` › `### Fixed` (create the heading if absent), in the same commit as the code:
+
+```markdown
+- `rewrite.exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries written with uppercase letters previously never matched and now take effect, so those hosts stop being proxied and click-wrapped, and `/first-party/sign` now rejects them with `502`; it used to sign them, or return `403` when the host was also outside `proxy.allowed_domains`. Empty and bare `"*"` `exclude_domains` entries, which never matched a host, are dropped at load with a warning. Absolute `http(s)` creative URLs that cannot be parsed (for example, a host containing a space) are now left untouched; previously the attribute was re-quoted and a link also gained `data-tsclick`. Audit `exclude_domains` for mixed-case entries before upgrading.
+```
 
 ## File map
 
@@ -685,10 +690,14 @@ Run: `cargo fmt --all && cargo clippy-fastly`
 
 Expected: no warnings.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: CHANGELOG**
+
+Add the [Shared step](#shared-step) CHANGELOG entry verbatim, as the first item under `## [Unreleased]` › `### Fixed`. It ships with the shared step, so Task 6 does not repeat it.
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/trusted-server-core/src/creative.rs crates/trusted-server-core/src/proxy.rs crates/trusted-server-core/src/settings.rs
+git add crates/trusted-server-core/src/creative.rs crates/trusted-server-core/src/proxy.rs crates/trusted-server-core/src/settings.rs CHANGELOG.md
 git commit --signoff -S -m "Split creative URL normalization from rewrite host policy" -m "Replace to_abs with normalize_creative_url and route asset, click and first-party sign decisions through Rewrite::should_proxy_asset and Rewrite::should_wrap_click."
 ```
 
@@ -730,17 +739,76 @@ In `settings.rs` tests:
 ```
 
 ```rust
+    fn include_domains_toml(entry: &str) -> String {
+        crate_test_settings_str() + &format!("\n[rewrite]\ninclude_domains = [\"{entry}\"]\n")
+    }
+
     #[test]
     fn rewrite_include_domains_reject_malformed_entries() {
-        for entry in ["", "   ", "*", "*.", "cdn.*.example.com", "**.example.com"] {
-            let toml_str = crate_test_settings_str()
-                + &format!("\n[rewrite]\ninclude_domains = [\"{entry}\"]\n");
+        for entry in [
+            "",
+            "   ",
+            "*",
+            "*.",
+            "cdn.*.example.com",
+            "**.example.com",
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "cdn.example.com/x",
+            ".example.com",
+            "example.com.",
+            "cdn..example.com",
+            "cdn example.com",
+            "cdn_assets.example.com",
+            "::1",
+            "[::1",
+            "[2001:0db8::1]",
+            "*.192.0.2.1",
+            "192.0.2",
+            "256.0.2.1",
+        ] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
 
-            let result = Settings::from_toml(&toml_str);
-
+            let err = result.expect_err(&format!("should reject include_domains entry `{entry}`"));
             assert!(
-                result.is_err(),
-                "should reject include_domains entry `{entry}`"
+                format!("{err:?}").contains("invalid_rewrite_include_domain"),
+                "should report `{entry}` as an invalid include_domains entry: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint() {
+        for entry in ["bücher.example", "*.bücher.example"] {
+            let result = Settings::from_toml(&include_domains_toml(entry));
+
+            let err = result.expect_err(&format!("should reject non-ASCII entry `{entry}`"));
+            assert!(
+                format!("{err:?}").contains("non_ascii_rewrite_include_domain"),
+                "should report `{entry}` as non-ASCII: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_accept_hosts_and_ip_literals() {
+        for entry in [
+            "cdn.example.com",
+            "*.example.com",
+            "xn--bcher-kva.example",
+            "192.0.2.1",
+            "[2001:db8::1]",
+            "[::1]",
+        ] {
+            let settings =
+                Settings::from_toml(&include_domains_toml(entry)).unwrap_or_else(|err| {
+                    panic!("should accept include_domains entry `{entry}`: {err:?}")
+                });
+
+            assert_eq!(
+                settings.rewrite.include_domains,
+                vec![entry.to_owned()],
+                "should keep accepted entry `{entry}` as written"
             );
         }
     }
@@ -805,7 +873,7 @@ In `config_payload.rs` tests:
 
 Run: `cargo test-fastly -- rewrite_include_domains legacy_blob_without_rewrite`
 
-Expected: five `error[E0609]: no field include_domains on type settings::Rewrite`.
+Expected: compile errors, `error[E0609]: no field include_domains on type settings::Rewrite`. The reject tests compile, and against a validator that only checks `*` placement they fail on `https://cdn.example.com`, which that validator accepts.
 
 - [ ] **Step 3: Implement**
 
@@ -848,17 +916,85 @@ At the end of `Rewrite::normalize`, after the `exclude_domains` warning block:
 Before `validate_publisher_domain`:
 
 ```rust
-/// Rejects `rewrite.include_domains` entries that cannot name a host.
+/// Rejects `rewrite.include_domains` entries that can never equal a URL host.
 ///
 /// Runs after [`Rewrite::normalize`], so entries are already trimmed and
-/// lowercased. An entry must be an exact host or `*.` followed by a non-empty
-/// suffix with no further `*`.
+/// lowercased. Entries are matched against [`Url::host_str`], so each one must
+/// be:
+///
+/// - a DNS name, optionally prefixed with `*.`: one or more `.`-separated,
+///   non-empty labels of ASCII `a-z`, `0-9` and `-`;
+/// - an IPv4 address in dotted-quad form, such as `192.0.2.1`; or
+/// - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+///
+/// A scheme, port, path, space, leading or trailing `.`, empty label, wildcard
+/// IP address or unbracketed IPv6 address is rejected with
+/// `invalid_rewrite_include_domain`. A non-ASCII (IDN) name is rejected with
+/// `non_ascii_rewrite_include_domain`; write it in punycode (`xn--`) form.
 fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> {
     for pattern in patterns {
-        let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
-        if suffix.is_empty() || suffix.contains('*') {
-            return Err(ValidationError::new("invalid_rewrite_include_domain"));
+        if !pattern.is_ascii() {
+            let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
+            err.add_param("value".into(), pattern);
+            err.message = Some(
+                "rewrite.include_domains entries must be ASCII; write internationalized domain names in punycode (xn--) form"
+                    .into(),
+            );
+            return Err(err);
         }
+        if let Err(reason) = check_include_domain(pattern) {
+            let mut err = ValidationError::new("invalid_rewrite_include_domain");
+            err.add_param("value".into(), pattern);
+            err.add_param("reason".into(), &reason);
+            err.message = Some(
+                "rewrite.include_domains entries must be a host name, an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address"
+                    .into(),
+            );
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Checks one normalized ASCII `include_domains` entry, returning why it can
+/// never equal a URL host.
+fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
+    if let Some(bracketed) = pattern.strip_prefix('[') {
+        let address = bracketed
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+            .ok_or("not a bracketed IPv6 address")?;
+        if format!("[{address}]") != pattern {
+            return Err("IPv6 address not in compressed form");
+        }
+        return Ok(());
+    }
+    if pattern.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err("IPv6 address without brackets");
+    }
+
+    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if name.is_empty() {
+        return Err("no host");
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+    }) {
+        return Err("character outside a-z, 0-9, `-` and `.`");
+    }
+    if name.split('.').any(str::is_empty) {
+        return Err("leading or trailing `.` or empty label");
+    }
+
+    // A URL host whose last label is numeric is parsed as an IPv4 address, so
+    // such an entry only matches as an exact dotted-quad address.
+    let last_label = name.rsplit('.').next().unwrap_or(name);
+    let numeric_last_label =
+        last_label.bytes().all(|byte| byte.is_ascii_digit()) || last_label.starts_with("0x");
+    if numeric_last_label
+        && (name.len() != pattern.len() || name.parse::<std::net::Ipv4Addr>().is_err())
+    {
+        return Err("numeric host that is not a dotted-quad IPv4 address");
     }
     Ok(())
 }
@@ -866,11 +1002,13 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
 
 The `validator` derive passes `&Vec<String>`, which coerces to `&[String]`, so no `clippy::ptr_arg` allowance is needed.
 
+`validation_error_summary` reports only each error's code, so the code carries the distinction an operator needs. `non_ascii_rewrite_include_domain` says to use punycode, and `invalid_rewrite_include_domain` covers everything else. The `message` and `value`/`reason` params give the detail to anyone reading `ValidationErrors` directly. The checks are exact on purpose. Patterns are compared with `Url::host_str()`, so an entry with a scheme, a port, a path, a non-canonical IPv6 form or a non-ASCII name would load fine and then never match. The operator would see a silently empty allowlist instead of an error at `ts config push`.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test-fastly -- rewrite_include_domains legacy_blob_without_rewrite`
 
-Expected: `6 passed` (the five new tests plus `legacy_blob_without_rewrite_creatives_preserves_rewriting`).
+Expected: the seven new tests pass (`rewrite_include_domains_are_normalized_from_toml`, `rewrite_include_domains_reject_malformed_entries`, `rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint`, `rewrite_include_domains_accept_hosts_and_ip_literals`, `rewrite_include_domains_default_to_empty`, `legacy_blob_without_rewrite_include_domains_loads_with_empty_list` and `rewrite_include_domains_survive_blob_round_trip`), together with the existing `legacy_blob_without_rewrite_*` tests.
 
 - [ ] **Step 5: Lint**
 
@@ -882,7 +1020,7 @@ Expected: no warnings.
 
 ```bash
 git add crates/trusted-server-core/src/settings.rs crates/trusted-server-core/src/config_payload.rs
-git commit --signoff -S -m "Add rewrite include_domains setting with validation"
+git commit --signoff -S -m "Add rewrite include_domains setting with validation" -m "Add the [rewrite] include_domains field with load-time normalization, strict entry validation and blob round-trip tests. Enforcement arrives in the next commit, which applies the list to asset rewriting and first-party sign."
 ```
 
 ---
@@ -960,6 +1098,7 @@ Then add, before `rewrite_html_excludes_blacklisted_domains`:
     const ALLOWLIST_LISTED: &[&str] = &[
         "https://assets.example.com/a.css",
         "https://assets.example.com/p1.png",
+        "https://assets.example.com/p1-2x.png",
         "https://assets.example.com/a.js",
         "https://assets.example.com/i.css",
         "https://assets.example.com/bg.png",
@@ -1000,7 +1139,7 @@ Then add, before `rewrite_html_excludes_blacklisted_domains`:
     const ALLOWLIST_CREATIVE: &str = r#"<html><head>
 <link rel="stylesheet" href="https://assets.example.com/a.css">
 <link rel="stylesheet" href="https://cdn.example.net/a.css">
-<link rel="preload" as="image" href="https://assets.example.com/p1.png" imagesrcset="https://assets.example.com/p1.png 1x, https://cdn.example.net/p2.png 2x">
+<link rel="preload" as="image" href="https://assets.example.com/p1.png" imagesrcset="https://cdn.example.net/p2.png 1x, https://assets.example.com/p1-2x.png 2x">
 <script src="https://assets.example.com/a.js"></script>
 <script src="https://cdn.example.net/a.js"></script>
 <style>
@@ -1131,19 +1270,39 @@ Then add, before `rewrite_html_excludes_blacklisted_domains`:
     fn host_in_both_lists_is_left_alone() {
         let mut settings = allowlist_settings();
         settings.rewrite.exclude_domains = vec!["assets.example.com".to_owned()];
-        let html = r#"<img src="https://assets.example.com/img.png"><a href="https://assets.example.com/landing">x</a>"#;
-
-        let out = rewrite_creative_html(&settings, html);
-
-        assert!(
-            out.contains(r#"<img src="https://assets.example.com/img.png">"#),
-            "should leave an asset on a host in both lists raw: {out}"
+        let html = ALLOWLIST_CREATIVE.replace(
+            "</body>",
+            r#"<a href="https://assets.example.com/landing">Excluded</a></body>"#,
         );
-        assert!(
-            out.contains(r#"<a href="https://assets.example.com/landing">"#)
-                && !out.contains("data-tsclick"),
-            "should leave an excluded click-through link raw: {out}"
-        );
+
+        for (label, out) in [
+            ("auction", rewrite_creative_html(&settings, &html)),
+            (
+                "inline",
+                rewrite_inline_creative_html(&settings, "https://www.example.com", &html),
+            ),
+            ("proxied", rewrite_proxied_html(&settings, &html)),
+        ] {
+            assert!(
+                !out.contains("tsurl=https%3A%2F%2Fassets.example.com"),
+                "{label}: should not rewrite any URL on a host in both lists: {out}"
+            );
+            for listed in ALLOWLIST_LISTED {
+                assert!(
+                    out.contains(listed),
+                    "{label}: should keep `{listed}` raw when its host is also excluded: {out}"
+                );
+            }
+            assert!(
+                out.contains(r#"<a href="https://assets.example.com/landing">Excluded</a>"#),
+                "{label}: should leave an excluded click-through link raw: {out}"
+            );
+            assert_eq!(
+                out.matches("data-tsclick=").count(),
+                2,
+                "{label}: should wrap only the two links on hosts that are not excluded: {out}"
+            );
+        }
     }
 ```
 
@@ -1282,7 +1441,9 @@ Expected failures:
 - `should keep off-list CSS URL `https://cdn.example.net/i.css` raw`
 - `GET off-list absolute should return 502 Bad Gateway`
 
-`host_in_both_lists_is_left_alone` already passes here: `exclude_domains` wins without the include clause. It guards precedence after Step 3.
+`host_in_both_lists_is_left_alone` already passes here: `exclude_domains` wins without the include clause. It guards precedence after Step 3. It runs the whole `ALLOWLIST_CREATIVE`, plus an anchor on the excluded host, through all three HTML paths with `exclude_domains = ["assets.example.com"]`, so every handler is covered. It asserts that no `assets.example.com` URL is rewritten anywhere, that every listed URL stays raw, and that only the two non-excluded links are wrapped.
+
+The `link imagesrcset` listed candidate (`p1-2x.png`) is a different URL from the link's `href` (`p1.png`). That way the matrix proves `imagesrcset` itself is proxied while the list is set, and an `href` match cannot satisfy the assertion.
 
 - [ ] **Step 3: Implement the include clause**
 
@@ -1314,6 +1475,13 @@ Replace `should_proxy_asset` and its doc comment:
 ```
 
 `is_host_permitted` returns `true` for an empty list, which is the "include list empty" half of the rule.
+
+In the `creative.rs` module docs, after the `exclude_domains` key behavior, add:
+
+```rust
+//! - When `[rewrite] include_domains` is non-empty, only asset URLs on listed
+//!   hosts are proxied. Links ignore it.
+```
 
 In `proxy.rs`, update the decline log in `handle_first_party_proxy_sign`:
 
@@ -1445,6 +1613,8 @@ In the `link[href]` handler, delete the `imagesrcset` block and keep the `href` 
                 }),
 ```
 
+In the `creative.rs` module docs, drop "and `imagesrcset`" from the `<link>` bullet, which becomes ``//!   - `<link rel~="stylesheet|preload|prefetch" href>` ``. The `[imagesrcset]` bullet above it already covers the attribute.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test-fastly -p trusted-server-core --lib -- imagesrcset include_domains_limit`
@@ -1512,16 +1682,42 @@ Replace lines 127-129 with:
 
 - Both lists are trimmed and lowercased at load, so matching is case-insensitive.
 - `exclude_domains` wins when a host matches both lists.
-- `include_domains` rejects empty entries, a bare `*`, and any `*` other than a
-  leading `*.`. Empty and bare `*` entries in `exclude_domains` are dropped with
-  a warning, because they never match a host.
+- Each `include_domains` entry must be able to equal a URL host. After
+  lowercasing, an entry must be one of:
+  - a host name of ASCII letters, digits, `-` and `.`, optionally prefixed with
+    `*.`, with no leading or trailing `.` and no empty label;
+  - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
+  - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+- Settings load and `ts config validate` reject any other `include_domains`
+  entry: an empty entry, a bare `*`, a `*` other than a leading `*.`, a scheme
+  (`https://`), a port, a path, spaces, or an unbracketed IPv6 address.
+  Non-ASCII (internationalized) names are rejected too; write them in punycode,
+  such as `xn--bcher-kva.example`.
+- Empty and bare `*` entries in `exclude_domains` are dropped with a warning,
+  because they never match a host.
 
 ::: tip
 When both `include_domains` and `proxy.allowed_domains` are set, keep every
 `include_domains` host inside `proxy.allowed_domains`. Otherwise a listed asset
 is rewritten to a proxy URL that then fails with `403`.
 :::
+
+::: warning Upgrade sequencing and rollback for `include_domains`
+An empty `include_domains` is omitted from stored JSON. A non-empty list is
+serialized, and older binaries reject a blob that carries it because `[rewrite]`
+uses `deny_unknown_fields`.
+
+**Upgrading:** deploy the binary **first**, then add `include_domains` to
+`trusted-server.toml`, run `ts config validate`, and push.
+
+**Rolling back:** remove `include_domains` from the TOML, run
+`ts config validate`, push the resulting blob, and only then roll back the
+binary. Rolling back the binary also restores case-sensitive `exclude_domains`
+matching.
+:::
 ```
+
+The warning box mirrors the `[auction]` one for `rewrite_clicks`.
 
 - [ ] **Step 3: `docs/guide/creative-processing.md`**
 
@@ -1543,15 +1739,20 @@ Limit asset rewriting to hosts you list:
   rewritten to `/first-party/proxy`. Other assets keep their original URL, load
   directly, and do not receive the EC ID that proxied fetches append.
 - `exclude_domains` wins when a host matches both lists.
-- Click-through links (`<a href>`, `<area href>`) are not affected; they are
-  still wrapped in `/first-party/click` unless excluded.
+- Click-through links (`<a href>`, `<area href>`) are not affected. Whether
+  they are wrapped in `/first-party/click` depends only on `rewrite_clicks` and
+  `exclude_domains`.
 - HTML and CSS fetched through `/first-party/proxy` go through the same rewrite
   pass and follow the same list.
 - `/first-party/sign` declines off-list hosts with a non-`403` error, so the
   creative runtime loads them directly.
 
-Patterns use the same syntax as `exclude_domains`.
+Patterns use the same syntax as `exclude_domains`. Entries that can never
+equal a URL host, such as ones with a scheme, port, path or non-ASCII name, fail
+validation; see [Pattern Matching](/guide/configuration#pattern-matching).
 ```
+
+If #1234 has not landed, drop the `rewrite_clicks` mention from the click-through bullet.
 
 (In the guide the TOML is a fenced `toml` block.)
 
@@ -1570,17 +1771,16 @@ In `/first-party/sign` Error Responses, after the `413` bullet:
 
 - [ ] **Step 6: `CHANGELOG.md`**
 
-Append to the existing `### Fixed` list under `## [Unreleased]`:
+Append to the existing `### Fixed` list under `## [Unreleased]`. The `exclude_domains` entry already came with the shared step.
 
 ```markdown
 - Inline SSAT/page-bids creatives no longer proxy `<link rel="preload" imagesrcset>` candidates twice. The `imagesrcset` attribute is now rewritten once, by the same handler on every creative path; previously the inline path's absolute proxy URLs were wrapped in a second `/first-party/proxy` URL.
-- `rewrite.exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries written with uppercase letters previously never matched and now take effect, so those hosts stop being proxied and click-wrapped. Audit `exclude_domains` for mixed-case entries before upgrading.
 ```
 
 Insert at the top of the existing `### Added` list under `## [Unreleased]`:
 
 ```markdown
-- `[rewrite] include_domains` limits creative asset rewriting to listed hosts. When non-empty, only asset URLs on matching hosts are proxied through `/first-party/proxy`, so only those hosts receive the EC ID on proxied fetches. Other assets keep their original URL, and `/first-party/sign` returns `502` for them so the creative runtime loads them directly. Click-through links are not affected, and `exclude_domains` still wins.
+- `[rewrite] include_domains` limits creative asset rewriting to listed hosts. When non-empty, only asset URLs on matching hosts are proxied through `/first-party/proxy`, so only those hosts receive the EC ID on proxied fetches. Other assets keep their original URL, and `/first-party/sign` returns `502` for them so the creative runtime loads them directly. Click-through links are not affected, and `exclude_domains` still wins. Entries must be host names, optionally prefixed with `*.`, dotted-quad IPv4 addresses, or bracketed IPv6 addresses; entries with a scheme, port, path, spaces or non-ASCII characters are rejected at load. Upgrading: deploy the binary first, then push a config that sets `include_domains`. Rolling back: remove `include_domains`, push the resulting config, then roll back the binary; older binaries reject the key because `[rewrite]` denies unknown fields.
 ```
 
 - [ ] **Step 7: Format and check**
@@ -1620,7 +1820,7 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --
 ./scripts/test-cli.sh
 ```
 
-Expected on `7a0ecb4c` plus this change: `test-fastly` 3155 passed, 10 ignored (core 2908 passed, 6 ignored); `test-fastly-reuse` 219 passed; `test-axum` 43 passed; `test-cloudflare` 53 passed; `test-spin` 87 passed; parity 17 passed; CLI 733 passed.
+Expected on `7a0ecb4c` plus #1234's code and this change (the review-fix run): `test-fastly` 3169 passed, 10 ignored (core 2922 passed, 6 ignored); `test-fastly-reuse` 219 passed; `test-axum` 43 passed; `test-cloudflare` 53 passed; `test-spin` 87 passed; parity 17 passed; CLI 735 passed across `./scripts/test-cli.sh`. Without #1234 in front, the counts are lower by #1234's own tests.
 
 - [ ] **Step 3: JS and docs**
 
