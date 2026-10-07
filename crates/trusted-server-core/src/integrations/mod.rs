@@ -51,11 +51,13 @@ pub use registry::{
 /// 15-second first-byte timeout, and delegates to
 /// [`crate::platform::PlatformBackend::ensure`].
 ///
+/// Public for the same reason as [`ensure_integration_backend_with_timeout`].
+///
 /// # Errors
 ///
 /// Returns an error when `url` cannot be parsed, is missing a host, or the
 /// backend registration fails.
-pub(crate) fn ensure_integration_backend(
+pub fn ensure_integration_backend(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
@@ -177,7 +179,9 @@ fn integration_backend_spec(
 }
 
 /// Maximum body size accepted by integration proxy endpoints (256 KiB).
-pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
+///
+/// Public so every integration crate bounds a request body at one size.
+pub const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Maximum response body size from RTB providers (prebid, aps, ad server).
 ///
@@ -185,17 +189,24 @@ pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 /// response at the size the built-in ones do.
 pub const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
-pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+///
+/// Public so every integration crate bounds an upstream script or proxied
+/// response at one size.
+pub const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Drains an [`EdgeBody`] into a byte vector, rejecting bodies larger than
 /// `max_bytes` with [`TrustedServerError::RequestTooLarge`].
+///
+/// Public because an integration crate outside this one reads request bodies
+/// too, and an unbounded read of a client's body is not a fault each crate
+/// should solve again.
 ///
 /// # Errors
 ///
 /// Returns an error when:
 /// - The body exceeds `max_bytes`.
 /// - A streaming body chunk cannot be read (mapped to an `Integration` error).
-pub(crate) async fn collect_body_bounded(
+pub async fn collect_body_bounded(
     body: EdgeBody,
     max_bytes: usize,
     integration: &'static str,

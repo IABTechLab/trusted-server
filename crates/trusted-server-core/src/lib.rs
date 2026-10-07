@@ -51,7 +51,7 @@ pub mod error;
 pub mod evidence;
 pub mod geo;
 pub mod host_header;
-pub(crate) mod host_rewrite;
+pub mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
 pub mod integrations;

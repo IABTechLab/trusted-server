@@ -4843,7 +4843,18 @@ where
     }
 }
 
-pub(crate) fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+/// Reads a list setting written as a sequence, as a map keyed by position,
+/// or as a string holding a JSON array or comma-separated values.
+///
+/// The map and string forms are what an environment overlay produces, so a
+/// list reads the same from a file and from the environment. Public so a
+/// module crate's own list settings read the same way.
+///
+/// # Errors
+///
+/// When the value is none of those forms, a map key is not a position, or an
+/// item cannot be read as `T`.
+pub fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: DeserializeOwned,
