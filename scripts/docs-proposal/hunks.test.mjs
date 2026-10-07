@@ -6,6 +6,7 @@ import {
   collectHunks,
   indexEvidence,
   listHunks,
+  neutralizeMentions,
   parseDiff,
   revertSuggestion,
 } from "./hunks.mjs";
@@ -195,6 +196,16 @@ test("indexEvidence keeps valid entries and sanitizes text", () => {
     "should drop invalid entries and strip backticks, newlines, and mentions",
   );
   assert.equal(indexEvidence(null).size, 0, "should accept missing evidence");
+});
+
+test("neutralizeMentions keeps text but breaks every mention", () => {
+  assert.equal(
+    neutralizeMentions(
+      "- docs/guide/cli.md: ask @example-org/team\nor @user.\n",
+    ),
+    "- docs/guide/cli.md: ask @\u200bexample-org/team\nor @\u200buser.\n",
+    "should insert a zero width space after each @ and keep newlines",
+  );
 });
 
 test("buildReview cites evidence and suggests reverts", () => {

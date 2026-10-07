@@ -125,8 +125,9 @@ and nothing installs, builds, or executes proposal content.
 6. Find the originating pull request with
    `gh api repos/{owner}/{repo}/commits/<sha>/pulls`. Create the pull request,
    or edit the existing one, with a body that links the merge commit and the
-   originating pull request, includes `rationale.md`, and states that a human
-   must verify the prose against the code before merging.
+   originating pull request, includes `rationale.md` with its `@` mentions
+   neutralized, and states that a human must verify the prose against the
+   code before merging.
 7. If `github-actions[bot]` already reviewed the pushed commit, stop: nothing
    is re-posted. Otherwise `node scripts/docs-proposal/hunks.mjs review`
    builds review comments and posts one `COMMENT` review through `gh api`

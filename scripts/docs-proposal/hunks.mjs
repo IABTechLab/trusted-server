@@ -146,15 +146,19 @@ export function revertSuggestion(hunk) {
 
 const MAX_EVIDENCE_LENGTH = 300;
 
-// Model output lands in review comments, so strip anything that could break
-// out of the inline code span or ping a user or team.
+// Model output lands in pull request bodies and review comments, so a zero
+// width space after every `@` keeps it from pinging a user or team.
+export function neutralizeMentions(text) {
+  return text.replace(/@/g, "@​");
+}
+
+// Evidence also lands in an inline code span, so strip anything that could
+// break out of it.
 function sanitize(value) {
   if (typeof value !== "string") {
     return "";
   }
-  return value
-    .replace(/[`\r\n]+/g, " ")
-    .replace(/@/g, "@​")
+  return neutralizeMentions(value.replace(/[`\r\n]+/g, " "))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, MAX_EVIDENCE_LENGTH);
@@ -255,7 +259,12 @@ function readEvidence(path) {
 }
 
 function main([command, evidencePath, commitId]) {
-  const files = parseDiff(readFileSync(0, "utf8"));
+  const input = readFileSync(0, "utf8");
+  if (command === "sanitize") {
+    process.stdout.write(neutralizeMentions(input));
+    return;
+  }
+  const files = parseDiff(input);
   if (command === "list") {
     process.stdout.write(`${JSON.stringify(listHunks(files), null, 2)}\n`);
     return;
@@ -266,7 +275,7 @@ function main([command, evidencePath, commitId]) {
     return;
   }
   process.stderr.write(
-    "usage: hunks.mjs list | review <evidence.json> <commit-sha>\n",
+    "usage: hunks.mjs list | review <evidence.json> <commit-sha> | sanitize\n",
   );
   process.exitCode = 2;
 }

@@ -38,11 +38,12 @@ fi
 assert_eq "$status" 0 "should accept guide and nested guide paths"
 
 rationale="$(mktemp)"
-printf -- '- docs/guide/cli.md: documents the new flag.\n' > "$rationale"
+printf -- '- docs/guide/cli.md: documents the new flag for @example-org/maintainers.\n' > "$rationale"
 body="$(docs_proposal_pr_body "$sha" "Add example flag" 42 "$rationale")"
 assert_contains "$body" "<!-- docs-proposal: $sha -->" "should embed the SHA marker"
 assert_contains "$body" "merged change $sha (#42): Add example flag" "should link the merge and its PR"
 assert_contains "$body" "documents the new flag" "should include the rationale"
+assert_contains "$body" $'@\u200bexample-org/maintainers' "should neutralize mentions in the rationale"
 : > "$rationale"
 body="$(docs_proposal_pr_body "$sha" "Add example flag" "" "$rationale")"
 assert_contains "$body" "merged change $sha: Add example flag" "should omit a missing origin PR"
