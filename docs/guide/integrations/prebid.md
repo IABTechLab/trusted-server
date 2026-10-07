@@ -45,7 +45,7 @@ name = "idl_env"
 expires = 15
 refresh_in_seconds = 1800
 
-# External bundle generation inputs used by `ts prebid bundle`.
+# External bundle generation inputs used by `ts prebid client`.
 # Values are exact Prebid module stems without `.js`.
 [integrations.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
@@ -145,27 +145,64 @@ The typed `profile_config` fields are:
 Every server-side bidder code comes from `[auction.bidders.<code>]`; the browser
 integration has no server bidder list. The validated route keys are injected as
 `serverSideBidders`. On initial and refresh auctions, only matching publisher
-bids are folded into the `trustedServer.bidderParams` envelope. Configured
+bids are folded into the `trustedServer.params.bidderParams` envelope. Configured
 `client_side_bidders` and other unowned demand remain native browser bids. Both
 paths compete in the same Prebid.js auction.
 
 The reserved `trustedServer` envelope cannot select a provider or endpoint. Its
 nested bidder keys resolve through `[auction.bidders]`, and one envelope accepts
 at most 128 bidder entries. The optional `zone` fact is limited to 256 UTF-8
-bytes. Missing, `null`, or empty `bidderParams` invokes Prebid stored-request
-routing; malformed envelopes do not.
+bytes. `params.storedRequest` controls PBS stored fallback: `false` disables it,
+`true` permits it, and omission preserves legacy inference. `null` and non-boolean
+values are invalid and reject the complete envelope. Usable inline params take
+precedence after provider-local overrides. See the [wire contract](/guide/api-reference#pbs-stored-request-intent).
+
+TSJS sets `storedRequest: false` on every newly synthesized envelope, including
+those carrying inline candidates. Existing publisher-authored envelopes retain
+`true`, `false`, or omission on repeated requests. Refresh uses live ad-unit intent
+when available and an immutable request snapshot otherwise, using the same code
+and container-ID lookup as bidder params. Invalid authored values remain intact
+for server validation. An unrecovered refresh defaults to `false`; it does not
+invent a PBS stored lookup just to invoke eligible APS or standard providers.
 
 Browser `timeout_ms`/`debug` never inherit a server provider timeout or profile
 debug value. Enabling the browser integration does not create a server provider,
 and a `prebid-server` provider can exist independently from browser injection.
 
+### Stored intent deployment
+
+Deploy server admission support before distributing the TSJS bundle that emits
+`storedRequest`. The pre-fix configuration-first router from #1016 rejects unknown
+envelope fields. Sending new JS to an old server can discard valid inline envelope
+demand as well as fail to solve the unwanted stored lookup.
+
+Rust artifacts embed the generated JS bundles through
+`crates/trusted-server-js/build.rs` and `include_str!`. A normal full build couples
+server support and JS emission; they are not independently published artifacts.
+
+1. Prepare a server-support-only build that retains the old JS emission behavior.
+   Deploy it to every serving instance and verify admission of `true` and `false`
+   alongside valid inline demand.
+2. Only after that verification, distribute the full build containing the new JS.
+   Account for serving instances, browser caches, and any external bundle that
+   still embeds an older shim. If the release process cannot produce the first
+   build, resolve that release mechanism before rollout.
+3. After new JS reaches browsers or caches, do not roll back to a server that
+   rejects `storedRequest`. Keep compatible admission until those clients can
+   safely be served again. Rolling back JS alone does not remove cached clients.
+
+Omission remains supported in this change. Removing legacy inference requires a
+separate migration: inventory direct callers and server-generated opportunities,
+migrate them to explicit intent, account for cached clients, and approve a
+versioned contract change. There is no time-based expiry in this fix.
+
 ## External Bundle Generation
 
-Use `ts prebid bundle` to build the publisher-specific browser bundle from
+Use `ts prebid client` to build the publisher-specific browser bundle from
 `[integrations.prebid.bundle.modules]` selections:
 
 ```bash
-ts prebid bundle
+ts prebid client
 ```
 
 The command writes generated artifacts to `dist/prebid/` by default and updates
@@ -211,7 +248,7 @@ upstream stems. For example, `adapters = ["rubicon"]` becomes
 `bidder = ["rubiconBidAdapter"]`; `client_side_bidders` continues to use the
 runtime code `rubicon`.
 
-`ts prebid bundle` rejects the removed `adapters`, `user_id_modules`, and
+`ts prebid client` rejects the removed `adapters`, `user_id_modules`, and
 `analytics_adapters` fields with the replacement path. Runtime config
 validation, `ts config push`, and server startup also reject the old bundle
 fields.
@@ -608,7 +645,7 @@ bidder = ["rubiconBidAdapter", "appnexusBidAdapter", "openxBidAdapter"]
 user_id = ["sharedIdSystem", "uid2IdSystem"]
 ```
 
-Run `ts prebid bundle` after changing the module list. The generator resolves
+Run `ts prebid client` after changing the module list. The generator resolves
 `prebid.js/modules/<stem>.js` through the pinned package and records both stems
 and registered bidder codes in `manifest.json`. At runtime, TSJS checks each
 `client_side_bidders` runtime code against that manifest.
@@ -712,7 +749,7 @@ The module must be present in the built bundle. Name it under
 `bundle.user_id_modules`, or omit that list to take the generator's default
 preset, which covers the commonly used modules.
 
-`ts prebid bundle` resolves every managed `name` through the checked-in
+`ts prebid client` resolves every managed `name` through the checked-in
 `user_id_modules.json` registry. An unknown name, a name that maps to more than
 one module, or two managed names that resolve to the same module — `sharedId`
 and `pubCommonId` both select `sharedIdSystem`, for example — fail before bundle
@@ -743,7 +780,7 @@ expires = 15
 refresh_in_seconds = 1800
 ```
 
-Run `ts prebid bundle`, upload the generated content-addressed bundle, copy its
+Run `ts prebid client`, upload the generated content-addressed bundle, copy its
 hash metadata into `[integrations.prebid]`, and validate the configuration
 before rollout.
 
