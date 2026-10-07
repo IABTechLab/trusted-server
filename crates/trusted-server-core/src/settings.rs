@@ -5936,8 +5936,8 @@ mod tests {
 
     #[test]
     fn an_unknown_key_in_the_hmac_module_block_is_rejected() {
-        // A mistyped key in a module block used to be dropped silently, which
-        // leaves the setting the operator meant to change at its default.
+        // A mistyped key dropped silently would leave the setting the
+        // operator meant to change at its default.
         let toml_str = crate_test_settings_str().replace(
             "passphrase = \"test-secret-key-32-bytes-minimum\"",
             "passphrase = \"test-secret-key-32-bytes-minimum\"\n            typo_key = \"x\"",

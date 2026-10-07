@@ -144,12 +144,11 @@ mod tests {
 
     #[test]
     fn every_edge_cookie_response_header_is_an_internal_header() {
-        // These two lists used to be written out by hand in two files, with
-        // nothing keeping them in step, so a new Edge Cookie response header
-        // could be stripped by EC finalization and still forwarded to a third
-        // party. `INTERNAL_HEADERS` is now assembled from
-        // `EC_RESPONSE_HEADERS`, and this is the assertion that fails if
-        // anyone goes back to writing them out separately.
+        // `INTERNAL_HEADERS` is assembled from `EC_RESPONSE_HEADERS`. Two
+        // lists written out separately could drift, so that a new Edge Cookie
+        // response header was stripped by EC finalization and still
+        // forwarded to a third party, and this assertion fails if they are
+        // ever separated.
         for header in EC_RESPONSE_HEADERS {
             assert!(
                 INTERNAL_HEADERS.contains(header),

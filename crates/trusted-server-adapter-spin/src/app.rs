@@ -70,12 +70,11 @@ pub struct AppState {
     registry: Arc<IntegrationRegistry>,
     /// The Edge Cookie module `[ec] module` selects, resolved once here.
     ///
-    /// This adapter runs a fresh instance per request, so application state and
-    /// the request path used to resolve the same selection twice for every
-    /// request, once to check it could be satisfied and once to use it.
-    /// Resolving reads no request data, so the result is kept and handed to
-    /// every request through
-    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
+    /// This adapter runs a fresh instance per request and resolving reads no
+    /// request data, so the selection is resolved when the state is built
+    /// and handed to every request through
+    /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module),
+    /// rather than resolved again on the request path.
     /// `None` for a deployment that selects no module.
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
     /// Services a caller supplied for every request, rather than services built
@@ -87,10 +86,7 @@ pub struct AppState {
 ///
 /// Settings are read from the platform config store at run time, the same way
 /// the Fastly and Axum adapters read them, so an operator publishes one with
-/// `ts config push` and the deployed component picks it up. This
-/// adapter previously compiled `trusted-server.example.toml` into the binary
-/// and parsed it here, which could never succeed, because that template ships
-/// placeholder secrets and the placeholder admin password fails validation.
+/// `ts config push` and the deployed component picks it up.
 ///
 /// # Errors
 ///
@@ -1141,20 +1137,13 @@ mod tests {
 
     #[test]
     fn build_state_takes_its_settings_from_the_platform_config_store() {
-        // This adapter used to compile the shipped example template into the
-        // binary and parse it here. That template carries placeholder secrets
-        // by design, and the placeholder admin password fails
-        // `validate_admin_handler_passwords`, so `build_state` could never
-        // return `Ok` and the router fell back to the start-up error handler
-        // that answers every request with 503. Nothing caught it because every
-        // other test enters through the `routes_with_settings` parity seam and
-        // never calls this function.
-        //
-        // There is no Spin runtime under `cargo test`, so there are no
-        // component variables to read and this cannot return `Ok` here. What it
-        // must never do again is fail because of a configuration baked into the
-        // binary, so the failure has to be the absence of a config store and
-        // nothing else.
+        // Every other test enters through the `routes_with_settings` parity
+        // seam, so this is the one that calls `build_state` itself. There is
+        // no Spin runtime under `cargo test`, so there are no component
+        // variables to read and this cannot return `Ok` here. Its settings
+        // come from the config store alone, so the failure has to be the
+        // absence of a config store, and never a configuration compiled into
+        // the binary, such as a template's placeholder password.
         let Err(error) = build_state() else {
             return;
         };
@@ -1194,13 +1183,12 @@ mod tests {
     /// The per-request Edge Cookie read must return its error rather than a
     /// default context.
     ///
-    /// This adapter used to log the failure and continue with
-    /// `EcContext::default()`, so a deployment whose selected module could not
-    /// be built served every request with no identity. The call sites propagate
-    /// the error to `http_error`, matching the Fastly adapter. The settings are
-    /// parsed directly, bypassing the composition root's startup check, so the
-    /// per-request behavior can be exercised with a selection the adapter
-    /// cannot supply.
+    /// Continuing with `EcContext::default()` would serve every request with
+    /// no identity when the selected module cannot be built. The call sites
+    /// propagate the error to `http_error`, matching the Fastly adapter. The
+    /// settings are parsed directly, bypassing the composition root's startup
+    /// check, so the per-request behavior can be exercised with a selection
+    /// the adapter cannot supply.
     #[test]
     fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
         let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)
