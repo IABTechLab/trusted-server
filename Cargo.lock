@@ -5416,7 +5416,6 @@ dependencies = [
  "tokio",
  "toml",
  "trusted-server-core",
- "trusted-server-js",
  "worker",
 ]
 
@@ -5465,7 +5464,6 @@ dependencies = [
  "spin-sdk",
  "tokio",
  "trusted-server-core",
- "trusted-server-js",
 ]
 
 [[package]]

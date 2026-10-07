@@ -58,6 +58,15 @@ jobs:
           components: "clippy, rustfmt"
           cache-shared-key: cargo-${{ runner.os }}
 
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
