@@ -628,6 +628,8 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// core: a module whose identifiers are not the built-in shape (for
     /// example an opaque signed envelope) accepts its own format here, so its
     /// identifier round-trips instead of being silently dropped on read-back.
+    /// Core also asks about the string
+    /// [`normalize_id_for_kv`](Self::normalize_id_for_kv) returns.
     ///
     /// The default accepts the built-in HMAC identifier shape
     /// (`<64 hex>.<6 alphanumeric>`), which is correct for [`HmacModule`], the
@@ -636,11 +638,21 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
         generation::is_valid_ec_id(value)
     }
 
-    /// Returns the KV-key form of `value` for this module's identifiers.
+    /// Returns the identity two visits must share to be treated as the same
+    /// visitor, which is what core keys the identity graph by.
     ///
-    /// Core keys the identity graph by the returned string, so a module whose
-    /// identifiers are case-sensitive or carry no separable segments returns the
-    /// value unchanged to avoid collapsing distinct identifiers into one key.
+    /// Core builds the key from the module's code and the returned string, so
+    /// two identifiers that return the same string share one row and two that
+    /// differ never meet. A module whose identifier carries a signature, a
+    /// nonce, a timestamp or any other part that changes each time the
+    /// identifier is issued must return the stable part and not the value as
+    /// transported, or the identity does not survive a reissue. A module whose
+    /// whole identifier is stable returns it unchanged, keeping its case where
+    /// case matters, so distinct identifiers are not collapsed into one key.
+    ///
+    /// Core asks [`accepts_id`](Self::accepts_id) about the returned string as
+    /// well as about the identifier as issued, so a module must accept its own
+    /// canonical form, or no row is read or written for it.
     ///
     /// The default lowercases the leading HMAC hash segment and preserves the
     /// suffix, matching the built-in identifier shape.
@@ -1660,6 +1672,77 @@ mod tests {
             shared.normalize_id_for_kv("x"),
             "kv:x",
             "should delegate normalize_id_for_kv to the inner module"
+        );
+    }
+
+    /// A module whose identifier is a stable part followed by a part that
+    /// changes each time the identifier is issued, as a signed envelope does.
+    #[derive(Debug)]
+    struct ReissuedEnvelopeModule;
+
+    impl ReissuedEnvelopeModule {
+        fn stable_part(value: &str) -> &str {
+            value.split_once('.').map_or(value, |(stable, _)| stable)
+        }
+    }
+
+    impl EdgeCookieModule for ReissuedEnvelopeModule {
+        fn id(&self) -> &'static str {
+            "reissued_envelope"
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0re")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            // The identifier as issued, and its canonical form on its own.
+            Self::stable_part(value).starts_with("device-")
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            Self::stable_part(value).to_owned()
+        }
+    }
+
+    #[test]
+    fn two_issues_of_one_identity_share_one_identity_graph_key() {
+        // The key is the identity two visits must share. Two identifiers that
+        // differ only in the part reissued each time are one visitor and must
+        // reach one row, where a module returning the value unchanged would
+        // give each issue a row of its own.
+        let module = ReissuedEnvelopeModule;
+        let accepted = AcceptedModules::active(Some(&module));
+
+        let first = accepted
+            .canonical_kv_key("t0re~device-1.issued-monday")
+            .expect("should key the first issue");
+        let second = accepted
+            .canonical_kv_key("t0re~device-1.issued-tuesday")
+            .expect("should key the second issue");
+        assert_eq!(
+            first, second,
+            "two issues of one identity should share one identity-graph key"
+        );
+        assert_eq!(
+            first, "t0re~device-1",
+            "the key should be the module's code and the stable part"
+        );
+
+        let other = accepted
+            .canonical_kv_key("t0re~device-2.issued-monday")
+            .expect("should key another identity");
+        assert_ne!(
+            first, other,
+            "a different stable part should be a different visitor"
         );
     }
 
