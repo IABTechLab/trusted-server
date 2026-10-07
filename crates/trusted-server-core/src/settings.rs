@@ -841,7 +841,7 @@ impl Ec {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when a module name or
-    /// implementation is not `snake_case`, when a block is configured with no
+    /// implementation is not a module name, when a block is configured with no
     /// selector or alongside `"none"`, when the selector names a key `[ec]`
     /// reads as its own setting, when the selected implementation is not
     /// compiled into this build, when a block the selector does not name is
@@ -942,22 +942,16 @@ impl Ec {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when `name` is not
-    /// `snake_case`.
+    /// Returns [`TrustedServerError::Configuration`] when `name` is not a
+    /// module name, see [`crate::module_name::is_valid`].
     fn validate_module_name(name: &str) -> Result<(), Report<TrustedServerError>> {
-        let valid = !name.is_empty()
-            && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            && name
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_');
-        if valid {
+        if crate::module_name::is_valid(name) {
             return Ok(());
         }
         Err(Report::new(TrustedServerError::Configuration {
             message: format!(
-                "Edge Cookie module name `{name}` must be snake_case, matching \
-                 ^[a-z][a-z0-9_]*$"
+                "Edge Cookie module name `{name}` is not a module name, which is parts \
+                 joined by `.`, each of lower case letters, digits, `_` or `-`"
             ),
         }))
     }
@@ -1418,23 +1412,23 @@ impl DeviceConfig {
 
 /// Which permission signal modules run, and in what order.
 ///
-/// Mapped from the `[permission_signal]` TOML section, where `module`
-/// selects, as it does in `[ec]`, `[geo]` and `[device]`. Those each name one
-/// module, whereas signals compose, because a request can carry a TCF string
+/// Mapped from the `[permission-signal]` TOML section, where `modules`
+/// selects. `[ec]`, `[geo]` and `[device]` each name one module with
+/// `module`, whereas signals compose, because a request can carry a TCF string
 /// and a Global Privacy Control header at once and both have something to say.
-/// So here `module` names a list, and the order is the policy, because the
+/// So here `modules` names a list, and the order is the policy, because the
 /// last module with an opinion decides.
 ///
 /// A module that gains settings will take them in a
-/// `[permission_signal.<name>]` block named for it. None of the modules that
-/// ship has settings, so `module` is the only key accepted, and any other key
+/// `[permission-signal.<name>]` block named for it. None of the modules that
+/// ship has settings, so `modules` is the only key accepted, and any other key
 /// is refused as an unknown field rather than silently ignored.
 ///
 /// See `crates/trusted-server-core/src/permission_signal/README.md`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Validate)]
 pub struct PermissionSignalConfig {
-    /// The modules to run, in order, named by the identifier each module
-    /// crate declares, for example `gpc`, `gpp_sale_opt_out`, `us_privacy` and
+    /// The modules to run, in order, named by their crate folders below
+    /// `crates/permission-signal`, for example `gpc`, `gpp`, `us-privacy`,
     /// `tcf` and `mtm` for the five that ship.
     ///
     /// Absent means every module the adapter offers, in the order it offers
@@ -1452,11 +1446,11 @@ pub struct PermissionSignalConfig {
     /// [`build_permission_signal_modules`]:
     ///     crate::permission_signal::build_permission_signal_modules
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub module: Option<Vec<String>>,
+    pub modules: Option<Vec<String>>,
 }
 
-/// Read by hand rather than derived, so that `sources`, the key `module`
-/// replaced, is refused with a message saying what to write instead. A derived
+/// Read by hand rather than derived, so that `sources` and `module`, the keys
+/// `modules` replaced, are refused with a message saying what to write instead. A derived
 /// struct could only refuse it by name by declaring it as a field, and would
 /// then list it among the keys it expects whenever it refused any other.
 impl<'de> Deserialize<'de> for PermissionSignalConfig {
@@ -1467,24 +1461,31 @@ impl<'de> Deserialize<'de> for PermissionSignalConfig {
         let mut section = serde_json::Map::<String, JsonValue>::deserialize(deserializer)?;
         if section.contains_key("sources") {
             return Err(serde::de::Error::custom(
-                "[permission_signal] sources is no longer accepted. Name the modules \
-                 to run, in order, in [permission_signal] module instead",
+                "[permission-signal] sources is no longer accepted. Name the modules \
+                 to run, in order, in [permission-signal] modules instead",
             ));
         }
-        if let Some(key) = section.keys().find(|key| key.as_str() != "module") {
+        if section.contains_key("module") {
+            return Err(serde::de::Error::custom(
+                "[permission-signal] module is `modules` here, a list, because signals \
+                 compose. Name the modules to run, in order, in [permission-signal] \
+                 modules instead",
+            ));
+        }
+        if let Some(key) = section.keys().find(|key| key.as_str() != "modules") {
             return Err(serde::de::Error::custom(format!(
-                "unknown field `{key}` in [permission_signal], expected `module`. No \
+                "unknown field `{key}` in [permission-signal], expected `modules`. No \
                  permission signal module takes settings yet, so a \
-                 [permission_signal.<name>] block is not accepted"
+                 [permission-signal.<name>] block is not accepted"
             )));
         }
         // Read as an option, so an explicit JSON null is the same as leaving
         // the key out.
-        let module = match section.remove("module") {
+        let modules = match section.remove("modules") {
             Some(value) => serde_json::from_value(value).map_err(serde::de::Error::custom)?,
             None => None,
         };
-        Ok(Self { module })
+        Ok(Self { modules })
     }
 }
 
@@ -3647,6 +3648,37 @@ impl<'de> Deserialize<'de> for RemovedIntegrationsTable {
     }
 }
 
+/// A table that is no longer read under its old name, refused with directions
+/// to its new one when a configuration still carries it.
+macro_rules! refused_table {
+    ($(#[$doc:meta])* $name:ident => $message:expr) => {
+        $(#[$doc])*
+        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                // The value is read and discarded first so that a table, a
+                // string or anything else all reach the same message. A type
+                // error instead would send an operator looking for a type
+                // problem in a table that has simply moved.
+                serde::de::IgnoredAny::deserialize(deserializer)?;
+                Err(serde::de::Error::custom($message))
+            }
+        }
+    };
+}
+
+refused_table! {
+    /// The `[permission_signal]` table, renamed `[permission-signal]`.
+    RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
+        `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
+        settings there unchanged"
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -3969,9 +4001,21 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "is_default_geo_config")]
     #[validate(nested)]
     pub geo: GeoConfig,
-    #[serde(default, skip_serializing_if = "is_default_permission_signal_config")]
+    #[serde(
+        rename = "permission-signal",
+        default,
+        skip_serializing_if = "is_default_permission_signal_config"
+    )]
     #[validate(nested)]
     pub permission_signal: PermissionSignalConfig,
+    /// The `[permission_signal]` table, kept so a configuration carrying it is
+    /// told its new name.
+    #[serde(rename = "permission_signal", default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the renamed table fails with directions"
+    )]
+    renamed_permission_signal: RenamedPermissionSignalTable,
 }
 
 impl Settings {
@@ -6978,17 +7022,17 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn module_names_and_implementations_are_snake_case() {
+    fn module_names_and_implementations_follow_the_module_name_rule() {
         for ec_section in [
             "[ec]\nmodule = \"Primary\"\n",
             "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"Hmac\"\n",
             "[ec]\nmodule = \"primary\"\n\n[ec.Primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
         ] {
             let err = Settings::from_toml(&crate_test_settings_str_with_ec_section(ec_section))
-                .expect_err("a name outside snake_case should be rejected");
+                .expect_err("a name that is not a module name should be rejected");
             assert!(
-                format!("{err:?}").contains("must be snake_case"),
-                "should hold `{ec_section}` to the snake_case rule: {err:?}"
+                format!("{err:?}").contains("is not a module name"),
+                "should hold `{ec_section}` to the module name rule: {err:?}"
             );
         }
     }
@@ -10146,10 +10190,10 @@ mod permission_signal_config_tests {
     // tested here is the shape of the section itself.
 
     /// The test fixture's configuration with `section` written as its
-    /// `[permission_signal]` section.
+    /// `[permission-signal]` section.
     fn settings_toml_with(section: &str) -> String {
         format!(
-            "{}\n[permission_signal]\n{section}\n",
+            "{}\n[permission-signal]\n{section}\n",
             crate_test_settings_str()
         )
     }
@@ -10158,7 +10202,7 @@ mod permission_signal_config_tests {
     fn no_section_is_allowed_and_means_every_module() {
         let config = PermissionSignalConfig::default();
         assert!(
-            config.module.is_none(),
+            config.modules.is_none(),
             "absent rather than empty, because the two mean opposite things"
         );
     }
@@ -10166,9 +10210,9 @@ mod permission_signal_config_tests {
     #[test]
     fn the_section_round_trips_through_toml() {
         let parsed: PermissionSignalConfig =
-            toml::from_str(r#"module = ["gpc", "tcf"]"#).expect("should parse the section");
+            toml::from_str(r#"modules = ["gpc", "tcf"]"#).expect("should parse the section");
         assert_eq!(
-            parsed.module.as_deref(),
+            parsed.modules.as_deref(),
             Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
             "the order written is the order read, because the order is the policy"
         );
@@ -10179,14 +10223,14 @@ mod permission_signal_config_tests {
         // The section is written by derive and read by hand, so what a push
         // writes into a blob must be what a deployment reads back from it.
         let written = PermissionSignalConfig {
-            module: Some(vec!["tcf".to_owned(), "gpc".to_owned()]),
+            modules: Some(vec!["tcf".to_owned(), "gpc".to_owned()]),
         };
         let blob = serde_json::to_value(&written).expect("should write the section");
         let read: PermissionSignalConfig =
             serde_json::from_value(blob).expect("should read back what was written");
         assert_eq!(read, written, "the list and its order survive the blob");
 
-        let null: PermissionSignalConfig = serde_json::from_value(json!({ "module": null }))
+        let null: PermissionSignalConfig = serde_json::from_value(json!({ "modules": null }))
             .expect("should read an explicit null");
         assert_eq!(
             null,
@@ -10198,9 +10242,9 @@ mod permission_signal_config_tests {
     #[test]
     fn an_empty_list_is_kept_apart_from_no_list() {
         let parsed: PermissionSignalConfig =
-            toml::from_str("module = []").expect("should parse an empty list");
+            toml::from_str("modules = []").expect("should parse an empty list");
         assert_eq!(
-            parsed.module.as_deref(),
+            parsed.modules.as_deref(),
             Some(&[][..]),
             "a publisher acting on no signal at all writes an empty list, and it must \
              not read back as having written nothing"
@@ -10209,28 +10253,40 @@ mod permission_signal_config_tests {
 
     #[test]
     fn an_unknown_key_is_refused() {
-        let error = toml::from_str::<PermissionSignalConfig>(r#"modules = ["gpc"]"#)
+        let error = toml::from_str::<PermissionSignalConfig>(r#"module_list = ["gpc"]"#)
             .expect_err("should refuse a misspelled key rather than silently ignore it");
         assert!(
             error
                 .to_string()
-                .contains("unknown field `modules` in [permission_signal], expected `module`"),
+                .contains("unknown field `module_list` in [permission-signal], expected `modules`"),
             "the refusal names the key it did not recognize and the one it accepts: {error}"
         );
     }
 
     #[test]
-    fn the_removed_sources_key_is_refused_naming_module() {
+    fn the_singular_key_is_refused_naming_modules() {
+        let error = toml::from_str::<PermissionSignalConfig>(r#"module = ["gpc"]"#)
+            .expect_err("should refuse the singular key the other sections use");
+        assert!(
+            error
+                .to_string()
+                .contains("[permission-signal] module is `modules` here"),
+            "the refusal says which key to write instead: {error}"
+        );
+    }
+
+    #[test]
+    fn the_removed_sources_key_is_refused_naming_modules() {
         for written in [
             r#"sources = ["gpc", "tcf"]"#,
-            "module = [\"gpc\", \"tcf\"]\nsources = [\"gpc\", \"tcf\"]",
+            "modules = [\"gpc\", \"tcf\"]\nsources = [\"gpc\", \"tcf\"]",
         ] {
             let error = toml::from_str::<PermissionSignalConfig>(written)
                 .expect_err("should refuse the removed key, alone or beside its replacement");
             assert!(
                 error.to_string().contains(
-                    "[permission_signal] sources is no longer accepted. Name the modules \
-                     to run, in order, in [permission_signal] module instead"
+                    "[permission-signal] sources is no longer accepted. Name the modules \
+                     to run, in order, in [permission-signal] modules instead"
                 ),
                 "the refusal says which key to write instead: {error}"
             );
@@ -10243,7 +10299,7 @@ mod permission_signal_config_tests {
 
         let error = Settings::from_toml(&written).expect_err("should refuse the removed key");
         assert!(
-            format!("{error:?}").contains("[permission_signal] module"),
+            format!("{error:?}").contains("[permission-signal] modules"),
             "reading a TOML file names the key that replaced it: {error:?}"
         );
 
@@ -10254,7 +10310,7 @@ mod permission_signal_config_tests {
             .try_into::<TrustedServerAppConfig>()
             .expect_err("should refuse the removed key before a push");
         assert!(
-            error.to_string().contains("[permission_signal] module"),
+            error.to_string().contains("[permission-signal] modules"),
             "a push names the key that replaced it: {error}"
         );
 
@@ -10262,12 +10318,26 @@ mod permission_signal_config_tests {
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should load the test settings fixture");
         let mut blob = serde_json::to_value(settings).expect("should serialize the fixture");
-        blob["permission_signal"] = json!({ "sources": ["gpc", "tcf"] });
+        blob["permission-signal"] = json!({ "sources": ["gpc", "tcf"] });
         let error =
             Settings::from_json_value(blob).expect_err("should refuse the removed key at startup");
         assert!(
-            format!("{error:?}").contains("[permission_signal] module"),
+            format!("{error:?}").contains("[permission-signal] modules"),
             "startup names the key that replaced it: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_old_table_name_is_refused_with_its_new_name() {
+        let written = format!(
+            "{}\n[permission_signal]\nmodules = [\"gpc\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&written).expect_err("should refuse the old table name");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("[permission_signal]") && message.contains("[permission-signal]"),
+            "the refusal names the old table and the new one: {message}"
         );
     }
 
@@ -10276,13 +10346,13 @@ mod permission_signal_config_tests {
         // No module takes settings yet, so a block for one is refused rather
         // than read and then ignored.
         let written =
-            settings_toml_with("module = [\"gpc\"]\n\n[permission_signal.gpc]\nenabled = true");
+            settings_toml_with("modules = [\"gpc\"]\n\n[permission-signal.gpc]\nenabled = true");
         let error =
             Settings::from_toml(&written).expect_err("should refuse settings no module takes");
         let message = format!("{error:?}");
         assert!(
-            message.contains("unknown field `gpc` in [permission_signal]")
-                && message.contains("[permission_signal.<name>] block is not accepted"),
+            message.contains("unknown field `gpc` in [permission-signal]")
+                && message.contains("[permission-signal.<name>] block is not accepted"),
             "the refusal names the block and says why it is refused: {message}"
         );
     }

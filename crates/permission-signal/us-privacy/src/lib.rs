@@ -14,9 +14,21 @@ use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
-/// The stable identifier this module answers to in `[permission_signal]`
-/// `module`, in logs, and when a peer consults it.
-pub const ID: &str = "us_privacy";
+/// The name `[permission-signal] modules` selects this module by, from its
+/// crate folder.
+#[must_use]
+pub fn name() -> &'static str {
+    trusted_server_core::module_name!()
+}
+
+/// The name the page is told a signal came from, being the name without the
+/// type folder.
+fn short() -> &'static str {
+    trusted_server_core::module_name::short_form(
+        trusted_server_core::permission_signal::MODULE_TYPE,
+        name(),
+    )
+}
 
 /// A US Privacy string sale opt-out, read from `us_privacy`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -32,7 +44,7 @@ impl UsPrivacyModule {
 
 impl PermissionSignalModule for UsPrivacyModule {
     fn id(&self) -> &'static str {
-        ID
+        name()
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
@@ -73,7 +85,7 @@ impl PermissionSignalModule for UsPrivacyModule {
     ) -> Option<ValidSignal> {
         consent.us_privacy.as_ref()?;
         let raw = consent.raw_us_privacy.as_deref()?;
-        Some(ValidSignal::new(ID, "us_privacy", raw))
+        Some(ValidSignal::new(short(), "us_privacy", raw))
     }
 }
 
@@ -116,7 +128,7 @@ mod tests {
     fn answers_to_its_identifier() {
         assert_eq!(
             UsPrivacyModule::new().id(),
-            ID,
+            name(),
             "the module answers to the identifier configuration names"
         );
     }
@@ -152,7 +164,7 @@ mod tests {
         };
         assert_eq!(
             UsPrivacyModule::new().valid_signal(&decoded, &evidence),
-            Some(ValidSignal::new(ID, "us_privacy", "1YNN")),
+            Some(ValidSignal::new(short(), "us_privacy", "1YNN")),
             "a decoded string is vouched for as received, whatever it says"
         );
         let unreadable = ConsentContext {

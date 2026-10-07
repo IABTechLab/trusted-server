@@ -48,9 +48,21 @@ use trusted_server_core::permissions::{
 };
 use trusted_server_core::tdl::Tdl;
 
-/// The stable identifier this module answers to in `[permission_signal]`
-/// `module`, in logs, and when a peer consults it.
-pub const ID: &str = "mtm";
+/// The name `[permission-signal] modules` selects this module by, from its
+/// crate folder.
+#[must_use]
+pub fn name() -> &'static str {
+    trusted_server_core::module_name!()
+}
+
+/// The name the page is told a signal came from, being the name without the
+/// type folder.
+fn short() -> &'static str {
+    trusted_server_core::module_name::short_form(
+        trusted_server_core::permission_signal::MODULE_TYPE,
+        name(),
+    )
+}
 
 /// The scheme, as a [`ValidSignal`] names it.
 pub const SCHEME: &str = "mtm";
@@ -152,7 +164,7 @@ fn covered() -> PermissionSet {
 
 impl PermissionSignalModule for MtmModule {
     fn id(&self) -> &'static str {
-        ID
+        name()
     }
 
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
@@ -212,7 +224,7 @@ impl PermissionSignalModule for MtmModule {
         _consent: &ConsentContext,
         evidence: &dyn RequestInfo,
     ) -> Option<ValidSignal> {
-        preference(evidence).map(|word| ValidSignal::new(ID, SCHEME, word.as_str()))
+        preference(evidence).map(|word| ValidSignal::new(short(), SCHEME, word.as_str()))
     }
 
     /// The Model Terms, whenever a word is present, because either answer is
@@ -387,7 +399,11 @@ mod tests {
 
     #[test]
     fn answers_to_its_identifier() {
-        assert_eq!(MtmModule::new().id(), ID);
+        assert_eq!(
+            MtmModule::new().id(),
+            "permission-signal.mtm",
+            "the module is named by its crate folder"
+        );
     }
 
     #[test]
@@ -498,7 +514,7 @@ mod tests {
         let module = MtmModule::new();
         assert_eq!(
             module.valid_signal(&consent, &with_cookie("standard")),
-            Some(ValidSignal::new(ID, SCHEME, "standard"))
+            Some(ValidSignal::new(short(), SCHEME, "standard"))
         );
         let declared = module.tdls(&consent, &with_cookie("personalized"));
         assert_eq!(

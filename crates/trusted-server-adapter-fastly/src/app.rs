@@ -196,10 +196,9 @@ pub(crate) struct AppState {
     /// Resolving reads no request data, so the result is kept and handed to
     /// every request through
     /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
-    /// `None` for a deployment that selects no module, and for one whose
-    /// module must be resolved per request.
-    pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    /// The permission signal modules `[permission_signal] module` selects
+    /// `None` for a deployment that selects no module.
+    pub(crate) ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules `[permission-signal] modules` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
@@ -288,7 +287,7 @@ pub(crate) fn build_state_with_registrations(
     // `build_reusable_module` hands back nothing for a module built from
     // those signals, leaving it to be resolved per request against the
     // signals that request actually carried.
-    let resolved_ec_module = build_reusable_module(
+    let ec_module = build_reusable_module(
         &settings.ec,
         Some(Arc::new(FastlyHostSignals::default())),
         registry.ec_module(),
@@ -308,7 +307,7 @@ pub(crate) fn build_state_with_registrations(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
-        resolved_ec_module,
+        ec_module,
         permission_signal_modules,
     }))
 }
@@ -418,7 +417,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     // again. Nothing is set for a deployment that selects no module, or one
     // whose module is built from this request's own host signals, and both
     // are resolved on the request path instead.
-    let services = match state.resolved_ec_module.clone() {
+    let services = match state.ec_module.clone() {
         Some(module) => builder.resolved_ec_module(module).build(),
         None => builder.build(),
     };
@@ -1835,7 +1834,7 @@ mod tests {
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         // Resolved the same way the composition root resolves it, so this
         // router behaves like a served one.
-        let resolved_ec_module = trusted_server_core::ec::module::build_reusable_module(
+        let ec_module = trusted_server_core::ec::module::build_reusable_module(
             &settings.ec,
             None,
             registry.ec_module(),
@@ -1849,7 +1848,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
-            resolved_ec_module,
+            ec_module,
             permission_signal_modules: Arc::default(),
         });
         TrustedServerApp::routes_for_state(&state)

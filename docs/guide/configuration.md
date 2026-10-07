@@ -234,7 +234,7 @@ own `[<type>.<name>]` settings table, as
 | `[[handlers]]`             | nothing           | Ordered HTTP Basic-auth rules                               |
 | `[image_optimizer]`        | nothing           | Reusable Fastly Image Optimizer profiles                    |
 | `[integration]`            | several modules   | Partner and browser integrations                            |
-| `[permission_signal]`      | several modules   | Which permission signals are acted on, in order             |
+| `[permission-signal]`      | several modules   | Which permission signals are acted on, in order             |
 | `[proxy]`                  | nothing           | Proxy allowlist, TLS policy, and asset routes               |
 | `[publisher]`              | nothing           | Publisher domain, origin, and proxy signing key             |
 | `[request_signing]`        | nothing           | Outbound Ed25519 request signing and management-store IDs   |
@@ -683,7 +683,7 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                 |
 | `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                 |
 
-Each module that has settings is configured in its own `[ec.<name>]` table, and the `module` selector names which table is active. A table may set `implementation = "<id>"` to say which module it configures, which makes the table name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. Module names and implementation ids are `snake_case`.
+Each module that has settings is configured in its own `[ec.<name>]` table, and the `module` selector names which table is active. A table may set `implementation = "<id>"` to say which module it configures, which makes the table name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. A module from a crate is named by its folder below `crates/`, so it may be written in full, as `edgecookie.<name>`, or with that type folder left off, and core's own modules such as `hmac` take bare names. A name is parts joined by `.`, each of lower case letters, digits, `_` or `-`.
 
 A module has a table only when it has settings of its own. Both modules that derive an identifier at the edge take a passphrase, so selecting `hmac` or `host_signals` without its table fails at startup, while the `client_fixed` demonstration module needs no table at all. A table the selector does not name also fails at startup, so a stale table cannot sit unnoticed.
 
@@ -760,7 +760,7 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 **Purpose**: Names the active Edge Cookie module. Omit to run statelessly with no Edge Cookie.
 
-**Validation**: Application startup fails if the name is not `snake_case`, if it names a key the `[ec]` section reads as its own setting, if the selected module has no `[ec.<name>]` table where it needs one, if it names a module this build does not have, or if a table the selector does not name is configured. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
+**Validation**: Application startup fails if the name is not a module name (parts joined by `.`, each of lower case letters, digits, `_` or `-`), if it names a key the `[ec]` section reads as its own setting, if the selected module has no `[ec.<name>]` table where it needs one, if it names a module this build does not have, or if a table the selector does not name is configured. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
 
 #### `hmac.passphrase`
 
@@ -3146,14 +3146,14 @@ from the file, and startup checks the rest and runs the first set again.
 
 **EC Validation**:
 
-- `module`, when set, is `snake_case` and has the `[ec.<name>]` table its
+- `module`, when set, is a module name and has the `[ec.<name>]` table its
   implementation needs, and no unselected table is left configured, or startup
   fails
 - The `hmac.passphrase` key name is non-empty at push time, the resolved
   passphrase is at least 32 bytes at runtime, and a known placeholder value is
   rejected after resolution
 - The complete auction plan compiles from `[demand]`, `[adserver]` and
-  `[auction.bidders]`, so an unselected table, a name that is not snake_case,
+  `[auction.bidders]`, so an unselected table, a name that is not a module name,
   an implementation this build does not have, a bad endpoint, an out-of-range
   timeout, an unsupported routing mode, a route naming an unselected demand
   source, or a setting the implementation rejects, all fail here

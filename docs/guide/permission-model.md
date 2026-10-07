@@ -358,7 +358,7 @@ a module runs.
 A consent record that is present but cannot be decoded blocks baseline grants
 (fail-closed) rather than degrading to the no-signal baseline, ahead of every
 signal module and whichever are configured. The modules are then asked in
-the order `[permission_signal] module` gives, each amending what the ones
+the order `[permission-signal] modules` gives, each amending what the ones
 before it settled, and the last with an opinion decides. So which of a US-style
 opt-out (GPC, a GPP sale opt-out, or a US Privacy opt-out) and a consenting TCF
 record stands when they disagree is the configured order, not a rule in code.

@@ -134,6 +134,8 @@ pull_sync_concurrency = 3
 # selected as `module = "primary"` and configured in the table below
 # instead, which is how a deployment gives a module a name that means
 # something to the people running it.
+# A module from a crate is named by its folder below crates/, and may be
+# written in full, as edgecookie.<name>, or with that type folder left off.
 # [ec.primary]
 # implementation = "hmac"
 # passphrase = "ec_passphrase"
@@ -264,26 +266,33 @@ pull_sync_concurrency = 3
 #
 # Signals compose rather than select. A request can carry a TCF string and a
 # Global Privacy Control header at once, and both have something to say, so
-# module here is a list, whereas in [ec], [geo] and [device] it names one
-# module. The order is the policy, because the last module with an opinion
-# decides.
+# modules here is a list, whereas in [ec], [geo] and [device] module names
+# one module. The order is the policy, because the last module with an
+# opinion decides.
 #
 # Listed below is every module the shipped adapters link, which is also
-# exactly what runs when module is left out. Each is a crate under
-# crates/permission-signal, outside the core. Modules are named in
-# snake_case, lowercase words joined by underscores. Remove the ones this
+# exactly what runs when modules is left out. Each is a crate under
+# crates/permission-signal, outside the core, and is named by its folder
+# there. Remove the ones this
 # publisher does not want to act on. A module that is not on the list does
 # not run, and there is no separate switch to turn one off. An unknown or
 # repeated name is refused at startup rather than quietly ignored. None of the
 # four has settings, so none needs a [permission_signal.<name>] table.
 #
-# [permission_signal]
-# module = [
-#   "gpc",               # the Sec-GPC request header, Global Privacy Control
-#   "gpp_sale_opt_out",  # a GPP US sale opt-out
-#   "us_privacy",        # a US Privacy string sale opt-out
-#   "tcf",               # TCF v2, with its purpose mapping in the crate
+# [permission-signal]
+# modules = [
+#   "gpc",        # the Sec-GPC request header, Global Privacy Control
+#   "gpp",        # a GPP US sale opt-out
+#   "us-privacy", # a US Privacy string sale opt-out
+#   "tcf",        # TCF v2, with its purpose mapping in the crate
 # ]
+#
+# Each name is the module's crate folder below crates/permission-signal, and
+# may be written in full, as permission-signal.gpp.
+#
+# A module that gains settings will take them in a [permission-signal.<name>]
+# block named for it. None of these four has settings, so such a block is
+# refused rather than ignored.
 #
 # The three opt-outs are separate entries so that a publisher who does not act
 # on Global Privacy Control can remove "gpc" and keep the GPP and US Privacy

@@ -89,10 +89,9 @@ pub struct AppState {
     /// Resolving reads no request data, so the result is kept and handed to
     /// every request through
     /// [`RuntimeServices::resolved_ec_module`](trusted_server_core::platform::RuntimeServices::resolved_ec_module).
-    /// `None` for a deployment that selects no module, and for one whose
-    /// module must be resolved per request.
-    resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    /// The permission signal modules `[permission_signal] module` selects
+    /// `None` for a deployment that selects no module.
+    ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules `[permission-signal] modules` selects
     /// from the scheme crates this adapter links, in the order they run.
     /// Selected once here so a name no crate answers to fails startup rather
     /// than the first request, and handed to every request's services.
@@ -281,7 +280,7 @@ fn build_state_with_registrations_and_services(
     // `RuntimeServices` may have resolved one already, and that one comes first
     // because it is what the request path will see. This adapter supplies no
     // host signals, so that argument stays `None` until it does.
-    let resolved_ec_module = build_reusable_module(
+    let ec_module = build_reusable_module(
         &settings.ec,
         None,
         services
@@ -299,7 +298,7 @@ fn build_state_with_registrations_and_services(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        resolved_ec_module,
+        ec_module,
         permission_signal_modules,
         services,
     }))
@@ -347,7 +346,7 @@ impl AppState {
             .unwrap_or_else(|| {
                 build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
             })
-            .with_resolved_ec_module(self.resolved_ec_module.clone());
+            .with_resolved_ec_module(self.ec_module.clone());
         if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
         }
