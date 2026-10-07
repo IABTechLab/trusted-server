@@ -79,8 +79,8 @@ The last module with an opinion decides, so the order is the policy. It is
 a deployment's to set, not this code's to assume.
 
 ```toml
-[permission_signal]
-module = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf", "mtm"]
+[permission-signal]
+modules = ["gpc", "gpp", "us-privacy", "tcf", "mtm"]
 ```
 
 A module not on the list does not run, and there is no separate switch. A
@@ -88,17 +88,19 @@ publisher who does not want to act on Global Privacy Control removes `"gpc"`
 from the list, and the module that reads the header then does not run. One
 caveat: core's consent pipeline can also synthesize a US Privacy opt-out from
 that header for a visitor in a US state, when the consent settings say to,
-which they do by default, and the `us_privacy` module then acts on the
+which they do by default, and the `us-privacy` module then acts on the
 record it produced. A publisher who wants the header to have no effect at all
-turns that setting off as well. Leaving `module` out, or the section
+turns that setting off as well. Leaving `modules` out, or the section
 entirely, runs every module the adapter offers, in the order it offers them,
 so a signal is never quietly ignored because someone forgot to list it. An
 unknown or repeated name is refused at startup, so a typo cannot silently stop
 a scheme being honored.
 
-Modules are named in `snake_case`, lowercase words joined by underscores. A
-module that gains settings will take them in a `[permission_signal.<name>]`
-block named for it. None of the five here has settings, so `module` is the
+A module is named by its crate folder below `crates/permission-signal`, so
+`gpp` and `us-privacy` are the folders those crates live in, and a name may
+also be written in full, as `permission-signal.gpp`. A module that gains
+settings will take them in a `[permission-signal.<name>]`
+block named for it. None of the five here has settings, so `modules` is the
 only key the section accepts, and a block or any other key is refused as an
 unknown field rather than ignored.
 
@@ -207,7 +209,7 @@ the identifier never depended on the record.
 ## Writing a module
 
 Implement `PermissionSignalModule` in a crate that depends on core, and give
-it an identifier in `snake_case`, which is the name configuration uses. Answer
+it its name through `module_name!()`, which is the name configuration uses. Answer
 `Neutral` for a permission the module has no opinion on, including when the
 signal it reads is absent from the request. Returning `Revoke` for an absent
 signal turns silence into refusal and would revoke the permission on every
@@ -235,13 +237,13 @@ from configuration.
 Five crates ship, under `crates/permission-signal/`, and a deployment
 configuring nothing gets all five in this order:
 
-| Identifier         | Crate        | Reads                                               |
-| ------------------ | ------------ | --------------------------------------------------- |
-| `gpc`              | `gpc`        | The `Sec-GPC` header, Global Privacy Control        |
-| `gpp_sale_opt_out` | `gpp`        | The US sale opt-out in a GPP string                 |
-| `us_privacy`       | `us-privacy` | The sale opt-out in a US Privacy string             |
-| `tcf`              | `tcf`        | A TCF v2 record, with its purpose mapping in code   |
-| `mtm`              | `mtm`        | The PMP answer, under the Model Terms for Marketing |
+| Name         | Crate        | Reads                                               |
+| ------------ | ------------ | --------------------------------------------------- |
+| `gpc`        | `gpc`        | The `Sec-GPC` header, Global Privacy Control        |
+| `gpp`        | `gpp`        | The US sale opt-out in a GPP string                 |
+| `us-privacy` | `us-privacy` | The sale opt-out in a US Privacy string             |
+| `tcf`        | `tcf`        | A TCF v2 record, with its purpose mapping in code   |
+| `mtm`        | `mtm`        | The PMP answer, under the Model Terms for Marketing |
 
 The three opt-outs are separate rather than one so that a publisher who does
 not act on Global Privacy Control can remove it and keep the other two.

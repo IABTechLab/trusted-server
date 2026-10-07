@@ -56,6 +56,7 @@ pub mod html_processor;
 pub mod http_util;
 pub mod integrations;
 pub mod models;
+pub mod module_name;
 pub mod openrtb;
 pub mod permission_signal;
 pub mod permissions;
