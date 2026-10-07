@@ -22,9 +22,10 @@
 //!   `blob:`, `about:`.
 //!
 //! Notable helpers:
-//! - `to_abs(&Settings, &str) -> Option<String>`: Normalizes a string to an absolute URL if
-//!   it is already absolute or protocol-relative; returns `None` otherwise or for
-//!   non-network schemes.
+//! - `normalize_creative_url(&str) -> Option<Url>`: Normalizes an absolute or
+//!   protocol-relative http(s) URL; returns `None` for relative input,
+//!   non-network schemes and unparseable values. Host policy lives on
+//!   [`crate::settings::Rewrite`].
 //! - `rewrite_srcset(&Settings, &str) -> String`: Rewrites `srcset`/`imagesrcset`
 //!   values, proxying absolute candidates and preserving descriptors (`1x`,
 //!   `1.5x`, `100w`).
@@ -49,29 +50,45 @@ use std::io;
 /// Responses larger than this will be rejected to prevent memory exhaustion.
 const MAX_REWRITABLE_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
-// Helper: normalize to absolute URL if http/https or protocol-relative. Otherwise None.
-// Checks against the rewrite blacklist to exclude configured domains/patterns from proxying.
-pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
-    let t = u.trim();
-    if t.is_empty() {
-        return None;
-    }
-
-    let lower = t.to_ascii_lowercase();
-    let absolute = if t.starts_with("//") {
-        format!("https:{t}")
-    } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        t.to_owned()
+/// Normalizes a creative URL to an absolute HTTP(S) [`url::Url`].
+///
+/// Trims surrounding whitespace, resolves a protocol-relative `//host/...`
+/// against `https:`, and accepts only `http://` and `https://` input (ASCII
+/// case-insensitive). Returns `None` for empty, relative, non-network-scheme or
+/// unparseable input. Applies no host policy; see
+/// [`crate::settings::Rewrite::should_proxy_asset`] and
+/// [`crate::settings::Rewrite::should_wrap_click`].
+pub(super) fn normalize_creative_url(url: &str) -> Option<url::Url> {
+    let trimmed = url.trim();
+    let is_http = trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    let is_https = trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+    if trimmed.starts_with("//") {
+        url::Url::parse(&format!("https:{trimmed}")).ok()
+    } else if is_http || is_https {
+        url::Url::parse(trimmed).ok()
     } else {
-        return None;
-    };
-
-    // Match exclusions against the same absolute URL used for rewriting.
-    if settings.rewrite.is_excluded(&absolute) {
-        return None;
+        None
     }
+}
 
-    Some(absolute)
+/// Normalizes `raw` and returns it when asset policy allows proxying its host.
+fn asset_target(settings: &Settings, raw: &str) -> Option<url::Url> {
+    normalize_creative_url(raw).filter(|url| {
+        url.host_str()
+            .is_some_and(|host| settings.rewrite.should_proxy_asset(host))
+    })
+}
+
+/// Normalizes `raw` and returns it when click policy allows wrapping its host.
+fn click_target(settings: &Settings, raw: &str) -> Option<url::Url> {
+    normalize_creative_url(raw).filter(|url| {
+        url.host_str()
+            .is_some_and(|host| settings.rewrite.should_wrap_click(host))
+    })
 }
 
 /// Maximum number of nested parser scopes [`rewrite_style_urls`] will enter.
@@ -399,14 +416,14 @@ impl CssUrlRewriter<'_> {
         parser: &cssparser::Parser<'_, '_>,
         shape: UrlShape,
     ) {
-        let Some(absolute) = to_abs(self.settings, value) else {
+        let Some(target) = asset_target(self.settings, value) else {
             return;
         };
         let token_end = parser.position().byte_index();
         let result = (|| -> fmt::Result {
             self.out
                 .write_str(&self.style[self.write_pos..token_start])?;
-            let proxied = build_proxy_url(self.settings, &absolute, self.base_origin);
+            let proxied = build_proxy_url(self.settings, target.as_str(), self.base_origin);
             if let UrlShape::Function(name) = shape {
                 self.out.write_str(name)?;
                 self.out.write_char('(')?;
@@ -637,7 +654,7 @@ pub(super) fn build_click_url(settings: &Settings, clear_url: &str, base_origin:
 
 #[inline]
 pub(super) fn proxy_if_abs(settings: &Settings, val: &str, base_origin: &str) -> Option<String> {
-    to_abs(settings, val).map(|abs| build_proxy_url(settings, &abs, base_origin))
+    asset_target(settings, val).map(|url| build_proxy_url(settings, url.as_str(), base_origin))
 }
 
 /// Split a srcset/imagesrcset attribute into candidate strings.
@@ -723,8 +740,8 @@ pub(super) fn rewrite_srcset(settings: &Settings, srcset: &str, base_origin: &st
         let mut parts = it.split_whitespace();
         let url = parts.next().unwrap_or("");
         let descriptor = parts.collect::<Vec<_>>().join(" ");
-        let rewritten = if let Some(abs) = to_abs(settings, url) {
-            build_proxy_url(settings, &abs, base_origin)
+        let rewritten = if let Some(target) = asset_target(settings, url) {
+            build_proxy_url(settings, target.as_str(), base_origin)
         } else {
             url.to_owned()
         };
@@ -1282,9 +1299,9 @@ fn rewrite_creative_html_impl(
                 // Click-through links
                 element!("a[href], area[href]", |el| {
                     if let Some(href) = el.get_attribute("href")
-                        && let Some(abs) = to_abs(settings, &href)
+                        && let Some(target) = click_target(settings, &href)
                     {
-                        let click = build_click_url(settings, &abs, base_origin);
+                        let click = build_click_url(settings, target.as_str(), base_origin);
                         let _ = el.set_attribute("href", &click);
                         let _ = el.set_attribute("data-tsclick", &click);
                     }
@@ -1495,9 +1512,9 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreativeCssProcessor, StreamProcessor as _, process_auction_creative,
-        rewrite_creative_html, rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls,
-        sanitize_creative_html, to_abs,
+        CreativeCssProcessor, StreamProcessor as _, normalize_creative_url,
+        process_auction_creative, proxy_if_abs, rewrite_creative_html,
+        rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html,
     };
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
@@ -1696,44 +1713,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn to_abs_conversions() {
-        let settings = crate::test_support::tests::create_test_settings();
-        assert_eq!(
-            to_abs(&settings, "//cdn.example/x"),
-            Some("https://cdn.example/x".to_owned())
-        );
-        assert_eq!(
-            to_abs(&settings, "HTTPS://cdn.example/x"),
-            Some("HTTPS://cdn.example/x".to_owned())
-        );
-        assert_eq!(
-            to_abs(&settings, "http://cdn.example/x"),
-            Some("http://cdn.example/x".to_owned())
-        );
-        assert_eq!(to_abs(&settings, "/local/x"), None);
-        assert_eq!(
-            to_abs(&settings, "   //cdn.example/y  "),
-            Some("https://cdn.example/y".to_owned())
-        );
-        assert_eq!(to_abs(&settings, "data:image/png;base64,abcd"), None);
-        assert_eq!(to_abs(&settings, "javascript:alert(1)"), None);
-        assert_eq!(to_abs(&settings, "mailto:test@example.com"), None);
+    fn normalized(raw: &str) -> Option<String> {
+        normalize_creative_url(raw).map(|url| url.as_str().to_owned())
     }
 
     #[test]
-    fn to_abs_preserves_port_in_protocol_relative() {
-        let settings = crate::test_support::tests::create_test_settings();
-        assert_eq!(
-            to_abs(&settings, "//cdn.example.com:8080/asset.js"),
-            Some("https://cdn.example.com:8080/asset.js".to_owned()),
-            "should preserve port 8080 in protocol-relative URL"
-        );
-        assert_eq!(
-            to_abs(&settings, "//cdn.example.com:9443/img.png"),
-            Some("https://cdn.example.com:9443/img.png".to_owned()),
-            "should preserve port 9443 in protocol-relative URL"
-        );
+    fn normalize_creative_url_conversions() {
+        for (raw, expected) in [
+            ("//cdn.example/x", Some("https://cdn.example/x")),
+            ("HTTPS://cdn.example/x", Some("https://cdn.example/x")),
+            ("http://cdn.example/x", Some("http://cdn.example/x")),
+            ("   //cdn.example/y  ", Some("https://cdn.example/y")),
+            ("   https://cdn.example/a   ", Some("https://cdn.example/a")),
+            (
+                "//cdn.example.com:8080/asset.js",
+                Some("https://cdn.example.com:8080/asset.js"),
+            ),
+            (
+                "//cdn.example.com:9443/img.png",
+                Some("https://cdn.example.com:9443/img.png"),
+            ),
+            ("/local/x", None),
+            ("", None),
+            ("data:image/png;base64,abcd", None),
+            ("javascript:alert(1)", None),
+            ("mailto:test@example.com", None),
+            ("blob:xyz", None),
+            ("tel:+123", None),
+            ("about:blank", None),
+            ("https://exa mple.example/x", None),
+        ] {
+            assert_eq!(
+                normalized(raw).as_deref(),
+                expected,
+                "should normalize `{raw}` to {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -3417,18 +3432,6 @@ b{background:url(\"https://cdn.example/c.png\")}";
     }
 
     #[test]
-    fn to_abs_additional_cases() {
-        let settings = crate::test_support::tests::create_test_settings();
-        assert_eq!(
-            to_abs(&settings, "   https://cdn.example/a   "),
-            Some("https://cdn.example/a".to_owned())
-        );
-        assert_eq!(to_abs(&settings, "blob:xyz"), None);
-        assert_eq!(to_abs(&settings, "tel:+123"), None);
-        assert_eq!(to_abs(&settings, "about:blank"), None);
-    }
-
-    #[test]
     fn rewrites_lazy_img_data_src_and_data_srcset() {
         let settings = crate::test_support::tests::create_test_settings();
         let html = r#"
@@ -3443,62 +3446,86 @@ b{background:url(\"https://cdn.example/c.png\")}";
     }
 
     #[test]
-    fn to_abs_respects_exclude_domains() {
+    fn proxy_if_abs_respects_exclude_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_owned()];
+        settings.rewrite.exclude_domains = vec![
+            "trusted-cdn.example.com".to_owned(),
+            "*.example.org".to_owned(),
+        ];
 
-        // Excluded domain should return None (not proxied)
-        assert_eq!(
-            to_abs(&settings, "https://trusted-cdn.example.com/lib.js"),
-            None
-        );
+        for excluded in [
+            "https://trusted-cdn.example.com/lib.js",
+            "//trusted-cdn.example.com/lib.js",
+            "https://example.org/cdn.js",
+            "//cdnjs.example.org/lib.js",
+        ] {
+            assert_eq!(
+                proxy_if_abs(&settings, excluded, ""),
+                None,
+                "should leave excluded URL `{excluded}` unproxied"
+            );
+        }
+        for proxied in [
+            "https://other-cdn.example.com/lib.js",
+            "//other-cdn.example.com/lib.js",
+            "https://notexample.org/lib.js",
+        ] {
+            assert!(
+                proxy_if_abs(&settings, proxied, "")
+                    .is_some_and(|url| url.starts_with("/first-party/proxy?tsurl=")),
+                "should proxy non-excluded URL `{proxied}`"
+            );
+        }
+    }
 
-        assert_eq!(
-            to_abs(&settings, "//trusted-cdn.example.com/lib.js"),
-            None,
-            "should exclude a protocol-relative URL by exact domain"
-        );
+    #[test]
+    fn unparseable_absolute_url_is_left_byte_identical() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = "<img src='https://exa mple.example/x'>";
 
-        // Non-excluded domain should return Some
-        assert_eq!(
-            to_abs(&settings, "https://other-cdn.example.com/lib.js"),
-            Some("https://other-cdn.example.com/lib.js".to_owned())
-        );
-        assert_eq!(
-            to_abs(&settings, "//other-cdn.example.com/lib.js"),
-            Some("https://other-cdn.example.com/lib.js".to_owned()),
-            "should normalize a non-excluded protocol-relative URL"
+        let out = rewrite_creative_html(&settings, html);
+
+        assert!(
+            out.contains(html),
+            "should leave an unparseable absolute URL untouched, including its quoting: {out}"
         );
     }
 
     #[test]
-    fn to_abs_respects_wildcard_domains() {
+    fn unparseable_absolute_click_url_is_left_byte_identical() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = "<a href='https://exa mple.example/x'>x</a>";
+
+        let out = rewrite_creative_html(&settings, html);
+
+        assert!(
+            out.contains(html),
+            "should leave an unparseable click URL untouched, including its quoting: {out}"
+        );
+        assert!(
+            !out.contains("data-tsclick"),
+            "should not mark an unparseable link for the click guard: {out}"
+        );
+    }
+
+    #[test]
+    fn exclude_domains_match_case_insensitively_in_the_rewrite_pass() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_owned()];
+        settings
+            .rewrite
+            .exclude_domains
+            .extend(["Landing.Example.com", "CDN.example.com"].map(str::to_owned));
+        let html = r#"<a href="https://landing.example.com/page">x</a><img src="https://cdn.example.com/ad.png">"#;
 
-        // Should exclude base domain
-        assert_eq!(to_abs(&settings, "https://cloudflare.com/cdn.js"), None);
+        let out = rewrite_creative_html(&settings, html);
 
-        // Should exclude subdomain
-        assert_eq!(
-            to_abs(&settings, "https://cdnjs.cloudflare.com/lib.js"),
-            None
+        assert!(
+            out.contains(r#"<a href="https://landing.example.com/page">"#),
+            "should leave a link raw when its host matches a mixed-case entry: {out}"
         );
-        assert_eq!(
-            to_abs(&settings, "//cloudflare.com/cdn.js"),
-            None,
-            "should exclude a protocol-relative wildcard base domain"
-        );
-        assert_eq!(
-            to_abs(&settings, "//cdnjs.cloudflare.com/lib.js"),
-            None,
-            "should exclude a protocol-relative wildcard subdomain"
-        );
-
-        // Should not exclude different domain
-        assert_eq!(
-            to_abs(&settings, "https://notcloudflare.com/lib.js"),
-            Some("https://notcloudflare.com/lib.js".to_owned())
+        assert!(
+            out.contains(r#"<img src="https://cdn.example.com/ad.png">"#),
+            "should leave an asset raw when its host matches a mixed-case entry: {out}"
         );
     }
 

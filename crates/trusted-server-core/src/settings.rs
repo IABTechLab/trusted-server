@@ -23,6 +23,7 @@ use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
+use crate::proxy::is_host_allowed;
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -643,30 +644,48 @@ pub struct Rewrite {
 }
 
 impl Rewrite {
-    /// Checks if a URL should be excluded from rewriting based on domain matching
-    #[allow(dead_code)]
+    /// Returns `true` when an asset URL on `host` should be rewritten to
+    /// `/first-party/proxy`.
+    ///
+    /// The host must not match [`Self::exclude_domains`]. Matching is
+    /// case-insensitive; see [`is_host_allowed`] for the pattern rules.
     #[must_use]
-    pub fn is_excluded(&self, url: &str) -> bool {
-        // Parse URL to extract host
-        let Ok(parsed) = url::Url::parse(url) else {
-            return false;
-        };
+    pub fn should_proxy_asset(&self, host: &str) -> bool {
+        !self.is_excluded_host(host)
+    }
 
-        let host = parsed.host_str().unwrap_or("");
+    /// Returns `true` when a click-through URL on `host` should be wrapped in
+    /// `/first-party/click`.
+    ///
+    /// Only [`Self::exclude_domains`] applies to click-through links.
+    #[must_use]
+    pub fn should_wrap_click(&self, host: &str) -> bool {
+        !self.is_excluded_host(host)
+    }
 
-        // Check exact domain matches (with wildcard support)
-        for domain in &self.exclude_domains {
-            if let Some(suffix) = domain.strip_prefix("*.") {
-                // Wildcard: *.example.com matches both example.com and sub.example.com
-                if host == suffix || host.ends_with(&format!(".{}", suffix)) {
-                    return true;
-                }
-            } else if host == domain {
-                return true;
-            }
+    fn is_excluded_host(&self, host: &str) -> bool {
+        self.exclude_domains
+            .iter()
+            .any(|pattern| is_host_allowed(host, pattern))
+    }
+
+    /// Trims and lowercases host patterns in place.
+    ///
+    /// Empty and bare `*` entries in `exclude_domains` are dropped with a
+    /// warning: neither can match a host, so dropping them changes no behavior.
+    fn normalize(&mut self) {
+        let before = self.exclude_domains.len();
+        self.exclude_domains = self
+            .exclude_domains
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .filter(|pattern| !pattern.is_empty() && pattern != "*")
+            .collect();
+        if self.exclude_domains.len() < before {
+            log::warn!(
+                "rewrite.exclude_domains: removed empty or bare \"*\" entries, which never match a host"
+            );
         }
-
-        false
     }
 }
 
@@ -2988,6 +3007,7 @@ impl Settings {
     pub(crate) fn normalize_deserialized(&mut self) {
         self.cache.normalize();
         self.proxy.normalize();
+        self.rewrite.normalize();
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
@@ -6520,29 +6540,81 @@ source_domain = "partner.example.com"
     }
 
     #[test]
-    fn test_rewrite_is_excluded() {
-        let rewrite = Rewrite {
-            exclude_domains: vec!["cdn.example.com".to_string(), "*.example2.com".to_string()],
-        };
+    fn rewrite_policy_matches_exclude_patterns_case_insensitively() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .exclude_domains
+            .extend(["cdn.example.com", "*.example.org"].map(str::to_owned));
 
-        // Exact domain match
-        assert!(rewrite.is_excluded("http://cdn.example.com/image.png"));
+        for (host, expected) in [
+            ("cdn.example.com", false),
+            ("CDN.EXAMPLE.COM", false),
+            ("example.org", false),
+            ("a.b.example.org", false),
+            ("evil-example.org", true),
+            ("sub.cdn.example.com", true),
+            ("other.example.com", true),
+        ] {
+            assert_eq!(
+                rewrite.should_proxy_asset(host),
+                expected,
+                "should_proxy_asset(`{host}`) should be {expected}"
+            );
+            assert_eq!(
+                rewrite.should_wrap_click(host),
+                expected,
+                "should_wrap_click(`{host}`) should be {expected}"
+            );
+        }
+    }
 
-        // Wildcard match - base domain
-        assert!(rewrite.is_excluded("https://example2.com/cdn.js"));
-        // Wildcard match - subdomains
-        assert!(rewrite.is_excluded("https://cdnjs.example2.com/lib.js"));
-        assert!(rewrite.is_excluded("https://sub.domain.example2.com/asset.js"));
+    #[test]
+    fn rewrite_normalize_trims_lowercases_and_drops_inert_exclude_entries() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .exclude_domains
+            .extend(["  CDN.Example.com ", "", "*", "*.Example.ORG"].map(str::to_owned));
 
-        // Should NOT match
-        assert!(!rewrite.is_excluded("https://other.example.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://sub.cdn.example.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://example2.com.fake.com/asset.js"));
-        assert!(!rewrite.is_excluded("https://notexample.com/asset.js"));
+        rewrite.normalize();
 
-        // Invalid URLs should not crash and should return false
-        assert!(!rewrite.is_excluded("not a url"));
-        assert!(!rewrite.is_excluded(""));
+        assert_eq!(
+            rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned(), "*.example.org".to_owned()],
+            "should trim, lowercase, and drop empty and bare `*` entries"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_match_mixed_case_entries_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["CDN.Example.com"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.rewrite.should_proxy_asset("cdn.example.com"),
+            "should exclude a host whose config entry was written in mixed case"
+        );
+    }
+
+    #[test]
+    fn settings_load_normalizes_rewrite_exclude_domains() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["  CDN.Example.com ", "*", ""]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned()],
+            "should trim, lowercase, and drop inert entries when settings load"
+        );
     }
 
     #[test]
