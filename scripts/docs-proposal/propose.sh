@@ -6,8 +6,9 @@
 # checkout. Copilot inspects <base-sha>..<merge-sha>, where <base-sha>
 # defaults to the first parent and is the previous main head when one push
 # added several commits. Writes proposal.patch (empty when nothing changes),
-# rationale.md, and evidence.json to <work-dir>, which must be inside the
-# repository so Copilot can read the prompts and write its outputs there.
+# rationale.md, evidence.json, and the resolved base to <work-dir>, which must
+# be inside the repository so Copilot can read the prompts and write its
+# outputs there.
 set -euo pipefail
 
 sha="$1"
@@ -21,10 +22,15 @@ cd "$root"
 docs_proposal_require_sha "$sha"
 base="${3:-}"
 if [ -z "$base" ] || [ "$base" = "$sha" ] || ! git merge-base --is-ancestor "$base" "$sha" 2>/dev/null; then
+  if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ]; then
+    printf '::warning::Base %s is not an ancestor of %s; using its first parent.\n' "$base" "$sha"
+  fi
   base="$(git rev-parse "$sha^1")"
 fi
 mkdir -p "$2"
 work_dir="$(cd "$2" && pwd)"
+# publish.sh records the base so a retry over a different range is refused.
+printf '%s\n' "$base" > "$work_dir/base"
 relative_dir="${work_dir#"$root"/}"
 
 # Reads are always permitted; writes are allowed so Copilot can edit pages,

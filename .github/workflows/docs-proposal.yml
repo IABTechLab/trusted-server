@@ -20,6 +20,12 @@ on:
         description: Full SHA of a commit on main to propose documentation for
         required: true
         type: string
+      base:
+        description: >-
+          Full SHA of main before the push that added the commit, when that
+          push added several commits; defaults to the commit's first parent
+        required: false
+        type: string
 
 permissions: {}
 
@@ -34,10 +40,11 @@ concurrency:
 # Each job runs the proposal scripts from the workflow's own revision in
 # `tools/` against a checkout of the merge commit in `source/`, so retrying a
 # merge that predates this tooling, or a later fix to it, still works. A push
-# that adds several commits is inspected from the previous main head.
+# that adds several commits is inspected from the previous main head; a manual
+# retry of such a push needs that head as its `base` input.
 env:
   MERGE_SHA: ${{ inputs.sha || github.sha }}
-  BASE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+  BASE_SHA: ${{ github.event_name == 'push' && github.event.before || inputs.base }}
 
 jobs:
   # Copilot runs here with a read-only token; it cannot push or open PRs.

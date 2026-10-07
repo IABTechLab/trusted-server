@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests the documentation proposal helpers, validate flow, and publish flow
-# with stubbed gh and npm against a throwaway git repository.
+# Tests the documentation proposal helpers and the propose, validate, and
+# publish flows with stubbed copilot, gh, and npm against a throwaway git
+# repository.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +25,7 @@ assert_contains() {
 }
 
 sha=0123456789abcdef0123456789abcdef01234567
+base_sha=fedcba9876543210fedcba9876543210fedcba98
 
 assert_eq "$(docs_proposal_branch "$sha")" "docs/auto/0123456789ab" "should derive the branch from the SHA"
 
@@ -39,13 +41,15 @@ assert_eq "$status" 0 "should accept guide and nested guide paths"
 
 rationale="$(mktemp)"
 printf -- '- docs/guide/cli.md: documents the new flag for @example-org/maintainers.\n' > "$rationale"
-body="$(docs_proposal_pr_body "$sha" "Add example flag" 42 "$rationale")"
+body="$(docs_proposal_pr_body "$sha" "$base_sha" "Add example flag" 42 "$rationale")"
 assert_contains "$body" "<!-- docs-proposal: $sha -->" "should embed the SHA marker"
+assert_contains "$body" "<!-- docs-proposal-base: $base_sha -->" "should embed the base marker"
+assert_contains "$body" "inspected fedcba987654..0123456789ab" "should show the inspected range"
 assert_contains "$body" "merged change $sha (#42): Add example flag" "should link the merge and its PR"
 assert_contains "$body" "documents the new flag" "should include the rationale"
 assert_contains "$body" $'@\u200bexample-org/maintainers' "should neutralize mentions in the rationale"
 : > "$rationale"
-body="$(docs_proposal_pr_body "$sha" "Add example flag" "" "$rationale")"
+body="$(docs_proposal_pr_body "$sha" "$base_sha" "Add example flag" "" "$rationale")"
 assert_contains "$body" "merged change $sha: Add example flag" "should omit a missing origin PR"
 assert_contains "$body" "did not provide a rationale" "should note an empty rationale"
 rm -f "$rationale"
@@ -85,7 +89,11 @@ cat > "$tmp/bin/npm" <<'STUB'
 #!/usr/bin/env bash
 printf 'npm %s\n' "$*" >> "$STUB_LOG"
 STUB
-chmod +x "$tmp/bin/gh" "$tmp/bin/npm"
+cat > "$tmp/bin/copilot" <<'STUB'
+#!/usr/bin/env bash
+printf 'copilot %s\n' "$*" >> "$STUB_LOG"
+STUB
+chmod +x "$tmp/bin/gh" "$tmp/bin/npm" "$tmp/bin/copilot"
 export PATH="$tmp/bin:$PATH" STUB_LOG="$tmp/gh.log" STUB_REVIEW="$tmp/review.json"
 
 git init -q --bare "$tmp/origin.git"
@@ -111,6 +119,7 @@ make_patch() {
   fi
   printf -- '- docs/guide/cli.md: example rationale.\n' > "$tmp/proposal/rationale.md"
   printf '{}\n' > "$tmp/proposal/evidence.json"
+  printf '%s\n' "${2:-$base_sha}" > "$tmp/proposal/base"
 }
 
 run_publish() {
@@ -161,7 +170,7 @@ assert_eq "$(STUB_PR="" run_publish)" 0 "should succeed on an empty proposal"
 assert_eq "$(grep -c 'pr create\|pr close' "$STUB_LOG" || true)" 0 "should not open or close a PR for an empty diff"
 
 make_patch ""
-assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should succeed when closing a stale proposal"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should succeed when closing a stale proposal"
 assert_contains "$(cat "$STUB_LOG")" "pr close 7" "should close the open proposal for an empty diff"
 
 make_patch docs/superpowers/notes.md
@@ -177,16 +186,30 @@ assert_eq "$(grep -c '^npm' "$STUB_LOG" || true)" 0 "should never build proposal
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" '"path": "docs/guide/cli.md"' "should post a review for the hunk"
 
 published_head="$(remote_head)"
-assert_eq "$(STUB_PR="7 OPEN" STUB_REVIEWS=101 run_publish)" 0 "should succeed on an unchanged retry"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" STUB_REVIEWS=101 run_publish)" 0 "should succeed on an unchanged retry"
 assert_eq "$(remote_head)" "$published_head" "should not push an unchanged proposal"
 assert_eq "$(grep -c 'pr create\|--method POST' "$STUB_LOG" || true)" 0 "should not re-post an unchanged proposal"
 
+narrow_base=0000000000000000000000000000000000000001
+make_patch "" "$narrow_base"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 1 "should fail an empty retry over a different range"
+assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close a proposal from a narrower range"
+assert_contains "$(cat "$tmp/out.log")" "Rerun the workflow with base $base_sha" "should name the original base"
+
+make_patch docs/index.md "$narrow_base"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 1 "should fail a retry over a different range"
+assert_eq "$(remote_head)" "$published_head" "should not replace a proposal from a different range"
+
 make_patch docs/index.md
-assert_eq "$(STUB_PR="7 OPEN" STUB_FAIL_REVIEW=1 run_publish)" 1 "should fail when the review cannot be posted"
+assert_eq "$(STUB_PR="7 OPEN" run_publish)" 1 "should fail a retry of a proposal with no recorded base"
+assert_eq "$(remote_head)" "$published_head" "should not replace a proposal with no recorded base"
+
+make_patch docs/index.md
+assert_eq "$(STUB_PR="7 OPEN $base_sha" STUB_FAIL_REVIEW=1 run_publish)" 1 "should fail when the review cannot be posted"
 pushed_head="$(remote_head)"
 assert_contains "$(cat "$STUB_LOG")" "pr edit 7" "should edit the existing PR"
 
-assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should resume a proposal whose review failed"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should resume a proposal whose review failed"
 assert_eq "$(remote_head)" "$pushed_head" "should not push again when resuming"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" '"path": "docs/index.md"' "should review the new hunk"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" "\"commit_id\": \"$pushed_head\"" "should review the pushed commit"
@@ -199,18 +222,56 @@ git push -q origin "HEAD:refs/heads/$branch"
 maintainer_head="$(remote_head)"
 
 make_patch docs/guide/cli.md
-assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should succeed when a maintainer committed to the proposal"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should succeed when a maintainer committed to the proposal"
 assert_eq "$(remote_head)" "$maintainer_head" "should not overwrite maintainer commits"
 assert_contains "$(cat "$tmp/out.log")" "commits beyond the generated proposal" "should warn about maintainer commits"
 assert_eq "$(grep -c 'pr edit\|--method POST' "$STUB_LOG" || true)" 0 "should leave a maintained proposal untouched"
 
 make_patch ""
-assert_eq "$(STUB_PR="7 OPEN" run_publish)" 0 "should succeed on an empty rerun of a maintained proposal"
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should succeed on an empty rerun of a maintained proposal"
 assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close or delete a maintained proposal"
 assert_eq "$(remote_head)" "$maintainer_head" "should keep the maintained proposal branch"
 
 assert_eq "$(STUB_PR="7 CLOSED" run_publish)" 0 "should succeed for a closed proposal"
 assert_eq "$(grep -c 'pr edit\|pr create' "$STUB_LOG" || true)" 0 "should never reopen or recreate a closed proposal"
+
+# A push that added two commits is inspected from the previous main head; a
+# retry without that base falls back to the first parent, which publish.sh
+# then refuses to apply over the original proposal.
+git switch -q --detach "$merge_sha"
+printf 'first\n' > docs/guide/first.md
+git add docs && git commit -q -m "Document the first change"
+first_sha="$(git rev-parse HEAD)"
+printf 'second\n' > notes.txt
+git add notes.txt && git commit -q -m "Touch notes"
+second_sha="$(git rev-parse HEAD)"
+git push -q origin HEAD:main
+
+run_propose() {
+  : > "$STUB_LOG"
+  rm -rf .docs-proposal
+  if "$here/propose.sh" "$second_sha" .docs-proposal "$1" > "$tmp/out.log" 2>&1; then
+    printf '0'
+  else
+    printf '1'
+  fi
+}
+
+assert_eq "$(run_propose "$merge_sha")" 0 "should propose for a multi-commit push"
+assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the push base"
+assert_contains "$(cat .docs-proposal/prompt.md)" "- Base: $merge_sha" "should inspect the whole push"
+assert_contains "$(cat "$STUB_LOG")" "copilot -p" "should run Copilot"
+
+assert_eq "$(run_propose "")" 0 "should propose without a base"
+assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should default the base to the first parent"
+
+assert_eq "$(run_propose 0000000000000000000000000000000000000000)" 0 "should propose for a push that created main"
+assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an all-zero base with the first parent"
+assert_eq "$(grep -c '::warning::' "$tmp/out.log" || true)" 0 "should not warn about an all-zero base"
+
+assert_eq "$(run_propose "$published_head")" 0 "should propose with an unrelated base"
+assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an unrelated base with the first parent"
+assert_contains "$(cat "$tmp/out.log")" "is not an ancestor" "should warn about an unrelated base"
 
 cd "$here"
 

@@ -65,7 +65,8 @@ Permissions: `contents: read`, `copilot-requests: write`.
    1. Renders `.docs-proposal/prompt.md` from `scripts/docs-proposal/prompt.md`,
       the merge SHA, its base, its subject, and the Sources-of-truth table from
       the refresh design. The base is the push's previous `main` head, or the
-      first parent for a manual dispatch, so Copilot inspects
+      manual dispatch's optional `base` input, falling back to the first
+      parent when it is missing or not an ancestor, so Copilot inspects
       `git diff <base> <sha>`: a multi-commit push is covered in full, and a
       clean merge commit is not hidden by `git show`'s empty combined diff.
    2. Runs `copilot -p` with `--no-ask-user`, `--allow-tool=write`, and
@@ -109,26 +110,30 @@ and nothing installs, builds, or executes proposal content.
 1. If a closed or merged pull request already exists for
    `docs/auto/<short-sha>`, leave it alone and exit successfully: a
    maintainer's decision is never reopened or recreated.
-2. If the remote branch's head is not the generated proposal commit (its
+2. If an open pull request records a different base in its body, fail: the
+   retry inspected another range, such as a manual dispatch without the base
+   of a multi-commit push, and must not narrow or close the proposal. The
+   error names the recorded base to rerun with.
+3. If the remote branch's head is not the generated proposal commit (its
    parent is not the merge commit), a maintainer has committed there, for
    example by applying a review suggestion. Warn and exit successfully
    without pushing, closing, or deleting anything.
-3. Empty diff: close any open pull request for that branch with a comment,
+4. Empty diff: close any open pull request for that branch with a comment,
    then exit successfully. Otherwise apply `proposal.patch` to a fresh
    checkout of the merge commit.
-4. Reject the proposal again if any changed path is outside `docs/guide/**` or
+5. Reject the proposal again if any changed path is outside `docs/guide/**` or
    `docs/index.md`.
-5. Commit as `github-actions[bot]` on `docs/auto/<short-sha>`. If the remote
+6. Commit as `github-actions[bot]` on `docs/auto/<short-sha>`. If the remote
    branch already exists and its tree equals the new tree, reuse the remote
    commit and skip the push, so a retry resumes any later step that failed.
    Otherwise push with a lease on the fetched head.
-6. Find the originating pull request with
+7. Find the originating pull request with
    `gh api repos/{owner}/{repo}/commits/<sha>/pulls`. Create the pull request,
    or edit the existing one, with a body that links the merge commit and the
-   originating pull request, includes `rationale.md` with its `@` mentions
+   originating pull request, records the inspected base, includes `rationale.md` with its `@` mentions
    neutralized, and states that a human must verify the prose against the
    code before merging.
-7. If `github-actions[bot]` already reviewed the pushed commit, stop: nothing
+8. If `github-actions[bot]` already reviewed the pushed commit, stop: nothing
    is re-posted. Otherwise `node scripts/docs-proposal/hunks.mjs review`
    builds review comments and posts one `COMMENT` review through `gh api`
    against the pushed commit.
@@ -194,8 +199,9 @@ Documented in `scripts/README.md`:
   allowed proposals, the empty diff, closing a stale proposal, a disallowed
   path, first publish without a build, an unchanged retry, an updated proposal
   whose review fails and is resumed without a second push, a retry or empty
-  rerun that leaves maintainer commits in place, a closed proposal, and PR
-  body rendering.
+  rerun that leaves maintainer commits in place, retries over a different or
+  unrecorded range, a closed proposal, PR body rendering, and how
+  `propose.sh` resolves the base of a multi-commit push.
 - `shellcheck` passes for every script.
 - The `docs-proposal-scripts` job in `format.yml` runs all three on every
   pull request.

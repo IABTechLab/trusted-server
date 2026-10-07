@@ -2,7 +2,7 @@
 # Opens or updates the pull request for a validated documentation proposal.
 #
 # Usage: scripts/docs-proposal/publish.sh <merge-sha> <work-dir>
-# <work-dir> holds proposal.patch, rationale.md, and evidence.json from
+# <work-dir> holds proposal.patch, rationale.md, evidence.json, and base from
 # propose.sh. Requires GH_TOKEN with contents and pull-requests write access.
 # Run validate.sh first, in a job without write credentials: this script
 # re-checks the path allowlist but never builds or executes proposal content.
@@ -18,15 +18,28 @@ source "$here/lib.sh"
 cd "$root"
 docs_proposal_require_sha "$sha"
 branch="$(docs_proposal_branch "$sha")"
+base="$(cat "$work_dir/base")"
+if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+  printf '::error::Expected a full base SHA in %s/base, got %s\n' "$work_dir" "$base" >&2
+  exit 1
+fi
 
 # A closed or merged proposal is a maintainer decision; never reopen or
 # recreate it on a retry.
-existing="$(gh pr list --head "$branch" --state all --json number,state --jq '.[0] | select(.) | "\(.number) \(.state)"')"
-pr_number="${existing%% *}"
-pr_state="${existing#* }"
+existing="$(gh pr list --head "$branch" --state all --json number,state,body \
+  --jq '.[0] | select(.) | "\(.number) \(.state) \([.body | match("<!-- docs-proposal-base: ([0-9a-f]{40}) -->").captures[0].string] | first // "")"')"
+read -r pr_number pr_state pr_base <<< "$existing" || true
 if [ -n "$existing" ] && [ "$pr_state" != "OPEN" ]; then
   printf 'Proposal #%s for %s is %s; not reopening it.\n' "$pr_number" "$sha" "$pr_state"
   exit 0
+fi
+
+# A retry that inspected a different range, such as a manual dispatch without
+# the base of a multi-commit push, must not narrow or close the proposal.
+if [ -n "$existing" ] && [ "$pr_base" != "$base" ]; then
+  printf '::error::Proposal #%s for %s covers %s..%s, but this run inspected %s..%s. Rerun the workflow with base %s.\n' \
+    "$pr_number" "$sha" "${pr_base:-an unrecorded base}" "$sha" "$base" "$sha" "${pr_base:-<original base>}" >&2
+  exit 1
 fi
 
 # Maintainers push to the proposal branch, and applying a review suggestion
@@ -73,7 +86,7 @@ fi
 subject="$(git log -1 --format=%s "$sha")"
 origin_pr="$(gh api "repos/{owner}/{repo}/commits/$sha/pulls" --jq '.[0].number // empty' || true)"
 title="$(printf 'Update documentation for %s' "$subject" | cut -c1-200)"
-docs_proposal_pr_body "$sha" "$subject" "$origin_pr" "$work_dir/rationale.md" > "$work_dir/pr-body.md"
+docs_proposal_pr_body "$sha" "$base" "$subject" "$origin_pr" "$work_dir/rationale.md" > "$work_dir/pr-body.md"
 if [ -n "$existing" ]; then
   gh pr edit "$pr_number" --title "$title" --body-file "$work_dir/pr-body.md"
 else
