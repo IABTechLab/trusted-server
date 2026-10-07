@@ -858,14 +858,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
-        // This adapter used to hardcode `region: None` and read no region
-        // header, and the consequence ran all the way to the privacy outcome.
+        // The region header has to reach the privacy outcome.
         // `detect_jurisdiction` reaches a US state node of the policy tree
-        // only when the country is `US` and a region is present, so every US
-        // visitor fell through to the country node's `NonRegulated`, where
-        // `allows_ec_creation` returns true without ever reading `ctx.gpc`. A
-        // Sec-GPC opt-out was therefore ignored for every US visitor on
-        // Cloudflare.
+        // only when the country is `US` and a region is present. With no
+        // region a US visitor falls through to the country node's
+        // `NonRegulated`, where `allows_ec_creation` returns true without
+        // reading `ctx.gpc`, so a Sec-GPC opt-out would be ignored.
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);
         let geo = build_geo(&ctx)
             .lookup(None, &test_services())

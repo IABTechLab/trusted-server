@@ -103,13 +103,13 @@ curl -si "${TS_BASE_URL}/" \
 
 Look for:
 
-- `Set-Cookie: ts-ec=hmac~<64hex.6chars>` (the `hmac~` prefix is the module code; pre-series cookies without it still resolve)
+- `Set-Cookie: ts-ec=hmac~<64hex.6chars>` (the `hmac~` prefix is the module code, and a bare value with no prefix, as a browser may already hold, still resolves)
 
 ## 5) Batch Sync (S2S)
 
 Endpoint: `POST /_ts/api/v1/batch-sync`
 
-Important: request field is `ec_id` (the full value as issued, `hmac~{64hex}.{6alnum}`; the bare pre-series form is also accepted). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Within one request, valid mappings are grouped by normalized EC ID and the last valid UID for each group is applied once; unchanged UIDs are accepted without a write. Group outcomes are reported for every original mapping, and infrastructure failures abort the remaining groups. See the [API Reference](/guide/api-reference) for the complete accounting and failure contract.
+Important: request field is `ec_id` (the full value as issued, `hmac~{64hex}.{6alnum}`, with the bare form that has no prefix also accepted). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Within one request, valid mappings are grouped by normalized EC ID and the last valid UID for each group is applied once; unchanged UIDs are accepted without a write. Group outcomes are reported for every original mapping, and infrastructure failures abort the remaining groups. See the [API Reference](/guide/api-reference) for the complete accounting and failure contract.
 
 ```bash
 BATCH_UID="${PARTNER_UID}-batch"
