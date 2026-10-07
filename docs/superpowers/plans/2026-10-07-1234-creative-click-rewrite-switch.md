@@ -284,7 +284,11 @@ Every shared test builds `Rewrite` with `Rewrite::default()` and `.extend`/`.pus
 
 The `creative.rs` test module's `use super::{...}` list gains `normalize_creative_url` and `proxy_if_abs` and loses `to_abs`.
 
-CHANGELOG: the shared step's entry goes under `## [Unreleased]` › `### Fixed`.
+CHANGELOG: the shared step adds this entry as the first item under `## [Unreleased]` › `### Fixed` (create the heading if absent), in the same commit as the code:
+
+```markdown
+- `rewrite.exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries written with uppercase letters previously never matched and now take effect, so those hosts stop being proxied and click-wrapped, and `/first-party/sign` now rejects them with `502`; it used to sign them, or return `403` when the host was also outside `proxy.allowed_domains`. Empty and bare `"*"` `exclude_domains` entries, which never matched a host, are dropped at load with a warning. Absolute `http(s)` creative URLs that cannot be parsed (for example, a host containing a space) are now left untouched; previously the attribute was re-quoted and a link also gained `data-tsclick`. Audit `exclude_domains` for mixed-case entries before upgrading.
+```
 
 ---
 
@@ -662,11 +666,7 @@ Expected: clippy exits 0 with no `#[allow]` attributes. Every crate passes `test
 
 - [ ] **Step 8: CHANGELOG**
 
-Under `## [Unreleased]` › `### Fixed` (create the heading if absent), as the first entry:
-
-```markdown
-- `rewrite.exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries written with uppercase letters previously never matched and now take effect, so those hosts stop being proxied and click-wrapped. Audit `exclude_domains` for mixed-case entries before upgrading.
-```
+Add the [Shared step](#shared-step) CHANGELOG entry verbatim, as the first item under `## [Unreleased]` › `### Fixed` (create the heading if absent).
 
 - [ ] **Step 9: Commit**
 
@@ -971,7 +971,7 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
     use crate::settings::Settings;
 
     const MATRIX_FIXTURE_WITH_BODY: &str = r#"<html><head><base href="https://base.example.com/"><style>.b{background:url(https://cdn.example.com/bg.png)}</style></head><body><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x"><div style="background:url(https://cdn.example.com/inline.png)"></div><a href="https://landing.example.com/page">Ad</a><map><area href="https://landing.example.com/area"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
-    const MATRIX_FIXTURE_FRAGMENT: &str = r#"<base href="https://base.example.com/"><img src="https://cdn.example.com/ad.png"><a href="https://landing.example.com/page">Ad</a><a href="https://excluded.example.com/page">Excluded</a>"#;
+    const MATRIX_FIXTURE_FRAGMENT: &str = r#"<base href="https://base.example.com/"><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x"><div style="background:url(https://cdn.example.com/inline.png)"></div><a href="https://landing.example.com/page">Ad</a><map><area href="https://landing.example.com/area"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a>"#;
     const INLINE_ORIGIN: &str = "https://www.example.com";
 
     #[derive(Debug, Clone, Copy)]
@@ -1001,6 +1001,8 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
 
 - [ ] **Step 2: Matrix and unset-pin tests**
 
+`MATRIX_DEFAULT_AUCTION_OUTPUT` and `MATRIX_DEFAULT_INLINE_OUTPUT` are the exact output of `MATRIX_FIXTURE_WITH_BODY` on `main`, before this change. To capture them, add a throwaway test to a scratch worktree of `main` that builds the same settings without `rewrite_clicks` (`create_test_settings()`, `sanitize_creatives = false`, `rewrite_creatives = true`, `exclude_domains = ["excluded.example.com"]`). Have it print `process_auction_creative` and `process_inline_auction_creative(.., "https://www.example.com", ..)` twice each, run it with `--nocapture`, and confirm the two runs match. Then remove the scratch worktree. Signatures are deterministic for the fixed test settings, and the injected script tag carries no hash.
+
 ```rust
     #[test]
     fn asset_and_click_switches_combine_on_auction_and_inline_paths() {
@@ -1012,8 +1014,7 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
                 for (assets, clicks) in [(true, true), (true, false), (false, true), (false, false)]
                 {
                     let settings = matrix_settings(assets, Some(clicks));
-                    let label =
-                        format!("{path:?} assets={assets} clicks={clicks} body={has_body}");
+                    let label = format!("{path:?} assets={assets} clicks={clicks} body={has_body}");
                     let prefix = match path {
                         CreativePath::Auction => "",
                         CreativePath::Inline => INLINE_ORIGIN,
@@ -1024,7 +1025,7 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
                     let expected_proxied = match (assets, has_body) {
                         (false, _) => 0,
                         (true, true) => 4,
-                        (true, false) => 1,
+                        (true, false) => 3,
                     };
                     assert_eq!(
                         out.matches("/first-party/proxy?tsurl=").count(),
@@ -1042,12 +1043,9 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
                         "{label}: image raw only when assets are off: {out}"
                     );
 
-                    // Each wrapped anchor carries the click URL in href and data-tsclick.
-                    let expected_click_urls = match (clicks, has_body) {
-                        (false, _) => 0,
-                        (true, true) => 4,
-                        (true, false) => 2,
-                    };
+                    // Each wrapped `<a>` and `<area>` carries the click URL in
+                    // href and data-tsclick.
+                    let expected_click_urls = if clicks { 4 } else { 0 };
                     assert_eq!(
                         out.matches("/first-party/click?tsurl=").count(),
                         expected_click_urls,
@@ -1072,12 +1070,10 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
                         out.contains(r#"href="https://excluded.example.com/page""#),
                         "{label}: excluded anchor always stays raw: {out}"
                     );
-                    if has_body {
-                        assert!(
-                            out.contains(r#"href="mailto:ads@example.com""#),
-                            "{label}: mailto anchor always stays raw: {out}"
-                        );
-                    }
+                    assert!(
+                        out.contains(r#"href="mailto:ads@example.com""#),
+                        "{label}: mailto anchor always stays raw: {out}"
+                    );
 
                     assert_eq!(
                         out.contains("<base"),
@@ -1118,6 +1114,27 @@ At the top of `creative.rs` `mod tests`, after the `use super::{...}` block:
                 process_for_path(&disabled, path, MATRIX_FIXTURE_WITH_BODY),
                 MATRIX_FIXTURE_WITH_BODY,
                 "{path:?}: unset rewrite_clicks with rewrite_creatives = false should pass through"
+            );
+        }
+    }
+
+    // Captured from `main` before `rewrite_clicks` existed: default settings must
+    // keep producing these bytes on both auction paths.
+    const MATRIX_DEFAULT_AUCTION_OUTPUT: &str = r#"<html><head><style>.b{background:url("/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><script src="/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script><img src="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+    const MATRIX_DEFAULT_INLINE_OUTPUT: &str = r#"<html><head><style>.b{background:url("https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><img src="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+
+    #[test]
+    fn default_settings_rewrite_matrix_fixture_byte_for_byte_as_before() {
+        let settings = matrix_settings(true, None);
+
+        for (path, expected) in [
+            (CreativePath::Auction, MATRIX_DEFAULT_AUCTION_OUTPUT),
+            (CreativePath::Inline, MATRIX_DEFAULT_INLINE_OUTPUT),
+        ] {
+            assert_eq!(
+                process_for_path(&settings, path, MATRIX_FIXTURE_WITH_BODY),
+                expected,
+                "{path:?}: default settings should match the pre-rewrite_clicks output exactly"
             );
         }
     }
@@ -1215,7 +1232,7 @@ Run each test alone, as described in the environment notes. Expected:
 - `asset_and_click_switches_combine_on_auction_and_inline_paths` panics with "Auction assets=true clicks=false body=true: click URL count".
 - `convert_to_openrtb_response_wraps_clicks_without_rewriting_assets` panics with "should wrap the landing link". Nothing was rewritten.
 - `build_bid_map_keeps_inline_anchors_raw_when_clicks_are_off` panics with "should leave the landing link raw". The anchor was wrapped.
-- `unset_rewrite_clicks_preserves_existing_output` **passes**. It pins today's behavior.
+- `unset_rewrite_clicks_preserves_existing_output` and `default_settings_rewrite_matrix_fixture_byte_for_byte_as_before` **pass**. They pin today's behavior.
 
 - [ ] **Step 5: Add `CreativeFeatures`**
 
@@ -1346,12 +1363,18 @@ Public wrappers: pass `CreativeFeatures::ALL` as the sixth argument in `rewrite_
 - `rewrite_inline_creative_html`: "its click guard is unnecessary for click URLs that are already absolute here".
 - `auction/endpoints.rs` response doc: "Creative HTML is inlined in each bid's `adm` field after optional sanitization ([`auction.sanitize_creatives`][...]). First-party asset rewriting ([`auction.rewrite_creatives`][...]) and click wrapping ([`auction.rewrite_clicks`][...]) are enabled by default. Bidder `<base>` removal and creative TSJS injection run when either is on." This replaces the stale "mandatory server-side sanitization".
 - `auction/formats.rs`, on `convert_to_openrtb_response`: name `rewrite_clicks` next to `rewrite_creatives` and add the intra-doc link target `/// [`AuctionConfig::rewrite_clicks`]: crate::auction_config_types::AuctionConfig::rewrite_clicks`. Add `clicks {}` to the "Processed creative" debug log, fed by `settings.auction.rewrites_auction_clicks()`.
+- `auction/formats.rs`, the comment above `serialize_renderer` in `convert_to_openrtb_response`: "sanitization is opt-in, asset rewriting and click wrapping are on by default, and with all three disabled the creative ships exactly as the bidder returned it."
+- `creative.rs` module docs:
+  - add the goal "Route click-through links through a signed first-party click redirect.", and call the proxied list "asset URLs";
+  - add key behaviors for `<a href>`/`<area href>` wrapping with `data-tsclick`, for `exclude_domains` applying to assets and links, and for `<base>` removal;
+  - add a "Switches" list. Auction creatives rewrite assets on `rewrite_creatives` and wrap links on `rewrites_auction_clicks`, and an unset `rewrite_clicks` follows `rewrite_creatives`. `<base>` removal and TSJS run when either is on, and with both off the pass is skipped. Proxied HTML always rewrites assets and wraps links unless `rewrite_clicks` is explicitly `false`. The public wrappers rewrite both.
+  - Link the `AuctionConfig` items with reference definitions at the end of the module docs, because `creative.rs` does not import `AuctionConfig`.
 
 - [ ] **Step 9: Verify green**
 
 Run: `cargo fmt --all && cargo test-fastly -p trusted-server-core --lib -- creative:: auction::formats publisher::`
 
-Expected: `551 passed; 0 failed`, including every pre-existing rewrite test.
+Expected: `554 passed; 0 failed`, including every pre-existing rewrite test.
 
 Run: `cargo clippy-fastly`
 
@@ -1380,11 +1403,12 @@ Before `html_response_rewrite_preserves_non_standard_port`:
 ```rust
     #[test]
     fn proxied_html_click_wrapping_follows_explicit_rewrite_clicks() {
-        let html = r#"<html><body><a href="https://landing.example.com/page"><img src="https://cdn.example.com/ad.png"></a></body></html>"#;
+        let html = r#"<html><head><base href="https://base.example.com/"></head><body><a href="https://landing.example.com/page"><img src="https://cdn.example.com/ad.png"></a><a href="https://excluded.example.com/page">Excluded</a></body></html>"#;
         // (rewrite_creatives, rewrite_clicks, expect wrapped clicks)
         let cases = [
             (true, None, true),
             (false, None, true),
+            (true, Some(true), true),
             (true, Some(false), false),
             (false, Some(false), false),
             (false, Some(true), true),
@@ -1394,9 +1418,9 @@ Before `html_response_rewrite_preserves_non_standard_port`:
             let mut settings = create_test_settings();
             settings.auction.rewrite_creatives = rewrite_creatives;
             settings.auction.rewrite_clicks = rewrite_clicks;
-            let label = format!(
-                "rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}"
-            );
+            settings.rewrite.exclude_domains = vec!["excluded.example.com".to_owned()];
+            let label =
+                format!("rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}");
             let req = build_http_request(Method::GET, "https://edge.example.com/first-party/proxy");
             let mut response = build_http_response(StatusCode::OK, EdgeBody::from(html));
             response.headers_mut().insert(
@@ -1418,15 +1442,35 @@ Before `html_response_rewrite_preserves_non_standard_port`:
                 body.contains("/first-party/proxy?tsurl="),
                 "{label}: proxied HTML always proxies assets: {body}"
             );
+            // A wrapped landing link carries the click URL in href and data-tsclick.
             assert_eq!(
-                body.contains("/first-party/click?tsurl="),
-                expect_clicks,
+                body.matches("/first-party/click?tsurl=").count(),
+                if expect_clicks { 2 } else { 0 },
                 "{label}: click wrapping in proxied HTML: {body}"
             );
             assert_eq!(
-                body.contains("data-tsclick"),
-                expect_clicks,
+                body.matches("data-tsclick").count(),
+                usize::from(expect_clicks),
                 "{label}: data-tsclick in proxied HTML: {body}"
+            );
+            if !expect_clicks {
+                let landing_href = body
+                    .split("<a href=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next());
+                assert_eq!(
+                    landing_href,
+                    Some("https://landing.example.com/page"),
+                    "{label}: landing link keeps its raw href: {body}"
+                );
+            }
+            assert!(
+                body.contains(r#"<a href="https://excluded.example.com/page">Excluded</a>"#),
+                "{label}: excluded link always stays raw: {body}"
+            );
+            assert!(
+                !body.contains("<base"),
+                "{label}: proxied HTML always removes <base>: {body}"
             );
             assert!(
                 body.contains("/static/tsjs="),
@@ -1452,6 +1496,18 @@ In `rewrite_proxied_html`, replace `CreativeFeatures::ALL` with:
 ```
 
 Append this paragraph to its doc comment: "Asset rewriting here is unconditional. Click wrapping follows an explicit `[auction] rewrite_clicks`; when that is unset, links keep being wrapped regardless of `rewrite_creatives`."
+
+Fix the `CreativeHtmlProcessor` doc comment, which names `rewrite_creative_html` although the processor calls `rewrite_proxied_html`:
+
+```rust
+/// Stream processor for HTML fetched through `/first-party/proxy` that rewrites
+/// asset and click-through URLs to first-party endpoints.
+///
+/// This processor buffers input chunks and processes the complete HTML document
+/// when the stream ends, using [`rewrite_proxied_html`] internally. Asset URLs are
+/// always proxied; links are wrapped unless `[auction] rewrite_clicks` is
+/// explicitly `false`.
+```
 
 - [ ] **Step 4: Verify green**
 
@@ -1587,6 +1643,17 @@ rewrite_creatives = true
 # rewrite_clicks = true
 ```
 
+In the `sanitize_creatives` comment just below, replace the sentence that starts "Note that with `rewrite_creatives = true`" so it names both switches:
+
+```toml
+# (executable markup preserved). Note that with `rewrite_creatives` or
+# `rewrite_clicks` on, the adm is still not untouched: eligible asset URLs
+# and/or links are rewritten, bidder `<base>` elements are removed, and the
+# creative TSJS runtime is injected. Enable it whenever creatives can render
+# in a context that shares the publisher origin (its primary defence there);
+# leave it off when creatives render in a
+```
+
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -1625,18 +1692,24 @@ git commit --signoff -S -m "Document rewrite_clicks in the example config and pi
   - an explicit `rewrite_clicks` applies to links in proxied HTML, and unset keeps wrapping them.
 - Warning block:
   - add "any explicit `rewrite_clicks`" to the serialized values;
-  - rollback note: "Older binaries cannot express clicks off with assets on; rolling back from that configuration re-enables click wrapping.";
+  - rollback note: "Older binaries tie click wrapping to `rewrite_creatives` in both directions: rolling back from `rewrite_creatives = true` with `rewrite_clicks = false` turns click wrapping back on, and rolling back from `rewrite_creatives = false` with `rewrite_clicks = true` turns it off.";
   - overlay note: "`rewrite_clicks` is unset by default and so cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or `false` under `[auction]` before relying on `TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`."
 
 - [ ] **Step 2: `creative-processing.md`**
 
 - Processing Triggers, item 1, append: "Click-through links are wrapped according to `[auction].rewrite_clicks`, which follows `rewrite_creatives` when unset."
 - Item 2, append: "An explicitly set `[auction].rewrite_clicks` also applies to links in proxied HTML."
+- "Auction Rewrite Control" intro: "Three auction settings control the processing applied to winning-bid `adm` ... Sanitization is opt-in (default `false`) and asset rewriting is enabled by default. Click wrapping is controlled by `rewrite_clicks`, which follows `rewrite_creatives` when unset; see [Assets and clicks](#assets-and-clicks)." Add `# rewrite_clicks unset: follows rewrite_creatives` to its TOML snippet.
+- Its `sanitize_creatives` × `rewrite_creatives` table: asset URLs follow `rewrite_creatives` and links follow `rewrite_clicks`.
+  - `false`/`false`: "Asset URLs stay direct. With `rewrite_clicks` unset or `false`, deliver the creative exactly as the bidder returned it (subject to the size cap); with `rewrite_clicks = true`, wrap links as described in [Assets and clicks](#assets-and-clicks)."
+  - `true`/`false`: "...then deliver without asset rewriting. Sanitizer-accepted external resource and inline CSS URLs remain direct; links follow `rewrite_clicks` and stay direct when it is unset or `false`."
+  - `false`/`true`: "Rewrite eligible resource/CSS URLs ... removing any bidder `<base>` element. Links are wrapped unless `rewrite_clicks = false`. Executable markup is preserved."
 - After the sanitization warning in "Auction Rewrite Control", add an `### Assets and clicks` subsection containing:
   - the TOML snippet (`rewrite_creatives = true`, `# rewrite_clicks = false`);
   - the four-row table (assets × clicks → asset URLs, links, `<base>`, TSJS);
   - "SSAT/page-bids follows the same table with absolute URLs and never injects TSJS. `exclude_domains` applies to both assets and links.";
-  - the `clickGuard` versus `rewrite_clicks` paragraph.
+  - the `clickGuard` versus `rewrite_clicks` paragraph;
+  - a `renderGuard` note: "With `rewrite_creatives = false` and `rewrite_clicks = true`, `POST /auction` still injects TSJS. A creative that turns on `tsCreativeConfig.renderGuard` can therefore still send assets inserted by its own script through `/first-party/sign` and `/first-party/proxy`, even though the server left the markup's asset URLs direct."
 - "Anchors (Click Tracking)": add `**Controlled by**: [auction].rewrite_clicks (follows rewrite_creatives when unset)`, switch the example to `advertiser.example.com`, and show the `data-tsclick` attribute.
 
 - [ ] **Step 3: Remaining guides**
@@ -1653,7 +1726,13 @@ git commit --signoff -S -m "Document rewrite_clicks in the example config and pi
 Under `### Added`, as the first entry:
 
 ```markdown
-- Added `[auction].rewrite_clicks` to control creative click-through wrapping (`<a href>`/`<area href>` → signed `/first-party/click`) independently of asset rewriting. Unset (the default) follows `rewrite_creatives` for `POST /auction` and SSAT/page-bids and keeps wrapping links in HTML fetched through `/first-party/proxy`, so existing configs behave as before; an explicit value applies to every path. `rewrite_creatives` now governs asset URLs only; bidder `<base>` removal and creative TSJS injection run when either setting is on. Upgrading: deploy the binary first, then push a config that sets `rewrite_clicks`. Rolling back: remove any explicit `rewrite_clicks` (and its environment override), push the resulting config, then roll back the binary; older binaries cannot express clicks off with assets on.
+- Added `[auction].rewrite_clicks` to control creative click-through wrapping (`<a href>`/`<area href>` → signed `/first-party/click`) independently of asset rewriting. Unset (the default) follows `rewrite_creatives` for `POST /auction` and SSAT/page-bids and keeps wrapping links in HTML fetched through `/first-party/proxy`, so existing configs behave as before; an explicit value applies to every path. `rewrite_creatives` now governs asset URLs only; bidder `<base>` removal and creative TSJS injection run when either setting is on. Upgrading: deploy the binary first, then push a config that sets `rewrite_clicks`. Rolling back: remove any explicit `rewrite_clicks` (and its environment override), push the resulting config, then roll back the binary. Older binaries tie click wrapping to `rewrite_creatives` in both directions, so rolling back turns clicks back on for `rewrite_creatives = true` with `rewrite_clicks = false`, and off for `rewrite_creatives = false` with `rewrite_clicks = true`.
+```
+
+In the existing Unreleased `rewrite_creatives`/`sanitize_creatives` entry, replace "(proxy/click URL conversion, bidder `<base>` removal; creative TSJS injection on `POST /auction` only)." with:
+
+```markdown
+(asset URL conversion to `/first-party/proxy`, bidder `<base>` removal; creative TSJS injection on `POST /auction` only). Click-through wrapping is controlled by `[auction].rewrite_clicks`, which follows `rewrite_creatives` when unset.
 ```
 
 - [ ] **Step 5: Format**
@@ -1694,16 +1773,16 @@ Expected: every command exits 0. The validation run's results are in the spec ha
 
 - [ ] **Step 2: Map completion criteria to tests**
 
-| Criterion                               | Test                                                                                                                                                                                |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unset output unchanged                  | `unset_rewrite_clicks_preserves_existing_output`, existing rewrite tests, unset rows of `proxied_html_click_wrapping_follows_explicit_rewrite_clicks`                               |
-| Four-combination matrix on both paths   | `asset_and_click_switches_combine_on_auction_and_inline_paths`                                                                                                                      |
-| Clicks off: raw href, no `data-tsclick` | matrix, `build_bid_map_keeps_inline_anchors_raw_when_clicks_are_off`                                                                                                                |
-| Clicks on, assets off                   | matrix, `convert_to_openrtb_response_wraps_clicks_without_rewriting_assets`                                                                                                         |
-| `exclude_domains` applies to anchors    | matrix (excluded anchor), `rewrite_click_urls_excludes_blacklisted_domains`, `exclude_domains_match_case_insensitively_in_the_rewrite_pass`                                         |
-| Proxied HTML rule                       | `proxied_html_click_wrapping_follows_explicit_rewrite_clicks`                                                                                                                       |
-| Default omitted from the blob           | `default_rewrite_clicks_is_unset_and_not_serialized`, `legacy_blob_without_rewrite_clicks_follows_rewrite_creatives`, `rewrite_clicks_environment_override_is_ignored_without_leaf` |
-| Docs and CHANGELOG                      | Task 6                                                                                                                                                                              |
+| Criterion                               | Test                                                                                                                                                                                                                     |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Unset output unchanged                  | `default_settings_rewrite_matrix_fixture_byte_for_byte_as_before`, `unset_rewrite_clicks_preserves_existing_output`, existing rewrite tests, unset rows of `proxied_html_click_wrapping_follows_explicit_rewrite_clicks` |
+| Four-combination matrix on both paths   | `asset_and_click_switches_combine_on_auction_and_inline_paths`                                                                                                                                                           |
+| Clicks off: raw href, no `data-tsclick` | matrix, `build_bid_map_keeps_inline_anchors_raw_when_clicks_are_off`                                                                                                                                                     |
+| Clicks on, assets off                   | matrix, `convert_to_openrtb_response_wraps_clicks_without_rewriting_assets`                                                                                                                                              |
+| `exclude_domains` applies to anchors    | matrix (excluded anchor), `rewrite_click_urls_excludes_blacklisted_domains`, `exclude_domains_match_case_insensitively_in_the_rewrite_pass`                                                                              |
+| Proxied HTML rule                       | `proxied_html_click_wrapping_follows_explicit_rewrite_clicks`                                                                                                                                                            |
+| Default omitted from the blob           | `default_rewrite_clicks_is_unset_and_not_serialized`, `legacy_blob_without_rewrite_clicks_follows_rewrite_creatives`, `rewrite_clicks_environment_override_is_ignored_without_leaf`                                      |
+| Docs and CHANGELOG                      | Task 6                                                                                                                                                                                                                   |
 
 - [ ] **Step 3: Hand off**
 
