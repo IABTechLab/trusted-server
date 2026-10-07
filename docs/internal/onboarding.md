@@ -24,7 +24,7 @@ For project usage, start with the public guides.
 
 | Path                                                      | Purpose                           |
 | --------------------------------------------------------- | --------------------------------- |
-| `crates/trusted-server-adapter-fastly/src/main.rs`        | Request routing entry point       |
+| `crates/trusted-server-adapter-fastly/src/lib.rs`         | Request routing entry point       |
 | `crates/trusted-server-core/src/publisher.rs`             | Publisher origin handling         |
 | `crates/trusted-server-core/src/proxy.rs`                 | First-party proxy implementation  |
 | `crates/trusted-server-core/src/ec/`                      | EC identity subsystem             |

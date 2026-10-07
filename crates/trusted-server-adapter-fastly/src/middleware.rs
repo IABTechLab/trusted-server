@@ -41,7 +41,7 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 ///
 /// Router-level 405/404 responses for unregistered HTTP methods (e.g. TRACE) bypass the
 /// middleware chain. Those are covered by a second call to [`apply_finalize_headers`] at
-/// the `main.rs` entry point. Middleware-finalized responses carry
+/// the `lib.rs` entry point. Middleware-finalized responses carry
 /// [`HEADER_X_TS_FINALIZED`] so the entry point can skip duplicate finalization.
 ///
 /// # Header precedence
@@ -177,7 +177,7 @@ impl Middleware for AuthMiddleware {
 /// only part worth sharing between the two callers.
 ///
 /// Used by both [`FinalizeResponseMiddleware`] and the entry-point finalization
-/// in `main.rs` so the 401-skip rule is defined in one place.
+/// in `lib.rs` so the 401-skip rule is defined in one place.
 ///
 /// # Parity note
 ///
@@ -249,7 +249,7 @@ pub(crate) fn apply_finalize_headers(
 /// Forces cookie-bearing responses to stay private to shared caches.
 ///
 /// Re-exported from [`trusted_server_core::response_privacy`] so the `EdgeZero`
-/// entry point (`main.rs`) can re-apply it after
+/// entry point (`lib.rs`) can re-apply it after
 /// [`ec_finalize_response`](trusted_server_core::ec::finalize::ec_finalize_response)
 /// writes the EC identity `Set-Cookie`, using the single shared implementation.
 pub(crate) use trusted_server_core::response_privacy::{

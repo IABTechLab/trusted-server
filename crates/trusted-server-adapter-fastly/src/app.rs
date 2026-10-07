@@ -45,7 +45,7 @@
 //! > **Note:** Methods not in the list above (e.g. `TRACE`, `CONNECT`, WebDAV verbs) return a
 //! > router-level 405. Legacy routing proxied *every* method through to the publisher origin.
 //! > This is a known intentional restriction of the EdgeZero router; the entry-point
-//! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
+//! > `apply_finalize_headers` call in `lib.rs` still adds TS headers to those 405 responses.
 //!
 //! # EC identity lifecycle
 //!
@@ -503,7 +503,7 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 // EC request state
 // ---------------------------------------------------------------------------
 
-/// EC state threaded from route handlers to the `main.rs` entry point via
+/// EC state threaded from route handlers to the `lib.rs` entry point via
 /// response extensions.
 ///
 /// `edgezero_main` pops this from the response after dispatch and runs
@@ -1229,7 +1229,7 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
 /// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
 /// mirroring [`crate::http_error_response`] exactly.
 ///
-/// The near-identical function in `main.rs` is intentional: the legacy path
+/// The near-identical function in `lib.rs` is intentional: the legacy path
 /// uses fastly HTTP types while this path uses `edgezero_core` types.
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
@@ -2952,7 +2952,7 @@ mod tests {
         // does not inject TS headers at this layer.
         //
         // The full-system guarantee (TS headers on ALL responses including these 405s)
-        // is maintained by the entry-point apply_finalize_headers call in main.rs.
+        // is maintained by the entry-point apply_finalize_headers call in lib.rs.
         let router = test_router();
         let req = empty_request(
             Method::from_bytes(b"TRACE").expect("should parse TRACE"),
@@ -2971,7 +2971,7 @@ mod tests {
                 .headers()
                 .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .is_none(),
-            "router-level 405 bypasses FinalizeResponseMiddleware; main.rs entry-point covers this"
+            "router-level 405 bypasses FinalizeResponseMiddleware; lib.rs entry-point covers this"
         );
     }
 
