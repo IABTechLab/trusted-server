@@ -127,6 +127,10 @@ pub const HMAC_MODULE_KEY: &str = "hmac";
 /// arm when the host-signal module becomes a module of its own.
 pub const HOST_SIGNALS_MODULE_KEY: &str = "host_signals";
 
+/// The type folder of every Edge Cookie crate, which a name written in
+/// `[ec] module` or an `implementation` line may leave off.
+pub const MODULE_TYPE: &str = "edgecookie";
+
 /// The implementation ids core supplies itself, one per resolution arm in
 /// [`resolve_named_module`].
 ///
@@ -835,7 +839,8 @@ pub fn build_module(
 /// name itself. It is looked for among the modules built into core first,
 /// and is otherwise the module the adapter injects through
 /// [`RuntimeServices`](crate::platform::RuntimeServices) when the
-/// implementation names that module's id, so resolving an injected module
+/// implementation names that module's id, written in full or with the
+/// `edgecookie` type folder left off, so resolving an injected module
 /// needs no vendor name in core. The adapter reads the injected module's
 /// block when it builds it. Looking at core first cannot shadow an injected
 /// module, because [`ensure_no_name_collision`] has already refused one that
@@ -907,7 +912,9 @@ fn resolve_named_module(
 
     let known = known_implementations(injected.as_deref());
     injected
-        .filter(|module| module.id() == implementation)
+        .filter(|module| {
+            crate::module_name::resolve(MODULE_TYPE, implementation, &[module.id()]).is_some()
+        })
         .map(|module| Box::new(SharedModule(module)) as Box<dyn EdgeCookieModule>)
         .ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {

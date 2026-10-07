@@ -110,6 +110,8 @@ pull_sync_concurrency = 3
 # selected as `module = "primary"` and configured in the block below
 # instead, which is how a deployment gives a module a name that means
 # something to the people running it.
+# A module from a crate is named by its folder below crates/, and may be
+# written in full, as edgecookie.<name>, or with that type folder left off.
 # [ec.primary]
 # implementation = "hmac"
 # passphrase = "ec_passphrase"
