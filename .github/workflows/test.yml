@@ -197,6 +197,15 @@ jobs:
           components: clippy
           cache-key: cargo-cloudflare
 
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
 
@@ -221,6 +230,15 @@ jobs:
           target: wasm32-wasip1
           components: clippy
           cache-key: cargo-spin
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -257,6 +275,15 @@ jobs:
         with:
           components: clippy, rustfmt
           cache-key: cargo-parity
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
