@@ -609,7 +609,7 @@ fn remove_aps_bidders(config: &mut LegacyPrebidServerConfig) {
         bidders.retain(|bidder| !bidder.eq_ignore_ascii_case("aps"));
         if bidders.len() != original_len {
             log::warn!(
-                "prebid: ignoring APS in integration.prebid.{field}; configure APS under [testing.aps]"
+                "prebid: ignoring APS in auction.prebid.{field}; configure APS as a [demand] source with implementation = \"auction.aps\""
             );
         }
     }
@@ -1864,7 +1864,7 @@ impl CompiledBidParamOverrideRule {
             Some(bidder),
             None,
             set,
-            &format!("integration.prebid.bid_param_overrides.{bidder}"),
+            &format!("auction.prebid.bid_param_overrides.{bidder}"),
             false,
         )
     }
@@ -1878,7 +1878,7 @@ impl CompiledBidParamOverrideRule {
             Some(bidder),
             Some(zone),
             set,
-            &format!("integration.prebid.bid_param_zone_overrides.{bidder}.{zone}"),
+            &format!("auction.prebid.bid_param_zone_overrides.{bidder}.{zone}"),
             false,
         )
     }
@@ -1943,7 +1943,7 @@ impl TryFrom<&BidParamOverrideRule> for CompiledBidParamOverrideRule {
             rule.when.bidder.as_deref(),
             rule.when.zone.as_deref(),
             &rule.set,
-            "integration.prebid.bid_param_override_rules[*]",
+            "auction.prebid.bid_param_override_rules[*]",
             true,
         )
     }

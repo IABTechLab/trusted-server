@@ -223,7 +223,7 @@ impl Publisher {
 /// Which integrations run, and the settings each one is given.
 ///
 /// The sections of module types core does not read itself, such as `[cmp]` or
-/// `[tag]`, each named by its type's folder under `crates`.
+/// `[tag]`, each named for the type of module it selects.
 ///
 /// Every top-level table that is not one of Trusted Server's own settings is
 /// read as one of these. Whether its type is one a module on offer has is
@@ -254,8 +254,8 @@ impl<'de> Deserialize<'de> for TypeSections {
             };
             if name.contains('.') || !crate::module_name::is_valid(&name) {
                 return Err(serde::de::Error::custom(format!(
-                    "unknown field `{name}`. The section of a module type is named by the \
-                     type's folder, of lower case letters, digits, `_` or `-`"
+                    "unknown field `{name}`. The section of a module type is named for \
+                     the type, in lower case letters, digits, `_` or `-`"
                 )));
             }
             let section = SectionModules::from_entries(table).map_err(|message| {
@@ -2557,7 +2557,7 @@ pub struct Proxy {
     ///
     /// When empty (the default), proxy hosts are not restricted. Configure this
     /// in production to constrain signed and fetched first-party proxy targets.
-    /// When `integration.prebid.external_bundle_url` is configured, this list
+    /// When `auction.prebid.external_bundle_url` is configured, this list
     /// must include its host and any HTTPS redirect targets.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
@@ -3836,7 +3836,7 @@ pub struct Settings {
     )]
     integration: RemovedIntegrationTable,
     /// The sections of module types core does not read itself, such as
-    /// `[cmp]` or `[tag]`, each named by its type's folder under `crates`.
+    /// `[cmp]` or `[tag]`, each named for the type of module it selects.
     #[serde(flatten)]
     pub sections: TypeSections,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -4781,7 +4781,7 @@ where
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
 // This lets env vars such as
-// TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
+// TRUSTED_SERVER__AUCTION__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
 // the config env source represents the value as an object rather than a sequence.
 // String inputs may also be JSON arrays or comma-separated values.
 /// Deserializes a `HashMap<String, String>` from either:
@@ -5305,7 +5305,7 @@ module = \"none\"",
             ),
             ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
             (
-                "integrations.datadome.server_side_key_secret_name",
+                "bot-protection.datadome.server_side_key_secret_name",
                 CANARY_DATADOME_SERVER_SIDE_KEY,
             ),
         ];

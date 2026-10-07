@@ -2,8 +2,8 @@
 
 Trusted Server combines an edge adapter, server-side integrations, auction
 providers, and browser modules. These layers are related but not
-interchangeable: a deploy ID may register a settings builder, an auction-plan
-component, or a mediator, while browser code can be bundled, deferred, or
+interchangeable. A module may register a settings builder, an auction-plan
+component, or an ad server, while browser code can be bundled, deferred, or
 loaded by a separate tag.
 
 ## Adapter support
@@ -25,29 +25,31 @@ their operational procedures.
 
 ## Integration inventory
 
-| Integration                                                    | Operational status | Deploy ID | Registration       | Browser loading |
-| -------------------------------------------------------------- | ------------------ | --------- | ------------------ | --------------- |
-| [`ad-server.mock`](/guide/integrations/adserver_mock)          | development        | yes       | auction mediator   | none            |
-| [`aps`](/guide/integrations/aps)                               | development        | yes       | auction plan       | none            |
-| [`creative`](/guide/creative-processing)                       | development        | no        | browser capability | bundled         |
-| [`datadome`](/guide/integrations/datadome)                     | development        | yes       | settings builder   | bundled         |
-| [`didomi`](/guide/integrations/didomi)                         | production         | yes       | settings builder   | bundled         |
-| [`google_tag_manager`](/guide/integrations/google_tag_manager) | production         | yes       | settings builder   | bundled         |
-| [`gpt`](/guide/integrations/gpt)                               | production         | yes       | settings builder   | bundled         |
-| [`gpt_diagnostics`](/guide/integrations/gpt-diagnostics)       | development        | yes       | settings builder   | standalone      |
-| `js_asset_proxy` (no dedicated guide)                          | development        | yes       | settings builder   | none            |
-| [`lockr`](/guide/integrations/lockr)                           | production         | yes       | settings builder   | bundled         |
-| [`nextjs`](/guide/integrations/nextjs)                         | production         | yes       | settings builder   | none            |
-| [`osano`](/guide/integrations/osano)                           | development        | yes       | settings builder   | bundled         |
-| [`permutive`](/guide/integrations/permutive)                   | production         | yes       | settings builder   | bundled         |
-| [`prebid`](/guide/integrations/prebid)                         | production         | yes       | auction plan       | deferred        |
-| [`sourcepoint`](/guide/integrations/sourcepoint)               | development        | yes       | settings builder   | bundled         |
-| [`testlight`](/guide/integrations/testlight)                   | development        | yes       | settings builder   | bundled         |
+| Integration                                                    | Operational status | Selected by                                               | Registration       | Browser loading |
+| -------------------------------------------------------------- | ------------------ | --------------------------------------------------------- | ------------------ | --------------- |
+| [`adserver_mock`](/guide/integrations/adserver_mock)           | development        | `[ad-server] module = "mock"`                             | ad server          | none            |
+| [`aps`](/guide/integrations/aps)                               | development        | a `[demand]` source with `implementation = "auction.aps"` | auction plan       | none            |
+| [`creative`](/guide/creative-processing)                       | development        | nothing, it always runs                                   | browser capability | bundled         |
+| [`datadome`](/guide/integrations/datadome)                     | development        | `[bot-protection] module = "datadome"`                    | settings builder   | bundled         |
+| [`didomi`](/guide/integrations/didomi)                         | production         | `[cmp] module = "didomi"`                                 | settings builder   | bundled         |
+| [`google_tag_manager`](/guide/integrations/google_tag_manager) | production         | `[tag] modules = ["google-tag-manager"]`                  | settings builder   | bundled         |
+| [`gpt`](/guide/integrations/gpt)                               | production         | `[ad-tag] modules = ["google"]`                           | settings builder   | bundled         |
+| [`gpt_diagnostics`](/guide/integrations/gpt-diagnostics)       | development        | `[ad-tag] modules = ["google.diagnostics"]`               | settings builder   | standalone      |
+| `js_asset_proxy` (no dedicated guide)                          | development        | `[proxy] modules = ["js_asset_proxy"]`                    | settings builder   | none            |
+| [`lockr`](/guide/integrations/lockr)                           | production         | `[identity] module = "lockr"`                             | settings builder   | bundled         |
+| [`nextjs`](/guide/integrations/nextjs)                         | production         | `[framework] module = "nextjs"`                           | settings builder   | none            |
+| [`osano`](/guide/integrations/osano)                           | development        | `[cmp] module = "osano"`                                  | settings builder   | bundled         |
+| [`permutive`](/guide/integrations/permutive)                   | production         | `[audience] module = "permutive"`                         | settings builder   | bundled         |
+| [`prebid`](/guide/integrations/prebid)                         | production         | `[auction] modules = ["prebid"]`                          | auction plan       | deferred        |
+| [`sourcepoint`](/guide/integrations/sourcepoint)               | development        | `[cmp] module = "sourcepoint"`                            | settings builder   | bundled         |
+| [`testlight`](/guide/integrations/testlight)                   | development        | `[auction] modules = ["testing.testlight"]`               | settings builder   | bundled         |
 
 The inventory summarizes compiled registration sets and reviewed maturity
-records. A deploy ID means the deployment validator accepts
-that identifier; it does not imply that every adapter implements the same
-runtime capability. `creative` is a browser capability, not a deploy ID.
+records. The first column is the integration's ID, which names its routes and
+its browser module. "Selected by" is what the settings write to run it, which
+the deployment validator accepts. It does not imply that every adapter
+implements the same runtime capability. `creative` is a browser capability
+that no setting selects.
 
 Browser loading has three distinct modes:
 
@@ -63,7 +65,7 @@ families and adapter availability.
 
 ## How capabilities compose
 
-Enabled integrations share ordered request, HTML, and browser pipelines. They
+Selected integrations share ordered request, HTML, and browser pipelines. They
 are not guaranteed to be independent. Registration predicates determine which
 proxy routes, attribute or script rewriters, head injectors, request filters,
 post-processors, auction providers, and browser modules are active. Validate

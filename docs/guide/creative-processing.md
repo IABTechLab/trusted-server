@@ -800,7 +800,8 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 
 ### Integration bundles
 
-The integration registry selects TSJS modules by enabled integration ID. A
+The integration registry selects TSJS modules by the integrations the
+settings select, each known to the browser by its integration ID. A
 registered ID with a compiled module is included in the immediate unified
 bundle unless its builder calls `.with_deferred_js()`; deferred modules are
 served separately as `/static/tsjs=tsjs-<id>.min.js`. Builders can call

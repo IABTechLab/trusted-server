@@ -263,7 +263,7 @@ pub fn register(
     ))
 }
 
-/// Whether `[integration] module` names the diagnostics integration.
+/// Whether `[ad-tag] modules` names the diagnostics module.
 ///
 /// This says whether the deployment runs diagnostics at all, rather than the
 /// per-document activation state, so a caller that only needs to know whether

@@ -182,7 +182,7 @@ provider. An oversized body returns `413`; malformed input and validation
 failures use the shared adapter error mapping; provider failures use the shared
 `5xx` mapping. The endpoint sets no dedicated cache or CORS policy and has no
 in-process rate limiter. Provider selection, timeouts, and fan-out are governed
-by `[auction]` and the enabled provider profiles.
+by `[auction]` and the demand sources `[demand]` selects.
 
 **Request Body:**
 
@@ -289,7 +289,7 @@ The `200`, `400`, and `403` terminal responses are `private, no-store`. The
 endpoint has no built-in authentication, CORS grant, or rate limiter.
 
 **Configuration:** `[creative_opportunities]`, `[auction]`, slot page patterns,
-provider profiles, and consent settings. Bot and prefetch requests retain slot
+demand sources, and consent settings. Bot and prefetch requests retain slot
 shape but skip live provider calls.
 
 **Example:**
@@ -1071,7 +1071,7 @@ predicates below, `named` means a section selects the integration's module.
 
 | Integration          | Registration predicate                                              | HTTP routes                                       |
 | -------------------- | ------------------------------------------------------------------- | ------------------------------------------------- |
-| `ad-server.mock`     | `[ad-server] module = "mock"`                                       | None                                              |
+| `adserver_mock`      | `[ad-server] module = "mock"`                                       | None                                              |
 | `aps`                | `demand implementation=auction.aps;rendering_mode=publisher_native` | None                                              |
 | `aps`                | `demand implementation=auction.aps;rendering_mode=trusted_server`   | `GET /integrations/aps/renderer`                  |
 | `creative`           | `always`                                                            | None                                              |
@@ -1115,7 +1115,7 @@ predicates below, `named` means a section selects the integration's module.
 | `permutive`          | `named`                                                             | `POST /integrations/permutive/secure-signal/*`    |
 | `permutive`          | `named`                                                             | `POST /integrations/permutive/sync/*`             |
 | `prebid`             | `named;script_patterns=config-derived`                              | `GET /integrations/prebid/bundle.js`              |
-| `prebid`             | `named;script_patterns=config-derived`                              | `GET <integration.prebid.script_patterns[]>`      |
+| `prebid`             | `named;script_patterns=config-derived`                              | `GET <auction.prebid.script_patterns[]>`          |
 | `sourcepoint`        | `named`                                                             | `GET /integrations/sourcepoint/cdn/*`             |
 | `sourcepoint`        | `named`                                                             | `HEAD /integrations/sourcepoint/cdn/*`            |
 | `sourcepoint`        | `named`                                                             | `OPTIONS /integrations/sourcepoint/cdn/*`         |
@@ -1151,9 +1151,9 @@ available when a deployment needs either.
 | Sourcepoint CDN   | `GET`, `HEAD`, `OPTIONS`, or `POST /integrations/sourcepoint/cdn/*`; suffix/query and a bounded body proxy to `cdn_origin`; selected consent cookies can round-trip    | Upstream status preserved; cookie-bearing responses are private; eligible static responses use `cache_ttl_seconds`; redirect locations and eligible JS/HTML content are rewritten first-party | `curl -i https://edge.example.com/integrations/sourcepoint/cdn/unified/wrapperMessagingWithoutDetection.js`                               |
 | Testlight auction | `POST /integrations/testlight/auction`; OpenRTB JSON is bounded, parsed, and sent to the configured endpoint with `user.id` populated from the consent-allowed EC ID   | Malformed/oversized input and transport errors use shared mappings; upstream status/body preserved; no added cache/CORS policy and no EC response header                                      | `curl -X POST https://edge.example.com/integrations/testlight/auction -H 'Content-Type: application/json' -d '{"imp":[{"id":"slot-1"}]}'` |
 
-`ad-server.mock`, `creative`, `gpt_diagnostics`, `nextjs`, and `osano` have no
+`adserver_mock`, `creative`, `gpt_diagnostics`, `nextjs`, and `osano` have no
 HTTP endpoint. Their request schema, statuses, cache/CORS contract, rate limit,
-and curl example are therefore not applicable; their browser, mediator,
+and curl example are therefore not applicable; their browser, ad server,
 rewriter, or diagnostic behavior is documented in the integration guides.
 
 ### Prebid Integration

@@ -300,12 +300,12 @@ fn run_bundle_with_context(
     if config.external_bundle_url.is_none() {
         writeln!(
             out,
-            "Next: upload {bundle_filename} and set integration.prebid.external_bundle_url to its HTTPS URL."
+            "Next: upload {bundle_filename} and set auction.prebid.external_bundle_url to its HTTPS URL."
         )
     } else {
         writeln!(
             out,
-            "Next: upload {bundle_filename} and update integration.prebid.external_bundle_url if the hosted filename changed."
+            "Next: upload {bundle_filename} and update auction.prebid.external_bundle_url if the hosted filename changed."
         )
     }
     .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
@@ -326,7 +326,7 @@ fn validate_managed_user_id_modules(
             .any(|module| module == &requirement.module_name)
         {
             return cli_error(format!(
-                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to integration.prebid.bundle.modules.user_id and rerun `ts prebid client`",
+                "{} configures managed User ID {:?}, which requires Prebid module {:?}, but the generated manifest omits it; add {:?} to auction.prebid.bundle.modules.user_id and rerun `ts prebid client`",
                 config_path.display(),
                 requirement.config_name,
                 requirement.module_name,
@@ -343,7 +343,7 @@ fn read_managed_user_id_names(prebid: &toml::Value, config_path: &Path) -> CliRe
     };
     let entries = value.as_array().ok_or_else(|| {
         report_error(format!(
-            "{} integration.prebid.managed_user_ids must be an array of tables",
+            "{} auction.prebid.managed_user_ids must be an array of tables",
             config_path.display()
         ))
     })?;
@@ -354,11 +354,11 @@ fn read_managed_user_id_names(prebid: &toml::Value, config_path: &Path) -> CliRe
         .map(|(index, entry)| {
             let table = entry.as_table().ok_or_else(|| {
                 report_error(format!(
-                    "{} integration.prebid.managed_user_ids[{index}] must be a table",
+                    "{} auction.prebid.managed_user_ids[{index}] must be a table",
                     config_path.display()
                 ))
             })?;
-            let field = format!("integration.prebid.managed_user_ids[{index}].name");
+            let field = format!("auction.prebid.managed_user_ids[{index}].name");
             let name = table
                 .get("name")
                 .and_then(toml::Value::as_str)
@@ -503,31 +503,28 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
 
     let bundle_table = bundle.as_table().ok_or_else(|| {
         report_error(format!(
-            "{} integration.prebid.bundle must be a TOML table",
+            "{} auction.prebid.bundle must be a TOML table",
             config_path.display()
         ))
     })?;
     for (removed, replacement) in [
-        ("adapters", "integration.prebid.bundle.modules.bidder"),
-        (
-            "user_id_modules",
-            "integration.prebid.bundle.modules.user_id",
-        ),
+        ("adapters", "auction.prebid.bundle.modules.bidder"),
+        ("user_id_modules", "auction.prebid.bundle.modules.user_id"),
         (
             "analytics_adapters",
-            "integration.prebid.bundle.modules.analytics",
+            "auction.prebid.bundle.modules.analytics",
         ),
     ] {
         if bundle_table.contains_key(removed) {
             return cli_error(format!(
-                "integration.prebid.bundle.{removed} is no longer supported; configure exact module stems under {replacement}"
+                "auction.prebid.bundle.{removed} is no longer supported; configure exact module stems under {replacement}"
             ));
         }
     }
 
     let section: PrebidBundleSection = bundle.clone().try_into().map_err(|error| {
         report_error(format!(
-            "{} has invalid integration.prebid.bundle configuration: {error}",
+            "{} has invalid auction.prebid.bundle configuration: {error}",
             config_path.display()
         ))
     })?;
@@ -548,22 +545,22 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
 fn validate_bundle_modules(modules: &PrebidBundleModules, config_path: &Path) -> CliResult<()> {
     if modules.bidder.is_empty() {
         return cli_error(format!(
-            "{} integration.prebid.bundle.modules.bidder must contain at least one module stem",
+            "{} auction.prebid.bundle.modules.bidder must contain at least one module stem",
             config_path.display()
         ));
     }
 
     let selections = [
         (
-            "integration.prebid.bundle.modules.bidder",
+            "auction.prebid.bundle.modules.bidder",
             Some(modules.bidder.as_slice()),
         ),
         (
-            "integration.prebid.bundle.modules.user_id",
+            "auction.prebid.bundle.modules.user_id",
             modules.user_id.as_deref(),
         ),
         (
-            "integration.prebid.bundle.modules.analytics",
+            "auction.prebid.bundle.modules.analytics",
             modules.analytics.as_deref(),
         ),
     ];
@@ -770,7 +767,7 @@ fn patch_config_metadata(config_path: &Path, sha256: &str, sri: &str) -> CliResu
     }
     let prebid = table_like_mut(
         auction.get_mut("prebid").expect("should have prebid table"),
-        "integration.prebid",
+        "auction.prebid",
         config_path,
     )?;
 
@@ -901,7 +898,7 @@ user_id = [{user_id}]
             let error = load_bundle_config(&path).expect_err("should require an array");
 
             assert!(
-                error.contains("integration.prebid.managed_user_ids must be an array of tables"),
+                error.contains("auction.prebid.managed_user_ids must be an array of tables"),
                 "should identify the malformed managed list: {error}"
             );
         }
@@ -917,7 +914,7 @@ user_id = [{user_id}]
         let error = load_bundle_config(&path).expect_err("should require managed tables");
 
         assert!(
-            error.contains("integration.prebid.managed_user_ids[0] must be a table"),
+            error.contains("auction.prebid.managed_user_ids[0] must be a table"),
             "should identify the malformed managed entry: {error}"
         );
     }
@@ -938,7 +935,7 @@ user_id = [{user_id}]
             let error = load_bundle_config(&path).expect_err("should reject malformed name");
 
             assert!(
-                error.contains("integration.prebid.managed_user_ids[0].name"),
+                error.contains("auction.prebid.managed_user_ids[0].name"),
                 "should identify the malformed managed name: {error}"
             );
         }
@@ -1036,7 +1033,7 @@ user_id = [{user_id}]
             "should name the managed entry and its required module: {error}"
         );
         assert!(
-            error.contains("integration.prebid.bundle.modules.user_id"),
+            error.contains("auction.prebid.bundle.modules.user_id"),
             "should identify the corrective field: {error}"
         );
         assert_eq!(
@@ -1547,7 +1544,7 @@ real_time_data = ["exampleRtdProvider"]
         let error = load_bundle_config(&path).expect_err("should reject unknown kind");
 
         assert!(error.contains("unknown field `real_time_data`"));
-        assert!(error.contains("integration.prebid.bundle"));
+        assert!(error.contains("auction.prebid.bundle"));
     }
 
     #[test]
@@ -1748,7 +1745,7 @@ real_time_data = ["exampleRtdProvider"]
         assert!(output.contains("generator stdout"));
         assert!(
             output.contains(&format!(
-                "Next: upload trusted-prebid-{}.js and update integration.prebid.external_bundle_url",
+                "Next: upload trusted-prebid-{}.js and update auction.prebid.external_bundle_url",
                 "b".repeat(64)
             )),
             "should tell operators which content-addressed filename to host: {output}"

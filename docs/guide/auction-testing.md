@@ -6,8 +6,8 @@ tests at production bidder endpoints.
 ## Validate the configuration first
 
 The CLI compiles the complete target-independent `AuctionPlan`, including
-provider profiles, bidder routes, extension bounds, notification settings, and
-mediator selection:
+demand sources, bidder routes, extension bounds, notification settings, and
+the ad server selection:
 
 ```bash
 ts config validate --strict

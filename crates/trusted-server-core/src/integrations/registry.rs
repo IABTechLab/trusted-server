@@ -4253,6 +4253,31 @@ mod tests {
         );
     }
 
+    /// A demand or ad server implementation is not a page integration, so a
+    /// section naming one is refused like any name no builder supplies.
+    #[test]
+    fn an_auction_implementation_named_in_a_section_is_refused() {
+        for (section, name) in [
+            ("auction", "prebid-server"),
+            ("auction", "aps"),
+            ("auction", "ad-server.mock"),
+            ("auction-protocol", "openrtb"),
+        ] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings.select_module(section, name);
+
+            let error = IntegrationRegistry::new(&settings)
+                .err()
+                .expect("should refuse an implementation named as a page module");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("[{section}] selects `{name}`")),
+                "should name the section and the implementation: {message}"
+            );
+        }
+    }
+
     /// The same id is accepted once a builder supplies it, so a vendor crate
     /// an adapter composes in is named the same way a built-in is.
     #[test]

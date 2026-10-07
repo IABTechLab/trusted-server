@@ -311,14 +311,14 @@ pull_sync_concurrency = 3
 # and in the Permission Signals guide.
 
 # Page integrations are modules, each selected in the section of its type,
-# which is named by the type's folder under crates/: [cmp] for a consent
-# prompt, [tag] and [ad-tag] for tags, [bot-protection], [identity],
-# [audience], [framework], [auction] for the modules the auction runs and
-# [proxy] for the script proxy. A section names what runs with `module`
-# where one runs or `modules` where several run, a module with settings gets
-# its own [<section>.<name>] table, and a section that selects nothing or a
-# table its section does not select refuses startup. Nothing is selected by
-# default. The sections and tables are further down, commented out.
+# which is [cmp] for a consent prompt, [tag] and [ad-tag] for tags,
+# [bot-protection], [identity], [audience], [framework], [auction] for the
+# modules the auction runs and [proxy] for the script proxy. A section names
+# what runs with `module` where one runs or `modules` where several run, a
+# module with settings gets its own [<section>.<name>] table, and a section
+# that selects nothing or a table its section does not select refuses
+# startup. Nothing is selected by default. The sections and tables are
+# further down, commented out.
 
 # First-party proxying of named third-party scripts. Uncomment the
 # `modules` line under [proxy] below to switch it on.

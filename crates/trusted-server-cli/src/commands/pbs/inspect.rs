@@ -298,7 +298,7 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             "source": path,
             "source_sections": {
                 "server": ["demand", "auction.bidders"],
-                "browser": "integration.prebid"
+                "browser": "auction.prebid"
             },
             "auction_section_present": auction_present,
             "auction_enabled_explicit": auction.enabled,

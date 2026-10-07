@@ -83,7 +83,7 @@ pub struct AdServerMockSettings {
     /// to the ad server decision endpoint without hard-coding integration knowledge.
     ///
     /// ```toml
-    /// [ad-server.adserver_mock.context_query_params]
+    /// [ad-server.mock.context_query_params]
     /// permutive_segments = "permutive"
     /// ```
     #[serde(default)]

@@ -102,7 +102,7 @@ pub struct GptConfig {
     /// script after `window.load`, enabling scroll/refresh client-side auctions
     /// and userID module warm-up. Set to the publisher's tsjs-prebid bundle URL.
     ///
-    /// Override via env var: `TRUSTED_SERVER__INTEGRATIONS__GPT__SLIM_PREBID_URL`
+    /// Override via env var: `TRUSTED_SERVER__AD-TAG__GOOGLE__SLIM_PREBID_URL`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slim_prebid_url: Option<String>,
 }

@@ -701,7 +701,7 @@ ts prebid client
 By default, generated artifacts are written to `dist/prebid/`. The versioned
 manifest records effective module selections, bidder and analytics runtime
 codes, the content-addressed filename, SHA-256, and SRI. The command copies the
-hash and SRI into `integration.prebid` only after the generator and manifest
+hash and SRI into `[auction.prebid]` only after the generator and manifest
 both pass validation.
 
 Upload the generated JavaScript file yourself, set `external_bundle_url` to its

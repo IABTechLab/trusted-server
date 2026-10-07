@@ -12,7 +12,7 @@ on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API.
   service boundary adapters implement.
 - `publisher`, `router`, `handlers`, and `response` dispatch publisher and
   administrative requests through platform-neutral request/response types.
-- `auction` builds plans, invokes providers and mediators, selects bids, and
+- `auction` builds plans, invokes demand sources and the ad server, selects bids, and
   emits bounded telemetry events.
 - `integrations` registers explicit proxy, rewrite, injection, filter,
   post-processing, provider, and browser-module capabilities.

@@ -471,9 +471,10 @@ impl IntegrationBuilder {
         self
     }
 
-    /// Runs this builder when a section selects the module `name`, which is
-    /// the module's crate path with `.` between the parts, such as
-    /// `cmp.example`, or a bare name for one of core's own.
+    /// Runs this builder when a section selects the module `name`, which is a
+    /// crate's path under `crates` with `.` between the parts, such as
+    /// `cmp.example`. An integration still in core holds the name its crate
+    /// will have as a constant.
     #[must_use]
     pub const fn with_module_name(mut self, name: &'static str) -> Self {
         self.module = Some(name);

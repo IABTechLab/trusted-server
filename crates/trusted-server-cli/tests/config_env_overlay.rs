@@ -32,7 +32,7 @@ const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED";
 const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
 const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__DEMAND__PBS_MAIN__ENDPOINT";
-const BIDDER_PROVIDER_ENV: &str = "TRUSTED_SERVER__AUCTION__BIDDERS__EXAMPLE-BIDDER__PROVIDER";
+const BIDDER_MODULE_ENV: &str = "TRUSTED_SERVER__AUCTION__BIDDERS__EXAMPLE-BIDDER__MODULE";
 
 struct MigratedProject {
     directory: TempDir,
@@ -359,7 +359,7 @@ fn map_shaped_provider_and_bidder_environment_overlays_apply() {
             PROVIDER_ENDPOINT_ENV,
             "https://overlay.example/openrtb2/auction",
         )
-        .env(BIDDER_PROVIDER_ENV, "pbs_main")
+        .env(BIDDER_MODULE_ENV, "pbs_main")
         .output()
         .expect("should run ts config push with map overlays");
 

@@ -1610,7 +1610,7 @@ mod tests {
                 "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
                  multiple nor a ladder rung"
             );
-            // The mediator </body> hold bound relies on canonicalization never
+            // The ad server's </body> hold bound relies on canonicalization never
             // extending a transport cap past the wall-clock budget.
             assert!(
                 value <= remaining,
@@ -1627,7 +1627,7 @@ mod tests {
 
     #[test]
     fn canonicalize_budget_derived_names_stay_bounded_for_large_ceiling() {
-        // A large configured ceiling (e.g. a 60s mediator budget) must not let
+        // A large configured ceiling (e.g. a 60s ad server budget) must not let
         // the budget-derived buckets grow with the ceiling. Without the coarse
         // ladder a 60,000ms ceiling would mint ~240 distinct 250ms buckets and
         // blow past Fastly's documented per-service dynamic backend limit (200).
@@ -1646,7 +1646,7 @@ mod tests {
                 "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
                  multiple nor a ladder rung"
             );
-            // The mediator </body> hold bound relies on canonicalization never
+            // The ad server's </body> hold bound relies on canonicalization never
             // extending a transport cap past the wall-clock budget.
             assert!(
                 value <= remaining,

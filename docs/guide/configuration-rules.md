@@ -22,8 +22,7 @@ setting = "value"
 
 1. **The type is the job.** Each type is one top-level table, named for what
    its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand` and
-   `ad-server`, and the section of each module type, named by the type's
-   folder under `crates/`, such as `cmp` or `tag`.
+   `ad-server`, and the section of each module type, such as `cmp` or `tag`.
 2. **The selector chooses what runs.** A type that runs one module takes
    `module`, a string. A type that runs several takes `modules`, a list.
 3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
@@ -38,9 +37,10 @@ setting = "value"
 5. **A name is parts joined by `.`,** each of lower case letters, digits, `_`
    or `-`. A module from a crate is named by its folder below `crates/`, and
    may be written in full, as `permission-signal.gpc`, or with its section's
-   type folder left off. Core's own modules, such as `hmac`, take bare names.
-   A `[demand]` or `[ad-server]` name is snake_case, because it may be a label
-   of your own.
+   type folder left off. Core's own modules, such as `hmac`, take bare names,
+   and an integration still in core carries the name its crate will have,
+   such as `cmp.didomi`. A `[demand]` or `[ad-server]` name is snake_case,
+   because it may be a label of your own.
 6. **Secrets are key names.** A secret setting holds the name of a key in
    `trusted_server_secrets`, never the secret itself.
 
