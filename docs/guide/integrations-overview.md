@@ -83,3 +83,8 @@ Use the [Integration Guide](/guide/integration-guide) for the runtime-neutral
 extension path and a compiling `RuntimeServices` fixture. Add only the hooks a
 capability needs; do not create a catch-all proxy or assume an adapter-specific
 HTTP implementation in core code.
+
+An integration does not have to live in `trusted-server-core`. It can ship in
+its own crate that a deployment composes in at startup, which keeps the
+vendor's code and release cycle its own. See
+[Integrations that ship outside core](/guide/integration-guide#integrations-that-ship-outside-core).

@@ -214,10 +214,128 @@ DOM insertion dispatcher, remain idempotent, and leave unmatched elements
 untouched. See [Trusted Server JavaScript](/guide/tsjs) and
 [GPT's guarded handoff](/guide/integrations/gpt#server-slot-handoff).
 
+## Integrations that ship outside core
+
+Everything above describes an integration inside `trusted-server-core`. An
+integration can instead ship in its own crate, which a deployment composes in
+at startup. The vendor then owns the code, the release cycle and the
+integration's own rules, and core never names the vendor.
+
+`crates/testing/seam-probe` is the worked example. It is a test fixture rather
+than something to deploy, and it exercises every part of the seam from a
+vendor crate's position. The round-trip tests in
+`crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each part
+through a real adapter.
+
+### What the crate provides
+
+The crate hands out an `IntegrationBuilder`, which names the integration and
+points at the functions that do the work.
+
+| Part                                          | Purpose                                                                                                                                                                            |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Id                                            | Names the integration in its routes under `/integrations/<id>/`, in its browser module and in diagnostics                                                                          |
+| Source                                        | The crate or package name, reported when two builders claim one id, so an operator can tell which crates collided                                                                  |
+| Build function                                | Reads `Settings` and returns the registration. It is called only when a section selects the module                                                                                 |
+| Validate function                             | The integration's own deploy rules. It runs for every builder, selected or not                                                                                                     |
+| `.with_module_name("<type>.<name>")`          | The name a section selects the module by, which is the crate's path under `crates/` with `.` between the parts. `module_name!()` derives it from the crate's folder                |
+| `.with_request_preparer(...)`                 | Optional. Runs before routing, whether or not the module is selected                                                                                                               |
+| `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)` |
+
+```rust
+pub fn module_name() -> &'static str {
+    trusted_server_core::module_name!()
+}
+
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(EXAMPLE_ID, EXAMPLE_SOURCE, register, validate)
+        .with_module_name(module_name())
+        .with_request_preparer(prepare_request)
+}
+```
+
+A crate at `crates/cmp/example` is the module `cmp.example`, so a deployment
+runs it with `[cmp] module = "example"` and gives it settings in
+`[cmp.example]`.
+
+### What a registration can declare
+
+The build function returns an `IntegrationRegistration`, built with the same
+builder the integrations in core use.
+
+| Declaration                                           | What it does                                                                        |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                 |
+| `.with_head_injector(...)`                            | Emits markup at the start of `<head>`                                               |
+| `.with_attribute_rewriter(...)`                       | Rewrites attribute values in publisher HTML                                         |
+| `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                     |
+| `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                 |
+| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                |
+| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`     |
+| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle     |
+| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag |
+| `.without_js()`                                       | Ships no browser script                                                             |
+| `.with_ec_module(...)`                                | Offers an Edge Cookie module that `[ec] module` may select                          |
+| `.with_geo_module(...)`                               | Offers a geo module that `[geo] module` may select                                  |
+| `.with_device_module(...)`                            | Offers a device module that `[device] module` may select                            |
+
+The three script delivery choices are exclusive and the last call wins.
+
+`[ec] module`, `[geo] module` and `[device] module` select a registration's
+module by the integration's id, and only when a section also selects the
+integration, because the registry builds only the integrations a section
+selects. A `[geo] module` or `[device] module` naming an integration that
+declares no such module refuses startup, naming the integration and the
+capability.
+
+### How an adapter composes it in
+
+The Axum, Cloudflare and Spin adapters take the builders as an argument, so no
+adapter names a vendor.
+
+```rust
+let router = TrustedServerApp::routes_with_registrations(
+    settings,
+    &[example_integration::builder()],
+)?;
+```
+
+`build_state_with_registrations` takes the same list and returns the
+application state, for a host that builds its own router around it. Two
+builders claiming one id are refused at startup with a message naming the id
+and both sources.
+
+The Fastly adapter is a binary rather than a library and its
+`build_state_with_registrations` is private to the crate, so a Fastly
+deployment that ships a vendor crate has to pass the builders inside that
+adapter.
+
+### Two traps a vendor will hit
+
+**The carried script's hash literal must match the file's bytes.** A
+registration that carries a browser script states the script's SHA-256 next to
+it. The registry hashes the source when it is built and refuses to start on a
+disagreement, so a stale literal is a startup error rather than a stale script
+reaching browsers. The usual cause is line endings rewritten on checkout,
+because a Windows clone with `core.autocrlf` on rewrites the script's newlines
+and the hash moves with them. The probe crate ships a `.gitattributes` marking
+its script `text eol=lf` and a unit test comparing the literal with the file's
+bytes, so the failure names the cause. Copy both into a vendor crate.
+
+**A vendor's own deploy rules do not run through the CLI.** `ts config
+validate` and `ts config push` call `validate_settings_for_deploy` with no
+extra builders, so only core's rules run there. A vendor's validate function
+runs only when something calls `validate_settings_for_deploy_with` and hands it
+that vendor's builder, which means the deployment's own code or its tests. An
+operator can therefore push a configuration the integration rejects when the
+server starts. Run the vendor's validation from the deployment's own build or
+test step, and do not read a clean `ts config validate` as the integration
+having agreed.
+
 ## Registration checklist
 
-1. Add typed settings with validation and a disabled default unless the
-   integration is intentionally universal.
+1. Add typed settings with validation. An integration runs only when a
+   section selects its module, so it takes no enabled flag.
 2. Register the exact capability predicates and route methods.
 3. Add source and behavior parity records.
 4. Add positive, negative, body-bound, header, and adapter-capability tests.
