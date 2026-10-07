@@ -84,7 +84,7 @@ flowchart TD
     WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie"]
 ```
 
-When the required permissions cannot be established for the current request (for example an unknown country with no configured default, or missing or undecodable consent signals), Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
+When the required permissions are not set for the current request (for example a location lookup that failed, or a baseline that requires a signal no module has answered), Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
 
 ## Permission Gating
 
@@ -92,14 +92,14 @@ EC creation is gated through the [permission model](/guide/permission-model), no
 
 The Edge Cookie code never reads consent. It checks only whether the required **permission** is set. Consent is one of the sources that _set_ a permission, not something the gate reads directly, so the Edge Cookie logic does not change when a consent framework changes. Two sources combine for each request:
 
-- **A country and region baseline.** The country, and an optional region such as a US state, that the geo module returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
-- **Consent and privacy signals.** TCF, GPP, and GPC (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`) decoded from the request and mapped onto permissions as a **grant or a revoke** on top of that baseline. There is no separate consent KV fallback.
+- **A country and region baseline.** The country, and an optional region such as a US state, that the geo module returns. A region rule takes precedence over its country, and when no country is identified, or neither the region nor the country has a rule, the baseline on the top node of the rules tree applies.
+- **Consent and privacy signals.** TCF, GPP, a US Privacy string, GPC and the Model Terms for Marketing preference (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`, `__mtm_pref`), each read by its own [permission signal module](/guide/permission-signals) and mapped onto permissions as a **grant or a revoke** on top of that baseline, in the configured order. There is no separate consent KV fallback.
 
-Today only `necessary.operations.storage` is resolved this way: its country and region baseline is adjusted by the incoming TCF signal, and the Edge Cookie is created only when the result is set. With no configured default country, an unknown country sets nothing without a signal, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules are configuration rather than core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
+Every permission is resolved this way, and the Edge Cookie is created only when each permission its module requires is set. A location lookup that fails resolves at the requires-signal floor, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules live in the policy file rather than in core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
 
 ```mermaid
 flowchart TD
-    Start[Resolve country and region] --> Baseline[Country or region rule,<br/>else the default country]
+    Start[Resolve country and region] --> Baseline[Country or region rule,<br/>else the top of the rules tree]
     Baseline --> Signals[Apply consent/privacy signals<br/>as a grant or revoke]
     Signals --> Check{Module's required<br/>permissions all set?}
     Check -- "Yes" --> Allow([Create EC])
