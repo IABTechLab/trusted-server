@@ -3465,10 +3465,16 @@ mod tests {
         );
     }
 
-    fn duplicate_lockr_registration(
+    /// Claims the id of the JavaScript asset proxy, which is core's own.
+    fn duplicate_core_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-        Ok(Some(IntegrationRegistration::builder("lockr").build()))
+        Ok(Some(
+            IntegrationRegistration::builder(
+                crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
+            )
+            .build(),
+        ))
     }
 
     /// The shared fixture with the module `name` selected in its section, so a
@@ -3508,21 +3514,14 @@ mod tests {
 
     #[test]
     fn with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings
-            .insert_module_config(
-                "identity",
-                "identity.lockr",
-                &serde_json::json!({"app_id": "test-app-id" }),
-            )
-            .expect("should insert lockr config");
+        let settings = crate::test_support::tests::create_test_settings();
         let extra = [crate::integrations::IntegrationBuilder::new(
-            "lockr",
+            crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             "seam-probe",
-            duplicate_lockr_registration,
+            duplicate_core_registration,
             validate_nothing,
         )
-        .with_module_name("testing.lockr")];
+        .with_module_name("testing.duplicate")];
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
@@ -3530,7 +3529,7 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("lockr")
+            message.contains(crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID)
                 && message.contains("trusted-server-core")
                 && message.contains("seam-probe"),
             "error should name the id and both sources: {message}"

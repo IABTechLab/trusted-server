@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 trusted-server-cmp-osano = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-identity-lockr = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

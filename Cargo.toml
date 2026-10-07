@@ -14,6 +14,7 @@ members = [
     "crates/permission-signal/tcf",
     "crates/permission-signal/us-privacy",
     "crates/cmp/osano",
+    "crates/identity/lockr",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -136,6 +137,7 @@ trusted-server-permission-signal-mtm = { path = "crates/permission-signal/mtm" }
 trusted-server-permission-signal-tcf = { path = "crates/permission-signal/tcf" }
 trusted-server-permission-signal-us-privacy = { path = "crates/permission-signal/us-privacy" }
 trusted-server-cmp-osano = { path = "crates/cmp/osano" }
+trusted-server-identity-lockr = { path = "crates/identity/lockr" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

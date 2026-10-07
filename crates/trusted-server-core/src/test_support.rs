@@ -160,6 +160,67 @@ pub mod tests {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 }
 
+/// The operator-facing settings template, for tests that check what it
+/// documents.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod template {
+    /// The source-controlled template an operator starts from.
+    pub const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../trusted-server.example.toml"
+    ));
+
+    /// The template with its required secret-store key references replaced by
+    /// resolved test values, so parsing it as settings can exercise the
+    /// optional blocks a test uncomments.
+    #[must_use]
+    pub fn template_with_resolved_required_secrets() -> String {
+        EXAMPLE_TEMPLATE
+            .replace(
+                "password = \"handler_password\"",
+                "password = \"unit-test-resolved-handler-password-0001\"",
+            )
+            .replace(
+                "proxy_secret = \"publisher_proxy_secret\"",
+                "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"unit-test-resolved-ec-passphrase-secret-0001\"",
+            )
+    }
+
+    /// Uncomments the contiguous `#`-prefixed block that begins at the line
+    /// `# {header}`, leaving the rest of the template untouched. Stops at the
+    /// first line that is not a comment, so a blank line ends the block.
+    #[must_use]
+    pub fn uncomment_block(template: &str, header: &str) -> String {
+        let header_line = format!("# {header}");
+        let mut out = Vec::new();
+        let mut uncommenting = false;
+
+        for line in template.lines() {
+            if line == header_line {
+                uncommenting = true;
+            } else if uncommenting && !line.trim_start().starts_with('#') {
+                uncommenting = false;
+            }
+
+            if uncommenting {
+                let bare = line
+                    .strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line);
+                out.push(bare.to_owned());
+            } else {
+                out.push(line.to_owned());
+            }
+        }
+
+        out.join("\n")
+    }
+}
+
 /// Shared Next.js + auction origin fixture.
 ///
 /// Adapters exercise the buffered publisher path against this fixture in their

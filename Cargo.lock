@@ -5631,6 +5631,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-identity-lockr"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "trusted-server-core",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-integration-seam-probe"
 version = "0.1.0"
 dependencies = [
@@ -5695,6 +5710,7 @@ dependencies = [
  "serde_json",
  "trusted-server-cmp-osano",
  "trusted-server-core",
+ "trusted-server-identity-lockr",
 ]
 
 [[package]]

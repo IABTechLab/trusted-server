@@ -21,7 +21,6 @@ pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
-pub mod lockr;
 pub mod nextjs;
 pub mod openrtb;
 pub mod permutive;
@@ -581,7 +580,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     testlight::BUILDER,
     nextjs::BUILDER,
     permutive::BUILDER,
-    lockr::BUILDER,
     didomi::BUILDER,
     sourcepoint::BUILDER,
     google_tag_manager::BUILDER,

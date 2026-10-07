@@ -637,13 +637,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::integrations::IntegrationRegistration;
     use crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID;
-    use crate::integrations::{
-        IntegrationRegistration, lockr::LockrConfig, permutive::PermutiveConfig,
-        sourcepoint::SourcepointConfig,
-    };
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::test_support::template::{template_with_resolved_required_secrets, uncomment_block};
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, select_hmac_module,
     };
@@ -804,116 +802,6 @@ formats = [{ width = 300, height = 250 }]
             vec!["aps_main".to_string()],
             std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
         );
-    }
-
-    /// Source-controlled operator-facing config template.
-    const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../trusted-server.example.toml"
-    ));
-
-    /// Returns the template with required secret-store key references replaced
-    /// by resolved test values, so direct [`Settings`] parsing can exercise the
-    /// optional blocks this module uncomments.
-    fn template_with_resolved_required_secrets() -> String {
-        EXAMPLE_TEMPLATE
-            .replace(
-                "password = \"handler_password\"",
-                "password = \"unit-test-resolved-handler-password-0001\"",
-            )
-            .replace(
-                "proxy_secret = \"publisher_proxy_secret\"",
-                "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
-            )
-            .replace(
-                "passphrase = \"ec_passphrase\"",
-                "passphrase = \"unit-test-resolved-ec-passphrase-secret-0001\"",
-            )
-    }
-
-    /// Uncomments the contiguous `#`-prefixed block that begins at the line
-    /// `# {header}`, leaving the rest of the template untouched. Stops at the
-    /// first line that is not a comment (a blank line ends the block).
-    fn uncomment_block(template: &str, header: &str) -> String {
-        let header_line = format!("# {header}");
-        let mut out = Vec::new();
-        let mut uncommenting = false;
-
-        for line in template.lines() {
-            if line == header_line {
-                uncommenting = true;
-            } else if uncommenting && !line.trim_start().starts_with('#') {
-                uncommenting = false;
-            }
-
-            if uncommenting {
-                let bare = line
-                    .strip_prefix("# ")
-                    .or_else(|| line.strip_prefix('#'))
-                    .unwrap_or(line);
-                out.push(bare.to_owned());
-            } else {
-                out.push(line.to_owned());
-            }
-        }
-
-        out.join("\n")
-    }
-
-    /// Every documented table should be push-ready, so uncommenting its
-    /// section's selection and the table with the shown values must parse and
-    /// pass field validation. Tables that ship a deliberately-invalid
-    /// non-secret placeholder (GTM `container_id` and `request_signing`
-    /// store ids) are excluded.
-    #[test]
-    fn documented_module_tables_validate_when_uncommented_and_selected() {
-        use crate::integrations::{lockr, permutive, sourcepoint};
-
-        let base = template_with_resolved_required_secrets();
-
-        for (section, selection, header, name) in [
-            (
-                "[audience]",
-                "module = \"permutive\"",
-                "[audience.permutive]",
-                permutive::MODULE,
-            ),
-            (
-                "[identity]",
-                "module = \"lockr\"",
-                "[identity.lockr]",
-                lockr::MODULE,
-            ),
-            (
-                "[cmp]",
-                "module = \"sourcepoint\"",
-                "[cmp.sourcepoint]",
-                sourcepoint::MODULE,
-            ),
-        ] {
-            let toml = format!(
-                "{}\n{section}\n{selection}\n",
-                uncomment_block(&base, header)
-            );
-            let settings = Settings::from_toml(&toml)
-                .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
-
-            let valid = match name {
-                permutive::MODULE => settings
-                    .module_config::<PermutiveConfig>(name)
-                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                    .is_some(),
-                lockr::MODULE => settings
-                    .module_config::<LockrConfig>(name)
-                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                    .is_some(),
-                _ => settings
-                    .module_config::<SourcepointConfig>(name)
-                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                    .is_some(),
-            };
-            assert!(valid, "{header} should resolve to a valid config");
-        }
     }
 
     /// The `[tinybird]` block is top-level and validated at parse time, so

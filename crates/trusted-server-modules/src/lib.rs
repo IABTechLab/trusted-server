@@ -8,13 +8,21 @@
 //! A deployment that ships a module of its own hands that module's builder to
 //! its adapter, which runs it after these.
 
+#![cfg_attr(
+    test,
+    allow(clippy::panic, reason = "tests use panic-on-failure helpers")
+)]
+
 use trusted_server_core::integrations::IntegrationBuilder;
 
 /// The builders of the modules a stock build ships from crates of their own,
 /// in hook order.
 #[must_use]
 pub fn builders() -> Vec<IntegrationBuilder> {
-    vec![trusted_server_cmp_osano::builder()]
+    vec![
+        trusted_server_identity_lockr::builder(),
+        trusted_server_cmp_osano::builder(),
+    ]
 }
 
 /// The stock builders followed by `extra`, the builders a deployment added,
@@ -41,7 +49,7 @@ mod tests {
 
         assert_eq!(
             names,
-            ["cmp.osano"],
+            ["identity.lockr", "cmp.osano",],
             "should offer the stock modules in the order their hooks run"
         );
     }
@@ -95,5 +103,66 @@ mod tests {
             rendered.contains("[cmp.osano]"),
             "should name the module's table: {rendered}"
         );
+    }
+
+    /// Every documented table should be push-ready, so uncommenting its
+    /// section's selection and the table with the shown values must parse and
+    /// pass field validation. Tables that ship a deliberately invalid
+    /// placeholder that is not a secret (the Google Tag Manager
+    /// `container_id`) are left out.
+    #[test]
+    fn documented_module_tables_validate_when_uncommented_and_selected() {
+        use trusted_server_core::integrations::{permutive, sourcepoint};
+        use trusted_server_core::settings::Settings;
+        use trusted_server_core::test_support::template::{
+            template_with_resolved_required_secrets, uncomment_block,
+        };
+        use trusted_server_identity_lockr as lockr;
+
+        let base = template_with_resolved_required_secrets();
+
+        for (section, selection, header, name) in [
+            (
+                "[audience]",
+                "module = \"permutive\"",
+                "[audience.permutive]",
+                permutive::MODULE,
+            ),
+            (
+                "[identity]",
+                "module = \"lockr\"",
+                "[identity.lockr]",
+                lockr::MODULE,
+            ),
+            (
+                "[cmp]",
+                "module = \"sourcepoint\"",
+                "[cmp.sourcepoint]",
+                sourcepoint::MODULE,
+            ),
+        ] {
+            let toml = format!(
+                "{}\n{section}\n{selection}\n",
+                uncomment_block(&base, header)
+            );
+            let settings = Settings::from_toml(&toml)
+                .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
+
+            let valid = match name {
+                permutive::MODULE => settings
+                    .module_config::<permutive::PermutiveConfig>(name)
+                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                    .is_some(),
+                lockr::MODULE => settings
+                    .module_config::<lockr::LockrConfig>(name)
+                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                    .is_some(),
+                _ => settings
+                    .module_config::<sourcepoint::SourcepointConfig>(name)
+                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                    .is_some(),
+            };
+            assert!(valid, "{header} should resolve to a valid config");
+        }
     }
 }

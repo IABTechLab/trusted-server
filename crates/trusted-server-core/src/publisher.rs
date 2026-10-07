@@ -20123,13 +20123,6 @@ mod tests {
         // an integration instead of reading the flag could not serve it, and a
         // reintroduced constant would fail this test rather than pass it.
         let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "identity",
-                "identity.lockr",
-                &serde_json::json!({"app_id": "test-app-id" }),
-            )
-            .expect("should insert lockr config");
         settings.select_module("testing", "testing.probe");
         let extra = [IntegrationBuilder::new(
             "probe",
@@ -20141,8 +20134,8 @@ mod tests {
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build a registry with a carried standalone module");
         assert!(
-            registry.js_module_ids_immediate().contains(&"lockr"),
-            "fixture should put lockr in the unified bundle"
+            registry.js_module_ids_immediate().contains(&"creative"),
+            "fixture should put core's creative module in the unified bundle"
         );
         assert!(
             !registry.js_module_ids().contains(&"probe"),

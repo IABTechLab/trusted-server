@@ -7,6 +7,18 @@
 //! that is pre-configured to route API calls through the first-party proxy,
 //! so no runtime rewriting of the SDK JavaScript is needed.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,31 +29,34 @@ use http::{Method, StatusCode};
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::constants::INTERNAL_HEADERS;
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::constants::INTERNAL_HEADERS;
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
     ensure_integration_backend,
 };
-use crate::platform::{PlatformHttpRequest, RuntimeServices};
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
 
 /// The name this module is selected by, in `[identity]`.
 pub const MODULE: &str = "identity.lockr";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         LOCKR_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
-    .with_module_name(MODULE);
+    .with_module_name(MODULE)
+}
 
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
@@ -451,8 +466,10 @@ mod tests {
     use super::*;
     use edgezero_core::http::Method as HttpMethod;
 
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use crate::test_support::tests::create_test_settings;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     fn test_config() -> LockrConfig {
         LockrConfig {
@@ -566,7 +583,7 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"ok".to_vec());
         let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
         let integration = LockrIntegration::new(test_config());
@@ -604,7 +621,7 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, br#"{"success":true,"data":{}}"#.to_vec());
         let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
         let integration = LockrIntegration::new(test_config());
@@ -721,6 +738,15 @@ mod tests {
         assert!(
             registration.is_none(),
             "an integration no section selects should not register"
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
         );
     }
 }
