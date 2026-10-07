@@ -839,10 +839,9 @@ mod tests {
     /// The per-request Edge Cookie read must return its error rather than a
     /// default context.
     ///
-    /// This adapter used to log the failure and continue with
-    /// `EcContext::default()`, so a deployment whose selected module could not
-    /// be built served every request with no identity. The call sites propagate
-    /// the error to `http_error`, matching the Fastly adapter.
+    /// Continuing with `EcContext::default()` would serve every request with
+    /// no identity when the selected module cannot be built. The call sites
+    /// propagate the error to `http_error`, matching the Fastly adapter.
     #[test]
     fn build_ec_context_fails_when_the_selected_module_is_unavailable() {
         let state = state_with_uninjected_module();

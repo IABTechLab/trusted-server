@@ -2140,7 +2140,7 @@ fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> 
 /// calls `scheduleInitialAdInit`, which schedules `adInit` for precisely the traffic
 /// that opted out. Absent is not the same as empty here.
 ///
-/// It is never nothing at all any more, because the permission state has to reach the
+/// It is never nothing at all, because the permission state has to reach the
 /// page whether or not the ad stack ran, and a shared template's head cannot carry it.
 /// The no-ad-stack answer is [`build_permissions_seam_script`], which sets the state and
 /// schedules no ad init.
@@ -9783,7 +9783,7 @@ mod tests {
         #[test]
         fn a_request_with_no_ad_stack_still_receives_its_permission_state() {
             // Arrange: `seam_ad_slots` is `None` exactly when the ad stack did not
-            // run, which is where the seam used to be empty.
+            // run, and the seam has to carry the permission state all the same.
             let settings = create_test_settings();
             let mut params = make_stream_params(&settings, "");
             params.permissions_json = permissions_json_fixture();

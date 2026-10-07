@@ -2354,9 +2354,9 @@ rules:
 
     #[test]
     fn the_shipped_policy_reproduces_the_retired_consent_lists() {
-        // The 31 GDPR countries and the 20 US privacy states the consent
-        // configuration used to carry as compiled defaults now live in the
-        // policy tree, so the shipped file must resolve each the same way.
+        // The policy tree carries the 31 GDPR countries and the 20 US
+        // privacy states, in place of compiled defaults in the consent
+        // configuration, so the shipped file must resolve each to its regime.
         let maps = PermissionMaps::standard();
         let gdpr_countries = [
             "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
