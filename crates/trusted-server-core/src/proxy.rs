@@ -771,7 +771,10 @@ struct ProxyRedirectPolicy<'a> {
 ///
 /// Followed `307`/`308` redirects keep the original method and body. Followed
 /// `301`/`302`/`303` redirects are sent as a bodyless `GET` (a `HEAD` stays
-/// `HEAD`) without body-describing headers such as `Content-Type`.
+/// `HEAD`) without body-describing headers such as `Content-Type`. A `301`/`302`
+/// answering any method other than `GET`, `HEAD` or `POST` (for example `PUT`)
+/// is not followed: the redirect response is returned to the caller, so an
+/// update is neither replayed elsewhere nor silently turned into a `GET`.
 ///
 /// # Errors
 ///
@@ -1438,6 +1441,27 @@ async fn proxy_with_redirects(
                 redirect_policy.stream_passthrough,
             );
         };
+
+        // Fetch keeps methods other than POST on a 301/302, but replaying the
+        // body would reach a target the caller did not address, and rewriting
+        // to GET would report success for an update that never ran.
+        if matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+            && current_method != Method::GET
+            && current_method != Method::HEAD
+            && current_method != Method::POST
+        {
+            log::warn!(
+                "not following {} redirect for {current_method} request to {current_url}; returning redirect response",
+                status.as_u16()
+            );
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
+        }
 
         if redirect_attempt == MAX_REDIRECTS {
             log::warn!(
@@ -4024,6 +4048,14 @@ mod tests {
 
     /// Send `method` with a body through one redirect of `status` and return the stub.
     fn proxy_through_redirect(method: Method, status: u16) -> Arc<StubHttpClient> {
+        proxy_through_redirect_with_response(method, status).0
+    }
+
+    /// Like [`proxy_through_redirect`], but also return the proxied response.
+    fn proxy_through_redirect_with_response(
+        method: Method,
+        status: u16,
+    ) -> (Arc<StubHttpClient>, Response<EdgeBody>) {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             status,
@@ -4037,7 +4069,7 @@ mod tests {
         let settings = create_test_settings();
         let req = build_http_request(method, "https://edge.example/");
 
-        futures::executor::block_on(proxy_request(
+        let response = futures::executor::block_on(proxy_request(
             &settings,
             req,
             ProxyRequestConfig::new("https://source.example.com/start")
@@ -4057,7 +4089,7 @@ mod tests {
         ))
         .expect("should follow redirect");
 
-        stub
+        (stub, response)
     }
 
     fn recorded_header_names(stub: &StubHttpClient, index: usize) -> Vec<String> {
@@ -4100,6 +4132,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn proxy_request_returns_301_302_unfollowed_for_non_post_body_methods() {
+        for method in [Method::PUT, Method::PATCH, Method::DELETE] {
+            for status in [301, 302] {
+                let (stub, response) = proxy_through_redirect_with_response(method.clone(), status);
+
+                assert_eq!(
+                    response.status().as_u16(),
+                    status,
+                    "should return the {status} redirect for {method} to the caller"
+                );
+                assert_eq!(
+                    stub.recorded_request_methods(),
+                    vec![method.to_string()],
+                    "should not follow a {status} redirect for {method}"
+                );
+                assert_eq!(
+                    stub.recorded_request_bodies(),
+                    vec![REDIRECT_TEST_BODY.to_vec()],
+                    "should send the {method} body only to the addressed target on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_request_put_redirect_becomes_bodyless_get_for_303() {
+        let (stub, response) = proxy_through_redirect_with_response(Method::PUT, 303);
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return the 303 target's response"
+        );
+        assert_eq!(
+            stub.recorded_request_methods(),
+            vec!["PUT".to_string(), "GET".to_string()],
+            "should follow a 303 PUT redirect with GET"
+        );
+        assert_eq!(
+            stub.recorded_request_bodies(),
+            vec![REDIRECT_TEST_BODY.to_vec(), Vec::new()],
+            "should send the PUT body only on the first hop"
+        );
     }
 
     #[test]
