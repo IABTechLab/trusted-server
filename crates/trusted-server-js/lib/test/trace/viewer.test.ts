@@ -50,6 +50,45 @@ function button(label: string): HTMLButtonElement {
   if (!result) throw new Error(`should find ${label} control`);
   return result;
 }
+function joinedReport() {
+  const report = {
+    ...reportFixture(),
+    server_auctions: [
+      {
+        schema_version: 1,
+        diagnostic_auction_id: AUCTION_TOKEN,
+        source: 'initial_navigation_ssat',
+        terminal_status: 'completed',
+        total_time_ms: 10,
+        provider_calls: [
+          { provider_number: 1, role: 'bidder', status: 'no_bid', returned_bid_count: 0 },
+        ],
+        slots: [
+          {
+            slot_number: 1,
+            slot_ref: SLOT_TOKEN,
+            requested_sizes: [[300, 250]],
+            returned_bid_count: 0,
+            candidate: 'no_candidate',
+          },
+        ],
+        truncation: { omitted_provider_calls: 0, omitted_slots: 0, omitted_nested_values: 0 },
+        coverage: { provider_to_slot_no_bid: 'unavailable' },
+      },
+    ],
+    slot_correlations: [
+      {
+        schema_version: 1,
+        diagnostic_auction_id: AUCTION_TOKEN,
+        slot_ref: SLOT_TOKEN,
+        runtime_slot_number: 1,
+        request_number: 1,
+      },
+    ],
+    auction_coverage: { capture_status: 'complete', issues: [] },
+  };
+  return report;
+}
 const request = vi.fn<typeof fetch>();
 beforeEach(() => {
   page();
@@ -100,11 +139,11 @@ describe('consolidated trace report viewer', () => {
     const report = document.getElementById('trace-report');
     expect(report?.textContent).toContain('Browser-carried, unverified diagnostic data');
     for (const title of [
-      'Report summary',
+      'What happened',
+      'Ad slots',
+      'Server auctions',
       'Publisher request',
       'Cookie health',
-      'Server auctions',
-      'GPT delivery and creative rendering',
       'Coverage and ambiguity',
       'Export',
     ])
@@ -131,43 +170,59 @@ describe('consolidated trace report viewer', () => {
     expect(text).not.toContain('invalid UTF');
     expect(text).not.toContain('Not present');
   });
+  it('leads with what happened, links slots to auctions and keeps bars CSP-safe', () => {
+    const report = joinedReport();
+    const cycle = report.gpt_diagnostics.slots[0].requests[0];
+    cycle.requestedAtMs = 4175.300000000047;
+    cycle.durations.requestToResponseMs = 550.2999999998137;
+    const fixture = setup(report);
+    mountTraceViewer(document, fixture.options);
+    const summary = document.getElementById('trace-report-summary');
+    expect(summary?.querySelector('.trace-headline')?.textContent).toBe(
+      '1 of 1 ad slot filled · 0 Trusted Server bids'
+    );
+    expect(summary?.textContent).toContain('The server auction completed.');
+    expect(summary?.textContent).toContain('No bids were returned to Trusted Server.');
+    const card = document.getElementById('trace-slot-1');
+    expect(card?.querySelector('h3')?.textContent).toBe('Slot 1 · 300 × 250');
+    expect(card?.querySelector('.trace-chip')?.textContent).toBe('Filled · backfill');
+    expect(card?.querySelector('.trace-link')?.textContent).toBe(
+      'Linked to auction 1 (Initial-page server auction (SSAT)) · server slot 1 · No candidate'
+    );
+    const bar = card?.querySelector('.trace-timing');
+    expect(bar?.getAttribute('role')).toBe('img');
+    expect(bar?.getAttribute('aria-label')).toContain('response 550.3 ms');
+    for (const segment of Array.from(bar?.children ?? []))
+      expect(segment.className).toMatch(/trace-weight-([1-9]|1\d|20)$/);
+    const attention = document.querySelector<HTMLAnchorElement>('#trace-report-attention a');
+    expect(attention?.getAttribute('href')).toBe('#trace-slot-1');
+    const text = document.getElementById('trace-report')?.textContent ?? '';
+    expect(text).toContain('4175.3 ms');
+    expect(text).not.toMatch(/\d\.\d{2,} ms/);
+    expect(text).not.toMatch(/\bwon\b|\bwinner was\b/i);
+    expect(document.querySelector('#trace-report [style]')).toBeNull();
+    expect(document.getElementById('trace-report-request')?.textContent).toContain(
+      '2026-10-05 09:15:30 UTC'
+    );
+    const divider = Array.from(document.querySelectorAll('#trace-report *')).find(
+      (node) => node.textContent === 'More detail'
+    );
+    expect(divider?.tagName).toBe('P');
+    expect(
+      Array.from(document.querySelectorAll('#trace-report h2'), (heading) => heading.textContent)
+    ).not.toContain('More detail');
+    const visible = Array.from(document.querySelectorAll('#trace-report dl > dd')).filter(
+      (value) => !value.closest('details.trace-unavailable')
+    );
+    expect(visible.map((value) => value.textContent)).not.toContain('Unavailable');
+    const folded = document.querySelector('#trace-report details.trace-unavailable');
+    expect(folded?.querySelector('summary')?.textContent).toMatch(/^\d+ fields? unavailable$/);
+    expect(folded?.hasAttribute('open')).toBe(false);
+    for (const id of ['trace-report-request', 'trace-report-cookies', 'trace-report-coverage'])
+      expect(document.getElementById(id)?.hasAttribute('open')).toBe(false);
+  });
   it('renders exact joined server evidence and retains plain refresh path labels without inferring a winner', () => {
-    const report = {
-      ...reportFixture(),
-      server_auctions: [
-        {
-          schema_version: 1,
-          diagnostic_auction_id: AUCTION_TOKEN,
-          source: 'initial_navigation_ssat',
-          terminal_status: 'completed',
-          total_time_ms: 10,
-          provider_calls: [
-            { provider_number: 1, role: 'bidder', status: 'no_bid', returned_bid_count: 0 },
-          ],
-          slots: [
-            {
-              slot_number: 1,
-              slot_ref: SLOT_TOKEN,
-              requested_sizes: [[300, 250]],
-              returned_bid_count: 0,
-              candidate: 'no_candidate',
-            },
-          ],
-          truncation: { omitted_provider_calls: 0, omitted_slots: 0, omitted_nested_values: 0 },
-          coverage: { provider_to_slot_no_bid: 'unavailable' },
-        },
-      ],
-      slot_correlations: [
-        {
-          schema_version: 1,
-          diagnostic_auction_id: AUCTION_TOKEN,
-          slot_ref: SLOT_TOKEN,
-          runtime_slot_number: 1,
-          request_number: 1,
-        },
-      ],
-      auction_coverage: { capture_status: 'complete', issues: [] },
-    };
+    const report = joinedReport();
     report.gpt_diagnostics.slots[0].requests[0].requestPath = 'prebid_refresh';
     const fixture = setup(report);
     mountTraceViewer(document, fixture.options);

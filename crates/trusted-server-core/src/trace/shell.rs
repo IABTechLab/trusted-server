@@ -54,7 +54,6 @@ pub(crate) fn render_setup_shell(
 <button id="trace-back" type="button">Return to previous page</button>
 </div>
 <p id="trace-status" role="status" aria-live="polite"></p>
-<p>Return to the affected page, reload once, reproduce the problem, then select View trace results.</p>
 <p>If history is not useful, reopen the affected article on the exact same hostname and in this same tab, then reload once.</p>
 <noscript>JavaScript is required for these deliberate tracing actions.</noscript>
 </section>

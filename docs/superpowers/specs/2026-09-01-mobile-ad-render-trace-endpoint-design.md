@@ -319,18 +319,35 @@ fallback.
 
 When a valid snapshot exists, `/_ts/trace` renders:
 
-1. Report summary and capture time.
-2. Network and request section for the traced publisher document.
-3. Trusted Server cookie-health section.
-4. Server-auction section grouped by auction and numbered slot.
-5. GPT delivery and creative-rendering section grouped by numbered slot.
-6. Coverage and ambiguity section.
+1. Header with the unverified-data notice, capture time, origin and counts.
+2. `What happened`: a headline, a short reading of observed facts, count tiles
+   and slot fill chips.
+3. `Needs attention`, when any slot is empty, has no observed fill, has an
+   incomplete GPT event sequence or recorded a creative-bridge failure. Each
+   entry links to its slot card.
+4. `Ad slots`: one card per numbered GPT slot in page order, with its fill
+   state, a proportional request timing bar (response, render, then viewable
+   or load), its exact correlation to a server slot when one exists, and a
+   collapsed `All details` disclosure with every retained request field.
+5. Server-auction section grouped by auction and numbered slot.
+6. Collapsed network/request, cookie-health and coverage/ambiguity sections.
 7. Export actions.
 8. `Clear report and end tracing` action.
 
+The summary is computed only from retained report fields. It counts filled,
+empty and fill-unknown slots, completed auctions, failed provider calls,
+bidder-role returned bids (mediator echoes are excluded so bids are not counted
+twice), selected server candidates, GPT response classes of filled requests and
+slots without an exact correlation. It never names an auction winner, never
+places server and browser clocks on one timeline and applies no latency
+thresholds. Timing bars use relative flex weights from stylesheet classes,
+never inline styles; their exact milliseconds remain in text and in the bar's
+accessible label.
+
 The setup request's facts are not merged into or substituted for missing traced
-page facts. Missing fields display `Unavailable`; missing evidence displays
-`Not observed` or `Unknown`, following TS Console terminology.
+page facts. Missing fields display `Unavailable`, grouped behind a collapsed
+`N fields unavailable` disclosure; missing evidence displays `Not observed` or
+`Unknown`, following TS Console terminology.
 
 The viewer presents an evidence chain rather than one overloaded status:
 

@@ -1,10 +1,22 @@
-import { joinTraceEvidence } from './correlation';
+import { joinTraceEvidence, type TraceEvidenceView } from './correlation';
 import { copyTraceReport, downloadTraceReport, shareTraceReport } from './export';
 import { endTraceSessionAndObserve, type TraceSessionChangeResult } from './lifecycle';
-import type { TraceGptRequestCycle, TraceReportV1, TraceStoredReportV1 } from './report-types';
+import type { TraceReportV1, TraceStoredReportV1 } from './report-types';
 import { mountTraceSetup } from './setup';
 import { deleteTraceReport, readTraceReport } from './storage';
-import type { CookieHealth, TraceRequestContextV1 } from './types';
+import {
+  renderAuctions,
+  renderCoverage,
+  renderRequestContext,
+  renderRequestDetails,
+} from './report-details';
+import { capturedLabel, element, facts, label, millis, section, sizes } from './report-dom';
+import {
+  summarizeTraceReport,
+  type TraceSlotCard,
+  type TraceSlotFill,
+  type TraceSummary,
+} from './view-model';
 
 export interface TraceViewerOptions {
   readonly origin?: string;
@@ -16,138 +28,172 @@ export interface TraceViewerOptions {
   readonly share?: typeof shareTraceReport;
 }
 
-function label(value: string): string {
-  const labels: Record<string, string> = {
-    no_bid: 'No bid returned',
-    no_candidate: 'No candidate',
-    selected: 'Candidate selected',
-    selected_unrenderable: 'Selected candidate could not be rendered',
-    trusted_server_direct: 'Trusted Server request path observed',
-    prebid_refresh: 'Browser refresh observed; winner not determined',
-    publisher_refresh: 'Browser refresh observed; winner not determined',
-    competing: 'Multiple or unknown delivery paths',
-    unattributed: 'Multiple or unknown delivery paths',
-    trusted_server_response_sent: 'Trusted Server creative response sent',
-    trusted_server_selected: 'Trusted Server candidate selected; render unconfirmed',
-    candidate_unconfirmed: 'Candidate unconfirmed',
-    not_observed: 'Not observed',
-    unknown: 'Unknown',
-    unavailable: 'Unavailable',
-  };
-  return (
-    labels[value] ??
-    value
-      .replace(/([a-z])([A-Z])/g, '$1 $2')
-      .replace(/_/g, ' ')
-      .replace(/^./, (first) => first.toUpperCase())
+const FILL_LABELS: Record<TraceSlotFill, string> = {
+  filled: 'Filled',
+  empty: 'Empty',
+  unknown: 'Fill unknown',
+};
+const FILL_COUNT_LABELS: Record<TraceSlotFill, string> = {
+  filled: 'filled',
+  empty: 'empty',
+  unknown: 'fill unknown',
+};
+
+function chip(root: Document, fill: TraceSlotFill, text: string): HTMLElement {
+  const node = element(root, 'span', text);
+  node.className = `trace-chip trace-chip-${fill}`;
+  return node;
+}
+
+function renderSummary(root: Document, article: HTMLElement, summary: TraceSummary): void {
+  const box = section(root, article, 'What happened', 'trace-report-summary');
+  const verdict = element(root, 'div');
+  verdict.className = `trace-verdict ${summary.needsAttention ? 'is-attention' : 'is-clear'}`;
+  const headline = element(root, 'p', summary.headline);
+  headline.className = 'trace-headline';
+  verdict.append(headline);
+  for (const sentence of summary.reading) verdict.append(element(root, 'p', sentence));
+  const stats = element(root, 'ul');
+  stats.className = 'trace-stats';
+  for (const stat of summary.stats) {
+    const item = element(root, 'li');
+    const value = element(root, 'span', String(stat.value));
+    value.className = 'trace-stat-value';
+    const label = element(root, 'span', stat.label);
+    label.className = 'trace-stat-label';
+    item.append(value, label);
+    stats.append(item);
+  }
+  verdict.append(stats);
+  if (summary.fills.length) {
+    const fills = element(root, 'p');
+    fills.className = 'trace-chips';
+    for (const entry of summary.fills)
+      fills.append(chip(root, entry.fill, `${entry.count} ${FILL_COUNT_LABELS[entry.fill]}`));
+    verdict.append(fills);
+  }
+  box.append(verdict);
+  const flagged = summary.slots.filter((slot) => slot.attention.length > 0);
+  if (!flagged.length) return;
+  const attention = section(root, article, 'Needs attention', 'trace-report-attention');
+  const list = element(root, 'ul');
+  list.className = 'trace-attention';
+  for (const slot of flagged) {
+    const item = element(root, 'li');
+    const link = element(root, 'a', `Slot ${slot.runtimeSlotNumber}`);
+    link.href = `#trace-slot-${slot.runtimeSlotNumber}`;
+    item.append(link, element(root, 'span', ` — ${slot.attention.join('; ')}`));
+    list.append(item);
+  }
+  attention.append(list);
+}
+
+function renderTiming(root: Document, parent: HTMLElement, card: TraceSlotCard): void {
+  if (!card.timing.length) {
+    parent.append(element(root, 'p', 'Request timing unavailable'));
+    return;
+  }
+  const description = card.timing.map((segment) => `${segment.label} ${millis(segment.ms)}`);
+  const bar = element(root, 'div');
+  bar.className = 'trace-timing';
+  bar.setAttribute('role', 'img');
+  bar.setAttribute(
+    'aria-label',
+    `Request ${card.timingRequestNumber ?? 1} timing: ${description.join(', ')}`
   );
+  for (const segment of card.timing) {
+    const part = element(root, 'span');
+    part.className = `trace-segment trace-segment-${segment.kind} trace-weight-${segment.weight}`;
+    bar.append(part);
+  }
+  const legend = element(root, 'ul');
+  legend.className = 'trace-legend';
+  legend.setAttribute('aria-hidden', 'true');
+  for (const segment of card.timing) {
+    const item = element(root, 'li', `${segment.label} ${millis(segment.ms)}`);
+    item.className = `trace-legend-${segment.kind}`;
+    legend.append(item);
+  }
+  parent.append(bar, legend);
 }
-function valueText(value: unknown): string {
-  if (value === undefined) return 'Unavailable';
-  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
-  if (typeof value === 'number') return String(value);
-  if (typeof value === 'string') return value;
-  return 'Unavailable';
-}
-function healthText(health: CookieHealth): string {
-  if (health.state === 'absent') return 'Not present in this request';
-  if (health.state === 'present_valid') return 'Valid shape observed';
-  if (health.state === 'duplicate') return 'Multiple values observed';
-  if (health.state === 'present_invalid')
-    return health.detail === 'oversized'
-      ? 'Invalid shape — too long'
-      : health.detail === 'unsupported_value'
-        ? 'Invalid shape — unsupported value'
-        : 'Invalid shape observed';
-  if (health.detail === 'runtime_header_ambiguous')
-    return 'Unavailable — runtime-visible cookies could not be reliably inspected';
-  return health.detail === 'header_too_large'
-    ? 'Unavailable — the visible cookie header was too large'
-    : 'Unavailable — the visible cookie header was not valid text';
-}
-function element<K extends keyof HTMLElementTagNameMap>(
+
+function renderSlots(
   root: Document,
-  tag: K,
-  text?: string
-): HTMLElementTagNameMap[K] {
-  const node = root.createElement(tag);
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-function section(root: Document, parent: Element, title: string, id?: string): HTMLElement {
-  const node = element(root, 'section');
-  if (id) node.id = id;
-  node.append(element(root, 'h2', title));
-  parent.append(node);
-  return node;
-}
-function facts(
-  root: Document,
-  parent: Element,
-  rows: readonly (readonly [string, unknown])[]
+  article: HTMLElement,
+  report: TraceReportV1,
+  summary: TraceSummary,
+  joined: TraceEvidenceView | undefined
 ): void {
-  const list = element(root, 'dl');
-  for (const [name, value] of rows)
-    list.append(element(root, 'dt', name), element(root, 'dd', valueText(value)));
-  parent.append(list);
+  const slots = section(root, article, 'Ad slots', 'trace-report-slots');
+  slots.append(
+    element(
+      root,
+      'p',
+      'Browser observed. Server auction → GPT request/response → creative render/load/viewability are separate observations. A filled slot does not identify an auction winner.'
+    )
+  );
+  facts(root, slots, [
+    ['Browser snapshot captured at', capturedLabel(report.gpt_diagnostics.capturedAt)],
+  ]);
+  if (!report.gpt_diagnostics.slots.length) slots.append(element(root, 'p', 'Not observed'));
+  for (const [index, slot] of report.gpt_diagnostics.slots.entries()) {
+    const card = summary.slots[index];
+    const node = element(root, 'article');
+    node.className = 'trace-slot';
+    node.id = `trace-slot-${slot.runtimeSlotNumber}`;
+    const header = element(root, 'header');
+    header.append(
+      element(
+        root,
+        'h3',
+        card.size
+          ? `Slot ${slot.runtimeSlotNumber} · ${sizes([card.size])}`
+          : `Slot ${slot.runtimeSlotNumber}`
+      ),
+      chip(
+        root,
+        card.fill,
+        card.backfill && card.fill === 'filled' ? 'Filled · backfill' : FILL_LABELS[card.fill]
+      )
+    );
+    node.append(header);
+    renderTiming(root, node, card);
+    const link = element(
+      root,
+      'p',
+      card.link
+        ? `Linked to auction ${card.link.auctionNumber} (${card.link.sourceLabel}) · server slot ${card.link.serverSlotNumber} · ${label(card.link.candidate)}`
+        : 'Not linked to a server auction'
+    );
+    link.className = card.link ? 'trace-link' : 'trace-link is-unlinked';
+    node.append(link);
+    if (card.requestCount > 1)
+      node.append(
+        element(
+          root,
+          'p',
+          `${card.requestCount} requests; timing shows request ${card.timingRequestNumber}.`
+        )
+      );
+    const details = element(root, 'details');
+    details.className = 'trace-slot-details';
+    details.append(element(root, 'summary', `All details for slot ${slot.runtimeSlotNumber}`));
+    facts(root, details, [
+      ['Binding', label(slot.binding.status)],
+      [
+        'Binding reason',
+        slot.binding.reason === undefined ? 'Unavailable' : label(slot.binding.reason),
+      ],
+      ['Current visibility percentage', slot.currentVisibilityPercentage],
+      ['Maximum visibility percentage', slot.maximumVisibilityPercentage],
+    ]);
+    if (!slot.requests.length) details.append(element(root, 'p', 'Requests: Not observed'));
+    for (const cycle of slot.requests)
+      renderRequestDetails(root, details, slot.runtimeSlotNumber, cycle, joined);
+    node.append(details);
+    slots.append(node);
+  }
 }
-function sizes(value?: readonly (readonly [number, number])[]): string {
-  return value === undefined
-    ? 'Unavailable'
-    : value.length === 0
-      ? 'Not observed'
-      : value.map(([width, height]) => `${width} × ${height}`).join(', ');
-}
-function millis(value?: number): string {
-  return value === undefined ? 'Unavailable' : `${value} ms`;
-}
-const NETWORK_LABELS: Record<keyof TraceRequestContextV1['network'], string> = {
-  masked_client_ip: 'Approximate network identifier',
-  country: 'Country',
-  region: 'Region',
-  asn: 'ASN',
-  http_version: 'HTTP version',
-  tls_protocol: 'TLS protocol',
-  tls_cipher: 'TLS cipher',
-  edge_hostname: 'Edge hostname',
-  edge_region: 'Edge region',
-  edge_pop: 'Edge POP',
-};
-const CYCLE_FACTS: Record<
-  Exclude<
-    keyof TraceGptRequestCycle,
-    | 'requestNumber'
-    | 'durations'
-    | 'requestedSlotSizes'
-    | 'size'
-    | 'observedSlotSize'
-    | 'trustedServerAuctionId'
-    | 'trustedServerCreativeFailures'
-    | 'isEmpty'
-    | 'requestPath'
-  >,
-  string
-> = {
-  requestedAtMs: 'Requested (browser clock)',
-  responseAtMs: 'Response received (browser clock)',
-  renderAtMs: 'Rendered (browser clock)',
-  loadAtMs: 'Loaded (browser clock)',
-  viewableAtMs: 'Viewable (browser clock)',
-  isBackfill: 'Backfill observed',
-  slotContentChanged: 'Slot content changed',
-  incompleteSequence: 'Incomplete sequence',
-  responseClass: 'GPT response class',
-  requestIntentId: 'Browser request intent number',
-  opportunityToRequestMs: 'Opportunity to request',
-  replacedRequestNumber: 'Replaced request number',
-  previousRenderToRequestMs: 'Previous render to request',
-  creativeChanged: 'Creative changed',
-  loadObservedBeforeRender: 'Load observed before render',
-  trustedServerOpportunity: 'Trusted Server candidate opportunity',
-  trustedServerCreativeRequestAtMs: 'Creative bridge request (browser clock)',
-  trustedServerCreativeResponseAtMs: 'Creative bridge response (browser clock)',
-  delivery: 'Creative delivery observation',
-};
 
 function renderReport(
   root: Document,
@@ -157,273 +203,43 @@ function renderReport(
 ): HTMLElement {
   const article = element(root, 'article');
   article.id = 'trace-report';
-  article.append(
-    element(root, 'h1', 'Trusted Server trace results'),
-    element(root, 'p', 'Browser-carried, unverified diagnostic data')
+  const notice = element(root, 'p', 'Browser-carried, unverified diagnostic data');
+  notice.className = 'trace-notice';
+  const header = element(root, 'header');
+  header.className = 'trace-report-header';
+  const meta = element(
+    root,
+    'p',
+    `Captured ${capturedLabel(report.captured_at)} · ${report.gpt_diagnostics.page.origin} · ${plainCount(report.gpt_diagnostics.slots.length, 'ad slot', 'ad slots')} · ${plainCount(report.server_auctions.length, 'server auction', 'server auctions')}`
   );
-  article.append(
+  meta.className = 'trace-meta';
+  header.append(
+    notice,
+    element(root, 'h1', 'Trusted Server trace results'),
+    meta,
     element(
       root,
       'p',
       'This browser snapshot helps troubleshoot rendering. It is not proof of a server event, identity, or security incident.'
     )
   );
-  const summary = section(root, article, 'Report summary');
-  facts(root, summary, [
-    ['Captured at', report.captured_at],
-    ['Publisher origin', report.gpt_diagnostics.page.origin],
-    ['Server auctions retained', report.server_auctions.length],
-    ['GPT slots retained', report.gpt_diagnostics.slots.length],
-  ]);
-  const network = section(root, article, 'Publisher request');
-  network.append(
-    element(root, 'p', 'Produced by Trusted Server; copied through an untrusted browser snapshot')
-  );
-  network.append(
-    element(
-      root,
-      'p',
-      'These facts describe the traced publisher document. Masked identifiers are approximate and may still identify a network.'
-    )
-  );
-  facts(root, network, [
-    ['Document request captured at', report.request_context.captured_at],
-    ...Object.entries(NETWORK_LABELS).map(
-      ([key, name]) =>
-        [
-          name,
-          report.request_context.network[key as keyof TraceRequestContextV1['network']],
-        ] as const
-    ),
-  ]);
-  const cookies = section(root, article, 'Cookie health', 'trace-report-cookies');
-  cookies.append(
-    element(
-      root,
-      'p',
-      'Produced by Trusted Server; copied through an untrusted browser snapshot. Only cookie shape visible in this request is inspected; values and browser attributes are excluded.'
-    )
-  );
-  facts(root, cookies, [
-    ['Edge Cookie', healthText(report.request_context.cookies.ts_ec)],
-    ['External IDs', healthText(report.request_context.cookies.ts_eids)],
-    ['Tester', healthText(report.request_context.cookies.ts_tester)],
-    ['Diagnostics session', healthText(report.request_context.cookies.diagnostics_session)],
-  ]);
-  const auctions = section(root, article, 'Server auctions');
-  auctions.append(
-    element(
-      root,
-      'p',
-      'Returned bid counts may overlap between slots and must not be summed as unique bids.'
-    )
-  );
+  article.append(header);
   const joined = joinTraceEvidence(report, origin, storedAtMs);
-  if (!report.server_auctions.length)
-    auctions.append(element(root, 'p', 'Not observed. This does not mean no server auction ran.'));
-  for (const [index, view] of (joined?.auctions ?? []).entries()) {
-    const entry = element(root, 'details');
-    entry.open = true;
-    entry.append(element(root, 'summary', `Auction ${index + 1}: ${view.sourceLabel}`));
-    entry.append(
-      element(root, 'p', 'Produced by Trusted Server; copied through an untrusted browser snapshot')
-    );
-    facts(root, entry, [
-      ['Terminal outcome', label(view.evidence.terminal_status)],
-      [
-        'Terminal reason',
-        view.evidence.terminal_reason === undefined
-          ? 'Unavailable'
-          : label(view.evidence.terminal_reason),
-      ],
-      ['Server auction-local elapsed time', millis(view.evidence.total_time_ms)],
-      ['Request-relative milestones', view.relativeMilestonesLabel],
-    ]);
-    entry.append(element(root, 'p', view.providerScopeLabel));
-    for (const provider of view.evidence.provider_calls)
-      facts(root, entry, [
-        [`Provider call ${provider.provider_number}`, label(provider.role)],
-        ['Call outcome', label(provider.status)],
-        ['Provider-local elapsed time', millis(provider.response_time_ms)],
-        ['Returned bid count', provider.returned_bid_count],
-      ]);
-    if (!view.evidence.provider_calls.length)
-      entry.append(element(root, 'p', 'Provider calls: Not observed'));
-    for (const slot of view.slots) {
-      const box = element(root, 'details');
-      box.open = true;
-      box.append(element(root, 'summary', `Server slot ${slot.serverSlot.slot_number}`));
-      facts(root, box, [
-        ['Requested sizes', sizes(slot.serverSlot.requested_sizes)],
-        ['Returned bid count', slot.serverSlot.returned_bid_count],
-        ['Candidate', label(slot.serverSlot.candidate)],
-        [
-          'Selected creative size',
-          slot.serverSlot.selected_creative_size
-            ? sizes([slot.serverSlot.selected_creative_size])
-            : 'Unavailable',
-        ],
-        [
-          'Correlation',
-          slot.correlation === 'matched'
-            ? `Matched GPT slot ${slot.runtimeSlotNumber}, request ${slot.requestNumber}`
-            : 'Correlation unknown',
-        ],
-        ['Browser request path', slot.pathLabel ?? 'Unknown'],
-        ['Creative participation', slot.creativeLabel ?? 'Participation unconfirmed'],
-      ]);
-      entry.append(box);
-    }
-    facts(root, entry, [
-      ['Provider calls omitted', view.evidence.truncation.omitted_provider_calls],
-      ['Server slots omitted', view.evidence.truncation.omitted_slots],
-      ['Nested values omitted', view.evidence.truncation.omitted_nested_values],
-    ]);
-    auctions.append(entry);
-  }
-  const gpt = section(root, article, 'GPT delivery and creative rendering');
-  gpt.append(
-    element(
-      root,
-      'p',
-      'Browser observed. Server auction → GPT request/response → creative render/load/viewability are separate observations. A filled slot does not identify an auction winner.'
-    )
-  );
-  facts(root, gpt, [['Browser snapshot captured at', report.gpt_diagnostics.capturedAt]]);
-  if (!report.gpt_diagnostics.slots.length) gpt.append(element(root, 'p', 'Not observed'));
-  for (const slot of report.gpt_diagnostics.slots) {
-    const box = element(root, 'details');
-    box.open = true;
-    box.append(element(root, 'summary', `GPT slot ${slot.runtimeSlotNumber}`));
-    facts(root, box, [
-      ['Binding', label(slot.binding.status)],
-      [
-        'Binding reason',
-        slot.binding.reason === undefined ? 'Unavailable' : label(slot.binding.reason),
-      ],
-      ['Current visibility percentage', slot.currentVisibilityPercentage],
-      ['Maximum visibility percentage', slot.maximumVisibilityPercentage],
-    ]);
-    if (!slot.requests.length) box.append(element(root, 'p', 'Requests: Not observed'));
-    for (const cycle of slot.requests) {
-      const request = element(root, 'details');
-      request.open = true;
-      request.append(element(root, 'summary', `Request ${cycle.requestNumber}`));
-      const matches = (joined?.auctions ?? [])
-        .flatMap((auction) => auction.slots)
-        .filter(
-          (entry) =>
-            entry.correlation === 'matched' &&
-            entry.runtimeSlotNumber === slot.runtimeSlotNumber &&
-            entry.requestNumber === cycle.requestNumber
-        );
-      facts(root, request, [
-        ['Correlation', matches.length === 1 ? 'Matched server slot' : 'Correlation unknown'],
-        [
-          'Creative participation',
-          matches.length === 1 ? matches[0].creativeLabel : 'Participation unconfirmed',
-        ],
-        [
-          'GPT fill observation',
-          cycle.isEmpty === undefined ? 'Unknown' : cycle.isEmpty ? 'Empty' : 'Filled',
-        ],
-        [
-          'Browser request path',
-          cycle.requestPath === undefined ? 'Unavailable' : label(cycle.requestPath),
-        ],
-        ['Requested sizes', sizes(cycle.requestedSlotSizes)],
-        ['Rendered size', cycle.size ? sizes([cycle.size]) : 'Unavailable'],
-        [
-          'Observed CSS box size',
-          cycle.observedSlotSize ? sizes([cycle.observedSlotSize]) : 'Unavailable',
-        ],
-      ]);
-      const rows = Object.entries(CYCLE_FACTS).map(([key, name]): readonly [string, unknown] => {
-        const value = cycle[key as keyof typeof CYCLE_FACTS];
-        return [
-          name,
-          typeof value === 'string'
-            ? label(value)
-            : key.endsWith('Ms')
-              ? millis(value as number | undefined)
-              : value,
-        ];
-      });
-      facts(root, request, rows);
-      facts(root, request, [
-        ['Request to response', millis(cycle.durations.requestToResponseMs)],
-        ['Response to render', millis(cycle.durations.responseToRenderMs)],
-        ['Request to render', millis(cycle.durations.requestToRenderMs)],
-        ['Render to load', millis(cycle.durations.renderToLoadMs)],
-        ['Render to viewable', millis(cycle.durations.renderToViewableMs)],
-        [
-          'Creative bridge failures',
-          cycle.trustedServerCreativeFailures === undefined
-            ? 'Unavailable'
-            : cycle.trustedServerCreativeFailures.length === 0
-              ? 'Not observed'
-              : cycle.trustedServerCreativeFailures.map(label).join(', '),
-        ],
-      ]);
-      box.append(request);
-    }
-    gpt.append(box);
-  }
-  const coverage = section(root, article, 'Coverage and ambiguity');
-  facts(root, coverage, [
-    ['Server capture', label(report.auction_coverage.capture_status)],
-    [
-      'Capture and interpretation limits',
-      report.auction_coverage.issues.length
-        ? report.auction_coverage.issues.map(label).join(', ')
-        : 'None recorded',
-    ],
-    ['Correlation sidecars retained', report.slot_correlations.length],
-  ]);
-  for (const [kind, counts] of Object.entries(report.gpt_diagnostics.coverage))
-    facts(root, coverage, [
-      [
-        label(kind),
-        `${counts.observed} observed; ${counts.matched} matched; ${counts.unmatched} unmatched; ${counts.ambiguous} ambiguous`,
-      ],
-    ]);
-  for (const [key, count] of Object.entries(report.truncation))
-    facts(root, coverage, [[label(key), count]]);
-  for (const [key, count] of Object.entries(report.gpt_diagnostics.metadata))
-    facts(root, coverage, [[`GPT ${label(key)}`, count]]);
-  for (const issue of report.gpt_diagnostics.callbackIssues)
-    facts(root, coverage, [
-      ['Callback issue', label(issue.kind)],
-      ['GPT slot', issue.runtimeSlotNumber],
-      ['Browser clock', millis(issue.timestampMs)],
-      ['Disposition', label(issue.disposition)],
-      ['Reason', label(issue.reason)],
-    ]);
-  for (const issue of report.gpt_diagnostics.attributionIssues ?? [])
-    facts(root, coverage, [
-      ['Creative attribution issue', label(issue.reason)],
-      ['GPT slot', issue.runtimeSlotNumber],
-      ['Browser clock', millis(issue.timestampMs)],
-    ]);
-  for (const [index, record] of report.slot_correlations.entries()) {
-    const entry = element(root, 'details');
-    entry.append(element(root, 'summary', `Correlation record ${index + 1}`));
-    entry.append(
-      element(
-        root,
-        'p',
-        'Browser observed correlation. These opaque references permit a join only when unique and consistent; duplicate or conflicting records remain unknown.'
-      )
-    );
-    facts(root, entry, [
-      ['Auction reference', record.diagnostic_auction_id],
-      ['Slot reference', record.slot_ref],
-      ['GPT slot number', record.runtime_slot_number],
-      ['GPT request number', record.request_number],
-    ]);
-    coverage.append(entry);
-  }
+  const summary = summarizeTraceReport(report, joined);
+  renderSummary(root, article, summary);
+  renderSlots(root, article, report, summary, joined);
+  // A visual divider, not a heading: the sections below keep their own h2 outline.
+  const more = element(root, 'p', 'More detail');
+  more.className = 'trace-more';
+  article.append(more);
+  renderAuctions(root, article, report, joined);
+  renderRequestContext(root, article, report);
+  renderCoverage(root, article, report);
   return article;
+}
+
+function plainCount(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
 }
 
 /** Mounts the trace page using the current tab's validated report and setup controls. */
