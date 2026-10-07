@@ -99,6 +99,78 @@ async fn rewrite_host_keeps_forwarded_host_on_from() {
 }
 
 #[tokio::test]
+async fn rewrite_host_presents_same_origin_origin_as_the_upstream_origin() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_rewrite_host(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let response = support::drive_request_with_origin(
+        cfg,
+        ca,
+        "/_ts/trace/enable?source=test",
+        &format!("https://{}", support::FROM_HOST),
+    )
+    .await;
+
+    assert_eq!(response.status, 200, "response streamed back");
+    assert_eq!(
+        response.seen_origin,
+        format!("https://{}", upstream.addr),
+        "--rewrite-host should name the TO authority in Origin on /_ts requests"
+    );
+}
+
+#[tokio::test]
+async fn rewrite_host_keeps_origin_on_publisher_paths() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_rewrite_host(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let origin = format!("https://{}", support::FROM_HOST);
+
+    let response = support::drive_request_with_origin(cfg, ca, "/checkout", &origin).await;
+
+    assert_eq!(
+        response.seen_origin, origin,
+        "publisher-bound requests should keep the browser's real Origin"
+    );
+}
+
+#[tokio::test]
+async fn rewrite_host_forwards_a_cross_site_origin_unchanged() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_rewrite_host(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let response = support::drive_request_with_origin(
+        cfg,
+        ca,
+        "/_ts/trace/enable",
+        "https://evil.example.com",
+    )
+    .await;
+
+    assert_eq!(
+        response.seen_origin, "https://evil.example.com",
+        "should leave a cross-site Origin for the upstream to judge"
+    );
+}
+
+#[tokio::test]
+async fn origin_is_untouched_without_rewrite_host() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let origin = format!("https://{}", support::FROM_HOST);
+
+    let response = support::drive_request_with_origin(cfg, ca, "/_ts/trace/enable", &origin).await;
+
+    assert_eq!(
+        response.seen_origin, origin,
+        "Origin should stay FROM while Host stays FROM"
+    );
+}
+
+#[tokio::test]
 async fn resolve_pins_connection_to_address() {
     let upstream = support::start_echo_upstream().await;
     // The TO host is `pinned.invalid` (never DNS-resolvable); `--resolve` sends

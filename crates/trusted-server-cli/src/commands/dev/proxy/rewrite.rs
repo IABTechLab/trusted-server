@@ -190,12 +190,6 @@ impl Rule {
             VerifyMode::Secure
         };
         let origin_key = OriginKey::new(transport, reference, to.port, verify, address_policy);
-        // The browser→proxy leg is always TLS, so the browser's own origin is `https://FROM`.
-        let first_party_origin_text = format!("https://{from}");
-        let first_party_origin =
-            HeaderValue::from_str(&first_party_origin_text).map_err(|_| RuleError::Header {
-                value: first_party_origin_text.clone(),
-            })?;
         let upstream_origin = if rewrite_host {
             let scheme = if plaintext { "http" } else { "https" };
             let text = format!("{scheme}://{}", to.host_with_port());
@@ -210,7 +204,6 @@ impl Rule {
             host_header,
             orig_host,
             scheme_is_tls: !plaintext,
-            first_party_origin,
             upstream_origin,
         };
         Ok(Self {
@@ -259,11 +252,10 @@ pub struct RewriteOutcome {
     pub orig_host: HeaderValue,
     /// Whether the upstream leg is TLS (`!plaintext`).
     pub scheme_is_tls: bool,
-    /// The browser's origin for `FROM` (`https://FROM`).
-    pub first_party_origin: HeaderValue,
-    /// With `--rewrite-host`, the `TO` origin that replaces a same-origin
-    /// `Origin: https://FROM`, so `Origin` and `Host` name the same authority.
-    /// `None` without `--rewrite-host`, where `Host` stays `FROM`.
+    /// With `--rewrite-host`, the `TO` origin that replaces the browser's
+    /// same-origin `Origin` on Trusted Server requests, so `Origin` and `Host`
+    /// name the same authority. `None` without `--rewrite-host`, where `Host`
+    /// stays `FROM`.
     pub upstream_origin: Option<HeaderValue>,
 }
 
@@ -479,11 +471,6 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            rewrite_for(&plaintext).first_party_origin,
-            "https://www.example-publisher.com",
-            "should derive the browser origin from FROM over TLS"
-        );
         assert_eq!(
             rewrite_for(&plaintext).upstream_origin,
             Some(HeaderValue::from_static("http://127.0.0.1:7676")),

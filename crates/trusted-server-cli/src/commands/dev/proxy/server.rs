@@ -571,6 +571,10 @@ async fn proxy_to_upstream(
     );
 
     let metadata = super::upstream::RequestMetadata::capture(&req);
+    // Runs before `rewrite_headers` replaces the inbound `Host` it compares against.
+    if is_trusted_server_path(req.uri().path()) {
+        rewrite_first_party_origin(req.headers_mut(), outcome);
+    }
     rewrite_headers(req.headers_mut(), outcome, basic_auth);
 
     let mut response = upstream.send(req, metadata, rule, outcome).await?;
@@ -712,7 +716,6 @@ fn rewrite_headers(
     // headers we stamp below as connection-specific and have them dropped.
     strip_hop_by_hop(headers);
     headers.insert(hyper::header::HOST, outcome.host_header.clone());
-    rewrite_first_party_origin(headers, outcome);
     // Tell the upstream the original first-party host (always `FROM`). Trusted
     // Server resolves the request host from `Forwarded` → `X-Forwarded-Host` →
     // `Host`, so a client-supplied `Forwarded` would outrank the value we inject.
@@ -750,11 +753,27 @@ fn rewrite_headers(
     trailer_metadata.regenerate(headers);
 }
 
-/// With `--rewrite-host`, replaces a single same-origin `Origin: https://FROM`
-/// with the `TO` origin, so an upstream that compares `Origin` against its own
-/// origin (as Trusted Server's state-changing endpoints do) sees the same
-/// authority it receives in `Host`. Cross-site, opaque, or duplicated `Origin`
-/// values pass through unchanged for the upstream to judge.
+/// Whether `path` (query excluded) is in Trusted Server's `/_ts` namespace:
+/// `/_ts` itself or anything under `/_ts/`, but not `/_tsx` or `/_ts-foo`.
+///
+/// Only those requests get their `Origin` rewritten. Trusted Server's own
+/// endpoints there compare `Origin` against the `Host` they receive; every
+/// other path may be forwarded to the publisher origin or a third-party vendor,
+/// which must keep seeing the browser's real `Origin`, as in production.
+fn is_trusted_server_path(path: &str) -> bool {
+    path.strip_prefix("/_ts")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// With `--rewrite-host`, replaces a single same-origin `Origin` with the `TO`
+/// origin, so an upstream that compares `Origin` against its own origin (as
+/// Trusted Server's state-changing endpoints do) sees the same authority it
+/// receives in `Host`.
+///
+/// Must run before `Host` is rewritten: the browser's origin is `https://` plus
+/// the inbound `Host`, which keeps any non-default port the browser connected
+/// to. Cross-site, opaque, or duplicated `Origin` values — and requests with an
+/// ambiguous `Host` — pass through unchanged for the upstream to judge.
 fn rewrite_first_party_origin(
     headers: &mut hyper::HeaderMap,
     outcome: &super::rewrite::RewriteOutcome,
@@ -762,17 +781,24 @@ fn rewrite_first_party_origin(
     let Some(upstream_origin) = &outcome.upstream_origin else {
         return;
     };
-    let is_single_first_party_origin = {
-        let mut origins = headers.get_all(hyper::header::ORIGIN).iter();
-        origins.next().is_some_and(|origin| {
+    let is_first_party = single_header(headers, &hyper::header::ORIGIN)
+        .zip(single_header(headers, &hyper::header::HOST))
+        .is_some_and(|(origin, host)| {
             origin
                 .as_bytes()
-                .eq_ignore_ascii_case(outcome.first_party_origin.as_bytes())
-        }) && origins.next().is_none()
-    };
-    if is_single_first_party_origin {
+                .strip_prefix(b"https://")
+                .is_some_and(|authority| authority.eq_ignore_ascii_case(host.as_bytes()))
+        });
+    if is_first_party {
         headers.insert(hyper::header::ORIGIN, upstream_origin.clone());
     }
+}
+
+/// Returns the value of `name` only when exactly one such field is present.
+fn single_header<'a>(headers: &'a hyper::HeaderMap, name: &HeaderName) -> Option<&'a HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -817,12 +843,20 @@ mod tests {
             host_header: HeaderValue::from_static(host),
             orig_host: HeaderValue::from_static("www.example-publisher.com"),
             scheme_is_tls: true,
-            first_party_origin: HeaderValue::from_static("https://www.example-publisher.com"),
             upstream_origin: Some(
                 HeaderValue::from_str(&format!("https://{host}"))
                     .expect("should build upstream origin"),
             ),
         }
+    }
+
+    fn browser_headers(host: &'static str, origins: &[&'static str]) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::HOST, HeaderValue::from_static(host));
+        for origin in origins {
+            headers.append(hyper::header::ORIGIN, HeaderValue::from_static(origin));
+        }
+        headers
     }
 
     fn origins(headers: &hyper::HeaderMap) -> Vec<&str> {
@@ -1064,15 +1098,14 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_headers_maps_same_origin_origin_to_upstream_origin() {
+    fn maps_same_origin_origin_to_upstream_origin() {
         let outcome = rewrite_outcome("to.edgecompute.app");
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            hyper::header::ORIGIN,
-            HeaderValue::from_static("https://WWW.example-publisher.com"),
+        let mut headers = browser_headers(
+            "www.example-publisher.com",
+            &["https://WWW.example-publisher.com"],
         );
 
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_first_party_origin(&mut headers, &outcome);
 
         assert_eq!(
             origins(&headers),
@@ -1082,23 +1115,38 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_headers_keeps_foreign_opaque_and_duplicate_origins() {
+    fn maps_same_origin_origin_on_a_non_default_port() {
+        let outcome = rewrite_outcome("to.edgecompute.app");
+        let mut headers = browser_headers(
+            "www.example-publisher.com:8443",
+            &["https://www.example-publisher.com:8443"],
+        );
+
+        rewrite_first_party_origin(&mut headers, &outcome);
+
+        assert_eq!(
+            origins(&headers),
+            ["https://to.edgecompute.app"],
+            "should derive the browser origin from the inbound Host, port included"
+        );
+    }
+
+    #[test]
+    fn keeps_foreign_opaque_and_duplicate_origins() {
         let outcome = rewrite_outcome("to.edgecompute.app");
         for values in [
             &["https://evil.example.com"][..],
             &["null"][..],
             &["http://www.example-publisher.com"][..],
+            &["https://www.example-publisher.com:8443"][..],
             &[
                 "https://www.example-publisher.com",
                 "https://www.example-publisher.com",
             ][..],
         ] {
-            let mut headers = hyper::HeaderMap::new();
-            for value in values {
-                headers.append(hyper::header::ORIGIN, HeaderValue::from_static(value));
-            }
+            let mut headers = browser_headers("www.example-publisher.com", values);
 
-            rewrite_headers(&mut headers, &outcome, None);
+            rewrite_first_party_origin(&mut headers, &outcome);
 
             assert_eq!(
                 origins(&headers),
@@ -1109,19 +1157,70 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_headers_keeps_origin_without_rewrite_host() {
+    fn keeps_origin_when_host_is_missing_or_duplicated() {
+        let outcome = rewrite_outcome("to.edgecompute.app");
+        let mut missing = hyper::HeaderMap::new();
+        missing.insert(
+            hyper::header::ORIGIN,
+            HeaderValue::from_static("https://www.example-publisher.com"),
+        );
+        let mut duplicated = browser_headers(
+            "www.example-publisher.com",
+            &["https://www.example-publisher.com"],
+        );
+        duplicated.append(
+            hyper::header::HOST,
+            HeaderValue::from_static("www.example-publisher.com"),
+        );
+
+        for headers in [&mut missing, &mut duplicated] {
+            rewrite_first_party_origin(headers, &outcome);
+
+            assert_eq!(
+                origins(headers),
+                ["https://www.example-publisher.com"],
+                "should not rewrite Origin without a single inbound Host"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_only_the_trusted_server_namespace() {
+        for path in ["/_ts", "/_ts/", "/_ts/trace/enable", "/_ts/api/v1/identify"] {
+            assert!(
+                is_trusted_server_path(path),
+                "should treat {path} as a Trusted Server path"
+            );
+        }
+        for path in [
+            "/",
+            "/_tsx",
+            "/_ts-foo",
+            "/api/_ts/trace",
+            "/auction",
+            "/integrations/lockr/api",
+            "/_TS/trace",
+        ] {
+            assert!(
+                !is_trusted_server_path(path),
+                "should leave {path} with the browser's Origin"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_origin_without_rewrite_host() {
         let outcome = RewriteOutcome {
             host_header: HeaderValue::from_static("www.example-publisher.com"),
             upstream_origin: None,
             ..rewrite_outcome("www.example-publisher.com")
         };
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            hyper::header::ORIGIN,
-            HeaderValue::from_static("https://www.example-publisher.com"),
+        let mut headers = browser_headers(
+            "www.example-publisher.com",
+            &["https://www.example-publisher.com"],
         );
 
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_first_party_origin(&mut headers, &outcome);
 
         assert_eq!(
             origins(&headers),

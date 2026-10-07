@@ -28,6 +28,7 @@ pub struct ProxiedResponse {
     pub seen_host: String,
     pub seen_orig_host: String,
     pub seen_forwarded_host: String,
+    pub seen_origin: String,
     pub path: String,
 }
 
@@ -658,6 +659,7 @@ async fn serve_upstream_connection<S>(
         let host = header_value(&head, "host").unwrap_or_default();
         let orig_host = header_value(&head, "x-orig-host").unwrap_or_default();
         let fwd_host = header_value(&head, "x-forwarded-host").unwrap_or_default();
+        let origin = header_value(&head, "origin").unwrap_or_default();
         let has_auth = header_value(&head, "authorization").is_some();
 
         if fail_second_request && request_index == 2 {
@@ -667,7 +669,8 @@ async fn serve_upstream_connection<S>(
         let (status_line, body) = if gated && !has_auth {
             ("HTTP/1.1 401 Unauthorized", String::new())
         } else {
-            let body = format!("host={host};orig={orig_host};fwd={fwd_host};path={path}");
+            let body =
+                format!("host={host};orig={orig_host};fwd={fwd_host};origin={origin};path={path}");
             ("HTTP/1.1 200 OK", body)
         };
         if !response_delay.is_zero() {
@@ -1515,6 +1518,35 @@ pub async fn drive_request_with_host_header(
     read_http_response(&mut tls).await.status
 }
 
+/// CONNECTs to the mapped [`FROM_HOST`], then sends a single `POST` to `path`
+/// carrying `Host: FROM` and the given `Origin`, and returns what the upstream saw.
+pub async fn drive_request_with_origin(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+    path: &str,
+    origin: &str,
+) -> ProxiedResponse {
+    let proxy = spawn_proxy(cfg, ca).await;
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {FROM_HOST}\r\nOrigin: {origin}\r\nContent-Length: 0\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should send request over tunnel");
+    tls.flush().await.expect("should flush request");
+    read_http_response(&mut tls).await
+}
+
 /// Reads one HTTP/1.1 response (head + Content-Length body) and parses the echo.
 async fn read_http_response<S>(stream: &mut S) -> ProxiedResponse
 where
@@ -1552,34 +1584,44 @@ where
         body.extend_from_slice(&chunk[..n]);
     }
     let body = String::from_utf8_lossy(&body[..content_length.min(body.len())]).to_string();
-    let (seen_host, seen_orig_host, seen_forwarded_host, path) = parse_echo(&body);
+    let echo = parse_echo(&body);
     ProxiedResponse {
         status,
-        seen_host,
-        seen_orig_host,
-        seen_forwarded_host,
-        path,
+        seen_host: echo.host,
+        seen_orig_host: echo.orig,
+        seen_forwarded_host: echo.fwd,
+        seen_origin: echo.origin,
+        path: echo.path,
     }
 }
 
-/// Parses `host=..;orig=..;fwd=..;path=..` echoed by the upstream.
-fn parse_echo(body: &str) -> (String, String, String, String) {
-    let mut host = String::new();
-    let mut orig = String::new();
-    let mut fwd = String::new();
-    let mut path = String::new();
+/// Header values the echo upstream reported.
+#[derive(Default)]
+struct Echo {
+    host: String,
+    orig: String,
+    fwd: String,
+    origin: String,
+    path: String,
+}
+
+/// Parses `host=..;orig=..;fwd=..;origin=..;path=..` echoed by the upstream.
+fn parse_echo(body: &str) -> Echo {
+    let mut echo = Echo::default();
     for field in body.split(';') {
         if let Some(v) = field.strip_prefix("host=") {
-            host = v.to_string();
+            echo.host = v.to_string();
         } else if let Some(v) = field.strip_prefix("orig=") {
-            orig = v.to_string();
+            echo.orig = v.to_string();
         } else if let Some(v) = field.strip_prefix("fwd=") {
-            fwd = v.to_string();
+            echo.fwd = v.to_string();
+        } else if let Some(v) = field.strip_prefix("origin=") {
+            echo.origin = v.to_string();
         } else if let Some(v) = field.strip_prefix("path=") {
-            path = v.to_string();
+            echo.path = v.to_string();
         }
     }
-    (host, orig, fwd, path)
+    echo
 }
 
 /// CONNECTs through the proxy to an UNMATCHED authority, completes the TLS

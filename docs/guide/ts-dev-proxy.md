@@ -325,13 +325,26 @@ hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pa
 `X-Forwarded-Host: <FROM>`, so first-party URL rewriting stays anchored to `FROM`
 **as long as the upstream preserves that header**.
 
-With `--rewrite-host`, the proxy also replaces a single same-origin
-`Origin: https://<FROM>` with the `TO` origin (`http://` with
-`--upstream-plaintext`, `https://` otherwise, plus any non-default port), so
-`Origin` names the same authority as `Host`. Upstream endpoints that verify a
-same-origin `Origin` against their own origin then accept proxied same-origin
-requests. Cross-site, `null`, and duplicated `Origin` values pass through
-unchanged.
+With `--rewrite-host`, the proxy also replaces a single same-origin `Origin`
+(`https://<FROM>`, plus the port the browser connected to when it isn't 443)
+with the `TO` origin (`http://` with `--upstream-plaintext`, `https://`
+otherwise, plus any non-default port), so `Origin` names the same authority as
+`Host`. Trusted Server's state-changing endpoints compare `Origin` against their
+own origin, so they then accept proxied same-origin requests. Cross-site,
+`null`, plain `http://`, and duplicated `Origin` values pass through unchanged.
+
+The rewrite applies only to Trusted Server's `/_ts` namespace: the path `/_ts`
+or anything under `/_ts/` (not `/_tsx` or `/_ts-foo`). Trusted Server forwards
+the browser's request headers to the publisher origin and to integration
+vendors, so every other request keeps the browser's real `Origin`, as in
+production, and publisher or vendor `Origin` checks keep working. Trusted Server
+routes outside `/_ts` — `/auction`, `/first-party/*`, and `/integrations/*` —
+are not rewritten; none of them check `Origin` today.
+
+Inside `/_ts`, `/_ts/api/v1/identify` answers CORS only for an `https` `Origin`
+on the publisher domain. It is GET-only, so a same-origin call carries no
+`Origin` and a cross-site one is never rewritten, but a same-origin POST added
+under `/_ts` later would see the rewritten `TO` origin.
 
 > **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
 > request paths strip inbound `X-Forwarded-Host` before routing, so with
