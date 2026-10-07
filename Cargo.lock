@@ -5456,6 +5456,7 @@ dependencies = [
  "trusted-server-core",
  "trusted-server-device-fastly",
  "trusted-server-geo-fastly",
+ "trusted-server-integration-seam-probe",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",

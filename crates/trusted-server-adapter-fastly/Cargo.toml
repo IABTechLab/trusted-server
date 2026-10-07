@@ -50,3 +50,6 @@ bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 toml = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
+# Test fixture only. It proves the integration seam on this adapter from
+# outside core and must never be a regular dependency.
+trusted-server-integration-seam-probe = { path = "../testing/seam-probe" }

@@ -239,7 +239,29 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_with_registrations(settings, &[])
+    build_state_with_registrations(settings, registered_integrations())
+}
+
+/// The integration builders a deployment offered through
+/// [`crate::run_with`], set once before any request is served.
+///
+/// Held here rather than threaded through the build, because the state is
+/// built inside the `EdgeZero` application hooks, which take no arguments.
+/// [`IntegrationBuilder`] is `Copy` and holds only function pointers and
+/// static references, so nothing here can change once it is set.
+static REGISTERED_INTEGRATIONS: std::sync::OnceLock<Vec<IntegrationBuilder>> =
+    std::sync::OnceLock::new();
+
+/// Records the builders a deployment offers. The first call wins, and
+/// [`crate::run_with`] is the only caller, so nothing registers after serving
+/// has begun.
+pub(crate) fn register_integrations(builders: Vec<IntegrationBuilder>) {
+    let _ = REGISTERED_INTEGRATIONS.set(builders);
+}
+
+/// The builders a deployment registered, or none.
+fn registered_integrations() -> &'static [IntegrationBuilder] {
+    REGISTERED_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
 }
 
 /// Build the application state from explicit settings, composing the built-in
@@ -1578,6 +1600,9 @@ impl Hooks for TrustedServerApp {
         }
     }
 }
+
+#[cfg(test)]
+mod seam_probe_tests;
 
 #[cfg(test)]
 mod tests {
