@@ -39,13 +39,13 @@ use trusted_server_core::platform::{GeoInfo, PlatformError, PlatformGeo, Runtime
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
-/// Integration id, which is also the key of the probe's configuration block
-/// (`[testing.seam-probe]`) and the value `[geo] module` names to
-/// select the probe's geo module.
+/// Integration id, which names the probe's routes and its browser module.
 pub const SEAM_PROBE_ID: &str = "seam_probe";
 
-/// The name a section selects this module by, its crate folder below
-/// `crates/`, so `[testing] modules = ["seam-probe"]` selects it.
+/// The name this module is selected by, its crate folder below `crates/`, so
+/// `[testing] modules = ["seam-probe"]` selects it. Its geo, Edge Cookie and
+/// device modules carry the same name, so `[geo] module`, `[ec] module` and
+/// `[device] module` select each of them as `testing.seam-probe`.
 #[must_use]
 pub fn module_name() -> &'static str {
     trusted_server_core::module_name!()
@@ -151,8 +151,8 @@ pub struct SeamProbeConfig {
     /// Whether the registration declares the probe's geo module.
     ///
     /// Set this to `false` to build a selected module that supplies no geo
-    /// module, which is what `[geo] module = "seam_probe"` must reject at
-    /// startup.
+    /// module, which is what `[geo] module = "testing.seam-probe"` must
+    /// reject at startup.
     #[serde(default = "default_declares_geo")]
     pub declares_geo: bool,
 }
@@ -197,7 +197,7 @@ const SEAM_PROBE_EC_CODE: ModuleCode = trusted_server_core::module_code!("sprb")
 #[async_trait::async_trait(?Send)]
 impl EdgeCookieModule for SeamProbeEc {
     fn id(&self) -> &'static str {
-        SEAM_PROBE_ID
+        module_name()
     }
 
     fn code(&self) -> ModuleCode {
@@ -232,7 +232,7 @@ pub struct SeamProbeDevice;
 #[async_trait::async_trait(?Send)]
 impl DeviceModule for SeamProbeDevice {
     fn id(&self) -> &'static str {
-        SEAM_PROBE_ID
+        module_name()
     }
 
     async fn detect(
@@ -304,7 +304,7 @@ impl IntegrationProxy for SeamProbeProxy {
         let prepared = req.extensions().get::<SeamProbePrepared>().copied();
 
         let body = json!({
-            "module": SEAM_PROBE_ID,
+            "module": module_name(),
             "geo_country": country,
             "request_preparer_runs": prepared.map_or(0, |marker| marker.runs),
         })
@@ -370,14 +370,15 @@ pub fn register(
             sha256: PROBE_JS_SHA256,
         });
     if config.declares_geo {
-        registration = registration.with_geo_module(Arc::new(SeamProbeGeo::new(config.country)));
+        registration = registration
+            .with_geo_module(module_name(), Arc::new(SeamProbeGeo::new(config.country)));
     }
     {
         // Identity and device are declared the same way location is, so one
         // module supplies all three and there is no second mechanism.
         registration = registration
-            .with_ec_module(Arc::new(SeamProbeEc))
-            .with_device_module(Arc::new(SeamProbeDevice));
+            .with_ec_module(module_name(), Arc::new(SeamProbeEc))
+            .with_device_module(module_name(), Arc::new(SeamProbeDevice));
     }
 
     Ok(Some(registration.build()))

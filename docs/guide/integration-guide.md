@@ -275,18 +275,33 @@ builder the integrations in core use.
 | `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle     |
 | `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag |
 | `.without_js()`                                       | Ships no browser script                                                             |
-| `.with_ec_module(...)`                                | Offers an Edge Cookie module that `[ec] module` may select                          |
-| `.with_geo_module(...)`                               | Offers a geo module that `[geo] module` may select                                  |
-| `.with_device_module(...)`                            | Offers a device module that `[device] module` may select                            |
+| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name             |
+| `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                     |
+| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name               |
 
 The three script delivery choices are exclusive and the last call wins.
 
-`[ec] module`, `[geo] module` and `[device] module` select a registration's
-module by the integration's id, and only when a section also selects the
-integration, because the registry builds only the integrations a section
-selects. A `[geo] module` or `[device] module` naming an integration that
-declares no such module refuses startup, naming the integration and the
-capability.
+Each of the last three takes the module's name, which is the path under
+`crates/` of the crate the module lives in, as `module_name!()` gives it.
+`[ec] module`, `[geo] module` and `[device] module` read a written name the
+way a section does, as written or with the type folder (`edgecookie`, `geo`
+or `device`) in front, so a geo module from `crates/geo/example` is selected
+with `[geo] module = "example"`. One registration can supply a module of each
+type, each under the name of its own crate, which is how a vendor makes one
+backend call serve all three.
+
+An Edge Cookie module is declared under the name its own `id` returns.
+Startup refuses a registration where the two differ, and two registrations
+that supply a module of one type under one name.
+
+The registry builds only the modules a section selects, so the module that
+supplies one of these has to be selected in its section as well. The probe
+is run with `[testing] modules = ["seam-probe"]` and its geo module is
+selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
+`[device] module` naming something no running module supplies refuses
+startup. The message lists the modules of that type the deployment runs, and
+says when the name is a module no section selects or one that supplies no
+module of that type.
 
 ### How an adapter composes it in
 

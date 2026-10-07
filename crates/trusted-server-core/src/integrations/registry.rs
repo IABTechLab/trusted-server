@@ -660,23 +660,26 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
-    /// Geo module this module supplies, selectable by `[geo] module`.
+    /// Geo module this registration supplies, with the name `[geo] module`
+    /// selects it by.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to resolve location when `[geo] module` names this module's id.
-    pub geo_module: Option<Arc<dyn PlatformGeo>>,
-    /// Edge Cookie module this module supplies, selectable by `[ec] module`.
+    /// to resolve location when `[geo] module` names it.
+    pub geo_module: Option<(&'static str, Arc<dyn PlatformGeo>)>,
+    /// Edge Cookie module this registration supplies, with the name
+    /// `[ec] module` selects it by.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to create an identifier when `[ec] module` names this module's id. This
-    /// is the same route geo takes, so identity is not a second extension
-    /// mechanism sitting beside the integration system.
-    pub ec_module: Option<Arc<dyn EdgeCookieModule>>,
-    /// Device module this module supplies, selectable by `[device] module`.
+    /// to create an identifier when `[ec] module` names it. This is the same
+    /// route geo takes, so identity is not a second extension mechanism
+    /// sitting beside the integration system.
+    pub ec_module: Option<(&'static str, Arc<dyn EdgeCookieModule>)>,
+    /// Device module this registration supplies, with the name
+    /// `[device] module` selects it by.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to classify a request when `[device] module` names this module's id.
-    pub device_module: Option<Arc<dyn DeviceModule>>,
+    /// to classify a request when `[device] module` names it.
+    pub device_module: Option<(&'static str, Arc<dyn DeviceModule>)>,
 }
 
 impl IntegrationRegistration {
@@ -754,36 +757,43 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
-    /// Declare the geo module this module supplies.
+    /// Declare the geo module this registration supplies, under its `name`.
     ///
-    /// The module only resolves location when `[geo] module` names this
-    /// module's id, and a declared module the selector does not choose is
+    /// The name is the path under `crates` of the crate the module lives in,
+    /// as [`crate::module_name!`] gives it, so a module from
+    /// `crates/geo/example` is selected by `[geo] module = "example"`. One
+    /// registration can therefore supply a module of each type, each under
+    /// the name of its own crate. The module only resolves location when
+    /// `[geo] module` names it, and a module the selector does not choose is
     /// logged as a warning when the registry is built.
     #[must_use]
-    pub fn with_geo_module(mut self, module: Arc<dyn PlatformGeo>) -> Self {
-        self.registration.geo_module = Some(module);
+    pub fn with_geo_module(mut self, name: &'static str, module: Arc<dyn PlatformGeo>) -> Self {
+        self.registration.geo_module = Some((name, module));
         self
     }
 
-    /// Declare the Edge Cookie module this module supplies.
+    /// Declare the Edge Cookie module this registration supplies, under its
+    /// `name`, which is also what the module's
+    /// [`id`](EdgeCookieModule::id) returns.
     ///
-    /// The module only creates identifiers when `[ec] module` names this
-    /// module's id, and a declared module the selector does not choose is
-    /// logged as a warning when the registry is built, the same as geo.
+    /// The module only creates identifiers when `[ec] module` names it, and
+    /// a module the selector does not choose is logged as a warning when the
+    /// registry is built, the same as geo.
     #[must_use]
-    pub fn with_ec_module(mut self, module: Arc<dyn EdgeCookieModule>) -> Self {
-        self.registration.ec_module = Some(module);
+    pub fn with_ec_module(mut self, name: &'static str, module: Arc<dyn EdgeCookieModule>) -> Self {
+        self.registration.ec_module = Some((name, module));
         self
     }
 
-    /// Declare the device module this module supplies.
+    /// Declare the device module this registration supplies, under its
+    /// `name`.
     ///
-    /// The module only classifies requests when `[device] module` names
-    /// this module's id, and a declared module the selector does not choose
-    /// is logged as a warning when the registry is built, the same as geo.
+    /// The module only classifies requests when `[device] module` names it,
+    /// and a module the selector does not choose is logged as a warning when
+    /// the registry is built, the same as geo.
     #[must_use]
-    pub fn with_device_module(mut self, module: Arc<dyn DeviceModule>) -> Self {
-        self.registration.device_module = Some(module);
+    pub fn with_device_module(mut self, name: &'static str, module: Arc<dyn DeviceModule>) -> Self {
+        self.registration.device_module = Some((name, module));
         self
     }
 
@@ -868,15 +878,19 @@ struct IntegrationRegistryInner {
     extra_js_module_ids: Vec<&'static str>,
     // Preparers from every builder, named or not, in registration order.
     request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
-    // Geo modules declared by the registrations that run, in registration
-    // order. Declaring one does not activate it.
+    // Geo modules the running registrations supply, each with the name
+    // `[geo] module` selects it by, in registration order. Declaring one does
+    // not activate it.
     geo_modules: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
-    // Edge Cookie modules each declaring module supplies, in registration
-    // order. `[ec] module` picks at most one of them.
+    // Edge Cookie modules the running registrations supply, each with its
+    // name, in registration order. `[ec] module` picks at most one of them.
     ec_modules: Vec<(&'static str, Arc<dyn EdgeCookieModule>)>,
-    // Device modules each declaring module supplies, in registration order.
-    // `[device] module` picks at most one of them.
+    // Device modules the running registrations supply, each with its name, in
+    // registration order. `[device] module` picks at most one of them.
     device_modules: Vec<(&'static str, Arc<dyn DeviceModule>)>,
+    // Every builder's module name, with whether a section selects it, so the
+    // refusal of a name a selector wrote can say what that name is.
+    builder_modules: Vec<(&'static str, bool)>,
     // The module `[geo] module` resolved to, or `None` when the selector
     // is `platform` and the adapter's own host lookup stands. Unset and `none`
     // both resolve the disabled module.
@@ -912,6 +926,7 @@ impl Default for IntegrationRegistryInner {
             geo_modules: Vec::new(),
             ec_modules: Vec::new(),
             device_modules: Vec::new(),
+            builder_modules: Vec::new(),
             geo_module: None,
             ec_module: None,
             device_module: None,
@@ -936,46 +951,169 @@ const DEVICE_MODULE_BUILTIN: &str = "builtin";
 /// than by a module, so the registry supplies nothing for it.
 const DEVICE_MODULE_FASTLY: &str = "fastly";
 
-/// Resolves the Edge Cookie module `[ec] module` names, when a module
-/// supplies it.
+/// The type folder each of these kinds of module is selected in, which a name
+/// written in its section may leave off.
+const EDGECOOKIE_TYPE: &str = crate::ec::module::MODULE_TYPE;
+const DEVICE_TYPE: &str = "device";
+const GEO_TYPE: &str = "geo";
+
+impl IntegrationRegistryInner {
+    /// A sentence to follow the refusal of a name a selector wrote, when the
+    /// name is a builder's module: one no section selects, which is why
+    /// nothing it supplies is running, or one that is selected and supplies no
+    /// module of this kind. Empty when no builder's module answers to the
+    /// name.
+    fn builder_note(&self, type_folder: &str, kind: &str, written: &str) -> String {
+        let names: Vec<&str> = self.builder_modules.iter().map(|(name, _)| *name).collect();
+        let Some(name) = crate::module_name::resolve(type_folder, written, &names) else {
+            return String::new();
+        };
+        let selected = self
+            .builder_modules
+            .iter()
+            .any(|(module, selected)| *module == name && *selected);
+        if selected {
+            format!(". `{written}` is selected and supplies no {kind} module")
+        } else {
+            format!(
+                ". `{written}` is a module no section selects, so nothing it supplies is running"
+            )
+        }
+    }
+}
+
+/// The module a name written in a section means, among those the running
+/// registrations supply, written in full or with the section's type folder
+/// left off.
+fn find_named<'a, T: ?Sized>(
+    type_folder: &str,
+    written: &str,
+    offered: &'a [(&'static str, Arc<T>)],
+) -> Option<&'a Arc<T>> {
+    let names: Vec<&str> = offered.iter().map(|(name, _)| *name).collect();
+    let name = crate::module_name::resolve(type_folder, written, &names)?;
+    offered
+        .iter()
+        .find(|(offered_name, _)| *offered_name == name)
+        .map(|(_, module)| module)
+}
+
+/// Warns about each module on offer that the section does not select, so an
+/// operator can see a capability the deployment never uses.
+fn warn_unselected<T: ?Sized>(
+    section: &str,
+    type_folder: &str,
+    selected: Option<&Arc<T>>,
+    offered: &[(&'static str, Arc<T>)],
+) {
+    for (name, module) in offered {
+        if !selected.is_some_and(|chosen| Arc::ptr_eq(chosen, module)) {
+            log::warn!(
+                "the module `{}` is offered, and `[{section}] module` does not select it",
+                crate::module_name::short_form(type_folder, name)
+            );
+        }
+    }
+}
+
+/// The registered module a section names.
 ///
-/// Unlike geo, identity has modules built into core, so a selector naming one
-/// of those is not an error here. This returns `Some` only when a registered
-/// module declared a module under that name, and core resolves the rest.
+/// # Errors
+///
+/// A configuration error naming the section and the modules on offer when no
+/// registered module answers to the name, because otherwise a mistyped name
+/// would fall back to core's own module with nothing said.
+fn named_module<T: ?Sized>(
+    type_folder: &str,
+    section: &str,
+    written: &str,
+    offered: &[(&'static str, Arc<T>)],
+    inner: &IntegrationRegistryInner,
+) -> Result<Arc<T>, Report<TrustedServerError>> {
+    if let Some(module) = find_named(type_folder, written, offered) {
+        return Ok(Arc::clone(module));
+    }
+    let names: Vec<&str> = offered
+        .iter()
+        .map(|(name, _)| crate::module_name::short_form(type_folder, name))
+        .collect();
+    let runs = if names.is_empty() {
+        format!("It runs no {section} module")
+    } else {
+        format!("The {section} modules it runs are [{}]", names.join(", "))
+    };
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "`[{section}] module` names `{written}`, which no module this deployment runs \
+             supplies. {runs}{}",
+            inner.builder_note(type_folder, section, written)
+        ),
+    }))
+}
+
+/// Records that `integration` supplies the `kind` module `name`.
+///
+/// # Errors
+///
+/// When another registration already supplies a module of that kind under the
+/// name, naming both, because a selector could then mean either.
+fn claim_module_name(
+    claimed: &mut Vec<(&'static str, &'static str, &'static str)>,
+    kind: &'static str,
+    name: &'static str,
+    integration: &'static str,
+) -> Result<(), Report<TrustedServerError>> {
+    if let Some((_, _, first)) = claimed
+        .iter()
+        .find(|(claimed_kind, claimed_name, _)| *claimed_kind == kind && *claimed_name == name)
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "the {kind} module `{name}` is declared twice, by integration `{first}` and by \
+                 integration `{integration}`"
+            ),
+        }));
+    }
+    claimed.push((kind, name, integration));
+    Ok(())
+}
+
+/// Resolves the Edge Cookie module `[ec] module` names, when a registered
+/// module supplies it.
+///
+/// Core has Edge Cookie modules of its own, so a name no registered module
+/// answers to is not an error here. This returns `Some` only for a registered
+/// module, and core resolves the rest. The name looked for is the
+/// implementation the selection's `[ec.<name>]` block names, or the selection
+/// itself, which is the name core checks the module's id against.
 fn resolve_ec_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
 ) -> Option<Arc<dyn EdgeCookieModule>> {
     // `None` spells statelessness and never names a module, so only a named
     // selection can match one.
-    let selector = match settings.ec.module.as_ref() {
-        Some(EcModuleSelection::Named(key)) => Some(key.as_str()),
+    let implementation = match settings.ec.module.as_ref() {
+        Some(EcModuleSelection::Named(key)) => Some(settings.ec.module_blocks.implementation(key)),
         Some(EcModuleSelection::None) | None => None,
     };
-    let resolved = selector.and_then(|key| {
-        inner
-            .ec_modules
-            .iter()
-            .find(|(id, _)| *id == key)
-            .map(|(_, module)| Arc::clone(module))
-    });
-
-    for (id, _) in &inner.ec_modules {
-        if selector != Some(*id) {
-            log::warn!(
-                "integration module `{id}` declares an Edge Cookie module that `[ec] module` does not select"
-            );
-        }
-    }
-
+    let resolved = implementation
+        .and_then(|name| find_named(EDGECOOKIE_TYPE, name, &inner.ec_modules))
+        .map(Arc::clone);
+    warn_unselected("ec", EDGECOOKIE_TYPE, resolved.as_ref(), &inner.ec_modules);
     resolved
 }
 
-/// Resolves the device module `[device] module` names, when a module
-/// supplies it.
+/// Resolves the device module `[device] module` names, when a registered
+/// module supplies it.
 ///
-/// As with identity, core has a built-in device module, so a selector naming
+/// As with identity, core has a device module of its own, so a selector naming
 /// it is not an error here.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the selector names no
+/// registered module, or names one that declares a permission nothing can
+/// enforce.
 fn resolve_device_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -986,7 +1124,13 @@ fn resolve_device_module(
         // `fastly` names the host module the adapter builds, so the registry
         // supplies nothing for any of the three.
         None | Some(DEVICE_MODULE_BUILTIN) | Some(DEVICE_MODULE_FASTLY) => None,
-        Some(module_id) => Some(declared_device_module(module_id, inner)?),
+        Some(written) => Some(named_module(
+            DEVICE_TYPE,
+            "device",
+            written,
+            &inner.device_modules,
+            inner,
+        )?),
     };
 
     // A module-supplied device module may declare the permissions its data
@@ -1007,85 +1151,35 @@ fn resolve_device_module(
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!(
-            "integration module `{}` declares a device module requiring `{declared}`, \
-             and Trusted Server has no per-request gate that can enforce that yet, so the \
+            "`[device] module` selects `{}`, a device module requiring `{declared}`, and \
+             Trusted Server has no per-request gate that can enforce that yet, so the \
              selection is refused rather than silently ignored",
             selector.unwrap_or_default(),
         );
         return Err(Report::new(TrustedServerError::Configuration { message }));
     }
 
-    for (id, _) in &inner.device_modules {
-        if selector != Some(*id) {
-            log::warn!(
-                "integration module `{id}` declares a device module that `[device] module` does not select"
-            );
-        }
-    }
+    warn_unselected(
+        "device",
+        DEVICE_TYPE,
+        resolved.as_ref(),
+        &inner.device_modules,
+    );
 
     Ok(resolved)
 }
 
-/// Looks up the device module declared by the module `module_id`.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::Configuration`] naming the module and the
-/// capability when the module declares no device module, is supplied by a
-/// builder no section selects, or is not registered at
-/// all. Without this a mistyped selector would fall back to core's built-in
-/// module with nothing said, which is the silent wrong answer the geo
-/// selector already refuses to give.
-fn declared_device_module(
-    module_id: &str,
-    inner: &IntegrationRegistryInner,
-) -> Result<Arc<dyn DeviceModule>, Report<TrustedServerError>> {
-    if let Some((_, module)) = inner.device_modules.iter().find(|(id, _)| *id == module_id) {
-        return Ok(Arc::clone(module));
-    }
-
-    let message = if inner
-        .running_integration_ids
-        .iter()
-        .copied()
-        .any(|id| id == module_id)
-    {
-        format!(
-            "`[device] module` selects integration module `{module_id}`, which declares no device module"
-        )
-    } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
-        format!(
-            "`[device] module` selects integration module `{module_id}`, which no section selects, so its device module is unavailable"
-        )
-    } else {
-        format!(
-            "`[device] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device module are [{}]",
-            inner
-                .device_modules
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    Err(Report::new(TrustedServerError::Configuration { message }))
-}
-
-/// Resolves `[geo] module` against the modules that declared a geo module.
+/// Resolves `[geo] module` against the registered geo modules.
 ///
 /// Returns the disabled module when the selector is unset or `none`, `None`
 /// when it is `platform` so the adapter's own host lookup stands, and the
-/// module's module otherwise. A module that declares a geo module the
-/// selector does not choose is logged as a warning when the registry is built,
-/// so an operator can see a module shipping a capability the deployment never
-/// uses.
+/// registered module otherwise. A module on offer that the selector does not
+/// choose is logged as a warning when the registry is built.
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::Configuration`] when the selector names a
-/// module that is not registered, is supplied by a builder no section
-/// selects, or runs and declares no geo module.
+/// Returns [`TrustedServerError::Configuration`] when the selector names no
+/// registered module.
 fn resolve_geo_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1099,65 +1193,16 @@ fn resolve_geo_module(
         // `platform` opts in to the adapter's own host lookup, so the registry
         // supplies nothing and the adapter's module stands.
         Some(GEO_MODULE_PLATFORM) => None,
-        Some(module_id) => Some(declared_geo_module(module_id, inner)?),
+        Some(written) => Some(named_module(
+            GEO_TYPE,
+            "geo",
+            written,
+            &inner.geo_modules,
+            inner,
+        )?),
     };
-
-    for (id, _) in &inner.geo_modules {
-        if selector != Some(*id) {
-            log::warn!(
-                "integration module `{id}` declares a geo module that `[geo] module` does not select"
-            );
-        }
-    }
-
+    warn_unselected("geo", GEO_TYPE, resolved.as_ref(), &inner.geo_modules);
     Ok(resolved)
-}
-
-/// Looks up the geo module declared by the module `module_id`.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::Configuration`] naming the module and the
-/// capability when the module declares no geo module, is supplied by a
-/// builder no section selects, or is not registered at
-/// all.
-fn declared_geo_module(
-    module_id: &str,
-    inner: &IntegrationRegistryInner,
-) -> Result<Arc<dyn PlatformGeo>, Report<TrustedServerError>> {
-    if let Some((_, module)) = inner.geo_modules.iter().find(|(id, _)| *id == module_id) {
-        return Ok(Arc::clone(module));
-    }
-
-    // Only a module a section selects reaches the collection
-    // loop, so a module that exists but is not named must say so rather than
-    // read as a module that never declared the capability.
-    let message = if inner
-        .running_integration_ids
-        .iter()
-        .copied()
-        .any(|id| id == module_id)
-    {
-        format!(
-            "`[geo] module` selects integration module `{module_id}`, which declares no geo module"
-        )
-    } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
-        format!(
-            "`[geo] module` selects integration module `{module_id}`, which no section selects, so its geo module is unavailable"
-        )
-    } else {
-        format!(
-            "`[geo] module` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo module are [{}]",
-            inner
-                .geo_modules
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    Err(Report::new(TrustedServerError::Configuration { message }))
 }
 
 /// Summary of registered integration capabilities.
@@ -1379,10 +1424,13 @@ impl IntegrationRegistry {
             // Only a builder whose module a section selects is built, so an
             // integration runs exactly when an operator selects it, whatever
             // its builder would otherwise make of the settings.
-            if !builder
+            let selected = builder
                 .module_name()
-                .is_some_and(|name| settings.selects_module(name))
-            {
+                .is_some_and(|name| settings.selects_module(name));
+            if let Some(name) = builder.module_name() {
+                inner.builder_modules.push((name, selected));
+            }
+            if !selected {
                 continue;
             }
 
@@ -1403,6 +1451,9 @@ impl IntegrationRegistry {
         // because a vendor crate the CLI never links may supply the name.
         check_section_selections(settings, extra)?;
 
+        // The geo, Edge Cookie and device module names taken so far, with the
+        // integration that supplies each.
+        let mut claimed = Vec::new();
         for registration in registrations {
             inner
                 .running_integration_ids
@@ -1465,18 +1516,35 @@ impl IntegrationRegistry {
                 .extend(registration.html_stream_processors);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
-            if let Some(module) = registration.geo_module {
-                inner
-                    .geo_modules
-                    .push((registration.integration_id, module));
+            if let Some((name, module)) = registration.geo_module {
+                claim_module_name(&mut claimed, "geo", name, registration.integration_id)?;
+                inner.geo_modules.push((name, module));
             }
-            if let Some(module) = registration.ec_module {
-                inner.ec_modules.push((registration.integration_id, module));
+            if let Some((name, module)) = registration.ec_module {
+                claim_module_name(
+                    &mut claimed,
+                    "Edge Cookie",
+                    name,
+                    registration.integration_id,
+                )?;
+                // Core checks the selected module by its own id, so a module
+                // declared under another name would be selected here and
+                // refused there.
+                if module.id() != name {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "integration `{}` declares an Edge Cookie module under `{name}`, \
+                             and the module's own id is `{}`. The two must be the same name",
+                            registration.integration_id,
+                            module.id()
+                        ),
+                    }));
+                }
+                inner.ec_modules.push((name, module));
             }
-            if let Some(module) = registration.device_module {
-                inner
-                    .device_modules
-                    .push((registration.integration_id, module));
+            if let Some((name, module)) = registration.device_module {
+                claim_module_name(&mut claimed, "device", name, registration.integration_id)?;
+                inner.device_modules.push((name, module));
             }
             if registration.js_disabled {
                 inner.disabled_js_ids.push(registration.integration_id);
@@ -2066,6 +2134,7 @@ impl IntegrationRegistry {
                 geo_modules: Vec::new(),
                 ec_modules: Vec::new(),
                 device_modules: Vec::new(),
+                builder_modules: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -2107,6 +2176,7 @@ impl IntegrationRegistry {
                 geo_modules: Vec::new(),
                 ec_modules: Vec::new(),
                 device_modules: Vec::new(),
+                builder_modules: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -2144,6 +2214,7 @@ impl IntegrationRegistry {
                 geo_modules: Vec::new(),
                 ec_modules: Vec::new(),
                 device_modules: Vec::new(),
+                builder_modules: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -2221,6 +2292,7 @@ impl IntegrationRegistry {
                 geo_modules: Vec::new(),
                 ec_modules: Vec::new(),
                 device_modules: Vec::new(),
+                builder_modules: Vec::new(),
                 geo_module: None,
                 ec_module: None,
                 device_module: None,
@@ -3988,13 +4060,16 @@ mod tests {
         }
     }
 
+    /// The name the `geo-probe` registration's geo module is selected by.
+    const GEO_PROBE_MODULE: &str = "testing.geo-probe";
+
     /// Builds a `geo-probe` registration that declares a geo module.
     fn geo_probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("geo-probe")
-                .with_geo_module(Arc::new(FixedCountryGeo))
+                .with_geo_module(GEO_PROBE_MODULE, Arc::new(FixedCountryGeo))
                 .build(),
         ))
     }
@@ -4004,10 +4079,14 @@ mod tests {
     #[derive(Debug)]
     struct PermissionDemandingDevice;
 
+    /// The name the `device-probe` registration's device module is selected
+    /// by.
+    const DEVICE_PROBE_MODULE: &str = "testing.device-probe";
+
     #[async_trait::async_trait(?Send)]
     impl crate::ec::device::DeviceModule for PermissionDemandingDevice {
         fn id(&self) -> &'static str {
-            "device-probe"
+            DEVICE_PROBE_MODULE
         }
 
         async fn detect(
@@ -4036,7 +4115,7 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("device-probe")
-                .with_device_module(Arc::new(PermissionDemandingDevice))
+                .with_device_module(DEVICE_PROBE_MODULE, Arc::new(PermissionDemandingDevice))
                 .build(),
         ))
     }
@@ -4048,13 +4127,13 @@ mod tests {
             device_probe_registration,
             validate_nothing,
         )
-        .with_module_name("testing.device-probe")]
+        .with_module_name(DEVICE_PROBE_MODULE)]
     }
 
     #[test]
     fn a_modules_device_module_declaring_permissions_is_refused_at_startup() {
         let mut settings = settings_naming("device-probe");
-        settings.device.module = Some("device-probe".to_owned());
+        settings.device.module = Some(DEVICE_PROBE_MODULE.to_owned());
 
         let error = IntegrationRegistry::with_registrations(&settings, &device_probe_builders())
             .err()
@@ -4081,7 +4160,7 @@ mod tests {
             geo_probe_registration,
             validate_nothing,
         )
-        .with_module_name("testing.geo-probe")]
+        .with_module_name(GEO_PROBE_MODULE)]
     }
 
     /// Settings whose `[geo] module` names `module`, which may be a value
@@ -4092,20 +4171,18 @@ mod tests {
         settings
     }
 
-    /// The same, with the module run as well, which is what a deployment
-    /// selecting a module's geo module writes.
-    fn settings_selecting_geo_module(module_id: &str) -> Settings {
-        let mut settings = settings_with_geo_selector(module_id);
-        let section = module_id
-            .split_once('.')
-            .map_or("testing", |(folder, _)| folder);
-        settings.select_module(section, module_id);
+    /// The same, with the module selected in its section as well, which is
+    /// what a deployment running a module's geo module writes.
+    fn settings_selecting_geo_module(name: &str) -> Settings {
+        let mut settings = settings_with_geo_selector(name);
+        let section = name.split_once('.').map_or("testing", |(folder, _)| folder);
+        settings.select_module(section, name);
         settings
     }
 
     #[tokio::test]
     async fn geo_selector_resolves_the_geo_module_the_selected_module_declares() {
-        let settings = settings_selecting_geo_module("geo-probe");
+        let settings = settings_selecting_geo_module(GEO_PROBE_MODULE);
 
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
             .expect("should build registry with a module geo module");
@@ -4185,7 +4262,7 @@ mod tests {
 
     #[test]
     fn geo_selector_rejects_a_module_that_declares_no_geo_module() {
-        let settings = settings_selecting_geo_module("probe");
+        let settings = settings_selecting_geo_module("testing.probe");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "probe",
             "seam-probe",
@@ -4200,16 +4277,18 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("probe") && message.contains("geo module"),
-            "error should name the module and the capability: {message}"
+            message.contains("`[geo] module` names `testing.probe`")
+                && message.contains("It runs no geo module")
+                && message.contains("is selected and supplies no geo module"),
+            "error should name the module and say it supplies no geo module: {message}"
         );
     }
 
     #[test]
-    fn geo_selector_rejects_a_module_the_integration_list_does_not_name() {
-        // The module is registered, but no section selects
-        // it, so its geo module is not there to select.
-        let settings = settings_with_geo_selector("probe-unnamed");
+    fn geo_selector_rejects_a_module_no_section_selects() {
+        // The module is registered, but no section selects it, so its geo
+        // module is not there to select.
+        let settings = settings_with_geo_selector("testing.probe-unnamed");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "probe-unnamed",
             "seam-probe",
@@ -4220,14 +4299,13 @@ mod tests {
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
-            .expect("should reject a module the module list does not name");
+            .expect("should reject a module no section selects");
 
         let message = error.to_string();
         assert!(
-            message.contains("probe-unnamed")
-                && message.contains("no section selects")
-                && message.contains("geo module"),
-            "error should name the module, the list, and the capability: {message}"
+            message.contains("`[geo] module` names `testing.probe-unnamed`")
+                && message.contains("is a module no section selects"),
+            "error should name the module and say no section selects it: {message}"
         );
     }
 
@@ -4301,19 +4379,286 @@ mod tests {
     }
 
     #[test]
-    fn geo_selector_rejects_a_module_that_is_not_registered() {
-        // Nothing supplies the module, so naming it in the module list would
-        // be refused before the geo selector is resolved.
+    fn geo_selector_rejects_a_name_no_module_supplies() {
+        // Nothing supplies the name, as a geo module or as a module at all.
         let settings = settings_with_geo_selector("absent-module");
 
         let error = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
             .err()
-            .expect("should reject a selector naming nothing registered");
+            .expect("should reject a selector naming nothing this deployment runs");
 
         let message = error.to_string();
         assert!(
-            message.contains("absent-module") && message.contains("not registered"),
-            "error should name the module and say it is not registered: {message}"
+            message.contains("`[geo] module` names `absent-module`")
+                && message.contains("which no module this deployment runs supplies")
+                && !message.contains("no section selects"),
+            "error should name what was written and say nothing supplies it: {message}"
+        );
+    }
+
+    /// A device module that needs no permission, for a registration that
+    /// supplies more than one type of module.
+    #[derive(Debug)]
+    struct ExampleDevice;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::device::DeviceModule for ExampleDevice {
+        fn id(&self) -> &'static str {
+            "device.example"
+        }
+
+        async fn detect(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _services: &crate::platform::RuntimeServices,
+        ) -> crate::ec::device::DeviceSignals {
+            crate::ec::device::DeviceSignals {
+                is_mobile: 1,
+                ja4_class: None,
+                platform_class: Some("example".to_owned()),
+                h2_fp_hash: None,
+                known_browser: None,
+                looks_like_browser: true,
+            }
+        }
+    }
+
+    /// An Edge Cookie module that answers to `edgecookie.example`.
+    #[derive(Debug)]
+    struct ExampleEc;
+
+    #[async_trait::async_trait(?Send)]
+    impl EdgeCookieModule for ExampleEc {
+        fn id(&self) -> &'static str {
+            "edgecookie.example"
+        }
+
+        fn code(&self) -> crate::ec::module::ModuleCode {
+            crate::module_code!("t0rg")
+        }
+
+        async fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::module::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
+        ) -> Result<crate::ec::module::GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(crate::ec::module::GeneratedEdgeCookie::default())
+        }
+    }
+
+    /// Builds one registration that supplies a geo, a device and an Edge
+    /// Cookie module, each under the name of its own type.
+    fn example_vendor_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("example-vendor")
+                .with_geo_module("geo.example", Arc::new(FixedCountryGeo))
+                .with_device_module("device.example", Arc::new(ExampleDevice))
+                .with_ec_module("edgecookie.example", Arc::new(ExampleEc))
+                .build(),
+        ))
+    }
+
+    fn example_vendor_builders() -> [crate::integrations::IntegrationBuilder; 1] {
+        [crate::integrations::IntegrationBuilder::new(
+            "example-vendor",
+            "seam-probe",
+            example_vendor_registration,
+            validate_nothing,
+        )
+        .with_module_name("testing.example-vendor")]
+    }
+
+    /// One registration can supply a module of each type, and each selector
+    /// finds its own by the short name, the type folder left off.
+    #[test]
+    fn each_selector_resolves_its_own_type_of_module_from_one_registration() {
+        let mut settings = settings_naming("example-vendor");
+        settings.geo.module = Some("example".to_owned());
+        settings.device.module = Some("example".to_owned());
+        settings.ec.module = Some(EcModuleSelection::from("example"));
+
+        let registry =
+            IntegrationRegistry::with_registrations(&settings, &example_vendor_builders())
+                .expect("should build registry with one module of each type");
+
+        assert!(
+            registry.geo_module().is_some(),
+            "`[geo] module = \"example\"` should resolve `geo.example`"
+        );
+        assert_eq!(
+            registry
+                .device_module()
+                .expect("`[device] module = \"example\"` should resolve `device.example`")
+                .id(),
+            "device.example",
+            "should resolve the registration's device module"
+        );
+        assert_eq!(
+            registry
+                .ec_module()
+                .expect("`[ec] module = \"example\"` should resolve `edgecookie.example`")
+                .id(),
+            "edgecookie.example",
+            "should resolve the registration's Edge Cookie module"
+        );
+    }
+
+    /// A name written in full selects the same module, and a short name is
+    /// read within the selector's own type only.
+    #[test]
+    fn a_selector_reads_a_full_name_and_keeps_a_short_name_within_its_type() {
+        let mut settings = settings_naming("example-vendor");
+        settings.geo.module = Some("geo.example".to_owned());
+
+        let registry =
+            IntegrationRegistry::with_registrations(&settings, &example_vendor_builders())
+                .expect("should resolve a geo module written in full");
+        assert!(
+            registry.geo_module().is_some(),
+            "`[geo] module = \"geo.example\"` should resolve the module"
+        );
+
+        // `device.example` is a device module, so `[geo]` does not find it
+        // under the short name of another type.
+        let mut settings = settings_naming("example-vendor");
+        settings.geo.module = Some("device.example".to_owned());
+        let error = IntegrationRegistry::with_registrations(&settings, &example_vendor_builders())
+            .err()
+            .expect("should refuse a device module named as a geo module");
+        let message = error.to_string();
+        assert!(
+            message.contains("`[geo] module` names `device.example`")
+                && message.contains("The geo modules it runs are [example]"),
+            "error should list the geo modules by the name the section writes: {message}"
+        );
+    }
+
+    /// `[ec] module` may name a label whose block names the implementation,
+    /// and the registry resolves the implementation, as core does.
+    #[test]
+    fn ec_selector_resolves_the_implementation_a_labelled_block_names() {
+        let mut settings = settings_naming("example-vendor");
+        settings.ec.module = Some(EcModuleSelection::from("primary"));
+        settings.ec.module_blocks.insert(
+            "primary".to_owned(),
+            crate::settings::EcModuleBlock {
+                implementation: Some("example".to_owned()),
+                settings: crate::settings::EcModuleSettings::Injected(serde_json::Map::new()),
+            },
+        );
+
+        let registry =
+            IntegrationRegistry::with_registrations(&settings, &example_vendor_builders())
+                .expect("should build registry with a labelled Edge Cookie selection");
+
+        assert_eq!(
+            registry
+                .ec_module()
+                .expect("should resolve the implementation the block names")
+                .id(),
+            "edgecookie.example",
+            "should resolve the registration's Edge Cookie module"
+        );
+    }
+
+    /// Core's own Edge Cookie modules are not the registry's to supply, so a
+    /// selection naming one resolves nothing here and is not an error.
+    #[test]
+    fn ec_selector_naming_a_module_of_cores_resolves_nothing_here() {
+        let settings = settings_naming("example-vendor");
+        assert!(
+            settings
+                .ec
+                .module
+                .as_ref()
+                .is_some_and(|selection| selection.key() == crate::ec::module::HMAC_MODULE_KEY),
+            "the shared test settings should select core's HMAC module"
+        );
+
+        let registry =
+            IntegrationRegistry::with_registrations(&settings, &example_vendor_builders())
+                .expect("should build registry with core's own Edge Cookie module selected");
+
+        assert!(
+            registry.ec_module().is_none(),
+            "core resolves its own module, so the registry should supply none"
+        );
+    }
+
+    fn misnamed_ec_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("misnamed")
+                .with_ec_module("edgecookie.another", Arc::new(ExampleEc))
+                .build(),
+        ))
+    }
+
+    /// Core checks the selected Edge Cookie module by its own id, so one
+    /// declared under another name is refused where the mistake is made.
+    #[test]
+    fn an_edge_cookie_module_declared_under_another_name_is_refused() {
+        let settings = settings_naming("misnamed");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "misnamed",
+            "seam-probe",
+            misnamed_ec_registration,
+            validate_nothing,
+        )
+        .with_module_name("testing.misnamed")];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse an Edge Cookie module declared under another name");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("`edgecookie.another`") && message.contains("`edgecookie.example`"),
+            "error should give both names: {message}"
+        );
+    }
+
+    fn second_geo_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("geo-second")
+                .with_geo_module(GEO_PROBE_MODULE, Arc::new(FixedCountryGeo))
+                .build(),
+        ))
+    }
+
+    /// Two registrations supplying a module of one type under one name would
+    /// leave a selector meaning either, so the pair is refused.
+    #[test]
+    fn two_registrations_declaring_one_geo_module_name_are_refused() {
+        let mut settings = settings_naming("geo-probe");
+        settings.select_module("testing", "testing.geo-second");
+        let extra = [
+            geo_probe_builders()[0],
+            crate::integrations::IntegrationBuilder::new(
+                "geo-second",
+                "seam-probe",
+                second_geo_registration,
+                validate_nothing,
+            )
+            .with_module_name("testing.geo-second"),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse one geo module name declared twice");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("the geo module `testing.geo-probe` is declared twice")
+                && message.contains("`geo-probe`")
+                && message.contains("`geo-second`"),
+            "error should name the module and both integrations: {message}"
         );
     }
 }
