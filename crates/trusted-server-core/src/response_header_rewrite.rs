@@ -95,7 +95,11 @@ impl OriginHeaderRewrite<'_> {
     fn rewrite_navigation_url(&self, url: &str) -> Option<String> {
         let rewritten = self.rewrite_url(url)?;
         if self.is_scheme_change_to_current_request(url) {
-            log::debug!("Keeping origin scheme-change redirect to the current request URL");
+            log::warn!(
+                "Keeping origin scheme-change redirect to the current request URL; the \
+                 browser leaves the serving host. Check that `publisher.origin_url` uses \
+                 the scheme the origin enforces"
+            );
             return None;
         }
         Some(rewritten)
