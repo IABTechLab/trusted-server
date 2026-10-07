@@ -44,10 +44,17 @@ fi
 
 # Maintainers push to the proposal branch, and applying a review suggestion
 # commits there too. Never overwrite or delete commits beyond the generated
-# proposal, whose only parent is the merge commit.
+# proposal, whose only parent is the merge commit. Only a verified absent
+# branch counts as empty; any other lookup or fetch failure stops the run.
 remote_head=""
-if git fetch --quiet origin "refs/heads/$branch" 2>/dev/null; then
+ls_status=0
+git ls-remote --exit-code --quiet origin "refs/heads/$branch" > /dev/null || ls_status=$?
+if [ "$ls_status" -eq 0 ]; then
+  git fetch --quiet origin "refs/heads/$branch"
   remote_head="$(git rev-parse FETCH_HEAD)"
+elif [ "$ls_status" -ne 2 ]; then
+  printf '::error::Could not inspect proposal branch %s.\n' "$branch" >&2
+  exit 1
 fi
 if [ -n "$remote_head" ] && [ "$(git rev-parse "$remote_head^")" != "$sha" ]; then
   printf '::warning::Proposal branch %s has commits beyond the generated proposal; not overwriting it.\n' "$branch"
@@ -57,7 +64,12 @@ fi
 if [ ! -s "$work_dir/proposal.patch" ]; then
   printf 'No documentation changes proposed for %s.\n' "$sha"
   if [ -n "$existing" ]; then
-    gh pr close "$pr_number" --delete-branch \
+    # The lease refuses the deletion if a maintainer pushed after the
+    # inspection above; the pull request is closed only once it succeeds.
+    if [ -n "$remote_head" ]; then
+      git push --quiet --force-with-lease="refs/heads/$branch:$remote_head" origin --delete "$branch"
+    fi
+    gh pr close "$pr_number" \
       --comment "A rerun for $sha proposed no documentation changes."
   fi
   exit 0

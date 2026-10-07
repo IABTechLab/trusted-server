@@ -93,7 +93,20 @@ cat > "$tmp/bin/copilot" <<'STUB'
 #!/usr/bin/env bash
 printf 'copilot %s\n' "$*" >> "$STUB_LOG"
 STUB
-chmod +x "$tmp/bin/gh" "$tmp/bin/npm" "$tmp/bin/copilot"
+# Wraps git so a test can fail the proposal branch fetch, or land a
+# maintainer push right after publish.sh inspects the branch head.
+real_git="$(command -v git)"
+cat > "$tmp/bin/git" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = fetch ] && [ -n "\${STUB_FAIL_FETCH:-}" ]; then
+  exit 128
+fi
+"$real_git" "\$@" || exit
+if [ "\$1" = fetch ] && [ -n "\${STUB_RACE_PUSH:-}" ]; then
+  STUB_RACE_PUSH="" "\$STUB_RACE_PUSH" >&2
+fi
+STUB
+chmod +x "$tmp/bin/gh" "$tmp/bin/npm" "$tmp/bin/copilot" "$tmp/bin/git"
 export PATH="$tmp/bin:$PATH" STUB_LOG="$tmp/gh.log" STUB_REVIEW="$tmp/review.json"
 
 git init -q --bare "$tmp/origin.git"
@@ -214,6 +227,26 @@ assert_eq "$(remote_head)" "$pushed_head" "should not push again when resuming"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" '"path": "docs/index.md"' "should review the new hunk"
 assert_contains "$(cat "$STUB_REVIEW" 2>/dev/null)" "\"commit_id\": \"$pushed_head\"" "should review the pushed commit"
 
+# A maintainer push that lands between the head inspection and the deletion
+# must survive an empty rerun.
+git clone -q "$tmp/origin.git" "$tmp/racer" 2>/dev/null
+cat > "$tmp/race-push.sh" <<RACE
+#!/usr/bin/env bash
+set -e
+cd "$tmp/racer"
+git fetch -q origin "refs/heads/$branch"
+git switch -q --detach FETCH_HEAD
+printf 'racing edit\\n' >> docs/guide/cli.md
+git commit -q -am "Push a maintainer edit during the rerun"
+git push -q origin "HEAD:refs/heads/$branch"
+RACE
+chmod +x "$tmp/race-push.sh"
+make_patch ""
+assert_eq "$(STUB_PR="7 OPEN $base_sha" STUB_RACE_PUSH="$tmp/race-push.sh" run_publish)" 1 "should fail an empty rerun that races a maintainer push"
+assert_eq "$(remote_has_branch)" yes "should keep a branch pushed to during an empty rerun"
+assert_eq "$(git -C "$tmp/racer" rev-parse HEAD)" "$(remote_head)" "should keep the racing maintainer commit"
+assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close a proposal whose branch moved"
+
 git fetch -q origin "refs/heads/$branch"
 git switch -q --detach FETCH_HEAD
 printf 'maintainer edit\n' >> docs/guide/cli.md
@@ -232,8 +265,24 @@ assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should succeed on an em
 assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close or delete a maintained proposal"
 assert_eq "$(remote_head)" "$maintainer_head" "should keep the maintained proposal branch"
 
+make_patch ""
+assert_eq "$(STUB_PR="7 OPEN $base_sha" STUB_FAIL_FETCH=1 run_publish)" 1 "should fail an empty rerun when the branch fetch fails"
+assert_eq "$(grep -c 'pr close' "$STUB_LOG" || true)" 0 "should not close a proposal whose branch could not be fetched"
+assert_eq "$(remote_head)" "$maintainer_head" "should keep a branch that could not be fetched"
+
+make_patch docs/guide/cli.md
+assert_eq "$(STUB_PR="7 OPEN $base_sha" STUB_FAIL_FETCH=1 run_publish)" 1 "should fail a rerun when the branch fetch fails"
+assert_eq "$(remote_head)" "$maintainer_head" "should not push over a branch that could not be fetched"
+
 assert_eq "$(STUB_PR="7 CLOSED" run_publish)" 0 "should succeed for a closed proposal"
 assert_eq "$(grep -c 'pr edit\|pr create' "$STUB_LOG" || true)" 0 "should never reopen or recreate a closed proposal"
+
+git push -q --force origin "$pushed_head:refs/heads/$branch"
+make_patch ""
+assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should succeed when an empty rerun deletes the proposal"
+assert_eq "$(remote_has_branch)" no "should delete an unmaintained proposal branch"
+assert_contains "$(cat "$STUB_LOG")" "pr close 7 --comment" "should close the proposal after deleting its branch"
+assert_eq "$(grep -c 'delete-branch' "$STUB_LOG" || true)" 0 "should not let gh delete the branch"
 
 # A push that added two commits is inspected from the previous main head; a
 # retry without that base falls back to the first parent, which publish.sh

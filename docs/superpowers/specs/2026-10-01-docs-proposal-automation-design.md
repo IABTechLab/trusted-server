@@ -114,12 +114,18 @@ and nothing installs, builds, or executes proposal content.
    retry inspected another range, such as a manual dispatch without the base
    of a multi-commit push, and must not narrow or close the proposal. The
    error names the recorded base to rerun with.
-3. If the remote branch's head is not the generated proposal commit (its
+3. Look up the remote branch with `git ls-remote --exit-code`. Only a
+   verified absent branch counts as new; any other lookup or fetch failure
+   fails the run, so an error never hides maintainer commits. If the remote
+   branch's head is not the generated proposal commit (its
    parent is not the merge commit), a maintainer has committed there, for
    example by applying a review suggestion. Warn and exit successfully
    without pushing, closing, or deleting anything.
-4. Empty diff: close any open pull request for that branch with a comment,
-   then exit successfully. Otherwise apply `proposal.patch` to a fresh
+4. Empty diff: if a pull request is open, delete its branch with
+   `git push --force-with-lease=refs/heads/<branch>:<inspected head> --delete`,
+   so a maintainer push after the inspection makes the deletion fail, and
+   close the pull request with a comment only after the deletion succeeds.
+   Then exit successfully. Otherwise apply `proposal.patch` to a fresh
    checkout of the merge commit.
 5. Reject the proposal again if any changed path is outside `docs/guide/**` or
    `docs/index.md`.
@@ -199,7 +205,9 @@ Documented in `scripts/README.md`:
   allowed proposals, the empty diff, closing a stale proposal, a disallowed
   path, first publish without a build, an unchanged retry, an updated proposal
   whose review fails and is resumed without a second push, a retry or empty
-  rerun that leaves maintainer commits in place, retries over a different or
+  rerun that leaves maintainer commits in place, an empty rerun that races a
+  maintainer push, a failed branch fetch on both the empty and push paths,
+  deleting an unmaintained branch before closing its proposal, retries over a different or
   unrecorded range, a closed proposal, PR body rendering, and how
   `propose.sh` resolves the base of a multi-commit push.
 - `shellcheck` passes for every script.
