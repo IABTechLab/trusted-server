@@ -3,10 +3,11 @@
 //! Goals:
 //! - Normalize external asset fetches in ad creatives (HTML/CSS) to a single
 //!   first-party proxy endpoint so the publisher can control egress.
+//! - Route click-through links through a signed first-party click redirect.
 //! - Leave relative URLs and non-network schemes untouched.
 //!
 //! Key behaviors:
-//! - Absolute and protocol-relative URLs (http/https or `//`) are proxied to
+//! - Absolute and protocol-relative asset URLs (http/https or `//`) are proxied to
 //!   `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
 //!   - `<img src>`, `data-src`, `[srcset]`, `[imagesrcset]`
 //!   - `<script src>`
@@ -17,9 +18,30 @@
 //!   - `<iframe src>`
 //!   - `<link rel~="stylesheet|preload|prefetch" href>` and `imagesrcset`
 //!   - Inline styles (`[style]`) and `<style>` blocks: url(...) values are rewritten
+//! - Click-through links (`<a href>`, `<area href>`) are wrapped in
+//!   `/first-party/click?tsurl=<base-url>&<original-query-params>&tstoken=<sig>`,
+//!   and the same URL is copied into `data-tsclick` for the creative runtime's
+//!   click guard.
+//! - Hosts matching `[rewrite] exclude_domains` are left untouched, for assets
+//!   and links alike.
+//! - Bidder-supplied `<base>` elements are removed so root-relative first-party
+//!   URLs cannot be rebased.
 //! - Relative URLs (e.g., `/path`, `../path`, `local/file`) remain unchanged.
 //! - Non-network schemes are ignored: `data:`, `javascript:`, `mailto:`, `tel:`,
 //!   `blob:`, `about:`.
+//!
+//! Switches:
+//! - Auction creatives (`POST /auction` and inline SSAT/page-bids) rewrite asset
+//!   URLs when [`AuctionConfig::rewrite_creatives`] is on and wrap links when
+//!   [`AuctionConfig::rewrites_auction_clicks`] is on; an unset
+//!   [`AuctionConfig::rewrite_clicks`] follows `rewrite_creatives`. `<base>`
+//!   removal and TSJS injection run when either is on. With both off the
+//!   rewrite pass is skipped.
+//! - HTML fetched through `/first-party/proxy` always rewrites asset URLs and
+//!   wraps links unless `rewrite_clicks` is explicitly `false`
+//!   ([`AuctionConfig::rewrites_proxied_clicks`]).
+//! - The public [`rewrite_creative_html`] and [`rewrite_inline_creative_html`]
+//!   wrappers rewrite assets and links unconditionally.
 //!
 //! Notable helpers:
 //! - `normalize_creative_url(&str) -> Option<Url>`: Normalizes an absolute or
@@ -37,6 +59,11 @@
 //!
 //! See the tests in this module for comprehensive cases, including irregular
 //! spacing, no-space commas, and `data:` handling.
+//!
+//! [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
+//! [`AuctionConfig::rewrite_clicks`]: crate::auction_config_types::AuctionConfig::rewrite_clicks
+//! [`AuctionConfig::rewrites_auction_clicks`]: crate::auction_config_types::AuctionConfig::rewrites_auction_clicks
+//! [`AuctionConfig::rewrites_proxied_clicks`]: crate::auction_config_types::AuctionConfig::rewrites_proxied_clicks
 
 use crate::http_util::compute_encrypted_sha256_token;
 use crate::settings::Settings;
@@ -993,39 +1020,47 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 /// first-party endpoints.
 ///
 /// Sanitization is controlled by
-/// [`crate::auction_config_types::AuctionConfig::sanitize_creatives`] and
+/// [`crate::auction_config_types::AuctionConfig::sanitize_creatives`], asset
 /// rewriting by
-/// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`]. With both
-/// disabled the creative is returned exactly as the bidder sent it. In every
-/// mode, input over the 1 MiB per-creative cap is rejected (empty string).
+/// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`], and click
+/// wrapping by
+/// [`crate::auction_config_types::AuctionConfig::rewrites_auction_clicks`]. With
+/// all three disabled the creative is returned exactly as the bidder sent it. In
+/// every mode, input over the 1 MiB per-creative cap is rejected (empty string).
 #[must_use]
 pub(crate) fn process_auction_creative(settings: &Settings, raw: &str) -> String {
-    process_auction_creative_with_rewriter(settings, raw, |sanitized| {
-        rewrite_creative_html(settings, sanitized)
+    process_auction_creative_with_rewriter(settings, raw, |sanitized, features| {
+        rewrite_creative_html_impl(settings, sanitized, "", true, MAX_CREATIVE_SIZE, features)
     })
 }
 
 /// Process an inline auction creative rendered from a foreign-origin document.
 ///
-/// Applies the same opt-in sanitization as [`process_auction_creative`]. When
-/// auction creative rewriting is enabled, proxy and click URLs are emitted as
-/// absolute URLs against `base_origin` without injecting the creative TSJS
-/// bundle.
+/// Applies the same opt-in sanitization and the same asset and click switches as
+/// [`process_auction_creative`]. Proxy and click URLs are emitted as absolute
+/// URLs against `base_origin` without injecting the creative TSJS bundle.
 #[must_use]
 pub(crate) fn process_inline_auction_creative(
     settings: &Settings,
     base_origin: &str,
     raw: &str,
 ) -> String {
-    process_auction_creative_with_rewriter(settings, raw, |sanitized| {
-        rewrite_inline_creative_html(settings, base_origin, sanitized)
+    process_auction_creative_with_rewriter(settings, raw, |sanitized, features| {
+        rewrite_creative_html_impl(
+            settings,
+            sanitized,
+            base_origin,
+            false,
+            MAX_CREATIVE_SIZE,
+            features,
+        )
     })
 }
 
 fn process_auction_creative_with_rewriter(
     settings: &Settings,
     raw: &str,
-    rewrite: impl FnOnce(&str) -> String,
+    rewrite: impl FnOnce(&str, CreativeFeatures) -> String,
 ) -> String {
     // The per-creative size cap is a delivery invariant, not a sanitizer
     // implementation detail: it must hold in every processing mode, including
@@ -1045,8 +1080,12 @@ fn process_auction_creative_with_rewriter(
     } else {
         raw.to_owned()
     };
-    if settings.auction.rewrite_creatives {
-        rewrite(&sanitized)
+    let features = CreativeFeatures {
+        assets: settings.auction.rewrite_creatives,
+        clicks: settings.auction.rewrites_auction_clicks(),
+    };
+    if features.any() {
+        rewrite(&sanitized, features)
     } else {
         sanitized
     }
@@ -1057,8 +1096,12 @@ fn process_auction_creative_with_rewriter(
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
-///   (served from `/static/tsjs=tsjs-creative.min.js`).
+/// - `<a href>` / `<area href>` → `/first-party/click?tsurl=…`, copied into `data-tsclick`
+/// - Injects the unified TSJS bundle (`/static/tsjs=tsjs-unified.min.js`), whose creative
+///   runtime installs the click guard, once at the top of `<body>`.
+///
+/// Rewrites assets and clicks unconditionally; the auction settings are applied by
+/// the auction processing entry points, not here.
 ///
 /// The proxy/click URLs are emitted **root-relative** (`/first-party/…`), which
 /// resolves only when the creative's document base URL is the first-party origin.
@@ -1066,7 +1109,14 @@ fn process_auction_creative_with_rewriter(
 /// Universal Creative's `srcdoc` under GAM), use [`rewrite_inline_creative_html`].
 #[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
-    rewrite_creative_html_impl(settings, markup, "", true, MAX_CREATIVE_SIZE)
+    rewrite_creative_html_impl(
+        settings,
+        markup,
+        "",
+        true,
+        MAX_CREATIVE_SIZE,
+        CreativeFeatures::ALL,
+    )
 }
 
 /// Rewrite an HTML document proxied through `/first-party/proxy`.
@@ -1077,7 +1127,14 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// 1 MiB. The creative runtime is still injected so click mediation survives.
 #[must_use]
 pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
-    rewrite_creative_html_impl(settings, markup, "", true, MAX_REWRITABLE_BODY_SIZE)
+    rewrite_creative_html_impl(
+        settings,
+        markup,
+        "",
+        true,
+        MAX_REWRITABLE_BODY_SIZE,
+        CreativeFeatures::ALL,
+    )
 }
 
 /// Rewrite an inline ad creative for rendering in a **foreign-origin** context —
@@ -1095,16 +1152,23 @@ pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
 ///   `http://localhost:7676`); the caller derives it from the request rather than
 ///   the configured publisher domain, which cannot carry a port and may differ
 ///   from the subdomain serving the request.
-/// - The `tsjs` bundle is **not** injected into `<body>`: its only job is to
-///   safeguard click URLs, which are already absolute here, and shipping the full
-///   core-plus-integrations bundle into every creative iframe is pure weight.
+/// - The `tsjs` bundle is **not** injected into `<body>`: its click guard is
+///   unnecessary for click URLs that are already absolute here, and shipping the
+///   full core-plus-integrations bundle into every creative iframe is pure weight.
 #[must_use]
 pub fn rewrite_inline_creative_html(
     settings: &Settings,
     base_origin: &str,
     markup: &str,
 ) -> String {
-    rewrite_creative_html_impl(settings, markup, base_origin, false, MAX_CREATIVE_SIZE)
+    rewrite_creative_html_impl(
+        settings,
+        markup,
+        base_origin,
+        false,
+        MAX_CREATIVE_SIZE,
+        CreativeFeatures::ALL,
+    )
 }
 
 /// The clear-price auction macro DSPs embed in creative markup and tracking URLs.
@@ -1133,10 +1197,34 @@ pub fn expand_auction_price_macro(markup: &str, cpm: f64) -> String {
     markup.replace(AUCTION_PRICE_MACRO, &cpm.to_string())
 }
 
+/// Which rewrite features one creative pass applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CreativeFeatures {
+    /// Proxy eligible asset URLs through `/first-party/proxy`.
+    assets: bool,
+    /// Wrap eligible click-through links in `/first-party/click`.
+    clicks: bool,
+}
+
+impl CreativeFeatures {
+    /// Both features on: the behavior of the public rewrite wrappers.
+    const ALL: Self = Self {
+        assets: true,
+        clicks: true,
+    };
+
+    /// Whether the pass needs to run at all.
+    fn any(self) -> bool {
+        self.assets || self.clicks
+    }
+}
+
 /// Shared creative rewriter. `base_origin` is prefixed onto first-party proxy and
 /// click paths (empty for root-relative, `https://<domain>` for absolute);
 /// `inject_tsjs` controls the `<body>` tsjs bundle injection; `max_output_size`
-/// bounds the rewritten result. See the public wrappers,
+/// bounds the rewritten result; `features` selects which handlers run. `<base>`
+/// removal and TSJS injection always run, since callers only invoke the pass
+/// when at least one feature is on. See the public wrappers,
 /// [`rewrite_creative_html`], [`rewrite_inline_creative_html`], and
 /// [`rewrite_proxied_html`], for the supported render contexts.
 fn rewrite_creative_html_impl(
@@ -1145,6 +1233,7 @@ fn rewrite_creative_html_impl(
     base_origin: &str,
     inject_tsjs: bool,
     max_output_size: usize,
+    features: CreativeFeatures,
 ) -> String {
     // Nothing to rewrite, and nothing to attach a runtime to: an empty input is
     // an upstream rejection (the sanitizer fails closed this way) or an empty
@@ -1168,193 +1257,195 @@ fn rewrite_creative_html_impl(
     // elements. The bound is the caller's, not a single global: auction `adm`
     // and proxied HTML documents have very different legitimate sizes.
     let overflowed = std::cell::Cell::new(false);
-    let mut rewriter = HtmlRewriter::new(
-        HtmlSettings {
-            element_content_handlers: vec![
-                // Remove <base> unconditionally: a bidder-supplied base URL
-                // rebases the root-relative `/first-party/…` and `/static/tsjs=…`
-                // URLs this pass emits onto an attacker-chosen origin, hijacking
-                // proxy/click mediation and leaking signed URL data. The
-                // sanitizer also strips <base>, but rewriting must not depend on
-                // sanitization, which is independently optional.
-                element!("base", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                // Inject unified tsjs bundle at the top of body once
-                element!("body", {
-                    let injected = std::rc::Rc::clone(&injected_ts_creative);
-                    move |el| {
-                        if inject_tsjs && !injected.get() {
-                            let script_tag = tsjs::tsjs_unified_script_tag();
-                            el.prepend(&script_tag, ContentType::Html);
-                            injected.set(true);
-                        }
-                        Ok(())
-                    }
-                }),
-                // Image src + data-src
-                element!("img", |el| {
-                    if let Some(src) = el.get_attribute("src")
-                        && let Some(p) = proxy_if_abs(settings, &src, base_origin)
-                    {
-                        let _ = el.set_attribute("src", &p);
-                    }
-                    if let Some(dsrc) = el.get_attribute("data-src")
-                        && let Some(p) = proxy_if_abs(settings, &dsrc, base_origin)
-                    {
-                        let _ = el.set_attribute("data-src", &p);
-                    }
-                    Ok(())
-                }),
-                // External scripts
-                element!("script[src]", |el| {
+    let mut element_content_handlers = vec![
+        // Remove <base> unconditionally: a bidder-supplied base URL
+        // rebases the root-relative `/first-party/…` and `/static/tsjs=…`
+        // URLs this pass emits onto an attacker-chosen origin, hijacking
+        // proxy/click mediation and leaking signed URL data. The
+        // sanitizer also strips <base>, but rewriting must not depend on
+        // sanitization, which is independently optional.
+        element!("base", |el| {
+            el.remove();
+            Ok(())
+        }),
+        // Inject unified tsjs bundle at the top of body once
+        element!("body", {
+            let injected = std::rc::Rc::clone(&injected_ts_creative);
+            move |el| {
+                if inject_tsjs && !injected.get() {
+                    let script_tag = tsjs::tsjs_unified_script_tag();
+                    el.prepend(&script_tag, ContentType::Html);
+                    injected.set(true);
+                }
+                Ok(())
+            }
+        }),
+    ];
+    if features.assets {
+        element_content_handlers.extend([
+            // Image src + data-src
+            element!("img", |el| {
+                if let Some(src) = el.get_attribute("src")
+                    && let Some(p) = proxy_if_abs(settings, &src, base_origin)
+                {
+                    let _ = el.set_attribute("src", &p);
+                }
+                if let Some(dsrc) = el.get_attribute("data-src")
+                    && let Some(p) = proxy_if_abs(settings, &dsrc, base_origin)
+                {
+                    let _ = el.set_attribute("data-src", &p);
+                }
+                Ok(())
+            }),
+            // External scripts
+            element!("script[src]", |el| {
+                if let Some(p) = proxied_attr_value(settings, el.get_attribute("src"), base_origin)
+                {
+                    let _ = el.set_attribute("src", &p);
+                }
+                Ok(())
+            }),
+            // Stylesheets and preloads
+            element!("link[href]", |el| {
+                let rel = el
+                    .get_attribute("rel")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if rel.contains("stylesheet") || rel.contains("preload") || rel.contains("prefetch")
+                {
                     if let Some(p) =
-                        proxied_attr_value(settings, el.get_attribute("src"), base_origin)
+                        proxied_attr_value(settings, el.get_attribute("href"), base_origin)
                     {
-                        let _ = el.set_attribute("src", &p);
+                        let _ = el.set_attribute("href", &p);
                     }
-                    Ok(())
-                }),
-                // Stylesheets and preloads
-                element!("link[href]", |el| {
-                    let rel = el
-                        .get_attribute("rel")
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    if rel.contains("stylesheet")
-                        || rel.contains("preload")
-                        || rel.contains("prefetch")
-                    {
-                        if let Some(p) =
-                            proxied_attr_value(settings, el.get_attribute("href"), base_origin)
-                        {
-                            let _ = el.set_attribute("href", &p);
-                        }
-                        if let Some(srcset) = el.get_attribute("imagesrcset") {
-                            let rewritten = rewrite_srcset(settings, &srcset, base_origin);
-                            if rewritten != srcset {
-                                let _ = el.set_attribute("imagesrcset", &rewritten);
-                            }
-                        }
-                    }
-                    Ok(())
-                }),
-                // Media sources
-                element!("video[src], audio[src], source[src]", |el| {
-                    if let Some(p) =
-                        proxied_attr_value(settings, el.get_attribute("src"), base_origin)
-                    {
-                        let _ = el.set_attribute("src", &p);
-                    }
-                    Ok(())
-                }),
-                // Object/embed
-                element!("object[data]", |el| {
-                    if let Some(p) =
-                        proxied_attr_value(settings, el.get_attribute("data"), base_origin)
-                    {
-                        let _ = el.set_attribute("data", &p);
-                    }
-                    Ok(())
-                }),
-                element!("embed[src]", |el| {
-                    if let Some(p) =
-                        proxied_attr_value(settings, el.get_attribute("src"), base_origin)
-                    {
-                        let _ = el.set_attribute("src", &p);
-                    }
-                    Ok(())
-                }),
-                // Input type=image
-                element!("input[src]", |el| {
-                    if let Some(t) = el.get_attribute("type") {
-                        if !t.eq_ignore_ascii_case("image") {
-                            return Ok(());
-                        }
-                    } else {
-                        return Ok(());
-                    }
-                    if let Some(p) =
-                        proxied_attr_value(settings, el.get_attribute("src"), base_origin)
-                    {
-                        let _ = el.set_attribute("src", &p);
-                    }
-                    Ok(())
-                }),
-                // SVG hrefs
-                element!(
-                    "image[href], image[xlink\\:href], use[href], use[xlink\\:href]",
-                    |el| {
-                        for attr in ["href", "xlink:href"] {
-                            if let Some(p) =
-                                proxied_attr_value(settings, el.get_attribute(attr), base_origin)
-                            {
-                                let _ = el.set_attribute(attr, &p);
-                            }
-                        }
-                        Ok(())
-                    }
-                ),
-                // Click-through links
-                element!("a[href], area[href]", |el| {
-                    if let Some(href) = el.get_attribute("href")
-                        && let Some(target) = click_target(settings, &href)
-                    {
-                        let click = build_click_url(settings, target.as_str(), base_origin);
-                        let _ = el.set_attribute("href", &click);
-                        let _ = el.set_attribute("data-tsclick", &click);
-                    }
-                    Ok(())
-                }),
-                // Inline style url(...)
-                element!("[style]", |el| {
-                    if let Some(st) = el.get_attribute("style") {
-                        let rewritten = rewrite_style_attribute_urls(settings, &st, base_origin);
-                        if rewritten != st {
-                            let _ = el.set_attribute("style", &rewritten);
-                        }
-                    }
-                    Ok(())
-                }),
-                // <style> blocks
-                text!("style", |t| {
-                    let s = t.as_str();
-                    let rewritten = rewrite_style_urls(settings, s, base_origin);
-                    if rewritten != s {
-                        t.replace(&rewritten, ContentType::Html);
-                    }
-                    Ok(())
-                }),
-                // iframes
-                element!("iframe", |el| {
-                    if let Some(src) = el.get_attribute("src")
-                        && let Some(p) = proxy_if_abs(settings, src.as_str(), base_origin)
-                    {
-                        let _ = el.set_attribute("src", &p);
-                    }
-                    Ok(())
-                }),
-                // srcset + imagesrcset
-                element!("[srcset]", |el| {
-                    if let Some(srcset) = el.get_attribute("srcset") {
-                        let rewritten = rewrite_srcset(settings, &srcset, base_origin);
-                        if rewritten != srcset {
-                            let _ = el.set_attribute("srcset", &rewritten);
-                        }
-                    }
-                    Ok(())
-                }),
-                element!("[imagesrcset]", |el| {
                     if let Some(srcset) = el.get_attribute("imagesrcset") {
                         let rewritten = rewrite_srcset(settings, &srcset, base_origin);
                         if rewritten != srcset {
                             let _ = el.set_attribute("imagesrcset", &rewritten);
                         }
                     }
+                }
+                Ok(())
+            }),
+            // Media sources
+            element!("video[src], audio[src], source[src]", |el| {
+                if let Some(p) = proxied_attr_value(settings, el.get_attribute("src"), base_origin)
+                {
+                    let _ = el.set_attribute("src", &p);
+                }
+                Ok(())
+            }),
+            // Object/embed
+            element!("object[data]", |el| {
+                if let Some(p) = proxied_attr_value(settings, el.get_attribute("data"), base_origin)
+                {
+                    let _ = el.set_attribute("data", &p);
+                }
+                Ok(())
+            }),
+            element!("embed[src]", |el| {
+                if let Some(p) = proxied_attr_value(settings, el.get_attribute("src"), base_origin)
+                {
+                    let _ = el.set_attribute("src", &p);
+                }
+                Ok(())
+            }),
+            // Input type=image
+            element!("input[src]", |el| {
+                if let Some(t) = el.get_attribute("type") {
+                    if !t.eq_ignore_ascii_case("image") {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
+                }
+                if let Some(p) = proxied_attr_value(settings, el.get_attribute("src"), base_origin)
+                {
+                    let _ = el.set_attribute("src", &p);
+                }
+                Ok(())
+            }),
+            // SVG hrefs
+            element!(
+                "image[href], image[xlink\\:href], use[href], use[xlink\\:href]",
+                |el| {
+                    for attr in ["href", "xlink:href"] {
+                        if let Some(p) =
+                            proxied_attr_value(settings, el.get_attribute(attr), base_origin)
+                        {
+                            let _ = el.set_attribute(attr, &p);
+                        }
+                    }
                     Ok(())
-                }),
-            ],
+                }
+            ),
+            // Inline style url(...)
+            element!("[style]", |el| {
+                if let Some(st) = el.get_attribute("style") {
+                    let rewritten = rewrite_style_attribute_urls(settings, &st, base_origin);
+                    if rewritten != st {
+                        let _ = el.set_attribute("style", &rewritten);
+                    }
+                }
+                Ok(())
+            }),
+            // <style> blocks
+            text!("style", |t| {
+                let s = t.as_str();
+                let rewritten = rewrite_style_urls(settings, s, base_origin);
+                if rewritten != s {
+                    t.replace(&rewritten, ContentType::Html);
+                }
+                Ok(())
+            }),
+            // iframes
+            element!("iframe", |el| {
+                if let Some(src) = el.get_attribute("src")
+                    && let Some(p) = proxy_if_abs(settings, src.as_str(), base_origin)
+                {
+                    let _ = el.set_attribute("src", &p);
+                }
+                Ok(())
+            }),
+            // srcset + imagesrcset
+            element!("[srcset]", |el| {
+                if let Some(srcset) = el.get_attribute("srcset") {
+                    let rewritten = rewrite_srcset(settings, &srcset, base_origin);
+                    if rewritten != srcset {
+                        let _ = el.set_attribute("srcset", &rewritten);
+                    }
+                }
+                Ok(())
+            }),
+            element!("[imagesrcset]", |el| {
+                if let Some(srcset) = el.get_attribute("imagesrcset") {
+                    let rewritten = rewrite_srcset(settings, &srcset, base_origin);
+                    if rewritten != srcset {
+                        let _ = el.set_attribute("imagesrcset", &rewritten);
+                    }
+                }
+                Ok(())
+            }),
+        ]);
+    }
+    if features.clicks {
+        element_content_handlers.push(
+            // Click-through links
+            element!("a[href], area[href]", |el| {
+                if let Some(href) = el.get_attribute("href")
+                    && let Some(target) = click_target(settings, &href)
+                {
+                    let click = build_click_url(settings, target.as_str(), base_origin);
+                    let _ = el.set_attribute("href", &click);
+                    let _ = el.set_attribute("data-tsclick", &click);
+                }
+                Ok(())
+            }),
+        );
+    }
+    let mut rewriter = HtmlRewriter::new(
+        HtmlSettings {
+            element_content_handlers,
             ..HtmlSettings::default()
         },
         |c: &[u8]| {
@@ -1516,6 +1607,36 @@ mod tests {
         process_auction_creative, proxy_if_abs, rewrite_creative_html,
         rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html,
     };
+
+    use crate::settings::Settings;
+
+    const MATRIX_FIXTURE_WITH_BODY: &str = r#"<html><head><base href="https://base.example.com/"><style>.b{background:url(https://cdn.example.com/bg.png)}</style></head><body><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x"><div style="background:url(https://cdn.example.com/inline.png)"></div><a href="https://landing.example.com/page">Ad</a><map><area href="https://landing.example.com/area"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+    const MATRIX_FIXTURE_FRAGMENT: &str = r#"<base href="https://base.example.com/"><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x"><div style="background:url(https://cdn.example.com/inline.png)"></div><a href="https://landing.example.com/page">Ad</a><map><area href="https://landing.example.com/area"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a>"#;
+    const INLINE_ORIGIN: &str = "https://www.example.com";
+
+    #[derive(Debug, Clone, Copy)]
+    enum CreativePath {
+        Auction,
+        Inline,
+    }
+
+    fn process_for_path(settings: &Settings, path: CreativePath, html: &str) -> String {
+        match path {
+            CreativePath::Auction => process_auction_creative(settings, html),
+            CreativePath::Inline => {
+                super::process_inline_auction_creative(settings, INLINE_ORIGIN, html)
+            }
+        }
+    }
+
+    fn matrix_settings(assets: bool, clicks: Option<bool>) -> Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = assets;
+        settings.auction.rewrite_clicks = clicks;
+        settings.rewrite.exclude_domains = vec!["excluded.example.com".to_owned()];
+        settings
+    }
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
         let settings = crate::test_support::tests::create_test_settings();
@@ -1711,6 +1832,141 @@ mod tests {
             out.contains("https://test-publisher.com:8443/first-party/proxy?tsurl="),
             "expected the non-default HTTPS port preserved in the origin: {out}"
         );
+    }
+
+    #[test]
+    fn asset_and_click_switches_combine_on_auction_and_inline_paths() {
+        for path in [CreativePath::Auction, CreativePath::Inline] {
+            for (fixture, has_body) in [
+                (MATRIX_FIXTURE_WITH_BODY, true),
+                (MATRIX_FIXTURE_FRAGMENT, false),
+            ] {
+                for (assets, clicks) in [(true, true), (true, false), (false, true), (false, false)]
+                {
+                    let settings = matrix_settings(assets, Some(clicks));
+                    let label = format!("{path:?} assets={assets} clicks={clicks} body={has_body}");
+                    let prefix = match path {
+                        CreativePath::Auction => "",
+                        CreativePath::Inline => INLINE_ORIGIN,
+                    };
+
+                    let out = process_for_path(&settings, path, fixture);
+
+                    let expected_proxied = match (assets, has_body) {
+                        (false, _) => 0,
+                        (true, true) => 4,
+                        (true, false) => 3,
+                    };
+                    assert_eq!(
+                        out.matches("/first-party/proxy?tsurl=").count(),
+                        expected_proxied,
+                        "{label}: proxied asset URL count: {out}"
+                    );
+                    assert_eq!(
+                        out.contains(&format!("src=\"{prefix}/first-party/proxy?tsurl=")),
+                        assets,
+                        "{label}: image proxied only when assets are on: {out}"
+                    );
+                    assert_eq!(
+                        out.contains(r#"src="https://cdn.example.com/ad.png""#),
+                        !assets,
+                        "{label}: image raw only when assets are off: {out}"
+                    );
+
+                    // Each wrapped `<a>` and `<area>` carries the click URL in
+                    // href and data-tsclick.
+                    let expected_click_urls = if clicks { 4 } else { 0 };
+                    assert_eq!(
+                        out.matches("/first-party/click?tsurl=").count(),
+                        expected_click_urls,
+                        "{label}: click URL count: {out}"
+                    );
+                    assert_eq!(
+                        out.contains(&format!("href=\"{prefix}/first-party/click?tsurl=")),
+                        clicks,
+                        "{label}: anchor wrapped only when clicks are on: {out}"
+                    );
+                    assert_eq!(
+                        out.contains(r#"href="https://landing.example.com/page""#),
+                        !clicks,
+                        "{label}: anchor raw only when clicks are off: {out}"
+                    );
+                    assert_eq!(
+                        out.contains("data-tsclick"),
+                        clicks,
+                        "{label}: data-tsclick only when clicks are on: {out}"
+                    );
+                    assert!(
+                        out.contains(r#"href="https://excluded.example.com/page""#),
+                        "{label}: excluded anchor always stays raw: {out}"
+                    );
+                    assert!(
+                        out.contains(r#"href="mailto:ads@example.com""#),
+                        "{label}: mailto anchor always stays raw: {out}"
+                    );
+
+                    assert_eq!(
+                        out.contains("<base"),
+                        !(assets || clicks),
+                        "{label}: <base> removed whenever either switch is on: {out}"
+                    );
+                    let expected_tsjs =
+                        usize::from(matches!(path, CreativePath::Auction) && (assets || clicks));
+                    assert_eq!(
+                        out.matches("/static/tsjs=").count(),
+                        expected_tsjs,
+                        "{label}: TSJS injected once on /auction when either switch is on: {out}"
+                    );
+                    if !assets && !clicks {
+                        assert_eq!(
+                            out, fixture,
+                            "{label}: should pass through byte for byte with both switches off"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unset_rewrite_clicks_preserves_existing_output() {
+        for path in [CreativePath::Auction, CreativePath::Inline] {
+            let unset = matrix_settings(true, None);
+            let explicit = matrix_settings(true, Some(true));
+            assert_eq!(
+                process_for_path(&unset, path, MATRIX_FIXTURE_WITH_BODY),
+                process_for_path(&explicit, path, MATRIX_FIXTURE_WITH_BODY),
+                "{path:?}: unset rewrite_clicks with rewrite_creatives = true should match full rewriting"
+            );
+
+            let disabled = matrix_settings(false, None);
+            assert_eq!(
+                process_for_path(&disabled, path, MATRIX_FIXTURE_WITH_BODY),
+                MATRIX_FIXTURE_WITH_BODY,
+                "{path:?}: unset rewrite_clicks with rewrite_creatives = false should pass through"
+            );
+        }
+    }
+
+    // Captured from `main` before `rewrite_clicks` existed: default settings must
+    // keep producing these bytes on both auction paths.
+    const MATRIX_DEFAULT_AUCTION_OUTPUT: &str = r#"<html><head><style>.b{background:url("/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><script src="/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script><img src="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+    const MATRIX_DEFAULT_INLINE_OUTPUT: &str = r#"<html><head><style>.b{background:url("https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><img src="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+
+    #[test]
+    fn default_settings_rewrite_matrix_fixture_byte_for_byte_as_before() {
+        let settings = matrix_settings(true, None);
+
+        for (path, expected) in [
+            (CreativePath::Auction, MATRIX_DEFAULT_AUCTION_OUTPUT),
+            (CreativePath::Inline, MATRIX_DEFAULT_INLINE_OUTPUT),
+        ] {
+            assert_eq!(
+                process_for_path(&settings, path, MATRIX_FIXTURE_WITH_BODY),
+                expected,
+                "{path:?}: default settings should match the pre-rewrite_clicks output exactly"
+            );
+        }
     }
 
     fn normalized(raw: &str) -> Option<String> {
