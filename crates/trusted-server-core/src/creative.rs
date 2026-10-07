@@ -1125,6 +1125,10 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// own [`MAX_REWRITABLE_BODY_SIZE`] rather than the per-creative auction cap:
 /// a proxied document is a whole page, not an `adm`, and legitimately exceeds
 /// 1 MiB. The creative runtime is still injected so click mediation survives.
+///
+/// Asset rewriting here is unconditional. Click wrapping follows an explicit
+/// `[auction] rewrite_clicks`; when that is unset, links keep being wrapped
+/// regardless of `rewrite_creatives`.
 #[must_use]
 pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
     rewrite_creative_html_impl(
@@ -1133,7 +1137,10 @@ pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
         "",
         true,
         MAX_REWRITABLE_BODY_SIZE,
-        CreativeFeatures::ALL,
+        CreativeFeatures {
+            assets: true,
+            clicks: settings.auction.rewrites_proxied_clicks(),
+        },
     )
 }
 
@@ -1510,10 +1517,13 @@ fn rewrite_creative_html_impl(
     rewritten
 }
 
-/// Stream processor for creative HTML that rewrites URLs to first-party proxy.
+/// Stream processor for HTML fetched through `/first-party/proxy` that rewrites
+/// asset and click-through URLs to first-party endpoints.
 ///
 /// This processor buffers input chunks and processes the complete HTML document
-/// when the stream ends, using `rewrite_creative_html` internally.
+/// when the stream ends, using [`rewrite_proxied_html`] internally. Asset URLs are
+/// always proxied; links are wrapped unless `[auction] rewrite_clicks` is
+/// explicitly `false`.
 pub struct CreativeHtmlProcessor<'a> {
     settings: &'a Settings,
     buffer: Vec<u8>,
