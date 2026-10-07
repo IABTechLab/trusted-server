@@ -5499,6 +5499,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-audience-permutive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "trusted-server-core",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-cli"
 version = "0.1.0"
 dependencies = [
@@ -5708,6 +5723,7 @@ name = "trusted-server-modules"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "trusted-server-audience-permutive",
  "trusted-server-cmp-osano",
  "trusted-server-core",
  "trusted-server-identity-lockr",

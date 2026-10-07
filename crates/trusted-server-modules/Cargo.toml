@@ -14,6 +14,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+trusted-server-audience-permutive = { workspace = true }
 trusted-server-cmp-osano = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }

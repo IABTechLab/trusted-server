@@ -23,7 +23,6 @@ pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
 pub mod nextjs;
 pub mod openrtb;
-pub mod permutive;
 pub mod prebid;
 pub mod prebid_server;
 mod registry;
@@ -579,7 +578,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     js_asset_proxy::BUILDER,
     testlight::BUILDER,
     nextjs::BUILDER,
-    permutive::BUILDER,
     didomi::BUILDER,
     sourcepoint::BUILDER,
     google_tag_manager::BUILDER,
