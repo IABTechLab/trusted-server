@@ -1670,37 +1670,31 @@ pub async fn handle_first_party_proxy_sign(
     };
 
     let trimmed = payload.url.trim();
-    let abs = if trimmed.starts_with("//") {
-        format!("{}:{}", request_scheme, trimmed)
+    let protocol_relative;
+    // A protocol-relative target inherits the signing request's scheme before
+    // normalization, so `//` and absolute input reach the same policy check.
+    let candidate = if trimmed.starts_with("//") {
+        protocol_relative = format!("{request_scheme}:{trimmed}");
+        protocol_relative.as_str()
     } else {
-        crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
-            Report::new(TrustedServerError::Proxy {
-                message: "unsupported url".to_string(),
-            })
-        })?
+        trimmed
     };
-
-    if settings.rewrite.is_excluded(&abs) {
-        return Err(Report::new(TrustedServerError::Proxy {
+    let target = crate::creative::normalize_creative_url(candidate).ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
             message: "unsupported url".to_string(),
-        }));
-    }
-
-    let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
-        message: "invalid url".to_string(),
+        })
     })?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "unsupported scheme".to_string(),
-        }));
-    }
-
-    let host = parsed.host_str().ok_or_else(|| {
+    let host = target.host_str().ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
             message: "missing host".to_string(),
         })
     })?;
+    if !settings.rewrite.should_proxy_asset(host) {
+        log::debug!("sign request for `{host}` declined by rewrite policy");
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported url".to_string(),
+        }));
+    }
     if !is_host_permitted(&settings.proxy.allowed_domains, host) {
         log::warn!(
             "sign request for `{}` blocked: host not in proxy.allowed_domains",
@@ -1720,10 +1714,10 @@ pub async fn handle_first_party_proxy_sign(
         .to_string();
     let extras = vec![(String::from("tsexp"), tsexp)];
 
-    let mut base = parsed.clone();
+    let mut base = target.clone();
     base.set_query(None);
     base.set_fragment(None);
-    let proxied = crate::creative::build_proxy_url_with_extras(settings, &abs, &extras);
+    let proxied = crate::creative::build_proxy_url_with_extras(settings, target.as_str(), &extras);
 
     let resp = ProxySignResp {
         href: proxied,
@@ -2695,20 +2689,58 @@ mod tests {
             let mut settings = create_test_settings();
             settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
 
-            for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
-                let body = serde_json::json!({ "url": url });
-                let req =
-                    build_http_post_json_request("https://edge.example/first-party/sign", &body);
-                let err: Report<TrustedServerError> =
-                    handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                        .await
-                        .expect_err("should reject excluded URL");
+            for method in [&Method::GET, &Method::POST] {
+                for url in [
+                    "https://cdn.example/asset.js",
+                    "//cdn.example/asset.js",
+                    "https://CDN.Example/asset.js",
+                ] {
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example/first-party/sign",
+                        url,
+                    );
+                    let err: Report<TrustedServerError> =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                            .await
+                            .expect_err("should reject excluded URL");
 
-                assert_eq!(
-                    err.current_context().status_code(),
-                    StatusCode::BAD_GATEWAY,
-                    "should reject excluded URL `{url}` as unsupported"
-                );
+                    assert_eq!(
+                        err.current_context().status_code(),
+                        StatusCode::BAD_GATEWAY,
+                        "{} should reject excluded URL `{url}` as unsupported",
+                        method.as_str()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_rejects_excluded_urls_case_insensitively() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["CDN.Example".to_owned()];
+
+            for method in [&Method::GET, &Method::POST] {
+                for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example/first-party/sign",
+                        url,
+                    );
+                    let err: Report<TrustedServerError> =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                            .await
+                            .expect_err("should reject a host excluded by a mixed-case entry");
+
+                    assert_eq!(
+                        err.current_context().status_code(),
+                        StatusCode::BAD_GATEWAY,
+                        "{} should reject `{url}` excluded by a mixed-case entry as unsupported",
+                        method.as_str()
+                    );
+                }
             }
         });
     }
