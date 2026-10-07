@@ -58,7 +58,9 @@ pub struct KvEntry {
     /// Network cluster disambiguation data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<KvNetwork>,
-    /// Map of partner ID namespace → UID record.
+    /// Map of partner ID namespace to that partner's identifier for the same
+    /// browser on the same device, never an identifier for a person.
+    ///
     /// Populated by pixel sync, batch sync, and pull sync operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ids: BTreeMap<String, KvPartnerId>,
@@ -181,7 +183,12 @@ pub struct KvDevice {
 ///
 /// Tracks how many distinct EC entries share the same hash prefix. A high
 /// count indicates a shared network (corporate VPN, campus); a low count
-/// indicates an individual or household.
+/// indicates a small one, such as a home connection.
+///
+/// The count is a fact about a network and identifies no person. An Edge
+/// Cookie identifies a browser on a device, and the partner identifiers in
+/// [`KvEntry::ids`] are other parties' identifiers for that same browser and
+/// device.
 ///
 /// Written only by the `/_ts/api/v1/identify` endpoint when `cluster_size` is
 /// missing. Once stored, the value is reused because the EC entry no longer
