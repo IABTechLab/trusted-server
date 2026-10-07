@@ -709,9 +709,11 @@ than left for each vendor to rediscover.
     alone it refuses a `[demand]` or `[ad-server]` name one of the
     deployment's own builders supplies, before any adapter state is built.
     The implementation (#1094) carries the builders through the load and
-    through deploy validation, and has the probe supply an ad server so the
-    auction seam is reached from a crate core does not know. A demand
-    source from such a crate is not yet proven the same way.
+    through deploy validation, and has the probe supply a demand source and
+    an ad server, so the auction seam is reached from a crate core does not
+    know. No auction is driven through either, so what an implementation
+    outside core does during an auction is held by the tests of the built-in
+    ones.
 11. **A device module is asked on Fastly alone.** Only the Fastly adapter
     classifies a request and sets device signals, on `main` as in this
     stack, so a device module a crate supplies runs there and on no other
