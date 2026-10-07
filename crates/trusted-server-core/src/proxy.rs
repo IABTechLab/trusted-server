@@ -1529,6 +1529,12 @@ async fn proxy_with_redirects(
             status,
             StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
         ) {
+            if current_body.is_some_and(|bytes| !bytes.is_empty()) {
+                log::warn!(
+                    "dropping {current_method} request body on {} redirect to {current_url}",
+                    status.as_u16()
+                );
+            }
             if current_method != Method::HEAD {
                 current_method = Method::GET;
             }
