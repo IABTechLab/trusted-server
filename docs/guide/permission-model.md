@@ -266,9 +266,9 @@ that state's own opt-out handling. A Texas visitor gets `us-notice` under
 exists. A visitor whose country cannot be resolved gets `gdpr-eu` under GDPR
 handling, both stated at the top.
 
-Startup rejects a file whose top node has no `group` or no `jurisdiction`, in
-the same way a missing default country was rejected before, so the unknown case
-is always answered in the file rather than assumed by the code.
+Startup rejects a file whose top node has no `group` or no `jurisdiction`, so
+the unknown case is always answered in the file rather than assumed by the
+code.
 
 Because the tree now says which regime applies where, the older consent
 settings `[consent.gdpr] applies_in` and `[consent.us_states] privacy_states`

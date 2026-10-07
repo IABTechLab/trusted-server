@@ -1437,9 +1437,9 @@ impl GeoConfig {
         ec: &Ec,
     ) -> Result<(), Report<TrustedServerError>> {
         let geo_disabled = !matches!(self.module.as_deref(), Some("platform"));
-        // The selector is a typed enum on this branch, so statelessness is the
-        // absent selector or the explicit `none`, matched rather than compared
-        // as a string.
+        // The selector is a typed enum, so statelessness is the absent
+        // selector or the explicit `none`, matched rather than compared as a
+        // string.
         let ec_active = !matches!(ec.module, None | Some(EcModuleSelection::None));
         if geo_disabled && ec_active && !self.assume_single_jurisdiction {
             return Err(Report::new(TrustedServerError::Configuration {
