@@ -16,7 +16,7 @@
 //!   - `<input type="image" src>`
 //!   - SVG: `<image href|xlink:href>`, `<use href|xlink:href>`
 //!   - `<iframe src>`
-//!   - `<link rel~="stylesheet|preload|prefetch" href>` and `imagesrcset`
+//!   - `<link rel~="stylesheet|preload|prefetch" href>`
 //!   - Inline styles (`[style]`) and `<style>` blocks: url(...) values are rewritten
 //! - Click-through links (`<a href>`, `<area href>`) are wrapped in
 //!   `/first-party/click?tsurl=<base-url>&<original-query-params>&tstoken=<sig>`,
@@ -1322,16 +1322,13 @@ fn rewrite_creative_html_impl(
                     .to_ascii_lowercase();
                 if rel.contains("stylesheet") || rel.contains("preload") || rel.contains("prefetch")
                 {
+                    // `imagesrcset` is left to the `[imagesrcset]` handler, which
+                    // also runs on this element; rewriting it here too would
+                    // proxy the inline path's absolute proxy URLs a second time.
                     if let Some(p) =
                         proxied_attr_value(settings, el.get_attribute("href"), base_origin)
                     {
                         let _ = el.set_attribute("href", &p);
-                    }
-                    if let Some(srcset) = el.get_attribute("imagesrcset") {
-                        let rewritten = rewrite_srcset(settings, &srcset, base_origin);
-                        if rewritten != srcset {
-                            let _ = el.set_attribute("imagesrcset", &rewritten);
-                        }
                     }
                 }
                 Ok(())
@@ -3963,6 +3960,50 @@ b{background:url(\"https://cdn.example/c.png\")}";
             assert!(
                 out.contains(off_list) && !out.contains(&encoded_tsurl(off_list)),
                 "should keep off-list CSS URL `{off_list}` raw: {out}"
+            );
+        }
+    }
+
+    // `imagesrcset` is rewritten only by the `[imagesrcset]` handler. When the
+    // `link[href]` handler also rewrote it, the inline path's absolute proxy
+    // URLs were proxied a second time.
+    #[test]
+    fn inline_link_imagesrcset_is_proxied_once() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<link rel="preload" as="image" href="https://assets.example.com/p.png" imagesrcset="https://assets.example.com/p.png 1x">"#;
+
+        let out = rewrite_inline_creative_html(&settings, "https://publisher.example.com", html);
+
+        let imagesrcset = out
+            .split("imagesrcset=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("should keep an imagesrcset attribute");
+        assert_eq!(
+            imagesrcset.matches("tsurl=").count(),
+            1,
+            "should proxy the imagesrcset candidate exactly once: {imagesrcset}"
+        );
+    }
+
+    #[test]
+    fn root_relative_link_imagesrcset_is_proxied_once() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<link rel="preload" as="image" href="https://assets.example.com/p.png" imagesrcset="https://assets.example.com/p.png 1x">"#;
+
+        for (label, out) in [
+            ("auction", rewrite_creative_html(&settings, html)),
+            ("proxied", rewrite_proxied_html(&settings, html)),
+        ] {
+            let imagesrcset = out
+                .split("imagesrcset=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("should keep an imagesrcset attribute");
+            assert_eq!(
+                imagesrcset.matches("tsurl=").count(),
+                1,
+                "{label}: should proxy the imagesrcset candidate exactly once: {imagesrcset}"
             );
         }
     }
