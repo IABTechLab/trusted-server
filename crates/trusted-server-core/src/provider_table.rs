@@ -296,6 +296,293 @@ impl<S: ProviderSelection> Serialize for ProviderTable<S> {
     }
 }
 
+/// Which key a section's selection was written under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionKey {
+    Module,
+    Modules,
+}
+
+impl SelectionKey {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Module => "module",
+            Self::Modules => "modules",
+        }
+    }
+}
+
+/// The modules one section selects, and each one's settings table.
+///
+/// `modules` selects several, in the order they run, and `module` one, and a
+/// section carries at most one of the two. Every other table in the section is
+/// the settings of a selected module, at the name written in the selection
+/// with `.` between its parts, so `modules = ["testing.example"]` reads its
+/// settings from `[<section>.testing.example]`.
+#[derive(Clone, Default, PartialEq)]
+pub struct SectionModules {
+    key: Option<SelectionKey>,
+    selected: Vec<String>,
+    tables: Map<String, Value>,
+}
+
+impl fmt::Debug for SectionModules {
+    // The tables can hold secrets, so only the selection and the tables'
+    // names are shown.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SectionModules")
+            .field("selected", &self.selected)
+            .field("tables", &self.tables.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SectionModules {
+    /// Reads a section's entries, in a section that holds nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for a selection of the wrong shape, for both keys at
+    /// once, and for an entry that is neither a selection nor a table.
+    pub fn from_entries(entries: Map<String, Value>) -> Result<Self, String> {
+        let mut section = Self::default();
+        for (key, value) in entries {
+            match key.as_str() {
+                "module" | "modules" => {
+                    let key = if key == "module" {
+                        SelectionKey::Module
+                    } else {
+                        SelectionKey::Modules
+                    };
+                    if section.key.is_some_and(|written| written != key) {
+                        return Err(
+                            "carries both `module` and `modules`. Write `module` for one or \
+                             `modules` for several"
+                                .to_owned(),
+                        );
+                    }
+                    section.key = Some(key);
+                    section.selected = match key {
+                        SelectionKey::Module => {
+                            <Option<String> as ProviderSelection>::from_value(value)?
+                                .into_iter()
+                                .collect()
+                        }
+                        SelectionKey::Modules => {
+                            <Vec<String> as ProviderSelection>::from_value(value)?
+                        }
+                    };
+                }
+                _ => match value {
+                    Value::Object(_) => {
+                        section.tables.insert(key, value);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "has `{key}`, which is not a setting it reads. Only `module` or \
+                             `modules` and the settings tables of the modules they select \
+                             belong there"
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(section)
+    }
+
+    /// The selected names, as written, in the order they run.
+    #[must_use]
+    pub fn selected(&self) -> &[String] {
+        &self.selected
+    }
+
+    /// Whether the section selects nothing and holds no table.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.selected.is_empty() && self.tables.is_empty()
+    }
+
+    /// The settings table of a name as written in the selection, found by
+    /// its parts.
+    #[must_use]
+    pub fn settings_of(&self, written: &str) -> Option<&Map<String, Value>> {
+        let mut parts = written.split('.');
+        let mut table = self.tables.get(parts.next()?)?.as_object()?;
+        for part in parts {
+            table = table.get(part)?.as_object()?;
+        }
+        Some(table)
+    }
+
+    /// The settings table of a name as written in the selection, to change.
+    pub fn settings_of_mut(&mut self, written: &str) -> Option<&mut Map<String, Value>> {
+        let mut parts = written.split('.');
+        let mut table = self.tables.get_mut(parts.next()?)?.as_object_mut()?;
+        for part in parts {
+            table = table.get_mut(part)?.as_object_mut()?;
+        }
+        Some(table)
+    }
+
+    /// Selects `written` and stores its settings table, which is what writing
+    /// both in a document does.
+    pub fn insert(&mut self, written: &str, settings: Map<String, Value>) {
+        if !self.selected.iter().any(|name| name == written) {
+            self.selected.push(written.to_owned());
+        }
+        if self.key.is_none() {
+            self.key = Some(SelectionKey::Modules);
+        }
+        let mut parts: Vec<&str> = written.split('.').collect();
+        let last = parts.pop().unwrap_or(written);
+        let mut table = &mut self.tables;
+        for part in parts {
+            let entry = table
+                .entry(part.to_owned())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !entry.is_object() {
+                *entry = Value::Object(Map::new());
+            }
+            let Value::Object(next) = entry else {
+                return;
+            };
+            table = next;
+        }
+        table.insert(last.to_owned(), Value::Object(settings));
+    }
+
+    /// Selects `written` with no settings table of its own.
+    pub fn select(&mut self, written: &str) {
+        if !self.selected.iter().any(|name| name == written) {
+            self.selected.push(written.to_owned());
+        }
+        if self.key.is_none() {
+            self.key = Some(SelectionKey::Modules);
+        }
+    }
+
+    /// Stops selecting `written` and drops its table.
+    pub fn remove(&mut self, written: &str) {
+        self.selected.retain(|name| name != written);
+        let mut parts: Vec<&str> = written.split('.').collect();
+        let Some(last) = parts.pop() else {
+            return;
+        };
+        let mut table = &mut self.tables;
+        for part in parts {
+            let Some(Value::Object(next)) = table.get_mut(part) else {
+                return;
+            };
+            table = next;
+        }
+        table.remove(last);
+    }
+
+    /// Stops selecting everything and drops every table.
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.tables.clear();
+    }
+
+    /// Checks the rules every section's selection follows, naming the section.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for a name that is not a module name, a name selected
+    /// twice, and a table that is not the settings of a selected name.
+    pub fn validate(&self, section: &str) -> Result<(), String> {
+        let key = self.key.unwrap_or(SelectionKey::Modules).as_str();
+        for (position, name) in self.selected.iter().enumerate() {
+            if !crate::module_name::is_valid(name) {
+                return Err(format!(
+                    "[{section}] {key} names `{name}`, which is not a module name, being parts \
+                     joined by `.`, each of lower case letters, digits, `_` or `-`"
+                ));
+            }
+            if self.selected[..position].contains(name) {
+                return Err(format!("[{section}] {key} names `{name}` more than once"));
+            }
+        }
+        check_tables(section, key, &self.selected, &self.tables, "")
+    }
+}
+
+/// Checks that every table under `prefix` is a selected name's settings, or
+/// lies on the way to one.
+fn check_tables(
+    section: &str,
+    key: &str,
+    selected: &[String],
+    tables: &Map<String, Value>,
+    prefix: &str,
+) -> Result<(), String> {
+    for (name, value) in tables {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if selected.contains(&path) {
+            continue;
+        }
+        let leads_to_one = selected
+            .iter()
+            .any(|written| written.starts_with(&format!("{path}.")));
+        match value {
+            Value::Object(inner) if leads_to_one => {
+                check_tables(section, key, selected, inner, &path)?;
+            }
+            _ => {
+                return Err(format!(
+                    "[{section}.{path}] is configured, but [{section}] {key} does not select \
+                     `{path}`. Add it to {key}, or remove the table"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for SectionModules {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Map::<String, Value>::deserialize(deserializer)?;
+        Self::from_entries(entries)
+            .map_err(|message| serde::de::Error::custom(format!("the section {message}")))
+    }
+}
+
+impl Serialize for SectionModules {
+    fn serialize<Z>(&self, serializer: Z) -> Result<Z::Ok, Z::Error>
+    where
+        Z: Serializer,
+    {
+        let selection =
+            (!self.selected.is_empty()).then(|| match self.key.unwrap_or(SelectionKey::Modules) {
+                SelectionKey::Module if self.selected.len() == 1 => (
+                    SelectionKey::Module.as_str(),
+                    Value::String(self.selected[0].clone()),
+                ),
+                _ => (
+                    SelectionKey::Modules.as_str(),
+                    Value::Array(self.selected.iter().cloned().map(Value::String).collect()),
+                ),
+            });
+        let mut map =
+            serializer.serialize_map(Some(self.tables.len() + usize::from(selection.is_some())))?;
+        if let Some((key, value)) = selection {
+            map.serialize_entry(key, &value)?;
+        }
+        for (name, table) in &self.tables {
+            map.serialize_entry(name, table)?;
+        }
+        map.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +709,138 @@ mod tests {
         let value = serde_json::to_value(&table).expect("should serialize");
         let again: ProviderList = serde_json::from_value(value).expect("should read it back");
         assert_eq!(table, again);
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::SectionModules;
+    use serde_json::{Map, Value, json};
+
+    fn read(json: Value) -> Result<SectionModules, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn reads_the_selection_and_the_selected_tables() {
+        let section = read(json!({
+            "modules": ["didomi", "sourcepoint"],
+            "didomi": { "api_key": "k" }
+        }))
+        .expect("should read a section");
+        assert_eq!(section.selected(), ["didomi", "sourcepoint"]);
+        assert_eq!(
+            section.settings_of("didomi").and_then(|t| t.get("api_key")),
+            Some(&json!("k"))
+        );
+        assert!(section.settings_of("sourcepoint").is_none());
+        section.validate("cmp").expect("should pass validation");
+    }
+
+    #[test]
+    fn module_selects_one_and_a_list_there_is_refused() {
+        let section = read(json!({ "module": "didomi" })).expect("should read one");
+        assert_eq!(section.selected(), ["didomi"]);
+        let error = read(json!({ "module": ["didomi"] })).expect_err("should refuse a list");
+        assert!(error.to_string().contains("`module` names one"), "{error}");
+    }
+
+    #[test]
+    fn both_keys_at_once_are_refused() {
+        let error =
+            read(json!({ "module": "a", "modules": ["b"] })).expect_err("should refuse both keys");
+        assert!(
+            error
+                .to_string()
+                .contains("carries both `module` and `modules`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_neither_selection_nor_table_is_refused() {
+        let error = read(json!({ "modules": ["a"], "enabled": true }))
+            .expect_err("should refuse a stray value");
+        assert!(
+            error
+                .to_string()
+                .contains("has `enabled`, which is not a setting it reads"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_table_no_selection_names_is_refused_by_validation() {
+        let section = read(json!({ "modules": ["a"], "b": {} })).expect("should read");
+        let error = section
+            .validate("cmp")
+            .expect_err("should refuse the stray table");
+        assert_eq!(
+            error,
+            "[cmp.b] is configured, but [cmp] modules does not select `b`. Add it to modules, or remove the table"
+        );
+    }
+
+    #[test]
+    fn a_name_written_with_dots_reads_a_nested_table() {
+        let section = read(json!({
+            "modules": ["google", "google.diagnostics"],
+            "google": { "timeout_ms": 5, "diagnostics": { "overlay": true } }
+        }))
+        .expect("should read");
+        section
+            .validate("ad-tag")
+            .expect("the nested table is a selected name's");
+        assert_eq!(
+            section
+                .settings_of("google.diagnostics")
+                .and_then(|t| t.get("overlay")),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_module_name_or_is_repeated_is_refused() {
+        let section = read(json!({ "modules": ["Didomi"] })).expect("should read");
+        let error = section.validate("cmp").expect_err("should refuse the name");
+        assert!(error.contains("is not a module name"), "{error}");
+        let section = read(json!({ "modules": ["a", "a"] })).expect("should read");
+        let error = section
+            .validate("cmp")
+            .expect_err("should refuse the repeat");
+        assert_eq!(error, "[cmp] modules names `a` more than once");
+    }
+
+    #[test]
+    fn insert_select_remove_and_clear_keep_the_selection_and_tables_together() {
+        let mut section = SectionModules::default();
+        assert!(section.is_unset());
+        let mut settings = Map::new();
+        settings.insert("api_key".to_owned(), json!("k"));
+        section.insert("didomi", settings);
+        section.select("osano");
+        assert_eq!(section.selected(), ["didomi", "osano"]);
+        assert!(section.settings_of("didomi").is_some());
+        section.remove("didomi");
+        assert_eq!(section.selected(), ["osano"]);
+        assert!(section.settings_of("didomi").is_none());
+        section.clear();
+        assert!(section.is_unset());
+    }
+
+    #[test]
+    fn round_trips_through_serialization() {
+        let section =
+            read(json!({ "module": "didomi", "didomi": { "api_key": "k" } })).expect("should read");
+        let value = serde_json::to_value(&section).expect("should serialize");
+        assert_eq!(
+            value,
+            json!({ "module": "didomi", "didomi": { "api_key": "k" } })
+        );
+        let several = read(json!({ "modules": ["a", "b"] })).expect("should read");
+        assert_eq!(
+            serde_json::to_value(&several).expect("should serialize"),
+            json!({ "modules": ["a", "b"] })
+        );
     }
 }

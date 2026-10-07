@@ -1198,8 +1198,8 @@ mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integration]
-            module = ["gpt_diagnostics"]
+            [ad-tag]
+            modules = ["google.diagnostics"]
             "#,
         )
         .expect("should parse diagnostics settings")

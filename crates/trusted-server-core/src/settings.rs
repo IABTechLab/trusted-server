@@ -27,7 +27,7 @@ use crate::ec::module::{
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
-use crate::provider_table::{ProviderChoice, ProviderList};
+use crate::provider_table::{ProviderChoice, ProviderList, SectionModules};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -222,252 +222,109 @@ impl Publisher {
 
 /// Which integrations run, and the settings each one is given.
 ///
-/// Mapped from the `[integration]` TOML section, which follows the convention
-/// every selectable type uses, where [`module`](Self::module) names what runs
-/// and a named block holds one module's settings. Here that block is
-/// `[integration.<id>]`, and it is written only for an integration that has
-/// settings to give.
-#[derive(Default, Clone, Deserialize, Serialize)]
-pub struct IntegrationSettings {
-    /// The integrations that run, named by id, for example
-    /// `module = ["gpt", "prebid"]`.
-    ///
-    /// An integration runs when, and only when, its id is on this list, so
-    /// there is no second switch inside its own block and leaving the list out
-    /// runs none of them. A repeated id, and a block for an integration that
-    /// is not named here, are both refused by
-    /// [`validate_selection`](Self::validate_selection). An id that no builder
-    /// supplies is refused where the registry is built, which is the only
-    /// place an adapter's and a vendor crate's builders are known.
-    ///
-    /// The order of the list carries no meaning, because integrations run in
-    /// the order their builders are registered. This is unlike
-    /// `[permission_signal] module`, where the order is the policy.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub module: Vec<String>,
-    #[serde(flatten)]
-    entries: HashMap<String, JsonValue>,
-}
-
-impl std::fmt::Debug for IntegrationSettings {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut integration_ids = self.entries.keys().collect::<Vec<_>>();
-        integration_ids.sort_unstable();
-        formatter
-            .debug_struct("IntegrationSettings")
-            .field("module", &self.module)
-            .field("integration_ids", &integration_ids)
-            .finish()
-    }
-}
-
-/// The settings type an integration reads from its `[integration.<id>]` block.
+/// The sections of module types core does not read itself, such as `[cmp]` or
+/// `[tag]`, each named by its type's folder under `crates`.
 ///
-/// The type states which settings the integration takes and how they are
-/// validated, and nothing else. Whether the integration runs is not its
-/// business, because `[integration] module` names what runs.
-pub trait IntegrationConfig: DeserializeOwned + Validate {}
+/// Every top-level table that is not one of Trusted Server's own settings is
+/// read as one of these. Whether its type is one a module on offer has is
+/// only known where the registry is built, so it is checked there.
+#[derive(Clone, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct TypeSections(BTreeMap<String, SectionModules>);
 
-impl IntegrationSettings {
-    /// Whether `integration_id` is named in `[integration] module`.
-    #[must_use]
-    pub fn is_selected(&self, integration_id: &str) -> bool {
-        self.module
-            .iter()
-            .any(|selected| selected == integration_id)
+impl std::fmt::Debug for TypeSections {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_map().entries(self.0.iter()).finish()
     }
+}
 
-    /// Names `integration_id` in `[integration] module`, so it runs.
-    ///
-    /// Naming one that is already on the list changes nothing, so a caller
-    /// never has to check first.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn select(&mut self, integration_id: impl Into<String>) {
-        let integration_id = integration_id.into();
-        if !self.is_selected(&integration_id) {
-            self.module.push(integration_id);
-        }
-    }
-
-    /// Selects an integration and stores the settings it runs with, which is
-    /// what naming it in `[integration] module` and writing its
-    /// `[integration.<id>]` block do together.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration cannot be serialized to JSON.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn insert_config<T>(
-        &mut self,
-        integration_id: impl Into<String>,
-        value: &T,
-    ) -> Result<(), Report<TrustedServerError>>
+impl<'de> Deserialize<'de> for TypeSections {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        T: Serialize,
+        D: Deserializer<'de>,
     {
-        let json =
-            serde_json::to_value(value).change_context(TrustedServerError::Configuration {
-                message: "Failed to serialize integration configuration".to_string(),
+        let entries = serde_json::Map::<String, JsonValue>::deserialize(deserializer)?;
+        let mut sections = BTreeMap::new();
+        for (name, value) in entries {
+            let JsonValue::Object(table) = value else {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown field `{name}`, which is neither a setting Trusted Server reads nor \
+                     the section of a module type, which is a table"
+                )));
+            };
+            if name.contains('.') || !crate::module_name::is_valid(&name) {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown field `{name}`. The section of a module type is named by the \
+                     type's folder, of lower case letters, digits, `_` or `-`"
+                )));
+            }
+            let section = SectionModules::from_entries(table).map_err(|message| {
+                serde::de::Error::custom(format!(
+                    "[{name}] is not a section Trusted Server reads itself, so it is read as \
+                     the section of a module type, and it {message}"
+                ))
             })?;
-        let integration_id = integration_id.into();
-        self.select(integration_id.clone());
-        self.entries.insert(integration_id, json);
-        Ok(())
+            sections.insert(name, section);
+        }
+        Ok(Self(sections))
+    }
+}
+
+impl TypeSections {
+    /// Whether no type section is present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
-    /// Validates the selection against the blocks that are present.
-    ///
-    /// Three shapes are refused, because each reads as though it does
-    /// something it does not: an id named twice, an `enabled` key left in an
-    /// integration's block, and a block for an integration that is not
-    /// selected. Startup and `ts config validate` both run this, so none of
-    /// them is quietly ignored.
-    ///
-    /// Whether an id names an integration this build supplies is a separate
-    /// question, answered where the registry is built, because only there are
-    /// the adapter's and a vendor crate's builders known.
+    /// Each type section, by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &SectionModules)> {
+        self.0
+            .iter()
+            .map(|(name, section)| (name.as_str(), section))
+    }
+
+    /// The section of `type_name`, when present.
+    #[must_use]
+    pub fn section(&self, type_name: &str) -> Option<&SectionModules> {
+        self.0.get(type_name)
+    }
+
+    /// The section of `type_name`, created empty when absent.
+    pub fn section_mut(&mut self, type_name: &str) -> &mut SectionModules {
+        self.0.entry(type_name.to_owned()).or_default()
+    }
+
+    /// Refuses a section that selects nothing, and checks each selection.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] naming the ids at fault
-    /// and the fix for them.
-    pub fn validate_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        let mut named = HashSet::new();
-        for integration_id in &self.module {
-            if !named.insert(integration_id.as_str()) {
+    /// Naming the first section at fault.
+    pub fn validate(&self) -> Result<(), Report<TrustedServerError>> {
+        for (name, section) in &self.0 {
+            if section.selected().is_empty() {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "[integration] module names `{integration_id}` more than once. \
-                         Name each integration that runs exactly once"
+                        "[{name}] selects no module. A module type's section names what runs \
+                         with `module` or `modules`, so select one or remove the section"
                     ),
                 }));
             }
+            section
+                .validate(name)
+                .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
         }
-
-        // Blocks live in a map, so both lists are sorted before they are
-        // reported and an operator gets the same message every time.
-        let mut carries_enabled = Vec::new();
-        let mut unselected = Vec::new();
-        for (integration_id, block) in &self.entries {
-            if block.get("enabled").is_some() {
-                carries_enabled.push(integration_id.as_str());
-            }
-            if !self.is_selected(integration_id) {
-                unselected.push(integration_id.as_str());
-            }
-        }
-        carries_enabled.sort_unstable();
-        unselected.sort_unstable();
-
-        if !carries_enabled.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "[integration.{}] sets `enabled`, which is no longer read. An integration \
-                     runs when its id is named in [integration] module, so remove the key \
-                     and name the integration there instead",
-                    carries_enabled.join("] and [integration."),
-                ),
-            }));
-        }
-
-        if !unselected.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "[integration.{}] is configured but not named in [integration] module. \
-                     Add the integration to that list to run it, or remove the block",
-                    unselected.join("] and [integration."),
-                ),
-            }));
-        }
-
         Ok(())
     }
-
-    fn remove_legacy_static_secret_store_selectors(&mut self) {
-        let Some(datadome) = self
-            .entries
-            .get_mut("datadome")
-            .and_then(JsonValue::as_object_mut)
-        else {
-            return;
-        };
-
-        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
-        if let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(JsonValue::as_object_mut)
-        {
-            removed |= bypass.remove("credential_secret_store").is_some();
-        }
-        if removed {
-            log::warn!(
-                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default app-config secret store"
-            );
-        }
-    }
-
-    /// Reads and validates a selected integration's typed configuration, or
-    /// returns `None` when `[integration] module` does not name it.
-    ///
-    /// A selected integration with no block of its own is read from an empty
-    /// one, so an integration that takes no settings runs on its id alone and
-    /// one that requires a setting reports the setting it is missing. The
-    /// parse and validation messages carry the underlying error, because a
-    /// report renders only its outermost message in `ts config validate`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration cannot be parsed from JSON or fails validation.
-    pub fn get_typed<T>(
-        &self,
-        integration_id: &str,
-    ) -> Result<Option<T>, Report<TrustedServerError>>
-    where
-        T: IntegrationConfig,
-    {
-        if !self.is_selected(integration_id) {
-            return Ok(None);
-        }
-
-        let raw = self
-            .entries
-            .get(integration_id)
-            .cloned()
-            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
-
-        let config: T = serde_json::from_value(raw).map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration could not be parsed: {error}"
-                ),
-            })
-        })?;
-
-        config.validate().map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Integration '{integration_id}' configuration failed validation: {err}"
-                ),
-            })
-        })?;
-
-        Ok(Some(config))
-    }
 }
 
-impl Deref for IntegrationSettings {
-    type Target = HashMap<String, JsonValue>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.entries
-    }
-}
-
-impl DerefMut for IntegrationSettings {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.entries
-    }
-}
+/// The settings type a module reads from its table, beneath the section that
+/// selects it.
+///
+/// The type states which settings the module takes and how they are
+/// validated, and nothing else. Whether the module runs is not its business,
+/// because the section's selection names what runs.
+pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
 ///
@@ -2685,7 +2542,6 @@ impl ProxyAssetRoute {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Proxy {
     /// Enable TLS certificate verification when proxying to HTTPS origins.
     /// Defaults to true for secure production use.
@@ -2708,6 +2564,10 @@ pub struct Proxy {
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub asset_routes: Vec<ProxyAssetRoute>,
+    /// The modules this section selects, with each one's settings in the
+    /// table at its name.
+    #[serde(flatten)]
+    pub modules: SectionModules,
 }
 
 fn default_certificate_check() -> bool {
@@ -2728,6 +2588,7 @@ impl Default for Proxy {
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
             asset_routes: Vec::new(),
+            modules: SectionModules::default(),
         }
     }
 }
@@ -3613,19 +3474,12 @@ fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
     *value == PermissionSignalConfig::default()
 }
 
-// `[integration]` is a new section under this name, so a serialized blob that
-// carries it is rejected by a base-revision binary that has never heard of it.
-// An unconfigured section is omitted for the same reason the selector tables
-// above are.
-fn is_default_integration_config(value: &IntegrationSettings) -> bool {
-    value.module.is_empty() && value.entries.is_empty()
-}
-
 /// Message a configuration still carrying the removed `[integrations]` table
 /// is rejected with.
-const REMOVED_INTEGRATIONS_TABLE_MESSAGE: &str = "Configuration table `[integrations]` was removed. Move each `[integrations.<id>]` block to \
-     `[integration.<id>]`, name the integrations that run in `[integration] module`, and delete \
-     every `enabled` key, as described in the CHANGELOG.md breaking migration";
+const REMOVED_INTEGRATIONS_TABLE_MESSAGE: &str = "Configuration table `[integrations]` was removed. Each module is selected in the \
+     section of its type, as [<type>] module = \"<name>\" or modules = [\"<name>\", ...], with its \
+     settings in the table at its name, [<type>.<name>], as described in the CHANGELOG.md \
+     breaking migration";
 
 /// The removed `[integrations]` table.
 ///
@@ -3677,6 +3531,14 @@ refused_table! {
     RenamedAdServerTable => "Configuration table `[adserver]` is now `[ad-server]`. Select the \
         ad server with `[ad-server] module` and move its settings to `[ad-server.<name>]` \
         unchanged"
+}
+
+refused_table! {
+    /// The `[integration]` table, which is no longer read.
+    RemovedIntegrationTable => "Configuration table `[integration]` is no longer read. Each \
+        module is selected in the section of its type, as [<type>] module = \"<name>\" or \
+        modules = [\"<name>\", ...], with its settings in the table at its name, \
+        [<type>.<name>]"
 }
 
 refused_table! {
@@ -3934,7 +3796,6 @@ fn validate_trusted_client_ip_shared_secret(
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -3966,8 +3827,18 @@ pub struct Settings {
         reason = "the field exists so that reading the removed table fails with directions"
     )]
     integrations: RemovedIntegrationsTable,
-    #[serde(default, skip_serializing_if = "is_default_integration_config")]
-    pub integration: IntegrationSettings,
+    /// The `[integration]` table, kept so a configuration carrying it is
+    /// told where modules are selected now.
+    #[serde(default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the removed table fails with directions"
+    )]
+    integration: RemovedIntegrationTable,
+    /// The sections of module types core does not read itself, such as
+    /// `[cmp]` or `[tag]`, each named by its type's folder under `crates`.
+    #[serde(flatten)]
+    pub sections: TypeSections,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     #[validate(nested)]
     pub handlers: Vec<Handler>,
@@ -4110,8 +3981,7 @@ impl Settings {
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
-        self.integration
-            .remove_legacy_static_secret_store_selectors();
+        self.remove_legacy_static_secret_store_selectors();
         self.consent.validate();
     }
 
@@ -4134,7 +4004,7 @@ impl Settings {
         settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_module_selection()?;
         settings.ec.validate_resolve_allowed_origins()?;
-        settings.integration.validate_selection()?;
+        settings.validate_module_sections()?;
         settings.device.validate_module_selection()?;
         settings.geo.validate_module_selection()?;
         GeoConfig::validate_permission_policy()?;
@@ -4517,23 +4387,194 @@ impl Settings {
         Ok(())
     }
 
-    /// Retrieves a selected integration's configuration of a specific type.
+    /// Every section that selects modules, with its name: `[proxy]`,
+    /// `[auction]` and each module type's own section.
+    pub fn module_sections(&self) -> impl Iterator<Item = (&str, &SectionModules)> {
+        [
+            ("proxy", &self.proxy.modules),
+            ("auction", &self.auction.modules),
+        ]
+        .into_iter()
+        .chain(self.sections.iter())
+    }
+
+    /// The section that selects the module `name`, and the name as written
+    /// there, whether in full or with the section's type folder left off.
+    #[must_use]
+    pub fn module_selection(&self, name: &str) -> Option<(&str, &str)> {
+        self.module_sections().find_map(|(section, modules)| {
+            modules
+                .selected()
+                .iter()
+                .find(|written| crate::module_name::resolve(section, written, &[name]).is_some())
+                .map(|written| (section, written.as_str()))
+        })
+    }
+
+    /// Whether a section selects the module `name`.
+    #[must_use]
+    pub fn selects_module(&self, name: &str) -> bool {
+        self.module_selection(name).is_some()
+    }
+
+    /// Reads and validates a selected module's settings, from the table at the
+    /// name it is written under beneath the section that selects it, or
+    /// returns `None` when no section selects it.
     ///
-    /// Hands back `None` when `[integration] module` does not name the
-    /// integration, so a caller that reads its own configuration is also
-    /// asking whether it runs.
+    /// A selected module with no table reads an empty one, so a module that
+    /// takes no settings runs on its selection alone and one that requires a
+    /// setting reports the setting it is missing. The parse and validation
+    /// messages carry the underlying error, because a report renders only its
+    /// outermost message in `ts config validate`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the integration configuration exists but cannot be deserialized as the requested type.
-    pub fn integration_config<T>(
-        &self,
-        integration_id: &str,
-    ) -> Result<Option<T>, Report<TrustedServerError>>
+    /// When the table cannot be read as `T` or fails its validation, naming the
+    /// table.
+    pub fn module_config<T>(&self, name: &str) -> Result<Option<T>, Report<TrustedServerError>>
     where
         T: IntegrationConfig,
     {
-        self.integration.get_typed(integration_id)
+        let Some((section, written)) = self.module_selection(name) else {
+            return Ok(None);
+        };
+        let table = self
+            .module_sections()
+            .find(|(candidate, _)| *candidate == section)
+            .and_then(|(_, modules)| modules.settings_of(written))
+            .cloned()
+            .unwrap_or_default();
+        let config: T = serde_json::from_value(JsonValue::Object(table)).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{section}.{written}] could not be read: {error}"),
+            })
+        })?;
+        config.validate().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{section}.{written}] failed validation: {error}"),
+            })
+        })?;
+        Ok(Some(config))
+    }
+
+    /// The modules `section` selects, to change, with the section created
+    /// empty when it is a module type's and absent.
+    fn section_modules_mut(&mut self, section: &str) -> &mut SectionModules {
+        match section {
+            "proxy" => &mut self.proxy.modules,
+            "auction" => &mut self.auction.modules,
+            _ => self.sections.section_mut(section),
+        }
+    }
+
+    /// Selects the module `name` in `section`, written with the section's
+    /// type folder left off, with no table of its own.
+    pub fn select_module(&mut self, section: &str, name: &str) {
+        let written = crate::module_name::short_form(section, name).to_owned();
+        self.section_modules_mut(section).select(&written);
+    }
+
+    /// Stops selecting the module `name` in `section` and drops its table.
+    pub fn remove_module(&mut self, section: &str, name: &str) {
+        let written = crate::module_name::short_form(section, name).to_owned();
+        self.section_modules_mut(section).remove(&written);
+    }
+
+    /// Selects the module `name` in `section`, with `settings` as its table,
+    /// which is what writing both in a document does.
+    ///
+    /// The section is the name's type folder, except for the sections that
+    /// Trusted Server reads itself and that also select modules, where the
+    /// name is written in full.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `settings` cannot be serialized to a table.
+    pub fn insert_module_config<T>(
+        &mut self,
+        section: &str,
+        name: &str,
+        settings: &T,
+    ) -> Result<(), Report<TrustedServerError>>
+    where
+        T: Serialize,
+    {
+        let JsonValue::Object(table) =
+            serde_json::to_value(settings).change_context(TrustedServerError::Configuration {
+                message: "Failed to serialize module configuration".to_string(),
+            })?
+        else {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!("the settings of `{name}` are not a table"),
+            }));
+        };
+        let written = crate::module_name::short_form(section, name).to_owned();
+        self.section_modules_mut(section).insert(&written, table);
+        Ok(())
+    }
+
+    /// Checks every section's selection and tables, and that no module is
+    /// selected in two sections.
+    ///
+    /// # Errors
+    ///
+    /// Naming the section at fault.
+    pub fn validate_module_sections(&self) -> Result<(), Report<TrustedServerError>> {
+        self.sections.validate()?;
+        for (section, modules) in [
+            ("proxy", &self.proxy.modules),
+            ("auction", &self.auction.modules),
+        ] {
+            modules
+                .validate(section)
+                .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
+        }
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for (section, modules) in self.module_sections() {
+            for written in modules.selected() {
+                let full = if written.contains('.') {
+                    written.clone()
+                } else {
+                    format!("{section}.{written}")
+                };
+                if let Some((earlier, _)) = seen.iter().find(|(_, name)| *name == full) {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "`{written}` is selected in both [{earlier}] and [{section}]. A \
+                             module is selected in one section"
+                        ),
+                    }));
+                }
+                seen.push((section, full));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the `DataDome` secret-store selectors a previous release read,
+    /// from the module's table when it is configured.
+    fn remove_legacy_static_secret_store_selectors(&mut self) {
+        let Some(datadome) = self
+            .sections
+            .0
+            .get_mut("bot-protection")
+            .and_then(|section| section.settings_of_mut("datadome"))
+        else {
+            return;
+        };
+
+        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
+        if let Some(bypass) = datadome
+            .get_mut("protection_test_bypass")
+            .and_then(JsonValue::as_object_mut)
+        {
+            removed |= bypass.remove("credential_secret_store").is_some();
+        }
+        if removed {
+            log::warn!(
+                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default secret store"
+            );
+        }
     }
 }
 
@@ -5032,7 +5073,8 @@ mod tests {
         // country, so both selector tables are reset to unset here.
         settings.geo = GeoConfig::default();
         settings.device = DeviceConfig::default();
-        settings.integration = IntegrationSettings::default();
+        settings.sections = TypeSections::default();
+        settings.auction.modules.clear();
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
@@ -5207,14 +5249,13 @@ module = \"none\"",
             max_body_bytes: 0,
         };
 
-        // `IntegrationSettings` stores integration configs as opaque JSON and
-        // relies on a hand-written `Debug` impl to suppress their values. That
-        // impl is the only thing keeping resolved DataDome credentials out of
-        // this output, so pin it here.
+        // A module's table is opaque JSON, and the section's hand-written
+        // `Debug` impl is the only thing keeping resolved DataDome
+        // credentials out of this output, so pin it here.
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                crate::integrations::datadome::MODULE,
                 &json!({
                     "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
                 }),
@@ -5701,8 +5742,9 @@ module = \"none\"",
     #[test]
     fn toml_settings_reject_legacy_auction_provider_list_with_migration_guidance() {
         let toml = format!(
-            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            "{}\n",
             crate_test_settings_str()
+                .replace("[auction]\n", "[auction]\nproviders = [\"prebid\"]\n")
         );
 
         let error = Settings::from_toml(&toml)
@@ -5981,21 +6023,21 @@ module = \"none\"",
 
         let settings = settings.expect("should parse valid TOML");
         let prebid_cfg = settings
-            .integration_config::<PrebidIntegrationConfig>("prebid")
+            .module_config::<PrebidIntegrationConfig>(crate::integrations::prebid::MODULE)
             .expect("Prebid config query should succeed")
             .expect("Prebid config should load from test settings");
         assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
-                .integration_config::<NextJsIntegrationConfig>("nextjs")
+                .module_config::<NextJsIntegrationConfig>(crate::integrations::nextjs::MODULE)
                 .expect("Next.js config query should succeed")
                 .is_none(),
-            "an integration the module list does not name should not run"
+            "a module no section selects should not run"
         );
         assert_eq!(
-            settings.integration.module,
-            vec!["prebid".to_owned()],
-            "the fixture should run exactly the integration it names"
+            settings.auction.modules.selected(),
+            ["prebid".to_owned()],
+            "the fixture should run exactly the module it selects"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
@@ -8294,212 +8336,228 @@ source_domain = "partner.example.com"
         );
     }
 
-    /// An integration `[integration] module` does not name has no
-    /// configuration, whatever else the settings hold.
+    /// A module no section selects has no configuration, whatever else the
+    /// settings hold.
     #[test]
-    fn an_integration_that_is_not_named_has_no_configuration() {
-        use crate::integrations::testlight::TestlightConfig;
+    fn a_module_that_is_not_selected_has_no_configuration() {
+        use crate::integrations::testlight::{self, TestlightConfig};
 
         let settings = create_test_settings();
 
         assert!(
-            !settings.integration.is_selected("testlight"),
-            "the shared fixture should not name testlight"
+            !settings.selects_module(testlight::MODULE),
+            "the shared fixture should not select testlight"
         );
         assert!(
             settings
-                .integration_config::<TestlightConfig>("testlight")
-                .expect("reading an unnamed integration should succeed")
+                .module_config::<TestlightConfig>(testlight::MODULE)
+                .expect("reading an unselected module should succeed")
                 .is_none(),
-            "an integration that is not named should have no configuration"
+            "a module that is not selected should have no configuration"
         );
     }
 
-    /// A named integration with no block of its own is read from an empty one,
-    /// so one that takes no settings runs on its id alone.
+    /// A selected module with no table of its own is read from an empty one,
+    /// so one that takes no settings runs on its selection alone.
     #[test]
-    fn a_named_integration_with_no_block_is_read_from_an_empty_one() {
-        use crate::integrations::osano::OsanoConfig;
+    fn a_selected_module_with_no_table_is_read_from_an_empty_one() {
+        use crate::integrations::osano::{self, OsanoConfig};
 
         let mut settings = create_test_settings();
-        settings.integration.select("osano");
+        settings.select_module("cmp", osano::MODULE);
 
         assert!(
             settings
-                .integration_config::<OsanoConfig>("osano")
-                .expect("an integration that takes no settings should read from an empty block")
+                .module_config::<OsanoConfig>(osano::MODULE)
+                .expect("a module that takes no settings should read from an empty table")
                 .is_some(),
-            "naming the integration should be the whole configuration"
+            "selecting the module should be the whole configuration"
         );
     }
 
-    /// The same empty block makes an integration that requires a setting report
-    /// the setting it is missing, rather than starting without it.
+    /// The same empty table makes a module that requires a setting report the
+    /// setting it is missing, rather than starting without it.
     #[test]
-    fn a_named_integration_without_a_required_setting_names_it() {
-        use crate::integrations::testlight::TestlightConfig;
+    fn a_selected_module_without_a_required_setting_names_it() {
+        use crate::integrations::testlight::{self, TestlightConfig};
 
         let mut settings = create_test_settings();
-        settings.integration.select("testlight");
+        settings.select_module("auction", testlight::MODULE);
 
         let error = settings
-            .integration_config::<TestlightConfig>("testlight")
-            .expect_err("should reject a named integration with no endpoint");
+            .module_config::<TestlightConfig>(testlight::MODULE)
+            .expect_err("should reject a selected module with no endpoint");
 
         let rendered = error.to_string();
         assert!(
             rendered.contains("testlight") && rendered.contains("endpoint"),
-            "should name the integration and the missing setting: {rendered}"
+            "should name the module and the missing setting: {rendered}"
         );
     }
 
     #[test]
     fn removed_integration_fields_are_rejected() {
-        for (integration_id, removed_field) in
-            [("prebid", "server_url"), ("datadome", "account_id")]
-        {
-            let mut settings = create_test_settings();
-            settings
-                .integration
-                .insert_config(
-                    integration_id,
-                    &json!({
-                        (removed_field): "removed-value",
-                    }),
-                )
-                .expect("should insert removed integration config field");
+        use crate::integrations::{datadome, prebid};
 
-            let error = match integration_id {
-                "prebid" => settings
-                    .integration_config::<PrebidIntegrationConfig>(integration_id)
-                    .expect_err("should reject the removed Prebid field"),
-                "datadome" => settings
-                    .integration_config::<crate::integrations::datadome::DataDomeConfig>(
-                        integration_id,
-                    )
-                    .expect_err("should reject the removed DataDome field"),
-                _ => unreachable!("test integration ID should be known"),
-            };
-            assert!(
-                format!("{error:?}").contains(removed_field),
-                "should identify removed field `{removed_field}`: {error:?}"
-            );
-        }
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "auction",
+                prebid::MODULE,
+                &json!({ "server_url": "removed-value" }),
+            )
+            .expect("should insert the removed Prebid field");
+        let error = settings
+            .module_config::<PrebidIntegrationConfig>(prebid::MODULE)
+            .expect_err("should reject the removed Prebid field");
+        assert!(
+            format!("{error:?}").contains("server_url"),
+            "should identify the removed field: {error:?}"
+        );
+
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "bot-protection",
+                datadome::MODULE,
+                &json!({ "account_id": "removed-value" }),
+            )
+            .expect("should insert the removed DataDome field");
+        let error = settings
+            .module_config::<datadome::DataDomeConfig>(datadome::MODULE)
+            .expect_err("should reject the removed DataDome field");
+        assert!(
+            format!("{error:?}").contains("account_id"),
+            "should identify the removed field: {error:?}"
+        );
     }
 
-    /// A block written for an integration the module list does not name is
-    /// refused, rather than sitting in the configuration doing nothing.
+    /// A table written for a module its section does not select is refused,
+    /// rather than sitting in the configuration doing nothing.
     #[test]
-    fn a_block_for_an_integration_that_is_not_named_is_refused() {
+    fn a_table_for_a_module_that_is_not_selected_is_refused() {
         let toml = format!(
-            "{}\n[integration.osano]\n",
-            crate_test_settings_str().replace(
-                "module = [\"prebid\"]",
-                "module = [\"prebid\"]\n\n[integration.nextjs]\nrewrite_attributes = [\"href\"]",
-            )
+            "{}\n[testing]\nmodule = \"example\"\n\n[testing.another]\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("should reject a table nothing selects");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[testing.another] is configured")
+                && rendered.contains("does not select"),
+            "should name the table and the selection it is missing from: {rendered}"
+        );
+    }
+
+    /// A module type's section that selects nothing is refused, which is also
+    /// what a misspelt section of Trusted Server's own meets.
+    #[test]
+    fn a_section_that_selects_no_module_is_refused() {
+        let toml = format!(
+            "{}\n[framework.nextjs]\nrewrite_attributes = [\"href\"]\n",
+            crate_test_settings_str()
         );
 
         let error =
-            Settings::from_toml(&toml).expect_err("should reject blocks nothing on the list names");
-        let rendered = format!("{error:?}");
+            Settings::from_toml(&toml).expect_err("should reject a section selecting nothing");
 
         assert!(
-            rendered.contains("[integration.nextjs]") && rendered.contains("[integration.osano]"),
-            "should name every block that is not on the list: {rendered}"
-        );
-        assert!(
-            rendered.contains("[integration] module"),
-            "should say where to name the integration instead: {rendered}"
+            format!("{error:?}").contains("[framework] selects no module"),
+            "should name the section: {error:?}"
         );
     }
 
-    /// The removed `enabled` key is refused where it is written, so a
-    /// configuration carried over from the previous release cannot read as
-    /// switched off while the integration runs.
+    /// A key left in a module's table that its settings do not have, such as
+    /// the removed `enabled`, is refused when the module reads its table, so a
+    /// configuration cannot read as switched off while the module runs.
     #[test]
-    fn an_enabled_key_left_in_a_block_is_refused() {
-        let toml = crate_test_settings_str().replace(
-            "[integration.prebid]",
-            "[integration.prebid]\nenabled = false",
-        );
-
-        let error = Settings::from_toml(&toml).expect_err("should reject a leftover enabled key");
-        let rendered = format!("{error:?}");
-
-        assert!(
-            rendered.contains("[integration.prebid]") && rendered.contains("enabled"),
-            "should name the block and the key: {rendered}"
-        );
-        assert!(
-            rendered.contains("[integration] module"),
-            "should say what switches an integration on instead: {rendered}"
-        );
-    }
-
-    /// Naming one integration twice is a mistake rather than a way of running
-    /// it twice, so it is refused.
-    #[test]
-    fn naming_an_integration_twice_is_refused() {
+    fn an_enabled_key_left_in_a_table_is_refused() {
         let toml = crate_test_settings_str()
-            .replace("module = [\"prebid\"]", "module = [\"prebid\", \"prebid\"]");
+            .replace("[auction.prebid]", "[auction.prebid]\nenabled = false");
+        let settings = Settings::from_toml(&toml).expect("core reads no module's table itself");
 
-        let error = Settings::from_toml(&toml).expect_err("should reject a repeated id");
+        let error = settings
+            .module_config::<PrebidIntegrationConfig>(crate::integrations::prebid::MODULE)
+            .expect_err("should reject a leftover enabled key");
+        let rendered = format!("{error:?}");
+
+        assert!(
+            rendered.contains("[auction.prebid]") && rendered.contains("enabled"),
+            "should name the table and the key: {rendered}"
+        );
+    }
+
+    /// Naming one module twice is a mistake rather than a way of running it
+    /// twice, so it is refused.
+    #[test]
+    fn naming_a_module_twice_is_refused() {
+        let toml = crate_test_settings_str().replace(
+            "modules = [\"prebid\"]",
+            "modules = [\"prebid\", \"prebid\"]",
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("should reject a repeated name");
 
         assert!(
             format!("{error:?}").contains("more than once"),
-            "should report the repeated id: {error:?}"
+            "should report the repeated name: {error:?}"
         );
     }
 
-    /// The table this release removed is refused with the move spelled out,
-    /// rather than with a bare unknown-field error.
+    /// The tables removed from the configuration are refused with the move
+    /// spelled out, rather than with a bare unknown-field error.
     #[test]
-    fn the_removed_integrations_table_is_refused_with_directions() {
-        let toml = crate_test_settings_str().replace("[integration]", "[integrations]");
+    fn the_removed_integration_tables_are_refused_with_directions() {
+        for (table, expected) in [
+            ("[integrations.example]", "CHANGELOG.md"),
+            (
+                "[integration]\nmodules = [\"example\"]",
+                "is no longer read",
+            ),
+        ] {
+            let toml = format!("{}\n{table}\n", crate_test_settings_str());
 
-        let error = Settings::from_toml(&toml).expect_err("should reject the removed table");
-        let rendered = format!("{error:?}");
+            let error = Settings::from_toml(&toml).expect_err("should reject the removed table");
+            let rendered = format!("{error:?}");
 
-        assert!(
-            rendered.contains("[integration.<id>]") && rendered.contains("[integration] module"),
-            "should say where the blocks moved: {rendered}"
-        );
-        assert!(
-            rendered.contains("CHANGELOG.md"),
-            "should point at the migration: {rendered}"
-        );
+            assert!(
+                rendered.contains("the section of its type") && rendered.contains(expected),
+                "should say where modules are selected now: {rendered}"
+            );
+        }
     }
 
     /// The same refusal reaches a configuration blob, which is the shape the
     /// runtime loads rather than TOML.
     #[test]
-    fn json_settings_refuse_the_removed_integrations_table() {
-        let mut value = serde_json::to_value(create_test_settings())
-            .expect("should serialize the test settings fixture to JSON");
-        let settings = value
-            .as_object_mut()
-            .expect("settings should serialize as an object");
-        let integration = settings
-            .remove("integration")
-            .expect("the fixture should serialize its integration table");
-        settings.insert("integrations".to_owned(), integration);
+    fn json_settings_refuse_the_removed_integration_tables() {
+        for table in ["integrations", "integration"] {
+            let mut value = serde_json::to_value(create_test_settings())
+                .expect("should serialize the test settings fixture to JSON");
+            value
+                .as_object_mut()
+                .expect("settings should serialize as an object")
+                .insert(table.to_owned(), json!({ "example": {} }));
 
-        let error =
-            Settings::from_json_value(value).expect_err("should reject the removed table in JSON");
+            let error = Settings::from_json_value(value)
+                .expect_err("should reject the removed table in JSON");
 
-        assert!(
-            format!("{error:?}").contains("[integration] module"),
-            "should say where the blocks moved: {error:?}"
-        );
+            assert!(
+                format!("{error:?}").contains("the section of its type"),
+                "should say where modules are selected now: {error:?}"
+            );
+        }
     }
 
     #[test]
-    fn invalid_settings_for_a_named_integration_fail_registry_startup() {
+    fn invalid_settings_for_a_selected_module_fail_registry_startup() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "gpt",
+            .insert_module_config(
+                "ad-tag",
+                crate::integrations::gpt::MODULE,
                 &json!({
                     "script_url": "not a url",
                 }),
@@ -8513,12 +8571,12 @@ source_domain = "partner.example.com"
                     .expect("should compile auction plan"),
             ),
         ) {
-            Ok(_) => panic!("a named integration with invalid settings should fail startup"),
+            Ok(_) => panic!("a selected module with invalid settings should fail startup"),
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("Integration 'gpt'"),
-            "should identify the invalid integration config"
+            format!("{err:?}").contains("[ad-tag.google]"),
+            "should identify the invalid module table: {err:?}"
         );
     }
 
@@ -8574,11 +8632,8 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_creative_processing_defaults_when_omitted() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            "#;
+        let toml_str =
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n");
 
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
 
@@ -8594,12 +8649,10 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_rewrite_creatives_accepts_explicit_false() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            rewrite_creatives = false
-            "#;
+        let toml_str = crate_test_settings_str().replace(
+            "[auction]\n",
+            "[auction]\nenabled = true\nrewrite_creatives = false\n",
+        );
 
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
 
@@ -8620,12 +8673,7 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_allowed_context_keys_from_toml() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            allowed_context_keys = ["permutive_segments", "lockr_ids"]
-            "#;
+        let toml_str = crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\nallowed_context_keys = [\"permutive_segments\", \"lockr_ids\"]\n");
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert_eq!(
             settings.auction.allowed_context_keys,
@@ -8635,12 +8683,10 @@ source_domain = "partner.example.com"
 
     #[test]
     fn test_auction_empty_allowed_context_keys_blocks_all() {
-        let toml_str = crate_test_settings_str()
-            + r#"
-            [auction]
-            enabled = true
-            allowed_context_keys = []
-            "#;
+        let toml_str = crate_test_settings_str().replace(
+            "[auction]\n",
+            "[auction]\nenabled = true\nallowed_context_keys = []\n",
+        );
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert!(
             settings.auction.allowed_context_keys.is_empty(),
@@ -8659,6 +8705,7 @@ source_domain = "partner.example.com"
                 "*.Example.Org".to_string(),
             ],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8679,6 +8726,7 @@ source_domain = "partner.example.com"
                 "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8694,6 +8742,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8709,6 +8758,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert!(
@@ -8723,6 +8773,7 @@ source_domain = "partner.example.com"
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert!(
@@ -8741,6 +8792,7 @@ source_domain = "partner.example.com"
                 origin_url: "  https://assets.example.com  ".to_string(),
                 ..Default::default()
             }],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
         assert_eq!(
@@ -8765,6 +8817,7 @@ source_domain = "partner.example.com"
                 target_path: Some("  /rewritten/$1  ".to_string()),
                 ..Default::default()
             }],
+            modules: SectionModules::default(),
         };
         proxy.normalize();
 
@@ -9244,6 +9297,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            modules: SectionModules::default(),
         };
 
         let route = proxy
@@ -9272,6 +9326,7 @@ source_domain = "partner.example.com"
                     ..Default::default()
                 },
             ],
+            modules: SectionModules::default(),
         };
 
         let route = proxy

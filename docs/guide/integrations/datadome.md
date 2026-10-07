@@ -32,10 +32,10 @@ The DataDome integration can:
 Add the following to your `trusted-server.toml`:
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[integration.datadome]
+[bot-protection.datadome]
 
 # First-party JavaScript/proxy layer
 sdk_origin = "https://js.datadome.co"
@@ -62,7 +62,7 @@ inject_client_side_tag = true
 client_side_tag_url = "/integrations/datadome/tags.js"
 client_side_configuration = { ajaxListenerPath = true }
 
-[[integration.datadome.protection_exclusion_rules]]
+[[bot-protection.datadome.protection_exclusion_rules]]
 id = "default-static-assets"
 type = "path_regex"
 patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"]
@@ -100,10 +100,10 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 Set `client_side_key` to have Trusted Server inject the DataDome browser tag into processed HTML responses:
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[integration.datadome]
+[bot-protection.datadome]
 client_side_key = "YOUR_DATADOME_JS_KEY"
 inject_client_side_tag = true
 ```
@@ -121,10 +121,10 @@ Trusted Server emits the DataDome configuration before the Trusted Server JavaSc
 If your site already manages the DataDome tag, disable auto-injection:
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[integration.datadome]
+[bot-protection.datadome]
 inject_client_side_tag = false
 ```
 
@@ -167,7 +167,7 @@ When `enable_protection = true`, Trusted Server calls DataDome before normal rou
 
 A request is protected when all of the following are true:
 
-1. `[integration] module` names the DataDome integration.
+1. `[bot-protection] module` selects DataDome.
 2. `enable_protection = true`.
 3. The method is not listed in `protection_excluded_methods`.
 4. The path is not one of Trusted Server's internal routes.
@@ -188,10 +188,10 @@ Protection API:
 
 ```toml
 # Runtime activation also requires FASTLY_IS_STAGING=1.
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[integration.datadome.protection_test_bypass]
+[bot-protection.datadome.protection_test_bypass]
 enabled = true
 credential_secret_name = "datadome_test_bypass"
 ```
@@ -271,10 +271,10 @@ fields. For example:
 Use structured rules for all DataDome protection exclusions. Each rule has an `id`, optional `methods`, and a typed matcher. The default configuration includes a `path_regex` rule for common static assets.
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[[integration.datadome.protection_exclusion_rules]]
+[[bot-protection.datadome.protection_exclusion_rules]]
 id = "legacy-static-get-head"
 methods = ["GET", "HEAD"]
 type = "path_regex"
@@ -284,7 +284,7 @@ patterns = [
   "^/robots\\.txt$",
 ]
 
-[[integration.datadome.protection_exclusion_rules]]
+[[bot-protection.datadome.protection_exclusion_rules]]
 id = "next-rsc"
 methods = ["GET", "HEAD"]
 type = "query_param_non_empty"
@@ -304,10 +304,10 @@ Supported rule types are:
 Config Store-backed CIDR sources accept newline-, comma-, whitespace-, or JSON-array encoded CIDR lists. They are useful for large or frequently updated vendor crawler lists.
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[[integration.datadome.protection_excluded_ip_cidr_sources]]
+[[bot-protection.datadome.protection_excluded_ip_cidr_sources]]
 config_store = "datadome-ip-bypass"
 key = "googlebot_ips"
 ```
@@ -382,13 +382,13 @@ sequenceDiagram
 Override configuration via environment variables:
 
 ```bash
-TRUSTED_SERVER__INTEGRATION__DATADOME__SDK_ORIGIN=https://js.datadome.co
-TRUSTED_SERVER__INTEGRATION__DATADOME__API_ORIGIN=https://api-js.datadome.co
-TRUSTED_SERVER__INTEGRATION__DATADOME__CACHE_TTL_SECONDS=3600
-TRUSTED_SERVER__INTEGRATION__DATADOME__REWRITE_SDK=true
-TRUSTED_SERVER__INTEGRATION__DATADOME__ENABLE_PROTECTION=true
-TRUSTED_SERVER__INTEGRATION__DATADOME__SERVER_SIDE_KEY_SECRET_NAME=datadome_server_side_key
-TRUSTED_SERVER__INTEGRATION__DATADOME__CLIENT_SIDE_KEY=your-client-side-key
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__SDK_ORIGIN=https://js.datadome.co
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__API_ORIGIN=https://api-js.datadome.co
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__CACHE_TTL_SECONDS=3600
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__REWRITE_SDK=true
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__ENABLE_PROTECTION=true
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__SERVER_SIDE_KEY_SECRET_NAME=datadome_server_side_key
+TRUSTED_SERVER__BOT-PROTECTION__DATADOME__CLIENT_SIDE_KEY=your-client-side-key
 ```
 
 ## Client-side script guard
@@ -407,11 +407,11 @@ This keeps DataDome scripts routed through first-party context, even when insert
 
 ### Script not loading
 
-Check that `[integration] module` names the integration:
+Check that `[bot-protection]` selects the module:
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 ```
 
 If you rely on auto-injection, verify `client_side_key` is non-empty and `inject_client_side_tag = true`.
@@ -429,10 +429,10 @@ curl -X POST https://www.example.com/integrations/datadome/js/check
 Check that both fields are configured:
 
 ```toml
-[integration]
-module = ["datadome"]
+[bot-protection]
+module = "datadome"
 
-[integration.datadome]
+[bot-protection.datadome]
 enable_protection = true
 server_side_key_secret_name = "datadome_server_side_key"
 ```

@@ -7891,17 +7891,17 @@ mod tests {
 
     fn scheduling_settings() -> Settings {
         let toml = format!(
-            "{}\n[auction]\nenabled = true\n\n\
+            "{}\n\
              [creative_opportunities]\ngam_network_id = \"12345\"\n",
-            crate_test_settings_str()
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
         );
         let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
         settings.demand = crate::auction::test_support::demand_named(&[SCHEDULING_PROVIDER]);
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "client_side_key": "scheduling-test-key",
                 }),
@@ -8567,7 +8567,7 @@ mod tests {
     #[test]
     fn auction_debug_comment_never_leaks_provider_debug_metadata() {
         // A provider response whose `debug` metadata mirrors the shape prebid
-        // stores verbatim when `[integration.prebid].debug` is on: the resolved
+        // stores verbatim when `[auction.prebid].debug` is on: the resolved
         // OpenRTB request carrying the visitor's identity graph. The dump must
         // drop it — only allowlisted keys may reach the DOM.
         let response = AuctionResponse::error("prebid", 12)
@@ -9281,7 +9281,7 @@ mod tests {
     #[test]
     fn stream_publisher_body_injects_active_diagnostics_for_materialized_html() {
         let mut settings = create_test_settings();
-        settings.integration.select("gpt_diagnostics");
+        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
         let integration_registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -9781,7 +9781,8 @@ mod tests {
                 "fingerprint-probe",
                 registration,
                 validate_nothing,
-            )];
+            )
+            .with_module_name("testing.probe")];
             let registry = IntegrationRegistry::with_registrations(settings, &extra)
                 .expect("should build a registry with a carried module");
             template_fingerprint(settings, &registry)
@@ -9790,22 +9791,24 @@ mod tests {
         /// Base settings with one integration's config replaced, and the
         /// integration itself run or not.
         ///
-        /// Edits the parsed `[integration]` map rather than appending TOML, so the two
+        /// Edits the parsed `[auction]` section rather than appending TOML, so the two
         /// fixtures differ in exactly the field under test — the base settings already
-        /// declare `[integration.prebid]`, and a second table would not parse.
+        /// declare `[auction.prebid]`, and a second table would not parse.
         fn settings_with_prebid(runs: bool, timeout_ms: u32) -> Settings {
             let mut settings = create_test_settings();
             if runs {
-                settings.integration.insert(
-                    "prebid".to_string(),
-                    serde_json::json!({
-                        "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                        "timeout_ms": timeout_ms,
-                    }),
-                );
+                settings
+                    .insert_module_config(
+                        "auction",
+                        "auction.prebid",
+                        &serde_json::json!({
+                            "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                            "timeout_ms": timeout_ms,
+                        }),
+                    )
+                    .expect("should insert the prebid table");
             } else {
-                settings.integration.module.clear();
-                settings.integration.remove("prebid");
+                settings.auction.modules.clear();
             }
             settings
         }
@@ -9861,8 +9864,8 @@ mod tests {
         #[test]
         fn a_context_key_allowlist_fingerprints_identically_across_parses() {
             let source = format!(
-                "{}\n[auction]\nallowed_context_keys = [\"zeta\", \"alpha\", \"gamma\", \"beta\", \"epsilon\", \"delta\"]\n",
-                crate_test_settings_str()
+                "{}\n",
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nallowed_context_keys = [\"zeta\", \"alpha\", \"gamma\", \"beta\", \"epsilon\", \"delta\"]\n")
             );
             let first = Settings::from_toml(&source).expect("should parse context allowlist");
             let registry = test_registry(&create_test_settings());
@@ -9902,7 +9905,7 @@ mod tests {
             // hash built from that map alone would not move when the vendor
             // rebuilt its bundle and a cached template would keep the stale `?v=`.
             let mut settings = create_test_settings();
-            settings.integration.select("probe");
+            settings.select_module("testing", "testing.probe");
 
             assert_ne!(
                 fingerprint_with_carried(&settings, carrying_before),
@@ -10526,14 +10529,14 @@ mod tests {
         /// was reading that stamp and refusing to cache every page that runs ads.
         fn settings_with_mode(mode: &str) -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n\
+                "{}\n\
                  [creative_opportunities]\ngam_network_id = \"99999\"\n\
                  assembly_mode = \"{mode}\"\n\n\
                  [[creative_opportunities.slot]]\n\
                  id = \"test-slot\"\n\
                  page_patterns = [\"/article\"]\n\
                  formats = [{{ width = 728, height = 90 }}]\n",
-                crate_test_settings_str()
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             let mut settings =
                 Settings::from_toml(&toml).expect("should parse settings with an assembly mode");
@@ -13028,9 +13031,9 @@ mod tests {
             let mut settings = settings_with_mode("esi");
             settings.publisher.origin_url = "https://origin.example.com".to_owned();
             settings
-                .integration
-                .insert_config(
-                    "nextjs",
+                .insert_module_config(
+                    "framework",
+                    "framework.nextjs",
                     &serde_json::json!({
                         "rewrite_attributes": ["href", "link", "url"],
                     }),
@@ -13420,17 +13423,20 @@ mod tests {
 
         /// [`settings_with_mode`], with one integration configured a stated way.
         ///
-        /// Edits the parsed `[integration]` map rather than appending TOML, so two
+        /// Edits the parsed `[auction]` section rather than appending TOML, so two
         /// fixtures differ in exactly the field under test.
         fn settings_with_prebid_timeout(mode: &str, timeout_ms: u32) -> Settings {
             let mut settings = settings_with_mode(mode);
-            settings.integration.insert(
-                "prebid".to_string(),
-                serde_json::json!({
-                    "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                    "timeout_ms": timeout_ms,
-                }),
-            );
+            settings
+                .insert_module_config(
+                    "auction",
+                    "auction.prebid",
+                    &serde_json::json!({
+                        "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                        "timeout_ms": timeout_ms,
+                    }),
+                )
+                .expect("should insert the prebid table");
             settings
         }
 
@@ -13484,7 +13490,7 @@ mod tests {
             );
             assert_ne!(
                 stored[0], stored[1],
-                "two `[integration]` configurations must key different templates, because \
+                "two `[auction.prebid]` configurations must key different templates, because \
                  one key serves the first configuration's injected markup to the second"
             );
             assert_eq!(
@@ -13502,7 +13508,7 @@ mod tests {
             // moves between two equal configurations is a cache that never hits, which
             // this would read as "no measurable benefit" rather than as a bug.
             //
-            // The two `Settings` are parsed independently, so their `[integration]`
+            // The two `Settings` are parsed independently, so their `[auction.prebid]`
             // maps iterate in different orders — which is what exercises the sort.
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -14818,14 +14824,14 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.integration
-                .insert_config(
-                    "datadome",
-                    &serde_json::json!({
-                        "client_side_key": "test-client-key",
-                    }),
-                )
-                .expect("should configure DataDome integration");
+            raw.insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
+                &serde_json::json!({
+                    "client_side_key": "test-client-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -14882,7 +14888,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.integration.select("gpt_diagnostics");
+            raw.select_module("ad-tag", "ad-tag.google.diagnostics");
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -14930,7 +14936,7 @@ mod tests {
                 .as_mut()
                 .expect("fixture configures creative opportunities")
                 .origin_is_cookie_independent = Some(true);
-            raw.integration.select("gpt_diagnostics");
+            raw.select_module("ad-tag", "ad-tag.google.diagnostics");
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
@@ -16897,27 +16903,27 @@ mod tests {
 
         fn settings_with_enabled_auction_and_creative_opportunities() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n\
+                "{}\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             settings_from_toml(&toml)
         }
 
         fn settings_with_disabled_ad_templates() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n\
+                "{}\n\
                  [creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             settings_from_toml(&toml)
         }
 
         fn settings_with_disabled_auction() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = false\n\n\
+                "{}\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = false\n")
             );
             settings_from_toml(&toml)
         }
@@ -16928,9 +16934,9 @@ mod tests {
 
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[demand]\nmodules = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[demand]\nmodules = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             settings_from_toml(&toml)
         }
@@ -17801,7 +17807,7 @@ mod tests {
         async fn inactive_ad_stack_preserves_gpt_diagnostics_cache_privacy() {
             // Arrange
             let mut settings = settings_with_disabled_ad_templates();
-            settings.integration.select("gpt_diagnostics");
+            settings.select_module("ad-tag", "ad-tag.google.diagnostics");
             let stub = Arc::new(StubHttpClient::new());
             queue_html_response_with_cache_control(&stub, "no-cache");
             let services = build_services_with_http_client(
@@ -18419,9 +18425,9 @@ mod tests {
     async fn datadome_filter_marker_survives_into_publisher_html_pipeline() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "enable_protection": true,
                     "server_side_key_secret_name": "server-side-key",
@@ -18493,9 +18499,9 @@ mod tests {
     fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "client_side_key": "test-client-key",
                 }),
@@ -19742,7 +19748,7 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_diagnostics_standalone_without_cookie_variance() {
         let mut settings = create_test_settings();
-        settings.integration.select("gpt_diagnostics");
+        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -19796,13 +19802,14 @@ mod tests {
     #[test]
     fn parse_single_module_filename_resolves_a_carried_module_id() {
         let mut settings = create_test_settings();
-        settings.integration.select("probe");
+        settings.select_module("testing", "testing.probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "seam-probe",
             carried_probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build a registry with a carried module");
 
@@ -19871,8 +19878,7 @@ mod tests {
         let mut settings = create_test_settings();
         // The shared fixture names prebid, and this asks what is served when
         // it does not.
-        settings.integration.module.clear();
-        settings.integration.remove("prebid");
+        settings.auction.modules.clear();
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -20022,13 +20028,14 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_a_carried_module_in_the_unified_bundle_under_the_composed_hash() {
         let mut settings = create_test_settings();
-        settings.integration.select("probe");
+        settings.select_module("testing", "testing.probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "seam-probe",
             carried_probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build a registry with a carried module");
         let parts = registry.js_parts_immediate();
@@ -20061,13 +20068,14 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_a_carried_deferred_module_standalone() {
         let mut settings = create_test_settings();
-        settings.integration.select("probe");
+        settings.select_module("testing", "testing.probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "seam-probe",
             carried_deferred_probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build a registry with a carried deferred module");
         let request = build_request(
@@ -20116,16 +20124,20 @@ mod tests {
         // reintroduced constant would fail this test rather than pass it.
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config("lockr", &serde_json::json!({"app_id": "test-app-id" }))
+            .insert_module_config(
+                "identity",
+                "identity.lockr",
+                &serde_json::json!({"app_id": "test-app-id" }),
+            )
             .expect("should insert lockr config");
-        settings.integration.select("probe");
+        settings.select_module("testing", "testing.probe");
         let extra = [IntegrationBuilder::new(
             "probe",
             "standalone-probe",
             carried_standalone_probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build a registry with a carried standalone module");
         assert!(
@@ -21495,9 +21507,9 @@ mod tests {
     fn streaming_finalize_emits_gam_attribution_head_before_origin_eof() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "gpt",
+            .insert_module_config(
+                "ad-tag",
+                "ad-tag.google",
                 &serde_json::json!({
                     "gam_attribution_enabled": true
                 }),
@@ -21571,9 +21583,9 @@ mod tests {
         let page = br#"<html><head></head><body><script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","text":"</body>"}'])</script><article>still streaming</article>"#;
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -21753,9 +21765,9 @@ mod tests {
             settings.auction.provider_names = vec!["seam_test".to_owned()];
             settings.auction.timeout_ms = 60_000;
             settings
-                .integration
-                .insert_config(
-                    "nextjs",
+                .insert_module_config(
+                    "framework",
+                    "framework.nextjs",
                     &serde_json::json!({
                         "rewrite_attributes": ["href", "link", "url"],
                     }),
@@ -22575,9 +22587,9 @@ mod tests {
         // Configure nextjs so a stream processor is registered.
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -22661,9 +22673,9 @@ mod tests {
     fn document_state_placeholders_substitute_through_streaming_path() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -23011,7 +23023,7 @@ mod tests {
                 "no token should be minted without the diagnostics integration"
             );
 
-            settings.integration.select("gpt_diagnostics");
+            settings.select_module("ad-tag", "ad-tag.google.diagnostics");
             let first =
                 diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
             let second =
@@ -24505,8 +24517,8 @@ mod tests {
 
         fn settings_with_co() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                "{}\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
@@ -24514,23 +24526,26 @@ mod tests {
         /// Settings for a deployment that has no `[creative_opportunities]`
         /// section, so page-bids answers `404`.
         fn settings_without_co() -> Settings {
-            let toml = format!("{}\n[auction]\nenabled = true\n", crate_test_settings_str());
+            let toml = format!(
+                "{}\n",
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
+            );
             Settings::from_toml(&toml)
                 .expect("should parse settings without creative_opportunities")
         }
 
         fn settings_with_co_auction_disabled() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = false\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                "{}\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = false\n")
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
         fn settings_with_co_templates_disabled() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                "{}\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             Settings::from_toml(&toml).expect("should parse settings with disabled templates")
         }
@@ -24731,7 +24746,7 @@ mod tests {
             let mut settings = settings_with_co();
             settings.demand =
                 crate::auction::test_support::demand_named(&[AUCTION_ID_TEST_PROVIDER]);
-            settings.integration.select("gpt_diagnostics");
+            settings.select_module("ad-tag", "ad-tag.google.diagnostics");
             let slots = article_slot();
             let winning_stub = Arc::new(StubHttpClient::new());
             winning_stub.push_response(200, b"winner".to_vec());
@@ -24885,7 +24900,7 @@ mod tests {
             let mut settings = settings_with_co();
             settings.demand =
                 crate::auction::test_support::demand_named(&[AUCTION_ID_TEST_PROVIDER]);
-            settings.integration.select("gpt_diagnostics");
+            settings.select_module("ad-tag", "ad-tag.google.diagnostics");
 
             let first = winning_auction_id(&settings)
                 .await
@@ -24898,10 +24913,7 @@ mod tests {
                 "each auction for the same visitor should mint its own token"
             );
 
-            settings
-                .integration
-                .module
-                .retain(|id| id != "gpt_diagnostics");
+            settings.remove_module("ad-tag", "ad-tag.google.diagnostics");
             assert_eq!(
                 winning_auction_id(&settings).await,
                 None,
@@ -25573,9 +25585,9 @@ mod tests {
 
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[demand]\nmodules = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[demand]\nmodules = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
+                crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
             settings_from_toml(&toml)
         }

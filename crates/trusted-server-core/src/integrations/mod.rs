@@ -290,13 +290,12 @@ pub(crate) async fn collect_response_bounded(
 /// Builds an integration's registration from settings, or `None` when the
 /// settings give it nothing to register.
 ///
-/// The registry calls this only for an integration `[integration] module`
-/// names, so an integration runs exactly when an operator names it.
+/// The registry calls this only for an integration a section selects, so an integration runs exactly when an operator names it.
 pub type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
 
 /// Validates an integration's configuration for deployment and reports
-/// whether `[integration] module` names it.
+/// whether a section selects it.
 ///
 /// Runs for every builder, named or not, so one builder's rules cannot be
 /// skipped by the order the builders happen to be in. At deploy time secret
@@ -307,7 +306,7 @@ pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedSer
 /// Prepares a request before routing, for every routed request except the
 /// health check.
 ///
-/// Runs whether or not `[integration] module` names the integration, so one
+/// Runs whether or not a section selects the integration, so one
 /// can strip its own reserved query or cookie in a deployment that does not
 /// run it.
 pub type IntegrationPrepareRequestFn =
@@ -343,11 +342,12 @@ pub const CORE_SOURCE: &str = "trusted-server-core";
 /// }
 ///
 /// # fn demo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-/// let builder = IntegrationBuilder::new("example", "example-crate", build, validate);
-/// // The registry builds an integration `[integration] module` names, so a
-/// // deployment that wants this one writes `module = ["example"]`.
+/// let builder = IntegrationBuilder::new("example", "example-crate", build, validate)
+///     .with_module_name("testing.example");
+/// // The registry builds a module a section selects, so a deployment that
+/// // wants this one writes `[testing] modules = ["example"]`.
 /// let mut settings = settings.clone();
-/// settings.integration.select("example");
+/// settings.select_module("testing", "testing.example");
 /// let plan = Arc::new(compile_auction_plan(&settings)?);
 /// let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder])?;
 /// assert!(registry.integration_runs("example"));
@@ -364,6 +364,8 @@ pub struct IntegrationBuilder {
     supplies_integration: bool,
     demand: Option<&'static DemandImplementation>,
     adserver: Option<&'static AdServerImplementation>,
+    module: Option<&'static str>,
+    section: Option<&'static str>,
 }
 
 /// The build function of a builder that supplies no page integration.
@@ -397,6 +399,8 @@ impl IntegrationBuilder {
             supplies_integration: true,
             demand: None,
             adserver: None,
+            module: None,
+            section: None,
         }
     }
 
@@ -417,6 +421,8 @@ impl IntegrationBuilder {
             supplies_integration: false,
             demand: None,
             adserver: None,
+            module: None,
+            section: None,
         }
     }
 
@@ -465,6 +471,40 @@ impl IntegrationBuilder {
         self
     }
 
+    /// Runs this builder when a section selects the module `name`, which is
+    /// the module's crate path with `.` between the parts, such as
+    /// `cmp.example`, or a bare name for one of core's own.
+    #[must_use]
+    pub const fn with_module_name(mut self, name: &'static str) -> Self {
+        self.module = Some(name);
+        self
+    }
+
+    /// The name a section selects this builder's module by, when it has one.
+    #[must_use]
+    pub const fn module_name(&self) -> Option<&'static str> {
+        self.module
+    }
+
+    /// Names the section that selects this module, for one selected outside
+    /// the section of its type, such as a module of core's own in a section
+    /// of core's.
+    #[must_use]
+    pub const fn selected_in(mut self, section: &'static str) -> Self {
+        self.section = Some(section);
+        self
+    }
+
+    /// The section that selects this builder's module: the one
+    /// [`selected_in`](Self::selected_in) named, or else its type's.
+    #[must_use]
+    pub fn section(&self) -> Option<&'static str> {
+        self.section.or_else(|| {
+            self.module
+                .and_then(|name| name.split_once('.').map(|(folder, _)| folder))
+        })
+    }
+
     /// The integration id this builder produces.
     #[must_use]
     pub const fn id(&self) -> &'static str {
@@ -491,7 +531,7 @@ impl IntegrationBuilder {
     }
 
     /// Validates the integration's configuration for deployment and reports
-    /// whether `[integration] module` names the integration.
+    /// whether a section selects the integration's module.
     ///
     /// # Errors
     ///
@@ -511,56 +551,20 @@ impl IntegrationBuilder {
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // This must remain first: attribute rewriters chain replacements and
     // short-circuit removals.
-    IntegrationBuilder::new(
-        js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
-        CORE_SOURCE,
-        js_asset_proxy::register,
-        js_asset_proxy::validate,
-    ),
-    IntegrationBuilder::new(
-        "testlight",
-        CORE_SOURCE,
-        testlight::register,
-        testlight::validate,
-    ),
-    IntegrationBuilder::new("nextjs", CORE_SOURCE, nextjs::register, nextjs::validate),
-    IntegrationBuilder::new(
-        "permutive",
-        CORE_SOURCE,
-        permutive::register,
-        permutive::validate,
-    ),
-    IntegrationBuilder::new("lockr", CORE_SOURCE, lockr::register, lockr::validate),
-    IntegrationBuilder::new("didomi", CORE_SOURCE, didomi::register, didomi::validate),
-    IntegrationBuilder::new(
-        "sourcepoint",
-        CORE_SOURCE,
-        sourcepoint::register,
-        sourcepoint::validate,
-    ),
-    IntegrationBuilder::new("osano", CORE_SOURCE, osano::register, osano::validate),
-    IntegrationBuilder::new(
-        "google_tag_manager",
-        CORE_SOURCE,
-        google_tag_manager::register,
-        google_tag_manager::validate,
-    ),
-    IntegrationBuilder::new(
-        "datadome",
-        CORE_SOURCE,
-        datadome::register,
-        datadome::validate,
-    ),
-    IntegrationBuilder::new("gpt", CORE_SOURCE, gpt::register, gpt::validate),
-    IntegrationBuilder::new(
-        "gpt_diagnostics",
-        CORE_SOURCE,
-        gpt_diagnostics::register,
-        gpt_diagnostics::validate,
-    )
-    .with_request_preparer(gpt_diagnostics::prepare_request_hook),
-    // Implementations `[demand]` and `[ad-server]` can name. None of them is a
-    // page integration, so none can be named in `[integration] module`.
+    js_asset_proxy::BUILDER,
+    testlight::BUILDER,
+    nextjs::BUILDER,
+    permutive::BUILDER,
+    lockr::BUILDER,
+    didomi::BUILDER,
+    sourcepoint::BUILDER,
+    osano::BUILDER,
+    google_tag_manager::BUILDER,
+    datadome::BUILDER,
+    gpt::BUILDER,
+    gpt_diagnostics::BUILDER,
+    // Implementations `[demand]` and `[ad-server]` can name. None of them is
+    // a module a section selects.
     IntegrationBuilder::implementations(openrtb::OPENRTB_ID, CORE_SOURCE)
         .with_demand(&openrtb::DEMAND),
     IntegrationBuilder::implementations(prebid_server::PREBID_SERVER_ID, CORE_SOURCE)

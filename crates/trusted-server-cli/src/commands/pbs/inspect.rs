@@ -9,8 +9,8 @@ use trusted_server_core::integrations::prebid_server::PREBID_SERVER_ID;
 
 use super::{Output, PbsError, Result, identifier, read_text};
 
-/// The id `[integration] module` names to run the Prebid integration.
-const PREBID_INTEGRATION_ID: &str = "prebid";
+/// The name `[auction] modules` selects the Prebid module by.
+const PREBID_MODULE: &str = "prebid";
 
 /// Deliberately partial: inspecting PBS requirements must not require unrelated TS settings.
 #[derive(Default, Deserialize)]
@@ -18,8 +18,6 @@ struct Source {
     auction: Option<Auction>,
     #[serde(default)]
     demand: Demand,
-    #[serde(default)]
-    integration: Integration,
 }
 
 #[derive(Default, Deserialize)]
@@ -27,6 +25,11 @@ struct Auction {
     enabled: Option<bool>,
     #[serde(default)]
     bidders: BTreeMap<BidderId, AuctionBidder>,
+    /// The modules `[auction]` selects, `prebid` among them.
+    #[serde(default)]
+    modules: Vec<String>,
+    /// The Prebid module's own table, `[auction.prebid]`.
+    prebid: Option<Prebid>,
 }
 
 /// The `[demand]` table: `modules` selects what runs, and every other key is
@@ -82,16 +85,7 @@ struct ServerProviderReport {
     server_bidder_candidates: Vec<ServerBidderCandidate>,
 }
 
-/// The `[integration]` table: `module` names the integrations that run, and
-/// `[integration.prebid]` holds the browser settings.
-#[derive(Default, Deserialize)]
-struct Integration {
-    #[serde(default)]
-    module: Vec<String>,
-    prebid: Option<Prebid>,
-}
-
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct Prebid {
     account_id: Option<String>,
     timeout_ms: Option<u32>,
@@ -102,14 +96,14 @@ struct Prebid {
     bundle: Bundle,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct Bundle {
     #[serde(default)]
     modules: BundleModules,
 }
 
 /// Explicit selections from core's bundle module schema; never expand generator presets.
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct BundleModules {
     #[serde(default)]
     bidder: Vec<String>,
@@ -193,13 +187,12 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
     })?;
     let auction_present = source.auction.is_some();
     let auction = source.auction.unwrap_or_default();
-    let prebid_present = source.integration.prebid.is_some();
-    let prebid_selected = source
-        .integration
-        .module
+    let prebid_present = auction.prebid.is_some();
+    let prebid_selected = auction
+        .modules
         .iter()
-        .any(|id| id == PREBID_INTEGRATION_ID);
-    let prebid = source.integration.prebid.unwrap_or_default();
+        .any(|name| name == PREBID_MODULE || name == "auction.prebid");
+    let prebid = auction.prebid.clone().unwrap_or_default();
     for name in prebid
         .client_side_bidders
         .iter()
@@ -254,7 +247,7 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             auction.enabled
         ),
         format!(
-            "Prebid browser section present: {prebid_present}; named in [integration] module: {prebid_selected}"
+            "Prebid browser section present: {prebid_present}; selected in [auction] modules: {prebid_selected}"
         ),
         format!("Prebid Server demand sources: {}", server_providers.len()),
     ];
@@ -364,11 +357,11 @@ module = "pbs_main"
 [auction.bidders.otherbidder]
 module = "pbs_secondary"
 
-[integration.prebid]
+[auction.prebid]
 account_id = "NEVER_PRINT_ME"
 client_side_bidders = ["browserbidder"]
 
-[integration.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["exampleBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["exampleAnalyticsAdapter"]
@@ -470,7 +463,7 @@ analytics = ["exampleAnalyticsAdapter"]
         fs::write(
             file.path(),
             r#"
-[integration.prebid]
+[auction.prebid]
 client_side_bidders = 'examplebidder\'
 "#,
         )
@@ -498,7 +491,7 @@ client_side_bidders = 'examplebidder\'
             "'example\\u0062idder,otherbidder'",
             "{ '10' = 'otherbidder', '2' = 'examplebidder' }",
         ] {
-            let text = format!("[integration.prebid]\nclient_side_bidders={input}\n");
+            let text = format!("[auction.prebid]\nclient_side_bidders={input}\n");
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
             let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
@@ -526,8 +519,8 @@ client_side_bidders = 'examplebidder\'
             let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
                 toml::from_str(input).expect("should parse current core bundle schema");
             let text = format!(
-                "[integration.prebid]\n{}",
-                input.replace("[bundle", "[integration.prebid.bundle")
+                "[auction.prebid]\n{}",
+                input.replace("[bundle", "[auction.prebid.bundle")
             );
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
@@ -561,7 +554,7 @@ client_side_bidders = 'examplebidder\'
         let file = tempfile::NamedTempFile::new().expect("should create config");
         fs::write(
             file.path(),
-            input.replace("[bundle]", "[integration.prebid.bundle]"),
+            input.replace("[bundle]", "[auction.prebid.bundle]"),
         )
         .expect("should write config");
         // Inspection is deliberately partial, not full runtime validation.
@@ -579,7 +572,7 @@ client_side_bidders = 'examplebidder\'
                 let file = tempfile::NamedTempFile::new().expect("should create config");
                 fs::write(
                     file.path(),
-                    format!("[integration.prebid.bundle.modules]\n{field} = {value}\n"),
+                    format!("[auction.prebid.bundle.modules]\n{field} = {value}\n"),
                 )
                 .expect("should write config");
                 let error = inspect(file.path())

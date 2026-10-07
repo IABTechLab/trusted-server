@@ -235,7 +235,7 @@ Upstream request timeout after 1000ms
 timeout_ms = 2000
 ```
 
-Browser `[integration.prebid].timeout_ms` is independent and does not control
+Browser `[auction.prebid].timeout_ms` is independent and does not control
 Prebid Server transport.
 
 2. Verify upstream service is responsive:
@@ -297,7 +297,7 @@ Prebid Server returned 400: Invalid OpenRTB request
 debug = true
 ```
 
-`[integration.prebid].debug` controls browser Prebid.js only.
+`[auction.prebid].debug` controls browser Prebid.js only.
 
 2. Check logs for request/response details
 3. Verify bidders are supported by your Prebid Server
@@ -332,10 +332,10 @@ Next.js links still pointing to origin domain
 2. Update `rewrite_attributes` to match actual keys:
 
 ```toml
-[integration]
-module = ["nextjs"]
+[framework]
+module = "nextjs"
 
-[integration.nextjs]
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]  # Add keys you find
 ```
 
@@ -363,10 +363,10 @@ Failed to fetch Permutive SDK: 404 Not Found
 2. Update configuration:
 
 ```toml
-[integration]
-module = ["permutive"]
+[audience]
+module = "permutive"
 
-[integration.permutive]
+[audience.permutive]
 organization_id = "myorg"
 workspace_id = "workspace-123"
 ```
@@ -387,15 +387,15 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 No route matched for /integrations/custom/endpoint
 ```
 
-**Cause:** `[integration] module` does not name the integration, or the route is not registered
+**Cause:** No section selects the integration's module, or the route is not registered
 
 **Solution:**
 
-1. Name the integration so it runs:
+1. Select the module in the section of its type so it runs:
 
 ```toml
-[integration]
-module = ["custom"]
+[testing]
+modules = ["custom"]
 ```
 
 2. Verify integration is compiled in (check build logs)
@@ -648,13 +648,13 @@ cargo install viceroy --version 0.17.0 --locked --force
 
 ### Enable Debug Logging
 
-Browser Prebid.js debug remains under `[integration.prebid]`:
+Browser Prebid.js debug remains under `[auction.prebid]`:
 
 ```toml
-[integration]
-module = ["prebid"]
+[auction]
+modules = ["prebid"]
 
-[integration.prebid]
+[auction.prebid]
 debug = true
 ```
 

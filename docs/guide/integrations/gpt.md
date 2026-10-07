@@ -51,10 +51,10 @@ There are three layers:
 Add GPT configuration to `trusted-server.toml`:
 
 ```toml
-[integration]
-module = ["gpt"]
+[ad-tag]
+modules = ["google"]
 
-[integration.gpt]
+[ad-tag.google]
 gam_attribution_enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
@@ -71,8 +71,8 @@ rewrite_script = true
 | `rewrite_script`          | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML                        |
 
 The environment override
-`TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED` works only when
-`gam_attribution_enabled` is already present under `[integration.gpt]` in the
+`TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED` works only when
+`gam_attribution_enabled` is already present under `[ad-tag.google]` in the
 TOML file. The environment overlay cannot create a missing configuration leaf.
 
 ## Endpoints
@@ -156,7 +156,7 @@ value `ts=true`. It is applied before publisher GPT initialization and remains
 for the browser document's lifetime, so initial, lazy, refresh, publisher-owned,
 and SPA-route requests inherit it unless another targeting consumer clears or
 overrides the key. The attribution switch is independently controlled and
-defaults to `false`, but `[integration] module` must also name `gpt`, which
+defaults to `false`, but `[ad-tag] modules` must also select `google`, which
 be `true`.
 
 This key is distinct from the existing slot-level `ts_initial=1` value.

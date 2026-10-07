@@ -19,6 +19,19 @@ use crate::platform::{GeoInfo, PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
+
+/// The name this module is selected by, in `[cmp]`.
+pub const MODULE: &str = "cmp.didomi";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        DIDOMI_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
 const DIDOMI_DEFAULT_PREFIX: &str = "/integrations/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
@@ -369,9 +382,7 @@ impl DidomiIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<DidomiIntegration>>, Report<TrustedServerError>> {
-    let Some(config) =
-        settings.integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<DidomiIntegrationConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -379,7 +390,7 @@ fn build(
 }
 
 /// Validates the Didomi configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -387,12 +398,12 @@ fn build(
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+        .module_config::<DidomiIntegrationConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register the Didomi consent notice integration when `[integration]
-/// module` names it.
+/// Register the Didomi consent notice integration when a section selects
+/// it.
 ///
 /// # Errors
 ///
@@ -642,13 +653,13 @@ mod tests {
     #[test]
     fn geo_query_parameters_defaults_to_disabled() {
         let settings = Settings::from_toml(&format!(
-            "{}\n[integration.didomi]\n",
-            crate_test_settings_str_running(DIDOMI_INTEGRATION_ID)
+            "{}\n[cmp.didomi]\n",
+            crate_test_settings_str_running("cmp", MODULE)
         ))
         .expect("should parse Didomi configuration");
 
         let config = settings
-            .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+            .module_config::<DidomiIntegrationConfig>(MODULE)
             .expect("should read Didomi configuration")
             .expect("should enable Didomi");
 
@@ -661,13 +672,13 @@ mod tests {
     #[test]
     fn geo_query_parameters_parses_explicit_opt_in() {
         let settings = Settings::from_toml(&format!(
-            "{}\n[integration.didomi]\ngeo_query_parameters = true\n",
-            crate_test_settings_str_running(DIDOMI_INTEGRATION_ID)
+            "{}\n[cmp.didomi]\ngeo_query_parameters = true\n",
+            crate_test_settings_str_running("cmp", MODULE)
         ))
         .expect("should parse Didomi geo configuration");
 
         let config = settings
-            .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+            .module_config::<DidomiIntegrationConfig>(MODULE)
             .expect("should read Didomi configuration")
             .expect("should enable Didomi");
 
@@ -1178,8 +1189,7 @@ mod tests {
     fn registers_prefix_routes() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(DIDOMI_INTEGRATION_ID, &config())
+            .insert_module_config("cmp", "cmp.didomi", &config())
             .expect("should insert config");
 
         let registry = IntegrationRegistry::with_plan(
@@ -1280,8 +1290,7 @@ mod tests {
             api_origin: default_api_origin(),
         };
         settings
-            .integration
-            .insert_config(DIDOMI_INTEGRATION_ID, &custom_config)
+            .insert_module_config("cmp", "cmp.didomi", &custom_config)
             .expect("should insert config");
 
         let registry = IntegrationRegistry::with_plan(

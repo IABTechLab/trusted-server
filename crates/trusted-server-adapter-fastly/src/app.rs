@@ -1761,14 +1761,13 @@ mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integration]
-            module = ["prebid"]
-
-            [integration.prebid]
-            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
-
             [auction]
             enabled = true
+            modules = ["prebid"]
+
+            [auction.prebid]
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+
             [demand]
             modules = ["prebid"]
 

@@ -43,6 +43,19 @@ use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
+
+/// The name this module is selected by, in `[cmp]`.
+pub const MODULE: &str = "cmp.sourcepoint";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        SOURCEPOINT_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
 const SOURCEPOINT_CDN_HOST: &str = "cdn.privacy-mgmt.com";
 const SOURCEPOINT_CDN_PREFIX: &str = "/integrations/sourcepoint/cdn";
 
@@ -732,9 +745,7 @@ fn is_sourcepoint_bare_host_reference(value: &str) -> bool {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<SourcepointIntegration>>, Report<TrustedServerError>> {
-    let Some(config) =
-        settings.integration_config::<SourcepointConfig>(SOURCEPOINT_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<SourcepointConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -742,7 +753,7 @@ fn build(
 }
 
 /// Validates the Sourcepoint configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -750,11 +761,11 @@ fn build(
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<SourcepointConfig>(SOURCEPOINT_INTEGRATION_ID)
+        .module_config::<SourcepointConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register the Sourcepoint integration when `[integration] module` names it.
+/// Register the Sourcepoint integration when a section selects it.
 ///
 /// # Errors
 ///
@@ -1394,7 +1405,7 @@ mod tests {
     #[test]
     fn registers_sourcepoint_routes() {
         let mut settings = create_test_settings();
-        settings.integration.select(SOURCEPOINT_INTEGRATION_ID);
+        settings.select_module("cmp", "cmp.sourcepoint");
 
         let registry = IntegrationRegistry::with_plan(
             &settings,

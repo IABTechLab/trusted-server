@@ -82,16 +82,23 @@ mod tests {
 
         let config = fs::read_to_string(&path).expect("should read initialized config");
         let parsed = toml::from_str::<toml::Value>(&config).expect("config should parse as TOML");
-        assert!(
-            parsed["integration"]["module"]
-                .as_array()
-                .expect("starter config should carry the module list")
-                .is_empty(),
-            "no integration should run until an operator names one"
-        );
+        for section in [
+            "cmp",
+            "tag",
+            "ad-tag",
+            "bot-protection",
+            "identity",
+            "audience",
+            "framework",
+        ] {
+            assert!(
+                parsed.get(section).is_none(),
+                "no module should run until an operator selects one, but [{section}] is present"
+            );
+        }
         assert!(
             config.contains(
-                "# [integration.js_asset_proxy]\n# Uncomment to override upstream cache headers for every asset below.\n# This replaces upstream directives, including private and no-store.\n# Use only when each asset's bytes are identical for every visitor.\n# cache_ttl_seconds = 3600\n# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets\n# that vary by browser User-Agent or use integrity hashes for UA-specific bytes."
+                "# [proxy.js_asset_proxy]\n# Uncomment to override upstream cache headers for every asset below.\n# This replaces upstream directives, including private and no-store.\n# Use only when each asset's bytes are identical for every visitor.\n# cache_ttl_seconds = 3600\n# Asset fetches use a fixed TrustedServer/1.0 User-Agent. Do not proxy assets\n# that vary by browser User-Agent or use integrity hashes for UA-specific bytes."
             ),
             "initialized config should document the optional cache override"
         );

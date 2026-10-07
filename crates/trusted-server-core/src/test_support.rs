@@ -31,13 +31,13 @@ pub mod tests {
             # is acknowledged the same way a deployment would.
             assume_single_jurisdiction = true
 
-            [integration]
-            module = ["prebid"]
+            [auction]
+            modules = ["prebid"]
 
-            [integration.prebid]
+            [auction.prebid]
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
-            [integration.prebid.bundle.modules]
+            [auction.prebid.bundle.modules]
             bidder = ["exampleBidderBidAdapter"]
 
             [ec]
@@ -53,14 +53,21 @@ pub mod tests {
         .to_owned()
     }
 
-    /// The shared fixture TOML with `integration_id` named in
-    /// `[integration] module` as well, for a test that appends that
-    /// integration's own block.
+    /// The shared fixture TOML with the module `name` selected in `section`
+    /// as well, written with the section's type folder left off, for a test
+    /// that appends that module's own table.
     #[must_use]
-    pub fn crate_test_settings_str_running(integration_id: &str) -> String {
-        crate_test_settings_str().replace(
-            "module = [\"prebid\"]",
-            &format!("module = [\"prebid\", \"{integration_id}\"]"),
+    pub fn crate_test_settings_str_running(section: &str, name: &str) -> String {
+        let written = crate::module_name::short_form(section, name);
+        if section == "auction" {
+            return crate_test_settings_str().replace(
+                "modules = [\"prebid\"]",
+                &format!("modules = [\"prebid\", \"{written}\"]"),
+            );
+        }
+        format!(
+            "{}\n[{section}]\nmodules = [\"{written}\"]\n",
+            crate_test_settings_str()
         )
     }
 
@@ -211,9 +218,9 @@ pub mod nextjs_auction {
         )
         .expect("should parse Next.js auction fixture settings");
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                crate::integrations::nextjs::MODULE,
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),

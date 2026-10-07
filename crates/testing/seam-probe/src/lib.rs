@@ -40,9 +40,16 @@ use trusted_server_core::settings::{IntegrationConfig, Settings};
 use validator::Validate;
 
 /// Integration id, which is also the key of the probe's configuration block
-/// (`[integration.seam_probe]`) and the value `[geo] module` names to
+/// (`[testing.seam-probe]`) and the value `[geo] module` names to
 /// select the probe's geo module.
 pub const SEAM_PROBE_ID: &str = "seam_probe";
+
+/// The name a section selects this module by, its crate folder below
+/// `crates/`, so `[testing] modules = ["seam-probe"]` selects it.
+#[must_use]
+pub fn module_name() -> &'static str {
+    trusted_server_core::module_name!()
+}
 
 /// Source label the registry uses in duplicate-id errors.
 pub const SEAM_PROBE_SOURCE: &str = "trusted-server-integration-seam-probe";
@@ -73,7 +80,7 @@ pub const PROBE_JS_SHA256: &str =
 /// can prove deploy validation reached a vendor's rules rather than stopping
 /// at the core ones.
 pub const SEAM_PROBE_COUNTRY_MESSAGE: &str =
-    "`[integration.seam_probe] country` must be exactly two letters";
+    "`[testing.seam-probe] country` must be exactly two letters";
 
 /// Request header a caller sets to have the preparer count that request.
 ///
@@ -131,7 +138,7 @@ pub struct SeamProbePrepared {
     pub runs: usize,
 }
 
-/// The probe's own configuration block, `[integration.seam_probe]`.
+/// The probe's own configuration block, `[testing.seam-probe]`.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct SeamProbeConfig {
@@ -329,19 +336,19 @@ fn check_country(country: &str) -> Result<(), Report<TrustedServerError>> {
     }))
 }
 
-/// Reads the probe's configuration block, or `None` when `[integration]
-/// module` does not name the probe.
+/// Reads the probe's settings table, or `None` when no section selects the
+/// probe.
 ///
 /// # Errors
 ///
 /// Returns an error when the block is present but cannot be parsed or fails
 /// validation.
 fn read_config(settings: &Settings) -> Result<Option<SeamProbeConfig>, Report<TrustedServerError>> {
-    settings.integration_config::<SeamProbeConfig>(SEAM_PROBE_ID)
+    settings.module_config::<SeamProbeConfig>(module_name())
 }
 
-/// Builds the probe's registration, or `None` when `[integration] module`
-/// does not name the probe.
+/// Builds the probe's registration, or `None` when no section selects the
+/// probe.
 ///
 /// # Errors
 ///
@@ -430,6 +437,7 @@ pub fn prepare_request(
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(SEAM_PROBE_ID, SEAM_PROBE_SOURCE, register, validate)
+        .with_module_name(module_name())
         .with_request_preparer(prepare_request)
 }
 
@@ -535,7 +543,7 @@ mod tests {
             .build()
     }
 
-    /// Settings carrying a `[integration.seam_probe]` block with `body`
+    /// Settings carrying a `[testing.seam-probe]` block with `body`
     /// appended to it.
     fn settings_with_probe(body: &str) -> Settings {
         Settings::from_toml(&format!(
@@ -557,10 +565,10 @@ mod tests {
                 [geo]
                 assume_single_jurisdiction = true
 
-                [integration]
-                module = ["seam_probe"]
+                [testing]
+                modules = ["seam-probe"]
 
-                [integration.seam_probe]
+                [testing.seam-probe]
                 {body}
             "#
         ))

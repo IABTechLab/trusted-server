@@ -30,6 +30,19 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
 
+/// The name this module is selected by, in `[identity]`.
+pub const MODULE: &str = "identity.lockr";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        LOCKR_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
+
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -298,7 +311,7 @@ impl LockrIntegration {
 }
 
 fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID)? else {
+    let Some(config) = settings.module_config::<LockrConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -306,7 +319,7 @@ fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<Tr
 }
 
 /// Validates the Lockr configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -314,7 +327,7 @@ fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<Tr
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID)
+        .module_config::<LockrConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
@@ -707,7 +720,7 @@ mod tests {
             register(&settings).expect("an unnamed integration should read no settings");
         assert!(
             registration.is_none(),
-            "an integration [integration] module does not name should not register"
+            "an integration no section selects should not register"
         );
     }
 }

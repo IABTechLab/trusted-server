@@ -17,10 +17,10 @@ The Sourcepoint integration:
 Add the following to `trusted-server.toml`:
 
 ```toml
-[integration]
-module = ["sourcepoint"]
+[cmp]
+module = "sourcepoint"
 
-[integration.sourcepoint]
+[cmp.sourcepoint]
 rewrite_sdk = true
 cdn_origin = "https://cdn.privacy-mgmt.com"
 # Optional: forward a custom Sourcepoint authCookie name upstream.
@@ -29,7 +29,7 @@ cache_ttl_seconds = 3600
 ```
 
 ::: warning Migration note
-The Sourcepoint browser module is now opt-in through `[integration] module`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should name `sourcepoint` there before upgrading.
+The Sourcepoint browser module is now opt-in through `[cmp] module`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should name `sourcepoint` there before upgrading.
 :::
 
 ### Configuration Options

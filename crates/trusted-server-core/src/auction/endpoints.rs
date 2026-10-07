@@ -999,8 +999,8 @@ mod tests {
     #[tokio::test]
     async fn direct_auction_remains_available_when_templates_are_disabled() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[demand]\nmodules = [\"template_switch_probe\"]\n\n[demand.template_switch_probe]\nimplementation = \"openrtb\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
-            crate_test_settings_str()
+            "{}\n[demand]\nmodules = [\"template_switch_probe\"]\n\n[demand.template_switch_probe]\nimplementation = \"openrtb\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
         );
         let settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
@@ -1127,8 +1127,8 @@ mod tests {
     #[tokio::test]
     async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[demand]\nmodules = [\"launch_fail\"]\n\n[demand.launch_fail]\nimplementation = \"openrtb\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
-            crate_test_settings_str()
+            "{}\n[demand]\nmodules = [\"launch_fail\"]\n\n[demand.launch_fail]\nimplementation = \"openrtb\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
+            crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
         );
         let settings =
             Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");

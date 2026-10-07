@@ -2034,8 +2034,11 @@ mod convert_tests {
         // (empty) applies — verify a key is NOT present rather than IS.
         // To test the allow-list, inject a key via a custom settings string.
         let settings_str = format!(
-            "{}\n[auction]\nallowed_context_keys = [\"permutive_segments\"]\n",
-            crate_test_settings_str()
+            "{}\n",
+            crate_test_settings_str().replace(
+                "[auction]\n",
+                "[auction]\nallowed_context_keys = [\"permutive_segments\"]\n"
+            )
         );
         let settings = Settings::from_toml(&settings_str).expect("should parse");
         let services = noop_services();

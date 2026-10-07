@@ -16,6 +16,19 @@ use super::IntegrationRegistration;
 
 const OSANO_INTEGRATION_ID: &str = "osano";
 
+/// The name this module is selected by, in `[cmp]`.
+pub const MODULE: &str = "cmp.osano";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        OSANO_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
+
 /// Configuration for the Osano consent mirror integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -24,7 +37,7 @@ pub struct OsanoConfig {}
 impl IntegrationConfig for OsanoConfig {}
 
 /// Validates the Osano configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -32,11 +45,11 @@ impl IntegrationConfig for OsanoConfig {}
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<OsanoConfig>(OSANO_INTEGRATION_ID)
+        .module_config::<OsanoConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register the Osano JS integration when `[integration] module` names it.
+/// Register the Osano JS integration when a section selects it.
 ///
 /// # Errors
 ///
@@ -45,7 +58,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let Some(_config) = settings.integration_config::<OsanoConfig>(OSANO_INTEGRATION_ID)? else {
+    let Some(_config) = settings.module_config::<OsanoConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -76,7 +89,7 @@ mod tests {
     #[test]
     fn register_returns_js_module_registration_when_enabled() {
         let mut settings = create_test_settings();
-        settings.integration.select("osano");
+        settings.select_module("cmp", "cmp.osano");
 
         let registration = register(&settings)
             .expect("should parse the osano config")
@@ -97,12 +110,11 @@ mod tests {
     fn config_rejects_unknown_fields() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config("osano", &json!({"typo": true }))
+            .insert_module_config("cmp", "cmp.osano", &json!({"typo": true }))
             .expect("should insert osano config");
 
         let err = settings
-            .integration_config::<OsanoConfig>("osano")
+            .module_config::<OsanoConfig>(super::MODULE)
             .expect_err("should reject unknown Osano config fields");
         let error_text = format!("{err:?}");
 

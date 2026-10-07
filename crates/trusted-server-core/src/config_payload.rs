@@ -31,9 +31,6 @@ pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_ST
 /// process-environment overrides.
 pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
-/// Id of the one integration whose blocks carry secret references.
-const DATADOME_INTEGRATION_ID: &str = "datadome";
-
 /// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
 ///
 /// Secret references are resolved after envelope verification and before
@@ -101,21 +98,25 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         }
     }
 
-    // An integration runs when `[integration] module` names it, so that list
-    // decides whether DataDome's secrets are live. A block for an integration
-    // the list does not name is refused once the settings are deserialized,
-    // and clearing its references here means that refusal is what an operator
-    // sees rather than a secret lookup failing first.
+    // A module runs when its section selects it, so `[bot-protection]`
+    // decides whether DataDome's secrets are live. A table its section does
+    // not select is refused once the settings are deserialized, and clearing
+    // its references here means that refusal is what an operator sees rather
+    // than a secret lookup failing first.
+    let selects_datadome = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .is_some_and(|name| name == "datadome" || name == crate::integrations::datadome::MODULE)
+    };
     let datadome_runs = data
-        .pointer("/integration/module")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|module| {
-            module
-                .iter()
-                .any(|id| id.as_str() == Some(DATADOME_INTEGRATION_ID))
-        });
+        .pointer("/bot-protection/module")
+        .is_some_and(selects_datadome)
+        || data
+            .pointer("/bot-protection/modules")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|modules| modules.iter().any(selects_datadome));
     let Some(datadome) = data
-        .pointer_mut("/integration/datadome")
+        .pointer_mut("/bot-protection/datadome")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return;
@@ -288,13 +289,14 @@ mod tests {
             },
         );
         let mut prebid = settings
-            .integration_config::<crate::integrations::prebid::PrebidIntegrationConfig>("prebid")
+            .module_config::<crate::integrations::prebid::PrebidIntegrationConfig>(
+                crate::integrations::prebid::MODULE,
+            )
             .expect("should parse Prebid config")
             .expect("should have enabled Prebid config");
         prebid.client_side_bidders = vec!["exampleBidder".to_string()];
         settings
-            .integration
-            .insert_config("prebid", &prebid)
+            .insert_module_config("auction", "auction.prebid", &prebid)
             .expect("should replace Prebid config");
         settings
     }
@@ -324,9 +326,9 @@ mod tests {
     fn didomi_geo_query_parameters_survive_blob_round_trip() {
         let mut original = test_settings();
         original
-            .integration
-            .insert_config(
-                "didomi",
+            .insert_module_config(
+                "cmp",
+                "cmp.didomi",
                 &DidomiIntegrationConfig {
                     geo_query_parameters: true,
                     proxy_path: None,
@@ -339,7 +341,7 @@ mod tests {
         let reconstructed =
             load_settings(&envelope_json(&original)).expect("should reconstruct settings");
         let config = reconstructed
-            .integration_config::<DidomiIntegrationConfig>("didomi")
+            .module_config::<DidomiIntegrationConfig>(crate::integrations::didomi::MODULE)
             .expect("should read Didomi configuration")
             .expect("should enable Didomi");
 
@@ -357,9 +359,9 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("tinybird-token-key".to_string()));
         original
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "enable_protection": true,
                     "server_side_key_secret_name": "datadome-server-key",
@@ -405,7 +407,9 @@ mod tests {
             Some("resolved-tinybird-token")
         );
         let datadome = reconstructed
-            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+            .module_config::<crate::integrations::datadome::DataDomeConfig>(
+                crate::integrations::datadome::MODULE,
+            )
             .expect("should parse DataDome config")
             .expect("should enable DataDome");
         assert_eq!(
@@ -758,9 +762,9 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("unused-tinybird-key".to_string()));
         original
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "enable_protection": false,
                     "server_side_key_secret_name": "unused-datadome-key",
@@ -786,7 +790,9 @@ mod tests {
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
         let datadome = reconstructed
-            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+            .module_config::<crate::integrations::datadome::DataDomeConfig>(
+                crate::integrations::datadome::MODULE,
+            )
             .expect("should parse inactive DataDome config")
             .expect("client-side DataDome remains enabled");
         assert!(datadome.server_side_key_secret_name.is_none());
@@ -798,37 +804,43 @@ mod tests {
         );
     }
 
-    /// A block for an integration `[integration] module` does not name is
-    /// refused, and its secret references are dropped before resolution, so
-    /// the operator reads the block's own fault rather than a secret-store
-    /// failure that follows from it.
+    /// A table for a module its section does not select is refused, and its
+    /// secret references are dropped before resolution, so the operator reads
+    /// the table's own fault rather than a secret-store failure that follows
+    /// from it.
     #[test]
-    fn an_unnamed_datadome_block_is_refused_without_resolving_its_secrets() {
-        let mut original = test_settings();
-        original.integration.insert(
-            "datadome".to_owned(),
-            serde_json::json!({
-                "enable_protection": true,
-                "server_side_key_secret_name": "unused-datadome-key",
-                "protection_test_bypass": {
-                    "enabled": true,
-                    "credential_secret_name": "unused-bypass-key",
-                },
-            }),
-        );
+    fn an_unselected_datadome_table_is_refused_without_resolving_its_secrets() {
+        let original = test_settings();
+        let mut data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+        data.as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "bot-protection".to_owned(),
+                serde_json::json!({
+                    "datadome": {
+                        "enable_protection": true,
+                        "server_side_key_secret_name": "unused-datadome-key",
+                        "protection_test_bypass": {
+                            "enabled": true,
+                            "credential_secret_name": "unused-bypass-key",
+                        },
+                    },
+                }),
+            );
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
+        let envelope = serde_json::to_string(&envelope).expect("should serialize envelope");
 
         let error = settings_from_config_blob(
-            &envelope_json(&original),
+            &envelope,
             &UnifiedSecretStore,
             &StoreName::from("ts_secrets"),
         )
-        .expect_err("should refuse a block nothing on the module list names");
+        .expect_err("should refuse a table its section does not select");
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[integration.datadome]")
-                && rendered.contains("[integration] module"),
-            "should name the block and the list: {rendered}"
+            rendered.contains("[bot-protection] selects no module"),
+            "should name the section and what it is missing: {rendered}"
         );
         assert!(
             !rendered.contains("unused-datadome-key"),

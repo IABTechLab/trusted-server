@@ -26,10 +26,10 @@ for the upstream contract.
 Add the integration to the operator-owned `trusted-server.toml`:
 
 ```toml
-[integration]
-module = ["didomi"]
+[cmp]
+module = "didomi"
 
-[integration.didomi]
+[cmp.didomi]
 geo_query_parameters = true
 # proxy_path = "my-custom-consent"
 # sdk_origin = "https://sdk.privacy-center.org"
@@ -63,10 +63,10 @@ already exists in the TOML input.
 `proxy_path` helps avoid a predictable integration path:
 
 ```toml
-[integration]
-module = ["didomi"]
+[cmp]
+module = "didomi"
 
-[integration.didomi]
+[cmp.didomi]
 geo_query_parameters = true
 proxy_path = "my-custom-consent"
 ```

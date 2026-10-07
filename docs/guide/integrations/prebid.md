@@ -16,21 +16,19 @@ Prebid is the leading open-source header bidding solution that allows publishers
 
 Prebid configuration has two independent owners:
 
-- `[integration.prebid]` owns browser Prebid.js behavior, being bundle
+- `[auction.prebid]` owns browser Prebid.js behavior, being bundle
   selection and injection, browser timeout and debug, account injection,
   script interception, client-side bidders, and refresh exclusions. It runs
-  when `prebid` is named in `[integration] module`.
+  when `[auction] modules` selects `prebid`.
 - A `[demand.<name>]` table that sets `implementation = "prebid_server"`, its
   `notifications`, and `[auction.bidders]` own every Prebid Server request.
-  Prebid Server is a demand implementation, not a page integration, so it is
-  never named in `[integration] module`. See
+  Prebid Server is a demand implementation, not a page integration, so no
+  module section selects it. See
   [Configuration Rules](/guide/configuration-rules).
 
 ```toml
-[integration]
-module = ["prebid"]
 
-[integration.prebid]
+[auction.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -41,11 +39,11 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 # external_bundle_sri = "sha384-<fictional digest>"
 
 # Optional operator-owned Prebid User ID modules, forwarded to Prebid verbatim.
-[[integration.prebid.managed_user_ids]]
+[[auction.prebid.managed_user_ids]]
 name = "identityLink"
 params = { pid = "999", notUse3P = false }
 
-[integration.prebid.managed_user_ids.storage]
+[auction.prebid.managed_user_ids.storage]
 type = "cookie"
 name = "idl_env"
 expires = 15
@@ -53,7 +51,7 @@ refresh_in_seconds = 1800
 
 # External bundle generation inputs used by `ts prebid client`.
 # Values are exact Prebid module stems without `.js`.
-[integration.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 user_id = ["sharedIdSystem", "identityLinkIdSystem"]
 analytics = ["atsAnalyticsAdapter"]
@@ -62,6 +60,7 @@ analytics = ["atsAnalyticsAdapter"]
 allowed_domains = ["assets.example.com"]
 
 [auction]
+modules = ["prebid"]
 enabled = true
 timeout_ms = 2000
 
@@ -206,7 +205,7 @@ versioned contract change. There is no time-based expiry in this fix.
 ## External Bundle Generation
 
 Use `ts prebid client` to build the publisher-specific browser bundle from
-`[integration.prebid.bundle.modules]` selections:
+`[auction.prebid.bundle.modules]` selections:
 
 ```bash
 ts prebid client
@@ -250,7 +249,7 @@ that bundle with the server and push its new hash and SRI. The sentinel
 ### Upgrading from `bundle.adapters` and `bundle.user_id_modules`
 
 Before deploying this server version, move the old bundle fields under
-`[integration.prebid.bundle.modules]` and expand short bidder names to exact
+`[auction.prebid.bundle.modules]` and expand short bidder names to exact
 upstream stems. For example, `adapters = ["rubicon"]` becomes
 `bidder = ["rubiconBidAdapter"]`; `client_side_bidders` continues to use the
 runtime code `rubicon`.
@@ -577,7 +576,7 @@ impression or measurement purpose but must not participate in Trusted Server's
 Prebid refresh auction:
 
 ```toml
-[integration.prebid]
+[auction.prebid]
 excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 ```
 
@@ -627,7 +626,7 @@ owned by Trusted Server.
 ### Configuration
 
 ```toml
-[integration.prebid]
+[auction.prebid]
 client_side_bidders = ["example-browser"]
 
 [auction.bidders.example-server]
@@ -644,10 +643,10 @@ Client-side bidders need their exact Prebid.js module stems in the generated
 bundle:
 
 ```toml
-[integration.prebid]
+[auction.prebid]
 client_side_bidders = ["rubicon", "appnexus", "openx"]
 
-[integration.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "appnexusBidAdapter", "openxBidAdapter"]
 user_id = ["sharedIdSystem", "uid2IdSystem"]
 ```
@@ -712,7 +711,7 @@ Add analytics modules by exact stem. When the pinned Prebid.js package includes
 ATS, use this build selection:
 
 ```toml
-[integration.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 analytics = ["atsAnalyticsAdapter"]
 ```
@@ -743,7 +742,7 @@ Trusted Server can own one or more Prebid `userSync.userIds` entries so
 operators configure identity centrally instead of asking publishers to edit
 their Prebid JavaScript.
 
-Each `[[integration.prebid.managed_user_ids]]` entry is forwarded to Prebid.js
+Each `[[auction.prebid.managed_user_ids]]` entry is forwarded to Prebid.js
 verbatim. Trusted Server validates only what Prebid needs to address the module
 — a usable entry name and storage key, positive expiry and refresh values — and
 never interprets `params`. Supported names come from the checked-in
@@ -772,15 +771,15 @@ is stale, or was modified after generation. Core remains vendor-neutral: it
 forwards each managed entry's `params` to Prebid.js without interpreting them.
 
 ```toml
-[integration.prebid.bundle]
+[auction.prebid.bundle]
 adapters = ["rubicon"]
 user_id_modules = ["identityLinkIdSystem"]
 
-[[integration.prebid.managed_user_ids]]
+[[auction.prebid.managed_user_ids]]
 name = "identityLink"
 params = { pid = "999", notUse3P = false }
 
-[integration.prebid.managed_user_ids.storage]
+[auction.prebid.managed_user_ids.storage]
 type = "cookie"
 name = "idl_env"
 expires = 15
@@ -788,7 +787,7 @@ refresh_in_seconds = 1800
 ```
 
 Run `ts prebid client`, upload the generated content-addressed bundle, copy its
-hash metadata into `[integration.prebid]`, and validate the configuration
+hash metadata into `[auction.prebid]`, and validate the configuration
 before rollout.
 
 ### Worked example: LiveRamp RampID

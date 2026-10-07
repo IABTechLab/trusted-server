@@ -304,9 +304,9 @@ publisher-specific settings, then run:
 ts config validate
 ```
 
-The draft also names in `[integration] module` the integrations it can
-configure from what it found, and writes their blocks. Where it found
-third-party scripts it writes `[integration.js_asset_proxy]` with each one
+The draft also selects, in the section of each module's type, the modules it
+can configure from what it found, and writes their tables. Where it found
+third-party scripts it writes `[proxy.js_asset_proxy]` with each one
 `proxy = "disabled"`, so they are inventory only, and nothing is served or
 rewritten until you review a candidate and change its `proxy` value to
 `"enabled"` or `"blocked"`. Some candidates may be runtime-injected scripts,
@@ -676,10 +676,10 @@ APIs.
 > is not accepted as an alias.
 
 ```toml
-[integration]
-module = ["prebid"]
+[auction]
+modules = ["prebid"]
 
-[integration.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["atsAnalyticsAdapter"]

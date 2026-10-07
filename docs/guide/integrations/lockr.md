@@ -41,10 +41,10 @@ Lockr is an identity resolution and privacy platform that helps publishers manag
 Add Lockr configuration to `trusted-server.toml`:
 
 ```toml
-[integration]
-module = ["lockr"]
+[identity]
+module = "lockr"
 
-[integration.lockr]
+[identity.lockr]
 api_endpoint = "https://api.lockr.io"
 organization_id = "your-org-id"
 project_id = "your-project-id"
@@ -61,9 +61,9 @@ project_id = "your-project-id"
 ### Environment Variables
 
 ```bash
-TRUSTED_SERVER__INTEGRATION__LOCKR__API_ENDPOINT=https://api.lockr.io
-TRUSTED_SERVER__INTEGRATION__LOCKR__ORGANIZATION_ID=your-org-id
-TRUSTED_SERVER__INTEGRATION__LOCKR__PROJECT_ID=your-project-id
+TRUSTED_SERVER__IDENTITY__LOCKR__API_ENDPOINT=https://api.lockr.io
+TRUSTED_SERVER__IDENTITY__LOCKR__ORGANIZATION_ID=your-org-id
+TRUSTED_SERVER__IDENTITY__LOCKR__PROJECT_ID=your-project-id
 ```
 
 ## Features

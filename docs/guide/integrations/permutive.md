@@ -15,10 +15,10 @@ Permutive is a real-time data platform that helps publishers build and activate 
 ## Configuration
 
 ```toml
-[integration]
-module = ["permutive"]
+[audience]
+module = "permutive"
 
-[integration.permutive]
+[audience.permutive]
 organization_id = "your-org-id"
 workspace_id = "your-workspace-id"
 project_id = "your-project-id"

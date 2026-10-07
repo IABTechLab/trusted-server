@@ -10,6 +10,19 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 
+/// The name this module is selected by, in `[framework]`.
+pub const MODULE: &str = "framework.nextjs";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        NEXTJS_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
+
 mod rsc;
 mod rsc_placeholders;
 mod rsc_stream;
@@ -55,7 +68,7 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
 }
 
 /// Validates the Next.js configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -63,11 +76,11 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
+        .module_config::<NextJsIntegrationConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register the Next.js integration when `[integration] module` names it.
+/// Register the Next.js integration when a section selects it.
 ///
 /// # Errors
 ///
@@ -84,7 +97,7 @@ pub fn register(
         );
         config
     } else {
-        log::info!("NextJS integration not registered ([integration] module does not name it)");
+        log::info!("NextJS integration not registered (no section selects it)");
         return Ok(None);
     };
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.
@@ -108,7 +121,7 @@ fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<NextJsIntegrationConfig>>, Report<TrustedServerError>> {
     settings
-        .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
+        .module_config::<NextJsIntegrationConfig>(MODULE)
         .map(|config| config.map(Arc::new))
 }
 
@@ -146,9 +159,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -232,9 +245,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": [
                         "href",
@@ -314,9 +327,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -366,9 +379,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "url"],
                 }),
@@ -420,9 +433,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                     "max_combined_payload_bytes": 1,
@@ -489,9 +502,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["url"],
                 }),
@@ -565,9 +578,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["url"],
                 }),
@@ -632,9 +645,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -693,9 +706,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -756,9 +769,9 @@ mod tests {
     fn stream_nextjs_html(html: &str, chunk_size: usize) -> String {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -867,9 +880,9 @@ mod tests {
 
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &json!({
                     "rewrite_attributes": ["href", "link", "url"],
                     // Fits either script alone, not both payloads together.

@@ -23,6 +23,20 @@ use crate::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
 
+/// The name this module is selected by, in `[auction]`.
+pub const MODULE: &str = "testing.testlight";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        TESTLIGHT_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE)
+    .selected_in("auction");
+
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct TestlightConfig {
@@ -128,8 +142,7 @@ impl TestlightIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<TestlightIntegration>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<TestlightConfig>(TESTLIGHT_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<TestlightConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -137,7 +150,7 @@ fn build(
 }
 
 /// Validates the Testlight configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -145,11 +158,11 @@ fn build(
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<TestlightConfig>(TESTLIGHT_INTEGRATION_ID)
+        .module_config::<TestlightConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register the Testlight integration when `[integration] module` names it.
+/// Register the Testlight integration when a section selects it.
 ///
 /// # Errors
 ///
@@ -361,9 +374,9 @@ mod tests {
     fn build_uses_settings_integration_block() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                TESTLIGHT_INTEGRATION_ID.to_string(),
+            .insert_module_config(
+                "auction",
+                "testing.testlight",
                 &json!({
                     "endpoint": "https://example.com/bid",
                     "rewrite_scripts": true,

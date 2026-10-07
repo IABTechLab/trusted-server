@@ -26,10 +26,10 @@ Next.js applications generate framework-specific JSON data (`__NEXT_DATA__`) and
 ## Configuration
 
 ```toml
-[integration]
-module = ["nextjs"]
+[framework]
+module = "nextjs"
 
-[integration.nextjs]
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url"]
 max_combined_payload_bytes = 10485760
 ```
@@ -145,8 +145,8 @@ Combine Next.js SSR/SSG with Trusted Server edge logic.
 Name it only if you're using Next.js:
 
 ```toml
-[integration]
-module = ["nextjs"]
+[framework]
+module = "nextjs"
 ```
 
 ### 2. Configure Rewrite Attributes
@@ -154,10 +154,10 @@ module = ["nextjs"]
 Add custom attributes if your Next.js app uses non-standard fields:
 
 ```toml
-[integration]
-module = ["nextjs"]
+[framework]
+module = "nextjs"
 
-[integration.nextjs]
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url", "customImageUrl"]
 ```
 

@@ -7,7 +7,7 @@ members = [
     # workspace member so it shares workspace settings and lints; no default
     # member and no adapter build reaches it, and only the Axum adapter's tests
     # depend on it.
-    "crates/integrations/seam-probe",
+    "crates/testing/seam-probe",
     "crates/permission-signal/gpc",
     "crates/permission-signal/gpp",
     "crates/permission-signal/mtm",

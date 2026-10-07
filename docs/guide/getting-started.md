@@ -174,7 +174,7 @@ only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- the integrations that run, in `[integration] module`, with their settings under `[integration.<id>]`
+- the page modules that run, each selected in the section of its type (`[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]`, `[framework]`, and `[auction]` for Prebid), with their settings under `[<section>.<name>]`
 - the demand sources, in `[demand] modules`, each with its settings under `[demand.<name>]`
 - the ad server, if one runs, in `[ad-server] module`, with its settings under `[ad-server.<name>]`
 - server bidder routes under `[auction.bidders.<code>]`
@@ -183,7 +183,7 @@ Edit `trusted-server.toml` to configure:
 - stable key names for `trusted_server_secrets`
 
 Do not put a Prebid Server URL or server bidder list under
-`[integration.prebid]`. Those server values belong to a `[demand.<name>]` table
+`[auction.prebid]`. Those server values belong to a `[demand.<name>]` table
 whose `implementation` is `prebid_server`, and APS has no integration table at
 all, because it is selected in `[demand]` too. The rules every one of these
 tables follows are in [Configuration Rules](/guide/configuration-rules).

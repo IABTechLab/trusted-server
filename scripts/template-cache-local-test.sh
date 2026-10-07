@@ -290,14 +290,14 @@ s = replace_once(
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
-    '[integration]\nmodule = []',
-    '[integration]\nmodule = ["prebid"]',
-    "integration selector",
+    '# modules = ["prebid"]',
+    'modules = ["prebid"]',
+    "auction selects prebid",
 )
 s = replace_once(
     s,
-    '# [integration.prebid]\n',
-    '[integration.prebid]\n'
+    '# [auction.prebid]\n',
+    '[auction.prebid]\n'
     'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"\n',
     "Prebid integration settings",
 )

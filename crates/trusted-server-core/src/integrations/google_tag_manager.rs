@@ -36,6 +36,19 @@ use crate::proxy::{FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS, ProxyRequestConfig, pr
 use crate::settings::{IntegrationConfig, Settings};
 
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
+
+/// The name this module is selected by, in `[tag]`.
+pub const MODULE: &str = "tag.google-tag-manager";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        GTM_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 /// Host serving the GA beacon endpoints the `/collect` paths are pinned to.
 const GA_COLLECT_HOST: &str = "www.google-analytics.com";
@@ -874,8 +887,7 @@ impl GoogleTagManagerIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<GoogleTagManagerIntegration>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<GoogleTagManagerConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -883,7 +895,7 @@ fn build(
 }
 
 /// Validates the Google Tag Manager configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -891,12 +903,12 @@ fn build(
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+        .module_config::<GoogleTagManagerConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register the Google Tag Manager integration when `[integration]
-/// module` names it.
+/// Register the Google Tag Manager integration when a section selects
+/// it.
 ///
 /// # Errors
 ///
@@ -3067,10 +3079,10 @@ module = "hmac"
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
-[integration]
-module = ["google_tag_manager"]
+[tag]
+modules = ["google-tag-manager"]
 
-[integration.google_tag_manager]
+[tag.google-tag-manager]
 container_id = "GTM-PARSED"
 upstream_url = "https://custom.gtm.example"
 
@@ -3079,7 +3091,7 @@ assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings
-            .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+            .module_config::<GoogleTagManagerConfig>(MODULE)
             .expect("should get config")
             .expect("should read the settings of a named integration");
 
@@ -3107,7 +3119,7 @@ module = "hmac"
 [ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
-[integration.google_tag_manager]
+[tag.google-tag-manager]
 container_id = "GTM-DEFAULT"
 
 [geo]
@@ -3117,8 +3129,8 @@ assume_single_jurisdiction = true
             .expect_err("a block for an integration nothing names should be refused");
 
         assert!(
-            format!("{error:?}").contains("[integration.google_tag_manager]"),
-            "should name the block that nothing runs: {error:?}"
+            format!("{error:?}").contains("[tag] selects no module"),
+            "should name the section that selects nothing: {error:?}"
         );
     }
 
@@ -3131,9 +3143,9 @@ assume_single_jurisdiction = true
         let mut settings = make_settings();
         // Enable GTM
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-TEST1234",
                     "upstream_url": "https://www.googletagmanager.com"
@@ -3176,9 +3188,9 @@ assume_single_jurisdiction = true
 
         // Use the ID from the fixture: GTM-522ZT3X6
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-522ZT3X6",
                     "upstream_url": "https://www.googletagmanager.com"
@@ -3248,9 +3260,9 @@ assume_single_jurisdiction = true
     fn test_inline_script_rewriting() {
         let mut settings = make_settings();
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-12345",
                     "upstream_url": "https://www.googletagmanager.com"
@@ -3637,9 +3649,9 @@ assume_single_jurisdiction = true
     fn small_chunk_gtm_rewrite_survives_fragmentation() {
         let mut settings = make_settings();
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-SMALL1"
                 }),
@@ -3694,9 +3706,9 @@ assume_single_jurisdiction = true
     fn a_split_inside_the_shared_marker_prefix_leaves_the_url_third_party() {
         let mut settings = make_settings();
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-SMALL1"
                 }),
@@ -3747,18 +3759,18 @@ assume_single_jurisdiction = true
 
         let mut settings = make_settings();
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-MIX1"
                 }),
             )
             .expect("should update gtm config");
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
@@ -3818,18 +3830,18 @@ assume_single_jurisdiction = true
 
         let mut settings = make_settings();
         settings
-            .integration
-            .insert_config(
-                "google_tag_manager",
+            .insert_module_config(
+                "tag",
+                "tag.google-tag-manager",
                 &serde_json::json!({
                     "container_id": "GTM-GTAIL1"
                 }),
             )
             .expect("should update gtm config");
         settings
-            .integration
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),

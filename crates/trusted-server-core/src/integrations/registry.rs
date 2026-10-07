@@ -1032,7 +1032,7 @@ fn resolve_device_module(
 ///
 /// Returns [`TrustedServerError::Configuration`] naming the module and the
 /// capability when the module declares no device module, is supplied by a
-/// builder `[integration] module` does not name, or is not registered at
+/// builder no section selects, or is not registered at
 /// all. Without this a mistyped selector would fall back to core's built-in
 /// module with nothing said, which is the silent wrong answer the geo
 /// selector already refuses to give.
@@ -1055,7 +1055,7 @@ fn declared_device_module(
         )
     } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
         format!(
-            "`[device] module` selects integration module `{module_id}`, which `[integration] module` does not name, so its device module is unavailable"
+            "`[device] module` selects integration module `{module_id}`, which no section selects, so its device module is unavailable"
         )
     } else {
         format!(
@@ -1084,8 +1084,8 @@ fn declared_device_module(
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the selector names a
-/// module that is not registered, is supplied by a builder `[integration]
-/// module` does not name, or runs and declares no geo module.
+/// module that is not registered, is supplied by a builder no section
+/// selects, or runs and declares no geo module.
 fn resolve_geo_module(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1119,7 +1119,7 @@ fn resolve_geo_module(
 ///
 /// Returns [`TrustedServerError::Configuration`] naming the module and the
 /// capability when the module declares no geo module, is supplied by a
-/// builder `[integration] module` does not name, or is not registered at
+/// builder no section selects, or is not registered at
 /// all.
 fn declared_geo_module(
     module_id: &str,
@@ -1129,7 +1129,7 @@ fn declared_geo_module(
         return Ok(Arc::clone(module));
     }
 
-    // Only a module `[integration] module` names reaches the collection
+    // Only a module a section selects reaches the collection
     // loop, so a module that exists but is not named must say so rather than
     // read as a module that never declared the capability.
     let message = if inner
@@ -1143,7 +1143,7 @@ fn declared_geo_module(
         )
     } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
         format!(
-            "`[geo] module` selects integration module `{module_id}`, which `[integration] module` does not name, so its geo module is unavailable"
+            "`[geo] module` selects integration module `{module_id}`, which no section selects, so its geo module is unavailable"
         )
     } else {
         format!(
@@ -1204,6 +1204,60 @@ pub struct ProxyDispatchInput<'a> {
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
+}
+
+/// Refuses a name a section selects that no module in this deployment
+/// supplies, listing what the section could select instead.
+///
+/// # Errors
+///
+/// Naming the first section and name at fault.
+fn check_section_selections(
+    settings: &Settings,
+    extra: &[crate::integrations::IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
+    // Prebid registers through the auction plan rather than a builder, and is
+    // selected in `[auction]` all the same.
+    let offered: Vec<&'static str> = crate::integrations::all_builders(extra)
+        .filter_map(|builder| builder.module_name())
+        .chain([crate::integrations::prebid::MODULE])
+        .collect();
+    for (section, modules) in settings.module_sections() {
+        for written in modules.selected() {
+            if crate::module_name::resolve(section, written, &offered).is_some() {
+                continue;
+            }
+            let of_type: Vec<&str> = offered
+                .iter()
+                .map(|name| crate::module_name::short_form(section, name))
+                .filter(|short| !offered.contains(short))
+                .collect();
+            let supplied = if of_type.is_empty() {
+                let mut types: Vec<&str> = offered
+                    .iter()
+                    .filter_map(|name| name.split_once('.').map(|(folder, _)| folder))
+                    .collect();
+                types.sort_unstable();
+                types.dedup();
+                format!(
+                    "It supplies no {section} module. The types it supplies modules of are [{}]",
+                    types.join(", ")
+                )
+            } else {
+                format!(
+                    "The {section} modules it supplies are [{}]",
+                    of_type.join(", ")
+                )
+            };
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{section}] selects `{written}`, which no module this deployment \
+                     supplies. {supplied}"
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 impl IntegrationRegistry {
@@ -1322,10 +1376,13 @@ impl IntegrationRegistry {
                 inner.request_preparers.push(prepare);
             }
 
-            // Only a builder `[integration] module` names is built, so an
-            // integration runs exactly when an operator names it, whatever its
-            // builder would otherwise make of the settings.
-            if !settings.integration.is_selected(builder.id()) {
+            // Only a builder whose module a section selects is built, so an
+            // integration runs exactly when an operator selects it, whatever
+            // its builder would otherwise make of the settings.
+            if !builder
+                .module_name()
+                .is_some_and(|name| settings.selects_module(name))
+            {
                 continue;
             }
 
@@ -1339,38 +1396,12 @@ impl IntegrationRegistry {
             }
         }
 
-        // Which ids name something this deployment can run is only knowable
-        // here, where the adapter's and a vendor crate's builders have been
-        // handed over, so the selector is checked against them rather than in
-        // the settings. Deploy validation deliberately does not make this
-        // check, because a vendor crate the CLI never links may supply the id.
-        let unknown = settings
-            .integration
-            .module
-            .iter()
-            .filter(|selected| {
-                !inner
-                    .builder_ids
-                    .iter()
-                    .any(|(known, _)| *known == selected.as_str())
-            })
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "[integration] module names `{}`, which no builder in this deployment \
-                     supplies. It supplies [{}]",
-                    unknown.join("`, `"),
-                    inner
-                        .builder_ids
-                        .iter()
-                        .map(|(id, _)| *id)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-            }));
-        }
+        // Which names a section can select is only knowable here, where the
+        // adapter's and a vendor crate's builders have been handed over, so
+        // the selections are checked against them rather than in the
+        // settings. Deploy validation deliberately does not make this check,
+        // because a vendor crate the CLI never links may supply the name.
+        check_section_selections(settings, extra)?;
 
         for registration in registrations {
             inner
@@ -1897,7 +1928,7 @@ impl IntegrationRegistry {
     }
 
     /// Ids of modules that run and are served standalone only. Only a
-    /// registration `[integration] module` names reaches the construction
+    /// registration a section selects reaches the construction
     /// loop, so every id here runs.
     #[must_use]
     pub fn js_standalone_ids(&self) -> Vec<&'static str> {
@@ -3134,9 +3165,9 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
-            .integration
-            .insert_config(
-                "prebid",
+            .insert_module_config(
+                "auction",
+                "auction.prebid",
                 &serde_json::json!({
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
@@ -3183,7 +3214,7 @@ mod tests {
     #[test]
     fn js_module_ids_skip_named_integrations_without_generated_js_module() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.integration.select("nextjs");
+        settings.select_module("framework", "framework.nextjs");
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -3228,8 +3259,8 @@ mod tests {
     #[test]
     fn js_module_ids_include_named_cmp_mirrors() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.integration.select("sourcepoint");
-        settings.integration.select("osano");
+        settings.select_module("cmp", "cmp.sourcepoint");
+        settings.select_module("cmp", "cmp.osano");
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -3276,8 +3307,7 @@ mod tests {
         let mut settings = crate::test_support::tests::create_test_settings();
         // The shared fixture names prebid, and this asks what the registry
         // serves when it does not.
-        settings.integration.module.clear();
-        settings.integration.remove("prebid");
+        settings.auction.modules.clear();
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -3299,9 +3329,9 @@ mod tests {
     fn js_module_ids_defer_prebid_shim_when_external_bundle_is_configured() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "prebid",
+            .insert_module_config(
+                "auction",
+                "auction.prebid",
                 &serde_json::json!({
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
                 }),
@@ -3340,9 +3370,9 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
-            .integration
-            .insert_config(
-                "prebid",
+            .insert_module_config(
+                "auction",
+                "auction.prebid",
                 &serde_json::json!({
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
@@ -3380,11 +3410,12 @@ mod tests {
         Ok(Some(IntegrationRegistration::builder("lockr").build()))
     }
 
-    /// The shared fixture with `id` named in `[integration] module`, so a
+    /// The shared fixture with the module `name` selected in its section, so a
     /// test builder is built the way any integration an operator names is.
-    fn settings_naming(id: &str) -> Settings {
+    fn settings_naming(name: &str) -> Settings {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.integration.select(id);
+        let section = name.split_once('.').map_or("testing", |(folder, _)| folder);
+        settings.select_module(section, name);
         settings
     }
 
@@ -3396,7 +3427,8 @@ mod tests {
             "seam-probe",
             probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
 
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build registry with an external builder");
@@ -3417,15 +3449,19 @@ mod tests {
     fn with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
-            .integration
-            .insert_config("lockr", &serde_json::json!({"app_id": "test-app-id" }))
+            .insert_module_config(
+                "identity",
+                "identity.lockr",
+                &serde_json::json!({"app_id": "test-app-id" }),
+            )
             .expect("should insert lockr config");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "lockr",
             "seam-probe",
             duplicate_lockr_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.lockr")];
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
@@ -3479,9 +3515,9 @@ mod tests {
 
     fn enable_prebid(settings: &mut Settings) {
         settings
-            .integration
-            .insert_config(
-                "prebid",
+            .insert_module_config(
+                "auction",
+                "auction.prebid",
                 &serde_json::json!({
                     "external_bundle_url": "https://assets.example.com/prebid/trusted-prebid.js",
                 }),
@@ -3490,7 +3526,7 @@ mod tests {
     }
 
     fn enable_gpt_diagnostics(settings: &mut Settings) {
-        settings.integration.select("gpt_diagnostics");
+        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
     }
 
     fn carried_probe_builder() -> crate::integrations::IntegrationBuilder {
@@ -3500,6 +3536,7 @@ mod tests {
             carried_probe_registration,
             validate_nothing,
         )
+        .with_module_name("testing.probe")
     }
 
     const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -3580,7 +3617,8 @@ mod tests {
             "seam-probe",
             lying_probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
@@ -3609,7 +3647,8 @@ mod tests {
             "seam-probe",
             disabled_carried_probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
 
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should build registry");
@@ -3799,6 +3838,7 @@ mod tests {
                 never_registering_builder,
                 validate_nothing,
             )
+            .with_module_name("testing.probe-first")
             .with_request_preparer(record_first_preparer),
             crate::integrations::IntegrationBuilder::new(
                 "probe-second",
@@ -3806,6 +3846,7 @@ mod tests {
                 never_registering_builder,
                 validate_nothing,
             )
+            .with_module_name("testing.probe-second")
             .with_request_preparer(record_second_preparer),
         ];
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
@@ -3847,6 +3888,7 @@ mod tests {
                 never_registering_builder,
                 validate_nothing,
             )
+            .with_module_name("testing.probe-failing")
             .with_request_preparer(failing_preparer),
             crate::integrations::IntegrationBuilder::new(
                 "probe-after-failure",
@@ -3854,6 +3896,7 @@ mod tests {
                 never_registering_builder,
                 validate_nothing,
             )
+            .with_module_name("testing.probe-after-failure")
             .with_request_preparer(record_after_failure_preparer),
         ];
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
@@ -4004,7 +4047,8 @@ mod tests {
             "seam-probe",
             device_probe_registration,
             validate_nothing,
-        )]
+        )
+        .with_module_name("testing.device-probe")]
     }
 
     #[test]
@@ -4036,7 +4080,8 @@ mod tests {
             "seam-probe",
             geo_probe_registration,
             validate_nothing,
-        )]
+        )
+        .with_module_name("testing.geo-probe")]
     }
 
     /// Settings whose `[geo] module` names `module`, which may be a value
@@ -4051,7 +4096,10 @@ mod tests {
     /// selecting a module's geo module writes.
     fn settings_selecting_geo_module(module_id: &str) -> Settings {
         let mut settings = settings_with_geo_selector(module_id);
-        settings.integration.select(module_id);
+        let section = module_id
+            .split_once('.')
+            .map_or("testing", |(folder, _)| folder);
+        settings.select_module(section, module_id);
         settings
     }
 
@@ -4143,7 +4191,8 @@ mod tests {
             "seam-probe",
             probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
@@ -4158,7 +4207,7 @@ mod tests {
 
     #[test]
     fn geo_selector_rejects_a_module_the_integration_list_does_not_name() {
-        // The module is registered, but `[integration] module` does not name
+        // The module is registered, but no section selects
         // it, so its geo module is not there to select.
         let settings = settings_with_geo_selector("probe-unnamed");
         let extra = [crate::integrations::IntegrationBuilder::new(
@@ -4166,7 +4215,8 @@ mod tests {
             "seam-probe",
             never_registering_builder,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe-unnamed")];
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
@@ -4175,7 +4225,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("probe-unnamed")
-                && message.contains("[integration] module")
+                && message.contains("no section selects")
                 && message.contains("geo module"),
             "error should name the module, the list, and the capability: {message}"
         );
@@ -4197,8 +4247,9 @@ mod tests {
             "should name the id nothing supplies: {message}"
         );
         assert!(
-            message.contains("prebid") && message.contains("gpt"),
-            "should list the integrations this deployment does supply: {message}"
+            message.contains("The testing modules it supplies are")
+                && message.contains("testlight"),
+            "should list the module types this deployment does supply: {message}"
         );
     }
 
@@ -4212,7 +4263,8 @@ mod tests {
             "seam-probe",
             probe_registration,
             validate_nothing,
-        )];
+        )
+        .with_module_name("testing.probe")];
 
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
             .expect("should accept an id a supplied builder claims");

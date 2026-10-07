@@ -917,9 +917,9 @@ mod tests {
             let integrations = if let Some(gam_attribution_enabled) = gam_attribution_enabled {
                 let mut settings = create_test_settings();
                 settings
-                    .integration
-                    .insert_config(
-                        "gpt",
+                    .insert_module_config(
+                        "ad-tag",
+                        "ad-tag.google",
                         &json!({
                             "gam_attribution_enabled": gam_attribution_enabled
                         }),
@@ -960,7 +960,7 @@ mod tests {
         );
         assert!(
             !without_gpt.contains("data-ts-gam-attribution"),
-            "should leave a bundle unmarked when [integration] module does not name gpt"
+            "should leave a bundle unmarked when no section selects google"
         );
 
         let head_insert_index = attributed
@@ -979,7 +979,7 @@ mod tests {
     fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
-        settings.integration.select("gpt_diagnostics");
+        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
 
         let mut request = http::Request::builder()
             .method(http::Method::GET)
@@ -1119,9 +1119,9 @@ mod tests {
     fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &json!({
                     "client_side_key": "test-client-key",
                 }),
@@ -1256,9 +1256,9 @@ mod tests {
         let mut settings = Settings::default();
         let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
         settings
-            .integration
-            .insert_config(
-                "testlight",
+            .insert_module_config(
+                "auction",
+                "testing.testlight",
                 &json!({
                     "endpoint": "https://example.com/openrtb2/auction",
                     "rewrite_scripts": true,
@@ -1997,8 +1997,11 @@ mod tests {
     fn nextjs_output_overflow_restores_in_progress_script_at_every_split() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config("nextjs", &json!({"max_combined_payload_bytes": 128}))
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
+                &json!({"max_combined_payload_bytes": 128}),
+            )
             .expect("should select the nextjs integration");
         let registry = IntegrationRegistry::with_plan(
             &settings,

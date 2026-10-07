@@ -34,10 +34,10 @@ This is a deliberate design choice to limit data forwarded to Google. If your us
 Add the GTM configuration to `trusted-server.toml`:
 
 ```toml
-[integration]
-module = ["google_tag_manager"]
+[tag]
+modules = ["google-tag-manager"]
 
-[integration.google_tag_manager]
+[tag.google-tag-manager]
 container_id = "GTM-XXXXXX"
 # upstream_url = "https://www.googletagmanager.com" # Optional override (must be https)
 # allowed_tag_ids = ["G-XXXXXXXX"] # Tag ids besides container_id that gtag/js may serve first-party

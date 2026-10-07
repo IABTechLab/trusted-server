@@ -23,6 +23,20 @@ use super::IntegrationRegistration;
 
 /// Stable integration identifier.
 pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
+
+/// The name this module is selected by, in `[ad-tag]`.
+pub const MODULE: &str = "ad-tag.google.diagnostics";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        GPT_DIAGNOSTICS_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE)
+    .with_request_preparer(prepare_request_hook);
 /// Reserved activation query parameter.
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
@@ -217,7 +231,7 @@ struct ConsoleCookieState {
 }
 
 /// Validates the GPT diagnostics configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -225,11 +239,11 @@ struct ConsoleCookieState {
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        .module_config::<GptDiagnosticsConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
-/// Register GPT diagnostics when `[integration] module` names it.
+/// Register GPT diagnostics when a section selects it.
 ///
 /// # Errors
 ///
@@ -238,9 +252,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let Some(_config) =
-        settings.integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)?
-    else {
+    let Some(_config) = settings.module_config::<GptDiagnosticsConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -261,7 +273,7 @@ pub fn register(
 #[must_use]
 pub fn runs(settings: &Settings) -> bool {
     settings
-        .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        .module_config::<GptDiagnosticsConfig>(MODULE)
         .ok()
         .flatten()
         .is_some()
@@ -286,7 +298,7 @@ pub fn prepare_request(
     }
 
     let integration_runs = settings
-        .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)?
+        .module_config::<GptDiagnosticsConfig>(MODULE)?
         .is_some();
     let (directive, clean_path, had_reserved_query) = console_query(request.uri());
     let cookie_state = console_cookie_state(request);
@@ -476,7 +488,7 @@ mod tests {
 
     fn settings() -> Settings {
         let mut settings = create_test_settings();
-        settings.integration.select(GPT_DIAGNOSTICS_INTEGRATION_ID);
+        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
         settings
     }
 
@@ -711,12 +723,15 @@ mod tests {
     fn config_rejects_unknown_fields() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(GPT_DIAGNOSTICS_INTEGRATION_ID, &json!({"typo": true }))
+            .insert_module_config(
+                "ad-tag",
+                "ad-tag.google.diagnostics",
+                &json!({"typo": true }),
+            )
             .expect("should insert diagnostics config");
 
         let error = settings
-            .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+            .module_config::<GptDiagnosticsConfig>(MODULE)
             .expect_err("should reject unknown diagnostics config fields");
         let error_text = format!("{error:?}");
         assert!(error_text.contains("typo") || error_text.contains("unknown field"));

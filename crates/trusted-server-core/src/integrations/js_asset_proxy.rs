@@ -30,6 +30,20 @@ use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 
 pub(crate) const JS_ASSET_PROXY_INTEGRATION_ID: &str = "js_asset_proxy";
+
+/// The name this module is selected by, in `[proxy]`.
+pub const MODULE: &str = "js_asset_proxy";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        JS_ASSET_PROXY_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE)
+    .selected_in("proxy");
 const JS_ASSET_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const X_CONTENT_TYPE_OPTIONS_NOSNIFF: &str = "nosniff";
 const ERROR_ORIGIN_UNREACHABLE: &str = "js-asset-origin-unreachable";
@@ -442,9 +456,7 @@ impl JsAssetProxyIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<JsAssetProxyIntegration>>, Report<TrustedServerError>> {
-    let Some(mut config) =
-        settings.integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)?
-    else {
+    let Some(mut config) = settings.module_config::<JsAssetProxyConfig>(MODULE)? else {
         return Ok(None);
     };
     config.normalize_origin_urls();
@@ -453,7 +465,7 @@ fn build(
 }
 
 /// Validates the JavaScript asset proxy configuration for deployment and
-/// reports whether `[integration] module` names the integration.
+/// reports whether a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -461,7 +473,7 @@ fn build(
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)
+        .module_config::<JsAssetProxyConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
@@ -840,11 +852,11 @@ mod tests {
     #[test]
     fn js_asset_proxy_rewriter_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
-        settings.integration.select("gpt");
+        settings.select_module("ad-tag", "ad-tag.google");
         settings
-            .integration
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
                     "assets": [{
                         "path": "/assets/gpt.js",
@@ -872,11 +884,11 @@ mod tests {
     #[test]
     fn js_asset_proxy_blocking_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
-        settings.integration.select("gpt");
+        settings.select_module("ad-tag", "ad-tag.google");
         settings
-            .integration
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
                     "assets": [{
                         "path": "/assets/gpt.js",
@@ -904,11 +916,11 @@ mod tests {
     #[test]
     fn disabled_js_asset_proxy_candidate_allows_native_rewriters() {
         let mut settings = create_test_settings();
-        settings.integration.select("gpt");
+        settings.select_module("ad-tag", "ad-tag.google");
         settings
-            .integration
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
                     "assets": [{
                         "path": "/assets/gpt.js",
@@ -1041,10 +1053,10 @@ mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integration]
-            module = ["js_asset_proxy"]
+            [proxy]
+            modules = ["js_asset_proxy"]
 
-            [[integration.js_asset_proxy.assets]]
+            [[proxy.js_asset_proxy.assets]]
             path = "/assets/vendor.js"
             origin_url = "https://cdn.example.com/vendor.js"
             proxy = "passthrough"
@@ -1053,7 +1065,7 @@ mod tests {
 
         assert!(
             settings
-                .integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)
+                .module_config::<JsAssetProxyConfig>(MODULE)
                 .is_err(),
             "unknown proxy mode should fail deserialization"
         );
@@ -1063,9 +1075,9 @@ mod tests {
     fn exact_configured_routes_are_registered() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
                     "assets": [
                         {
@@ -1263,9 +1275,9 @@ mod tests {
     fn configured_origin_urls_are_canonicalized_for_matching_and_duplicates() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
                     "assets": [{
                         "path": "/assets/vendor.js",

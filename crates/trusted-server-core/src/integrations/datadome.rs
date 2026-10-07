@@ -23,10 +23,10 @@
 //! Add to `trusted-server.toml`:
 //!
 //! ```toml
-//! [integration]
-//! module = ["datadome"]
+//! [bot-protection]
+//! module = "datadome"
 //!
-//! [integration.datadome]
+//! [bot-protection.datadome]
 //! sdk_origin = "https://js.datadome.co"        # SDK script origin
 //! api_origin = "https://api-js.datadome.co"    # Signal collection API origin
 //! cache_ttl_seconds = 3600                     # Cache TTL for tags.js (1 hour)
@@ -93,6 +93,19 @@ pub use protection_scope::{
 use protection_scope::ProtectionScope;
 
 pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
+
+/// The name this module is selected by, in `[bot-protection]`.
+pub const MODULE: &str = "bot-protection.datadome";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        DATADOME_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
 pub(super) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
 /// Fixed request header used by the staging-only protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
@@ -931,8 +944,7 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<DataDomeIntegration>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<DataDomeConfig>(DATADOME_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<DataDomeConfig>(MODULE)? else {
         log::debug!("[datadome] Integration disabled or not configured");
         return Ok(None);
     };
@@ -967,7 +979,7 @@ fn build(
 }
 
 /// Validates the `DataDome` configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -975,8 +987,7 @@ fn build(
 /// validation, or fails the startup checks on protection, bypass, or
 /// client-tag settings.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<DataDomeConfig>(DATADOME_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<DataDomeConfig>(MODULE)? else {
         return Ok(false);
     };
     DataDomeIntegration::validate_config_for_startup(config)?;

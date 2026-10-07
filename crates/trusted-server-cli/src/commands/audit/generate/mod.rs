@@ -466,44 +466,35 @@ fn build_draft_config_with_generator(
         .map(|integration| integration.id.as_str())
         .collect::<BTreeSet<_>>();
 
-    // An integration runs when `[integration] module` names it, so the audit
-    // writes that list rather than a switch inside each block. Only the
-    // integrations it can configure on its own are named here, and the rest go
-    // to manual review below.
-    let mut selected = ["datadome", "didomi", "gpt"]
-        .into_iter()
-        .filter(|id| detected.contains(id))
-        .collect::<Vec<_>>();
-
+    // A module runs when the section of its type selects it, so the audit
+    // writes that section for each module it can configure on its own. The
+    // rest go to manual review below.
     let gtm_container_id = if detected.contains("google_tag_manager") {
         extract_gtm_container_id(artifact)
     } else {
         None
     };
-    if gtm_container_id.is_some() {
-        selected.push("google_tag_manager");
-    }
-
     let asset_proxy_section = build_js_asset_proxy_section(artifact, path_generator)?;
     if asset_proxy_section.candidate_count > 0 {
-        selected.push(JS_ASSET_PROXY_ID);
+        draft = select_js_asset_proxy(&draft)?;
     }
-    selected.sort_unstable();
 
-    let module = selected
-        .iter()
-        .map(|id| format!("\"{id}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    draft = replace_key_in_section(
-        &draft,
-        "integration",
-        "module",
-        &format!("module = [{module}]"),
-    )?;
-
-    // The template documents every integration as a commented example, so the
-    // blocks the audit fills in are appended under the list that names them.
+    // The template documents every module as a commented example, so the
+    // sections the audit fills in are appended after it.
+    for id in ["datadome", "didomi", "gpt"] {
+        if detected.contains(id)
+            && let Some((section, written)) = module_section(id)
+        {
+            append_section(
+                &mut draft,
+                &format!(
+                    "# Selected by `ts audit`, which detected {id} on the audited page.\n\
+                     [{section}]\n\
+                     modules = [\"{written}\"]\n"
+                ),
+            );
+        }
+    }
     if let Some(container_id) = &gtm_container_id {
         append_section(&mut draft, &build_google_tag_manager_section(container_id));
     }
@@ -533,11 +524,17 @@ fn build_draft_config_with_generator(
         }
         draft.push_str("\n# Audit findings requiring manual review\n");
         for integration in manual_review {
-            draft.push_str(&format!(
-                "# - Detected {integration}; review the `[integration.{integration}]` \
-                 settings in this file, then add \"{integration}\" to \
-                 [integration] module to run it.\n"
-            ));
+            draft.push_str(&match module_section(integration) {
+                Some((section, written)) => format!(
+                    "# - Detected {integration}; review the `[{section}.{written}]` \
+                     settings in this file, then select \"{written}\" in [{section}] \
+                     to run it.\n"
+                ),
+                None => format!(
+                    "# - Detected {integration}, which no module in this build \
+                     configures; review it by hand.\n"
+                ),
+            });
         }
     }
 
@@ -573,7 +570,7 @@ fn build_js_asset_proxy_section(
     toml.push_str("# Audit note: some discovered scripts may be runtime-injected and may not\n");
     toml.push_str("# appear in origin HTML. JS Asset Proxy rewrites only matching script src\n");
     toml.push_str("# URLs present in HTML processed by Trusted Server.\n");
-    toml.push_str(&format!("[integration.{JS_ASSET_PROXY_ID}]\n"));
+    toml.push_str(&format!("[proxy.{JS_ASSET_PROXY_ID}]\n"));
     toml.push_str("# Uncomment to override upstream cache headers for every asset below.\n");
     toml.push_str("# This replaces upstream directives, including private and no-store.\n");
     toml.push_str("# Use only when each asset's bytes are identical for every visitor.\n");
@@ -590,7 +587,7 @@ fn build_js_asset_proxy_section(
             "# No eligible third-party HTTPS script assets were detected by `ts audit`, so\n",
         );
         notes.push_str(&format!(
-            "# no [integration.{JS_ASSET_PROXY_ID}] block is written.\n"
+            "# no [proxy.{JS_ASSET_PROXY_ID}] table is written.\n"
         ));
         append_js_asset_proxy_skip_comments(&mut notes, &skipped);
     }
@@ -602,10 +599,14 @@ fn build_js_asset_proxy_section(
             let integration = sanitized_comment_value(integration);
             toml.push_str(&format!("# Detected integration: {integration}\n"));
             toml.push_str(&format!(
-                "# Native integration may be preferable: [integration.{integration}]\n"
+                "# Native integration may be preferable: [{}]\n",
+                module_section(integration).map_or_else(
+                    || integration.to_owned(),
+                    |(section, written)| format!("{section}.{written}")
+                )
             ));
         }
-        toml.push_str("[[integration.js_asset_proxy.assets]]\n");
+        toml.push_str("[[proxy.js_asset_proxy.assets]]\n");
         toml.push_str(&format!("path = {}\n", toml_string(&generated_path)));
         toml.push_str(&format!(
             "origin_url = {}\n",
@@ -642,10 +643,50 @@ fn append_section(draft: &mut String, section: &str) {
 fn build_google_tag_manager_section(container_id: &str) -> String {
     format!(
         "# Generated by `ts audit` from the container found on the audited page.\n\
-         [integration.google_tag_manager]\n\
+         [tag]\n\
+         modules = [\"google-tag-manager\"]\n\
+         \n\
+         [tag.google-tag-manager]\n\
          container_id = {}\n",
         toml_string(container_id)
     )
+}
+
+/// Selects the JavaScript asset proxy in the template's `[proxy]` section by
+/// uncommenting the selection the template documents there.
+fn select_js_asset_proxy(draft: &str) -> CliResult<String> {
+    const COMMENTED: &str = "# modules = [\"js_asset_proxy\"]";
+    if draft.matches(COMMENTED).count() != 1 {
+        return cli_error(format!(
+            "failed to update starter config because `{COMMENTED}` was not found once in [proxy]"
+        ));
+    }
+    Ok(draft.replacen(COMMENTED, "modules = [\"js_asset_proxy\"]", 1))
+}
+
+/// The section a detected integration's module is selected in, and the name it
+/// is written under there, or `None` for one no module in this build
+/// configures.
+fn module_section(id: &str) -> Option<(&'static str, &'static str)> {
+    use trusted_server_core::integrations as modules;
+    let (section, name) = match id {
+        "datadome" => ("bot-protection", modules::datadome::MODULE),
+        "didomi" => ("cmp", modules::didomi::MODULE),
+        "sourcepoint" => ("cmp", modules::sourcepoint::MODULE),
+        "osano" => ("cmp", modules::osano::MODULE),
+        "lockr" => ("identity", modules::lockr::MODULE),
+        "permutive" => ("audience", modules::permutive::MODULE),
+        "nextjs" => ("framework", modules::nextjs::MODULE),
+        "gpt" => ("ad-tag", modules::gpt::MODULE),
+        "google_tag_manager" => ("tag", modules::google_tag_manager::MODULE),
+        "prebid" => ("auction", modules::prebid::MODULE),
+        "testlight" => ("auction", modules::testlight::MODULE),
+        _ => return None,
+    };
+    Some((
+        section,
+        trusted_server_core::module_name::short_form(section, name),
+    ))
 }
 
 fn select_js_asset_proxy_candidates(
@@ -2411,7 +2452,7 @@ mod tests {
             draft.js_asset_proxy_candidate_count, 2,
             "should report generated disabled entries"
         );
-        assert!(draft.toml.contains("[integration.js_asset_proxy]\n"));
+        assert!(draft.toml.contains("[proxy.js_asset_proxy]\n"));
         assert!(draft.toml.contains("/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js"));
         assert!(draft.toml.contains("/assets/bbbbbbbbbbbbbbbbbbbbbbbb.js"));
         assert!(
@@ -2424,7 +2465,7 @@ mod tests {
         assert!(
             draft
                 .toml
-                .contains("Native integration may be preferable: [integration.gpt]")
+                .contains("Native integration may be preferable: [ad-tag.google]")
         );
         assert!(
             draft
@@ -2441,7 +2482,7 @@ mod tests {
         let parsed =
             toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
         assert!(
-            parsed["integration"]["js_asset_proxy"]
+            parsed["proxy"]["js_asset_proxy"]
                 .get("cache_ttl_seconds")
                 .is_none(),
             "generated config should inherit upstream cache headers by default"
@@ -2539,7 +2580,7 @@ mod tests {
                 .toml
                 .matches(
                     "
-[[integration.js_asset_proxy.assets]]"
+[[proxy.js_asset_proxy.assets]]"
                 )
                 .count(),
             1,
@@ -2630,9 +2671,7 @@ mod tests {
                 .contains("No eligible third-party HTTPS script assets")
         );
         assert!(
-            !draft
-                .toml
-                .contains("\n[[integration.js_asset_proxy.assets]]"),
+            !draft.toml.contains("\n[[proxy.js_asset_proxy.assets]]"),
             "should not emit asset array entries without candidates"
         );
         assert!(
@@ -2695,19 +2734,26 @@ mod tests {
         assert!(draft.contains("origin_url = \"https://www.publisher.example:8443\""));
         assert!(draft.contains("Detected prebid"));
         let parsed = toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
-        let module = parsed["integration"]["module"]
-            .as_array()
-            .expect("should write the module list")
-            .iter()
-            .filter_map(|id| id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            module,
-            vec!["google_tag_manager", "gpt"],
-            "should name the integrations it can configure, and leave Prebid to manual review"
+        let selected = |section: &str| {
+            parsed[section]["modules"]
+                .as_array()
+                .expect("should write the section's selection")
+                .iter()
+                .filter_map(|name| name.as_str())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(selected("tag"), vec!["google-tag-manager"]);
+        assert_eq!(selected("ad-tag"), vec!["google"]);
+        assert!(
+            parsed
+                .get("auction")
+                .and_then(|auction| auction.get("modules"))
+                .is_none(),
+            "should leave Prebid to manual review"
         );
         assert_eq!(
-            parsed["integration"]["google_tag_manager"]["container_id"].as_str(),
+            parsed["tag"]["google-tag-manager"]["container_id"].as_str(),
             Some("GTM-ABC123"),
             "should write the container it found"
         );
@@ -2734,15 +2780,8 @@ mod tests {
 
         let parsed = toml::from_str::<toml::Value>(&draft).expect("draft should parse as TOML");
         assert!(
-            parsed["integration"]["module"]
-                .as_array()
-                .expect("should write the module list")
-                .is_empty(),
-            "should not name GTM without a container to configure it with"
-        );
-        assert!(
-            parsed["integration"].get("google_tag_manager").is_none(),
-            "should write no block for an integration it did not name"
+            parsed.get("tag").is_none(),
+            "should not select GTM without a container to configure it with"
         );
         assert!(draft.contains("Detected google_tag_manager"));
     }

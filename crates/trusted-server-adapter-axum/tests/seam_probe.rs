@@ -79,13 +79,13 @@ assume_single_jurisdiction = true
     .expect("should parse seam probe test settings")
 }
 
-/// The probe's own configuration block, enabling it with the country the geo
+/// The probe's own section and table, selecting it with the country the geo
 /// assertions expect.
 const PROBE_BLOCK: &str = r#"
-            [integration]
-            module = ["seam_probe"]
+            [testing]
+            modules = ["seam-probe"]
 
-            [integration.seam_probe]
+            [testing.seam-probe]
             country = "ZZ"
 "#;
 
@@ -320,10 +320,10 @@ async fn every_route_prepares_the_request_exactly_once() {
 fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
     let settings = settings_with(
         r#"
-            [integration]
-            module = ["seam_probe"]
+            [testing]
+            modules = ["seam-probe"]
 
-            [integration.seam_probe]
+            [testing.seam-probe]
             country = "ZZZ"
         "#,
     );
@@ -356,10 +356,10 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
             [geo]
             module = "seam_probe"
 
-            [integration]
-            module = ["seam_probe"]
+            [testing]
+            modules = ["seam-probe"]
 
-            [integration.seam_probe]
+            [testing.seam-probe]
             country = "ZZ"
             declares_geo = false
         "#,

@@ -707,6 +707,7 @@ Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See 
 
 ```toml
 [auction]
+modules = ["prebid"]
 enabled = true
 sanitize_creatives = false     # Opt-in, blanks script-based creatives when enabled
 rewrite_creatives = true
@@ -746,10 +747,7 @@ module = "adserver_mock"
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
-[integration]
-module = ["prebid"]
-
-[integration.prebid]
+[auction.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["example-browser"]
@@ -836,7 +834,7 @@ late response can remain eligible. Local decision and delivery also finish
 after network launch closes, so `timeout_ms` is not a hard wall-clock ceiling
 and an auction can exceed it.
 
-Browser Prebid `timeout_ms` and `debug` stay under `[integration.prebid]` and
+Browser Prebid `timeout_ms` and `debug` stay under `[auction.prebid]` and
 are independent of every demand source value. The server endpoint, timeout,
 routes, debug, test mode, overrides, consent forwarding and notification
 suppression belong to the `[demand.<name>]` table, not to the browser

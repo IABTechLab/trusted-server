@@ -21,8 +21,9 @@ setting = "value"
 ```
 
 1. **The type is the job.** Each type is one top-level table, named for what
-   its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand`,
-   `ad-server` and `integration`.
+   its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand` and
+   `ad-server`, and the section of each module type, named by the type's
+   folder under `crates/`, such as `cmp` or `tag`.
 2. **The selector chooses what runs.** A type that runs one module takes
    `module`, a string. A type that runs several takes `modules`, a list.
 3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
@@ -39,22 +40,29 @@ setting = "value"
 6. **Secrets are key names.** A secret setting holds the name of a key in
    `trusted_server_secrets`, never the secret itself.
 
-| Type                | Runs              | Selector           | Implementations in this repository                                                                                                                                    |
-| ------------------- | ----------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ec`                | one               | `module`, a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity                                                               |
-| `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                                                                                          |
-| `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                                                                                     |
-| `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                                                                                     |
-| `demand`            | several           | `modules`, a list  | `openrtb`, `prebid_server`, `aps`                                                                                                                                     |
-| `ad-server`         | one               | `module`, a string | `adserver_mock`                                                                                                                                                       |
-| `integration`       | several           | `modules`, a list  | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
+| Type                | Runs              | Selector           | Implementations in this repository                                                                      |
+| ------------------- | ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
+| `ec`                | one               | `module`, a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity |
+| `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                            |
+| `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                       |
+| `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
+| `demand`            | several           | `modules`, a list  | `openrtb`, `prebid_server`, `aps`                                                                       |
+| `ad-server`         | one               | `module`, a string | `adserver_mock`                                                                                         |
+| `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
+| `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |
+| `ad-tag`            | several           | `modules`, a list  | `google`, `google.diagnostics`                                                                          |
+| `bot-protection`    | one               | `module`, a string | `datadome`                                                                                              |
+| `identity`          | one               | `module`, a string | `lockr`                                                                                                 |
+| `audience`          | one               | `module`, a string | `permutive`                                                                                             |
+| `framework`         | one               | `module`, a string | `nextjs`                                                                                                |
+| `auction`           | several           | `modules`, a list  | `prebid`, `testing.testlight`                                                                           |
+| `proxy`             | several           | `modules`, a list  | `js_asset_proxy`                                                                                        |
 
 `openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
-only. They are not page integrations and cannot be named in
-`[integration] module`.
+only. No module section selects them.
 
-A module that an integration supplies needs that integration named in
-`[integration] module` too, because the module has to be registered before
+A module that an integration supplies needs that integration selected in the
+section of its type too, because the module has to be registered before
 another type can select what it offers.
 
 A few types keep settings of their own beside the selector, where the setting
@@ -64,15 +72,15 @@ partner registry and the cluster thresholds, and `[geo]` holds
 
 ### Leaving the selector out
 
-| Type                | With no `module` or `modules` line                        |
-| ------------------- | --------------------------------------------------------- |
-| `ec`                | no Edge Cookie is created                                 |
-| `geo`               | no location is resolved and no host geo service is called |
-| `device`            | `builtin` runs, which reads the User-Agent only           |
-| `permission-signal` | every linked module runs, in the order shown above        |
-| `demand`            | no demand source is called                                |
-| `ad-server`         | the highest bid wins, with no ad server                   |
-| `integration`       | no integration runs                                       |
+| Type                                            | With no `module` or `modules` line                                                |
+| ----------------------------------------------- | --------------------------------------------------------------------------------- |
+| `ec`                                            | no Edge Cookie is created                                                         |
+| `geo`                                           | no location is resolved and no host geo service is called                         |
+| `device`                                        | `builtin` runs, which reads the User-Agent only                                   |
+| `permission-signal`                             | every linked module runs, in the order shown above                                |
+| `demand`                                        | no demand source is called                                                        |
+| `ad-server`                                     | the highest bid wins, with no ad server                                           |
+| a module type's section, such as `cmp` or `tag` | the section is refused, so remove the whole section when none of its modules runs |
 
 ## What is checked before a request is served
 
@@ -111,9 +119,9 @@ implementations compiled into the CLI.
   host, timeouts, routing modes, notification bounds, a bidder route naming a
   demand source `[demand] modules` does not select, and any setting the
   chosen implementation rejects.
-- Every selected integration's own settings, and the refusal of a block for an
-  integration `[integration] module` does not name, of an `enabled` key left
-  behind in a block, and of the removed `[integrations]` table.
+- Every selected module's own settings, and the refusal of a table for a
+  module its section does not select, of a section that selects nothing, and
+  of the removed `[integrations]` and `[integration]` tables.
 - Every secret setting holding a non-empty key name rather than a value, with a
   secret store declared to hold it.
 - Basic-auth coverage of the admin namespace, and the placeholder values the
@@ -132,7 +140,7 @@ loaded, and these join it.
   four will start.** Start an instance on the new configuration to find out.
 - Assembling the integration registry, which is where a module that supplies an
   identity, location or device module is matched to the type that selected
-  it, and where an `[integration] module` entry no builder in this build
+  it, and where a name a section selects that no builder in this build
   supplies is refused. A module declaring an identity or device module that
   no type selects is logged as a warning here.
 - The resolved secret values, which a key name alone cannot show. A weak or
@@ -198,14 +206,14 @@ proxy_secret = "publisher_proxy_secret"    # key name
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integration]
-module = ["prebid", "gpt"]
+[ad-tag]
+modules = ["google"]
 
-[integration.prebid]
+[auction.prebid]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 timeout_ms = 1500                          # the browser's Prebid timeout
 
-[integration.gpt]
+[ad-tag.google]
 gam_attribution_enabled = true
 
 [ec]
@@ -241,6 +249,7 @@ endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
 [auction]
+modules = ["prebid"]
 enabled = true
 timeout_ms = 2000                          # the whole auction
 
@@ -280,7 +289,7 @@ endpoint = "https://house.example.com/openrtb2/auction"
 
 | Previous                                                                             | Now                                                                                                |
 | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `[integrations.<id>]` with `enabled = true`                                          | `<id>` in `[integration] module`, and `[integration.<id>]` only for settings                       |
+| `[integrations.<id>]` with `enabled = true`                                          | the module in the section of its type, and `[<type>.<name>]` only for settings                     |
 | `[ec.providers.<name>]`                                                              | `[ec.<name>]`                                                                                      |
 | `[permission_signal] sources`                                                        | `[permission-signal] modules`                                                                      |
 | `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `gpp_sale_opt_out`, `us_privacy` | `host_signals`, `client_fixed`, `gpp`, `us-privacy`                                                |

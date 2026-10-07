@@ -261,7 +261,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    optional_object("integration"),
+                    optional_object("bot-protection"),
                     optional_object("datadome"),
                     object("server_side_key_secret_name"),
                 ],
@@ -269,7 +269,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    optional_object("integration"),
+                    optional_object("bot-protection"),
                     optional_object("datadome"),
                     optional_object("protection_test_bypass"),
                     object("credential_secret_name"),
@@ -343,7 +343,7 @@ pub fn validate_settings_for_deploy_with(
 ) -> Result<(), Report<TrustedServerError>> {
     // The selection is checked first, so a block nothing runs is reported as
     // that rather than as whatever its unread settings fail next.
-    settings.integration.validate_selection()?;
+    settings.validate_module_sections()?;
     validate_secret_key_references(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
 
@@ -403,7 +403,7 @@ fn validate_prebid(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
 ) -> Result<(), Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<prebid::PrebidIntegrationConfig>("prebid")?
+    let Some(config) = settings.module_config::<prebid::PrebidIntegrationConfig>(prebid::MODULE)?
     else {
         return Ok(());
     };
@@ -499,16 +499,20 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
     }
 
-    if let Some(datadome) = settings.integration_config::<DataDomeConfig>("datadome")? {
+    if let Some(datadome) =
+        settings.module_config::<DataDomeConfig>(crate::integrations::datadome::MODULE)?
+    {
         if datadome.enable_protection {
             let key = datadome
                 .server_side_key_secret_name
                 .as_ref()
                 .ok_or_else(|| {
-                    missing_secret_key_reference("integration.datadome.server_side_key_secret_name")
+                    missing_secret_key_reference(
+                        "bot-protection.datadome.server_side_key_secret_name",
+                    )
                 })?;
             validate_secret_key_reference(
-                "integration.datadome.server_side_key_secret_name",
+                "bot-protection.datadome.server_side_key_secret_name",
                 key.expose(),
             )?;
         }
@@ -519,11 +523,11 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         {
             let credential = bypass.credential_secret_name.as_ref().ok_or_else(|| {
                 missing_secret_key_reference(
-                    "integration.datadome.protection_test_bypass.credential_secret_name",
+                    "bot-protection.datadome.protection_test_bypass.credential_secret_name",
                 )
             })?;
             validate_secret_key_reference(
-                "integration.datadome.protection_test_bypass.credential_secret_name",
+                "bot-protection.datadome.protection_test_bypass.credential_secret_name",
                 credential.expose(),
             )?;
         }
@@ -802,49 +806,59 @@ formats = [{ width = 300, height = 250 }]
         out.join("\n")
     }
 
-    /// Every documented block should be push-ready, so uncommenting it,
-    /// naming the integration and setting the shown values must parse and
-    /// pass field validation. Blocks that ship a deliberately-invalid
+    /// Every documented table should be push-ready, so uncommenting its
+    /// section's selection and the table with the shown values must parse and
+    /// pass field validation. Tables that ship a deliberately-invalid
     /// non-secret placeholder (GTM `container_id` and `request_signing`
     /// store ids) are excluded.
     #[test]
-    fn documented_integration_blocks_validate_when_uncommented_and_named() {
+    fn documented_module_tables_validate_when_uncommented_and_selected() {
+        use crate::integrations::{lockr, permutive, sourcepoint};
+
         let base = template_with_resolved_required_secrets();
 
-        for (header, id) in [
-            ("[integration.permutive]", "permutive"),
-            ("[integration.lockr]", "lockr"),
-            ("[integration.sourcepoint]", "sourcepoint"),
+        for (section, selection, header, name) in [
+            (
+                "[audience]",
+                "module = \"permutive\"",
+                "[audience.permutive]",
+                permutive::MODULE,
+            ),
+            (
+                "[identity]",
+                "module = \"lockr\"",
+                "[identity.lockr]",
+                lockr::MODULE,
+            ),
+            (
+                "[cmp]",
+                "module = \"sourcepoint\"",
+                "[cmp.sourcepoint]",
+                sourcepoint::MODULE,
+            ),
         ] {
-            let toml = uncomment_block(&base, header)
-                .replace("module = []", &format!("module = [\"{id}\"]"));
+            let toml = format!(
+                "{}\n{section}\n{selection}\n",
+                uncomment_block(&base, header)
+            );
             let settings = Settings::from_toml(&toml)
                 .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
 
-            match id {
-                "permutive" => assert!(
-                    settings
-                        .integration_config::<PermutiveConfig>(id)
-                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                        .is_some(),
-                    "{header} should resolve to a valid config"
-                ),
-                "lockr" => assert!(
-                    settings
-                        .integration_config::<LockrConfig>(id)
-                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                        .is_some(),
-                    "{header} should resolve to a valid config"
-                ),
-                "sourcepoint" => assert!(
-                    settings
-                        .integration_config::<SourcepointConfig>(id)
-                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                        .is_some(),
-                    "{header} should resolve to a valid config"
-                ),
-                other => panic!("unhandled integration id {other}"),
-            }
+            let valid = match name {
+                permutive::MODULE => settings
+                    .module_config::<PermutiveConfig>(name)
+                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                    .is_some(),
+                lockr::MODULE => settings
+                    .module_config::<LockrConfig>(name)
+                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                    .is_some(),
+                _ => settings
+                    .module_config::<SourcepointConfig>(name)
+                    .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                    .is_some(),
+            };
+            assert!(valid, "{header} should resolve to a valid config");
         }
     }
 
@@ -1063,11 +1077,12 @@ formats = [{ width = 300, height = 250 }]
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 (
-                    "integration.datadome.server_side_key_secret_name".to_owned(),
+                    "bot-protection.datadome.server_side_key_secret_name".to_owned(),
                     true,
                 ),
                 (
-                    "integration.datadome.protection_test_bypass.credential_secret_name".to_owned(),
+                    "bot-protection.datadome.protection_test_bypass.credential_secret_name"
+                        .to_owned(),
                     true,
                 ),
                 ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
@@ -1123,9 +1138,9 @@ formats = [{ width = 300, height = 250 }]
         let mut settings = valid_settings();
         settings.tinybird.secret_store = Some("legacy-tinybird-store".to_string());
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "server_side_key_secret_store": "legacy-datadome-store",
                     "protection_test_bypass": {
@@ -1171,9 +1186,9 @@ formats = [{ width = 300, height = 250 }]
         settings.tinybird.auction_token_secret =
             Some(Redacted::new("resolved-tinybird-secret".to_string()));
         settings
-            .integration
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "bot-protection",
+                "bot-protection.datadome",
                 &serde_json::json!({
                     "server_side_key_secret_name": "resolved-datadome-secret",
                 }),
@@ -1208,8 +1223,9 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn wrapper_rejects_legacy_auction_provider_list_with_migration_guidance() {
         let toml = format!(
-            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            "{}\n",
             crate_test_settings_str()
+                .replace("[auction]\n", "[auction]\nproviders = [\"prebid\"]\n")
         );
 
         let error = toml::from_str::<TrustedServerAppConfig>(&toml)
@@ -1501,25 +1517,27 @@ password = "production-admin-password-32-bytes"
         );
     }
 
-    /// A block written for an integration the module list does not name is
-    /// refused by deploy validation, so `ts config validate` reports it before
-    /// the configuration reaches a deployment.
+    /// A table written for a module its section does not select is refused
+    /// when the settings load, so `ts config validate` reports it before the
+    /// configuration reaches a deployment.
     #[test]
-    fn deploy_validation_rejects_a_block_for_an_integration_that_is_not_named() {
-        let mut settings = valid_settings();
-        settings.integration.insert(
-            "adserver_mock".to_owned(),
-            serde_json::json!({ "endpoint": "https://mediator.example.com/mediate" }),
-        );
+    fn a_table_for_a_module_its_section_does_not_select_is_refused() {
+        let mut value = serde_json::to_value(valid_settings()).expect("should serialize settings");
+        value
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "cmp".to_owned(),
+                serde_json::json!({ "modules": ["osano"], "didomi": { "api_key": "k" } }),
+            );
 
-        let error = validate_settings_for_deploy(&settings)
-            .expect_err("should reject a block nothing on the list names");
+        let error =
+            Settings::from_json_value(value).expect_err("should reject a table nothing selects");
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[integration.adserver_mock]")
-                && rendered.contains("[integration] module"),
-            "should name the block and where to name the integration: {rendered}"
+            rendered.contains("[cmp.didomi] is configured") && rendered.contains("does not select"),
+            "should name the table and the selection it is missing from: {rendered}"
         );
     }
 
@@ -1529,7 +1547,7 @@ password = "production-admin-password-32-bytes"
     #[test]
     fn deploy_validation_accepts_an_id_it_does_not_know() {
         let mut settings = valid_settings();
-        settings.integration.select("a_vendors_own_integration");
+        settings.select_module("testing", "testing.a_vendors_own_integration");
 
         validate_settings_for_deploy(&settings)
             .expect("deploy validation should leave unknown ids to the registry");
@@ -1602,7 +1620,8 @@ password = "production-admin-password-32-bytes"
             "seam-probe-crate",
             build_nothing,
             record_validate_call,
-        )];
+        )
+        .with_module_name("testing.seam-probe-integration")];
         validate_settings_for_deploy_with(&valid_settings(), &extra_integrations)
             .expect("should accept settings whose external builder reports disabled");
 
@@ -1624,20 +1643,28 @@ password = "production-admin-password-32-bytes"
     /// list of the built-ins exists in the crate.
     #[test]
     fn deploy_validation_reaches_every_built_in_builder() {
-        for id in crate::integrations::builders()
+        for builder in crate::integrations::builders()
             .iter()
             .filter(|builder| builder.supplies_integration())
-            .map(IntegrationBuilder::id)
         {
+            let name = builder
+                .module_name()
+                .expect("every built-in page integration names its module");
+            let section = builder
+                .section()
+                .expect("every built-in page integration has a section");
             let mut settings = valid_settings();
-            settings.integration.select(id);
             settings
-                .integration
-                .insert(id.to_owned(), serde_json::json!("not-a-block"));
+                .insert_module_config(
+                    section,
+                    name,
+                    &serde_json::json!({ "no_such_setting": true }),
+                )
+                .expect("should insert the planted table");
 
             assert!(
                 validate_settings_for_deploy(&settings).is_err(),
-                "deploy validation should reach the `{id}` builder and reject its planted config"
+                "deploy validation should reach the `{name}` builder and reject its planted config"
             );
         }
     }
@@ -1649,11 +1676,11 @@ password = "production-admin-password-32-bytes"
     #[test]
     fn deploy_validation_requires_external_bundle_url_for_selected_prebid() {
         let mut settings = valid_settings();
-        settings.integration.select("prebid");
+        settings.select_module("auction", "auction.prebid");
         settings
-            .integration
-            .insert_config(
-                "prebid",
+            .insert_module_config(
+                "auction",
+                "auction.prebid",
                 &serde_json::json!({
                     "bundle": {
                         "modules": { "bidder": ["exampleBidderBidAdapter"] }
@@ -1672,24 +1699,34 @@ password = "production-admin-password-32-bytes"
     /// integration and the key, rather than being ignored.
     #[test]
     fn every_integration_rejects_a_setting_it_does_not_know() {
-        for id in crate::integrations::builders()
+        for builder in crate::integrations::builders()
             .iter()
             .filter(|builder| builder.supplies_integration())
-            .map(IntegrationBuilder::id)
         {
+            let name = builder
+                .module_name()
+                .expect("every built-in page integration names its module");
+            let section = builder
+                .section()
+                .expect("every built-in page integration has a section");
             let mut settings = valid_settings();
             settings
-                .integration
-                .insert_config(id, &serde_json::json!({ "no_such_setting": true }))
-                .expect("should insert the planted block");
+                .insert_module_config(
+                    section,
+                    name,
+                    &serde_json::json!({ "no_such_setting": true }),
+                )
+                .expect("should insert the planted table");
 
             let error = match validate_settings_for_deploy(&settings) {
-                Ok(()) => panic!("`{id}` should refuse a setting it does not know"),
+                Ok(()) => panic!("`{name}` should refuse a setting it does not know"),
                 Err(error) => format!("{error:?}"),
             };
+            let written = crate::module_name::short_form(section, name);
             assert!(
-                error.contains(id) && error.contains("no_such_setting"),
-                "`{id}` should name itself and the unknown setting: {error}"
+                error.contains(&format!("[{section}.{written}]"))
+                    && error.contains("no_such_setting"),
+                "`{name}` should name its table and the unknown setting: {error}"
             );
         }
     }
@@ -1705,11 +1742,14 @@ password = "production-admin-password-32-bytes"
         {
             let id = "prebid";
             let mut settings = valid_settings();
-            settings.integration.select(id);
             settings
-                .integration
-                .insert(id.to_owned(), serde_json::json!("not-a-block"));
-            let expected = format!("Integration '{id}'");
+                .insert_module_config(
+                    "auction",
+                    crate::integrations::prebid::MODULE,
+                    &serde_json::json!({ "no_such_setting": true }),
+                )
+                .expect("should insert the planted table");
+            let expected = "[auction.prebid]".to_owned();
 
             let Err(deploy_error) = validate_settings_for_deploy(&settings) else {
                 panic!("deploy validation should reject the planted `{id}` block");
@@ -1736,7 +1776,8 @@ password = "production-admin-password-32-bytes"
             "seam-probe-crate",
             build_nothing,
             reject_deploy,
-        )];
+        )
+        .with_module_name("testing.seam-probe")];
 
         let err = validate_settings_for_deploy_with(&valid_settings(), &extra)
             .expect_err("should surface the external integration builder's rejection");
@@ -1751,8 +1792,7 @@ password = "production-admin-password-32-bytes"
     fn deploy_validation_rejects_invalid_osano_config() {
         let mut settings = valid_settings();
         settings
-            .integration
-            .insert_config("osano", &serde_json::json!({"typo": true }))
+            .insert_module_config("cmp", "cmp.osano", &serde_json::json!({"typo": true }))
             .expect("should insert Osano config");
 
         let err = validate_settings_for_deploy(&settings)
@@ -1773,9 +1813,9 @@ password = "production-admin-password-32-bytes"
         ] {
             let mut settings = valid_settings();
             settings
-                .integration
-                .insert_config(
-                    "datadome",
+                .insert_module_config(
+                    "bot-protection",
+                    "bot-protection.datadome",
                     &serde_json::json!({
                         "enable_protection": enable_protection,
                         "server_side_key_secret_name": "datadome_server_side_key",
@@ -1800,9 +1840,9 @@ password = "production-admin-password-32-bytes"
     fn validate_rejects_invalid_js_asset_proxy_assets() {
         let mut settings = valid_settings();
         settings
-            .integration
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &serde_json::json!({
                     "assets": [{
                         "path": "bad path",

@@ -29,7 +29,7 @@ ids = ["trusted_server_secrets"]
 "#;
 const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
-const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATION__GPT__GAM_ATTRIBUTION_ENABLED";
+const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED";
 const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
 const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__DEMAND__PBS_MAIN__ENDPOINT";
 const BIDDER_PROVIDER_ENV: &str = "TRUSTED_SERVER__AUCTION__BIDDERS__EXAMPLE-BIDDER__PROVIDER";
@@ -57,15 +57,15 @@ fn migrated_project() -> MigratedProject {
     // The demand source `pbs_main` and the bidder route `example-bidder`
     // that names it come from the fixture itself, so the map-shaped overlays
     // below have leaves to replace.
-    // An integration reads its settings only when the module list names it,
-    // and the overlay cannot create a leaf, so the GPT block carries the one
-    // the override replaces.
-    let mut module = Array::new();
-    module.push("gpt_diagnostics");
-    module.push("gpt");
-    document["integration"]["module"] = value(module);
-    document["integration"]["gpt"] = toml_edit::table();
-    document["integration"]["gpt"]["gam_attribution_enabled"] = value(false);
+    // A module reads its settings only when its section selects it, and the
+    // overlay cannot create a leaf, so the Google ad tag's table carries the
+    // one the override replaces.
+    let mut modules = Array::new();
+    modules.push("google.diagnostics");
+    modules.push("google");
+    document["ad-tag"]["modules"] = value(modules);
+    document["ad-tag"]["google"] = toml_edit::table();
+    document["ad-tag"]["google"]["gam_attribution_enabled"] = value(false);
     fs::write(&config_path, document.to_string()).expect("should write migrated config");
     fs::write(&manifest_path, MANIFEST).expect("should write test manifest");
     MigratedProject {
@@ -205,7 +205,7 @@ fn migrated_config_applies_boolean_environment_overrides() {
         serde_json::from_str(envelope_json).expect("should parse blob envelope");
 
     assert_eq!(
-        envelope["data"]["integration"]["gpt"]["gam_attribution_enabled"],
+        envelope["data"]["ad-tag"]["google"]["gam_attribution_enabled"],
         serde_json::Value::Bool(true),
         "pushed config should contain the GAM attribution environment override"
     );

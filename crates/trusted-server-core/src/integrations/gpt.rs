@@ -55,6 +55,19 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const GPT_INTEGRATION_ID: &str = "gpt";
 
+/// The name this module is selected by, in `[ad-tag]`.
+pub const MODULE: &str = "ad-tag.google";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        GPT_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
+
 /// Primary Google domain that serves GPT scripts.
 const SECUREPUBADS_HOST: &str = "securepubads.g.doubleclick.net";
 
@@ -362,7 +375,7 @@ impl GptIntegration {
 }
 
 fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<GptConfig>(GPT_INTEGRATION_ID)? else {
+    let Some(config) = settings.module_config::<GptConfig>(MODULE)? else {
         log::debug!("[gpt] Integration disabled or not configured");
         return Ok(None);
     };
@@ -371,7 +384,7 @@ fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<Trus
 }
 
 /// Validates the GPT configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -379,7 +392,7 @@ fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<Trus
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<GptConfig>(GPT_INTEGRATION_ID)
+        .module_config::<GptConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
@@ -1067,9 +1080,9 @@ mod tests {
     fn build_with_valid_config() {
         let mut settings = create_test_settings();
         settings
-            .integration
-            .insert_config(
-                GPT_INTEGRATION_ID,
+            .insert_module_config(
+                "ad-tag",
+                "ad-tag.google",
                 &serde_json::json!({
                     "script_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
                     "cache_ttl_seconds": 3600,
@@ -1094,7 +1107,7 @@ mod tests {
             build(&settings)
                 .expect("should evaluate integration build")
                 .is_none(),
-            "should not build an integration [integration] module does not name"
+            "should not build an integration no section selects"
         );
     }
 

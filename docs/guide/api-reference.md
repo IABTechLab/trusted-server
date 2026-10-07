@@ -1058,7 +1058,7 @@ compiled integration registry, not an arbitrary filename lookup.
 ```
 
 **Module Selection:**
-All integration modules are built at compile time. At runtime, the server concatenates only the modules of the integrations `[integration] module` names in `trusted-server.toml`. No rebuild is required to change the module set.
+All integration modules are built at compile time. At runtime, the server concatenates only the modules of the integrations the module sections select in `trusted-server.toml`. No rebuild is required to change the module set.
 
 ---
 
@@ -1067,8 +1067,7 @@ All integration modules are built at compile time. At runtime, the server concat
 Every row below records a compiled integration registration predicate.
 An integration with no HTTP route can still contribute a browser module,
 rewriter, injector, post-processor, request filter, or ad server. In the
-predicates below, `named` means the integration's id is in
-`[integration] module`.
+predicates below, `named` means a section selects the integration's module.
 
 | Integration          | Registration predicate                                      | HTTP routes                                       |
 | -------------------- | ----------------------------------------------------------- | ------------------------------------------------- |
@@ -1126,7 +1125,7 @@ predicates below, `named` means the integration's id is in
 ### Integration proxy contracts
 
 All integration routes are registered only when the documented predicate is
-true. An integration `[integration] module` does not name registers no route,
+true. An integration no section selects registers no route,
 so its path continues through
 normal routing and can reach the publisher fallback. Duplicate registrations
 are startup errors. None of these routes has built-in caller authentication or
@@ -1141,7 +1140,7 @@ available when a deployment needs either.
 | Didomi consent    | `GET` or `POST` under the configured prefix (default `/integrations/didomi/consent/*`); path selects SDK or API origin; query and bounded POST body forwarded          | Upstream status/body preserved; SDK responses receive the integration's CORS headers; API responses retain selected upstream headers; no local cache policy                                   | `curl -i https://edge.example.com/integrations/didomi/consent/loader.js`                                                                  |
 | GTM/gtag scripts  | `GET` the generated `gtm.js`, `gtag.js`, or `gtag/js` paths; query forwarded or configured container ID supplied; successful script is rewritten                       | Non-success upstream status preserved; rewritten scripts use `cache_max_age`; oversized rewritten upstream bodies use shared integration errors                                               | `curl -i 'https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-XXXX'`                                                   |
 | Google collect    | `GET` or `POST` the generated `collect` or `g/collect` paths; query, selected headers, and bounded body proxy to the configured Google origin                          | Malformed `Content-Length` returns `400`; body over `max_beacon_body_size` returns `413`; stream-read failure returns `502`; upstream response otherwise preserved                            | Browser beacon; body schema belongs to Google Analytics                                                                                   |
-| JS asset proxy    | `GET` each configured `[[integration.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                 | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
+| JS asset proxy    | `GET` each configured `[[proxy.js_asset_proxy.assets]]` path whose `proxy = "enabled"`; the exact `origin_url` is fetched and served first-party                       | Upstream failures use shared integration errors; successful responses honor the per-asset or integration `cache_ttl_seconds`; `blocked` assets register no route and strip matching tags      | Path is operator-configured, for example `curl -i https://edge.example.com/js/vendor-tag.js`                                              |
 | GPT               | `GET` `/script`, `/pagead/*`, or `/tag/*`; path/query proxy to the configured GPT origins and script content can be rewritten                                          | Upstream status is preserved; successful scripts/assets apply integration cache rules; selected upstream CORS is preserved                                                                    | `curl -i https://edge.example.com/integrations/gpt/script`                                                                                |
 | Lockr SDK         | `GET /integrations/lockr/sdk`; no body; fetches and returns the configured SDK as JavaScript                                                                           | Successful SDK uses `cache_ttl_seconds`; upstream/transport failures follow integration mapping; no added CORS policy                                                                         | `curl -i https://edge.example.com/integrations/lockr/sdk`                                                                                 |
 | Lockr API         | `GET` or `POST /integrations/lockr/api/*`; path, query, selected headers, and bounded body proxy to `api_endpoint`; publisher credentials are stripped                 | Upstream status/body preserved; no local cache/CORS policy                                                                                                                                    | Payload is Lockr-specific; use the SDK for normal calls                                                                                   |

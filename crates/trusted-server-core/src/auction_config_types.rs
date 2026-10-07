@@ -9,13 +9,14 @@ const MOVED_PROVIDERS_MESSAGE: &str = "`[auction.providers]` has moved. Select d
 
 const MOVED_MEDIATOR_MESSAGE: &str = "`[auction] mediator` has moved. Select the ad server with `[ad-server] module = \"<name>\"` and give it its settings in `[ad-server.<name>]`, as the configuration rules describe";
 
+use crate::provider_table::SectionModules;
+
 pub use crate::auction::plan::{
     BidderId, BidderRouteConfig, NotificationConfig, ProviderId, RoutingMode,
 };
 
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
 pub struct AuctionConfig {
     /// Enable the auction orchestrator
     #[serde(default)]
@@ -107,6 +108,11 @@ pub struct AuctionConfig {
     /// deduplicated and serialized in sorted order so config hashes are stable.
     #[serde(default = "default_allowed_context_keys")]
     pub allowed_context_keys: BTreeSet<String>,
+
+    /// The modules this section selects, with each one's settings in the
+    /// table at its name.
+    #[serde(flatten)]
+    pub modules: SectionModules,
 }
 
 impl Default for AuctionConfig {
@@ -125,6 +131,7 @@ impl Default for AuctionConfig {
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
             allowed_context_keys: BTreeSet::new(),
+            modules: SectionModules::default(),
         }
     }
 }

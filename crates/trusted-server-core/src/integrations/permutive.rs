@@ -26,6 +26,19 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
 
+/// The name this module is selected by, in `[audience]`.
+pub const MODULE: &str = "audience.permutive";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        PERMUTIVE_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE);
+
 /// Configuration for Permutive integration.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -288,8 +301,7 @@ impl PermutiveIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<PermutiveIntegration>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<PermutiveConfig>(PERMUTIVE_INTEGRATION_ID)?
-    else {
+    let Some(config) = settings.module_config::<PermutiveConfig>(MODULE)? else {
         return Ok(None);
     };
 
@@ -297,7 +309,7 @@ fn build(
 }
 
 /// Validates the Permutive configuration for deployment and reports whether
-/// `[integration] module` names the integration.
+/// a section selects the integration's module.
 ///
 /// # Errors
 ///
@@ -305,7 +317,7 @@ fn build(
 /// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
-        .integration_config::<PermutiveConfig>(PERMUTIVE_INTEGRATION_ID)
+        .module_config::<PermutiveConfig>(MODULE)
         .map(|config| config.is_some())
 }
 
@@ -591,7 +603,7 @@ mod tests {
     #[test]
     fn test_build_requires_config() {
         let settings = create_test_settings();
-        // Without [integration.permutive] config, should not build
+        // Without [audience.permutive] config, should not build
         assert!(
             build(&settings)
                 .expect("should evaluate integration build")
