@@ -829,13 +829,11 @@ mod tests {
 
     #[test]
     fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
-        // This adapter used to hardcode `region: None` and read no region
-        // header, and the consequence ran all the way to the privacy outcome.
+        // The region header has to reach the privacy outcome.
         // `detect_jurisdiction` reaches its US branch only when the country is
-        // `US` and a region is present, so every US visitor fell through to
-        // `NonRegulated`, where `allows_ec_creation` returns true without ever
-        // reading `ctx.gpc`. A Sec-GPC opt-out was therefore ignored for every
-        // US visitor on Cloudflare.
+        // `US` and a region is present. With no region a US visitor falls
+        // through to `NonRegulated`, where `allows_ec_creation` returns true
+        // without reading `ctx.gpc`, so a Sec-GPC opt-out would be ignored.
         let config = trusted_server_core::consent_config::ConsentConfig::default();
 
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);

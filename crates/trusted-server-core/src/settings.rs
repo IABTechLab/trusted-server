@@ -1267,11 +1267,10 @@ impl DeviceConfig {
 pub struct GeoConfig {
     /// The key of the geo module to activate.
     ///
-    /// The host platform's geo lookup is the default when absent, matching the
-    /// behavior before this selector existed; `module = "platform"` spells
-    /// the same choice explicitly. Selecting `module = "none"` resolves no
-    /// geolocation and makes no host geo call, so a deployment can opt out of
-    /// any host geo service. Override it with the
+    /// The host platform's geo lookup is the default when absent, and
+    /// `module = "platform"` spells the same choice explicitly. Selecting
+    /// `module = "none"` resolves no geolocation and makes no host geo call,
+    /// so a deployment can opt out of any host geo service. Override it with the
     /// `TRUSTED_SERVER__geo__module` environment variable so the same compiled
     /// WebAssembly can switch modules at deployment. An unknown key is rejected
     /// at startup by
