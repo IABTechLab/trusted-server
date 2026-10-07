@@ -83,11 +83,15 @@ pub(crate) fn ensure_integration_backend(
 /// given `first_byte_timeout`, and delegates to
 /// [`crate::platform::PlatformBackend::ensure`].
 ///
+/// Public because an integration crate outside this one cannot reach an
+/// upstream without registering a backend first, and a crate rolling its own
+/// registration would produce a different backend name for the same URL.
+///
 /// # Errors
 ///
 /// Returns an error when `url` cannot be parsed, is missing a host, or the
 /// backend registration fails.
-pub(crate) fn ensure_integration_backend_with_timeout(
+pub fn ensure_integration_backend_with_timeout(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
@@ -112,11 +116,15 @@ pub(crate) fn ensure_integration_backend_with_timeout(
 /// Parses `url`, builds a [`PlatformBackendSpec`], and delegates to
 /// [`crate::platform::PlatformBackend::predict_name`].
 ///
+/// Public for the same reason as [`ensure_integration_backend_with_timeout`],
+/// and the two have to agree, so a crate outside this one uses this function
+/// and does not derive a name of its own.
+///
 /// # Errors
 ///
 /// Returns an error when the URL cannot be parsed, is missing a host, or the
 /// platform backend cannot predict a name for the spec.
-pub(crate) fn predict_integration_backend_name(
+pub fn predict_integration_backend_name(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
@@ -173,7 +181,10 @@ fn integration_backend_spec(
 pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Maximum response body size from RTB providers (prebid, aps, ad server).
-pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+///
+/// Public so an integration crate outside this one bounds an upstream
+/// response at the size the built-in ones do.
+pub const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
 pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -232,7 +243,7 @@ pub(crate) async fn collect_body_bounded(
 ///
 /// Use this for upstream (provider/integration) response bodies to bound
 /// memory usage when a third-party server misbehaves. Unlike
-/// [`collect_body_bounded`], oversized bodies are classified as
+/// `collect_body_bounded`, oversized bodies are classified as
 /// [`TrustedServerError::Integration`] (502 `BAD_GATEWAY`) rather than
 /// [`TrustedServerError::RequestTooLarge`] (413).
 ///
@@ -240,12 +251,16 @@ pub(crate) async fn collect_body_bounded(
 /// because the size check runs after each chunk is materialized. Fastly
 /// H2/H3 chunks are ≤ 16 KiB in practice, making the overshoot negligible.
 ///
+/// Public because an integration crate outside this one reads upstream
+/// responses too, and an unbounded read of a misbehaving upstream is not a
+/// fault each crate should solve again.
+///
 /// # Errors
 ///
 /// Returns an error when:
 /// - The body exceeds `max_bytes` (mapped to [`TrustedServerError::Integration`]).
 /// - A streaming body chunk cannot be read (same error type).
-pub(crate) async fn collect_response_bounded(
+pub async fn collect_response_bounded(
     body: EdgeBody,
     max_bytes: usize,
     integration: &'static str,

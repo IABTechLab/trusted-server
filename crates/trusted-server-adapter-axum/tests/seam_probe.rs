@@ -423,6 +423,63 @@ fn duplicate_integration_id_is_rejected_naming_both_sources() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 6. An ad server the probe supplies is known to the plan and to validation
+// ---------------------------------------------------------------------------
+
+/// `[ad-server]` selecting the probe's ad server under a label of the
+/// operator's own, with nothing else of the probe's selected.
+const PROBE_ADSERVER_BLOCK: &str = r#"
+            [ad-server]
+            module = "probe"
+
+            [ad-server.probe]
+            implementation = "testing.seam-probe"
+"#;
+
+/// The adapter compiles the auction plan with the builders it is given, so an
+/// ad server a crate outside core supplies starts the adapter, and the same
+/// settings are refused without that crate's builder.
+#[test]
+fn ad_server_a_module_supplies_starts_the_adapter_only_with_its_builder() {
+    let started = TrustedServerApp::routes_with_registrations(
+        settings_with(PROBE_ADSERVER_BLOCK),
+        &[seam_probe::builder()],
+    );
+    assert!(
+        started.is_ok(),
+        "the adapter should start with the probe's ad server selected: {:?}",
+        started.err()
+    );
+
+    let error =
+        TrustedServerApp::routes_with_registrations(settings_with(PROBE_ADSERVER_BLOCK), &[])
+            .err()
+            .expect("should refuse an ad server no builder in the deployment supplies");
+    let message = error.to_string();
+    assert!(
+        message.contains("[ad-server] `probe` uses implementation `testing.seam-probe`"),
+        "should name the ad server and the implementation nothing supplies: {message}"
+    );
+}
+
+/// Deploy validation compiles the plan with the builders it is given too, so
+/// it agrees with the running adapter about the probe's ad server.
+#[test]
+fn deploy_validation_accepts_a_modules_ad_server_only_with_its_builder() {
+    let settings = settings_with(PROBE_ADSERVER_BLOCK);
+
+    validate_settings_for_deploy_with(&settings, &[seam_probe::builder()])
+        .expect("should accept the probe's ad server when given the probe's builder");
+
+    let error = validate_settings_for_deploy_with(&settings, &[])
+        .expect_err("should refuse the probe's ad server without the probe's builder");
+    assert!(
+        error.to_string().contains("testing.seam-probe"),
+        "should name the implementation nothing supplies: {error}"
+    );
+}
+
 /// Settings selecting a module-supplied module.
 ///
 /// These cannot use [`settings_with`], because that fixture carries the

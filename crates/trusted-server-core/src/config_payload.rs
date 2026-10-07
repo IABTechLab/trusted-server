@@ -10,6 +10,7 @@ use error_stack::Report;
 
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationBuilder;
 use crate::platform::{PlatformSecretStore, StoreName};
 use crate::secret_resolution::resolve_secret_references;
 use crate::settings::Settings;
@@ -31,10 +32,15 @@ pub const DEFAULT_CONFIG_STORE_ID: &str = env!("TRUSTED_SERVER_DEFAULT_CONFIG_ST
 /// process-environment overrides.
 pub const CONFIG_BLOB_KEY: &str = DEFAULT_CONFIG_STORE_ID;
 
-/// Reconstruct runtime [`Settings`] from a serialized config blob envelope.
+/// Reconstruct runtime [`Settings`] from a serialized config blob envelope,
+/// validating against the built-in integrations only.
 ///
 /// Secret references are resolved after envelope verification and before
 /// deserialization. The envelope data itself is never mutated or rewritten.
+///
+/// A deployment that composes builders of its own calls
+/// [`settings_from_config_blob_with`] instead, so a `[demand]` or
+/// `[ad-server]` name one of them supplies is not refused here.
 ///
 /// # Errors
 ///
@@ -45,6 +51,24 @@ pub fn settings_from_config_blob(
     envelope_json: &str,
     secret_store: &dyn PlatformSecretStore,
     default_secret_store_name: &StoreName,
+) -> Result<Settings, Report<TrustedServerError>> {
+    settings_from_config_blob_with(envelope_json, secret_store, default_secret_store_name, &[])
+}
+
+/// Reconstruct runtime [`Settings`] from a serialized config blob envelope,
+/// validating against the built-in integrations followed by
+/// `extra_integrations`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the envelope cannot be
+/// parsed, fails integrity verification, secret resolution fails, or resolved
+/// settings are invalid.
+pub fn settings_from_config_blob_with(
+    envelope_json: &str,
+    secret_store: &dyn PlatformSecretStore,
+    default_secret_store_name: &StoreName,
+    extra_integrations: &[IntegrationBuilder],
 ) -> Result<Settings, Report<TrustedServerError>> {
     let envelope: BlobEnvelope = serde_json::from_str(envelope_json).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -67,7 +91,7 @@ pub fn settings_from_config_blob(
         default_secret_store_name,
     )?;
     let settings = Settings::from_json_value(data)?;
-    crate::config::validate_settings_for_runtime(&settings)?;
+    crate::config::validate_settings_for_runtime_with(&settings, extra_integrations)?;
     Ok(settings)
 }
 
@@ -299,6 +323,68 @@ mod tests {
             .insert_module_config("auction", "auction.prebid", &prebid)
             .expect("should replace Prebid config");
         settings
+    }
+
+    /// The ad server implementation a crate outside core supplies.
+    static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
+        crate::auction::demand::AdServerImplementation {
+            id: "ad-server.example",
+            build: build_external_adserver,
+        };
+
+    fn build_external_adserver(
+        name: &str,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<
+        std::sync::Arc<dyn crate::auction::provider::AuctionProvider>,
+        Report<TrustedServerError>,
+    > {
+        Ok(std::sync::Arc::new(
+            crate::integrations::adserver_mock::AdServerMockProvider::new(
+                name,
+                crate::integrations::adserver_mock::AdServerMockSettings {
+                    endpoint: "https://external.example/mediate".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ))
+    }
+
+    /// The settings are validated as they load, so a deployment that composes
+    /// a builder hands it to the load. Without it the load refuses the ad
+    /// server that builder supplies, and with it the settings load.
+    #[test]
+    fn the_load_accepts_an_external_ad_server_only_when_given_its_builder() {
+        let mut settings = test_settings();
+        settings.adserver = crate::provider_table::ProviderChoice::new(
+            Some("example".to_string()),
+            std::collections::BTreeMap::from([("example".to_string(), serde_json::Map::new())]),
+        );
+        let envelope = envelope_json(&settings);
+        let extra = [
+            IntegrationBuilder::implementations("example-adserver", "example-crate")
+                .with_adserver(&EXTERNAL_ADSERVER),
+        ];
+
+        let error =
+            load_settings(&envelope).expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        let loaded = settings_from_config_blob_with(
+            &envelope,
+            &EchoSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+            &extra,
+        )
+        .expect("should load settings naming the external builder's ad server");
+        assert_eq!(
+            loaded.adserver.selected().first().copied(),
+            Some("example"),
+            "the loaded settings should still select the external ad server"
+        );
     }
 
     #[test]

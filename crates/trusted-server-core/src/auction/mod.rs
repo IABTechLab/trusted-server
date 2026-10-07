@@ -179,6 +179,58 @@ mod plan_sharing_tests {
         );
     }
 
+    /// The ad server implementation a crate outside core supplies.
+    static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
+        crate::auction::demand::AdServerImplementation {
+            id: "ad-server.example",
+            build: build_external_adserver,
+        };
+
+    fn build_external_adserver(
+        name: &str,
+        _settings: &Map<String, serde_json::Value>,
+    ) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
+        Ok(Arc::new(
+            crate::integrations::adserver_mock::AdServerMockProvider::new(
+                name,
+                crate::integrations::adserver_mock::AdServerMockSettings {
+                    endpoint: "https://external.example/mediate".to_string(),
+                    ..Default::default()
+                },
+            ),
+        ))
+    }
+
+    /// An ad server a builder outside core supplies resolves in the plan when
+    /// that builder is passed, and is a name no builder registers when it is
+    /// not. Both halves are asserted, so the test fails if either stops
+    /// holding.
+    #[test]
+    fn an_ad_server_an_external_builder_supplies_compiles_only_when_it_is_passed() {
+        let mut settings = create_test_settings();
+        settings.adserver = adserver("example", Map::new());
+        let extra = [crate::integrations::IntegrationBuilder::implementations(
+            "example-adserver",
+            "example-crate",
+        )
+        .with_adserver(&EXTERNAL_ADSERVER)];
+
+        let error = compile_auction_plan(&settings)
+            .expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        let plan = compile_auction_plan_with(&settings, &extra)
+            .expect("the external builder's ad server should compile");
+        assert_eq!(
+            plan.adserver().map(|adserver| adserver.implementation.id),
+            Some("ad-server.example"),
+            "the plan should carry the external ad server"
+        );
+    }
+
     #[test]
     fn the_selected_ad_server_is_built_from_its_own_table() {
         let mut settings = create_test_settings();

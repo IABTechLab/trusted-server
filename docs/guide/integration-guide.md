@@ -320,6 +320,29 @@ application state, for a host that builds its own router around it. Two
 builders claiming one id are refused at startup with a message naming the id
 and both sources.
 
+The settings are validated as they load, which is before any state is built,
+so a deployment loads them with the same builders. A `[demand]` or
+`[ad-server]` name that one of the builders supplies is otherwise refused by
+the load as an implementation the build does not have, and each builder's
+validate function runs as part of the load.
+
+```rust
+let builders = [example_integration::builder()];
+let settings = get_settings_from_config_store_with(
+    &config_store,
+    &secret_store,
+    &store_name,
+    &config_key,
+    &default_secret_store_name(),
+    &builders,
+)?;
+let router = TrustedServerApp::routes_with_registrations(settings, &builders)?;
+```
+
+`settings_from_config_blob_with` does the same for a host that reads the
+configuration envelope itself, and `validate_settings_for_deploy_with` is the
+deploy check with the same builders.
+
 The Fastly adapter is a binary rather than a library and its
 `build_state_with_registrations` is private to the crate, so a Fastly
 deployment that ships a vendor crate has to pass the builders inside that
@@ -340,10 +363,10 @@ bytes, so the failure names the cause. Copy both into a vendor crate.
 **A vendor's own deploy rules do not run through the CLI.** `ts config
 validate` and `ts config push` call `validate_settings_for_deploy` with no
 extra builders, so only core's rules run there. A vendor's validate function
-runs only when something calls `validate_settings_for_deploy_with` and hands it
-that vendor's builder, which means the deployment's own code or its tests. An
-operator can therefore push a configuration the integration rejects when the
-server starts. Run the vendor's validation from the deployment's own build or
+runs when the deployment loads its settings with that vendor's builder, and
+when something calls `validate_settings_for_deploy_with` with it, which means
+the deployment's own code or its tests. An operator can therefore push a
+configuration the integration rejects when the server starts. Run the vendor's validation from the deployment's own build or
 test step, and do not read a clean `ts config validate` as the integration
 having agreed.
 

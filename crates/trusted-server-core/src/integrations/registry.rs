@@ -1337,7 +1337,7 @@ impl IntegrationRegistry {
         settings: &Settings,
         extra: &[crate::integrations::IntegrationBuilder],
     ) -> Result<Self, Report<TrustedServerError>> {
-        let plan = Arc::new(crate::auction::compile_auction_plan(settings)?);
+        let plan = Arc::new(crate::auction::compile_auction_plan_with(settings, extra)?);
         Self::with_plan_and_registrations(settings, plan, extra)
     }
 
