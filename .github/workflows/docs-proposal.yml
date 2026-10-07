@@ -24,7 +24,8 @@ on:
 permissions: {}
 
 # Sequential merges are proposed one at a time, in order. The default queue
-# keeps only one pending run and cancels older ones, so keep them all.
+# keeps only one pending run and cancels older ones, so keep them all. Every
+# job has a timeout so a hung run cannot hold the queue for hours.
 concurrency:
   group: docs-proposal
   cancel-in-progress: false
@@ -44,6 +45,7 @@ jobs:
   # untrusted: it uses no dependency cache that later runs would restore.
   propose:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       copilot-requests: write
@@ -94,6 +96,7 @@ jobs:
   validate:
     needs: propose
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -136,6 +139,7 @@ jobs:
   publish:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
