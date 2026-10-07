@@ -18,6 +18,7 @@ workspace = true
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
 derive_more = { workspace = true }
+error-stack = { workspace = true }
 edgezero-cli = { workspace = true }
 edgezero-core = { workspace = true }
 futures = { workspace = true }
@@ -26,7 +27,8 @@ http = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
-# Also in the macOS block for the dev proxy; needed on every host so the probe can install
+rpassword = { workspace = true }
+# Also in the macOS/Linux block for the dev proxy; needed on every host so the probe can install
 # the process-level crypto provider its `-no-provider` reqwest build expects.
 rustls = { workspace = true }
 # Declared directly rather than inherited from the workspace, to control the rustls
@@ -47,6 +49,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
@@ -55,19 +58,25 @@ toml_edit = { workspace = true }
 tracing = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 which = { workspace = true }
 
-# `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
-# automation via `networksetup`, and a native TLS / networking stack. Scoping
-# these dependencies to macOS keeps unsupported targets (notably the
-# repo-default `wasm32-wasip1` from `.cargo/config.toml`) from trying to build
-# `tokio`, `ring`, or `aws-lc-sys` for a target they do not support; on those
-# targets the `dev` subcommand is simply absent.
-[target.'cfg(target_os = "macos")'.dependencies]
+# `ts dev sandbox-probe` needs a real HTTP/1.1 client with keep-alive. These
+# are shared with the macOS/Linux proxy but scoped to every non-wasm host, so
+# the probe builds on any host target. The exclusion still keeps
+# `tokio`/`ring` off the repo-default `wasm32-wasip1` target.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "client"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+# The shared proxy engine supports macOS and Linux only.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
 directories = { workspace = true }
-error-stack = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server", "client"] }
 hyper-util = { workspace = true, features = ["tokio"] }
@@ -80,6 +89,10 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
+
+# Exact NSS subject identity checks; already used transitively by rcgen.
+[target.'cfg(target_os = "linux")'.dependencies]
+x509-parser = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 x509-parser = { workspace = true }
