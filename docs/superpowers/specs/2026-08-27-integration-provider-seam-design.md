@@ -110,6 +110,24 @@ owns nothing behind it. Concretely:
   `[geo] module`, `[device] module` and `[integration] module`, and the
   identifiers this series added use the same word. The auction tables in
   §3.4 keep `provider`, because they name auction providers.
+- A module is named by its crate folder, not by an id written in its code.
+  The name is the crate's path below `crates/`, with `.` between the parts,
+  taken from `CARGO_MANIFEST_DIR` when the crate is built, so
+  `crates/permission-signal/gpp` is `permission-signal.gpp` and cannot drift
+  from its folder, as the hand-written ids this series started with had
+  (that crate called itself `gpp_sale_opt_out`). A section is named exactly
+  as its type folder, apart from `[ec]`, whose folder is `edgecookie`, and a
+  name written in a section may leave the section's own type folder off, so
+  `[permission-signal] modules = ["gpp"]` and `["permission-signal.gpp"]`
+  select the same module. Core's own modules, such as `hmac` and `builtin`,
+  take bare names. A section that selects several modules uses `modules`, a
+  list, and one that selects one uses `module`.
+- Page integrations are selected from the section of their type, such as
+  `[cmp]`, `[bot-protection]`, `[framework]`, `[tag]`, `[ad-tag]`,
+  `[identity]`, `[audience]`, `[proxy]` and `[testing]`, each a folder
+  under `crates/`, so there is no `[integration]` section. Where §3 below
+  reads `[integration] module`, read the section of the integration's
+  type; the implementation revises those passages as it lands them.
 
 ## 3. Design
 
