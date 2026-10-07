@@ -556,10 +556,9 @@ deployment that lists the same integrations gets the same responses.
    not the built-in one. The round trip has to run on the Fastly adapter,
    which is the primary deployment target, and not only on the Axum dev
    server, because a seam proven on the dev server alone is not a seam any
-   production deployment can use. The Fastly adapter carries only
-   `src/main.rs` and so has no library target for an external crate to
-   register through (§8 item 7), so meeting this criterion means giving
-   that adapter a composition entry point a vendor crate can reach.
+   production deployment can use. The Fastly adapter is a library with a
+   thin binary for that reason, and a deployment's own binary passes its
+   builders to `run_with` (§8 item 7).
 2. **Capabilities round trip, on the same adapter.** The same test
    integration declares an identity, a geo and a device module. With the
    three selectors naming it, a request is served by all three (the created
@@ -666,12 +665,16 @@ than left for each vendor to rediscover.
    its check inside its build function, which covers a deployment that does
    not. The operator path is item 1, and until it carries the builders §3.3
    is delivered at startup and not when an operator pushes.
-7. **The Fastly adapter cannot take a vendor crate at all.** Its
-   `build_state_with_registrations` is crate-private and it has no library
-   target, so composing a module into a Fastly deployment means editing the
-   adapter. The other three adapters expose both entry points. Fastly is
-   the primary deployment target, so this one decides whether the seam is
-   usable in production or only in the dev server.
+7. **The Fastly adapter takes a vendor crate through `run_with`.** It was
+   a binary only and its `build_state_with_registrations` was
+   crate-private, so composing a module into a Fastly deployment meant
+   editing the adapter. The implementation (#1094) makes it a library with
+   a thin binary. `run_with(Vec<IntegrationBuilder>)` records the builders
+   a deployment offers before any request is served, the settings load
+   validates against them, and the round trip of §6 items 1 and 2 runs on
+   it under Viceroy. No test loads settings from a config store with
+   registered builders on that adapter, so that one call is covered by the
+   tests of the load in core and not by a test of its own.
 8. **Core TypeScript imports APS directly, so generalizing the Rust
    renderer alone does not move APS out.** On `main` at d516a9e94,
    `crates/trusted-server-js/lib/src/core/auction.ts:5` imports
@@ -724,20 +727,18 @@ than left for each vendor to rediscover.
     signals be the test integration's, which can therefore be shown on
     Fastly and not on the dev server.
 
-Items 1, 6 and 7 are the ones a vendor meets on its first day, item 9
-joins them for a vendor with a secret, and item 7 decides whether any of
-this is reachable on the platform most deployments use. Item 5 is the one
+Items 1 and 6 are the ones a vendor meets on its first day, and item 9
+joins them for a vendor with a secret. Item 5 is the one
 that produces a bug report nobody can reproduce, because whether it appears
 depends on which host the reporter runs.
 
 Taken together these say the seam is proven but not yet finished. A vendor
 can register a module, ship its browser code, declare a geo module and
-serve a route, all from its own crate and proven end to end. It cannot yet
-do that on Fastly, and its own configuration rules are enforced at startup
-only for a deployment that loads its settings with its builders, and never
-when an operator pushes. Both are small changes against what this document
-already defines, and both should land before the first vendor is asked to
-use it.
+serve a route, all from its own crate and proven end to end on Axum and
+on Fastly. Its own configuration rules are enforced at startup only for a
+deployment that loads its settings with its builders, and never when an
+operator pushes. That is a small change against what this document already
+defines, and it should land before the first vendor is asked to use it.
 
 ## 9. Sign-off
 
@@ -784,7 +785,9 @@ use it.
   DataDome move. §8 item 6 says where a vendor's validate function now
   runs, and item 10 records that a deployment hands its builders to the
   settings load. Item 11 records that a device module is asked on Fastly
-  alone.
+  alone. Acceptance item 1 and §8 item 7 say the Fastly adapter is a
+  library that takes a deployment's builders through `run_with`, and that
+  the round trip runs on it.
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
