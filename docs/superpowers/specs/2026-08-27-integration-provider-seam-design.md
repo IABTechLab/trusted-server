@@ -1,6 +1,6 @@
 # Design Spec: The Integration Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28 and 2026-10-06. This PR adds design
+**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06 and 2026-10-07. This PR adds design
 documents only and targets `main` directly. Following the review of #1043
 (27 August) the seam it defines is a precondition for the module series
 rather than a follow-up to it, so the order is now this spec, then its
@@ -121,12 +121,16 @@ owns nothing behind it. Concretely:
   name written in a section may leave the section's own type folder off, so
   `[permission-signal] modules = ["gpp"]` and `["permission-signal.gpp"]`
   select the same module. Core's own modules, such as `hmac` and `builtin`,
-  take bare names. A section that selects several modules uses `modules`, a
-  list, and one that selects one uses `module`.
+  take bare names. An integration that still lives in core carries the name
+  its crate will have, held as a constant, so its section and table do not
+  change when it moves out. A section that selects several modules uses
+  `modules`, a list, and one that selects one uses `module`.
 - Page integrations are selected from the section of their type, such as
   `[cmp]`, `[bot-protection]`, `[framework]`, `[tag]`, `[ad-tag]`,
-  `[identity]`, `[audience]`, `[proxy]` and `[testing]`, each a folder
-  under `crates/`, so there is no `[integration]` section, and a table its
+  `[identity]`, `[audience]` and `[testing]`, each the folder under
+  `crates/` that a crate of that type lives in, with `[auction]` and
+  `[proxy]` selecting the modules they run beside their own settings, so
+  there is no `[integration]` section, and a table its
   section does not select, a section that selects nothing and a name no
   module in the deployment supplies are each refused at startup.
 
@@ -198,9 +202,9 @@ survives in a vendor-neutral form. Two details the map of `main` adds. The
 enumeration the test needs is independent of which integrations a
 configuration selects, so the registry exposes the full set of registrations
 it was built from, not only the ones the sections select. And
-Prebid Server, APS and `adserver_mock` are demand and ad server
+Prebid Server, APS and `ad-server.mock` are demand and ad server
 implementations rather than integrations, so their `[demand.<name>]` and
-`[adserver.<name>]` tables validate through the same reject-what-you-do-not-
+`[ad-server.<name>]` tables validate through the same reject-what-you-do-not-
 know rule the registration hook gives every other module, and a test
 plants a setting each of them must reject.
 
@@ -218,28 +222,31 @@ Demand and the ad server are two provider types in their own right, and
 neither is an integration. A demand provider is a source bids are requested
 from, and several run, so `[demand] modules` takes a list. An ad server
 decides what is shown, and one runs, so `[ad-server] module` takes a string.
-Each name is the implementation unless its own table carries
-`implementation = "<id>"`, which is how two Prebid Servers run side by side
-under different names:
+An implementation is named by its module path. A demand table names its
+implementation on an `implementation` line, because `demand` is not the
+type an implementation is named under, which is how two Prebid Servers run
+side by side under different names, and the ad server's name resolves
+within its own type, so `mock` is `ad-server.mock`:
 
 ```toml
 [demand]
 modules = ["pbs_main", "pbs_eu", "aps"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://pbs.example.com/openrtb2/auction"
 
 [demand.pbs_eu]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://pbs-eu.example.com/openrtb2/auction"
 
 [demand.aps]
+implementation = "auction.aps"
 endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
 rendering_mode = "aps_sdk"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
 [auction]
 enabled = true
@@ -249,8 +256,9 @@ timeout_ms = 1000
 module = "pbs_main"
 ```
 
-The demand implementations in this repository are `openrtb`, `prebid_server`
-and `aps`, and the one ad server implementation is `adserver_mock`. None of
+The demand implementations in this repository are `auction-protocol.openrtb`,
+`auction.prebid-server` and `auction.aps`, and the one ad server
+implementation is `ad-server.mock`. None of
 them is an integration, so no section selects them, and a configuration
 that selects one refuses startup. APS in particular
 stopped being an integration, and its `rendering_mode` now sits in its
@@ -258,10 +266,11 @@ stopped being an integration, and its `rendering_mode` now sits in its
 demand and ad server endpoint must be HTTPS, or HTTP to a loopback host only
 (`127.0.0.1`, `::1`, `localhost`).
 
-`[auction]` is not a provider type. It keeps `enabled`, `timeout_ms`, the
-creative settings and `allowed_context_keys`, and
-`[auction.bidders.<code>] module = "<demand name>"` maps a bidder code a
-page asks for onto one of the declared demand providers.
+`[auction]` is not a module type of its own. It keeps `enabled`,
+`timeout_ms`, the creative settings and `allowed_context_keys`, its
+`modules` list selects the page modules the auction runs, such as `prebid`
+(§2), and `[auction.bidders.<code>] module = "<demand name>"` maps a
+bidder code a page asks for onto one of the declared demand providers.
 
 The bid renderer contract is still generalized in this change. Before it,
 `BidRenderer` was an enum with one variant, `Aps(ApsRendererV1)`
@@ -279,8 +288,8 @@ form.
 The plan keeps three things closed, read from `main` at 066ea3c69, and they
 are recorded here rather than solved.
 
-- The set of demand implementations is fixed in core, being `openrtb`,
-  `prebid_server` and `aps`
+- The set of demand implementations is fixed in core, being the profiles
+  `standard`, `prebid-server` and `aps`
   (`crates/trusted-server-core/src/auction/profile.rs:170`), and the
   compiled form is a closed enum (`profile.rs:63`) whose Prebid and APS
   behavior is imported from those modules (`profile.rs:11` and `:12`).
@@ -289,7 +298,7 @@ are recorded here rather than solved.
   `crates/trusted-server-core/src/auction/plan.rs`), which is what
   `implementation` expresses, but a vendor cannot add an implementation
   without changing core.
-- The plan compiler treats `prebid_server` and `aps` specially by name
+- The plan compiler treats `prebid-server` and `aps` specially by name
   (`plan.rs:307`, `:585` and `:595`).
 - The only ad server implementation is `adserver_mock` (`plan.rs:20` and
   `:556`), and the orchestrator builds it by calling that module directly
@@ -698,10 +707,11 @@ defines, and both should land before the first vendor is asked to use it.
 | 7   | Identity, geo and device modules are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                            | Proposed             |
 | 8   | No module is built into core, because HMAC and the User-Agent-only device module are Tech Lab-owned crates registered by an integration builder and selected by `[ec] module` and `[device] module`, neither being a page integration, and core keeps only `none`                                                                                          | Proposed             |
 | 9   | This spec and its core implementation precede #1043, so 51Degrees implements the core seam and the nine vendor moves in §4 stay one PR each                                                                                                                                                                                                                | Proposed             |
-| 10  | What an operator selects is a module, and provider keeps its meaning of an auction provider instance (§2)                                                                                                                                                                                                                                                  |                      |     |
+| 10  | What an operator selects is a module, selected with `module` or `modules` in every type's table (§2)                                                                                                                                                                                                                                                       |                      |     |
 | 11  | The built-in integrations are discovered at build time, and an external crate registers through the adapter (§3.1)                                                                                                                                                                                                                                         |                      |     |
 | 12  | A page change is one middleware, run only where an ordered `[[fetch]]` or `[[serve]]` entry names it, in two phases (§3.7)                                                                                                                                                                                                                                 |                      |     |
 | 13  | A vendor crate pins its own dependency versions and releases without a pull request here, and Tech Lab reviews it (§2)                                                                                                                                                                                                                                     |                      |     |
+| 14  | A module is named by its crate folder, and a page integration is selected from the section of its type, so there is no `[integration]` section (§2)                                                                                                                                                                                                        |                      |     |
 
 ## Revision record
 
@@ -712,6 +722,15 @@ defines, and both should land before the first vendor is asked to use it.
   13). The hook traits leave "What does not change". The seven specs say
   module for what an operator selects, with provider kept for the demand and
   ad server selectors (pluggable spec §2.1).
+- 2026-10-07. A module is named by its crate folder, and a page integration
+  is selected from the section of its type, so there is no `[integration]`
+  section (§2, sign-off row 14). Every type selects with `module` or
+  `modules`, which takes the word provider out of the configuration, so the
+  auction's tables read `[demand] modules` and `[ad-server] module` and name
+  their implementations by module path (§3.4, pluggable spec §2.1). The
+  profile ids quoted from `main` in §3.4 are corrected to `standard` and
+  `prebid-server`. The response header design names DataDome's settings
+  under `[bot-protection.datadome]`.
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

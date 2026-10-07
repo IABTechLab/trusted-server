@@ -110,10 +110,12 @@ The rules, which hold for all seven:
   set. A module with no settings is selected by name alone.
 - The word `providers` appears nowhere in configuration. The type table,
   and the `module` or `modules` key inside it, carry the whole selection.
-- The name is the implementation, unless the table carries
-  `implementation = "<id>"`. That key is optional everywhere, and it is how
-  two Prebid Servers run side by side under different names, each with its
-  own endpoint and its own settings.
+- The name is the implementation, unless the table carries an
+  `implementation` line, which names the implementation by its module path.
+  A demand table always carries one, because `demand` is not the type its
+  implementations are named under, and it is how two Prebid Servers run side
+  by side under different names, each with its own endpoint and its own
+  settings.
 - A module from a crate is named by its folder below `crates/`, with `.`
   between the parts, and may be written without its own section's type
   folder. A `demand` or `ad-server` name is snake_case, because it may be
@@ -130,10 +132,12 @@ The rules, which hold for all seven:
 - A secret setting holds the **name** of a key in `trusted_server_secrets`,
   never a value, so no secret is ever written into a configuration file.
 
-`[auction]` is not a module type. It keeps `enabled`, `timeout_ms`, the
-creative settings, `allowed_context_keys`, and
+`[auction]` is not a module type of its own. It keeps `enabled`,
+`timeout_ms`, the creative settings, `allowed_context_keys`, and
 `[auction.bidders.<code>] module = "<demand name>"`, which maps a bidder
-code a page asks for onto one of the declared demand providers.
+code a page asks for onto one of the declared demand providers. Its
+`modules` list selects the page modules the auction runs, such as `prebid`
+(seam design §2).
 
 ### 2.2 The three module types this spec defines
 

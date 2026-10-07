@@ -68,8 +68,8 @@ module rather than a new resolution algorithm. Core names none of the four
 shipped schemes. Each is registered by an integration builder, which is the
 same seam a vendor crate uses, and a builder that supplies a permission
 signal implementation does not have to be a page integration, so none of
-these four crates ships browser JavaScript and none is named in
-`[integration] module`. §10 and §13 record the change.
+these four crates ships browser JavaScript and none is selected in a page
+integration's section. §10 and §13 record the change.
 
 Scope. The model governs decisions Trusted Server makes. A downstream protocol
 receives the full regulatory context only where that protocol defines fields
