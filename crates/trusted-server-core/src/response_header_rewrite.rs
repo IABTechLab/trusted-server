@@ -424,7 +424,7 @@ fn rewrite_csp(value: &str, rewrite: &OriginHeaderRewrite<'_>) -> Option<String>
                         .iter()
                         .map(|(_, queued)| queued.as_str()),
                 )
-                .any(|existing| existing.eq_ignore_ascii_case(&added));
+                .any(|existing| csp_sources_equal(existing, &added));
             if !already_present {
                 insertions.push((offset + token_offset + source.len(), added));
             }
@@ -446,6 +446,26 @@ fn rewrite_csp(value: &str, rewrite: &OriginHeaderRewrite<'_>) -> Option<String>
     }
     out.push_str(&value[copied_until..]);
     Some(out)
+}
+
+/// Whether two CSP source expressions are the same source.
+///
+/// Scheme and host compare case-insensitively; the path is case-sensitive, as
+/// in CSP path matching, so `/A.js` and `/a.js` stay distinct.
+fn csp_sources_equal(left: &str, right: &str) -> bool {
+    let (left_authority, left_path) = split_csp_source_path(left);
+    let (right_authority, right_path) = split_csp_source_path(right);
+    left_authority.eq_ignore_ascii_case(right_authority) && left_path == right_path
+}
+
+/// Split a CSP source expression into its scheme-and-host part and its path.
+fn split_csp_source_path(source: &str) -> (&str, &str) {
+    let authority_start = source.find("://").map_or(0, |index| index + 3);
+    source[authority_start..]
+        .find('/')
+        .map_or((source, ""), |offset| {
+            source.split_at(authority_start + offset)
+        })
 }
 
 fn tokens_with_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
@@ -824,6 +844,30 @@ mod tests {
             ),
             "img-src http://origin.example.com https://www.example.com https://origin.example.com",
             "should not add the same serving-host source twice"
+        );
+    }
+
+    #[test]
+    fn csp_keeps_path_case_when_deduplicating() {
+        assert_eq!(
+            single(
+                &header::CONTENT_SECURITY_POLICY,
+                "script-src https://origin.example.com/A.js https://origin.example.com/a.js"
+            ),
+            "script-src https://origin.example.com/A.js https://www.example.com/A.js \
+             https://origin.example.com/a.js https://www.example.com/a.js",
+            "should add a serving-host source for each path that differs only by case"
+        );
+        assert_eq!(
+            single(
+                &header::CONTENT_SECURITY_POLICY,
+                "script-src https://origin.example.com/A.js https://WWW.Example.com/a.js \
+                 https://origin.example.com/a.js"
+            ),
+            "script-src https://origin.example.com/A.js https://www.example.com/A.js \
+             https://WWW.Example.com/a.js https://origin.example.com/a.js",
+            "should match an existing serving-host source by host case-insensitively \
+             and by path case-sensitively"
         );
     }
 
