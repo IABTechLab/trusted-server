@@ -697,7 +697,7 @@ impl Ec {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when a module name or
-    /// implementation is not `snake_case`, when a block is configured with no
+    /// implementation is not a module name, when a block is configured with no
     /// selector or alongside `"none"`, when the selector names a key `[ec]`
     /// reads as its own setting, when a block the selector does not name is
     /// configured, or when the selected module resolves to an
@@ -789,22 +789,16 @@ impl Ec {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when `name` is not
-    /// `snake_case`.
+    /// Returns [`TrustedServerError::Configuration`] when `name` is not a
+    /// module name, see [`crate::module_name::is_valid`].
     fn validate_module_name(name: &str) -> Result<(), Report<TrustedServerError>> {
-        let valid = !name.is_empty()
-            && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            && name
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_');
-        if valid {
+        if crate::module_name::is_valid(name) {
             return Ok(());
         }
         Err(Report::new(TrustedServerError::Configuration {
             message: format!(
-                "Edge Cookie module name `{name}` must be snake_case, matching \
-                 ^[a-z][a-z0-9_]*$"
+                "Edge Cookie module name `{name}` is not a module name, which is parts \
+                 joined by `.`, each of lower case letters, digits, `_` or `-`"
             ),
         }))
     }
@@ -6098,17 +6092,17 @@ passphrase = "another-test-secret-key-32-bytes"
     }
 
     #[test]
-    fn module_names_and_implementations_are_snake_case() {
+    fn module_names_and_implementations_follow_the_module_name_rule() {
         for ec_section in [
             "[ec]\nmodule = \"Primary\"\n",
             "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"Hmac\"\n",
             "[ec]\nmodule = \"primary\"\n\n[ec.Primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
         ] {
             let err = Settings::from_toml(&crate_test_settings_str_with_ec_section(ec_section))
-                .expect_err("a name outside snake_case should be rejected");
+                .expect_err("a name that is not a module name should be rejected");
             assert!(
-                format!("{err:?}").contains("must be snake_case"),
-                "should hold `{ec_section}` to the snake_case rule: {err:?}"
+                format!("{err:?}").contains("is not a module name"),
+                "should hold `{ec_section}` to the module name rule: {err:?}"
             );
         }
     }
