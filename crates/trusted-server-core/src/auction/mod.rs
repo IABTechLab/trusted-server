@@ -183,7 +183,7 @@ mod plan_sharing_tests {
     fn the_selected_ad_server_is_built_from_its_own_table() {
         let mut settings = create_test_settings();
         settings.adserver = adserver(
-            "adserver_mock",
+            "mock",
             Map::from_iter([(
                 "endpoint".to_string(),
                 json!("https://adserver.example/mediate"),
@@ -197,7 +197,7 @@ mod plan_sharing_tests {
     #[test]
     fn an_ad_server_table_with_no_endpoint_fails_the_plan() {
         let mut settings = create_test_settings();
-        settings.adserver = adserver("adserver_mock", Map::new());
+        settings.adserver = adserver("mock", Map::new());
         let error = compile_auction_plan(&settings)
             .expect_err("should refuse an ad server with no endpoint");
         assert!(
@@ -231,7 +231,7 @@ mod plan_sharing_tests {
     #[test]
     fn an_aps_demand_source_registers_the_renderer_with_no_integration_table() {
         let mut settings = create_test_settings();
-        let mut table = demand_table("aps", "https://aps.example/e/pb/bid");
+        let mut table = demand_table("auction.aps", "https://aps.example/e/pb/bid");
         table.insert("routing".to_string(), json!("all_eligible"));
         settings.demand = demand_selection(vec![("aps_main", table)]);
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));
@@ -244,12 +244,12 @@ mod plan_sharing_tests {
     #[test]
     fn two_aps_sources_that_disagree_on_rendering_are_refused() {
         let mut settings = create_test_settings();
-        let mut publisher_native = demand_table("aps", "https://aps.example/e/pb/bid");
+        let mut publisher_native = demand_table("auction.aps", "https://aps.example/e/pb/bid");
         publisher_native.insert("rendering_mode".to_string(), json!("publisher_native"));
         settings.demand = demand_selection(vec![
             (
                 "aps_one",
-                demand_table("aps", "https://aps.example/e/pb/bid"),
+                demand_table("auction.aps", "https://aps.example/e/pb/bid"),
             ),
             ("aps_two", publisher_native),
         ]);

@@ -602,10 +602,19 @@ mod tests {
 
     fn routing_plan_config(aps_routing: RoutingMode) -> crate::auction::plan::AuctionPlanConfig {
         let mut config = plan_config(vec![
-            ("aps_primary", provider("aps", aps_routing)),
-            ("pbs_a", provider("prebid_server", RoutingMode::Explicit)),
-            ("pbs_b", provider("prebid_server", RoutingMode::Explicit)),
-            ("openrtb_direct", provider("openrtb", RoutingMode::Explicit)),
+            ("aps_primary", provider("auction.aps", aps_routing)),
+            (
+                "pbs_a",
+                provider("auction.prebid-server", RoutingMode::Explicit),
+            ),
+            (
+                "pbs_b",
+                provider("auction.prebid-server", RoutingMode::Explicit),
+            ),
+            (
+                "openrtb_direct",
+                provider("auction-protocol.openrtb", RoutingMode::Explicit),
+            ),
         ]);
         config.timeout_ms = 900;
         config

@@ -583,7 +583,7 @@ mod tests {
     fn single_prebid_plan() -> AuctionPlan {
         let mut config = plan_config(vec![(
             "pbs_primary",
-            demand_table("prebid_server", "https://pbs.example.test/openrtb"),
+            demand_table("auction.prebid-server", "https://pbs.example.test/openrtb"),
         )]);
         config.timeout_ms = 900;
         AuctionPlan::compile(config).expect("should compile plan")
@@ -1874,7 +1874,7 @@ mod tests {
     fn convert_to_openrtb_response_uses_parallel_adserver_when_adserver_configured() {
         let mut settings = make_settings();
         settings.adserver = crate::provider_table::ProviderChoice::new(
-            Some("adserver_mock".to_string()),
+            Some("mock".to_string()),
             std::collections::BTreeMap::new(),
         );
         let auction_request = make_auction_request();

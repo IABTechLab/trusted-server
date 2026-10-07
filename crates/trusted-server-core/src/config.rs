@@ -685,12 +685,12 @@ formats = [{ width = 300, height = 250 }]
         source["demand"] = serde_json::json!({
             "modules": ["secondary", "primary"],
             "secondary": {
-                "implementation": "openrtb", "endpoint": "https://secondary.example.com/auction",
+                "implementation": "auction-protocol.openrtb", "endpoint": "https://secondary.example.com/auction",
                 "routing": "all_eligible",
                 "notifications": {"suppress_seats": ["seat-b", "seat-a"]}
             },
             "primary": {
-                "implementation": "openrtb", "endpoint": "https://primary.example.com/auction",
+                "implementation": "auction-protocol.openrtb", "endpoint": "https://primary.example.com/auction",
                 "routing": "all_eligible",
                 "notifications": {"suppress_seats": ["seat-b", "seat-a"]}
             }
@@ -738,7 +738,10 @@ formats = [{ width = 300, height = 250 }]
 
     fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
         let table = serde_json::Map::from_iter([
-            ("implementation".to_string(), serde_json::json!("aps")),
+            (
+                "implementation".to_string(),
+                serde_json::json!("auction.aps"),
+            ),
             (
                 "endpoint".to_string(),
                 serde_json::json!("https://aps.example.com/e/pb/bid"),
@@ -1557,7 +1560,10 @@ password = "production-admin-password-32-bytes"
     fn deploy_validation_rejects_an_aps_demand_setting_it_does_not_know() {
         let mut settings = valid_settings();
         let table = serde_json::Map::from_iter([
-            ("implementation".to_string(), serde_json::json!("aps")),
+            (
+                "implementation".to_string(),
+                serde_json::json!("auction.aps"),
+            ),
             (
                 "endpoint".to_string(),
                 serde_json::json!("https://aps.example.com/e/pb/bid"),

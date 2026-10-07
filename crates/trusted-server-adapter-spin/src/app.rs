@@ -1193,7 +1193,10 @@ mod tests {
                     (
                         (*name).to_string(),
                         serde_json::Map::from_iter([
-                            ("implementation".to_string(), serde_json::json!("openrtb")),
+                            (
+                                "implementation".to_string(),
+                                serde_json::json!("auction-protocol.openrtb"),
+                            ),
                             (
                                 "endpoint".to_string(),
                                 serde_json::json!(format!("https://{name}.example/openrtb")),
@@ -1215,7 +1218,10 @@ mod tests {
             std::collections::BTreeMap::from([(
                 "aps_main".to_string(),
                 serde_json::Map::from_iter([
-                    ("implementation".to_string(), serde_json::json!("aps")),
+                    (
+                        "implementation".to_string(),
+                        serde_json::json!("auction.aps"),
+                    ),
                     (
                         "endpoint".to_string(),
                         serde_json::json!("https://aps.example/e/pb/bid"),

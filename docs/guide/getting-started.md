@@ -184,7 +184,7 @@ Edit `trusted-server.toml` to configure:
 
 Do not put a Prebid Server URL or server bidder list under
 `[auction.prebid]`. Those server values belong to a `[demand.<name>]` table
-whose `implementation` is `prebid_server`, and APS has no integration table at
+whose `implementation` is `auction.prebid-server`, and APS has no integration table at
 all, because it is selected in `[demand]` too. The rules every one of these
 tables follows are in [Configuration Rules](/guide/configuration-rules).
 

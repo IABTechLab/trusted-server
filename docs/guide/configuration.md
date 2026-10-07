@@ -281,7 +281,7 @@ timeout_ms = 2000
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1200
 routing = "explicit"
@@ -1668,7 +1668,7 @@ does. A `[<section>.<name>]` table for a module its section does not select
 refuses startup too, as does a section that selects nothing, so a table left
 behind after a module is switched off is caught rather than sitting unread.
 
-`openrtb`, `prebid_server`, `aps` and `adserver_mock` supply demand and ad
+`auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` supply demand and ad
 server implementations only. They are not page integrations and cannot be
 named here. Their settings live in `[demand.<name>]` and `[ad-server.<name>]`.
 
@@ -1820,7 +1820,7 @@ See [lockr](/guide/integrations/lockr).
 `[auction.prebid]` owns browser behavior only. The server endpoint, the
 demand source timeout, routing, debug and test controls, consent forwarding,
 bidder-param overrides, and notification suppression belong to a `[demand]`
-source with `implementation = "prebid_server"`.
+source with `implementation = "auction.prebid-server"`.
 
 | Browser field                        | Type          | Default                                                                | Description                                                                    |
 | ------------------------------------ | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -1875,7 +1875,7 @@ analytics = ["atsAnalyticsAdapter"]
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 debug = false
@@ -1960,7 +1960,7 @@ See [Prebid Integration](/guide/integrations/prebid) for full details.
 
 **Server Bid Param Override Surfaces**:
 
-These fields belong in the `[demand.<name>]` table of a `prebid_server`
+These fields belong in the `[demand.<name>]` table of a `auction.prebid-server`
 demand source:
 
 - `bid_param_overrides`: static per-bidder shallow-merge overrides;
@@ -2190,9 +2190,9 @@ the old binary and old-schema blob together.
 `[demand] modules` lists the demand sources, in a list because several run.
 Each table name is the demand source's identity for configuration, backend
 correlation, health, response metadata and telemetry, and must be snake_case.
-The name is the implementation unless the table carries an `implementation`
-line, which is how two Prebid Servers run side by side under names of their
-own.
+Every demand table carries an `implementation` line naming the
+implementation by its module path, such as `auction.prebid-server`, which is
+how two Prebid Servers run side by side under names of their own.
 
 **Example**:
 
@@ -2207,7 +2207,7 @@ timeout_ms = 2000
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 timeout_ms = 1200
@@ -2220,7 +2220,7 @@ suppress_all = false
 suppress_seats = ["example-seat"]
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -2231,9 +2231,9 @@ allow_script_creatives = false
 module = "pbs_main"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -2251,11 +2251,11 @@ implementation it names:
 Every other key in the table belongs to the implementation, which rejects any
 key it does not know.
 
-| Implementation  | Default timeout    | `all_eligible` | Its own settings                                                                                                                                |
-| --------------- | ------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `openrtb`       | the auction budget | yes            | `request_ext`, `imp_ext`                                                                                                                        |
-| `prebid_server` | 1000 ms            | no             | `debug`, `test_mode`, `debug_query_params`, `consent_forwarding`, `bid_param_overrides`, `bid_param_zone_overrides`, `bid_param_override_rules` |
-| `aps`           | 800 ms             | yes            | `account_id` (required), `debug`, `allow_script_creatives`, `inventory_domain`, `inventory_page_origin`, `rendering_mode`                       |
+| Implementation             | Default timeout    | `all_eligible` | Its own settings                                                                                                                                |
+| -------------------------- | ------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auction-protocol.openrtb` | the auction budget | yes            | `request_ext`, `imp_ext`                                                                                                                        |
+| `auction.prebid-server`    | 1000 ms            | no             | `debug`, `test_mode`, `debug_query_params`, `consent_forwarding`, `bid_param_overrides`, `bid_param_zone_overrides`, `bid_param_override_rules` |
+| `auction.aps`              | 800 ms             | yes            | `account_id` (required), `debug`, `allow_script_creatives`, `inventory_domain`, `inventory_page_origin`, `rendering_mode`                       |
 
 An explicit `timeout_ms` overrides the implementation default. Runtime uses
 `min(source timeout, auction time remaining)` for launch decisions and OpenRTB
@@ -2266,7 +2266,7 @@ source, plus trusted stored-request routes. `routing = "all_eligible"` sends
 every banner-compatible slot to the source, regardless of bidder routes. It
 does not disclose bidder parameters assigned to another source. APS commonly
 uses `all_eligible` to preserve its whole-inventory participation. The
-`prebid_server` implementation rejects `all_eligible` because every PBS
+`auction.prebid-server` implementation rejects `all_eligible` because every PBS
 impression must carry routed bidder or stored-request demand.
 
 APS `rendering_mode` is `trusted_server` by default, which renders through
@@ -2282,7 +2282,8 @@ applies floors locally. With one configured, normalized demand responses are
 sent to it, and Trusted Server falls back to local ranking when the ad server
 cannot run.
 
-The one implementation this repository ships is `adserver_mock`, for
+The one implementation this repository ships is `ad-server.mock`, written
+`mock` in `[ad-server]`, for
 development and testing.
 
 | Setting                | Required | Default | Description                                                         |
@@ -2294,13 +2295,13 @@ development and testing.
 
 ```toml
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
-[ad-server.adserver_mock.context_query_params]
+[ad-server.mock.context_query_params]
 example_segments = "segments"
 ```
 
@@ -2319,7 +2320,7 @@ surrounding whitespace, and cannot be the reserved exact ID `trustedServer`.
 Browser `trustedServer.bidderParams` accepts at most 128 bidder entries, and
 its optional `zone` is at most 256 UTF-8 bytes.
 
-For the `openrtb` implementation, `request_ext` and `imp_ext` must be JSON
+For the `auction-protocol.openrtb` implementation, `request_ext` and `imp_ext` must be JSON
 objects. Each object is limited to 16 KiB serialized, eight container levels,
 and 256 keys at any one object level. Reserved driver, implementation and
 signing fields cannot be overwritten.

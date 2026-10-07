@@ -63,7 +63,7 @@ allowed_context_keys = []
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 debug = false
@@ -75,7 +75,7 @@ suppress_all = false
 suppress_seats = []
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account-id"

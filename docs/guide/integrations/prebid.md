@@ -20,7 +20,7 @@ Prebid configuration has two independent owners:
   selection and injection, browser timeout and debug, account injection,
   script interception, client-side bidders, and refresh exclusions. It runs
   when `[auction] modules` selects `prebid`.
-- A `[demand.<name>]` table that sets `implementation = "prebid_server"`, its
+- A `[demand.<name>]` table that sets `implementation = "auction.prebid-server"`, its
   `notifications`, and `[auction.bidders]` own every Prebid Server request.
   Prebid Server is a demand implementation, not a page integration, so no
   module section selects it. See
@@ -68,7 +68,7 @@ timeout_ms = 2000
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 900
 routing = "explicit"
@@ -118,7 +118,7 @@ module = "pbs_main"
 ### Demand source options
 
 The settings every `[demand.<name>]` table shares are the required `endpoint`,
-optional `timeout_ms`, `routing`, and `notifications`. The `prebid_server`
+optional `timeout_ms`, `routing`, and `notifications`. The `auction.prebid-server`
 timeout defaults to 1000 ms, an explicit value in the table overrides it, and
 the remaining auction budget caps runtime `tmax`. `routing` must stay
 `explicit`, because PBS rejects impressions with no routed bidder or
@@ -129,7 +129,7 @@ When migrating an origin-only legacy `server_url`, use that origin as the
 parameters. A configured non-root path, such as `/bid` or `/custom/pbs`, stays
 exact. `/openrtb2/auction/` is normalized to `/openrtb2/auction`.
 
-The settings `prebid_server` adds to its own table are:
+The settings `auction.prebid-server` adds to its own table are:
 
 | Field                      | Default | Behavior                                            |
 | -------------------------- | ------- | --------------------------------------------------- |
@@ -173,7 +173,7 @@ invent a PBS stored lookup just to invoke eligible APS or standard providers.
 
 Browser `timeout_ms` and `debug` never inherit a demand source's timeout or
 debug value. Selecting the browser integration does not create a demand source,
-and a `prebid_server` demand source can exist without browser injection.
+and a `auction.prebid-server` demand source can exist without browser injection.
 
 ### Stored intent deployment
 

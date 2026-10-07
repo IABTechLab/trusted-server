@@ -1,4 +1,4 @@
-//! The demonstration ad server implementation, `adserver_mock`.
+//! The demonstration ad server implementation, `ad-server.mock`.
 //!
 //! It calls mocktioneer's decision endpoint, which picks the winning bid by
 //! price, so a deployment can exercise the ad server seam without a real ad
@@ -36,14 +36,12 @@ use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 // Configuration
 // ============================================================================
 
-/// The implementation id `[ad-server]` names.
-pub const ADSERVER_MOCK_ID: &str = "adserver_mock";
+/// The name this implementation is selected by, its module path, which
+/// `[ad-server]` shortens to `mock`. It also serves as its builder's id.
+pub const MODULE: &str = "ad-server.mock";
 
 /// The demonstration ad server implementation.
-pub static ADSERVER: AdServerImplementation = AdServerImplementation {
-    id: ADSERVER_MOCK_ID,
-    build,
-};
+pub static ADSERVER: AdServerImplementation = AdServerImplementation { id: MODULE, build };
 
 fn build(
     name: &str,
@@ -52,12 +50,12 @@ fn build(
     let settings: AdServerMockSettings = serde_json::from_value(Json::Object(settings.clone()))
         .map_err(|error| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
+                message: format!("invalid `{MODULE}` settings: {error}"),
             })
         })?;
     settings.validate().map_err(|error| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("invalid `{ADSERVER_MOCK_ID}` settings: {error}"),
+            message: format!("invalid `{MODULE}` settings: {error}"),
         })
     })?;
     Ok(Arc::new(AdServerMockProvider::new(name, settings)))

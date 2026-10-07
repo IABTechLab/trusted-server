@@ -1772,7 +1772,7 @@ mod tests {
             modules = ["prebid"]
 
             [demand.prebid]
-            implementation = "prebid_server"
+            implementation = "auction.prebid-server"
             endpoint = "https://test-prebid.com/openrtb2/auction"
             timeout_ms = 2000
             "#,
@@ -1931,7 +1931,10 @@ mod tests {
             std::collections::BTreeMap::from([(
                 "aps_main".to_string(),
                 serde_json::Map::from_iter([
-                    ("implementation".to_string(), serde_json::json!("aps")),
+                    (
+                        "implementation".to_string(),
+                        serde_json::json!("auction.aps"),
+                    ),
                     (
                         "endpoint".to_string(),
                         serde_json::json!("https://aps.example/e/pb/bid"),

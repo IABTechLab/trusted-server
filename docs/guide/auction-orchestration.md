@@ -81,7 +81,7 @@ sequenceDiagram
     Orch->>Orch: Detect strategy<br/>ad server? parallel_adserver : parallel_only
     deactivate TS
 
-    Note over Orch: Strategy determined by config:<br/>[ad-server]<br/>module = "adserver_mock" → parallel_adserver<br/>No [ad-server] → parallel_only
+    Note over Orch: Strategy determined by config:<br/>[ad-server]<br/>module = "mock" → parallel_adserver<br/>No [ad-server] → parallel_only
   end
 
   %% === Parallel Provider Execution ===
@@ -229,15 +229,15 @@ so request handling never reinterprets raw configuration.
 
 Three demand implementations ship in this repository:
 
-- `openrtb` for the common banner subset and bounded static extensions;
-- `prebid_server` for PBS request, response, cache, override, and diagnostics
+- `auction-protocol.openrtb` for the common banner subset and bounded static extensions;
+- `auction.prebid-server` for PBS request, response, cache, override, and diagnostics
   behavior; and
-- `aps` for APS account/SDK fields, response eligibility, and renderer output.
+- `auction.aps` for APS account/SDK fields, response eligibility, and renderer output.
 
 Each `[demand.<name>]` table is one instance of the shared OpenRTB path.
 Several tables may name the same implementation or endpoint and stay distinct
 through their names, which is what the optional `implementation` line is for.
-The `adserver_mock` ad server is selected the same way, by
+The `ad-server.mock` ad server is selected the same way, by
 `[ad-server] module`, and supplies an ad server implementation rather than a
 demand one. See [Configuration Rules](/guide/configuration-rules) for the
 syntax every type shares.
@@ -259,12 +259,12 @@ timeout_ms = 2000
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -298,12 +298,12 @@ timeout_ms = 2000
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -312,9 +312,9 @@ account_id = "example-aps-account"
 module = "pbs_main"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -379,7 +379,7 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 debug = false
@@ -412,7 +412,7 @@ Builds an independent banner OpenRTB request for Amazon Publisher Services.
 modules = ["aps_main"]
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -456,9 +456,9 @@ An external decision service that receives decoded-price demand responses and pe
 
 ```toml
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 price_floor = 0.50
@@ -717,7 +717,7 @@ timeout_ms = 2000
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 900
 routing = "explicit"
@@ -730,7 +730,7 @@ suppress_all = false
 suppress_seats = ["example-seat"]
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -741,9 +741,9 @@ allow_script_creatives = false
 module = "pbs_main"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
@@ -766,19 +766,19 @@ refused. The ad server is selected separately by `[ad-server] module`.
 Four settings are common to every `[demand.<name>]` table, whichever
 implementation it names:
 
-| Field           | Default                | Meaning                                                          |
-| --------------- | ---------------------- | ---------------------------------------------------------------- |
-| `endpoint`      | Required               | Absolute HTTPS endpoint, or HTTP to a loopback host              |
-| `timeout_ms`    | Implementation default | PBS 1000 ms, APS 800 ms, `openrtb` inherits the auction timeout  |
-| `routing`       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it |
-| `notifications` | No suppression         | Common `nurl`/`burl` suppression by all bids or returned seats   |
+| Field           | Default                | Meaning                                                                          |
+| --------------- | ---------------------- | -------------------------------------------------------------------------------- |
+| `endpoint`      | Required               | Absolute HTTPS endpoint, or HTTP to a loopback host                              |
+| `timeout_ms`    | Implementation default | PBS 1000 ms, APS 800 ms, `auction-protocol.openrtb` inherits the auction timeout |
+| `routing`       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it                 |
+| `notifications` | No suppression         | Common `nurl`/`burl` suppression by all bids or returned seats                   |
 
 Every other key in the table belongs to the implementation, which rejects any
 key it does not know.
 
 APS normally uses `all_eligible`, which sends every compatible banner slot but
 never another source's bidder parameters. An `explicit` source receives only
-centrally routed or trusted stored-request demand. The `prebid_server`
+centrally routed or trusted stored-request demand. The `auction.prebid-server`
 implementation rejects `all_eligible` because PBS requires bidder or
 stored-request demand on each impression.
 
@@ -800,7 +800,7 @@ before serving new JS; Rust builds embed those bundles.
 
 Demand source names must match `^[a-z][a-z0-9_]{0,62}$`. Bidder IDs are limited
 to 128 UTF-8 bytes and cannot be the exact reserved browser envelope ID
-`trustedServer`. Static `openrtb` `request_ext` and `imp_ext` objects are each
+`trustedServer`. Static `auction-protocol.openrtb` `request_ext` and `imp_ext` objects are each
 limited to 16 KiB, eight container levels, and 256 keys at one object level.
 Notification seat lists are limited to 128 unique entries of at most 128 UTF-8
 bytes each.

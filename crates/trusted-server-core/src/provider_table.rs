@@ -9,16 +9,18 @@
 //! modules = ["pbs_demo"]
 //!
 //! [demand.pbs_demo]
-//! implementation = "prebid_server"
+//! implementation = "auction.prebid-server"
 //! endpoint = "https://prebid.example.com/openrtb2/auction"
 //! ```
 //!
-//! A table's name is the implementation it configures, unless the table has an
-//! `implementation` line, which lets several providers share one
-//! implementation under names of their own. A provider with nothing to set
-//! needs no table. [`ProviderTable::validate`] checks the rules that hold for
-//! every type, and the code that reads a type checks what only that type
-//! knows, such as which implementations exist.
+//! A table's `implementation` line names the implementation it configures by
+//! its module path, which lets several providers share one implementation
+//! under names of their own. Without the line the table's name stands for
+//! the implementation, which only a section named by the implementation's
+//! type can match, as `mock` in `[ad-server]` is `ad-server.mock`. A provider
+//! with nothing to set needs no table. [`ProviderTable::validate`] checks the
+//! rules that hold for every type, and the code that reads a type checks what
+//! only that type knows, such as which implementations exist.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,7 +34,7 @@ use serde_json::{Map, Value};
 /// name is a label rather than the implementation.
 pub const IMPLEMENTATION_KEY: &str = "implementation";
 
-/// The longest provider name or implementation id, in bytes.
+/// The longest provider name, in bytes.
 const MAX_NAME_BYTES: usize = 63;
 
 /// A provider type whose `modules` names any number of providers.
@@ -177,32 +179,38 @@ impl<S: ProviderSelection> ProviderTable<S> {
     ///
     /// # Errors
     ///
-    /// Returns a message for a name or implementation id that is not
-    /// `snake_case`, a name selected twice, an `implementation` line that is
-    /// not a name, or a table that `provider` does not select.
+    /// Returns a message for a name that is not `snake_case`, a name selected
+    /// twice, an `implementation` line that is not a module name, or a table
+    /// the selection does not name.
     pub fn validate(&self, type_name: &str) -> Result<(), String> {
         let selected = self.selected.names();
         for (position, name) in selected.iter().enumerate() {
-            check_name(type_name, "provider name", name)?;
+            check_name(type_name, "module name", name)?;
             if selected[..position].contains(name) {
                 return Err(format!(
-                    "[{type_name}] provider names `{name}` more than once"
+                    "[{type_name}] {} names `{name}` more than once",
+                    S::KEY
                 ));
             }
         }
         for (name, table) in &self.tables {
             check_name(type_name, "table name", name)?;
             if let Some(implementation) = table.get(IMPLEMENTATION_KEY) {
-                let Some(implementation) = implementation.as_str() else {
+                let valid = implementation
+                    .as_str()
+                    .is_some_and(crate::module_name::is_valid);
+                if !valid {
                     return Err(format!(
-                        "[{type_name}.{name}] implementation must be an implementation id"
+                        "[{type_name}.{name}] implementation must be a module name, its \
+                         crate's parts joined by `.`, each in lower case letters, digits, \
+                         `_` or `-`, such as `auction.example`"
                     ));
-                };
-                check_name(type_name, "implementation", implementation)?;
+                }
             }
             if !selected.contains(&name.as_str()) {
                 return Err(format!(
-                    "[{type_name}.{name}] is configured, but [{type_name}] provider does not select `{name}`. Add it to provider, or remove the table"
+                    "[{type_name}.{name}] is configured, but [{type_name}] {key} does not select `{name}`. Add it to {key}, or remove the table",
+                    key = S::KEY
                 ));
             }
         }
@@ -210,7 +218,7 @@ impl<S: ProviderSelection> ProviderTable<S> {
     }
 }
 
-/// Checks that a name or implementation id is `snake_case`.
+/// Checks that a module's name within its type is `snake_case`.
 fn check_name(type_name: &str, what: &str, name: &str) -> Result<(), String> {
     let mut bytes = name.bytes();
     let valid = name.len() <= MAX_NAME_BYTES
@@ -594,21 +602,21 @@ mod tests {
     #[test]
     fn reads_the_selection_and_named_tables() {
         let table = list(serde_json::json!({
-            "modules": ["pbs_demo", "aps"],
-            "pbs_demo": { "implementation": "prebid_server", "endpoint": "https://pbs.example" }
+            "modules": ["main_source", "second_source"],
+            "main_source": { "implementation": "exchange", "endpoint": "https://exchange.example" }
         }))
-        .expect("should read a provider list");
+        .expect("should read a module list");
 
-        assert_eq!(table.selected(), vec!["pbs_demo", "aps"]);
-        assert_eq!(table.implementation_of("pbs_demo"), "prebid_server");
+        assert_eq!(table.selected(), vec!["main_source", "second_source"]);
+        assert_eq!(table.implementation_of("main_source"), "exchange");
         assert_eq!(
-            table.implementation_of("aps"),
-            "aps",
+            table.implementation_of("second_source"),
+            "second_source",
             "a name with no table should be its own implementation"
         );
         assert!(
             !table
-                .settings_of("pbs_demo")
+                .settings_of("main_source")
                 .contains_key(IMPLEMENTATION_KEY),
             "settings should not carry the implementation line"
         );
@@ -618,8 +626,8 @@ mod tests {
     #[test]
     fn rejects_a_table_that_is_not_selected() {
         let table = list(serde_json::json!({
-            "modules": ["aps"],
-            "pbs_demo": { "endpoint": "https://pbs.example" }
+            "modules": ["second_source"],
+            "main_source": { "endpoint": "https://exchange.example" }
         }))
         .expect("should read the table");
 
@@ -627,15 +635,15 @@ mod tests {
             .validate("demand")
             .expect_err("should reject an unselected table");
         assert!(
-            error.contains("[demand.pbs_demo]") && error.contains("does not select"),
+            error.contains("[demand.main_source]") && error.contains("does not select"),
             "should name the table and the fix: {error}"
         );
     }
 
     #[test]
     fn rejects_a_name_selected_twice() {
-        let table =
-            list(serde_json::json!({ "modules": ["aps", "aps"] })).expect("should read the table");
+        let table = list(serde_json::json!({ "modules": ["second_source", "second_source"] }))
+            .expect("should read the table");
 
         let error = table
             .validate("demand")
@@ -645,7 +653,7 @@ mod tests {
 
     #[test]
     fn rejects_names_that_are_not_snake_case() {
-        for name in ["pbs-demo", "PbsDemo", "1pbs", ""] {
+        for name in ["main-source", "MainSource", "1source", ""] {
             let table = list(serde_json::json!({ "modules": [name] })).expect("should read");
             let error = table
                 .validate("demand")
@@ -658,8 +666,40 @@ mod tests {
     }
 
     #[test]
+    fn an_implementation_is_named_by_its_module_path() {
+        let table = list(serde_json::json!({
+            "modules": ["main_source"],
+            "main_source": { "implementation": "auction.example-exchange" }
+        }))
+        .expect("should read the table");
+        table
+            .validate("demand")
+            .expect("a module path should name an implementation");
+
+        for implementation in [
+            serde_json::json!("Auction.Exchange"),
+            serde_json::json!("auction/exchange"),
+            serde_json::json!("auction..exchange"),
+            serde_json::json!(7),
+        ] {
+            let table = list(serde_json::json!({
+                "modules": ["main_source"],
+                "main_source": { "implementation": implementation }
+            }))
+            .expect("should read the table");
+            let error = table
+                .validate("demand")
+                .expect_err("should refuse an implementation that is not a module name");
+            assert!(
+                error.contains("[demand.main_source] implementation must be a module name"),
+                "should say why for {implementation}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_a_value_that_is_not_a_table() {
-        let error = list(serde_json::json!({ "modules": ["aps"], "timeout_ms": 500 }))
+        let error = list(serde_json::json!({ "modules": ["second_source"], "timeout_ms": 500 }))
             .expect_err("should reject a stray value");
         assert!(
             error.to_string().contains("`timeout_ms` is not a setting"),
@@ -670,19 +710,19 @@ mod tests {
     #[test]
     fn a_choice_takes_one_name_and_a_list_takes_a_list() {
         let choice: ProviderChoice =
-            serde_json::from_value(serde_json::json!({ "module": "adserver_mock" }))
+            serde_json::from_value(serde_json::json!({ "module": "picker" }))
                 .expect("should read a single name");
-        assert_eq!(choice.selected(), vec!["adserver_mock"]);
+        assert_eq!(choice.selected(), vec!["picker"]);
 
         serde_json::from_value::<ProviderChoice>(serde_json::json!({ "module": ["a"] }))
-            .expect_err("a single-provider type should refuse a list");
+            .expect_err("a single-module type should refuse a list");
         serde_json::from_value::<ProviderList>(serde_json::json!({ "modules": "a" }))
             .expect_err("a list type should refuse a single name");
     }
 
     #[test]
     fn refuses_the_previous_selection_key() {
-        let error = list(serde_json::json!({ "provider": ["aps"] }))
+        let error = list(serde_json::json!({ "provider": ["main_source"] }))
             .expect_err("should refuse the key the selection was written under before");
         assert!(
             error.to_string().contains("`provider` is `modules` here"),
@@ -701,8 +741,8 @@ mod tests {
     #[test]
     fn round_trips_through_serialization() {
         let table = list(serde_json::json!({
-            "modules": ["pbs_demo"],
-            "pbs_demo": { "implementation": "prebid_server", "timeout_ms": 900 }
+            "modules": ["main_source"],
+            "main_source": { "implementation": "exchange", "timeout_ms": 900 }
         }))
         .expect("should read the table");
 

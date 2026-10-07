@@ -1,4 +1,4 @@
-//! The Prebid Server demand implementation, `prebid_server`.
+//! The Prebid Server demand implementation, `auction.prebid-server`.
 //!
 //! Prebid Server takes the shared `OpenRTB` baseline with its own impression
 //! and request extensions, forwards the raw headers its auction needs, and
@@ -29,15 +29,16 @@ use crate::integrations::prebid::{
 };
 use crate::platform::PlatformResponse;
 
-/// The implementation id `[demand]` names.
-pub const PREBID_SERVER_ID: &str = "prebid_server";
+/// The name an `implementation` line gives this implementation, its module
+/// path, which also serves as its builder's id.
+pub const MODULE: &str = "auction.prebid-server";
 
 /// The canonical Prebid Server auction path.
 const AUCTION_PATH: &str = "/openrtb2/auction";
 
 /// The Prebid Server demand implementation.
 pub static DEMAND: DemandImplementation = DemandImplementation {
-    id: PREBID_SERVER_ID,
+    id: MODULE,
     default_timeout: DemandTimeoutDefault::Fixed(1000),
     allows_all_eligible: false,
     serves_stored_requests: true,
@@ -86,7 +87,7 @@ fn compile(
     let settings =
         PrebidServerSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("invalid `{PREBID_SERVER_ID}` settings: {error}"),
+                message: format!("invalid `{MODULE}` settings: {error}"),
             })
         })?;
     let override_engine = compile_profile_override_rules(

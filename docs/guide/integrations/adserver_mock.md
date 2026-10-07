@@ -1,10 +1,10 @@
 # Ad Server Mock
 
-`adserver_mock` is a development ad server for the auction orchestrator. It
+`ad-server.mock` is a development ad server for the auction orchestrator. It
 is not a demand source and does not expose an integration proxy route.
 
-Select it with `[ad-server] module = "adserver_mock"` and give it an
-`[ad-server.adserver_mock]` table. The orchestrator first gathers responses from
+Select it with `[ad-server] module = "mock"` and give it an
+`[ad-server.mock]` table. The orchestrator first gathers responses from
 the configured demand sources, then passes successful bids to the ad
 server's HTTP endpoint for final selection.
 

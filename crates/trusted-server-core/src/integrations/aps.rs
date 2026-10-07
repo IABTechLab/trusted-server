@@ -53,6 +53,9 @@ use crate::platform::{PlatformResponse, RuntimeServices};
 use crate::settings::Settings;
 
 pub(crate) const APS_INTEGRATION_ID: &str = "aps";
+/// The name an `implementation` line gives this implementation, its module
+/// path.
+pub const MODULE: &str = "auction.aps";
 /// Renderer type tag carried on the wire by an APS bid, read by the browser to
 /// select the APS renderer.
 pub const APS_RENDERER_TYPE: &str = "aps";
@@ -427,7 +430,7 @@ impl Default for LegacyApsProviderConfig {
 
 /// The APS demand implementation.
 pub static DEMAND: DemandImplementation = DemandImplementation {
-    id: APS_INTEGRATION_ID,
+    id: MODULE,
     default_timeout: DemandTimeoutDefault::Fixed(800),
     allows_all_eligible: true,
     serves_stored_requests: false,
@@ -2080,7 +2083,7 @@ pub fn register_for_plan(
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
     let mut selected: Option<(&str, ApsRenderingMode)> = None;
     for provider in plan.providers() {
-        if provider.implementation.id != APS_INTEGRATION_ID {
+        if provider.implementation.id != MODULE {
             continue;
         }
         let Some(demand) = provider.demand.as_any().downcast_ref::<ApsDemand>() else {
@@ -3212,10 +3215,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, mode)| {
-                let mut table = crate::auction::test_support::demand_table(
-                    APS_INTEGRATION_ID,
-                    &default_endpoint(),
-                );
+                let mut table =
+                    crate::auction::test_support::demand_table(MODULE, &default_endpoint());
                 table.insert("routing".to_string(), json!("all_eligible"));
                 if let Some(mode) = mode {
                     table.insert("rendering_mode".to_string(), json!(mode));

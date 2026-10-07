@@ -30,7 +30,11 @@ setting = "value"
    needs no table at all.
 4. **The name is the implementation.** `[ec.hmac]` configures the `hmac`
    implementation. To run an implementation under a name of your own, add an
-   `implementation` line. That is how two Prebid Servers run side by side.
+   `implementation` line. A demand source always has one, naming the
+   implementation by its module path, such as
+   `implementation = "auction.prebid-server"`, because `demand` is not the
+   type its implementations are named under. That is how two Prebid Servers
+   run side by side.
 5. **A name is parts joined by `.`,** each of lower case letters, digits, `_`
    or `-`. A module from a crate is named by its folder below `crates/`, and
    may be written in full, as `permission-signal.gpc`, or with its section's
@@ -46,8 +50,8 @@ setting = "value"
 | `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                            |
 | `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                       |
 | `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
-| `demand`            | several           | `modules`, a list  | `openrtb`, `prebid_server`, `aps`                                                                       |
-| `ad-server`         | one               | `module`, a string | `adserver_mock`                                                                                         |
+| `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
+| `ad-server`         | one               | `module`, a string | `mock`                                                                                                  |
 | `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
 | `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |
 | `ad-tag`            | several           | `modules`, a list  | `google`, `google.diagnostics`                                                                          |
@@ -58,7 +62,7 @@ setting = "value"
 | `auction`           | several           | `modules`, a list  | `prebid`, `testing.testlight`                                                                           |
 | `proxy`             | several           | `modules`, a list  | `js_asset_proxy`                                                                                        |
 
-`openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
+`auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` supply implementations
 only. No module section selects them.
 
 A module that an integration supplies needs that integration selected in the
@@ -236,15 +240,15 @@ modules = ["gpc", "gpp", "us-privacy", "tcf"]
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"           # the name is a label of your own
+implementation = "auction.prebid-server"           # the name is a label of your own
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1200                          # this demand source only
 consent_forwarding = "both"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
@@ -277,11 +281,11 @@ both at the same implementation.
 modules = ["pbs_main", "pbs_house"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 
 [demand.pbs_house]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://house.example.com/openrtb2/auction"
 ```
 
@@ -294,9 +298,10 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | `[permission_signal] sources`                                                        | `[permission-signal] modules`                                                                      |
 | `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `gpp_sale_opt_out`, `us_privacy` | `host_signals`, `client_fixed`, `gpp`, `us-privacy`                                                |
 | `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config`           | `[demand] modules` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
-| `profile = "standard"`                                                               | `implementation = "openrtb"`                                                                       |
-| `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`            | `[ad-server] module = "adserver_mock"` and `[ad-server.adserver_mock]`                             |
-| `[integrations.aps] rendering_mode`                                                  | `rendering_mode` in the `[demand.<name>]` table of the `aps` provider                              |
+| `profile = "standard"`                                                               | `implementation = "auction-protocol.openrtb"`                                                      |
+| `profile = "prebid-server"` and `profile = "aps"`                                    | `implementation = "auction.prebid-server"` and `implementation = "auction.aps"`                    |
+| `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`            | `[ad-server] module = "mock"` and `[ad-server.mock]`                                               |
+| `[integrations.aps] rendering_mode`                                                  | `rendering_mode` in the `[demand.<name>]` table of the `auction.aps` implementation                |
 | `[debug.auction_html_comment_options] include_mediator_response`                     | `include_adserver_response`                                                                        |
 
 The word mediator is gone with it. It is "ad server" in prose and `ad-server`

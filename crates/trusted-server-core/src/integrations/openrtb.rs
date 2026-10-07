@@ -1,4 +1,4 @@
-//! The plain `OpenRTB` 2.6 demand implementation, `openrtb`.
+//! The plain `OpenRTB` 2.6 demand implementation, `auction-protocol.openrtb`.
 //!
 //! A standards-compliant exchange needs no code of its own. It takes the
 //! shared request baseline, adds the static extensions its table sets, and has
@@ -23,12 +23,13 @@ use crate::auction::types::AuctionResponse;
 use crate::error::TrustedServerError;
 use crate::platform::PlatformResponse;
 
-/// The implementation id `[demand]` names.
-pub const OPENRTB_ID: &str = "openrtb";
+/// The name an `implementation` line gives this implementation, its module
+/// path, which also serves as its builder's id.
+pub const MODULE: &str = "auction-protocol.openrtb";
 
 /// The plain `OpenRTB` demand implementation.
 pub static DEMAND: DemandImplementation = DemandImplementation {
-    id: OPENRTB_ID,
+    id: MODULE,
     default_timeout: DemandTimeoutDefault::Auction,
     allows_all_eligible: true,
     serves_stored_requests: false,
@@ -74,10 +75,8 @@ struct OpenRtbSettings {
 fn compile(
     settings: &Map<String, Value>,
 ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
-    let settings =
-        OpenRtbSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
-            configuration_error(format!("invalid `{OPENRTB_ID}` settings: {error}"))
-        })?;
+    let settings = OpenRtbSettings::deserialize(Value::Object(settings.clone()))
+        .map_err(|error| configuration_error(format!("invalid `{MODULE}` settings: {error}")))?;
     Ok(Arc::new(OpenRtbDemand {
         request_ext: validate_static_extension("request_ext", settings.request_ext)?,
         imp_ext: validate_static_extension("imp_ext", settings.imp_ext)?,
@@ -192,13 +191,13 @@ fn validate_static_extension(
     };
     let object = value
         .as_object()
-        .ok_or_else(|| configuration_error(format!("`{OPENRTB_ID}` {field} must be an object")))?;
+        .ok_or_else(|| configuration_error(format!("`{MODULE}` {field} must be an object")))?;
     let size = serde_json::to_vec(&value)
         .map_err(|error| configuration_error(format!("cannot serialize {field}: {error}")))?
         .len();
     if size > STATIC_EXTENSION_MAX_BYTES {
         return Err(configuration_error(format!(
-            "`{OPENRTB_ID}` {field} exceeds {STATIC_EXTENSION_MAX_BYTES} bytes"
+            "`{MODULE}` {field} exceeds {STATIC_EXTENSION_MAX_BYTES} bytes"
         )));
     }
     validate_extension_value(field, &value, 0)?;
@@ -216,12 +215,12 @@ fn validate_extension_value(
             let container_depth = container_depth + 1;
             if container_depth > STATIC_EXTENSION_MAX_DEPTH {
                 return Err(configuration_error(format!(
-                    "`{OPENRTB_ID}` {field} exceeds nesting depth {STATIC_EXTENSION_MAX_DEPTH}"
+                    "`{MODULE}` {field} exceeds nesting depth {STATIC_EXTENSION_MAX_DEPTH}"
                 )));
             }
             if object.len() > STATIC_EXTENSION_MAX_KEYS {
                 return Err(configuration_error(format!(
-                    "`{OPENRTB_ID}` {field} object exceeds {STATIC_EXTENSION_MAX_KEYS} keys"
+                    "`{MODULE}` {field} object exceeds {STATIC_EXTENSION_MAX_KEYS} keys"
                 )));
             }
             for nested in object.values() {
@@ -232,7 +231,7 @@ fn validate_extension_value(
             let container_depth = container_depth + 1;
             if container_depth > STATIC_EXTENSION_MAX_DEPTH {
                 return Err(configuration_error(format!(
-                    "`{OPENRTB_ID}` {field} exceeds nesting depth {STATIC_EXTENSION_MAX_DEPTH}"
+                    "`{MODULE}` {field} exceeds nesting depth {STATIC_EXTENSION_MAX_DEPTH}"
                 )));
             }
             for nested in array {
@@ -254,7 +253,7 @@ fn reject_reserved_fields(
     };
     if let Some(key) = reserved.iter().find(|key| object.contains_key(**key)) {
         return Err(configuration_error(format!(
-            "`{OPENRTB_ID}` {field} cannot claim reserved field `{key}`"
+            "`{MODULE}` {field} cannot claim reserved field `{key}`"
         )));
     }
     Ok(())

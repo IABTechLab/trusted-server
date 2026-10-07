@@ -235,7 +235,10 @@ pub mod nextjs_auction {
             std::collections::BTreeMap::from([(
                 "fixture".to_owned(),
                 serde_json::Map::from_iter([
-                    ("implementation".to_owned(), serde_json::json!("openrtb")),
+                    (
+                        "implementation".to_owned(),
+                        serde_json::json!("auction-protocol.openrtb"),
+                    ),
                     (
                         "endpoint".to_owned(),
                         serde_json::json!("https://auction.example.com/bid"),

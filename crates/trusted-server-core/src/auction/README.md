@@ -74,7 +74,7 @@ produces one `ProviderAuctionInput` per demand source.
   source, or trusted stored-request demand where the implementation supports it.
 - `all_eligible` sends every compatible banner slot without copying another
   source's bidder params.
-- `prebid_server` requires `explicit`. PBS rejects impressions that have neither
+- `auction.prebid-server` requires `explicit`. PBS rejects impressions that have neither
   bidder demand nor a stored-request reference.
 - APS normally uses `all_eligible` because APS participates across eligible
   inventory without browser bidder params.
@@ -85,7 +85,7 @@ Each `[auction.bidders.<bidder-id>]` route has one owner, named by its
 ## Demand execution
 
 `provider::GenericOpenRtbProvider` owns the shared transport path for the
-`openrtb`, `prebid_server` and `aps` implementations. An implementation receives
+`auction-protocol.openrtb`, `auction.prebid-server` and `auction.aps` implementations. An implementation receives
 routed and privacy-approved facts, not the raw inbound request.
 
 The orchestrator launches all eligible demand sources before collecting
@@ -127,7 +127,7 @@ timeout_ms = 2000
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 900
 routing = "explicit"
@@ -140,7 +140,7 @@ suppress_all = false
 suppress_seats = ["example-seat"]
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-account"
@@ -149,16 +149,17 @@ account_id = "example-account"
 module = "pbs_main"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
 
-The table name is the implementation unless the table carries an
-`implementation` line, which is how two Prebid Servers run side by side under
-names of their own. Endpoints must be HTTPS, or HTTP to `127.0.0.1`, `::1` or
+Every demand table carries an `implementation` line naming the
+implementation by its module path, which is how two Prebid Servers run side
+by side under names of their own, and `[ad-server]` writes `ad-server.mock`
+as `mock`. Endpoints must be HTTPS, or HTTP to `127.0.0.1`, `::1` or
 `localhost`. Replace all example values before enabling an auction.
 
 ## Code map

@@ -27,7 +27,7 @@ their operational procedures.
 
 | Integration                                                    | Operational status | Deploy ID | Registration       | Browser loading |
 | -------------------------------------------------------------- | ------------------ | --------- | ------------------ | --------------- |
-| [`adserver_mock`](/guide/integrations/adserver_mock)           | development        | yes       | auction mediator   | none            |
+| [`ad-server.mock`](/guide/integrations/adserver_mock)          | development        | yes       | auction mediator   | none            |
 | [`aps`](/guide/integrations/aps)                               | development        | yes       | auction plan       | none            |
 | [`creative`](/guide/creative-processing)                       | development        | no        | browser capability | bundled         |
 | [`datadome`](/guide/integrations/datadome)                     | development        | yes       | settings builder   | bundled         |

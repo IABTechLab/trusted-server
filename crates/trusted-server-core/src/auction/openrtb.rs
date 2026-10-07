@@ -791,8 +791,12 @@ mod routing_metadata_tests {
 
     #[test]
     fn unused_bidder_param_count_follows_the_implementation() {
-        for (implementation, expected) in [("prebid_server", 0), ("openrtb", 1), ("aps", 1)] {
-            let endpoint = if implementation == "aps" {
+        for (implementation, expected) in [
+            ("auction.prebid-server", 0),
+            ("auction-protocol.openrtb", 1),
+            ("auction.aps", 1),
+        ] {
+            let endpoint = if implementation == "auction.aps" {
                 "https://aps.example/e/pb/bid"
             } else {
                 "https://provider.example/openrtb"

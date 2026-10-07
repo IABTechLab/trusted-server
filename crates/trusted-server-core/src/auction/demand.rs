@@ -233,7 +233,7 @@ pub type BuildAdServerFn =
 /// `provider` or by an `implementation` line.
 #[derive(Clone, Copy)]
 pub struct DemandImplementation {
-    /// The implementation id, in `snake_case`.
+    /// The implementation's name, its module path.
     pub id: &'static str,
     /// The timeout a source uses when its table sets none.
     pub default_timeout: DemandTimeoutDefault,
@@ -274,7 +274,7 @@ pub fn accept_endpoint(endpoint: &mut Url) -> Result<(), String> {
 /// `[ad-server] module` or by an `implementation` line.
 #[derive(Clone, Copy)]
 pub struct AdServerImplementation {
-    /// The implementation id, in `snake_case`.
+    /// The implementation's name, its module path.
     pub id: &'static str,
     /// Builds the ad server from its configured name and its settings.
     pub build: BuildAdServerFn,

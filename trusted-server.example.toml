@@ -448,18 +448,18 @@ allowed_context_keys = []
 # modules = ["prebid"]
 
 # Example demand sources. Remove or customize before enabling auctions. The
-# table name is this source's identity, and it is the implementation unless the
-# table carries an `implementation` line, which is how two Prebid Servers run
-# side by side under names of their own. The built-in implementations are
-# openrtb, prebid_server and aps. Every endpoint must be HTTPS, or HTTP to
-# 127.0.0.1, ::1 or localhost.
+# table name is this source's identity, and its `implementation` line names
+# the implementation by module path, which is how two Prebid Servers run side
+# by side under names of their own. The built-in implementations are
+# auction-protocol.openrtb, auction.prebid-server and auction.aps. Every
+# endpoint must be HTTPS, or HTTP to 127.0.0.1, ::1 or localhost.
 [demand]
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
-# `prebid_server` defaults to 1000 ms when omitted.
+# `auction.prebid-server` defaults to 1000 ms when omitted.
 routing = "explicit"
 debug = false
 test_mode = false
@@ -479,7 +479,7 @@ module = "pbs_main"
 # default to off. Add "aps_main" to the [demand] modules list above when
 # uncommenting this.
 # [demand.aps_main]
-# implementation = "aps"
+# implementation = "auction.aps"
 # endpoint = "https://aps.example.com/e/pb/bid"
 # routing = "all_eligible"
 # account_id = "example-aps-account-id"
@@ -491,15 +491,16 @@ module = "pbs_main"
 
 # The ad server that picks the auction winner. With no [ad-server] selection the
 # highest bid wins. The only implementation this repository ships is
-# adserver_mock, for development and testing.
+# ad-server.mock, for development and testing, written here as mock because
+# its type is this section's.
 # [ad-server]
-# module = "adserver_mock"
+# module = "mock"
 #
-# [ad-server.adserver_mock]
+# [ad-server.mock]
 # endpoint = "https://adserver.example.com/decide"
 # timeout_ms = 1000
 # Map auction context keys to decision-URL query params:
-# [ad-server.adserver_mock.context_query_params]
+# [ad-server.mock.context_query_params]
 # example_segments = "segments"
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.

@@ -25,12 +25,12 @@ timeout_ms = 2000
 modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -40,9 +40,9 @@ debug = false
 module = "pbs_main"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```

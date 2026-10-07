@@ -27,7 +27,7 @@ The integration does not implement:
 
 APS is a demand implementation, not a page integration, so no module section
 selects it. Everything APS owns, including rendering ownership,
-lives in the `[demand.<name>]` table that names `implementation = "aps"`. APS
+lives in the `[demand.<name>]` table that names `implementation = "auction.aps"`. APS
 renderer support is registered whenever the compiled auction plan contains an
 APS demand source. See [Configuration Rules](/guide/configuration-rules) for
 the syntax every provider type shares.
@@ -41,7 +41,7 @@ timeout_ms = 2000
 modules = ["aps_main"]
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
 account_id = "example-aps-account"
@@ -54,9 +54,9 @@ rendering_mode = "trusted_server"
 # inventory_page_origin = "https://www.inventory.example.com"
 
 [ad-server]
-module = "adserver_mock"
+module = "mock"
 
-[ad-server.adserver_mock]
+[ad-server.mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -122,7 +122,7 @@ click-through behavior with the APS account team before production rollout.
 
 `endpoint` is required and must be an absolute HTTPS URL with a host and no
 credentials or fragment. The legacy `/e/dtb/bid` path is rejected. `timeout_ms`
-sits beside it, and when omitted the `aps` implementation default of 800 ms
+sits beside it, and when omitted the `auction.aps` implementation default of 800 ms
 applies. Runtime caps it by the remaining auction budget.
 
 `account_id` is required, nonempty, and at most 1024 bytes. It is the canonical
@@ -151,7 +151,7 @@ bidder route:
 modules = ["aps_main"]
 
 [demand.aps_main]
-implementation = "aps"
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "explicit"
 account_id = "example-aps-account"
@@ -311,7 +311,7 @@ If script rendering requires weakening the outer sandbox, leave `allow_script_cr
 This release is a direct configuration and protocol cutover:
 
 1. Move `endpoint` and `timeout_ms` to a `[demand.<name>]` table that sets
-   `implementation = "aps"`, and use `/e/pb/bid`. `/e/dtb/bid` remains
+   `implementation = "auction.aps"`, and use `/e/pb/bid`. `/e/dtb/bid` remains
    rejected.
 2. Move `account_id`, `debug`, `allow_script_creatives`, `rendering_mode` and
    the inventory overrides into that same table, flat beside `endpoint`.
@@ -352,7 +352,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 - Confirm `account_id` and account eligibility with APS.
 - Confirm the endpoint is `/e/pb/bid` and uses HTTPS without credentials.
 - If the deployment hostname differs from APS-authorized inventory, configure both `inventory_domain` and `inventory_page_origin` with the APS-approved identity.
-- Ensure a `[demand.<name>]` table sets `implementation = "aps"` and that
+- Ensure a `[demand.<name>]` table sets `implementation = "auction.aps"` and that
   `[demand] modules` names it.
 - Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
 - Confirm the demand source timeout fits inside the auction timeout.

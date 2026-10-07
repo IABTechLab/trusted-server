@@ -2636,7 +2636,7 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "openrtb",
+                        "auction-protocol.openrtb",
                         "https://example.test/openrtb",
                         *routing,
                         &serde_json::json!({}),
@@ -2664,7 +2664,7 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "prebid_server",
+                        "auction.prebid-server",
                         &format!("https://{id}.example.test/openrtb"),
                         RoutingMode::Explicit,
                         settings,
@@ -2695,7 +2695,7 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "aps",
+                        "auction.aps",
                         "https://aps.example/e/pb/bid",
                         RoutingMode::AllEligible,
                         settings,
@@ -5096,9 +5096,9 @@ mod tests {
             let mut adserver_only = plan_config(Vec::new());
             adserver_only.timeout_ms = 49;
             adserver_only.adserver = crate::provider_table::ProviderChoice::new(
-                Some("adserver_mock".to_string()),
+                Some("mock".to_string()),
                 BTreeMap::from([(
-                    "adserver_mock".to_string(),
+                    "mock".to_string(),
                     serde_json::Map::from_iter([(
                         "endpoint".to_string(),
                         serde_json::json!("https://adserver.example/mediate"),
@@ -7307,9 +7307,9 @@ mod tests {
             );
             let mut config = planned_config(&[("provider", RoutingMode::AllEligible)], false);
             config.adserver = crate::provider_table::ProviderChoice::new(
-                Some("adserver_mock".to_string()),
+                Some("mock".to_string()),
                 BTreeMap::from([(
-                    "adserver_mock".to_string(),
+                    "mock".to_string(),
                     serde_json::Map::from_iter([(
                         "endpoint".to_string(),
                         serde_json::json!("https://adserver.example/mediate"),

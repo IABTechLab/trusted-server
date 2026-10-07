@@ -2377,7 +2377,7 @@ mod tests {
         });
         let mut config = plan_config(vec![(
             "pbs_primary",
-            demand_table("prebid_server", "https://pbs.example.test/openrtb"),
+            demand_table("auction.prebid-server", "https://pbs.example.test/openrtb"),
         )]);
         config.timeout_ms = 900;
         let plan = AuctionPlan::compile(config).expect("should compile plan");

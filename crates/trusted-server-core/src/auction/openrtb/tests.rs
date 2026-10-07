@@ -40,7 +40,7 @@ fn config_with_endpoint(
     endpoint: &str,
 ) -> AuctionPlanConfig {
     let provider_id = ProviderId::from_str("fictional_provider").expect("should parse provider ID");
-    let prebid_server = implementation == "prebid_server";
+    let prebid_server = implementation == "auction.prebid-server";
     let mut table = demand_table(implementation, endpoint);
     table.insert("timeout_ms".to_string(), json!(321));
     if !prebid_server {
@@ -204,10 +204,14 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
         ),
     ];
     for (name, consent) in cases {
-        for implementation in ["openrtb", "prebid_server", "aps"] {
+        for implementation in [
+            "auction-protocol.openrtb",
+            "auction.prebid-server",
+            "auction.aps",
+        ] {
             let mut canonical = canonical_parity_auction_request();
             canonical.user.consent = Some(consent.clone());
-            let config = if implementation == "aps" {
+            let config = if implementation == "auction.aps" {
                 json!({"account_id": "example-account-id"})
             } else {
                 json!({})
@@ -216,7 +220,7 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
                 serde_json::to_value(build_with_request(implementation, config, canonical, None))
                     .expect("should serialize request");
             let regs = value.get("regs");
-            if implementation == "aps" {
+            if implementation == "auction.aps" {
                 let regs = regs.expect("APS should preserve empty admitted context");
                 assert_eq!(
                     regs["gdpr"],
@@ -272,7 +276,7 @@ fn pbs_body_consent_respects_source_and_forwarding_mode() {
             .expect("should have consent context")
             .source = source;
         let value = serde_json::to_value(build_with_request(
-            "prebid_server",
+            "auction.prebid-server",
             json!({"consent_forwarding": mode}),
             canonical,
             None,
@@ -291,11 +295,11 @@ fn pbs_body_consent_respects_source_and_forwarding_mode() {
 fn language_limits_are_profile_specific() {
     let language = "abcdefghijk";
     for (implementation, expected) in [
-        ("prebid_server", Some(language)),
-        ("aps", None),
-        ("openrtb", None),
+        ("auction.prebid-server", Some(language)),
+        ("auction.aps", None),
+        ("auction-protocol.openrtb", None),
     ] {
-        let config = if implementation == "aps" {
+        let config = if implementation == "auction.aps" {
             json!({"account_id": "example-account-id"})
         } else {
             json!({})
@@ -311,8 +315,12 @@ fn language_limits_are_profile_specific() {
             expected
         );
     }
-    for implementation in ["prebid_server", "aps", "openrtb"] {
-        let config = if implementation == "aps" {
+    for implementation in [
+        "auction.prebid-server",
+        "auction.aps",
+        "auction-protocol.openrtb",
+    ] {
+        let config = if implementation == "auction.aps" {
             json!({"account_id": "example-account-id"})
         } else {
             json!({})
@@ -362,7 +370,7 @@ fn pbs_debug_query_fragment_preserves_exact_legacy_configured_semantics() {
         let mut request = canonical_parity_auction_request();
         request.publisher.page_url = Some(page.to_string());
         let built = build_with_request(
-            "prebid_server",
+            "auction.prebid-server",
             json!({"debug_query_params": fragment}),
             request,
             None,
@@ -378,7 +386,7 @@ fn pbs_debug_query_fragment_preserves_exact_legacy_configured_semantics() {
 #[test]
 fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
     let raw = config(
-        "prebid_server",
+        "auction.prebid-server",
         json!({
             "debug": true,
             "test_mode": true,
@@ -471,7 +479,7 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
 
 #[test]
 fn pbs_pairs_each_impression_with_its_routed_slot_params() {
-    let raw = config("prebid_server", json!({}));
+    let raw = config("auction.prebid-server", json!({}));
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
     let mut request = canonical_parity_auction_request();
     request.slots[0].id = "first-slot".to_string();
@@ -528,7 +536,7 @@ fn pbs_stored_intent_is_applied_after_overrides_with_inline_first() {
                 } else {
                     json!({})
                 };
-                let plan = AuctionPlan::compile(config("prebid_server", profile))
+                let plan = AuctionPlan::compile(config("auction.prebid-server", profile))
                     .expect("should compile plan");
                 let mut request = canonical_parity_auction_request();
                 let mut envelope = json!({"bidderParams":{"exampleBidder":if inline { json!({"original":1}) } else { json!({}) }}});
@@ -575,8 +583,8 @@ fn pbs_stored_intent_is_applied_after_overrides_with_inline_first() {
 
 #[test]
 fn pbs_filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
-    let plan =
-        AuctionPlan::compile(config("prebid_server", json!({}))).expect("should compile plan");
+    let plan = AuctionPlan::compile(config("auction.prebid-server", json!({})))
+        .expect("should compile plan");
     let mut request = canonical_parity_auction_request();
     let template = request.slots[0].clone();
     request.slots = [
@@ -652,7 +660,7 @@ fn pbs_filtering_keeps_slot_pairs_and_drops_demandless_trusted_routes() {
 
 #[test]
 fn pbs_disabled_empty_candidate_does_not_become_stored_demand() {
-    let mut raw = config("prebid_server", json!({"routing": "explicit"}));
+    let mut raw = config("auction.prebid-server", json!({"routing": "explicit"}));
     raw.bidders.insert(
         crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
         BidderRouteConfig {
@@ -690,7 +698,7 @@ fn pbs_disabled_empty_candidate_does_not_become_stored_demand() {
 
 #[test]
 fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
-    let raw = config("prebid_server", json!({}));
+    let raw = config("auction.prebid-server", json!({}));
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
     let mut request = canonical_parity_auction_request();
     request.slots[0].bidders = HashMap::from([(
@@ -724,7 +732,10 @@ fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
 
 #[test]
 fn pbs_driver_exact_golden_preserves_profile_policy() {
-    let raw = config("prebid_server", json!({"consent_forwarding": "both"}));
+    let raw = config(
+        "auction.prebid-server",
+        json!({"consent_forwarding": "both"}),
+    );
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
     let mut common = canonical_parity_auction_request();
     common.slots[0].bidders = HashMap::from([(
@@ -768,7 +779,7 @@ fn aps_inventory_identity_and_page_fallback_preserve_legacy_policy() {
     request.publisher.page_url =
         Some("https://deployment.example/news/story?edition=fictional#section".to_string());
     let built = build_with_request(
-        "aps",
+        "auction.aps",
         json!({
             "account_id": "example-account-id",
             "inventory_domain": "publisher.example",
@@ -797,7 +808,7 @@ fn aps_inventory_identity_and_page_fallback_preserve_legacy_policy() {
         let mut request = canonical_parity_auction_request();
         request.publisher.page_url = Some(unsafe_page.to_string());
         let built = build_with_request(
-            "aps",
+            "auction.aps",
             json!({"account_id":"example-account-id"}),
             request,
             None,
@@ -812,7 +823,11 @@ fn aps_inventory_identity_and_page_fallback_preserve_legacy_policy() {
 
 #[test]
 fn aps_driver_exact_golden_preserves_profile_policy() {
-    let request = build("aps", json!({"account_id": "example-account-id"}), None);
+    let request = build(
+        "auction.aps",
+        json!({"account_id": "example-account-id"}),
+        None,
+    );
     assert_eq!(
         serde_json::to_string(&request).expect("should serialize APS driver request"),
         r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
@@ -824,14 +839,17 @@ fn aps_driver_exact_golden_preserves_profile_policy() {
 fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
     let signer = deterministic_signer();
     for (implementation, config) in [
-        ("openrtb", json!({"request_ext": {"fictional": true}})),
-        ("prebid_server", json!({})),
-        ("aps", json!({"account_id": "example-account-id"})),
+        (
+            "auction-protocol.openrtb",
+            json!({"request_ext": {"fictional": true}}),
+        ),
+        ("auction.prebid-server", json!({})),
+        ("auction.aps", json!({"account_id": "example-account-id"})),
     ] {
         let unsigned = serde_json::to_value(build(implementation, config.clone(), None))
             .expect("should serialize unsigned request");
         let unsigned_ts = unsigned["ext"].get("trusted_server");
-        if implementation == "prebid_server" {
+        if implementation == "auction.prebid-server" {
             assert_eq!(
                 unsigned_ts,
                 Some(&json!({"request_host": "publisher.example", "request_scheme": "https"})),
@@ -872,17 +890,17 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
     let signer = deterministic_signer();
     let cases = [
         (
-            "openrtb",
+            "auction-protocol.openrtb",
             json!({"request_ext": {"fictional": true}}),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true,"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
         (
-            "prebid_server",
+            "auction.prebid-server",
             json!({}),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
         (
-            "aps",
+            "auction.aps",
             json!({"account_id": "example-account-id"}),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
@@ -898,7 +916,7 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
 
     assert_eq!(
         serde_json::to_string(&build(
-            "openrtb",
+            "auction-protocol.openrtb",
             json!({"request_ext": {"fictional": true}}),
             None,
         ))
@@ -911,7 +929,7 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
 #[test]
 fn standard_static_extensions_have_no_invented_bidder_param_location() {
     let request = build(
-        "openrtb",
+        "auction-protocol.openrtb",
         json!({
             "request_ext": {"fictional_request": {"enabled": true}},
             "imp_ext": {"fictional_imp": "value"}
@@ -929,7 +947,7 @@ fn standard_static_extensions_have_no_invented_bidder_param_location() {
 
 #[test]
 fn defensive_no_impression_outcome_does_not_build_transportable_request() {
-    let (plan, mut routed) = routed("openrtb", json!({}));
+    let (plan, mut routed) = routed("auction-protocol.openrtb", json!({}));
     let mut common = routed.inputs()[0].common_request().clone();
     common.slots = vec![AdSlot {
         id: "video-only".to_string(),
@@ -957,7 +975,7 @@ fn standard_fixture_with_formats(
     formats: Vec<AdFormat>,
 ) -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
     let mut raw = config(
-        "openrtb",
+        "auction-protocol.openrtb",
         json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
     );
     raw.bidders.insert(
@@ -1445,7 +1463,7 @@ fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_
             ("https://pbs.example/bid", "https://pbs.example/bid"),
         ] {
             let plan = AuctionPlan::compile(config_with_endpoint(
-                "prebid_server",
+                "auction.prebid-server",
                 json!({}),
                 configured_endpoint,
             ))
@@ -1554,7 +1572,7 @@ impl CompiledDemand for ForgingDemand {
 
 #[test]
 fn the_driver_refuses_an_implementation_that_claims_the_trusted_server_extension() {
-    let (plan, routed) = routed("openrtb", json!({}));
+    let (plan, routed) = routed("auction-protocol.openrtb", json!({}));
     let mut provider = plan.providers()[0].clone();
     provider.demand = Arc::new(ForgingDemand);
 
@@ -1577,7 +1595,7 @@ fn the_driver_refuses_an_implementation_that_claims_the_trusted_server_extension
 
 #[test]
 fn an_implementation_sees_each_impression_beside_the_slot_it_came_from() {
-    let (plan, routed) = routed("prebid_server", json!({}));
+    let (plan, routed) = routed("auction.prebid-server", json!({}));
     let request = match build_request(
         &routed.inputs()[0],
         &routed,

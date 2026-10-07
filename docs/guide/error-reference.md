@@ -95,12 +95,12 @@ credentials or fragment:
 ```toml
 # ❌ Wrong
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "prebid.example.com/openrtb2/auction"
 
 # ✅ Correct
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 ```
 

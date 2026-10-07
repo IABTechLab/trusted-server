@@ -46,7 +46,7 @@ Check the response and logs for these invariants:
   another demand source's bidder parameters;
 - a failure local to one demand source does not fabricate bids;
 - with no ad server, the orchestrator selects the highest valid bid per slot;
-- with `[ad-server] module = "adserver_mock"`, the configured ad server owns
+- with `[ad-server] module = "mock"`, the configured ad server owns
   final selection; and
 - APS winners use `ext.trusted_server.renderer` rather than raw `adm`.
 

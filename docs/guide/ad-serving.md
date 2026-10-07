@@ -23,14 +23,14 @@ the endpoint returns a no-bid response without contacting a provider.
 Demand sources are declared under `[demand.<name>]`, each naming the
 implementation it runs. The shipped implementations are:
 
-- `openrtb` for a generic OpenRTB 2.6 endpoint;
-- `prebid_server` for Prebid Server request controls; and
-- `aps` for the APS OpenRTB contract and typed renderer response.
+- `auction-protocol.openrtb` for a generic OpenRTB 2.6 endpoint;
+- `auction.prebid-server` for Prebid Server request controls; and
+- `auction.aps` for the APS OpenRTB contract and typed renderer response.
 
 Browser-visible bidder codes are mapped separately under
-`[auction.bidders.<id>]`. `adserver_mock` is the only shipped ad server; it
-is optional, selected by `[ad-server] module` and configured under
-`[ad-server.adserver_mock]`.
+`[auction.bidders.<id>]`. `ad-server.mock` is the only shipped ad server; it
+is optional, selected by `[ad-server] module = "mock"` and configured under
+`[ad-server.mock]`.
 
 ```toml
 [auction]
@@ -40,7 +40,7 @@ enabled = true
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 

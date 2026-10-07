@@ -5430,13 +5430,13 @@ external_bundle_sri = "sha384-AAAA"
         browser_config.timeout_ms = 1750;
         browser_config.debug = false;
         let mut primary = crate::auction::test_support::demand_table(
-            "prebid_server",
+            "auction.prebid-server",
             "https://primary.example.test/openrtb",
         );
         primary.insert("timeout_ms".to_string(), json!(3000));
         primary.insert("debug".to_string(), json!(true));
         let mut secondary = crate::auction::test_support::demand_table(
-            "prebid_server",
+            "auction.prebid-server",
             "https://secondary.example.test/openrtb",
         );
         secondary.insert("timeout_ms".to_string(), json!(4000));
@@ -8870,7 +8870,7 @@ set = { networkId = 42 }
         let mut config = crate::auction::test_support::plan_config(vec![(
             "pbs_instance",
             crate::auction::test_support::demand_table(
-                "prebid_server",
+                "auction.prebid-server",
                 "https://pbs.example/openrtb2/auction",
             ),
         )]);

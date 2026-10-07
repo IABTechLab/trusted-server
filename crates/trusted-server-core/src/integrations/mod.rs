@@ -565,13 +565,12 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     gpt_diagnostics::BUILDER,
     // Implementations `[demand]` and `[ad-server]` can name. None of them is
     // a module a section selects.
-    IntegrationBuilder::implementations(openrtb::OPENRTB_ID, CORE_SOURCE)
-        .with_demand(&openrtb::DEMAND),
-    IntegrationBuilder::implementations(prebid_server::PREBID_SERVER_ID, CORE_SOURCE)
+    IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),
+    IntegrationBuilder::implementations(prebid_server::MODULE, CORE_SOURCE)
         .with_demand(&prebid_server::DEMAND),
     IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
         .with_demand(&aps::DEMAND),
-    IntegrationBuilder::implementations(adserver_mock::ADSERVER_MOCK_ID, CORE_SOURCE)
+    IntegrationBuilder::implementations(adserver_mock::MODULE, CORE_SOURCE)
         .with_adserver(&adserver_mock::ADSERVER),
 ];
 

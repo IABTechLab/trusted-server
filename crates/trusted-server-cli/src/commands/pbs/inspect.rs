@@ -5,7 +5,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use trusted_server_core::auction_config_types::{BidderId, ProviderId};
-use trusted_server_core::integrations::prebid_server::PREBID_SERVER_ID;
+use trusted_server_core::integrations::prebid_server::MODULE as PREBID_SERVER_MODULE;
 
 use super::{Output, PbsError, Result, identifier, read_text};
 
@@ -54,9 +54,10 @@ struct DemandSource {
 }
 
 impl DemandSource {
-    /// A table runs the implementation it names, or the one its name is.
-    fn runs_prebid_server(&self, name: &ProviderId) -> bool {
-        self.implementation.as_deref().unwrap_or(name.as_str()) == PREBID_SERVER_ID
+    /// A demand table runs the implementation its `implementation` line
+    /// names by module path.
+    fn runs_prebid_server(&self) -> bool {
+        self.implementation.as_deref() == Some(PREBID_SERVER_MODULE)
     }
 }
 
@@ -210,7 +211,7 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
         .demand
         .sources
         .iter()
-        .filter(|(name, demand_source)| demand_source.runs_prebid_server(name))
+        .filter(|(_, demand_source)| demand_source.runs_prebid_server())
         .map(|(name, demand_source)| {
             let requirements: Vec<_> = auction
                 .bidders
@@ -334,7 +335,7 @@ enabled = true
 modules = ["pbs_main"]
 
 [demand.pbs_main]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://user:NEVER_PRINT_ME@pbs.example.com/path?token=NEVER_PRINT_ME"
 timeout_ms = 900
 routing = "explicit"
@@ -343,12 +344,12 @@ test_mode = true
 bid_param_override_rules = [{ when = { bidder = "serverbidder" }, set = { placementId = "NEVER_PRINT_ME" } }]
 
 [demand.pbs_secondary]
-implementation = "prebid_server"
+implementation = "auction.prebid-server"
 endpoint = "https://NEVER_PRINT_ME@secondary.example.com/openrtb2/auction"
 routing = "explicit"
 
 [demand.house]
-implementation = "openrtb"
+implementation = "auction-protocol.openrtb"
 endpoint = "https://house.example.com/openrtb2/auction"
 
 [auction.bidders.serverbidder]

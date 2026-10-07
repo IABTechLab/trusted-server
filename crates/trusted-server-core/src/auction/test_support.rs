@@ -130,7 +130,7 @@ pub(crate) fn demand_table(
         ("implementation".to_string(), json!(implementation)),
         ("endpoint".to_string(), json!(endpoint)),
     ]);
-    if implementation == "aps" {
+    if implementation == "auction.aps" {
         table.insert("account_id".to_string(), json!("example-account"));
     }
     table
@@ -180,7 +180,7 @@ pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderLis
             .iter()
             .map(|name| {
                 let mut table = demand_table(
-                    "openrtb",
+                    "auction-protocol.openrtb",
                     &format!("https://{name}.example/openrtb2/auction"),
                 );
                 table.insert("routing".to_string(), json!("all_eligible"));
