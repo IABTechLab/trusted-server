@@ -25,6 +25,7 @@
 //! still take precedence.
 
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
+use url::Url;
 
 /// Headers whose value is a Content Security Policy.
 const CSP_HEADERS: &[HeaderName] = &[
@@ -107,12 +108,20 @@ impl OriginHeaderRewrite<'_> {
         if scheme.eq_ignore_ascii_case(self.origin_scheme) {
             return false;
         }
-        let Some(suffix) = self.strip_origin_authority(rest) else {
+        if self.strip_origin_authority(rest).is_none() {
+            return false;
+        }
+        // Normalize the target the way the browser will before following it:
+        // an empty path becomes `/`, dot segments are resolved, and the
+        // fragment is dropped.
+        let Ok(target) = Url::parse(url) else {
             return false;
         };
-        let target = suffix.split_once('#').map_or(suffix, |(target, _)| target);
-        let target = if target.is_empty() { "/" } else { target };
-        target == self.request_path_and_query
+        let (request_path, request_query) = match self.request_path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (self.request_path_and_query, None),
+        };
+        target.path() == request_path && target.query() == request_query
     }
 
     /// Strip the origin authority from the start of `rest`, returning the
@@ -618,6 +627,50 @@ mod tests {
             ),
             "https://www.example.com/current?page=1",
             "should rewrite non-navigation self references"
+        );
+    }
+
+    #[test]
+    fn navigation_headers_normalize_scheme_change_targets_before_comparing() {
+        let rewrite = OriginHeaderRewrite {
+            request_path_and_query: "/?x=1",
+            ..REWRITE
+        };
+        assert_eq!(
+            rewrite.rewrite_navigation_url("https://origin.example.com?x=1"),
+            None,
+            "should treat an empty path before a query as `/`"
+        );
+        assert_eq!(
+            rewrite_refresh("0; url=https://origin.example.com?x=1", &rewrite),
+            None,
+            "should keep a scheme-change refresh with an empty path"
+        );
+        for value in [
+            "https://origin.example.com/a/../current?page=1",
+            "https://origin.example.com/./current?page=1#top",
+        ] {
+            assert_eq!(
+                single(&header::LOCATION, value),
+                value,
+                "should resolve dot segments in `{value}` before comparing"
+            );
+        }
+        assert_eq!(
+            single(
+                &header::REFRESH,
+                "0; url=https://origin.example.com/a/../current?page=1"
+            ),
+            "0; url=https://origin.example.com/a/../current?page=1",
+            "should resolve dot segments in a refresh target before comparing"
+        );
+        assert_eq!(
+            single(
+                &header::LOCATION,
+                "https://origin.example.com/a/../other?page=1"
+            ),
+            "https://www.example.com/a/../other?page=1",
+            "should still rewrite a normalized target that differs"
         );
     }
 
