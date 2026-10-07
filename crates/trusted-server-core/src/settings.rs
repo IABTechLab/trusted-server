@@ -8337,21 +8337,41 @@ source_domain = "partner.example.com"
         );
     }
 
+    /// The settings of an example module that takes none.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct NoSettings {}
+
+    impl IntegrationConfig for NoSettings {}
+
+    /// The settings of an example module that requires one.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct OneRequiredSetting {
+        #[expect(dead_code, reason = "read only by deserialization")]
+        endpoint: String,
+    }
+
+    impl IntegrationConfig for OneRequiredSetting {}
+
+    /// The example modules' names, in a section of their own type.
+    const EXAMPLE_SECTION: &str = "example";
+    const PLAIN_MODULE: &str = "example.plain";
+    const ENDPOINT_MODULE: &str = "example.endpoint";
+
     /// A module no section selects has no configuration, whatever else the
     /// settings hold.
     #[test]
     fn a_module_that_is_not_selected_has_no_configuration() {
-        use crate::integrations::testlight::{self, TestlightConfig};
-
         let settings = create_test_settings();
 
         assert!(
-            !settings.selects_module(testlight::MODULE),
-            "the shared fixture should not select testlight"
+            !settings.selects_module(ENDPOINT_MODULE),
+            "the shared fixture should not select the example module"
         );
         assert!(
             settings
-                .module_config::<TestlightConfig>(testlight::MODULE)
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
                 .expect("reading an unselected module should succeed")
                 .is_none(),
             "a module that is not selected should have no configuration"
@@ -8362,14 +8382,12 @@ source_domain = "partner.example.com"
     /// so one that takes no settings runs on its selection alone.
     #[test]
     fn a_selected_module_with_no_table_is_read_from_an_empty_one() {
-        use crate::integrations::osano::{self, OsanoConfig};
-
         let mut settings = create_test_settings();
-        settings.select_module("cmp", osano::MODULE);
+        settings.select_module(EXAMPLE_SECTION, PLAIN_MODULE);
 
         assert!(
             settings
-                .module_config::<OsanoConfig>(osano::MODULE)
+                .module_config::<NoSettings>(PLAIN_MODULE)
                 .expect("a module that takes no settings should read from an empty table")
                 .is_some(),
             "selecting the module should be the whole configuration"
@@ -8380,19 +8398,17 @@ source_domain = "partner.example.com"
     /// setting it is missing, rather than starting without it.
     #[test]
     fn a_selected_module_without_a_required_setting_names_it() {
-        use crate::integrations::testlight::{self, TestlightConfig};
-
         let mut settings = create_test_settings();
-        settings.select_module("auction", testlight::MODULE);
+        settings.select_module(EXAMPLE_SECTION, ENDPOINT_MODULE);
 
         let error = settings
-            .module_config::<TestlightConfig>(testlight::MODULE)
+            .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
             .expect_err("should reject a selected module with no endpoint");
 
         let rendered = error.to_string();
         assert!(
-            rendered.contains("testlight") && rendered.contains("endpoint"),
-            "should name the module and the missing setting: {rendered}"
+            rendered.contains("[example.endpoint]") && rendered.contains("endpoint"),
+            "should name the module's table and the missing setting: {rendered}"
         );
     }
 

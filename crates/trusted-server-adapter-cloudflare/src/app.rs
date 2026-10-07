@@ -16,7 +16,9 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(any(test, target_arch = "wasm32"))]
 use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
-use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
+use trusted_server_core::config_payload::{
+    DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with,
+};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
@@ -180,7 +182,14 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         })?;
     let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
     let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
-    settings_from_config_blob(envelope, &secret_store, &default_secret_store)
+    // The settings are validated as they load, against the same builders the
+    // state is built with.
+    settings_from_config_blob_with(
+        envelope,
+        &secret_store,
+        &default_secret_store,
+        &trusted_server_modules::builders(),
+    )
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -224,8 +233,9 @@ fn build_state_with_settings(
     build_state_with_registrations(settings, &[])
 }
 
-/// Build the application state from explicit settings, composing the built-in
-/// integrations with the externally supplied builders in `integrations`.
+/// Build the application state from explicit settings, composing the modules
+/// a stock build ships with the externally supplied builders in
+/// `integrations`.
 ///
 /// A deployment that ships a vendor crate calls this to add that crate's
 /// integration builder without the adapter naming the vendor. Auction
@@ -260,6 +270,11 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // The modules a stock build ships come first and the deployment's own
+    // follow, which is the order their hooks run in.
+    let integrations = trusted_server_modules::builders_with(integrations);
+    let integrations = integrations.as_slice();
+
     // The plan is compiled with the integrations this adapter was given, so an
     // `[ad-server]` or `[demand]` name one of their builders supplies resolves
     // here. Compiling without them would drop the implementation and report the

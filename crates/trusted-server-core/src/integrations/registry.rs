@@ -3332,7 +3332,6 @@ mod tests {
     fn js_module_ids_include_named_cmp_mirrors() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings.select_module("cmp", "cmp.sourcepoint");
-        settings.select_module("cmp", "cmp.osano");
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -3347,16 +3346,6 @@ mod tests {
         assert!(
             immediate.contains(&"sourcepoint"),
             "should include Sourcepoint when it is named"
-        );
-        assert!(
-            immediate.contains(&"osano"),
-            "should include Osano when it is named"
-        );
-
-        let metadata = registry.registered_integrations();
-        assert!(
-            metadata.iter().any(|integration| integration.id == "osano"),
-            "should include JS-only Osano registration in metadata"
         );
     }
 

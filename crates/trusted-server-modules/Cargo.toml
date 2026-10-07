@@ -1,0 +1,22 @@
+[package]
+name = "trusted-server-modules"
+description = "The modules a stock build of Trusted Server ships from crates of their own, in the order their hooks run."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-cmp-osano = { workspace = true }
+trusted-server-core = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }

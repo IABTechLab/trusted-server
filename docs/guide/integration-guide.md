@@ -350,8 +350,8 @@ deploy check with the same builders.
 The Fastly adapter is a library with a thin binary over it, so a Fastly
 deployment that ships a vendor crate has a binary of its own. `run_with`
 records the builders before any request is served, and they are handed to
-the settings load and composed with the built-in ones when the application
-state is built.
+the settings load and composed with the modules a stock build ships when the
+application state is built.
 
 ```rust
 fn main() {
@@ -362,6 +362,17 @@ fn main() {
 The round-trip tests in
 `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive the
 probe through the Fastly adapter under Viceroy.
+
+### The modules a stock build ships
+
+`crates/trusted-server-modules` lists the modules a stock build ships from
+crates of their own, in the order their hooks run. Every adapter builds its
+state with that list followed by the builders a deployment added, and loads
+its settings against the same list. The `ts` tool registers it for deploy
+validation. A module joins a stock build by adding its crate and its builder
+to that list, in the place its hooks should run. Offering a module does not
+run it, because the registry builds a module only when a section of the
+settings selects it.
 
 ### Two traps a vendor will hit
 
@@ -375,15 +386,16 @@ and the hash moves with them. The probe crate ships a `.gitattributes` marking
 its script `text eol=lf` and a unit test comparing the literal with the file's
 bytes, so the failure names the cause. Copy both into a vendor crate.
 
-**A vendor's own deploy rules do not run through the CLI.** `ts config
-validate` and `ts config push` call `validate_settings_for_deploy` with no
-extra builders, so only core's rules run there. A vendor's validate function
-runs when the deployment loads its settings with that vendor's builder, and
-when something calls `validate_settings_for_deploy_with` with it, which means
-the deployment's own code or its tests. An operator can therefore push a
-configuration the integration rejects when the server starts. Run the vendor's validation from the deployment's own build or
-test step, and do not read a clean `ts config validate` as the integration
-having agreed.
+**A module a deployment adds is not known to the stock CLI.** `ts config
+validate` and `ts config push` validate against the modules a stock build
+ships, so each of those modules' own rules runs there. A module from a crate
+the deployment added is not on that list. Its validate function runs when the
+deployment loads its settings with that module's builder, and when something
+calls `validate_settings_for_deploy_with` with it, which means the
+deployment's own code or its tests. An operator can therefore push a
+configuration that module rejects when the server starts. Run that module's
+validation from the deployment's own build or test step, and do not read a
+clean `ts config validate` as that module having agreed.
 
 ## Registration checklist
 

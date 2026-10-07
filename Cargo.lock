@@ -5398,6 +5398,7 @@ dependencies = [
  "tower 0.4.13",
  "trusted-server-core",
  "trusted-server-integration-seam-probe",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -5424,6 +5425,7 @@ dependencies = [
  "toml",
  "trusted-server-core",
  "trusted-server-js",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -5457,6 +5459,7 @@ dependencies = [
  "trusted-server-device-fastly",
  "trusted-server-geo-fastly",
  "trusted-server-integration-seam-probe",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -5487,6 +5490,7 @@ dependencies = [
  "tokio",
  "trusted-server-core",
  "trusted-server-js",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -5536,11 +5540,23 @@ dependencies = [
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "trusted-server-core",
+ "trusted-server-modules",
  "url",
  "uuid",
  "webpki-roots",
  "which",
  "x509-parser",
+]
+
+[[package]]
+name = "trusted-server-cmp-osano"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "validator",
 ]
 
 [[package]]
@@ -5670,6 +5686,15 @@ dependencies = [
  "hex",
  "sha2 0.10.9",
  "which",
+]
+
+[[package]]
+name = "trusted-server-modules"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "trusted-server-cmp-osano",
+ "trusted-server-core",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ members = [
     "crates/permission-signal/mtm",
     "crates/permission-signal/tcf",
     "crates/permission-signal/us-privacy",
+    "crates/cmp/osano",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -21,6 +22,7 @@ members = [
     "crates/trusted-server-core",
     "crates/trusted-server-integration-tests",
     "crates/trusted-server-js",
+    "crates/trusted-server-modules",
     "crates/trusted-server-openrtb",
     # Manual protobuf codegen tool — a member so it shares workspace settings,
     # but no default member or alias builds it. Run it explicitly with `-p`.
@@ -133,7 +135,9 @@ trusted-server-permission-signal-gpp = { path = "crates/permission-signal/gpp" }
 trusted-server-permission-signal-mtm = { path = "crates/permission-signal/mtm" }
 trusted-server-permission-signal-tcf = { path = "crates/permission-signal/tcf" }
 trusted-server-permission-signal-us-privacy = { path = "crates/permission-signal/us-privacy" }
+trusted-server-cmp-osano = { path = "crates/cmp/osano" }
 trusted-server-js = { path = "crates/trusted-server-js" }
+trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"
 urlencoding = "2.1"

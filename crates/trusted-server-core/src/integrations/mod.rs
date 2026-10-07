@@ -24,7 +24,6 @@ pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
 pub mod openrtb;
-pub mod osano;
 pub mod permutive;
 pub mod prebid;
 pub mod prebid_server;
@@ -574,7 +573,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     lockr::BUILDER,
     didomi::BUILDER,
     sourcepoint::BUILDER,
-    osano::BUILDER,
     google_tag_manager::BUILDER,
     datadome::BUILDER,
     gpt::BUILDER,

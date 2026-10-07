@@ -57,6 +57,7 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-modules = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 which = { workspace = true }

@@ -118,6 +118,9 @@ pub fn run_from_env() -> Result<RunOutcome, String> {
 }
 
 fn dispatch(args: Args) -> Result<RunOutcome, String> {
+    // The config commands validate through `EdgeZero`, which reaches the
+    // settings' own validation with no way to hand it a list of modules.
+    crate::app_config::register_stock_modules();
     match args.command {
         Command::ActiveVersion(args) => {
             edgezero_cli::run_active_version(&args).map(|()| RunOutcome::Success)

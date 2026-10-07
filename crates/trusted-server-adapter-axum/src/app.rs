@@ -38,7 +38,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
+    default_config_key, default_config_store_name, get_settings_from_config_store_with,
 };
 
 use trusted_server_core::platform::RuntimeServices;
@@ -99,12 +99,15 @@ fn shipped_signal_modules()
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
-    let settings = get_settings_from_config_store(
+    // The settings are validated as they load, against the same builders the
+    // state is built with.
+    let settings = get_settings_from_config_store_with(
         &AxumPlatformConfigStore,
         &AxumPlatformSecretStore,
         &store_name,
         &config_key,
         &trusted_server_core::settings_data::default_secret_store_name(),
+        &trusted_server_modules::builders(),
     )?;
     build_state_with_settings(settings)
 }
@@ -122,8 +125,9 @@ fn build_state_with_settings(
     build_state_with_registrations(settings, &[])
 }
 
-/// Build the application state from explicit settings, composing the built-in
-/// integrations with the externally supplied builders in `integrations`.
+/// Build the application state from explicit settings, composing the modules
+/// a stock build ships with the externally supplied builders in
+/// `integrations`.
 ///
 /// A deployment that ships a vendor crate calls this to add that crate's
 /// integration builder without the adapter naming the vendor. Auction
@@ -158,6 +162,11 @@ fn build_state_with_registrations_and_services(
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    // The modules a stock build ships come first and the deployment's own
+    // follow, which is the order their hooks run in.
+    let integrations = trusted_server_modules::builders_with(integrations);
+    let integrations = integrations.as_slice();
+
     // The plan is compiled with the integrations this adapter was given, so an
     // `[ad-server]` or `[demand]` name one of their builders supplies resolves
     // here. Compiling without them would drop the implementation and report the

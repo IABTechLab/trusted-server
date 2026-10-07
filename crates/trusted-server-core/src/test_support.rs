@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod tests {
     use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::redacted::Redacted;
@@ -142,6 +142,10 @@ pub mod tests {
     /// Panics if `name` has no block, or if its block configures another
     /// module.
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "a fixture names the block it could not find, which `expect` cannot"
+    )]
     pub fn hmac_passphrase<'a>(ec: &'a Ec, name: &str) -> &'a str {
         ec.module_blocks
             .get(name)

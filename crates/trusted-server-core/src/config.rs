@@ -83,11 +83,34 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
     }
 }
 
+/// The builders [`TrustedServerAppConfig`] validates against besides core's
+/// own, set once by the tool that validates.
+static DEPLOY_INTEGRATIONS: std::sync::OnceLock<Vec<IntegrationBuilder>> =
+    std::sync::OnceLock::new();
+
+/// Registers the integration builders [`TrustedServerAppConfig`] validates
+/// against besides core's own.
+///
+/// `EdgeZero` validates an app config through the [`Validate`] trait, which
+/// takes no arguments, so a tool that validates a deployment's settings
+/// registers that deployment's builders here before it validates anything.
+/// The first call wins and a later one changes nothing.
+pub fn register_deploy_integrations(builders: Vec<IntegrationBuilder>) {
+    let _ = DEPLOY_INTEGRATIONS.set(builders);
+}
+
+/// The builders a tool registered for deploy validation, or none.
+fn deploy_integrations() -> &'static [IntegrationBuilder] {
+    DEPLOY_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
+}
+
 impl Validate for TrustedServerAppConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = self.settings.validate().err().unwrap_or_default();
         remove_labeled_module_secret_errors(&mut errors, &self.settings.ec);
-        if let Err(report) = validate_settings_for_deploy(&self.settings) {
+        if let Err(report) =
+            validate_settings_for_deploy_with(&self.settings, deploy_integrations())
+        {
             errors.add(
                 DEPLOY_VALIDATION_FIELD,
                 report_to_validation_error(&report, "trusted_server_deploy_validation"),
@@ -1924,23 +1947,6 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains(EXTERNAL_REJECTION_MESSAGE),
             "should keep the external builder's message intact: {err:?}"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_invalid_osano_config() {
-        let mut settings = valid_settings();
-        settings
-            .insert_module_config("cmp", "cmp.osano", &serde_json::json!({"typo": true }))
-            .expect("should insert Osano config");
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject invalid Osano config during deploy validation");
-        let error_text = format!("{err:?}");
-
-        assert!(
-            error_text.contains("osano") || error_text.contains("typo"),
-            "error should mention Osano or the invalid field: {err:?}"
         );
     }
 
