@@ -567,6 +567,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 - `403 Forbidden`: The target has a valid host that does not match a non-empty `proxy.allowed_domains` list
 - `413 Payload Too Large`: The POST body exceeds 64 KiB
+- `502 Bad Gateway`: The target host matches `rewrite.exclude_domains` or is outside a non-empty `rewrite.include_domains`
 - Shared `5xx`: Malformed JSON or an invalid/unsupported target under the
   current proxy-error mapping
 

@@ -986,13 +986,14 @@ before pushing the config.
 
 ## URL Rewrite Configuration
 
-Control which domains are excluded from first-party rewriting.
+Control which hosts first-party rewriting covers.
 
 ### `[rewrite]`
 
-| Field             | Type          | Required         | Description               |
-| ----------------- | ------------- | ---------------- | ------------------------- |
-| `exclude_domains` | Array[String] | No (default: []) | Domains to skip rewriting |
+| Field             | Type          | Required         | Description                                                                                         |
+| ----------------- | ------------- | ---------------- | --------------------------------------------------------------------------------------------------- |
+| `exclude_domains` | Array[String] | No (default: []) | Hosts never rewritten, for assets and click-through links                                           |
+| `include_domains` | Array[String] | No (default: []) | When non-empty, the only hosts whose asset URLs are proxied. Does not apply to click-through links. |
 
 **Example**:
 
@@ -1003,12 +1004,14 @@ exclude_domains = [
     "first-party.publisher.com",  # Exact match
     "localhost",                  # Development
 ]
+include_domains = ["assets.example.com", "*.img.example.com"]
 ```
 
 **Environment Override**:
 
-EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
-`exclude_domains` in TOML, then validate and push the file again.
+EdgeZero v0.0.4 cannot replace these arrays or address their elements by index.
+Edit `exclude_domains` and `include_domains` in TOML, then validate and push the
+file again.
 
 ### Pattern Matching
 
@@ -1036,6 +1039,44 @@ Matches:
 - ✅ `api.example.com`
 - ❌ `www.api.example.com`
 - ❌ `api.example.com.evil.com`
+
+**Normalization and precedence**:
+
+- Both lists are trimmed and lowercased at load, so matching is case-insensitive.
+- `exclude_domains` wins when a host matches both lists.
+- Each `include_domains` entry must be able to equal a URL host. After
+  lowercasing, an entry must be one of:
+  - a host name of ASCII letters, digits, `-` and `.`, optionally prefixed with
+    `*.`, with no leading or trailing `.` and no empty label;
+  - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
+  - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+- Settings load and `ts config validate` reject any other `include_domains`
+  entry: an empty entry, a bare `*`, a `*` other than a leading `*.`, a scheme
+  (`https://`), a port, a path, spaces, or an unbracketed IPv6 address.
+  Non-ASCII (internationalized) names are rejected too; write them in punycode,
+  such as `xn--bcher-kva.example`.
+- Empty and bare `*` entries in `exclude_domains` are dropped with a warning,
+  because they never match a host.
+
+::: tip
+When both `include_domains` and `proxy.allowed_domains` are set, keep every
+`include_domains` host inside `proxy.allowed_domains`. Otherwise a listed asset
+is rewritten to a proxy URL that then fails with `403`.
+:::
+
+::: warning Upgrade sequencing and rollback for `include_domains`
+An empty `include_domains` is omitted from stored JSON. A non-empty list is
+serialized, and older binaries reject a blob that carries it because `[rewrite]`
+uses `deny_unknown_fields`.
+
+**Upgrading:** deploy the binary **first**, then add `include_domains` to
+`trusted-server.toml`, run `ts config validate`, and push.
+
+**Rolling back:** remove `include_domains` from the TOML, run
+`ts config validate`, push the resulting blob, and only then roll back the
+binary. Rolling back the binary also restores case-sensitive `exclude_domains`
+matching.
+:::
 
 ### Use Cases
 

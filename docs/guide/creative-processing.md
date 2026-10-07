@@ -689,14 +689,16 @@ exclude_domains = [
 
 ### Pattern Matching
 
-**Wildcard Patterns**: `*` matches any subdomain
+Matching is case-insensitive. Entries are trimmed and lowercased at load.
+
+**Wildcard Patterns**: `*.` matches the base domain and any subdomain
 
 ```
 Pattern: *.cdn.example.com
 Matches:
   ✅ assets.cdn.example.com
   ✅ images.cdn.example.com
-  ❌ cdn.example.com (no subdomain)
+  ✅ cdn.example.com (base domain)
   ❌ cdn.example.com.evil.com (different domain)
 ```
 
@@ -735,6 +737,33 @@ exclude_domains = ["assets.publisher.com"]
 ```
 
 Skip resources already on your domain.
+
+## Include Domains
+
+Limit asset rewriting to hosts you list:
+
+```toml
+[rewrite]
+include_domains = ["assets.example.com", "*.img.example.com"]
+```
+
+- When `include_domains` is empty (the default), every eligible asset URL is
+  proxied.
+- When it is non-empty, only asset URLs whose host matches an entry are
+  rewritten to `/first-party/proxy`. Other assets keep their original URL, load
+  directly, and do not receive the EC ID that proxied fetches append.
+- `exclude_domains` wins when a host matches both lists.
+- Click-through links (`<a href>`, `<area href>`) are not affected. Whether
+  they are wrapped in `/first-party/click` depends only on `rewrite_clicks` and
+  `exclude_domains`.
+- HTML and CSS fetched through `/first-party/proxy` go through the same rewrite
+  pass and follow the same list.
+- `/first-party/sign` declines off-list hosts with a non-`403` error, so the
+  creative runtime loads them directly.
+
+Patterns use the same syntax as `exclude_domains`. Entries that can never
+equal a URL host, such as ones with a scheme, port, path or non-ASCII name, fail
+validation; see [Pattern Matching](/guide/configuration#pattern-matching).
 
 ## Integration Hooks
 

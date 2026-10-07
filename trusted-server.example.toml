@@ -125,8 +125,13 @@ pull_sync_concurrency = 3
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]
-# Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
+# Hosts never rewritten: assets stay direct and click-through links are not
+# wrapped. Supports "*.example.com" wildcards (matches the apex too).
 # exclude_domains = ["*.cdn.example.com"]
+# When non-empty, only asset URLs on these hosts are proxied; other assets load
+# directly. Click-through links are not affected. Set this in TOML; environment
+# overrides cannot replace arrays.
+# include_domains = ["assets.example.com", "*.img.example.com"]
 
 # Trust a fronting CDN's reader IP only when the same request also supplies
 # the matching shared secret. The front door must set both headers on requests
