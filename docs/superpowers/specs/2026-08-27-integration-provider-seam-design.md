@@ -154,7 +154,7 @@ Make the builder contract public and give the registry a second input.
   today, only a per-route conflict check and a debug-only assertion, so the
   builder carries a source label and the registry gets the check. Prebid
   Server and APS are demand implementations rather than integrations,
-  selected by `[demand] provider` and never named in
+  selected by `[demand] modules` and never named in
   `[integration] module`, and their names are reserved by the same
   check so an integration cannot take one.
 
@@ -216,15 +216,15 @@ builder.
 
 Demand and the ad server are two provider types in their own right, and
 neither is an integration. A demand provider is a source bids are requested
-from, and several run, so `[demand] provider` takes a list. An ad server
-decides what is shown, and one runs, so `[adserver] provider` takes a string.
+from, and several run, so `[demand] modules` takes a list. An ad server
+decides what is shown, and one runs, so `[ad-server] module` takes a string.
 Each name is the implementation unless its own table carries
 `implementation = "<id>"`, which is how two Prebid Servers run side by side
 under different names:
 
 ```toml
 [demand]
-provider = ["pbs_main", "pbs_eu", "aps"]
+modules = ["pbs_main", "pbs_eu", "aps"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -238,20 +238,20 @@ endpoint = "https://pbs-eu.example.com/openrtb2/auction"
 endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
 rendering_mode = "aps_sdk"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
 [auction]
 enabled = true
 timeout_ms = 1000
 
 [auction.bidders.example_bidder]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 The demand implementations in this repository are `openrtb`, `prebid_server`
 and `aps`, and the one ad server implementation is `adserver_mock`. None of
-them is an integration, so none may be named in `[integration] provider`, and
+them is an integration, so none may be named in `[integration] module`, and
 a configuration that names one there refuses startup. APS in particular
 stopped being an integration, and its `rendering_mode` now sits in its
 `[demand.<name>]` table rather than in a vendor integration table. Every
@@ -260,7 +260,7 @@ demand and ad server endpoint must be HTTPS, or HTTP to a loopback host only
 
 `[auction]` is not a provider type. It keeps `enabled`, `timeout_ms`, the
 creative settings and `allowed_context_keys`, and
-`[auction.bidders.<code>] provider = "<demand name>"` maps a bidder code a
+`[auction.bidders.<code>] module = "<demand name>"` maps a bidder code a
 page asks for onto one of the declared demand providers.
 
 The bid renderer contract is still generalized in this change. Before it,

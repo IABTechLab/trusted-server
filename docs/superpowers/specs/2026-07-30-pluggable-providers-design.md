@@ -92,35 +92,38 @@ module = "<name>"          # a string where one runs, a list where several run
 setting = "value"
 ```
 
-The seven types, all singular and snake_case:
+The seven types, all singular:
 
-| Type                | What it decides                          | Selector   | It takes                   |
-| ------------------- | ---------------------------------------- | ---------- | -------------------------- |
-| `ec`                | Edge Cookie identity                     | `module`   | a string, one runs         |
-| `geo`               | location resolution                      | `module`   | a string, one runs         |
-| `device`            | device classification                    | `module`   | a string, one runs         |
-| `permission_signal` | which permission signal schemes run      | `module`   | a list, in the order given |
-| `demand`            | the sources bids are requested from      | `provider` | a list, all run            |
-| `adserver`          | the ad server that decides what is shown | `provider` | a string, one runs         |
-| `integration`       | the vendor modules a page loads          | `module`   | a list, all run            |
+| Type                | What it decides                          | Selector  | It takes                   |
+| ------------------- | ---------------------------------------- | --------- | -------------------------- |
+| `ec`                | Edge Cookie identity                     | `module`  | a string, one runs         |
+| `geo`               | location resolution                      | `module`  | a string, one runs         |
+| `device`            | device classification                    | `module`  | a string, one runs         |
+| `permission-signal` | which permission signal schemes run      | `modules` | a list, in the order given |
+| `demand`            | the sources bids are requested from      | `modules` | a list, all run            |
+| `ad-server`         | the ad server that decides what is shown | `module`  | a string, one runs         |
+| `integration`       | the vendor modules a page loads          | `modules` | a list, all run            |
 
 The rules, which hold for all seven:
 
 - A `[<type>.<name>]` table exists only where that module has something to
   set. A module with no settings is selected by name alone.
-- The words `modules` and `providers` appear nowhere in configuration. The
-  type table, and the selector key inside it, carry the whole selection.
+- The word `providers` appears nowhere in configuration. The type table,
+  and the `module` or `modules` key inside it, carry the whole selection.
 - The name is the implementation, unless the table carries
   `implementation = "<id>"`. That key is optional everywhere, and it is how
   two Prebid Servers run side by side under different names, each with its
   own endpoint and its own settings.
-- All names are snake_case.
+- A module from a crate is named by its folder below `crates/`, with `.`
+  between the parts, and may be written without its own section's type
+  folder. A `demand` or `ad-server` name is snake_case, because it may be
+  a label of the operator's own.
 - A `[<type>.<name>]` table that its type's selector does not select
   refuses startup, because an unreferenced table is a mistyped selector or a
   stale block, and accepting one silently invites configuration drift.
 - An implementation this build does not have refuses startup, and the
   message lists the implementations it does have.
-- A `demand` or `adserver` endpoint must be HTTPS, or HTTP to a loopback
+- A `demand` or `ad-server` endpoint must be HTTPS, or HTTP to a loopback
   host only (`127.0.0.1`, `::1`, `localhost`).
 - Every module rejects settings it does not know, so a typo fails loudly
   rather than being quietly ignored.
@@ -129,7 +132,7 @@ The rules, which hold for all seven:
 
 `[auction]` is not a module type. It keeps `enabled`, `timeout_ms`, the
 creative settings, `allowed_context_keys`, and
-`[auction.bidders.<code>] provider = "<demand name>"`, which maps a bidder
+`[auction.bidders.<code>] module = "<demand name>"`, which maps a bidder
 code a page asks for onto one of the declared demand providers.
 
 ### 2.2 The three module types this spec defines

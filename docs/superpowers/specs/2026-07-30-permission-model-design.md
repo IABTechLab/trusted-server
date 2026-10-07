@@ -6,8 +6,9 @@ on 2026-09-01 for the `rules:` tree, which replaces the flat rule keys and
 retires `[geo] default_country` (§3.2, §5.4, and the §12 record). Revised again
 on 2026-09-14 for permission signal modules, which replace the fixed signal
 precedence with a configured order (§4, and the §13 record). Revised on
-2026-10-06 to say module for what an operator selects, so the selector reads
-`[permission_signal] module`.
+2026-10-06 to say module for what an operator selects, and on 2026-10-07 to
+name a module by its crate folder, so the selector reads
+`[permission-signal] modules`.
 **Author:** Engineering
 **Issue references:** #779
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
@@ -55,7 +56,7 @@ The set is resolved from three inputs:
    rule per permission, plus a declared signal policy (§3).
 3. **Signals**, answered by the permission signal modules a deployment
    configures, in the order it configures (§4). Four implementations ship,
-   one per scheme, being `gpc`, `gpp_sale_opt_out`, `us_privacy` and `tcf`,
+   one per scheme, being `gpc`, `gpp`, `us-privacy` and `tcf`,
    each a crate under `crates/permission-signal/`.
 
 Issues #777 and #779 also envision publisher interaction and external services
@@ -284,7 +285,7 @@ Format rules, as implemented:
   is not in the file. It lives in the TCF module crate
   (`crates/permission-signal/tcf/src/mapping.rs`), so a deployment that runs
   no TCF carries no table of another scheme's numbers. Nor is the order the
-  signals are asked in, which is `[permission_signal] module` in
+  signals are asked in, which is `[permission-signal] modules` in
   `trusted-server.toml` (§4). The `us_opt_out.revokes` value is `all` or an
   explicit list of Data Uses, so a deployer bounds what an opt-out drops.
 
@@ -336,7 +337,7 @@ Validation runs where the policy actually enters the system:
   acknowledgment must be present where required (§5.3). A file whose top node
   is missing either key is rejected exactly as a missing
   `[geo] default_country` was rejected before. Both are settings-construction
-  failures, never per-request failures. A name in `[permission_signal] module`
+  failures, never per-request failures. A name in `[permission-signal] modules`
   that the build does not carry, or a name given twice, fails when the
   adapter builds its state at startup, also never per request (§4).
 
@@ -387,7 +388,7 @@ else opt-in), and the US and Australia to
 Precedence is the **order a deployment configures**, not a rule in code. The
 policy file decides what the shipped schemes mean for the deployment (§3.2),
 each permission signal module decides what its own scheme says, and
-`[permission_signal] module` in `trusted-server.toml` decides the order the
+`[permission-signal] modules` in `trusted-server.toml` decides the order the
 modules are asked in. Each permission resolves in these steps.
 
 1. **Policy `denied`** is never set, regardless of any signal. (Enforced in
@@ -416,13 +417,13 @@ modules are asked in. Each permission resolves in these steps.
    sets the permission and `requires_signal` leaves it unset. A `Revoke` drops
    a `granted` baseline, and only a `Grant` sets a `requires_signal` one.
 
-The order is set by `[permission_signal] module`, which takes a list rather
+The order is set by `[permission-signal] modules`, which takes a list rather
 than a single name because several permission signal modules run, and the
 list is the order they run in:
 
 ```toml
-[permission_signal]
-module = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+[permission-signal]
+modules = ["gpc", "gpp", "us-privacy", "tcf"]
 ```
 
 - **Omitted**, every module the build carries runs, in the order the
@@ -439,7 +440,7 @@ them has a setting to carry. A scheme that did would take one, under the rule
 in the providers spec §2.1.
 
 Every adapter offers the four shipped modules in the same default order,
-being `gpc`, `gpp_sale_opt_out`, `us_privacy` and `tcf`. Global Privacy
+being `gpc`, `gpp`, `us-privacy` and `tcf`. Global Privacy
 Control is a browser setting with no interface of its own, so it is asked
 first, and the three schemes that carry an answer a person gave through an
 interface are asked after it. Under that default a TCF record consenting to a
@@ -458,7 +459,7 @@ one level deep, so two modules asking each other cannot loop.
 
 Removing `gpc` from the list stops the GPC module running, but the consent
 pipeline can still synthesize a US Privacy opt-out from the same header for a
-US privacy state (§4.4), which the `us_privacy` module then acts on. A
+US privacy state (§4.4), which the `us-privacy` module then acts on. A
 deployment that wants the header to have no effect also turns that synthesis
 off.
 
@@ -638,8 +639,8 @@ identifier shared while contextual advertising and measurement continue. That
 is broader than the draft's mapping, which scoped sale opt-outs to
 personalized-ad selection only, and a deployer changes it by editing the list
 or writing `revokes: all`. Each source is read by its own module (`gpc`,
-`gpp_sale_opt_out`, `us_privacy`), which runs only when
-`[permission_signal] module` names it or the key is omitted, and whether an
+`gpp`, `us-privacy`), which runs only when
+`[permission-signal] modules` names it or the key is omitted, and whether an
 opt-out stands over a TCF answer is the order (§4). No sale-family opt-out is
 destructive (§4.2).
 
@@ -949,12 +950,12 @@ their deferred features.
 This spec supersedes #779 on the following points, so there is one
 acceptance contract, not two:
 
-| #779 says                                                                                    | This spec says                                                                                                                                                                                                    | Why                                                                                                                                                                        |
-| -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unmatched countries fall to `default_country`                                                | Adopted, with a changed mechanism since 2026-09-01. Unmatched and unresolved requests both fall to the required top node of the `rules:` tree, and a **failed** lookup floors instead (§5, §12)                   | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept                                                |
-| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)                                                                                 | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert                                                         |
-| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                                                                                                    | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                                                                  |
-| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Adopted as a seam. A source is a permission signal module, a crate implementing `PermissionSignalModule`, registered by an integration builder and asked in the order `[permission_signal] module` gives (§1, §4) | The four shipped schemes already use it from outside core, so the interface has real consumers, and publisher interaction or an external service arrives as another module |
+| #779 says                                                                                    | This spec says                                                                                                                                                                                                     | Why                                                                                                                                                                        |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unmatched countries fall to `default_country`                                                | Adopted, with a changed mechanism since 2026-09-01. Unmatched and unresolved requests both fall to the required top node of the `rules:` tree, and a **failed** lookup floors instead (§5, §12)                    | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept                                                |
+| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)                                                                                  | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert                                                         |
+| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                                                                                                     | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                                                                  |
+| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Adopted as a seam. A source is a permission signal module, a crate implementing `PermissionSignalModule`, registered by an integration builder and asked in the order `[permission-signal] modules` gives (§1, §4) | The four shipped schemes already use it from outside core, so the interface has real consumers, and publisher interaction or an external service arrives as another module |
 
 ## 11. Revision record vs the 2026-07-31 draft
 
@@ -1019,8 +1020,8 @@ crates. One row per change.
 
 | Before                                                                                                                 | After                                                                                                                                                                                                                                                                                | Why                                                                                                                                                                                                                    |
 | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Precedence fixed in code, most restrictive first, so an opt-out always beat a consenting TCF record                    | The order in `[permission_signal] module`, where the last module with an opinion decides, validated and logged at startup (§4)                                                                                                                                                       | Which scheme wins is a question about a jurisdiction and a publisher, and a fixed rule answers it in code for every deployment                                                                                         |
-| A GPC header suppressed a Data Use that a TCF record consented to                                                      | The default order is `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`, so a TCF answer amends an earlier opt-out, and listing the opt-out after `tcf` restores the previous outcome                                                                                                    | Global Privacy Control is a browser setting with no interface of its own, and the other three carry an answer a person gave through an interface, so by default that answer amends the header the visitor arrived with |
+| Precedence fixed in code, most restrictive first, so an opt-out always beat a consenting TCF record                    | The order in `[permission-signal] modules`, where the last module with an opinion decides, validated and logged at startup (§4)                                                                                                                                                      | Which scheme wins is a question about a jurisdiction and a publisher, and a fixed rule answers it in code for every deployment                                                                                         |
+| A GPC header suppressed a Data Use that a TCF record consented to                                                      | The default order is `gpc`, `gpp`, `us-privacy`, `tcf`, so a TCF answer amends an earlier opt-out, and listing the opt-out after `tcf` restores the previous outcome                                                                                                                 | Global Privacy Control is a browser setting with no interface of its own, and the other three carry an answer a person gave through an interface, so by default that answer amends the header the visitor arrived with |
 | Signals resolved inside core through a per-permission `ConsentSignal` closure, with further sources deferred (§1, §10) | A `PermissionSignalModule` trait in core, with GPC, the GPP sale opt-out, US Privacy and TCF each a crate under `crates/permission-signal/` that core does not name, registered through an integration builder                                                                       | A scheme core has never heard of plugs in without a change to core, and none of the four is privileged by being built in                                                                                               |
 | The TCF purpose to Data Use map in the `signals` section of `permissions.yaml` (§3.2)                                  | The map in the TCF module crate, `crates/permission-signal/tcf/src/mapping.rs`                                                                                                                                                                                                       | A deployment that runs no TCF carries no table of another scheme's numbers                                                                                                                                             |
 | Malformed-present as step 3 of the fixed order                                                                         | Ahead of every module and not configurable (§4, step 2)                                                                                                                                                                                                                              | It is error handling rather than a signaling scheme, and a place in the order would let a readable record from one scheme overwrite the refusal an unreadable record from another caused                               |
