@@ -228,8 +228,8 @@ pub mod nextjs_auction {
             .expect("should select the fixture Next.js integration");
         settings.auction.enabled = true;
         // One `[demand.fixture]` source, which is where an auction provider is
-        // configured now that `[auction.providers]` is gone. `implementation`
-        // states the wire format, so there is no separate `protocol`.
+        // configured. `implementation` states the wire format, so there is no
+        // separate `protocol`.
         settings.demand = crate::provider_table::ProviderTable::new(
             vec!["fixture".to_owned()],
             std::collections::BTreeMap::from([(

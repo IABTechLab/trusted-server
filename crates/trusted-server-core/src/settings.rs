@@ -6832,8 +6832,8 @@ module = \"none\"",
             .validate_module_selection()
             .expect("should validate the fastly opt-in");
 
-        // As with geo, a key core does not know is no longer a settings error,
-        // because a module id is a legitimate value here too.
+        // As with geo, a key core does not know is not a settings error,
+        // because a module's name is a legitimate value here too.
         let module_key = DeviceConfig {
             module: Some("acme".to_owned()),
         };
@@ -6990,9 +6990,10 @@ passphrase = "another-test-secret-key-32-bytes"
         none.validate_module_selection()
             .expect("should validate the explicit opt-out of geolocation");
 
-        // A key core does not know is no longer a settings error, because a
-        // module id is a legitimate value and a closed list here would shut
-        // every module out of geo. Settings accepts it and the registry decides.
+        // A key core does not know is not a settings error, because a
+        // module's name is a legitimate value and a closed list here would
+        // shut every module out of geo. Settings accepts it and the registry
+        // decides.
         let module_key = GeoConfig {
             module: Some("acme".to_owned()),
             assume_single_jurisdiction: false,

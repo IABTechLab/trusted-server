@@ -1677,8 +1677,7 @@ password = "production-admin-password-32-bytes"
 
     /// A selected Prebid block that names bundle modules has to name where the
     /// bundle is served from as well, and deploy validation says so. Selection
-    /// is what makes Prebid run here, so it stands in for the `enabled` flag
-    /// this branch took off the config.
+    /// is what makes Prebid run, so the check applies to a selected block.
     #[test]
     fn deploy_validation_requires_external_bundle_url_for_selected_prebid() {
         let mut settings = valid_settings();

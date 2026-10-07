@@ -4149,7 +4149,7 @@ mod tests {
         // Unset is the permission model's privacy default: it resolves the
         // disabled module, so no client IP ever reaches a host geo service.
         // It is deliberately not the same as leaving the adapter's own lookup
-        // in place, which is what `platform` now spells.
+        // in place, which is what `platform` spells.
         let settings = crate::test_support::tests::create_test_settings();
         assert!(
             settings.geo.module.is_none(),
