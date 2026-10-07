@@ -22,6 +22,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
         trusted_server_audience_permutive::builder(),
         trusted_server_identity_lockr::builder(),
+        trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
     ]
 }
@@ -50,7 +51,12 @@ mod tests {
 
         assert_eq!(
             names,
-            ["audience.permutive", "identity.lockr", "cmp.osano",],
+            [
+                "audience.permutive",
+                "identity.lockr",
+                "cmp.sourcepoint",
+                "cmp.osano",
+            ],
             "should offer the stock modules in the order their hooks run"
         );
     }
@@ -114,7 +120,7 @@ mod tests {
     #[test]
     fn documented_module_tables_validate_when_uncommented_and_selected() {
         use trusted_server_audience_permutive as permutive;
-        use trusted_server_core::integrations::sourcepoint;
+        use trusted_server_cmp_sourcepoint as sourcepoint;
         use trusted_server_core::settings::Settings;
         use trusted_server_core::test_support::template::{
             template_with_resolved_required_secrets, uncomment_block,

@@ -1332,7 +1332,7 @@ impl IntegrationRegistry {
     ///
     /// Returns an error if the auction plan or the integration registry is
     /// invalid.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_registrations(
         settings: &Settings,
         extra: &[crate::integrations::IntegrationBuilder],
@@ -3325,27 +3325,6 @@ mod tests {
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
             "selecting the `client_fixed` module should inject its demo page script"
-        );
-    }
-
-    #[test]
-    fn js_module_ids_include_named_cmp_mirrors() {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings.select_module("cmp", "cmp.sourcepoint");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-        let immediate = registry.js_module_ids_immediate();
-
-        assert!(
-            immediate.contains(&"sourcepoint"),
-            "should include Sourcepoint when it is named"
         );
     }
 

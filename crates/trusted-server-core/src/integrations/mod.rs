@@ -26,7 +26,6 @@ pub mod openrtb;
 pub mod prebid;
 pub mod prebid_server;
 mod registry;
-pub mod sourcepoint;
 pub mod testlight;
 
 #[cfg(test)]
@@ -579,7 +578,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     testlight::BUILDER,
     nextjs::BUILDER,
     didomi::BUILDER,
-    sourcepoint::BUILDER,
     google_tag_manager::BUILDER,
     datadome::BUILDER,
     gpt::BUILDER,
