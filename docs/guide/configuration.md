@@ -210,7 +210,7 @@ fail and the service will return its startup-error response.
 | `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
 | `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
 | `[integrations.*]`         | Typed partner and browser integration settings                          |
-| `[permission_signal]`      | Permission signal schemes and the order they run in                     |
+| `[permission-signal]`      | Permission signal schemes and the order they run in                     |
 | `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
 | `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
 | `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
@@ -656,7 +656,7 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                       |
 | `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                               |
 
-Each module that has settings is configured in its own `[ec.<name>]` block, and the `module` selector names which block is active. A block may set `implementation = "<id>"` to say which module it configures, which makes the block name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. Module names and implementation ids are `snake_case`.
+Each module that has settings is configured in its own `[ec.<name>]` block, and the `module` selector names which block is active. A block may set `implementation = "<id>"` to say which module it configures, which makes the block name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. A module from a crate is named by its folder below `crates/`, so it may be written in full, as `edgecookie.<name>`, or with that type folder left off, and core's own modules such as `hmac` take bare names. A name is parts joined by `.`, each of lower case letters, digits, `_` or `-`.
 
 A module has a block only when it has settings of its own. Both modules that derive an identifier at the edge take a passphrase, so selecting `hmac` or `host_signals` without its block fails at startup, while the `client_fixed` demonstration module needs no block at all. A block the selector does not name also fails at startup, so a stale block cannot sit unnoticed.
 
@@ -714,7 +714,7 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 **Purpose**: Names the active Edge Cookie module by its key. Omit to run statelessly with no Edge Cookie.
 
-**Validation**: Application startup fails if the name is not `snake_case`, if it names a key the `[ec]` section reads as its own setting, if the selected implementation needs an `[ec.<name>]` block it has no block for, or if a block the selector does not name is configured.
+**Validation**: Application startup fails if the name is not a module name (parts joined by `.`, each of lower case letters, digits, `_` or `-`), if it names a key the `[ec]` section reads as its own setting, if the selected implementation needs an `[ec.<name>]` block it has no block for, or if a block the selector does not name is configured.
 
 #### `hmac.passphrase`
 
@@ -3038,7 +3038,7 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- `module`, when set, is `snake_case` and has the `[ec.<name>]` block its implementation needs, and no unselected block is left configured, or startup fails
+- `module`, when set, is a module name and has the `[ec.<name>]` block its implementation needs, and no unselected block is left configured, or startup fails
 - The `hmac.passphrase` key name is non-empty at push time
 - The resolved passphrase is at least 32 bytes at runtime
 - Known placeholder values are rejected after resolution
