@@ -669,15 +669,15 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 ### `[ec]`
 
-| Field                     | Type           | Required | Description                                                                                                                                                                                                                                                                                     |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `module`                  | String or null | No       | Name of the active Edge Cookie module: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or a module an integration supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration module needs the `client-fixed-demo` build feature |
-| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                                                                            |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                                                                 |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                                                                      |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                                                                             |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                 |
-| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                 |
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                                                                                       |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                  | String or null | No       | Name of the active Edge Cookie module: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or the name of a module a crate outside core supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration module needs the `client-fixed-demo` build feature |
+| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                                                                                              |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                                                                                   |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                                                                                        |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                                                                                               |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                                   |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                                   |
 
 Each module that has settings is configured in its own `[ec.<name>]` table, and the `module` selector names which table is active. A table may set `implementation = "<id>"` to say which module it configures, which makes the table name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. A module from a crate is named by its folder below `crates/`, so it may be written in full, as `edgecookie.<name>`, or with that type folder left off, and core's own modules such as `hmac` take bare names. A name is parts joined by `.`, each of lower case letters, digits, `_` or `-`.
 
@@ -687,13 +687,12 @@ A module has a table only when it has settings of its own. Both modules that der
 rather than of one module, so they sit directly in `[ec]` whichever module
 is selected.
 
-A module an integration supplies also needs that integration selected in the
-section of its type.
-
-### `[ec.hmac]`
-
-A module an integration supplies also needs that integration selected in the
-section of its type.
+A crate outside core declares each module it supplies under a name, and
+`module` selects it by that name. The crate's own module has to be selected
+in the section of its type as well, because only a selected module runs. A
+name written in full has more than one part, so a module selected that way
+takes its settings under a label, as `[ec.primary]` with
+`implementation = "<name>"`.
 
 ### `[ec.hmac]`
 
@@ -779,11 +778,11 @@ Selects how a request is classified into the coarse device signals the Edge Cook
 
 ### `[device]`
 
-| Field    | Type           | Required | Description                                                                                                                                                                                                          |
-| -------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `module` | String or null | No       | Name of the device-detection module: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or a module an integration supplies |
+| Field    | Type           | Required | Description                                                                                                                                                                                                                            |
+| -------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module` | String or null | No       | Name of the device-detection module: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or the name of a module a crate outside core supplies |
 
-The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, so neither needs a `[device.<name>]` table. Selecting a module this build does not have fails at startup.
+The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, and `[device]` holds no module settings table. A module from a crate at `crates/device/<name>` is written `<name>` or `device.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the device modules it does run.
 
 **Example**:
 
@@ -806,13 +805,13 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 
 | Field                        | Type           | Required        | Description                                                                                                                                                                                                |
 | ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `module`                     | String or null | No              | Name of the geo module: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or a module an integration supplies                             |
+| `module`                     | String or null | No              | Name of the geo module: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or the name of a module a crate outside core supplies           |
 | `assume_single_jurisdiction` | Boolean        | See description | With no geo module, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie module without a geo module acknowledges that by setting this to `true`. |
 
 `assume_single_jurisdiction` is a setting of the job rather than of one
 module, so it sits directly in `[geo]`.
 
-No module is the default, so a default deployment is not tied to any host geo service. Selecting a module this build does not have fails at startup. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+No module is the default, so a default deployment is not tied to any host geo service. A module from a crate at `crates/geo/<name>` is written `<name>` or `geo.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the geo modules it does run. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
 **Example**:
 

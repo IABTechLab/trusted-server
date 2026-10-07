@@ -179,7 +179,7 @@ fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     let settings = settings_with(&format!(
         r#"
         [geo]
-        module = "seam_probe"
+        module = "testing.seam-probe"
         {HMAC_BLOCK}
         {PROBE_BLOCK}
         "#
@@ -199,7 +199,8 @@ fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
         serde_json::from_str(&body).expect("the route should return JSON");
 
     assert_eq!(
-        report["module"], "seam_probe",
+        report["module"],
+        seam_probe::module_name(),
         "the route should identify the module: {body}"
     );
     assert_eq!(
@@ -255,14 +256,14 @@ fn a_named_route_and_the_fallback_each_prepare_the_request_exactly_once() {
     );
 }
 
-/// `[geo] module` naming a selected module that declares no geo module is a
+/// `[geo] module` naming a selected module that supplies no geo module is a
 /// startup error, raised where this adapter builds its state.
 #[test]
 fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
     let settings = settings_with(&format!(
         r#"
         [geo]
-        module = "seam_probe"
+        module = "testing.seam-probe"
         {HMAC_BLOCK}
 
         [testing]
@@ -276,11 +277,12 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
 
     let error = build_state_with_registrations(settings, &[seam_probe::builder()])
         .err()
-        .expect("should refuse to start when the selected module declares no geo module");
+        .expect("should refuse to start when the selected module supplies no geo module");
 
     let message = error.to_string();
     assert!(
-        message.contains("seam_probe") && message.contains("declares no geo module"),
+        message.contains("`[geo] module` names `testing.seam-probe`")
+            && message.contains("is selected and supplies no geo module"),
         "should name the module and the missing capability: {message}"
     );
 }
@@ -337,35 +339,31 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
     let settings = settings_with(&format!(
         r#"
         [ec]
-        module = "seam_probe"
-
-        [ec.seam_probe]
+        module = "testing.seam-probe"
 
         [device]
-        module = "seam_probe"
+        module = "testing.seam-probe"
         {PROBE_BLOCK}
         "#
     ));
 
     let state = state_with(settings, &[seam_probe::builder()]);
 
-    let device = state
-        .registry
-        .device_module()
-        .expect("`[device] module = \"seam_probe\"` should resolve the module's device module");
+    let device = state.registry.device_module().expect(
+        "`[device] module = \"testing.seam-probe\"` should resolve the module's device module",
+    );
     assert_eq!(
         device.id(),
-        "seam_probe",
+        seam_probe::module_name(),
         "the device module should be the one the module declared"
     );
 
-    let module = state
-        .registry
-        .ec_module()
-        .expect("`[ec] module = \"seam_probe\"` should resolve the module's Edge Cookie module");
+    let module = state.registry.ec_module().expect(
+        "`[ec] module = \"testing.seam-probe\"` should resolve the module's Edge Cookie module",
+    );
     assert_eq!(
         module.id(),
-        "seam_probe",
+        seam_probe::module_name(),
         "the Edge Cookie module should be the one the module declared"
     );
 

@@ -49,7 +49,7 @@ startup and operator validation. It reads `[demand]`, `[ad-server]` and
 `[auction.bidders]` and validates:
 
 - demand source and ad server names, which must be snake_case
-- a settings table its type's `provider` does not select
+- a settings table its type's `modules` or `module` does not select
 - an `implementation` no builder registered, naming the ones that are
 - endpoints, which must be HTTPS or HTTP to a loopback host, with no
   credentials or fragment

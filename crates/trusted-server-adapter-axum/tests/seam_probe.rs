@@ -228,7 +228,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     let settings = settings_with(&format!(
         r#"
             [geo]
-            module = "seam_probe"
+            module = "testing.seam-probe"
             {PROBE_BLOCK}
         "#
     ));
@@ -247,7 +247,8 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
         serde_json::from_str(&body).expect("the route should return JSON");
 
     assert_eq!(
-        report["module"], "seam_probe",
+        report["module"],
+        seam_probe::module_name(),
         "the route should identify the module: {body}"
     );
     assert_eq!(
@@ -347,14 +348,14 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
 // 4. A geo selector naming a module that supplies no module fails at startup
 // ---------------------------------------------------------------------------
 
-/// `[geo] module` naming an enabled module that declares no geo module is
-/// a startup error, raised where the adapter builds its routes.
+/// `[geo] module` naming a selected module that supplies no geo module is a
+/// startup error, raised where the adapter builds its routes.
 #[test]
 fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
     let settings = settings_with(
         r#"
             [geo]
-            module = "seam_probe"
+            module = "testing.seam-probe"
 
             [testing]
             modules = ["seam-probe"]
@@ -367,11 +368,12 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
 
     let error = TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()])
         .err()
-        .expect("should refuse to start when the selected module declares no geo module");
+        .expect("should refuse to start when the selected module supplies no geo module");
 
     let message = error.to_string();
     assert!(
-        message.contains("seam_probe") && message.contains("declares no geo module"),
+        message.contains("`[geo] module` names `testing.seam-probe`")
+            && message.contains("is selected and supplies no geo module"),
         "should name the module and the missing capability: {message}"
     );
 }
@@ -459,7 +461,7 @@ fn settings_selecting_module(extra: &str) -> Settings {
 /// module, so identity reaches core through the integration registration
 /// rather than through a second extension mechanism.
 ///
-/// This test proves the selection resolves the module's module by its id.
+/// This test proves the selection resolves the module's module by its name.
 /// `ec_module_generates_an_identifier_with_the_modules_prefix` then drives
 /// that resolved module through `generate` and asserts the `seam-probe-`
 /// prefix the built-in HMAC module can never produce, so the round trip is
@@ -469,9 +471,7 @@ fn ec_selector_naming_a_module_resolves_the_edge_cookie_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            module = "seam_probe"
-
-            [ec.seam_probe]
+            module = "testing.seam-probe"
         "#,
     );
 
@@ -479,12 +479,45 @@ fn ec_selector_naming_a_module_resolves_the_edge_cookie_module_it_declares() {
 
     let module = registry
         .ec_module()
-        .expect("`[ec] module = \"seam_probe\"` should resolve the module's module");
+        .expect("`[ec] module = \"testing.seam-probe\"` should resolve the module's module");
 
     assert_eq!(
         module.id(),
-        "seam_probe",
+        seam_probe::module_name(),
         "the resolved module should be the one the module declared"
+    );
+}
+
+/// `[ec] module` may name a label of the operator's own, whose block names
+/// the module, and the adapter starts with that module resolved. A label is
+/// how a module named in full, such as the probe's, takes a settings block.
+#[test]
+fn ec_selector_naming_a_label_resolves_the_module_its_block_names() {
+    let settings = settings_selecting_module(
+        r#"
+            [ec]
+            module = "probe"
+
+            [ec.probe]
+            implementation = "testing.seam-probe"
+        "#,
+    );
+
+    let registry = registry_with_probe(&settings);
+    assert_eq!(
+        registry
+            .ec_module()
+            .expect("should resolve the module the label's block names")
+            .id(),
+        seam_probe::module_name(),
+        "the resolved module should be the one the block names"
+    );
+
+    let started = TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()]);
+    assert!(
+        started.is_ok(),
+        "the adapter should start with the module selected under a label: {:?}",
+        started.err()
     );
 }
 
@@ -499,9 +532,7 @@ fn ec_selector_naming_a_module_starts_the_adapter() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            module = "seam_probe"
-
-            [ec.seam_probe]
+            module = "testing.seam-probe"
         "#,
     );
 
@@ -521,7 +552,7 @@ fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [device]
-            module = "seam_probe"
+            module = "testing.seam-probe"
         "#,
     );
 
@@ -529,11 +560,11 @@ fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
 
     let module = registry
         .device_module()
-        .expect("`[device] module = \"seam_probe\"` should resolve the module's module");
+        .expect("`[device] module = \"testing.seam-probe\"` should resolve the module's module");
 
     assert_eq!(
         module.id(),
-        "seam_probe",
+        seam_probe::module_name(),
         "the resolved module should be the one the module declared"
     );
 }
@@ -543,7 +574,7 @@ fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
 /// never make.
 ///
 /// The selection tests above prove the resolved module is the module's by
-/// its id. This one drives that module end to end: it hands the resolved
+/// its name. This one drives that module end to end: it hands the resolved
 /// module a request and asserts the identifier it returns starts
 /// `seam-probe-`, a prefix only the module's module produces, so the
 /// module's module genuinely ran and read the evidence rather than core's
@@ -553,9 +584,7 @@ async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            module = "seam_probe"
-
-            [ec.seam_probe]
+            module = "testing.seam-probe"
         "#,
     );
 
@@ -563,7 +592,7 @@ async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
 
     let module = registry
         .ec_module()
-        .expect("`[ec] module = \"seam_probe\"` should resolve the module's module");
+        .expect("`[ec] module = \"testing.seam-probe\"` should resolve the module's module");
 
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
     let generated = module
