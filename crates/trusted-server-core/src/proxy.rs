@@ -3656,6 +3656,84 @@ mod tests {
     }
 
     #[test]
+    fn proxied_html_click_wrapping_follows_explicit_rewrite_clicks() {
+        let html = r#"<html><head><base href="https://base.example.com/"></head><body><a href="https://landing.example.com/page"><img src="https://cdn.example.com/ad.png"></a><a href="https://excluded.example.com/page">Excluded</a></body></html>"#;
+        // (rewrite_creatives, rewrite_clicks, expect wrapped clicks)
+        let cases = [
+            (true, None, true),
+            (false, None, true),
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (false, Some(false), false),
+            (false, Some(true), true),
+        ];
+
+        for (rewrite_creatives, rewrite_clicks, expect_clicks) in cases {
+            let mut settings = create_test_settings();
+            settings.auction.rewrite_creatives = rewrite_creatives;
+            settings.auction.rewrite_clicks = rewrite_clicks;
+            settings.rewrite.exclude_domains = vec!["excluded.example.com".to_owned()];
+            let label =
+                format!("rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}");
+            let req = build_http_request(Method::GET, "https://edge.example.com/first-party/proxy");
+            let mut response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+
+            let body = response_body_string(
+                finalize(
+                    &settings,
+                    &req,
+                    "https://cdn.example.com/creative.html",
+                    response,
+                )
+                .expect("should finalize proxied HTML"),
+            );
+
+            assert!(
+                body.contains("/first-party/proxy?tsurl="),
+                "{label}: proxied HTML always proxies assets: {body}"
+            );
+            // A wrapped landing link carries the click URL in href and data-tsclick.
+            assert_eq!(
+                body.matches("/first-party/click?tsurl=").count(),
+                if expect_clicks { 2 } else { 0 },
+                "{label}: click wrapping in proxied HTML: {body}"
+            );
+            assert_eq!(
+                body.matches("data-tsclick").count(),
+                usize::from(expect_clicks),
+                "{label}: data-tsclick in proxied HTML: {body}"
+            );
+            if !expect_clicks {
+                let landing_href = body
+                    .split("<a href=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next());
+                assert_eq!(
+                    landing_href,
+                    Some("https://landing.example.com/page"),
+                    "{label}: landing link keeps its raw href: {body}"
+                );
+            }
+            assert!(
+                body.contains(r#"<a href="https://excluded.example.com/page">Excluded</a>"#),
+                "{label}: excluded link always stays raw: {body}"
+            );
+            assert!(
+                !body.contains("<base"),
+                "{label}: proxied HTML always removes <base>: {body}"
+            );
+            assert!(
+                body.contains("/static/tsjs="),
+                "{label}: proxied HTML always receives the runtime: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn html_response_rewrite_preserves_non_standard_port() {
         // Verify that HTML rewriting preserves non-standard ports in sub-resource URLs.
         // This is the core test for the port preservation fix.
