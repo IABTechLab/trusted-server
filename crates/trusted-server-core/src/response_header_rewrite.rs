@@ -92,6 +92,11 @@ impl OriginHeaderRewrite<'_> {
     /// Only a scheme change can loop. A same-scheme target equal to the current
     /// request (POST-redirect-GET, a cookie-setting redirect, a periodic
     /// reload) depends on state and is rewritten like any other target.
+    ///
+    /// `Set-Cookie` `Domain` attributes are not rewritten. A cookie-setting
+    /// redirect to the current URL whose cookie names a `Domain` the serving
+    /// host is not within is rejected by the browser, so the redirect repeats
+    /// until the browser stops it.
     fn rewrite_navigation_url(&self, url: &str) -> Option<String> {
         let rewritten = self.rewrite_url(url)?;
         if self.is_scheme_change_to_current_request(url) {

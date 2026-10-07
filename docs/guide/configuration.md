@@ -810,6 +810,13 @@ is left unchanged. Rewriting it would send the browser back to the same URL, and
 the origin would redirect again. Same-scheme redirects to the current URL, such
 as after a form POST, are rewritten as usual.
 
+`Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
+`Domain` attribute that does not cover the serving host (for example,
+`Domain=origin.example.com` served at `www.example.com`), the browser rejects
+it. A redirect to the current URL that relies on that cookie then repeats until
+the browser reports too many redirects. Have the origin set host-only cookies,
+or a `Domain` shared by both hosts.
+
 Each response keeps its own per-page values. A `[response_headers]` entry for
 the same header still replaces the rewritten value.
 
