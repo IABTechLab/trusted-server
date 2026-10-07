@@ -93,7 +93,7 @@ owns nothing behind it. Concretely:
 - An integration builder is the one way an implementation of any module
   type reaches operator configuration. A builder that supplies only an
   implementation is not a page integration, ships no browser JavaScript,
-  and is never named in `[integration] module`.
+  and no section selects it.
 - A vendor integration ships as its own crate with its Rust, its browser
   JavaScript, its configuration type, its startup validation and its tests.
 - An adapter composes the deployment by injecting the registrations it was
@@ -104,12 +104,13 @@ owns nothing behind it. Concretely:
   binary, and a vendor release needs no pull request to this repository. One
   crate for every vendor would mean one release train and one person choosing
   versions for everyone, which does not scale with the number of modules.
-- What an operator selects to supply a capability is a module. "Provider"
-  keeps the one meaning it has on `main`, an auction provider instance, so
-  the identity, geo, device and page selectors read `[ec] module`,
-  `[geo] module`, `[device] module` and `[integration] module`, and the
-  identifiers this series added use the same word. The auction tables in
-  §3.4 keep `provider`, because they name auction providers.
+- What an operator selects to supply a capability is a module, and every
+  type selects one the same way, with `module` where one runs and `modules`
+  where several run: `[ec] module`, `[geo] module`, `[device] module`,
+  `[permission-signal] modules`, `[demand] modules`, `[ad-server] module`
+  and, for a page integration, the section of its type. The word provider
+  has left the configuration, and the identifiers this series added say
+  module.
 - A module is named by its crate folder, not by an id written in its code.
   The name is the crate's path below `crates/`, with `.` between the parts,
   taken from `CARGO_MANIFEST_DIR` when the crate is built, so
@@ -125,9 +126,9 @@ owns nothing behind it. Concretely:
 - Page integrations are selected from the section of their type, such as
   `[cmp]`, `[bot-protection]`, `[framework]`, `[tag]`, `[ad-tag]`,
   `[identity]`, `[audience]`, `[proxy]` and `[testing]`, each a folder
-  under `crates/`, so there is no `[integration]` section. Where §3 below
-  reads `[integration] module`, read the section of the integration's
-  type; the implementation revises those passages as it lands them.
+  under `crates/`, so there is no `[integration]` section, and a table its
+  section does not select, a section that selects nothing and a name no
+  module in the deployment supplies are each refused at startup.
 
 ## 3. Design
 
@@ -154,9 +155,8 @@ Make the builder contract public and give the registry a second input.
   today, only a per-route conflict check and a debug-only assertion, so the
   builder carries a source label and the registry gets the check. Prebid
   Server and APS are demand implementations rather than integrations,
-  selected by `[demand] modules` and never named in
-  `[integration] module`, and their names are reserved by the same
-  check so an integration cannot take one.
+  selected by `[demand] modules` and by no section, and their names are
+  reserved by the same check so an integration cannot take one.
 
 ### 3.2 Carrying browser JavaScript on the registration
 
@@ -197,7 +197,7 @@ every registered integration is covered by deploy validation
 survives in a vendor-neutral form. Two details the map of `main` adds. The
 enumeration the test needs is independent of which integrations a
 configuration selects, so the registry exposes the full set of registrations
-it was built from, not only the ones `[integration] module` names. And
+it was built from, not only the ones the sections select. And
 Prebid Server, APS and `adserver_mock` are demand and ad server
 implementations rather than integrations, so their `[demand.<name>]` and
 `[adserver.<name>]` tables validate through the same reject-what-you-do-not-
@@ -251,8 +251,8 @@ module = "pbs_main"
 
 The demand implementations in this repository are `openrtb`, `prebid_server`
 and `aps`, and the one ad server implementation is `adserver_mock`. None of
-them is an integration, so none may be named in `[integration] module`, and
-a configuration that names one there refuses startup. APS in particular
+them is an integration, so no section selects them, and a configuration
+that selects one refuses startup. APS in particular
 stopped being an integration, and its `rendering_mode` now sits in its
 `[demand.<name>]` table rather than in a vendor integration table. Every
 demand and ad server endpoint must be HTTPS, or HTTP to a loopback host only
@@ -348,9 +348,9 @@ capability.
   module from #1044 become Tech Lab-owned crates under
   `crates/integrations/`, registered by an integration builder, selected by
   `[ec] module` and `[device] module`, and validated through §3.3 like
-  any other registration. Neither ships browser JavaScript and neither is
-  named in `[integration] module`, because a builder that supplies an
-  implementation does not have to be a page integration. Each takes an
+  any other registration. Neither ships browser JavaScript and no section
+  selects either, because a builder that supplies an implementation does
+  not have to be a page integration. Each takes an
   `[ec.<name>]` or `[device.<name>]` table only where it has a setting to
   carry, which `hmac` does and the User-Agent-only classifier does not, and
   the adapters register both by default. Core keeps only the seam and the
@@ -482,19 +482,19 @@ One vendor per PR, after this change lands. Each migration PR gives its vendor c
 TypeScript, its config type and its tests into
 `crates/integrations/<vendor>`, and the adapter that wants it depends on it.
 
-| Vendor                                                           | What it needs                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                                                                                                                                                                                                 |
-| APS                                                              | A demand provider rather than an integration, so it is configured under `[demand.<name>]`, carries its `rendering_mode` there, and is never named in `[integration] module`. Needs the generalized renderer contract in §3.4, which this change delivers. It also needs a change to the auction plan so an auction-side vendor can live outside core (§3.4), and browser-side work, because core TypeScript imports APS directly (§8 item 8). This change delivers neither. |
-| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                                                                                                                                                                                                                                                                                |
-| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                                                                                                                                                                                                                                                                                |
+| Vendor                                                           | What it needs                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                                                                                                                                                                                        |
+| APS                                                              | A demand implementation rather than a page integration, so it is configured under `[demand.<name>]`, carries its `rendering_mode` there, and no section selects it. Needs the generalized renderer contract in §3.4, which this change delivers. It also needs a change to the auction plan so an auction-side vendor can live outside core (§3.4), and browser-side work, because core TypeScript imports APS directly (§8 item 8). This change delivers neither. |
+| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                                                                                                                                                                                                                                                                       |
+| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                                                                                                                                                                                                                                                                       |
 
-A vendor's `[integration.<vendor>]` table needs no change when the vendor
-moves, because `IntegrationSettings` is a flattened map that already accepts
-a name core does not know
-(`crates/trusted-server-core/src/settings.rs:215`). Which vendors run is
-`[integration] module`, a list, and a table no entry in that list names
-refuses startup like any other stray module table.
+A vendor's `[<type>.<name>]` table needs no change when the vendor moves,
+because the sections are read into `TypeSections` in
+`crates/trusted-server-core/src/settings.rs`, which accepts a name core
+does not know. Which vendors run is the section of each vendor's type, and
+a table its section does not select refuses startup like any other stray
+module table.
 
 Two more places every move must touch, found by mapping `main`:
 
@@ -526,7 +526,7 @@ Two more places every move must touch, found by mapping `main`:
 ## 5. What does not change
 
 The request pipeline, the served script format and its hash, every
-`[integration.*]` table, the permission model,
+module's settings table, the permission model,
 and the identity lifecycle, envelope and validation contracts from #986 as
 implemented in PRs #1043 to #1046. No integration changes behavior. A
 deployment that lists the same integrations gets the same responses.
@@ -586,7 +586,7 @@ for each vendor to rediscover.
 1. **A vendor's own deploy rules do not run through the operator CLI.**
    `ts config validate` and `ts config push` reach validation through
    `TrustedServerAppConfig`, which supplies no builders, so a vendor's
-   `[integration.<id>]` rules are skipped on exactly the path an operator
+   `[<type>.<name>]` rules are skipped on exactly the path an operator
    uses. The validation hook in §3.3 is only real once that path can carry
    the builders a deployment was composed with. This needs a decision:
    either the CLI is built per deployment with its vendor crates, or the
