@@ -660,6 +660,14 @@ fn finalize_proxied_response(
     let ct = meta.ct_raw.to_ascii_lowercase();
     let compression = Compression::from_content_encoding(&meta.content_encoding);
 
+    // A HEAD response has no body to rewrite. Decoding its empty body would fail
+    // for a compressed type, and its representation headers must describe the
+    // body a GET would return, so pass it through unchanged.
+    if req.method() == Method::HEAD {
+        apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "");
+        return Ok(beresp);
+    }
+
     if ct.contains("text/html") {
         let processor = CreativeHtmlProcessor::new(settings);
         return process_response_with_pipeline(
@@ -4223,6 +4231,74 @@ mod tests {
             assert!(
                 stub.recorded_request_bodies()[1].is_empty(),
                 "should send no body on the {status} HEAD follow-up"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_request_head_redirect_keeps_header_only_compressed_response() {
+        for (content_type, content_encoding) in [("text/html", "gzip"), ("text/css", "br")] {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                303,
+                Vec::new(),
+                vec![("location", "https://redirect.example.com/final")],
+            );
+            stub.push_response_with_headers(
+                200,
+                Vec::new(),
+                vec![
+                    ("content-type", content_type),
+                    ("content-encoding", content_encoding),
+                    ("content-length", "1234"),
+                    ("access-control-allow-origin", "*"),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::HEAD, "https://edge.example/");
+
+            let response = futures::executor::block_on(proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://source.example.com/start")
+                    .without_ec_id()
+                    .without_forward_headers(),
+                &services,
+            ))
+            .expect("should return the header-only HEAD response");
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD".to_string(), "HEAD".to_string()],
+                "should keep HEAD across the 303 redirect"
+            );
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should return the target's {content_type} HEAD status"
+            );
+            let headers = response.headers();
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static(content_type)),
+                "should keep the upstream Content-Type on a {content_type} HEAD response"
+            );
+            assert_eq!(
+                headers.get(header::CONTENT_ENCODING),
+                Some(&HeaderValue::from_static(content_encoding)),
+                "should keep the upstream Content-Encoding on a {content_type} HEAD response"
+            );
+            assert_eq!(
+                headers.get(header::CONTENT_LENGTH),
+                Some(&HeaderValue::from_static("1234")),
+                "should keep the upstream Content-Length on a {content_type} HEAD response"
+            );
+            assert!(
+                headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+                "should still strip CORS headers from a {content_type} HEAD response"
             );
         }
     }
