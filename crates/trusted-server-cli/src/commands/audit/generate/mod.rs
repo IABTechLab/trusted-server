@@ -600,8 +600,8 @@ fn build_js_asset_proxy_section(
             toml.push_str(&format!("# Detected integration: {integration}\n"));
             toml.push_str(&format!(
                 "# Native integration may be preferable: [{}]\n",
-                module_section(integration).map_or_else(
-                    || integration.to_owned(),
+                module_section(&integration).map_or_else(
+                    || integration.clone(),
                     |(section, written)| format!("{section}.{written}")
                 )
             ));
