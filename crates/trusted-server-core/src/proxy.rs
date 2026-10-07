@@ -1225,7 +1225,7 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+pub(crate) fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1690,7 +1690,9 @@ pub async fn handle_first_party_proxy_sign(
         })
     })?;
     if !settings.rewrite.should_proxy_asset(host) {
-        log::debug!("sign request for `{host}` declined by rewrite policy");
+        log::debug!(
+            "sign request for `{host}` declined: host excluded or not in rewrite.include_domains"
+        );
         return Err(Report::new(TrustedServerError::Proxy {
             message: "unsupported url".to_string(),
         }));
@@ -2739,6 +2741,119 @@ mod tests {
                         StatusCode::BAD_GATEWAY,
                         "{} should reject `{url}` excluded by a mixed-case entry as unsupported",
                         method.as_str()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_applies_rewrite_include_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            include_domains: &'static [&'static str],
+            exclude_domains: &'static [&'static str],
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            expected: StatusCode,
+        }
+
+        let cases = [
+            Case {
+                name: "listed absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "listed protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "off-list absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off-list protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "host in both lists",
+                include_domains: &["*.example.com"],
+                exclude_domains: &["img.example.com"],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off include list and off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "listed but off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "mixed-case host",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://IMG.Example.COM/a.png",
+                expected: StatusCode::OK,
+            },
+        ];
+
+        let to_owned = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+
+        futures::executor::block_on(async {
+            for case in &cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.rewrite.include_domains = to_owned(case.include_domains);
+                    settings.rewrite.exclude_domains = to_owned(case.exclude_domains);
+                    settings.proxy.allowed_domains = to_owned(case.allowed_domains);
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example.com/first-party/sign",
+                        case.target,
+                    );
+
+                    let status =
+                        match handle_first_party_proxy_sign(&settings, &noop_services(), req).await
+                        {
+                            Ok(response) => response.status(),
+                            Err(error) => error.current_context().status_code(),
+                        };
+
+                    assert_eq!(
+                        status, case.expected,
+                        "{label} should return {}",
+                        case.expected
                     );
                 }
             }

@@ -23,7 +23,7 @@ use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
-use crate::proxy::is_host_allowed;
+use crate::proxy::{is_host_allowed, is_host_permitted};
 use crate::redacted::Redacted;
 
 #[cfg(test)]
@@ -660,11 +660,12 @@ impl Rewrite {
     /// Returns `true` when an asset URL on `host` should be rewritten to
     /// `/first-party/proxy`.
     ///
-    /// The host must not match [`Self::exclude_domains`]. Matching is
+    /// The host must not match [`Self::exclude_domains`], and must match
+    /// [`Self::include_domains`] when that list is non-empty. Matching is
     /// case-insensitive; see [`is_host_allowed`] for the pattern rules.
     #[must_use]
     pub fn should_proxy_asset(&self, host: &str) -> bool {
-        !self.is_excluded_host(host)
+        !self.is_excluded_host(host) && is_host_permitted(&self.include_domains, host)
     }
 
     /// Returns `true` when a click-through URL on `host` should be wrapped in
@@ -6715,6 +6716,43 @@ source_domain = "partner.example.com"
             settings.rewrite.exclude_domains,
             vec!["cdn.example.com".to_owned()],
             "should trim, lowercase, and drop inert entries when settings load"
+        );
+    }
+
+    #[test]
+    fn rewrite_should_proxy_asset_honors_include_list() {
+        let mut rewrite = Rewrite::default();
+        rewrite
+            .include_domains
+            .extend(["*.example.com", "img.example.net"].map(str::to_owned));
+        rewrite
+            .exclude_domains
+            .push("blocked.example.com".to_owned());
+
+        for (host, expected) in [
+            ("example.com", true),
+            ("a.b.example.com", true),
+            ("img.example.net", true),
+            ("IMG.EXAMPLE.NET", true),
+            ("evil-example.com", false),
+            ("cdn.example.org", false),
+            ("blocked.example.com", false),
+        ] {
+            assert_eq!(
+                rewrite.should_proxy_asset(host),
+                expected,
+                "should_proxy_asset(`{host}`) should be {expected}"
+            );
+        }
+        for host in ["cdn.example.org", "evil-example.com", "example.com"] {
+            assert!(
+                rewrite.should_wrap_click(host),
+                "should wrap click for `{host}` regardless of include_domains"
+            );
+        }
+        assert!(
+            !rewrite.should_wrap_click("blocked.example.com"),
+            "should not wrap a click to an excluded host"
         );
     }
 
