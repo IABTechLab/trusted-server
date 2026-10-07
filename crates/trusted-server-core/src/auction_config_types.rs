@@ -36,8 +36,13 @@ pub struct AuctionConfig {
     )]
     pub sanitize_creatives: bool,
 
-    /// Rewrite winning-bid creative HTML to first-party endpoints (applied
-    /// after sanitization when [`Self::sanitize_creatives`] is enabled).
+    /// Rewrite winning-bid creative asset URLs (images, scripts, styles,
+    /// media, iframes, CSS `url()`) to first-party `/first-party/proxy`
+    /// endpoints, applied after sanitization when
+    /// [`Self::sanitize_creatives`] is enabled.
+    ///
+    /// Bidder `<base>` removal and creative TSJS injection run whenever this
+    /// or click rewriting ([`Self::rewrites_auction_clicks`]) is on.
     ///
     /// The default stays omitted from serialized config blobs to avoid adding
     /// this field when it has no effect. Any rollback across schema versions
@@ -48,6 +53,18 @@ pub struct AuctionConfig {
         skip_serializing_if = "is_default_rewrite_creatives"
     )]
     pub rewrite_creatives: bool,
+
+    /// Wrap creative click-through links (`<a href>`, `<area href>`) in signed
+    /// `/first-party/click` redirects.
+    ///
+    /// Unset keeps each path's existing behavior: auction creatives follow
+    /// [`Self::rewrite_creatives`], and HTML fetched through
+    /// `/first-party/proxy` keeps wrapping. An explicit value applies to every
+    /// path. Unset is omitted from serialized config blobs, so older binaries
+    /// keep loading them; any explicit value is serialized and rejected by
+    /// binaries that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_clicks: Option<bool>,
 
     /// Operator-defined bidder-provider instances, keyed by provider ID.
     #[serde(default, deserialize_with = "deserialize_provider_map")]
@@ -87,6 +104,7 @@ impl Default for AuctionConfig {
             enabled: false,
             sanitize_creatives: default_sanitize_creatives(),
             rewrite_creatives: default_rewrite_creatives(),
+            rewrite_clicks: None,
             providers: BTreeMap::new(),
             bidders: BTreeMap::new(),
             mediator: None,
@@ -160,6 +178,25 @@ fn default_allowed_context_keys() -> BTreeSet<String> {
 }
 
 impl AuctionConfig {
+    /// Whether auction creatives (`POST /auction` and inline SSAT/page-bids)
+    /// wrap click-through links.
+    ///
+    /// Unset [`Self::rewrite_clicks`] follows [`Self::rewrite_creatives`].
+    #[must_use]
+    pub fn rewrites_auction_clicks(&self) -> bool {
+        self.rewrite_clicks.unwrap_or(self.rewrite_creatives)
+    }
+
+    /// Whether HTML fetched through `/first-party/proxy` wraps click-through
+    /// links.
+    ///
+    /// Unset [`Self::rewrite_clicks`] keeps wrapping, as before the setting
+    /// existed.
+    #[must_use]
+    pub fn rewrites_proxied_clicks(&self) -> bool {
+        self.rewrite_clicks.unwrap_or(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn legacy_provider_map(names: &[&str]) -> BTreeMap<ProviderId, ProviderConfig> {
         names
@@ -253,6 +290,72 @@ mod tests {
             Some(&serde_json::Value::Bool(false)),
             "should preserve an explicit rewrite opt-out"
         );
+    }
+
+    #[test]
+    fn default_rewrite_clicks_is_unset_and_not_serialized() {
+        let config = AuctionConfig::default();
+
+        assert_eq!(
+            config.rewrite_clicks, None,
+            "should leave click rewriting unset by default"
+        );
+        let serialized = serde_json::to_value(&config).expect("should serialize defaults");
+        assert!(
+            serialized.get("rewrite_clicks").is_none(),
+            "should omit the unset click setting from serialized config"
+        );
+    }
+
+    #[test]
+    fn explicit_rewrite_clicks_is_serialized() {
+        for value in [true, false] {
+            let config = AuctionConfig {
+                rewrite_clicks: Some(value),
+                ..AuctionConfig::default()
+            };
+
+            let serialized =
+                serde_json::to_value(config).expect("should serialize explicit click setting");
+
+            assert_eq!(
+                serialized.get("rewrite_clicks"),
+                Some(&serde_json::Value::Bool(value)),
+                "should serialize explicit rewrite_clicks = {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_rewriting_resolves_per_entry_point() {
+        // (rewrite_creatives, rewrite_clicks, auction clicks, proxied clicks)
+        let cases = [
+            (true, None, true, true),
+            (false, None, false, true),
+            (true, Some(false), false, false),
+            (false, Some(true), true, true),
+            (true, Some(true), true, true),
+            (false, Some(false), false, false),
+        ];
+
+        for (rewrite_creatives, rewrite_clicks, auction, proxied) in cases {
+            let config = AuctionConfig {
+                rewrite_creatives,
+                rewrite_clicks,
+                ..AuctionConfig::default()
+            };
+
+            assert_eq!(
+                config.rewrites_auction_clicks(),
+                auction,
+                "auction clicks for rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}"
+            );
+            assert_eq!(
+                config.rewrites_proxied_clicks(),
+                proxied,
+                "proxied clicks for rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}"
+            );
+        }
     }
 
     #[test]
