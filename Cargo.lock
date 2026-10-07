@@ -5763,6 +5763,7 @@ dependencies = [
  "trusted-server-core",
  "trusted-server-identity-lockr",
  "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-testlight",
 ]
 
 [[package]]
@@ -5832,6 +5833,21 @@ dependencies = [
  "serde_json",
  "trusted-server-core",
  "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-testing-testlight"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
  "validator",
 ]
 

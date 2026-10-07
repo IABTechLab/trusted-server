@@ -1248,60 +1248,6 @@ mod tests {
     }
 
     #[test]
-    fn test_integration_registry_rewrites_integration_scripts() {
-        let html = r#"<html><head>
-            <script src="https://cdn.testlight.com/v1/testlight.js"></script>
-        </head><body></body></html>"#;
-
-        let mut settings = Settings::default();
-        let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
-        settings
-            .insert_module_config(
-                "auction",
-                "testing.testlight",
-                &json!({
-                    "endpoint": "https://example.com/openrtb2/auction",
-                    "rewrite_scripts": true,
-                    "shim_src": shim_src,
-                }),
-            )
-            .expect("should insert testlight config");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-        let mut config = create_test_config();
-        config.integrations = registry;
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        result.unwrap();
-
-        let processed = String::from_utf8_lossy(&output);
-        assert!(
-            processed.contains(&shim_src),
-            "Integration shim should replace integration script reference"
-        );
-        assert!(
-            !processed.contains("cdn.testlight.com"),
-            "Original integration URL should be removed"
-        );
-    }
-
-    #[test]
     fn test_real_publisher_html_with_gzip() {
         use flate2::Compression as GzCompression;
         use flate2::read::GzDecoder;

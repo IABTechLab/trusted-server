@@ -4281,8 +4281,15 @@ mod tests {
     #[test]
     fn an_id_no_builder_supplies_is_refused_at_registry_build() {
         let settings = settings_naming("a_vendors_own_integration");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )
+        .with_module_name("testing.probe")];
 
-        let error = IntegrationRegistry::new(&settings)
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
             .expect("should refuse an id no builder in this deployment supplies");
 
@@ -4292,9 +4299,8 @@ mod tests {
             "should name the id nothing supplies: {message}"
         );
         assert!(
-            message.contains("The testing modules it supplies are")
-                && message.contains("testlight"),
-            "should list the module types this deployment does supply: {message}"
+            message.contains("The testing modules it supplies are") && message.contains("probe"),
+            "should list the modules of that type this deployment does supply: {message}"
         );
     }
 

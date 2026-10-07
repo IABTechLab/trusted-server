@@ -1,3 +1,14 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,33 +20,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::edge_cookie::recognized_ec_id;
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::edge_cookie::recognized_ec_id;
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
 };
-use crate::platform::RuntimeServices;
-use crate::proxy::{ProxyRequestConfig, proxy_request};
-use crate::settings::{IntegrationConfig, Settings};
-use crate::tsjs;
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::proxy::{ProxyRequestConfig, proxy_request};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
+use trusted_server_core::tsjs;
 
 const TESTLIGHT_INTEGRATION_ID: &str = "testlight";
 
 /// The name this module is selected by, in `[auction]`.
 pub const MODULE: &str = "testing.testlight";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         TESTLIGHT_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
     .with_module_name(MODULE)
-    .selected_in("auction");
+    .selected_in("auction")
+}
 
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -298,12 +312,14 @@ fn default_shim_src() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use crate::test_support::tests::{VALID_SYNTHETIC_ID, create_test_settings};
-    use crate::tsjs;
     use http::Method;
     use serde_json::json;
     use std::sync::Arc;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+    use trusted_server_core::test_support::tests::{VALID_SYNTHETIC_ID, create_test_settings};
+    use trusted_server_core::tsjs;
 
     #[test]
     fn build_requires_config() {
@@ -443,7 +459,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, br#"{"ok":true}"#.to_vec());
             let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
             );
             let settings = create_test_settings();
             let integration = TestlightIntegration::new(TestlightConfig {
@@ -458,7 +474,7 @@ mod tests {
                 .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
                 .expect("should build request");
             req.headers_mut().insert(
-                crate::constants::HEADER_X_TS_EC.clone(),
+                trusted_server_core::constants::HEADER_X_TS_EC.clone(),
                 http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
             );
 
@@ -498,7 +514,7 @@ mod tests {
             .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
             .expect("should build request");
         req.headers_mut().insert(
-            crate::constants::HEADER_X_TS_EC.clone(),
+            trusted_server_core::constants::HEADER_X_TS_EC.clone(),
             http::HeaderValue::from_str(ec_id).expect("should build EC header value"),
         );
         req
@@ -522,7 +538,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, br#"{"ok":true}"#.to_vec());
             let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
             );
             let settings = create_test_settings();
 
@@ -549,7 +565,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, br#"{"ok":true}"#.to_vec());
             let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
             );
             // The value is one the built-in module would recognize, so only
             // the absence of a selected module can withhold it.
@@ -572,5 +588,76 @@ mod tests {
                 "no upstream call should be made without a recognized identifier"
             );
         });
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+
+    #[test]
+    fn a_served_page_loads_the_shim_in_place_of_the_vendor_script() {
+        use std::io::Cursor;
+
+        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::integrations::IntegrationRegistry;
+        use trusted_server_core::streaming_processor::{
+            Compression, PipelineConfig, StreamingPipeline,
+        };
+
+        let html = r#"<html><head>
+            <script src="https://cdn.testlight.com/v1/testlight.js"></script>
+        </head><body></body></html>"#;
+
+        let mut settings = Settings::default();
+        let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
+        settings
+            .insert_module_config(
+                "auction",
+                MODULE,
+                &json!({
+                    "endpoint": "https://example.com/openrtb2/auction",
+                    "rewrite_scripts": true,
+                    "shim_src": shim_src,
+                }),
+            )
+            .expect("should insert testlight config");
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+        let config = HtmlProcessorConfig::from_settings(
+            &settings,
+            &registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size: 8192,
+            },
+            create_html_processor(config),
+        );
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process the page");
+
+        let processed = String::from_utf8_lossy(&output);
+        assert!(
+            processed.contains(&shim_src),
+            "the shim should replace the vendor's script reference"
+        );
+        assert!(
+            !processed.contains("cdn.testlight.com"),
+            "the vendor's own URL should be gone from the page"
+        );
     }
 }

@@ -20,6 +20,7 @@ use trusted_server_core::integrations::IntegrationBuilder;
 #[must_use]
 pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
+        trusted_server_testing_testlight::builder(),
         trusted_server_audience_permutive::builder(),
         trusted_server_identity_lockr::builder(),
         trusted_server_cmp_didomi::builder(),
@@ -54,6 +55,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "testing.testlight",
                 "audience.permutive",
                 "identity.lockr",
                 "cmp.didomi",

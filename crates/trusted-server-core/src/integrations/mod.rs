@@ -24,7 +24,6 @@ pub mod openrtb;
 pub mod prebid;
 pub mod prebid_server;
 mod registry;
-pub mod testlight;
 
 #[cfg(test)]
 pub(crate) use registry::test_support as registry_test_support;
@@ -573,7 +572,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // This must remain first: attribute rewriters chain replacements and
     // short-circuit removals.
     js_asset_proxy::BUILDER,
-    testlight::BUILDER,
     nextjs::BUILDER,
     datadome::BUILDER,
     gpt::BUILDER,
