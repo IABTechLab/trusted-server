@@ -27,16 +27,18 @@ The four adapter smoke contracts are documented in the
 [deployment guides](../docs/guide/integrations-overview.md#adapter-support).
 Repository-wide verification policy lives in [TESTING.md](../TESTING.md).
 
-The `Documentation proposal` workflow runs both proposal scripts after code
-merges to `main` and opens one pull request per merge on `docs/auto/<sha12>`.
-It needs the organization Copilot policy "Allow use of Copilot CLI billed to
-the organization" and the repository setting "Allow GitHub Actions to create
-and approve pull requests". Pull requests opened with `GITHUB_TOKEN` do not
-trigger other workflows, so the workflow's validate job runs the docs gates
-itself, without write credentials; push to the proposal branch to run regular
-CI. Retry a merge from the workflow's manual dispatch with its full commit SHA;
-the scripts always run from the workflow's revision, so any merge on `main` can
-be retried. When the original push added several commits, as a rebase merge
-does, also pass its `base`: the `main` head before that push, shown as
-`BASE_SHA` in the original run and recorded in the proposal's body. Publication
-refuses a retry whose range differs from an open proposal's.
+The `Documentation proposal` workflow runs the propose, validate, and publish
+scripts after code merges to `main` and opens one pull request per merge on
+`docs/auto/<sha12>`. Its first run, including the one triggered by merging the
+workflow itself, fails unless the organization Copilot policy "Allow use of
+Copilot CLI billed to the organization" and the repository setting "Allow GitHub
+Actions to create and approve pull requests" are already enabled. Pull requests
+opened with `GITHUB_TOKEN` do not trigger other workflows, so the workflow's
+validate job runs the docs gates itself, without write credentials; push to the
+proposal branch to run regular CI. Retry a merge from the workflow's manual
+dispatch with its full commit SHA; the scripts always run from the workflow's
+revision, so any merge on `main` can be retried. When the original push added
+several commits, as a rebase merge does, also pass its `base`: the `main` head
+before that push, shown as `BASE_SHA` in the original run and recorded in the
+proposal's body. Publication refuses a retry whose range differs from an open
+proposal's.
