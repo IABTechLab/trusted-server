@@ -92,7 +92,7 @@ fn assert_payload_cleanup(dir: &Path) {
 #[test]
 fn local_commands_never_execute_aws_and_preserve_the_source() {
     let dir = fixture();
-    let toml = "[auction]\nenabled=true\n[demand]\nprovider=['pbs_main']\n[demand.pbs_main]\nimplementation='prebid_server'\nendpoint='https://DUMMY_SECRET@pbs.example.com/openrtb2/auction'\n[auction.bidders.examplebidder]\nprovider='pbs_main'\n[integration.prebid]\naccount_id='DUMMY_SECRET'\n[integration.prebid.bundle.modules]\nbidder=['exampleBidAdapter']\nuser_id=['sharedIdSystem']\nanalytics=['exampleAnalyticsAdapter']\n";
+    let toml = "[auction]\nenabled=true\n[demand]\nmodules=['pbs_main']\n[demand.pbs_main]\nimplementation='prebid_server'\nendpoint='https://DUMMY_SECRET@pbs.example.com/openrtb2/auction'\n[auction.bidders.examplebidder]\nmodule='pbs_main'\n[integration.prebid]\naccount_id='DUMMY_SECRET'\n[integration.prebid.bundle.modules]\nbidder=['exampleBidAdapter']\nuser_id=['sharedIdSystem']\nanalytics=['exampleAnalyticsAdapter']\n";
     fs::write(dir.path().join("trusted-server.toml"), toml).expect("should write TOML");
     let output = command(dir.path())
         .args(["prebid", "server", "inspect", "--json"])

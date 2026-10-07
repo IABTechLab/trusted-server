@@ -284,7 +284,7 @@ mod tests {
                 .parse()
                 .expect("should parse server-side bidder"),
             crate::auction::BidderRouteConfig {
-                provider: "pbs".parse().expect("should parse provider"),
+                module: "pbs".parse().expect("should parse provider"),
             },
         );
         let mut prebid = settings

@@ -191,7 +191,7 @@ pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderLis
 }
 
 /// The legacy test orchestrator's configuration for these settings, carrying
-/// the demand source names `[demand] provider` selects.
+/// the demand source names `[demand] modules` selects.
 ///
 /// Production compiles its sources from the plan instead, so this exists only
 /// so the parity tests can drive the pre-plan orchestrator.

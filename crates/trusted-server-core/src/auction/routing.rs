@@ -617,14 +617,13 @@ mod tests {
             (
                 BidderId::from_str("alpha").expect("should parse bidder"),
                 BidderRouteConfig {
-                    provider: ProviderId::from_str("pbs_a").expect("should parse provider"),
+                    module: ProviderId::from_str("pbs_a").expect("should parse provider"),
                 },
             ),
             (
                 BidderId::from_str("beta").expect("should parse bidder"),
                 BidderRouteConfig {
-                    provider: ProviderId::from_str("openrtb_direct")
-                        .expect("should parse provider"),
+                    module: ProviderId::from_str("openrtb_direct").expect("should parse provider"),
                 },
             ),
         ]);

@@ -10,16 +10,14 @@ Trusted Server uses a flexible configuration system based on:
 2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **EdgeZero Stores** - Config and secret stores for the pushed blob and runtime secret values
 
-Everything the deployment can switch on is selected the same way, with a
-`module` key, or a `provider` key for the auction's demand sources and ad
-server. Read
+Everything the deployment can switch on is a module, selected the same way,
+with `module`, or `modules` where several run. Read
 [Configuration Rules](/guide/configuration-rules) first. It is short, and it
 is the pattern every section below follows:
 
 ```toml
 [<type>]
-module = "<name>"            # provider = ... for demand and adserver,
-                             # and a list where several run
+module = "<name>"            # modules = [...] where several run
 
 [<type>.<name>]                # only when the selected name has settings
 setting = "value"
@@ -214,35 +212,35 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-7 of these sections select what runs. Five take a `module` key, the two
-auction tables take a `provider` key, and each gives every selected name its
-own `[<type>.<name>]` settings table, as
+7 of these sections select what runs, with `module` where one runs and
+`modules` where several run, and each gives every selected name its own
+`[<type>.<name>]` settings table, as
 [Configuration Rules](/guide/configuration-rules) describes.
 
-| Section                    | Selects           | Purpose                                                     |
-| -------------------------- | ----------------- | ----------------------------------------------------------- |
-| `[adserver]`               | one provider      | The ad server that picks the winner                         |
-| `[auction]`                | nothing           | Auction orchestration, bidder routes, and mediation         |
-| `[cache]`                  | nothing           | Static and rehosted asset cache policy                      |
-| `[consent]`                | nothing           | Consent interpretation, forwarding, and conflict resolution |
-| `[creative_opportunities]` | nothing           | Server-side page ad opportunities and templates             |
-| `[debug]`                  | nothing           | Explicit non-production diagnostics                         |
-| `[demand]`                 | several providers | The auction's demand sources                                |
-| `[device]`                 | one module        | Device classification                                       |
-| `[ec]`                     | one module        | Edge Cookie identity, persistence, and partner sync         |
-| `[geo]`                    | one module        | Which module resolves location, if any                      |
-| `[[handlers]]`             | nothing           | Ordered HTTP Basic-auth rules                               |
-| `[image_optimizer]`        | nothing           | Reusable Fastly Image Optimizer profiles                    |
-| `[integration]`            | several modules   | Partner and browser integrations                            |
-| `[permission-signal]`      | several modules   | Which permission signals are acted on, in order             |
-| `[proxy]`                  | nothing           | Proxy allowlist, TLS policy, and asset routes               |
-| `[publisher]`              | nothing           | Publisher domain, origin, and proxy signing key             |
-| `[request_signing]`        | nothing           | Outbound Ed25519 request signing and management-store IDs   |
-| `[response_headers]`       | nothing           | Headers added to Trusted Server responses                   |
-| `[rewrite]`                | nothing           | First-party URL rewrite exclusions                          |
-| `[tester_cookie]`          | nothing           | Optional tester-cookie endpoints                            |
-| `[tinybird]`               | nothing           | Direct Tinybird auction telemetry                           |
-| `[trusted_client_ip]`      | nothing           | Authenticated front-door client-IP forwarding               |
+| Section                    | Selects         | Purpose                                                     |
+| -------------------------- | --------------- | ----------------------------------------------------------- |
+| `[ad-server]`              | one module      | The ad server that picks the winner                         |
+| `[auction]`                | nothing         | Auction orchestration, bidder routes, and mediation         |
+| `[cache]`                  | nothing         | Static and rehosted asset cache policy                      |
+| `[consent]`                | nothing         | Consent interpretation, forwarding, and conflict resolution |
+| `[creative_opportunities]` | nothing         | Server-side page ad opportunities and templates             |
+| `[debug]`                  | nothing         | Explicit non-production diagnostics                         |
+| `[demand]`                 | several modules | The auction's demand sources                                |
+| `[device]`                 | one module      | Device classification                                       |
+| `[ec]`                     | one module      | Edge Cookie identity, persistence, and partner sync         |
+| `[geo]`                    | one module      | Which module resolves location, if any                      |
+| `[[handlers]]`             | nothing         | Ordered HTTP Basic-auth rules                               |
+| `[image_optimizer]`        | nothing         | Reusable Fastly Image Optimizer profiles                    |
+| `[integration]`            | several modules | Partner and browser integrations                            |
+| `[permission-signal]`      | several modules | Which permission signals are acted on, in order             |
+| `[proxy]`                  | nothing         | Proxy allowlist, TLS policy, and asset routes               |
+| `[publisher]`              | nothing         | Publisher domain, origin, and proxy signing key             |
+| `[request_signing]`        | nothing         | Outbound Ed25519 request signing and management-store IDs   |
+| `[response_headers]`       | nothing         | Headers added to Trusted Server responses                   |
+| `[rewrite]`                | nothing         | First-party URL rewrite exclusions                          |
+| `[tester_cookie]`          | nothing         | Optional tester-cookie endpoints                            |
+| `[tinybird]`               | nothing         | Direct Tinybird auction telemetry                           |
+| `[trusted_client_ip]`      | nothing         | Authenticated front-door client-IP forwarding               |
 
 ## Example: Production Setup
 
@@ -282,7 +280,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -292,7 +290,7 @@ routing = "explicit"
 debug = false
 
 [auction.bidders.example-server-bidder]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 ## Detailed Reference
@@ -338,7 +336,7 @@ ts config validate
 
 This example changes an existing scalar leaf. Edit TOML and run `ts config
 validate` followed by `ts config push` when changing an array, table, map, or
-rule. A `module` or `provider` list is an array, so it cannot be overridden
+rule. A `modules` list is an array, so it cannot be overridden
 this way.
 
 ## Publisher Configuration
@@ -839,14 +837,14 @@ Global Privacy Control header at once and both have something to say, so this
 type takes a list. The order is the policy, because the last module with an
 opinion decides.
 
-### `[permission_signal]`
+### `[permission-signal]`
 
-| Field    | Type          | Required | Description                                                                                                |
-| -------- | ------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `module` | Array[String] | No       | The modules to act on, in order. Omit it to act on every module this build links, in the order shown below |
+| Field     | Type          | Required | Description                                                                                                |
+| --------- | ------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `modules` | Array[String] | No       | The modules to act on, in order. Omit it to act on every module this build links, in the order shown below |
 
 The modules that ship are `gpc` (the `Sec-GPC` request header),
-`gpp_sale_opt_out` (a GPP US sale opt-out), `us_privacy` (a US Privacy string
+`gpp` (a GPP US sale opt-out), `us-privacy` (a US Privacy string
 sale opt-out) and `tcf` (TCF v2). Each is a crate under
 `crates/permission-signal`, outside the core.
 
@@ -854,13 +852,13 @@ A module that is not on the list does not run, and there is no separate
 switch to turn one off. An empty list acts on nothing, leaving every
 permission at its country and region baseline. An unknown or repeated name
 refuses startup. None of the four has settings, so none needs a
-`[permission_signal.<name>]` table.
+`[permission-signal.<name>]` table.
 
 **Example**:
 
 ```toml
-[permission_signal]
-module = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+[permission-signal]
+modules = ["gpc", "gpp", "us-privacy", "tcf"]
 ```
 
 See [Permission Signals](/guide/permission-signals) for what each module
@@ -1665,7 +1663,7 @@ switched off is caught rather than sitting unread.
 
 `openrtb`, `prebid_server`, `aps` and `adserver_mock` supply demand and ad
 server implementations only. They are not page integrations and cannot be
-named here. Their settings live in `[demand.<name>]` and `[adserver.<name>]`.
+named here. Their settings live in `[demand.<name>]` and `[ad-server.<name>]`.
 
 The sections below cover Prebid, Next.js, Osano, Permutive and Testlight. For
 the others, see the relevant integration guides.
@@ -1867,7 +1865,7 @@ bidder = ["rubiconBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["atsAnalyticsAdapter"]
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -1888,7 +1886,7 @@ suppress_all = false
 suppress_seats = ["example-seat"]
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 **Environment override**:
@@ -1899,8 +1897,8 @@ env 'TRUSTED_SERVER__INTEGRATION__PREBID__TIMEOUT_MS=1000' \
   ts config validate
 ```
 
-Environment overlays only replace existing scalar leaves. Keep the `module`
-and `provider` lists, `client_side_bidders`, bidder-parameter overrides and rules in TOML,
+Environment overlays only replace existing scalar leaves. Keep the `modules`
+lists, `client_side_bidders`, bidder-parameter overrides and rules in TOML,
 then validate and push the edited file.
 
 **Managed User ID modules**:
@@ -2081,10 +2079,10 @@ rewrite_scripts = true
 ## Auction Configuration
 
 An auction is configured by three tables. `[demand]` selects the demand sources
-and gives each its settings, `[adserver]` selects the ad server that picks the
+and gives each its settings, `[ad-server]` selects the ad server that picks the
 winner, and `[auction]` holds the settings that belong to the auction itself,
 including `[auction.bidders.<code>]`, the only client-visible bidder route map.
-`[auction]` selects nothing and takes no `provider` key of its own.
+`[auction]` selects nothing and takes no `module` key of its own.
 
 ### `[auction]`
 
@@ -2158,7 +2156,7 @@ becomes `"prebid_server"`, and `"aps"` stays `"aps"`. Everything that was
 inside `profile_config` moves up into the table itself, flat beside
 `endpoint`, `timeout_ms`, `routing` and `notifications`. Demand source names
 that carried a hyphen, such as `pbs-main`, become snake_case, such as `pbs_main`,
-and so does every `[auction.bidders.<code>] provider` value that points at
+and so does every `[auction.bidders.<code>] module` value that points at
 one.
 
 For Prebid Server, move `server_url` to `endpoint` and the server timeout to
@@ -2182,7 +2180,7 @@ deployment will put one version on a schema it rejects. Roll back by restoring
 the old binary and old-schema blob together.
 :::
 
-`[demand] provider` lists the demand sources, in a list because several run.
+`[demand] modules` lists the demand sources, in a list because several run.
 Each table name is the demand source's identity for configuration, backend
 correlation, health, response metadata and telemetry, and must be snake_case.
 The name is the implementation unless the table carries an `implementation`
@@ -2199,7 +2197,7 @@ rewrite_creatives = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -2223,12 +2221,12 @@ debug = false
 allow_script_creatives = false
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -2270,8 +2268,8 @@ a controlled publisher-origin friendly-frame cohort.
 
 ### Ad server
 
-`[adserver] provider` names the one ad server that picks the winner, as a
-string rather than a list, and `[adserver.<name>]` holds its settings. With no
+`[ad-server] module` names the one ad server that picks the winner, as a
+string rather than a list, and `[ad-server.<name>]` holds its settings. With no
 ad server the orchestrator selects the highest decoded CPM per slot and
 applies floors locally. With one configured, normalized demand responses are
 sent to it, and Trusted Server falls back to local ranking when the ad server
@@ -2288,18 +2286,18 @@ development and testing.
 | `context_query_params` | No       | `{}`    | Maps auction context keys to decision-URL query parameters          |
 
 ```toml
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
-[adserver.adserver_mock.context_query_params]
+[ad-server.adserver_mock.context_query_params]
 example_segments = "segments"
 ```
 
-The word mediator is gone. It is "ad server" in prose and `adserver` in
+The word mediator is gone. It is "ad server" in prose and `ad-server` in
 configuration, `[debug.auction_html_comment_options] include_mediator_response`
 is now `include_adserver_response`, and the auction response metadata that read
 `parallel_mediation` now reads `parallel_adserver`.
@@ -2308,7 +2306,7 @@ is now `include_adserver_response`, and the auction response metadata that read
 
 Each `[auction.bidders.<bidder-id>]` maps one client-visible bidder ID to
 exactly one demand source, named by its `[demand]` table name. A route naming
-a source `[demand] provider` does not select is refused. Bidder IDs must be
+a source `[demand] modules` does not select is refused. Bidder IDs must be
 nonempty, no more than 128 UTF-8 bytes, contain no control characters or
 surrounding whitespace, and cannot be the reserved exact ID `trustedServer`.
 Browser `trustedServer.bidderParams` accepts at most 128 bidder entries, and
@@ -2334,7 +2332,7 @@ UTF-8 bytes and without ASCII control characters.
 ### Validation timing and target limits
 
 `ts config validate` and ordinary deploy validation compile the complete
-target-independent plan from `[demand]`, `[adserver]` and `[auction.bidders]`.
+target-independent plan from `[demand]`, `[ad-server]` and `[auction.bidders]`.
 That covers unselected tables, names that are not snake_case, an
 implementation this build does not have, endpoint scheme and host, timeouts,
 routing modes, notification bounds, bidder route ownership, signing structure,
@@ -2381,7 +2379,7 @@ env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
   ts config validate
 ```
 
-A selector list is an array, so `[demand] provider` and
+A selector list is an array, so `[demand] modules` and
 `[integration] module` cannot be changed by an overlay. Edit the TOML, then
 validate and push.
 
@@ -3152,7 +3150,7 @@ from the file, and startup checks the rest and runs the first set again.
 - The `hmac.passphrase` key name is non-empty at push time, the resolved
   passphrase is at least 32 bytes at runtime, and a known placeholder value is
   rejected after resolution
-- The complete auction plan compiles from `[demand]`, `[adserver]` and
+- The complete auction plan compiles from `[demand]`, `[ad-server]` and
   `[auction.bidders]`, so an unselected table, a name that is not a module name,
   an implementation this build does not have, a bad endpoint, an out-of-range
   timeout, an unsupported routing mode, a route naming an unselected demand
@@ -3177,7 +3175,7 @@ from the file, and startup checks the rest and runs the first set again.
 
 Everything above runs again on the loaded configuration, and these join it:
 
-- The `[ec]`, `[geo]`, `[device]` and `[permission_signal]` selections. A name
+- The `[ec]`, `[geo]`, `[device]` and `[permission-signal]` selections. A name
   this build does not have, a missing settings table, or a table the selector
   does not name, stops the service on its next start. A passing
   `ts config validate` is not proof that a change to those four will start

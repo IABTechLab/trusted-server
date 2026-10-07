@@ -369,8 +369,8 @@ Bad: `"fix: added feature flags"`
 Each vendor-differentiated capability is pluggable behind its own trait, so a
 deployment selects an implementation and the core stays neutral. Every
 pluggable thing follows one configuration convention, which is a top-level
-table named for the job, a `module` key that selects what runs (`provider` for
-the auction's `[demand]` and `[adserver]` tables), and a `[<type>.<name>]`
+table named for the job, a `module` key that selects what runs (`modules`
+where several run), and a `[<type>.<name>]`
 table for a selected name that has settings. The rules and what
 is checked when are in `docs/guide/configuration-rules.md`, which is the page
 to read before changing any module configuration.
@@ -381,8 +381,8 @@ to read before changing any module configuration.
 | Device detection      | `DeviceModule` (`ec/device.rs`)                       | `[device] module`                               | `builtin`, User-Agent only (the default)                                                                                                                              | `crates/device/<vendor>`            |
 | Geo / IP intelligence | `PlatformGeo` (`platform/traits.rs`)                  | `[geo] module`                                  | None, no location (the default), or `platform`                                                                                                                        | `crates/geo/<vendor>`               |
 | Permission signals    | `PermissionSignalModule` (`permission_signal/mod.rs`) | `[permission-signal] modules` (an ordered list) | `gpc`, `gpp`, `us-privacy`, `tcf`, all of them with no list                                                                                                           | `crates/permission-signal/<scheme>` |
-| Auction demand        | `DemandImplementation` (`auction/demand.rs`)          | `[demand] provider` (a list)                    | `openrtb`, `prebid_server`, `aps`                                                                                                                                     | an integration builder              |
-| Ad server             | `AdServerImplementation` (`auction/demand.rs`)        | `[adserver] provider`                           | `adserver_mock`                                                                                                                                                       | an integration builder              |
+| Auction demand        | `DemandImplementation` (`auction/demand.rs`)          | `[demand] modules` (a list)                     | `openrtb`, `prebid_server`, `aps`                                                                                                                                     | an integration builder              |
+| Ad server             | `AdServerImplementation` (`auction/demand.rs`)        | `[ad-server] module`                            | `adserver_mock`                                                                                                                                                       | an integration builder              |
 | Page integrations     | `IntegrationBuilder` (`integrations/mod.rs`)          | `[integration] module` (a list)                 | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` | an adapter-supplied builder         |
 
 `openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
@@ -443,14 +443,14 @@ IntegrationRegistration::builder(ID)
 
 ## Configuration Files
 
-| File                          | Purpose                                                                                                                                                         |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                                                                               |
-| `fastly.toml`                 | Fastly service configuration and build settings                                                                                                                 |
-| `trusted-server.example.toml` | Source-controlled app-config template (includes the `[ec]`, `[geo]`, `[device]`, `[permission-signal]`, `[demand]`, `[adserver]` and `[integration]` selectors) |
-| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope                                                               |
-| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                                                                                     |
-| `.env.dev`                    | Local development environment variables                                                                                                                         |
+| File                          | Purpose                                                                                                                                                          |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero.toml`               | EdgeZero app/platform manifest and logical stores                                                                                                                |
+| `fastly.toml`                 | Fastly service configuration and build settings                                                                                                                  |
+| `trusted-server.example.toml` | Source-controlled app-config template (includes the `[ec]`, `[geo]`, `[device]`, `[permission-signal]`, `[demand]`, `[ad-server]` and `[integration]` selectors) |
+| `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope                                                                |
+| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                                                                                      |
+| `.env.dev`                    | Local development environment variables                                                                                                                          |
 
 ---
 

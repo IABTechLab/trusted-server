@@ -1072,7 +1072,7 @@ predicates below, `named` means the integration's id is in
 
 | Integration          | Registration predicate                                      | HTTP routes                                       |
 | -------------------- | ----------------------------------------------------------- | ------------------------------------------------- |
-| `adserver_mock`      | `[adserver] provider = "adserver_mock"`                     | None                                              |
+| `adserver_mock`      | `[ad-server] module = "adserver_mock"`                      | None                                              |
 | `aps`                | `demand implementation=aps;rendering_mode=publisher_native` | None                                              |
 | `aps`                | `demand implementation=aps;rendering_mode=trusted_server`   | `GET /integrations/aps/renderer`                  |
 | `creative`           | `always`                                                    | None                                              |

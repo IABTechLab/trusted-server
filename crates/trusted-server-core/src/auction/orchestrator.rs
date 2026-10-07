@@ -5696,7 +5696,7 @@ mod tests {
                     .parse()
                     .expect("should parse fictional bidder ID"),
                 crate::auction::plan::BidderRouteConfig {
-                    provider: "provider_a"
+                    module: "provider_a"
                         .parse()
                         .expect("should parse fictional provider ID"),
                 },
@@ -5995,7 +5995,7 @@ mod tests {
                 config.bidders.insert(
                     bidder.parse().expect("should parse bidder"),
                     crate::auction::plan::BidderRouteConfig {
-                        provider: provider.parse().expect("should parse provider"),
+                        module: provider.parse().expect("should parse provider"),
                     },
                 );
             }
@@ -7529,7 +7529,7 @@ mod tests {
                     .parse()
                     .expect("should parse fictional bidder ID"),
                 crate::auction::plan::BidderRouteConfig {
-                    provider: provider_id
+                    module: provider_id
                         .parse()
                         .expect("should parse fictional provider ID"),
                 },
@@ -7727,7 +7727,7 @@ mod tests {
                     .parse()
                     .expect("should parse fictional bidder ID"),
                 crate::auction::plan::BidderRouteConfig {
-                    provider: "signed"
+                    module: "signed"
                         .parse()
                         .expect("should parse fictional provider ID"),
                 },

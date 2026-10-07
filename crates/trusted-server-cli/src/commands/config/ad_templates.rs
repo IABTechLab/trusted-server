@@ -183,7 +183,7 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
     .map_err(output_error)?;
     writeln!(
         out,
-        "demand.provider: {}",
+        "demand.modules: {}",
         if loaded.settings.demand.selected().is_empty() {
             "(none)".to_string()
         } else {
@@ -219,7 +219,7 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
     } else if loaded.settings.demand.selected().is_empty() {
         writeln!(
             out,
-            "status: slots are configured, but [demand] provider is empty"
+            "status: slots are configured, but [demand] modules is empty"
         )
         .map_err(output_error)?;
     } else {
@@ -722,7 +722,7 @@ mod tests {
             .and_then(toml::Value::as_table_mut)
             .expect("should find the demand table");
         demand
-            .get_mut("provider")
+            .get_mut("modules")
             .and_then(toml::Value::as_array_mut)
             .expect("should find the demand selection")
             .push(toml::Value::String("aps_main".to_string()));
@@ -759,8 +759,8 @@ mod tests {
         assert_eq!(
             output
                 .lines()
-                .find(|line| line.starts_with("demand.provider:")),
-            Some("demand.provider: aps_main, pbs_main"),
+                .find(|line| line.starts_with("demand.modules:")),
+            Some("demand.modules: aps_main, pbs_main"),
             "should report demand names in deterministic order: {output}"
         );
         assert!(!output.contains("legacy fallback"));
@@ -794,14 +794,14 @@ mod tests {
         assert_eq!(
             output
                 .lines()
-                .find(|line| line.starts_with("demand.provider:")),
-            Some("demand.provider: (none)"),
+                .find(|line| line.starts_with("demand.modules:")),
+            Some("demand.modules: (none)"),
             "should report no demand sources"
         );
         assert!(
             output
                 .lines()
-                .any(|line| line == "status: slots are configured, but [demand] provider is empty"),
+                .any(|line| line == "status: slots are configured, but [demand] modules is empty"),
             "should explain why configured slots are ineligible: {output}"
         );
     }

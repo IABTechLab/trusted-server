@@ -5454,15 +5454,14 @@ external_bundle_sri = "sha384-AAAA"
             (
                 BidderId::from_str("secondaryRoute").expect("should parse bidder ID"),
                 BidderRouteConfig {
-                    provider: ProviderId::from_str("pbs_secondary")
+                    module: ProviderId::from_str("pbs_secondary")
                         .expect("should parse provider ID"),
                 },
             ),
             (
                 BidderId::from_str("primaryRoute").expect("should parse bidder ID"),
                 BidderRouteConfig {
-                    provider: ProviderId::from_str("pbs_primary")
-                        .expect("should parse provider ID"),
+                    module: ProviderId::from_str("pbs_primary").expect("should parse provider ID"),
                 },
             ),
         ]);
@@ -8882,7 +8881,7 @@ set = { networkId = 42 }
         config.bidders = BTreeMap::from([(
             bidder_id,
             BidderRouteConfig {
-                provider: provider_id,
+                module: provider_id,
             },
         )]);
         let plan = crate::auction::plan::AuctionPlan::compile(config)

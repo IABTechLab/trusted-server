@@ -679,7 +679,7 @@ formats = [{ width = 300, height = 250 }]
             "zeta", "alpha", "gamma", "beta", "epsilon", "delta", "alpha"
         ]);
         source["demand"] = serde_json::json!({
-            "provider": ["secondary", "primary"],
+            "modules": ["secondary", "primary"],
             "secondary": {
                 "implementation": "openrtb", "endpoint": "https://secondary.example.com/auction",
                 "routing": "all_eligible",
@@ -692,7 +692,7 @@ formats = [{ width = 300, height = 250 }]
             }
         });
         source["auction"]["bidders"] = serde_json::json!({
-            "bidder-b": {"provider": "secondary"}, "bidder-a": {"provider": "primary"}
+            "bidder-b": {"module": "secondary"}, "bidder-a": {"module": "primary"}
         });
         source["creative_opportunities"] = serde_json::json!({
             "gam_network_id": "99999",
@@ -1220,7 +1220,7 @@ formats = [{ width = 300, height = 250 }]
             "should identify the removed field: {rendered}"
         );
         assert!(
-            rendered.contains("[demand] provider"),
+            rendered.contains("[demand] modules"),
             "should name where the setting moved to: {rendered}"
         );
     }

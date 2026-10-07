@@ -3673,6 +3673,13 @@ macro_rules! refused_table {
 }
 
 refused_table! {
+    /// The `[adserver]` table, renamed `[ad-server]`.
+    RenamedAdServerTable => "Configuration table `[adserver]` is now `[ad-server]`. Select the \
+        ad server with `[ad-server] module` and move its settings to `[ad-server.<name>]` \
+        unchanged"
+}
+
+refused_table! {
     /// The `[permission_signal]` table, renamed `[permission-signal]`.
     RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
         `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
@@ -3973,14 +3980,26 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub auction: AuctionConfig,
-    /// The auction's demand sources. `[demand] provider` selects them and each
+    /// The auction's demand sources. `[demand] modules` selects them and each
     /// `[demand.<name>]` table holds one source's settings.
     #[serde(default, skip_serializing_if = "ProviderList::is_unset")]
     pub demand: ProviderList,
-    /// The ad server that picks the auction winner. `[adserver] provider`
-    /// selects it and `[adserver.<name>]` holds its settings.
-    #[serde(default, skip_serializing_if = "ProviderChoice::is_unset")]
+    /// The ad server that picks the auction winner. `[ad-server] module`
+    /// selects it and `[ad-server.<name>]` holds its settings.
+    #[serde(
+        rename = "ad-server",
+        default,
+        skip_serializing_if = "ProviderChoice::is_unset"
+    )]
     pub adserver: ProviderChoice,
+    /// The `[adserver]` table, kept so a configuration carrying it is told
+    /// its new name.
+    #[serde(rename = "adserver", default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the renamed table fails with directions"
+    )]
+    renamed_adserver: RenamedAdServerTable,
     #[serde(default)]
     pub consent: ConsentConfig,
     #[serde(default)]
@@ -5674,7 +5693,7 @@ module = \"none\"",
             "error should identify the removed field, got {rendered}"
         );
         assert!(
-            rendered.contains("[demand] provider"),
+            rendered.contains("[demand] modules"),
             "error should name where the setting moved to, got {rendered}"
         );
     }
@@ -5694,7 +5713,7 @@ module = \"none\"",
             "error should identify the removed field, got {rendered}"
         );
         assert!(
-            rendered.contains("[demand] provider"),
+            rendered.contains("[demand] modules"),
             "error should name where the setting moved to, got {rendered}"
         );
     }
@@ -10338,6 +10357,20 @@ mod permission_signal_config_tests {
         assert!(
             message.contains("[permission_signal]") && message.contains("[permission-signal]"),
             "the refusal names the old table and the new one: {message}"
+        );
+    }
+
+    #[test]
+    fn the_old_ad_server_table_name_is_refused_with_its_new_name() {
+        let written = format!(
+            "{}\n[adserver]\nmodule = \"adserver_mock\"\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&written).expect_err("should refuse the old table name");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("[adserver]") && message.contains("[ad-server] module"),
+            "the refusal names the old table and the new selector: {message}"
         );
     }
 

@@ -262,7 +262,7 @@ fn build_state_with_registrations_and_services(
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     // The plan is compiled with the integrations this adapter was given, so an
-    // `[adserver]` or `[demand]` name one of their builders supplies resolves
+    // `[ad-server]` or `[demand]` name one of their builders supplies resolves
     // here. Compiling without them would drop the implementation and report the
     // name as one no builder registers.
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);

@@ -45,7 +45,7 @@ in `auction::endpoints`, so no demand implementation depends on Fastly types.
 ## Configuration boundary
 
 `auction::compile_auction_plan` is the single settings-to-plan boundary used by
-startup and operator validation. It reads `[demand]`, `[adserver]` and
+startup and operator validation. It reads `[demand]`, `[ad-server]` and
 `[auction.bidders]` and validates:
 
 - demand source and ad server names, which must be snake_case
@@ -124,7 +124,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -146,12 +146,12 @@ routing = "all_eligible"
 account_id = "example-account"
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```

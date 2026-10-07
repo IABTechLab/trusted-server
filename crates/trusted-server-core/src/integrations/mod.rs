@@ -420,7 +420,7 @@ impl IntegrationBuilder {
         }
     }
 
-    /// Registers a demand implementation, which `[demand] provider` or an
+    /// Registers a demand implementation, which `[demand] modules` or an
     /// `implementation` line can name.
     #[must_use]
     pub const fn with_demand(mut self, demand: &'static DemandImplementation) -> Self {
@@ -428,7 +428,7 @@ impl IntegrationBuilder {
         self
     }
 
-    /// Registers an ad server implementation, which `[adserver] provider` or
+    /// Registers an ad server implementation, which `[ad-server] module` or
     /// an `implementation` line can name.
     #[must_use]
     pub const fn with_adserver(mut self, adserver: &'static AdServerImplementation) -> Self {
@@ -559,7 +559,7 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
         gpt_diagnostics::validate,
     )
     .with_request_preparer(gpt_diagnostics::prepare_request_hook),
-    // Implementations `[demand]` and `[adserver]` can name. None of them is a
+    // Implementations `[demand]` and `[ad-server]` can name. None of them is a
     // page integration, so none can be named in `[integration] module`.
     IntegrationBuilder::implementations(openrtb::OPENRTB_ID, CORE_SOURCE)
         .with_demand(&openrtb::DEMAND),

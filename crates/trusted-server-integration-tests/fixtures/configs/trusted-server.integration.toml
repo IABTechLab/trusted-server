@@ -60,7 +60,7 @@ timeout_ms = 2000
 allowed_context_keys = []
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -83,7 +83,7 @@ debug = false
 allow_script_creatives = false
 
 [auction.bidders.example-bidder]
-provider = "pbs_main"
+module = "pbs_main"
 
 [debug]
 ja4_endpoint_enabled = false

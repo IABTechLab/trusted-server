@@ -36,7 +36,7 @@ use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 // Configuration
 // ============================================================================
 
-/// The implementation id `[adserver]` names.
+/// The implementation id `[ad-server]` names.
 pub const ADSERVER_MOCK_ID: &str = "adserver_mock";
 
 /// The demonstration ad server implementation.
@@ -63,7 +63,7 @@ fn build(
     Ok(Arc::new(AdServerMockProvider::new(name, settings)))
 }
 
-/// The settings one `[adserver.<name>]` table holds for this implementation.
+/// The settings one `[ad-server.<name>]` table holds for this implementation.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct AdServerMockSettings {
@@ -85,7 +85,7 @@ pub struct AdServerMockSettings {
     /// to the ad server decision endpoint without hard-coding integration knowledge.
     ///
     /// ```toml
-    /// [adserver.adserver_mock.context_query_params]
+    /// [ad-server.adserver_mock.context_query_params]
     /// permutive_segments = "permutive"
     /// ```
     #[serde(default)]
@@ -154,7 +154,7 @@ pub struct AdServerMockProvider {
 }
 
 impl AdServerMockProvider {
-    /// Create one ad server under the name `[adserver] provider` selected.
+    /// Create one ad server under the name `[ad-server] module` selected.
     #[must_use]
     pub fn new(name: &str, config: AdServerMockSettings) -> Self {
         Self {

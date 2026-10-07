@@ -29,12 +29,12 @@ struct Auction {
     bidders: BTreeMap<BidderId, AuctionBidder>,
 }
 
-/// The `[demand]` table: `provider` selects what runs, and every other key is
+/// The `[demand]` table: `modules` selects what runs, and every other key is
 /// one demand source's settings table.
 #[derive(Default, Deserialize)]
 struct Demand {
     #[serde(default)]
-    provider: Vec<ProviderId>,
+    modules: Vec<ProviderId>,
     #[serde(flatten)]
     sources: BTreeMap<ProviderId, DemandSource>,
 }
@@ -59,7 +59,7 @@ impl DemandSource {
 
 #[derive(Deserialize)]
 struct AuctionBidder {
-    provider: ProviderId,
+    module: ProviderId,
 }
 
 #[derive(Serialize)]
@@ -222,17 +222,17 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
             let requirements: Vec<_> = auction
                 .bidders
                 .iter()
-                .filter(|(_, bidder)| &bidder.provider == name)
+                .filter(|(_, bidder)| &bidder.module == name)
                 .map(|(bidder_id, _)| ServerBidderCandidate {
                     bidder: bidder_id.as_str().to_owned(),
-                    source_key: format!("auction.bidders.{}.provider", bidder_id.as_str()),
+                    source_key: format!("auction.bidders.{}.module", bidder_id.as_str()),
                     host_secret_requirement: "unresolved",
                     partner_authorization: "unresolved",
                 })
                 .collect();
             ServerProviderReport {
                 provider: name.as_str().to_owned(),
-                selected: source.demand.provider.contains(name),
+                selected: source.demand.modules.contains(name),
                 endpoint_configured: demand_source.endpoint.is_some(),
                 timeout_ms_explicit: demand_source.timeout_ms,
                 test_mode_explicit: demand_source.test_mode,
@@ -245,7 +245,7 @@ pub(super) fn inspect(path: &Path) -> Result<Output> {
     let warnings = [
         "Local file only: confirm environment, remote configuration, and request-time overrides.",
         "Omitted fields/defaults are not expanded; empty candidate lists are not proof of no demand.",
-        "A disabled auction, a demand source [demand] provider does not select, and browser bundle adapters do not authorize PBS activation.",
+        "A disabled auction, a demand source [demand] modules does not select, and browser bundle adapters do not authorize PBS activation.",
         "Host secret requirements need adapter metadata verified against the selected PBS release.",
     ];
     let mut details = vec![
@@ -338,7 +338,7 @@ mod tests {
 enabled = true
 
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -359,10 +359,10 @@ implementation = "openrtb"
 endpoint = "https://house.example.com/openrtb2/auction"
 
 [auction.bidders.serverbidder]
-provider = "pbs_main"
+module = "pbs_main"
 
 [auction.bidders.otherbidder]
-provider = "pbs_secondary"
+module = "pbs_secondary"
 
 [integration.prebid]
 account_id = "NEVER_PRINT_ME"
@@ -395,7 +395,7 @@ analytics = ["exampleAnalyticsAdapter"]
         );
         assert_eq!(
             report.data["server_providers"][1]["selected"], false,
-            "a table [demand] provider does not name is reported as not selected"
+            "a table [demand] modules does not name is reported as not selected"
         );
         assert_eq!(
             report.data["server_providers"][1]["server_bidder_candidates"][0]["bidder"],
@@ -403,7 +403,7 @@ analytics = ["exampleAnalyticsAdapter"]
         );
         assert_eq!(
             report.data["server_providers"][0]["server_bidder_candidates"][0]["source_key"],
-            "auction.bidders.serverbidder.provider"
+            "auction.bidders.serverbidder.module"
         );
         assert_eq!(
             report.data["server_providers"][0]["endpoint_configured"],

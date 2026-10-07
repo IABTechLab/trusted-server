@@ -1,8 +1,8 @@
 //! Demand and ad server implementations, the seam through which an integration
 //! supplies the providers an auction calls.
 //!
-//! A deployment selects its demand sources with `[demand] provider = [...]` and
-//! its ad server with `[adserver] provider = "..."`. Each selected name resolves
+//! A deployment selects its demand sources with `[demand] modules = [...]` and
+//! its ad server with `[ad-server] module = "..."`. Each selected name resolves
 //! to an implementation that an integration builder registers, so core names no
 //! vendor. The common `OpenRTB` driver builds every standard request field, sends
 //! the request and enforces privacy. An implementation decides only the choices
@@ -271,7 +271,7 @@ pub fn accept_endpoint(endpoint: &mut Url) -> Result<(), String> {
 }
 
 /// An ad server implementation an integration registers, named by
-/// `[adserver] provider` or by an `implementation` line.
+/// `[ad-server] module` or by an `implementation` line.
 #[derive(Clone, Copy)]
 pub struct AdServerImplementation {
     /// The implementation id, in `snake_case`.

@@ -806,7 +806,7 @@ mod routing_metadata_tests {
             config.bidders = BTreeMap::from([(
                 BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
                 BidderRouteConfig {
-                    provider: provider_id,
+                    module: provider_id,
                 },
             )]);
             let plan = AuctionPlan::compile(config).expect("should compile the plan");

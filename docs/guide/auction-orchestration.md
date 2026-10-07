@@ -81,7 +81,7 @@ sequenceDiagram
     Orch->>Orch: Detect strategy<br/>ad server? parallel_adserver : parallel_only
     deactivate TS
 
-    Note over Orch: Strategy determined by config:<br/>[adserver]<br/>provider = "adserver_mock" → parallel_adserver<br/>No [adserver] → parallel_only
+    Note over Orch: Strategy determined by config:<br/>[ad-server]<br/>module = "adserver_mock" → parallel_adserver<br/>No [ad-server] → parallel_only
   end
 
   %% === Parallel Provider Execution ===
@@ -220,7 +220,7 @@ The orchestrator is composed of several modules:
 
 ### Configuration-first plan
 
-At startup, Trusted Server compiles `[demand]`, `[adserver]` and
+At startup, Trusted Server compiles `[demand]`, `[ad-server]` and
 `[auction.bidders]` through one registry into an immutable `AuctionPlan`.
 Demand source names, endpoints, implementation defaults, routes, static
 extensions and notification policy are resolved once. The same
@@ -238,7 +238,7 @@ Each `[demand.<name>]` table is one instance of the shared OpenRTB path.
 Several tables may name the same implementation or endpoint and stay distinct
 through their names, which is what the optional `implementation` line is for.
 The `adserver_mock` ad server is selected the same way, by
-`[adserver] provider`, and supplies an ad server implementation rather than a
+`[ad-server] module`, and supplies an ad server implementation rather than a
 demand one. See [Configuration Rules](/guide/configuration-rules) for the
 syntax every type shares.
 
@@ -256,7 +256,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -270,9 +270,9 @@ routing = "all_eligible"
 account_id = "example-aps-account"
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
-# No [adserver], so the highest bid wins
+# No [ad-server], so the highest bid wins
 ```
 
 **How winner selection works:**
@@ -295,7 +295,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -309,12 +309,12 @@ routing = "all_eligible"
 account_id = "example-aps-account"
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -376,7 +376,7 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 
 ```toml
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -385,7 +385,7 @@ routing = "explicit"
 debug = false
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 ### APS Provider
@@ -409,7 +409,7 @@ Builds an independent banner OpenRTB request for Amazon Publisher Services.
 
 ```toml
 [demand]
-provider = ["aps_main"]
+modules = ["aps_main"]
 
 [demand.aps_main]
 implementation = "aps"
@@ -455,10 +455,10 @@ An external decision service that receives decoded-price demand responses and pe
 **Ad server response:** Standard OpenRTB with decoded prices and selected winners.
 
 ```toml
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 price_floor = 0.50
@@ -713,7 +713,7 @@ rewrite_creatives = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -737,12 +737,12 @@ debug = false
 allow_script_creatives = false
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
@@ -759,11 +759,11 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 allowed_domains = ["assets.example.com"]
 ```
 
-`[demand] provider` lists the demand sources and each `[demand.<name>]` table
+`[demand] modules` lists the demand sources and each `[demand.<name>]` table
 holds one source's settings. The name owns endpoint and backend correlation
 and telemetry. `[auction.bidders]` maps each client-visible bidder ID to one
 of those names, and a route naming a source the list does not select is
-refused. The ad server is selected separately by `[adserver] provider`.
+refused. The ad server is selected separately by `[ad-server] module`.
 
 Four settings are common to every `[demand.<name>]` table, whichever
 implementation it names:
@@ -849,7 +849,7 @@ override existing scalar leaves. The pinned EdgeZero loader does not create
 missing leaves or replace arrays, tables, maps, or rules. Existing configs must add
 `rewrite_creatives = true` and `sanitize_creatives = false` before relying on
 those scalar overrides. Edit and re-push TOML for other values. Every selected
-name is snake_case, so it maps straight onto a path segment:
+name is a module name, so it maps straight onto a path segment:
 
 ```bash
 export TRUSTED_SERVER__AUCTION__ENABLED=true
@@ -860,8 +860,8 @@ export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
 ts config validate
 ```
 
-A selector list is an array, so `[demand] provider` and
-`[adserver] provider` cannot be set this way. Edit the TOML and push it.
+A selector list is an array, so `[demand] modules` and
+`[ad-server] module` cannot be set this way. Edit the TOML and push it.
 
 Before rolling back to a binary that does not know a creative-processing field,
 remove that field's non-default value (`rewrite_creatives = false` or

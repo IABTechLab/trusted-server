@@ -1,7 +1,7 @@
 //! Auction orchestration across the demand sources and the ad server a
 //! deployment selects.
 //!
-//! `[demand] provider` selects the demand sources and `[adserver] provider`
+//! `[demand] modules` selects the demand sources and `[ad-server] module`
 //! the optional ad server. Their implementations are registered by
 //! integrations through [`demand`], so this module names no vendor.
 
@@ -53,7 +53,7 @@ pub use types::{
 ///
 /// # Errors
 ///
-/// Returns an error when the `[demand]`, `[adserver]`, bidder route or signing
+/// Returns an error when the `[demand]`, `[ad-server]`, bidder route or signing
 /// configuration is invalid.
 pub fn compile_auction_plan(
     settings: &Settings,
@@ -67,7 +67,7 @@ pub fn compile_auction_plan(
 ///
 /// # Errors
 ///
-/// Returns an error when the `[demand]`, `[adserver]`, bidder route or signing
+/// Returns an error when the `[demand]`, `[ad-server]`, bidder route or signing
 /// configuration is invalid, including a selected name whose implementation no
 /// builder registers.
 pub fn compile_auction_plan_with(
@@ -145,7 +145,7 @@ mod plan_sharing_tests {
     use serde_json::{Map, json};
     use std::collections::BTreeMap;
 
-    /// An `[adserver]` table selecting one name with the settings given.
+    /// An `[ad-server]` table selecting one name with the settings given.
     fn adserver(name: &str, settings: Map<String, serde_json::Value>) -> ProviderChoice {
         ProviderChoice::new(
             Some(name.to_string()),

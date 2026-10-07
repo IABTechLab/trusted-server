@@ -29,15 +29,15 @@ implementation it runs. The shipped implementations are:
 
 Browser-visible bidder codes are mapped separately under
 `[auction.bidders.<id>]`. `adserver_mock` is the only shipped ad server; it
-is optional, selected by `[adserver] provider` and configured under
-`[adserver.adserver_mock]`.
+is optional, selected by `[ad-server] module` and configured under
+`[ad-server.adserver_mock]`.
 
 ```toml
 [auction]
 enabled = true
 
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -45,7 +45,7 @@ endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 
 [auction.bidders.example-bidder]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 Deploy validation compiles this configuration before publication. Adapter

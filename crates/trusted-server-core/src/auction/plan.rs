@@ -1,6 +1,6 @@
 //! Target-independent auction plan compiler.
 //!
-//! The plan is compiled once at startup from `[demand]`, `[adserver]` and
+//! The plan is compiled once at startup from `[demand]`, `[ad-server]` and
 //! `[auction.bidders]`. Every selected name resolves to an implementation an
 //! integration registered, so the compiler names no vendor, and request
 //! handling reads only the compiled plan.
@@ -35,8 +35,8 @@ const TIMEOUT_KEY: &str = "timeout_ms";
 const ROUTING_KEY: &str = "routing";
 const NOTIFICATIONS_KEY: &str = "notifications";
 
-/// A validated provider name, as written in `[demand] provider` or
-/// `[adserver] provider`.
+/// A validated provider name, as written in `[demand] modules` or
+/// `[ad-server] module`.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, derive_more::Display)]
 pub struct ProviderId(String);
 
@@ -148,8 +148,8 @@ impl Serialize for BidderId {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BidderRouteConfig {
-    /// The `[demand]` provider the bidder is sent to.
-    pub provider: ProviderId,
+    /// The `[demand]` module the bidder is sent to.
+    pub module: ProviderId,
 }
 
 /// Which slots a demand source receives.
@@ -183,7 +183,7 @@ pub struct AuctionPlanConfig {
     pub timeout_ms: u32,
     /// The `[demand]` table.
     pub demand: ProviderList,
-    /// The `[adserver]` table.
+    /// The `[ad-server]` table.
     pub adserver: ProviderChoice,
     /// Client bidder routes from `[auction.bidders]`.
     pub bidders: BTreeMap<BidderId, BidderRouteConfig>,
@@ -317,7 +317,7 @@ impl AuctionPlan {
             .map_err(configuration_error)?;
         config
             .adserver
-            .validate("adserver")
+            .validate("ad-server")
             .map_err(configuration_error)?;
         let signing_enabled = compile_signing_enabled(config.request_signing.as_ref())?;
 
@@ -402,12 +402,12 @@ impl AuctionPlan {
             }
             let provider_index =
                 provider_indices
-                    .get(&route.provider)
+                    .get(&route.module)
                     .copied()
                     .ok_or_else(|| {
                         configuration_error(format!(
-                            "[auction.bidders.{bidder}] sends the bidder to `{}`, which [demand] provider does not select",
-                            route.provider
+                            "[auction.bidders.{bidder}] sends the bidder to `{}`, which [demand] modules does not select",
+                            route.module
                         ))
                     })?;
             bidder_routes.insert(bidder, provider_index);
@@ -424,7 +424,7 @@ impl AuctionPlan {
                     .copied()
                     .find(|implementation| implementation.id == implementation_id)
                     .ok_or_else(|| {
-                        unknown_implementation("adserver", name, implementation_id, {
+                        unknown_implementation("ad-server", name, implementation_id, {
                             config
                                 .adserver_implementations
                                 .iter()
@@ -434,14 +434,14 @@ impl AuctionPlan {
                 let settings = config.adserver.settings_of(name);
                 if let Some(endpoint) = settings.get(ENDPOINT_KEY) {
                     let endpoint = endpoint.as_str().ok_or_else(|| {
-                        configuration_error(format!("[adserver.{name}] endpoint must be a URL"))
+                        configuration_error(format!("[ad-server.{name}] endpoint must be a URL"))
                     })?;
-                    check_endpoint("adserver", name, endpoint)?;
+                    check_endpoint("ad-server", name, endpoint)?;
                 }
                 (implementation.build)(name, &settings).change_context(
                     TrustedServerError::Configuration {
                         message: format!(
-                            "[adserver.{name}] settings are not valid for implementation `{}`",
+                            "[ad-server.{name}] settings are not valid for implementation `{}`",
                             implementation.id
                         ),
                     },
@@ -565,7 +565,7 @@ impl AuctionPlan {
         Ok(())
     }
 
-    /// Borrow compiled demand sources in the order `[demand] provider` lists
+    /// Borrow compiled demand sources in the order `[demand] modules` lists
     /// them.
     #[must_use]
     pub fn providers(&self) -> &[ProviderPlan] {
@@ -611,7 +611,7 @@ impl AuctionPlan {
         self.signing_enabled
     }
 
-    /// Borrow the selected ad server, when `[adserver] provider` names one.
+    /// Borrow the selected ad server, when `[ad-server] module` names one.
     #[must_use]
     pub fn adserver(&self) -> Option<&AdServerPlan> {
         self.adserver.as_ref()
@@ -975,9 +975,7 @@ mod tests {
         let mut raw = one_source();
         raw.bidders.insert(
             bidder("trustedServer"),
-            BidderRouteConfig {
-                provider: id("one"),
-            },
+            BidderRouteConfig { module: id("one") },
         );
         assert!(
             AuctionPlan::compile(raw).is_err(),
@@ -987,9 +985,7 @@ mod tests {
         let mut case_distinct = one_source();
         case_distinct.bidders.insert(
             bidder("TrustedServer"),
-            BidderRouteConfig {
-                provider: id("one"),
-            },
+            BidderRouteConfig { module: id("one") },
         );
         assert!(
             AuctionPlan::compile(case_distinct).is_ok(),
@@ -1006,13 +1002,13 @@ mod tests {
         raw.bidders.insert(
             bidder("z-bidder"),
             BidderRouteConfig {
-                provider: id("z_provider"),
+                module: id("z_provider"),
             },
         );
         raw.bidders.insert(
             bidder("a-bidder"),
             BidderRouteConfig {
-                provider: id("a_provider"),
+                module: id("a_provider"),
             },
         );
         let plan = AuctionPlan::compile(raw).expect("should compile deterministic plan");
@@ -1104,7 +1100,7 @@ mod tests {
         raw.bidders.insert(
             bidder("example"),
             BidderRouteConfig {
-                provider: id("missing"),
+                module: id("missing"),
             },
         );
         let error = AuctionPlan::compile(raw).expect_err("should refuse an unrouted bidder");

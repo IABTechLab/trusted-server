@@ -5,9 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use validator::Validate;
 
-const MOVED_PROVIDERS_MESSAGE: &str = "`[auction.providers]` has moved. Select demand sources with `[demand] provider = [...]` and give each its settings in `[demand.<name>]`, as the configuration rules describe";
+const MOVED_PROVIDERS_MESSAGE: &str = "`[auction.providers]` has moved. Select demand sources with `[demand] modules = [...]` and give each its settings in `[demand.<name>]`, as the configuration rules describe";
 
-const MOVED_MEDIATOR_MESSAGE: &str = "`[auction] mediator` has moved. Select the ad server with `[adserver] provider = \"<name>\"` and give it its settings in `[adserver.<name>]`, as the configuration rules describe";
+const MOVED_MEDIATOR_MESSAGE: &str = "`[auction] mediator` has moved. Select the ad server with `[ad-server] module = \"<name>\"` and give it its settings in `[ad-server.<name>]`, as the configuration rules describe";
 
 pub use crate::auction::plan::{
     BidderId, BidderRouteConfig, NotificationConfig, ProviderId, RoutingMode,
@@ -67,7 +67,7 @@ pub struct AuctionConfig {
 
     /// The ad server name the legacy test orchestrator runs.
     ///
-    /// Production selects its ad server in `[adserver]` instead, so this never
+    /// Production selects its ad server in `[ad-server]` instead, so this never
     /// appears in a configuration file.
     #[cfg(test)]
     #[serde(skip)]
@@ -291,7 +291,7 @@ mod tests {
             .expect_err("should refuse the moved providers table");
 
             assert!(
-                error.to_string().contains("[demand] provider"),
+                error.to_string().contains("[demand] modules"),
                 "should name the new home: {error}"
             );
         }
@@ -305,7 +305,7 @@ mod tests {
         .expect_err("should refuse the moved mediator setting");
 
         assert!(
-            error.to_string().contains("[adserver] provider"),
+            error.to_string().contains("[ad-server] module"),
             "should name the new home: {error}"
         );
     }
@@ -314,7 +314,7 @@ mod tests {
     fn bidder_routes_round_trip() {
         let config: AuctionConfig = serde_json::from_value(serde_json::json!({
             "bidders": {
-                "example-bidder": { "provider": "pbs_main" }
+                "example-bidder": { "module": "pbs_main" }
             }
         }))
         .expect("should parse bidder routes");

@@ -1,11 +1,12 @@
-//! The table the auction's `[demand]` and `[adserver]` share.
+//! The table the auction's `[demand]` and `[ad-server]` share.
 //!
-//! Each is one top-level table. Its `provider` key selects what runs, and
-//! every other key is one named provider's settings table:
+//! Each is one top-level table. Its `modules` key, or `module` where one
+//! runs, selects what runs, and every other key is one named provider's
+//! settings table:
 //!
 //! ```toml
 //! [demand]
-//! provider = ["pbs_demo"]
+//! modules = ["pbs_demo"]
 //!
 //! [demand.pbs_demo]
 //! implementation = "prebid_server"
@@ -27,9 +28,6 @@ use serde::ser::SerializeMap as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-/// The key that selects which providers of a type run.
-pub const SELECTOR_KEY: &str = "provider";
-
 /// The line naming the implementation a table configures when the table's
 /// name is a label rather than the implementation.
 pub const IMPLEMENTATION_KEY: &str = "implementation";
@@ -37,29 +35,35 @@ pub const IMPLEMENTATION_KEY: &str = "implementation";
 /// The longest provider name or implementation id, in bytes.
 const MAX_NAME_BYTES: usize = 63;
 
-/// A provider type whose `provider` names any number of providers.
+/// A provider type whose `modules` names any number of providers.
 pub type ProviderList = ProviderTable<Vec<String>>;
 
-/// A provider type whose `provider` names at most one provider.
+/// A provider type whose `module` names at most one provider.
 pub type ProviderChoice = ProviderTable<Option<String>>;
 
-/// How a type's `provider` value is written.
+/// How a type's selection is written.
 pub trait ProviderSelection: Default + Clone + PartialEq + fmt::Debug {
+    /// The key the selection is written under, `module` for a type that runs
+    /// one and `modules` for a type that runs several.
+    const KEY: &'static str;
+
     /// The selected names, in the order they were written.
     fn names(&self) -> Vec<&str>;
 
-    /// Reads the `provider` value.
+    /// Reads the selection.
     ///
     /// # Errors
     ///
     /// Returns a message when the value has the wrong shape for this type.
     fn from_value(value: Value) -> Result<Self, String>;
 
-    /// Writes the `provider` value, or `None` when nothing is selected.
+    /// Writes the selection, or `None` when nothing is selected.
     fn to_value(&self) -> Option<Value>;
 }
 
 impl ProviderSelection for Vec<String> {
+    const KEY: &'static str = "modules";
+
     fn names(&self) -> Vec<&str> {
         self.iter().map(String::as_str).collect()
     }
@@ -70,14 +74,14 @@ impl ProviderSelection for Vec<String> {
                 .into_iter()
                 .map(|item| match item {
                     Value::String(name) => Ok(name),
-                    other => Err(format!("`provider` must list names, found `{other}`")),
+                    other => Err(format!("`modules` must list names, found `{other}`")),
                 })
                 .collect(),
             Value::String(name) => Err(format!(
-                "`provider` is a list for this type, so write [\"{name}\"]"
+                "`modules` is a list for this type, so write [\"{name}\"]"
             )),
             other => Err(format!(
-                "`provider` must be a list of names, found `{other}`"
+                "`modules` must be a list of names, found `{other}`"
             )),
         }
     }
@@ -88,6 +92,8 @@ impl ProviderSelection for Vec<String> {
 }
 
 impl ProviderSelection for Option<String> {
+    const KEY: &'static str = "module";
+
     fn names(&self) -> Vec<&str> {
         self.iter().map(String::as_str).collect()
     }
@@ -96,9 +102,9 @@ impl ProviderSelection for Option<String> {
         match value {
             Value::String(name) => Ok(Some(name)),
             Value::Array(_) => {
-                Err("`provider` names one provider for this type, not a list".to_owned())
+                Err("`module` names one provider for this type, not a list".to_owned())
             }
-            other => Err(format!("`provider` must be a name, found `{other}`")),
+            other => Err(format!("`module` must be a name, found `{other}`")),
         }
     }
 
@@ -231,7 +237,7 @@ impl<'de, S: ProviderSelection> Deserialize<'de> for ProviderTable<S> {
             type Value = ProviderTable<S>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a provider table with a `provider` key and named tables")
+                formatter.write_str("a provider table with its selection key and named tables")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -241,9 +247,16 @@ impl<'de, S: ProviderSelection> Deserialize<'de> for ProviderTable<S> {
                 let mut table = ProviderTable::<S>::default();
                 while let Some(key) = map.next_key::<String>()? {
                     let value = map.next_value::<Value>()?;
-                    if key == SELECTOR_KEY {
+                    if key == S::KEY {
                         table.selected = S::from_value(value).map_err(de::Error::custom)?;
                         continue;
+                    }
+                    if key == "provider" {
+                        return Err(de::Error::custom(format!(
+                            "`provider` is `{}` here. Name what runs with `{}`",
+                            S::KEY,
+                            S::KEY
+                        )));
                     }
                     match value {
                         Value::Object(settings) => {
@@ -251,7 +264,8 @@ impl<'de, S: ProviderSelection> Deserialize<'de> for ProviderTable<S> {
                         }
                         _ => {
                             return Err(de::Error::custom(format!(
-                                "`{key}` is not a setting of this table. Only `provider` and named provider tables belong here"
+                                "`{key}` is not a setting of this table. Only `{}` and named provider tables belong here",
+                                S::KEY
                             )));
                         }
                     }
@@ -273,7 +287,7 @@ impl<S: ProviderSelection> Serialize for ProviderTable<S> {
         let mut map =
             serializer.serialize_map(Some(self.tables.len() + usize::from(selection.is_some())))?;
         if let Some(selection) = selection {
-            map.serialize_entry(SELECTOR_KEY, &selection)?;
+            map.serialize_entry(S::KEY, &selection)?;
         }
         for (name, settings) in &self.tables {
             map.serialize_entry(name, settings)?;
@@ -293,7 +307,7 @@ mod tests {
     #[test]
     fn reads_the_selection_and_named_tables() {
         let table = list(serde_json::json!({
-            "provider": ["pbs_demo", "aps"],
+            "modules": ["pbs_demo", "aps"],
             "pbs_demo": { "implementation": "prebid_server", "endpoint": "https://pbs.example" }
         }))
         .expect("should read a provider list");
@@ -317,7 +331,7 @@ mod tests {
     #[test]
     fn rejects_a_table_that_is_not_selected() {
         let table = list(serde_json::json!({
-            "provider": ["aps"],
+            "modules": ["aps"],
             "pbs_demo": { "endpoint": "https://pbs.example" }
         }))
         .expect("should read the table");
@@ -334,7 +348,7 @@ mod tests {
     #[test]
     fn rejects_a_name_selected_twice() {
         let table =
-            list(serde_json::json!({ "provider": ["aps", "aps"] })).expect("should read the table");
+            list(serde_json::json!({ "modules": ["aps", "aps"] })).expect("should read the table");
 
         let error = table
             .validate("demand")
@@ -345,7 +359,7 @@ mod tests {
     #[test]
     fn rejects_names_that_are_not_snake_case() {
         for name in ["pbs-demo", "PbsDemo", "1pbs", ""] {
-            let table = list(serde_json::json!({ "provider": [name] })).expect("should read");
+            let table = list(serde_json::json!({ "modules": [name] })).expect("should read");
             let error = table
                 .validate("demand")
                 .expect_err("should reject a name that is not snake_case");
@@ -358,7 +372,7 @@ mod tests {
 
     #[test]
     fn rejects_a_value_that_is_not_a_table() {
-        let error = list(serde_json::json!({ "provider": ["aps"], "timeout_ms": 500 }))
+        let error = list(serde_json::json!({ "modules": ["aps"], "timeout_ms": 500 }))
             .expect_err("should reject a stray value");
         assert!(
             error.to_string().contains("`timeout_ms` is not a setting"),
@@ -369,20 +383,38 @@ mod tests {
     #[test]
     fn a_choice_takes_one_name_and_a_list_takes_a_list() {
         let choice: ProviderChoice =
-            serde_json::from_value(serde_json::json!({ "provider": "adserver_mock" }))
+            serde_json::from_value(serde_json::json!({ "module": "adserver_mock" }))
                 .expect("should read a single name");
         assert_eq!(choice.selected(), vec!["adserver_mock"]);
 
-        serde_json::from_value::<ProviderChoice>(serde_json::json!({ "provider": ["a"] }))
+        serde_json::from_value::<ProviderChoice>(serde_json::json!({ "module": ["a"] }))
             .expect_err("a single-provider type should refuse a list");
-        serde_json::from_value::<ProviderList>(serde_json::json!({ "provider": "a" }))
+        serde_json::from_value::<ProviderList>(serde_json::json!({ "modules": "a" }))
             .expect_err("a list type should refuse a single name");
+    }
+
+    #[test]
+    fn refuses_the_previous_selection_key() {
+        let error = list(serde_json::json!({ "provider": ["aps"] }))
+            .expect_err("should refuse the key the selection was written under before");
+        assert!(
+            error.to_string().contains("`provider` is `modules` here"),
+            "the refusal names the key to use: {error}"
+        );
+
+        let error =
+            serde_json::from_value::<ProviderChoice>(serde_json::json!({ "provider": "a" }))
+                .expect_err("should refuse the previous key for a type that runs one");
+        assert!(
+            error.to_string().contains("`provider` is `module` here"),
+            "the refusal names the key to use: {error}"
+        );
     }
 
     #[test]
     fn round_trips_through_serialization() {
         let table = list(serde_json::json!({
-            "provider": ["pbs_demo"],
+            "modules": ["pbs_demo"],
             "pbs_demo": { "implementation": "prebid_server", "timeout_ms": 900 }
         }))
         .expect("should read the table");

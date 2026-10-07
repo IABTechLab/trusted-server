@@ -175,8 +175,8 @@ only the asset proxy entries you want to serve or block. Then validate it.
 Edit `trusted-server.toml` to configure:
 
 - the integrations that run, in `[integration] module`, with their settings under `[integration.<id>]`
-- the demand sources, in `[demand] provider`, each with its settings under `[demand.<name>]`
-- the ad server, if one runs, in `[adserver] provider`, with its settings under `[adserver.<name>]`
+- the demand sources, in `[demand] modules`, each with its settings under `[demand.<name>]`
+- the ad server, if one runs, in `[ad-server] module`, with its settings under `[ad-server.<name>]`
 - server bidder routes under `[auction.bidders.<code>]`
 - KV store mappings
 - Edge Cookie configuration under `[ec]`

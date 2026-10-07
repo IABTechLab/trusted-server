@@ -22,7 +22,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main", "aps_main"]
+modules = ["pbs_main", "aps_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -37,18 +37,18 @@ account_id = "example-aps-account"
 debug = false
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
 
 Replace the example endpoints and account values before running the server.
-Leave `[adserver]` out to test local highest-bid selection with no ad server.
+Leave `[ad-server]` out to test local highest-bid selection with no ad server.
 
 ## Send a routed request
 

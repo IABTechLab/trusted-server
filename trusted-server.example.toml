@@ -19,17 +19,16 @@
 # so replace them with your real endpoints in your private config, not in this
 # template.
 #
-# Everything this deployment can switch on is selected the same way. The ec,
-# geo, device, permission_signal and integration tables take a `module` key,
-# and the auction's demand and adserver tables take a `provider` key:
+# Everything this deployment can switch on is a module, selected the same way,
+# with `module` where one runs and `modules` where several run:
 #
 #   [<type>]
-#   module = "<name>"     # a string where one runs, a list where several run
+#   module = "<name>"     # modules = [...] where several run
 #
 #   [<type>.<name>]       # only when that name has settings
 #   setting = "value"
 #
-# The types are ec, geo, device, permission_signal, demand, adserver and
+# The types are ec, geo, device, permission-signal, demand, ad-server and
 # integration. A settings table its type's selector does not name refuses
 # startup, so there is no stale block to misread. The complete rules, and what
 # is checked when, are in docs/guide/configuration-rules.md.
@@ -277,7 +276,7 @@ pull_sync_concurrency = 3
 # publisher does not want to act on. A module that is not on the list does
 # not run, and there is no separate switch to turn one off. An unknown or
 # repeated name is refused at startup rather than quietly ignored. None of the
-# four has settings, so none needs a [permission_signal.<name>] table.
+# four has settings, so none needs a [permission-signal.<name>] table.
 #
 # [permission-signal]
 # modules = [
@@ -414,7 +413,7 @@ module = []
 # immutable = true
 
 # Server-side auction. [auction] holds the settings that belong to the auction
-# itself, [demand] selects the demand sources, [adserver] selects the ad server
+# itself, [demand] selects the demand sources, [ad-server] selects the ad server
 # that picks the winner, and [auction.bidders.<code>] says which demand source a
 # browser bidder code is routed to. Kept active with the creative-processing
 # leaves present so the EdgeZero environment override can apply to them.
@@ -450,7 +449,7 @@ allowed_context_keys = []
 # openrtb, prebid_server and aps. Every endpoint must be HTTPS, or HTTP to
 # 127.0.0.1, ::1 or localhost.
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -466,13 +465,13 @@ suppress_all = false
 suppress_seats = []
 
 [auction.bidders.example-bidder]
-provider = "pbs_main"
+module = "pbs_main"
 
 # APS is a demand implementation too, not a page integration, so everything it
 # owns lives in its own table. Use routing = "all_eligible" when every
 # banner-compatible slot should be eligible. The APS timeout defaults to
 # 800 ms, and debug, script creatives and publisher-native rendering all
-# default to off. Add "aps_main" to the [demand] provider list above when
+# default to off. Add "aps_main" to the [demand] modules list above when
 # uncommenting this.
 # [demand.aps_main]
 # implementation = "aps"
@@ -485,17 +484,17 @@ provider = "pbs_main"
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
 
-# The ad server that picks the auction winner. With no [adserver] selection the
+# The ad server that picks the auction winner. With no [ad-server] selection the
 # highest bid wins. The only implementation this repository ships is
 # adserver_mock, for development and testing.
-# [adserver]
-# provider = "adserver_mock"
+# [ad-server]
+# module = "adserver_mock"
 #
-# [adserver.adserver_mock]
+# [ad-server.adserver_mock]
 # endpoint = "https://adserver.example.com/decide"
 # timeout_ms = 1000
 # Map auction context keys to decision-URL query params:
-# [adserver.adserver_mock.context_query_params]
+# [ad-server.adserver_mock.context_query_params]
 # example_segments = "segments"
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.

@@ -66,7 +66,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -90,7 +90,7 @@ suppress_all = false
 suppress_seats = ["example-seat"]
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 ### Browser configuration options
@@ -631,7 +631,7 @@ owned by Trusted Server.
 client_side_bidders = ["example-browser"]
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 ```
 
 Do not route the same bidder through `[auction.bidders]` while also listing it in

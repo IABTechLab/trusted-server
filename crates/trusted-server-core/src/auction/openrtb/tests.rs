@@ -55,7 +55,7 @@ fn config_with_endpoint(
         config.bidders = BTreeMap::from([(
             BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
             BidderRouteConfig {
-                provider: provider_id,
+                module: provider_id,
             },
         )]);
     }
@@ -656,7 +656,7 @@ fn pbs_disabled_empty_candidate_does_not_become_stored_demand() {
     raw.bidders.insert(
         crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
         BidderRouteConfig {
-            provider: ProviderId::from_str("fictional_provider").expect("should parse provider"),
+            module: ProviderId::from_str("fictional_provider").expect("should parse provider"),
         },
     );
     let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
@@ -963,7 +963,7 @@ fn standard_fixture_with_formats(
     raw.bidders.insert(
         BidderId::from_str("exampleBidder").expect("should parse bidder"),
         BidderRouteConfig {
-            provider: ProviderId::from_str("fictional_provider").expect("should parse provider"),
+            module: ProviderId::from_str("fictional_provider").expect("should parse provider"),
         },
     );
     let plan = AuctionPlan::compile(raw).expect("should compile standard fixture plan");

@@ -7,46 +7,47 @@ request, and why the file is built this way.
 
 ## One rule for every type
 
-Almost everything Trusted Server can switch on is selected the same way. The
-Edge Cookie identity, the location and device lookups, the permission signals
-and the page integrations are modules, selected with a `module` key. The
-demand sources in an auction and the ad server that picks the winner are the
-auction's providers, selected with a `provider` key, which is the one meaning
-that word keeps. Everything else about the two is the same.
+Everything Trusted Server can switch on is a module, selected the same way:
+the Edge Cookie identity, the location and device lookups, the permission
+signals, the demand sources in an auction, the ad server that picks the
+winner, and the page integrations.
 
 ```toml
 [<type>]
-module = "<name>"              # provider = ... for demand and adserver,
-                               # and a list where several run
+module = "<name>"              # modules = [...] where several run
 
 [<type>.<name>]                # only when the selected name has settings
 setting = "value"
 ```
 
 1. **The type is the job.** Each type is one top-level table, named for what
-   it selects. `ec`, `geo`, `device`, `permission_signal` and `integration`
-   select modules, and `demand` and `adserver` select the auction's providers.
-2. **The selector chooses what runs.** It is `module` for the five module
-   types and `provider` for the two auction types. A type that runs one takes
-   a string. A type that runs several takes a list.
+   its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand`,
+   `ad-server` and `integration`.
+2. **The selector chooses what runs.** A type that runs one module takes
+   `module`, a string. A type that runs several takes `modules`, a list.
 3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
    needs no table at all.
 4. **The name is the implementation.** `[ec.hmac]` configures the `hmac`
    implementation. To run an implementation under a name of your own, add an
    `implementation` line. That is how two Prebid Servers run side by side.
-5. **Names are snake_case,** like every key in the file.
+5. **A name is parts joined by `.`,** each of lower case letters, digits, `_`
+   or `-`. A module from a crate is named by its folder below `crates/`, and
+   may be written in full, as `permission-signal.gpc`, or with its section's
+   type folder left off. Core's own modules, such as `hmac`, take bare names.
+   A `[demand]` or `[ad-server]` name is snake_case, because it may be a label
+   of your own.
 6. **Secrets are key names.** A secret setting holds the name of a key in
    `trusted_server_secrets`, never the secret itself.
 
-| Type                | Runs              | Selector             | Implementations in this repository                                                                                                                                    |
-| ------------------- | ----------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ec`                | one               | `module`, a string   | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity                                                               |
-| `geo`               | one               | `module`, a string   | `platform`, `none`, or an integration that supplies location                                                                                                          |
-| `device`            | one               | `module`, a string   | `builtin` (the default), `fastly`, or an integration that supplies device signals                                                                                     |
-| `permission_signal` | several, in order | `module`, a list     | `gpc`, `gpp_sale_opt_out`, `us_privacy`, `tcf`                                                                                                                        |
-| `demand`            | several           | `provider`, a list   | `openrtb`, `prebid_server`, `aps`                                                                                                                                     |
-| `adserver`          | one               | `provider`, a string | `adserver_mock`                                                                                                                                                       |
-| `integration`       | several           | `module`, a list     | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
+| Type                | Runs              | Selector           | Implementations in this repository                                                                                                                                    |
+| ------------------- | ----------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ec`                | one               | `module`, a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity                                                               |
+| `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                                                                                          |
+| `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                                                                                     |
+| `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                                                                                     |
+| `demand`            | several           | `modules`, a list  | `openrtb`, `prebid_server`, `aps`                                                                                                                                     |
+| `ad-server`         | one               | `module`, a string | `adserver_mock`                                                                                                                                                       |
+| `integration`       | several           | `modules`, a list  | `datadome`, `didomi`, `google_tag_manager`, `gpt`, `gpt_diagnostics`, `js_asset_proxy`, `lockr`, `nextjs`, `osano`, `permutive`, `prebid`, `sourcepoint`, `testlight` |
 
 `openrtb`, `prebid_server`, `aps` and `adserver_mock` supply implementations
 only. They are not page integrations and cannot be named in
@@ -63,14 +64,14 @@ partner registry and the cluster thresholds, and `[geo]` holds
 
 ### Leaving the selector out
 
-| Type                | With no `module` or `provider` line                       |
+| Type                | With no `module` or `modules` line                        |
 | ------------------- | --------------------------------------------------------- |
 | `ec`                | no Edge Cookie is created                                 |
 | `geo`               | no location is resolved and no host geo service is called |
 | `device`            | `builtin` runs, which reads the User-Agent only           |
-| `permission_signal` | every linked module runs, in the order shown above        |
+| `permission-signal` | every linked module runs, in the order shown above        |
 | `demand`            | no demand source is called                                |
-| `adserver`          | the highest bid wins, with no ad server                   |
+| `ad-server`         | the highest bid wins, with no ad server                   |
 | `integration`       | no integration runs                                       |
 
 ## What is checked before a request is served
@@ -89,10 +90,10 @@ the two lists say which.
 - A setting the selected name does not know. Every module and provider
   rejects unknown keys, so
   a misspelled setting fails instead of being ignored.
-- A name that is not snake_case, or a name selected twice.
+- A name that is not a module name, or a name selected twice.
 - A key in a type's table that is neither the selector, one of that type's
   own settings, nor a named settings table.
-- A `demand` or `adserver` endpoint that is not HTTPS. Plain HTTP is allowed
+- A `demand` or `ad-server` endpoint that is not HTTPS. Plain HTTP is allowed
   only to `127.0.0.1`, `::1` or `localhost`, so a local test stack runs
   without certificates and nothing leaves the machine unencrypted. An endpoint
   carrying credentials or a fragment is refused in every case.
@@ -104,11 +105,11 @@ the two lists say which.
 set. It is everything that can be decided from the file and from the
 implementations compiled into the CLI.
 
-- The whole auction plan, compiled from `[demand]`, `[adserver]` and
+- The whole auction plan, compiled from `[demand]`, `[ad-server]` and
   `[auction.bidders]`. That covers unselected tables, names that are not
-  snake_case, an implementation this build does not have, endpoint scheme and
+  a module name, an implementation this build does not have, endpoint scheme and
   host, timeouts, routing modes, notification bounds, a bidder route naming a
-  demand source `[demand] provider` does not select, and any setting the
+  demand source `[demand] modules` does not select, and any setting the
   chosen implementation rejects.
 - Every selected integration's own settings, and the refusal of a block for an
   integration `[integration] module` does not name, of an `enabled` key left
@@ -123,7 +124,7 @@ implementations compiled into the CLI.
 Everything above runs again, on the configuration the instance actually
 loaded, and these join it.
 
-- Which modules `[ec]`, `[geo]`, `[device]` and `[permission_signal]`
+- Which modules `[ec]`, `[geo]`, `[device]` and `[permission-signal]`
   select. Those four are settled where the adapter composes the build, so a
   name this build does not have, a missing settings table, or a table the
   selector does not name, stops the service on its next start rather than the
@@ -220,11 +221,11 @@ module = "platform"
 [device]
 module = "builtin"
 
-[permission_signal]
-module = ["gpc", "gpp_sale_opt_out", "us_privacy", "tcf"]
+[permission-signal]
+modules = ["gpc", "gpp", "us-privacy", "tcf"]
 
 [demand]
-provider = ["pbs_main"]
+modules = ["pbs_main"]
 
 [demand.pbs_main]
 implementation = "prebid_server"           # the name is a label of your own
@@ -232,10 +233,10 @@ endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1200                          # this demand source only
 consent_forwarding = "both"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
@@ -244,7 +245,7 @@ enabled = true
 timeout_ms = 2000                          # the whole auction
 
 [auction.bidders.example-server]
-provider = "pbs_main"
+module = "pbs_main"
 
 [creative_opportunities]
 enabled = true
@@ -264,7 +265,7 @@ both at the same implementation.
 
 ```toml
 [demand]
-provider = ["pbs_main", "pbs_house"]
+modules = ["pbs_main", "pbs_house"]
 
 [demand.pbs_main]
 implementation = "prebid_server"
@@ -277,19 +278,19 @@ endpoint = "https://house.example.com/openrtb2/auction"
 
 ## Moving from the previous layout
 
-| Previous                                                                   | Now                                                                                                 |
-| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `[integrations.<id>]` with `enabled = true`                                | `<id>` in `[integration] module`, and `[integration.<id>]` only for settings                        |
-| `[ec.providers.<name>]`                                                    | `[ec.<name>]`                                                                                       |
-| `[permission_signal] sources`                                              | `[permission_signal] module`                                                                        |
-| `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `us-privacy`           | `host_signals`, `client_fixed`, `gpp_sale_opt_out`, `us_privacy`                                    |
-| `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config` | `[demand] provider` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
-| `profile = "standard"`                                                     | `implementation = "openrtb"`                                                                        |
-| `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`  | `[adserver] provider = "adserver_mock"` and `[adserver.adserver_mock]`                              |
-| `[integrations.aps] rendering_mode`                                        | `rendering_mode` in the `[demand.<name>]` table of the `aps` provider                               |
-| `[debug.auction_html_comment_options] include_mediator_response`           | `include_adserver_response`                                                                         |
+| Previous                                                                             | Now                                                                                                |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `[integrations.<id>]` with `enabled = true`                                          | `<id>` in `[integration] module`, and `[integration.<id>]` only for settings                       |
+| `[ec.providers.<name>]`                                                              | `[ec.<name>]`                                                                                      |
+| `[permission_signal] sources`                                                        | `[permission-signal] modules`                                                                      |
+| `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `gpp_sale_opt_out`, `us_privacy` | `host_signals`, `client_fixed`, `gpp`, `us-privacy`                                                |
+| `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config`           | `[demand] modules` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
+| `profile = "standard"`                                                               | `implementation = "openrtb"`                                                                       |
+| `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`            | `[ad-server] module = "adserver_mock"` and `[ad-server.adserver_mock]`                             |
+| `[integrations.aps] rendering_mode`                                                  | `rendering_mode` in the `[demand.<name>]` table of the `aps` provider                              |
+| `[debug.auction_html_comment_options] include_mediator_response`                     | `include_adserver_response`                                                                        |
 
-The word mediator is gone with it. It is "ad server" in prose and `adserver`
+The word mediator is gone with it. It is "ad server" in prose and `ad-server`
 in configuration, and the auction response metadata that read
 `parallel_mediation` now reads `parallel_adserver`.
 

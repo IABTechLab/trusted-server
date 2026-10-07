@@ -16928,7 +16928,7 @@ mod tests {
 
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[demand]\nprovider = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[auction]\nenabled = true\n\n[demand]\nmodules = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
@@ -25573,7 +25573,7 @@ mod tests {
 
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[demand]\nprovider = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[auction]\nenabled = true\n\n[demand]\nmodules = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"openrtb\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );

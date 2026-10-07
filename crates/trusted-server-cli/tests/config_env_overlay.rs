@@ -119,7 +119,7 @@ fn config_validate_explains_legacy_provider_list_migration() {
         "error should identify the removed field: {stderr}"
     );
     assert!(
-        stderr.contains("[demand] provider"),
+        stderr.contains("[demand] modules"),
         "error should name where the setting moved to: {stderr}"
     );
 }
@@ -389,7 +389,7 @@ fn map_shaped_provider_and_bidder_environment_overlays_apply() {
         "https://overlay.example/openrtb2/auction"
     );
     assert_eq!(
-        envelope["data"]["auction"]["bidders"]["example-bidder"]["provider"],
+        envelope["data"]["auction"]["bidders"]["example-bidder"]["module"],
         "pbs_main"
     );
 }

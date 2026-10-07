@@ -265,7 +265,7 @@ pub(crate) fn build_state_with_registrations(
     warn_if_certificate_check_disabled(&settings);
 
     // The plan is compiled with the integrations this adapter was given, so an
-    // `[adserver]` or `[demand]` name one of their builders supplies resolves
+    // `[ad-server]` or `[demand]` name one of their builders supplies resolves
     // here. Compiling without them would drop the implementation and report the
     // name as one no builder registers.
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
@@ -1770,7 +1770,7 @@ mod tests {
             [auction]
             enabled = true
             [demand]
-            provider = ["prebid"]
+            modules = ["prebid"]
 
             [demand.prebid]
             implementation = "prebid_server"

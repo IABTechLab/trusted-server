@@ -38,7 +38,7 @@ enabled = true
 timeout_ms = 2000
 
 [demand]
-provider = ["aps_main"]
+modules = ["aps_main"]
 
 [demand.aps_main]
 implementation = "aps"
@@ -53,10 +53,10 @@ rendering_mode = "trusted_server"
 # inventory_domain = "inventory.example.com"
 # inventory_page_origin = "https://www.inventory.example.com"
 
-[adserver]
-provider = "adserver_mock"
+[ad-server]
+module = "adserver_mock"
 
-[adserver.adserver_mock]
+[ad-server.adserver_mock]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -148,7 +148,7 @@ bidder route:
 
 ```toml
 [demand]
-provider = ["aps_main"]
+modules = ["aps_main"]
 
 [demand.aps_main]
 implementation = "aps"
@@ -157,11 +157,11 @@ routing = "explicit"
 account_id = "example-aps-account"
 
 [auction.bidders.aps]
-provider = "aps_main"
+module = "aps_main"
 ```
 
-The optional ad server stays separate under `[adserver] provider`. Never name
-it in `[demand] provider` or `[auction.bidders]`.
+The optional ad server stays separate under `[ad-server] module`. Never name
+it in `[demand] modules` or `[auction.bidders]`.
 
 APS uses ordinary auction slot IDs and banner formats. Legacy creative-
 opportunity APS `slot_id` values are ignored, and `bidders.aps.slotID` is not
@@ -353,7 +353,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 - Confirm the endpoint is `/e/pb/bid` and uses HTTPS without credentials.
 - If the deployment hostname differs from APS-authorized inventory, configure both `inventory_domain` and `inventory_page_origin` with the APS-approved identity.
 - Ensure a `[demand.<name>]` table sets `implementation = "aps"` and that
-  `[demand] provider` names it.
+  `[demand] modules` names it.
 - Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
 - Confirm the demand source timeout fits inside the auction timeout.
 - On a controlled test site, set `debug = true` in that table and inspect
