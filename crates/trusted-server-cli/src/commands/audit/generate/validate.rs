@@ -126,6 +126,7 @@ mod tests {
         );
         let parsed: TrustedServerAppConfig =
             toml::from_str(&invalid).expect("should accept source syntax and schema");
+        crate::app_config::register_stock_modules();
         assert!(
             TrustedServerAppConfig::new(parsed.into_settings()).is_err(),
             "should exercise deploy validation"

@@ -5870,6 +5870,7 @@ dependencies = [
  "trusted-server-adapter-cloudflare",
  "trusted-server-adapter-spin",
  "trusted-server-core",
+ "trusted-server-modules",
  "urlencoding",
 ]
 

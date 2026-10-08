@@ -121,6 +121,9 @@ fn build_app_config_envelope(
     if let Some(origin_url) = origin_url {
         settings.publisher.origin_url = origin_url.to_string();
     }
+    // The fixture selects modules a stock build ships, so validation needs
+    // the stock list as the adapters and the `ts` tool have it.
+    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
     let app_config = TrustedServerAppConfig::new(settings)
         .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
 
