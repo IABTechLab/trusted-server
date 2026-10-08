@@ -1,0 +1,1690 @@
+//! Edge Cookie identity modules.
+//!
+//! An [`EdgeCookieModule`] derives an Edge Cookie identifier. The module is
+//! selected by configuration, with no default, and [`build_module`] is the
+//! composition root that builds the selected one. A built-in module is
+//! constructed from its `[ec.<name>]` block, and a vendor module is taken
+//! from the adapter that injected it. Construction reads no request data,
+//! so a selection this deployment cannot satisfy fails at startup rather than
+//! leaving it running without an identity. Fastly, Cloudflare and Spin resolve
+//! the module once per application state and thread the result. Axum and
+//! embedders resolve per request.
+//!
+//! Request evidence reaches a module at call time rather than at
+//! construction. [`EdgeCookieModule::generate`] borrows a [`RequestInfo`],
+//! which carries the normalized client IP, the User-Agent and the request
+//! headers, for the life of the call, alongside an [`IdentityInput`] holding
+//! the request's gating context. A module reads what it needs and retains
+//! nothing. Core snapshots the headers, path and query it lends to the module
+//! at generate time, and the module itself keeps none of it.
+//!
+//! [`HmacModule`] is the built-in server-side implementation. It derives the
+//! identifier from the client IP using HMAC over the configured passphrase.
+
+use std::sync::Arc;
+
+use error_stack::Report;
+use serde::{Deserialize, Serialize};
+
+use crate::consent::ConsentContext;
+use crate::error::TrustedServerError;
+use crate::evidence::RequestInfo;
+use crate::redacted::Redacted;
+use crate::settings::{Ec, EcModuleBlock};
+
+use super::cookies::ec_id_has_only_allowed_chars;
+use super::generation;
+
+/// The Edge Cookie identity module a deployment has selected.
+///
+/// Deserialized from the `[ec] module` string and serialized back to the
+/// same string. Module names are open-ended (a vendor crate names its own),
+/// so every name other than the explicit `"none"` becomes
+/// [`Named`](Self::Named) rather than a parse failure, and whether the
+/// deployment can actually supply that module is decided by
+/// [`build_module`].
+///
+/// No module has a variant of its own, so every module is selected the
+/// same way, by name, and no caller can be written around one module being
+/// different.
+///
+/// This is the one place the selector is spelled. Everything that needs to ask
+/// which module is selected matches on this rather than comparing string
+/// literals.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(from = "String", into = "String")]
+pub enum EcModuleSelection {
+    /// Explicit statelessness, spelled `"none"`. The same meaning as omitting
+    /// the selector: no Edge Cookie is created and no module block may be
+    /// configured.
+    None,
+
+    /// A module selected by name, configured by the matching `[ec.<name>]`
+    /// block when it has settings. The name is the implementation unless that
+    /// block names one, and [`build_module`] resolves the implementation,
+    /// whether it is built into core or injected by the adapter.
+    Named(String),
+}
+
+impl EcModuleSelection {
+    /// The configuration spelling of explicit statelessness.
+    pub const NONE_KEY: &'static str = "none";
+
+    /// The configuration key this selection is written as.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::None => Self::NONE_KEY,
+            Self::Named(key) => key,
+        }
+    }
+}
+
+impl From<&str> for EcModuleSelection {
+    fn from(key: &str) -> Self {
+        match key {
+            EcModuleSelection::NONE_KEY => Self::None,
+            other => Self::Named(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for EcModuleSelection {
+    fn from(key: String) -> Self {
+        match key.as_str() {
+            EcModuleSelection::NONE_KEY => Self::None,
+            _ => Self::Named(key),
+        }
+    }
+}
+
+impl From<EcModuleSelection> for String {
+    fn from(selection: EcModuleSelection) -> Self {
+        match selection {
+            EcModuleSelection::None => EcModuleSelection::NONE_KEY.to_owned(),
+            EcModuleSelection::Named(key) => key,
+        }
+    }
+}
+
+/// The implementation id of the HMAC module built into core.
+///
+/// It is also [`HmacModule::id`]'s return value and the text of
+/// [`HMAC_MODULE_CODE`].
+pub const HMAC_MODULE_KEY: &str = "hmac";
+
+/// The type folder of every Edge Cookie crate, which a name written in
+/// `[ec] module` or an `implementation` line may leave off.
+pub const MODULE_TYPE: &str = "edgecookie";
+
+/// The implementation ids core supplies itself, one per resolution arm in
+/// [`resolve_named_module`].
+///
+/// [`build_module`] refuses an injected module under one of these ids
+/// rather than picking one of the two.
+const BUILTIN_MODULE_KEYS: &[&str] = &[HMAC_MODULE_KEY];
+
+/// The registry code of the built-in HMAC module.
+///
+/// The same text as [`HMAC_MODULE_KEY`], but a different role: this is the
+/// `{code}~` namespace stamped on every identifier the built-in module
+/// creates, and it is what [`generation`] matches when it decides whether an
+/// enveloped identifier is one of its own.
+pub const HMAC_MODULE_CODE: ModuleCode = crate::module_code!(HMAC_MODULE_KEY);
+
+/// The request-scoped gating context passed to [`EdgeCookieModule::generate`].
+///
+/// Request data reaches a module through the `request_info` parameter of
+/// [`EdgeCookieModule::generate`], not through this struct and not through
+/// anything injected into the module's constructor. This struct carries only
+/// the per-request gating context a module may read for behavior beyond
+/// gating. On the organic request path the gate has confirmed Edge Cookie
+/// storage is allowed before `generate` is called. A test calling
+/// `edge_cookie::generate_ec_id` reaches `generate` without that gate.
+#[derive(Default)]
+pub struct IdentityInput<'a> {
+    /// The request's consent context, when available, for module-specific
+    /// logic. The core gates generation before calling the module, so a
+    /// module reads this only to forward or record consent. [`HmacModule`]
+    /// ignores it.
+    pub consent: Option<&'a ConsentContext>,
+}
+
+/// The outcome of [`EdgeCookieModule::generate`].
+///
+/// Carries the derived identifier, if any, and any response headers the module
+/// needs set on the outbound response.
+#[derive(Debug, Default)]
+pub struct GeneratedEdgeCookie {
+    /// The derived Edge Cookie identifier, or `None` when the module produced
+    /// none for this request.
+    pub id: Option<String>,
+
+    /// Response headers the module needs set on the outbound response, for
+    /// example to request additional client evidence on later requests. Empty
+    /// for modules that set no headers, such as [`HmacModule`].
+    ///
+    /// Core checks every header here against its own reserved response surface
+    /// (see [`reserved_response_effect`]) before it is applied, so a module
+    /// may set its own cookies and headers but cannot reach into the surface
+    /// core manages.
+    pub response_headers: Vec<(http::HeaderName, http::HeaderValue)>,
+}
+
+/// The cookie-name namespace Trusted Server manages.
+///
+/// Every cookie core writes or reads as part of its own behavior is named
+/// `ts-<something>` (`ts-ec` in [`COOKIE_TS_EC`](crate::constants::COOKIE_TS_EC),
+/// `ts-eids` in [`COOKIE_TS_EIDS`](crate::constants::COOKIE_TS_EIDS), and
+/// `ts-tester` in [`COOKIE_TS_TESTER`](crate::constants::COOKIE_TS_TESTER)), so
+/// core defends the whole prefix rather than a list that a new managed cookie
+/// would silently outgrow. `sharedId` is deliberately not reserved: core only
+/// reads it, and it belongs to the page's own identity stack.
+const MANAGED_COOKIE_NAME_PREFIX: &[u8] = b"ts-";
+
+/// The response-header namespace Trusted Server reserves for itself.
+///
+/// Covers the fixed EC output headers and the per-partner
+/// `x-ts-<source_domain>` headers, which is why the prefix is reserved rather
+/// than the four names in
+/// [`INTERNAL_HEADERS`](crate::constants::INTERNAL_HEADERS).
+const RESERVED_RESPONSE_HEADER_PREFIX: &str = "x-ts-";
+
+/// Response headers that frame an HTTP message, are hop-by-hop, or govern
+/// caching.
+///
+/// The hop-by-hop set is RFC 7230 §6.1, plus `content-length`, which frames the
+/// body the adapter is about to write, and `cache-control`, which governs
+/// whether the response may be cached. A module that set any of these would
+/// be rewriting the response envelope rather than adding evidence to it, and a
+/// module setting `cache-control` could make an identity-bearing response
+/// publicly cacheable, so it is reserved with the rest.
+const FRAMING_OR_HOP_BY_HOP_HEADERS: &[&str] = &[
+    "cache-control",
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Why one module response header falls inside core's reserved surface.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display)]
+pub enum ReservedResponseEffect {
+    /// A `Set-Cookie` naming a cookie in the `ts-` namespace core manages.
+    #[display("sets a cookie in the `ts-` namespace Trusted Server manages")]
+    ManagedCookie,
+
+    /// A header in the `x-ts-` namespace core emits and strips.
+    #[display("sets a header in the reserved `x-ts-` namespace")]
+    ReservedHeader,
+
+    /// A framing, hop-by-hop, or caching header core manages.
+    #[display("sets a framing, hop-by-hop, or caching header core manages")]
+    FramingHeader,
+}
+
+/// The cookie name in a `Set-Cookie` value, as raw bytes.
+///
+/// Reads the bytes rather than a `&str` so a value that is not valid UTF-8
+/// cannot smuggle a managed cookie name past the check.
+fn set_cookie_name(value: &[u8]) -> &[u8] {
+    let pair_end = value.iter().position(|b| *b == b';').unwrap_or(value.len());
+    let pair = &value[..pair_end];
+    let name_end = pair.iter().position(|b| *b == b'=').unwrap_or(pair.len());
+    pair[..name_end].trim_ascii()
+}
+
+/// Classifies one module response header against core's reserved surface.
+///
+/// Returns `Some` when the header would reach into what core manages, and
+/// `None` for everything else, including a module's own cookie. Modules
+/// legitimately need to set cookies of their own (an evidence cookie for a
+/// later request, for example), so the rule reserves core's namespace rather
+/// than banning `Set-Cookie` outright.
+///
+/// A rejected effect is not simply dropped while the rest of the module
+/// response goes ahead. Generation returns an error instead, as it does for a
+/// module creating an identifier outside the cookie-safe alphabet, because a
+/// module reaching into the reserved surface has broken its contract in the
+/// same way. The check runs before anything from that module response is
+/// kept, so neither its identifier nor any of its headers is kept. The
+/// publisher proxy and integration proxy log the error and serve the response
+/// without an Edge Cookie, and orphan recovery in EC finalization leaves the
+/// visitor's existing cookie in place. Applying the header instead would let a
+/// module set `ts-ec` directly, bypassing core's identifier validation and
+/// its requirement that a created identifier have an identity-graph row.
+#[must_use]
+pub fn reserved_response_effect(
+    name: &http::HeaderName,
+    value: &http::HeaderValue,
+) -> Option<ReservedResponseEffect> {
+    let lower = name.as_str();
+    if lower == http::header::SET_COOKIE.as_str() {
+        let cookie_name = set_cookie_name(value.as_bytes());
+        if cookie_name.len() >= MANAGED_COOKIE_NAME_PREFIX.len()
+            && cookie_name[..MANAGED_COOKIE_NAME_PREFIX.len()]
+                .eq_ignore_ascii_case(MANAGED_COOKIE_NAME_PREFIX)
+        {
+            return Some(ReservedResponseEffect::ManagedCookie);
+        }
+        return None;
+    }
+    if lower.starts_with(RESERVED_RESPONSE_HEADER_PREFIX) {
+        return Some(ReservedResponseEffect::ReservedHeader);
+    }
+    if FRAMING_OR_HOP_BY_HOP_HEADERS.contains(&lower) {
+        return Some(ReservedResponseEffect::FramingHeader);
+    }
+    None
+}
+
+/// Appends a module's response headers to a response that already carries
+/// the publisher origin's own.
+///
+/// Appending keeps the origin's `Set-Cookie` and `Vary` lines, and lets a
+/// module set more than one cookie of its own.
+/// [`reserved_response_effect`] has already refused the single-valued headers
+/// core owns, so nothing a module may set here needs to replace a value.
+pub(crate) fn apply_module_response_headers<I>(headers: &mut http::HeaderMap, module_headers: I)
+where
+    I: IntoIterator<Item = (http::HeaderName, http::HeaderValue)>,
+{
+    for (name, value) in module_headers {
+        headers.append(name, value);
+    }
+}
+
+/// The registered short code that namespaces one Edge Cookie module's
+/// identifiers.
+///
+/// Exactly four characters from `[a-z0-9]`, allocated append-only in the
+/// module-code registry and never reused. The code appears as the
+/// `{code}~` prefix of every identifier the module creates, so identifiers
+/// from different modules can never collide in the cookie, the identity
+/// graph, or a withdrawal, and each identifier records which module
+/// created it.
+#[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, derive_more::Display)]
+pub struct ModuleCode(&'static str);
+
+impl ModuleCode {
+    /// Creates a module code when `code` matches the registry format.
+    ///
+    /// Returns `None` when `code` is not exactly four characters of `[a-z0-9]`,
+    /// so a caller that assembles a code from anything other than a literal is
+    /// handed an answer it has to deal with rather than a panic. Nothing in
+    /// this function can panic, whatever it is called with and wherever it is
+    /// called from.
+    ///
+    /// Use [`module_code!`](crate::module_code) for a literal. That macro
+    /// runs this check while the crate is compiled, so a malformed code is a
+    /// build failure and the resulting value needs no unwrapping.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::ec::module::ModuleCode;
+    ///
+    /// assert_eq!(ModuleCode::new("t0ac").map(ModuleCode::as_str), Some("t0ac"));
+    /// assert_eq!(ModuleCode::new("nope!"), None);
+    /// ```
+    #[must_use]
+    pub const fn new(code: &'static str) -> Option<Self> {
+        let bytes = code.as_bytes();
+        if bytes.len() != 4 {
+            return None;
+        }
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if !b.is_ascii_lowercase() && !b.is_ascii_digit() {
+                return None;
+            }
+            i += 1;
+        }
+        Some(Self(code))
+    }
+
+    /// The code as a string slice.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+/// Builds a [`ModuleCode`] from a constant, checked while the crate is
+/// compiled.
+///
+/// The check runs inside a `const` block, so a code that is not exactly four
+/// characters of `[a-z0-9]` fails the build instead of panicking at run time,
+/// and the value the macro produces needs no unwrapping. Every module code in
+/// this workspace is written through this macro, which is what makes
+/// [`ModuleCode::new`]'s fallible form safe to hand to anyone else.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::module_code;
+///
+/// assert_eq!(module_code!("t0ac").as_str(), "t0ac");
+/// ```
+#[macro_export]
+macro_rules! module_code {
+    ($code:expr) => {
+        const {
+            match $crate::ec::module::ModuleCode::new($code) {
+                Some(code) => code,
+                None => panic!("module code must be exactly four characters of [a-z0-9]"),
+            }
+        }
+    };
+}
+
+/// The separator between a module code and the module's identifier value.
+///
+/// The tilde is inside the cookie-safe identifier alphabet and outside the
+/// built-in HMAC identifier's own characters, so a legacy bare identifier can
+/// never be misread as a coded one.
+pub const MODULE_CODE_SEPARATOR: char = '~';
+
+/// Splits a full identifier into its module-code prefix and value.
+///
+/// Returns `(Some(code), value)` when the identifier starts with a well-formed
+/// `{code}~` prefix, and `(None, full)` for a legacy bare identifier. The code
+/// here is the raw string, not a validated [`ModuleCode`]: an unknown code
+/// simply fails the ownership check against the selected module.
+#[must_use]
+pub fn split_module_code(full: &str) -> (Option<&str>, &str) {
+    if let Some((code, value)) = full.split_once(MODULE_CODE_SEPARATOR)
+        && code.len() == 4
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return (Some(code), value);
+    }
+    (None, full)
+}
+
+/// Whether the selected module owns `full` as one of its identifiers.
+///
+/// A coded identifier belongs to the module whose registered code it
+/// carries, with the value part accepted by that module's
+/// [`accepts_id`](EdgeCookieModule::accepts_id). An identifier with no code
+/// prefix is the built-in HMAC module's older form, still held in browsers,
+/// so the HMAC module alone owns it.
+#[must_use]
+pub fn module_owns_id(module: &dyn EdgeCookieModule, full: &str) -> bool {
+    match split_module_code(full) {
+        (Some(code), value) => code == module.code().as_str() && module.accepts_id(value),
+        (None, value) => module.id() == HMAC_MODULE_KEY && module.accepts_id(value),
+    }
+}
+
+/// The full created identifier for `value` under `module`'s code.
+#[must_use]
+pub fn apply_module_code(module: &dyn EdgeCookieModule, value: &str) -> String {
+    format!("{}{MODULE_CODE_SEPARATOR}{value}", module.code())
+}
+
+/// The KV-key form of a full identifier under `module`.
+///
+/// The code prefix is preserved verbatim and the module normalizes only its
+/// own value part, so distinct modules' rows can never share a key and a
+/// module never sees another module's syntax.
+#[must_use]
+pub fn module_kv_key(module: &dyn EdgeCookieModule, full: &str) -> String {
+    match split_module_code(full) {
+        (Some(code), value) => format!(
+            "{code}{MODULE_CODE_SEPARATOR}{}",
+            module.normalize_id_for_kv(value)
+        ),
+        (None, value) => module.normalize_id_for_kv(value),
+    }
+}
+
+/// The modules whose identifiers a partner or diagnostic path accepts.
+///
+/// Pull sync, batch sync, and the admin lookup each take an identifier from
+/// outside the organic request path and have to decide whether Trusted Server
+/// issued it. The answer is in two parts. The **global cookie bounds** (the
+/// length cap and the cookie-safe alphabet, see `ec_id_has_only_allowed_chars`)
+/// apply to every identifier whichever module created it. The rest is
+/// **dispatched by the `{code}~` prefix** to the module that owns that code,
+/// which canonicalizes its own value part and decides whether the canonical
+/// form is one of its own. A code no module in the set owns is rejected, so a
+/// second module's identifiers can never be adopted or written under this
+/// deployment's keys.
+///
+/// All three look rows up under the key
+/// [`canonical_kv_key`](Self::canonical_kv_key) returns rather than under the
+/// identifier as given, and pull sync and batch sync also write under that
+/// key, so a module whose canonical form differs from the cookie value still
+/// reaches the row it created. Batch sync and the admin lookup call
+/// `canonical_kv_key` directly. Pull sync calls `canonical_kv_key` through
+/// `EcContext::kv_key_for` and still sends partners the identifier as issued.
+///
+/// The set holds the deployment's active module, so an identifier another
+/// module created is rejected, one created under an earlier selection
+/// included. A stateless deployment, with no module in the set, falls back
+/// to the built-in HMAC grammar (see
+/// [`canonical_kv_key`](Self::canonical_kv_key)).
+pub struct AcceptedModules<'a> {
+    readers: Vec<&'a dyn EdgeCookieModule>,
+}
+
+impl<'a> AcceptedModules<'a> {
+    /// The set holding only the deployment's active module.
+    ///
+    /// `None` means no module is selected, so the deployment is stateless.
+    #[must_use]
+    pub fn active(module: Option<&'a dyn EdgeCookieModule>) -> Self {
+        Self {
+            readers: module.into_iter().collect(),
+        }
+    }
+
+    /// The module in the set that owns `full`'s code.
+    ///
+    /// Dispatch is on the code alone, before any module looks at a value, so
+    /// an identifier a partner echoed back in a different case still reaches
+    /// its own module to be canonicalized rather than being rejected first.
+    /// A legacy bare identifier predates the envelope and belongs to the
+    /// built-in HMAC module alone.
+    fn owner(&self, full: &str) -> Option<&'a dyn EdgeCookieModule> {
+        let (code, _) = split_module_code(full);
+        self.readers.iter().copied().find(|module| match code {
+            Some(code) => module.code().as_str() == code,
+            None => module.id() == HMAC_MODULE_KEY,
+        })
+    }
+
+    /// Whether `full` is an identifier this deployment accepts.
+    #[must_use]
+    pub fn accepts(&self, full: &str) -> bool {
+        self.canonical_kv_key(full).is_some()
+    }
+
+    /// The identity-graph key for `full`, or `None` when nothing in the set
+    /// accepts it.
+    ///
+    /// The owning module supplies the canonical form of its own value part
+    /// and the code prefix is preserved verbatim, so two modules' rows can
+    /// never share a key.
+    #[must_use]
+    pub fn canonical_kv_key(&self, full: &str) -> Option<String> {
+        if !ec_id_has_only_allowed_chars(full) {
+            return None;
+        }
+        match self.owner(full) {
+            Some(owner) => {
+                let key = module_kv_key(owner, full);
+                module_owns_id(owner, &key).then_some(key)
+            }
+            // No module is selected, so there is no code to dispatch on and
+            // the built-in HMAC grammar is the fallback for a stateless
+            // deployment.
+            None if self.readers.is_empty() => {
+                let key = generation::normalize_ec_id_for_kv(full);
+                generation::is_valid_ec_id(&key).then_some(key)
+            }
+            // A code that belongs to some other deployment's module.
+            None => None,
+        }
+    }
+}
+
+/// A strategy for deriving an Edge Cookie identifier.
+///
+/// Implementations are selected by configuration. A module derives the
+/// identifier at the edge in [`generate`](Self::generate), and the page
+/// response sets the `ts-ec` cookie.
+///
+/// A module that cannot derive an identifier at the edge returns a
+/// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
+/// the request proceeds without an Edge Cookie rather than failing.
+pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
+    /// Returns the stable implementation id for this module, used in
+    /// configuration and logs.
+    ///
+    /// This is what `[ec] module` selects the module by, or what an
+    /// `[ec.<name>] implementation` names when the module is configured
+    /// under a label of the operator's choosing.
+    fn id(&self) -> &'static str;
+
+    /// The module's registered code, the `{code}~` namespace of every
+    /// identifier it creates.
+    ///
+    /// Mandatory, with no default: a module must allocate a unique code in
+    /// the module-code registry before it can exist, so no two modules
+    /// can ever create colliding identifiers. Core applies the code at
+    /// creation and checks it at read-back, and the module itself only ever
+    /// sees its own value part.
+    fn code(&self) -> ModuleCode;
+
+    /// Derives an Edge Cookie identifier from the request evidence in
+    /// `request_info` and the gating context in `input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::EdgeCookie`] when derivation fails.
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>>;
+
+    /// Returns whether `value` is a well-formed identifier this module issues.
+    ///
+    /// Core calls this to decide whether an incoming `ts-ec` cookie value is a
+    /// usable Edge Cookie identifier before reading it back, keying the KV
+    /// identity graph, or withdrawing it. Core strips the module's `{code}~`
+    /// prefix first, so this receives only the module's own value part.
+    /// This keeps the identifier opaque to
+    /// core: a module whose identifiers are not the built-in shape (for
+    /// example an opaque signed envelope) accepts its own format here, so its
+    /// identifier round-trips instead of being silently dropped on read-back.
+    /// Core also asks about the string
+    /// [`normalize_id_for_kv`](Self::normalize_id_for_kv) returns.
+    ///
+    /// The default accepts the built-in HMAC identifier shape
+    /// (`<64 hex>.<6 alphanumeric>`), which is correct for [`HmacModule`], the
+    /// one module core builds in.
+    fn accepts_id(&self, value: &str) -> bool {
+        generation::is_valid_ec_id(value)
+    }
+
+    /// Returns the identity two visits must share to be treated as the same
+    /// visitor, which is what core keys the identity graph by.
+    ///
+    /// Core builds the key from the module's code and the returned string, so
+    /// two identifiers that return the same string share one row and two that
+    /// differ never meet. A module whose identifier carries a signature, a
+    /// nonce, a timestamp or any other part that changes each time the
+    /// identifier is issued must return the stable part and not the value as
+    /// transported, or the identity does not survive a reissue. A module whose
+    /// whole identifier is stable returns it unchanged, keeping its case where
+    /// case matters, so distinct identifiers are not collapsed into one key.
+    ///
+    /// Core asks [`accepts_id`](Self::accepts_id) about the returned string as
+    /// well as about the identifier as issued, so a module must accept its own
+    /// canonical form, or no row is read or written for it.
+    ///
+    /// The default lowercases the leading HMAC hash segment and preserves the
+    /// suffix, matching the built-in identifier shape.
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        generation::normalize_ec_id_for_kv(value)
+    }
+}
+
+/// The built-in HMAC Edge Cookie module.
+///
+/// Derives the identifier from the client IP (read from the [`RequestInfo`]
+/// passed at call time) and the configured passphrase via
+/// [`generation::generate_ec_id`].
+///
+/// The client IP is this module's only input, so it is this module that
+/// requires one. On a host that cannot supply one, [`RequestInfo::client_ip`]
+/// is the empty string and [`generate`](Self::generate) fails rather than
+/// hashing the empty string into an identifier every visitor on that host
+/// would share. The failure is returned to the caller. The publisher proxy and
+/// integration proxy log it and serve the response without an Edge Cookie. A
+/// module that reads other evidence makes its own decision and is unaffected.
+#[derive(Debug, Clone)]
+pub struct HmacModule {
+    passphrase: Redacted<String>,
+}
+
+impl HmacModule {
+    /// Creates an HMAC module with the given passphrase.
+    #[must_use]
+    pub fn new(passphrase: Redacted<String>) -> Self {
+        Self { passphrase }
+    }
+}
+
+impl EdgeCookieModule for HmacModule {
+    fn id(&self) -> &'static str {
+        HMAC_MODULE_KEY
+    }
+
+    fn code(&self) -> ModuleCode {
+        HMAC_MODULE_CODE
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        let client_ip = request_info.client_ip();
+        if client_ip.is_empty() {
+            return Err(Report::new(TrustedServerError::EdgeCookie {
+                message: "Edge Cookie module `hmac` requires the client IP, and this host \
+                          could not supply one"
+                    .to_owned(),
+            }));
+        }
+        let id = generation::generate_ec_id(self.passphrase.expose(), client_ip)?;
+        Ok(GeneratedEdgeCookie {
+            id: Some(id),
+            response_headers: Vec::new(),
+        })
+    }
+}
+
+/// Refuses an injected module that claims an implementation core supplies
+/// itself.
+///
+/// An adapter may inject a module whose id is also a built-in id, and the
+/// resolution order alone would silently prefer the built-in one and drop the
+/// injected module, so the pair is refused and the error names both
+/// claimants. The check runs before the selection is read, so the clash is
+/// reported at startup whatever the selector says, and selecting something
+/// else cannot hide it.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::EdgeCookie`] when the injected module's id
+/// is one of [`BUILTIN_MODULE_KEYS`].
+fn ensure_no_name_collision(
+    injected: Option<&dyn EdgeCookieModule>,
+) -> Result<(), Report<TrustedServerError>> {
+    let Some(injected) = injected else {
+        return Ok(());
+    };
+    let Some(claimed) = BUILTIN_MODULE_KEYS
+        .iter()
+        .find(|key| **key == injected.id())
+    else {
+        return Ok(());
+    };
+    Err(Report::new(TrustedServerError::EdgeCookie {
+        message: format!(
+            "Edge Cookie module implementation `{claimed}` is claimed twice, by the \
+             module built into Trusted Server core and by the module this \
+             deployment's adapter injects. Give the injected module an implementation \
+             of its own and select it under that, because `{claimed}` cannot mean both \
+             of them."
+        ),
+    }))
+}
+
+/// Builds the Edge Cookie module named by the `[ec] module` selector.
+///
+/// This is the composition root for the Edge Cookie module. It reads the
+/// `[ec]` configuration and takes the adapter's optional injected module,
+/// resolving the selector to the built-in module or the injected one. The
+/// per-request [`RequestInfo`] is passed borrowed to
+/// [`generate`](EdgeCookieModule::generate) at call time rather than stored,
+/// so no request snapshot is cloned here. Returns `Ok(None)` when no module
+/// is selected, so the caller stays stateless.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::EdgeCookie`] when the named module cannot be
+/// built, which is a built-in implementation whose configuration block is
+/// missing, or an implementation this deployment's adapter does not inject.
+/// Both fail loudly rather than leaving the deployment running stateless under
+/// a selector that says otherwise.
+pub fn build_module(
+    ec: &Ec,
+    injected: Option<Arc<dyn EdgeCookieModule>>,
+) -> Result<Option<Box<dyn EdgeCookieModule>>, Report<TrustedServerError>> {
+    ensure_no_name_collision(injected.as_deref())?;
+    let Some(selection) = ec.module.as_ref() else {
+        return Ok(None);
+    };
+    let module: Option<Box<dyn EdgeCookieModule>> = match selection {
+        // Explicit statelessness: the same meaning as omitting the selector.
+        EcModuleSelection::None => None,
+        EcModuleSelection::Named(name) => Some(resolve_named_module(name, ec, injected)?),
+    };
+    Ok(module)
+}
+
+/// Resolves one module name to its implementation.
+///
+/// The implementation is the one the name's `[ec.<name>]` block names, or the
+/// name itself. It is looked for among the modules built into core first,
+/// and is otherwise the module the adapter injects through
+/// [`RuntimeServices`](crate::platform::RuntimeServices) when the
+/// implementation names that module's id, written in full or with the
+/// `edgecookie` type folder left off, so resolving an injected module
+/// needs no vendor name in core. The adapter reads the injected module's
+/// block when it builds it. Looking at core first cannot shadow an injected
+/// module, because [`ensure_no_name_collision`] has already refused one that
+/// claims a built-in implementation.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::EdgeCookie`] when the implementation matches
+/// no module this deployment can build, naming the implementations it has,
+/// or when a built-in implementation has no configuration block.
+fn resolve_named_module(
+    name: &str,
+    ec: &Ec,
+    injected: Option<Arc<dyn EdgeCookieModule>>,
+) -> Result<Box<dyn EdgeCookieModule>, Report<TrustedServerError>> {
+    let implementation = ec.module_blocks.implementation(name);
+
+    // Settings validation rejects a built-in implementation with no block
+    // before this runs, so reaching the error means the two checks have
+    // drifted apart. Stopping is the only safe answer, because returning no
+    // module would run the deployment stateless under a selector that says
+    // it has an identity module.
+    if implementation == HMAC_MODULE_KEY {
+        let config = ec
+            .module_blocks
+            .get(name)
+            .and_then(EcModuleBlock::hmac_settings)
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::EdgeCookie {
+                    message: format!(
+                        "Edge Cookie module `{name}` uses the `hmac` implementation but \
+                         has no `[ec.{name}]` configuration"
+                    ),
+                })
+            })?;
+        return Ok(Box::new(HmacModule::new(config.passphrase.clone())));
+    }
+
+    let known = known_implementations(injected.as_deref());
+    injected
+        .filter(|module| {
+            crate::module_name::resolve(MODULE_TYPE, implementation, &[module.id()]).is_some()
+        })
+        .map(|module| Box::new(SharedModule(module)) as Box<dyn EdgeCookieModule>)
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::EdgeCookie {
+                message: format!(
+                    "Edge Cookie module `{name}` is selected, but its implementation \
+                     `{implementation}` is not one this deployment has. Known \
+                     implementations: {known}"
+                ),
+            })
+        })
+}
+
+/// The implementations this deployment could build, for an error that has just
+/// refused one it could not.
+///
+/// The modules built into core, plus the one the adapter injects when there
+/// is one, which is the whole set [`resolve_named_module`] chooses from.
+fn known_implementations(injected: Option<&dyn EdgeCookieModule>) -> String {
+    BUILTIN_MODULE_KEYS
+        .iter()
+        .copied()
+        .chain(injected.map(EdgeCookieModule::id))
+        .map(|implementation| format!("`{implementation}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Checks once, at startup, that this deployment can build the module named
+/// by the `[ec] module` selector.
+///
+/// The composition root calls this while it builds application state, passing
+/// the same injected module it will put into
+/// [`RuntimeServices`](crate::platform::RuntimeServices) on every request.
+/// [`build_module`] reads no request data, so the answer is the same for
+/// every request and a selection the adapter can never supply fails at startup
+/// rather than on the first request. A stateless deployment (no selector, or
+/// `"none"`) passes.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::EdgeCookie`] when the selected module cannot
+/// be built from the services this deployment injects.
+pub fn ensure_module_available(
+    ec: &Ec,
+    injected: Option<Arc<dyn EdgeCookieModule>>,
+) -> Result<(), Report<TrustedServerError>> {
+    build_shared_module(ec, injected)?;
+    Ok(())
+}
+
+/// Resolves the selected module into a shared handle the composition root can
+/// keep and the request path can reuse.
+///
+/// The same resolution as [`build_module`], returned as an `Arc` rather than
+/// a `Box` so one instance can be threaded into
+/// [`RuntimeServices`](crate::platform::RuntimeServices) and read by every
+/// request without being built again. An adapter that calls this while it
+/// builds application state gets the startup check
+/// [`ensure_module_available`] performs and the module itself for one piece
+/// of work rather than two.
+///
+/// # Errors
+///
+/// The same errors as [`build_module`].
+pub fn build_shared_module(
+    ec: &Ec,
+    injected: Option<Arc<dyn EdgeCookieModule>>,
+) -> Result<Option<Arc<dyn EdgeCookieModule>>, Report<TrustedServerError>> {
+    Ok(build_module(ec, injected)?.map(Arc::from))
+}
+
+/// The Edge Cookie module to use for this request.
+///
+/// A module reaches the request path through one seam only. An adapter
+/// resolves `[ec] module` once while it builds application state and threads
+/// the answer into
+/// [`RuntimeServices::resolved_ec_module`](crate::platform::RuntimeServices::resolved_ec_module),
+/// and that same instance comes back here with nothing resolved or constructed
+/// again on the request path. When nothing was threaded, this builds from
+/// `[ec]` settings alone, which is what a deployment selecting only a built-in
+/// module does.
+///
+/// # Errors
+///
+/// The same errors as [`build_module`], and only when the adapter threaded
+/// nothing, because a threaded module has already been resolved successfully.
+pub fn request_module(
+    ec: &Ec,
+    services: &crate::platform::RuntimeServices,
+) -> Result<Option<Arc<dyn EdgeCookieModule>>, Report<TrustedServerError>> {
+    if let Some(resolved) = services.resolved_ec_module() {
+        return Ok(Some(resolved));
+    }
+    build_shared_module(ec, None)
+}
+
+/// Adapts an injected, shared [`EdgeCookieModule`] to the owned `Box` that
+/// [`build_module`] returns.
+///
+/// A vendor or host module is injected as an `Arc` so it can live in
+/// [`RuntimeServices`](crate::platform::RuntimeServices) and be cloned per
+/// request. Every method delegates to the inner module, so its behavior is
+/// unchanged.
+#[derive(Debug)]
+struct SharedModule(Arc<dyn EdgeCookieModule>);
+
+impl EdgeCookieModule for SharedModule {
+    fn code(&self) -> ModuleCode {
+        self.0.code()
+    }
+
+    fn id(&self) -> &'static str {
+        self.0.id()
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        self.0.generate(request_info, input)
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        self.0.accepts_id(value)
+    }
+
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        self.0.normalize_id_for_kv(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::tests::select_hmac_module;
+
+    /// Settings selecting the built-in HMAC module under `name`, which is a
+    /// label whenever it is not the implementation's own name.
+    fn selected_hmac(name: &str) -> Ec {
+        let mut ec = Ec::default();
+        select_hmac_module(&mut ec, name, test_passphrase().expose());
+        ec
+    }
+
+    #[test]
+    fn a_malformed_module_code_is_refused_rather_than_panicking() {
+        // `ModuleCode::new` is public, so a vendor crate can reach it with a
+        // value it assembled rather than a literal. Every rejected shape has to
+        // come back as `None`, because a panic here would take down whatever
+        // request the caller was serving.
+        for malformed in ["", "abc", "abcde", "AB12", "t0a_", "t0a-", "t0a ", "t.ac"] {
+            assert_eq!(
+                ModuleCode::new(malformed),
+                None,
+                "`{malformed}` is outside the registry format and should be refused"
+            );
+        }
+
+        assert_eq!(
+            ModuleCode::new("t0ac").map(ModuleCode::as_str),
+            Some("t0ac"),
+            "a well-formed code should still be accepted"
+        );
+    }
+
+    #[test]
+    fn the_module_code_macro_keeps_the_compile_time_guarantee() {
+        // The macro checks a literal while the crate is compiled and yields the
+        // code itself, so the codes written across this workspace stay as
+        // strong as the old panicking constructor made them, with none of the
+        // run-time risk.
+        assert_eq!(
+            crate::module_code!("t0ac").as_str(),
+            "t0ac",
+            "the macro should yield the code it was given"
+        );
+        assert_eq!(
+            HMAC_MODULE_CODE.as_str(),
+            HMAC_MODULE_KEY,
+            "the built-in code should still be the built-in key"
+        );
+    }
+
+    #[test]
+    fn split_module_code_separates_coded_and_legacy_forms() {
+        assert_eq!(
+            split_module_code("hmac~abc.DEF123"),
+            (Some("hmac"), "abc.DEF123"),
+            "a four-character code before the first tilde splits off"
+        );
+        assert_eq!(
+            split_module_code("51dd~value~with~tildes"),
+            (Some("51dd"), "value~with~tildes"),
+            "only the first tilde splits, so a value may contain tildes"
+        );
+        assert_eq!(
+            split_module_code("abcdef.XYZ"),
+            (None, "abcdef.XYZ"),
+            "no tilde means the legacy bare form"
+        );
+        assert_eq!(
+            split_module_code("toolong~x"),
+            (None, "toolong~x"),
+            "a prefix that is not exactly four characters is not a code"
+        );
+        assert_eq!(
+            split_module_code("AB12~x"),
+            (None, "AB12~x"),
+            "uppercase is outside the code alphabet"
+        );
+    }
+
+    fn header(name: &str, value: &str) -> (http::HeaderName, http::HeaderValue) {
+        (
+            http::HeaderName::from_bytes(name.as_bytes()).expect("should parse header name"),
+            http::HeaderValue::from_str(value).expect("should parse header value"),
+        )
+    }
+
+    #[test]
+    fn reserved_response_effect_rejects_the_namespace_core_manages() {
+        for (name, value, expected) in [
+            (
+                "set-cookie",
+                "ts-ec=hmac~deadbeef.abc123; Path=/",
+                ReservedResponseEffect::ManagedCookie,
+            ),
+            (
+                "Set-Cookie",
+                "  TS-EIDS=x; Path=/",
+                ReservedResponseEffect::ManagedCookie,
+            ),
+            ("x-ts-ec", "spoofed", ReservedResponseEffect::ReservedHeader),
+            (
+                "X-TS-partner.example.com",
+                "uid",
+                ReservedResponseEffect::ReservedHeader,
+            ),
+            ("content-length", "0", ReservedResponseEffect::FramingHeader),
+            (
+                "Transfer-Encoding",
+                "chunked",
+                ReservedResponseEffect::FramingHeader,
+            ),
+            ("connection", "close", ReservedResponseEffect::FramingHeader),
+            (
+                "cache-control",
+                "public, max-age=31536000",
+                ReservedResponseEffect::FramingHeader,
+            ),
+            (
+                "Cache-Control",
+                "public",
+                ReservedResponseEffect::FramingHeader,
+            ),
+        ] {
+            let (name, value) = header(name, value);
+            assert_eq!(
+                reserved_response_effect(&name, &value),
+                Some(expected),
+                "`{name}` should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_response_effect_allows_module_owned_effects() {
+        for (name, value) in [
+            ("set-cookie", "acme-evidence=abc; Path=/; Secure"),
+            ("set-cookie", "sharedId=abc"),
+            ("accept-ch", "Sec-CH-UA-Full-Version-List"),
+            ("x-acme-probe", "1"),
+            ("vary", "Sec-CH-UA"),
+        ] {
+            let (name, value) = header(name, value);
+            assert_eq!(
+                reserved_response_effect(&name, &value),
+                None,
+                "`{name}` is the module's own and should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_response_effect_reads_a_non_utf8_set_cookie_as_bytes() {
+        // A `Set-Cookie` carrying a byte above 127 cannot be read as a string,
+        // so the cookie name is matched on raw bytes. Reading it as UTF-8 and
+        // giving up on failure would let this value through.
+        let name = http::header::SET_COOKIE;
+        let mut bytes = b"ts-ec=value".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"; Path=/");
+        let value =
+            http::HeaderValue::from_bytes(&bytes).expect("should build a non-utf8 header value");
+        assert!(
+            value.to_str().is_err(),
+            "the test value should not be readable as UTF-8"
+        );
+        assert_eq!(
+            reserved_response_effect(&name, &value),
+            Some(ReservedResponseEffect::ManagedCookie),
+            "a non-UTF-8 Set-Cookie should still be matched on its cookie name"
+        );
+    }
+
+    /// A stand-in for a vendor module an adapter injects.
+    #[derive(Debug)]
+    struct VendorModule;
+
+    impl EdgeCookieModule for VendorModule {
+        fn id(&self) -> &'static str {
+            "acme"
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0ac")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+    }
+
+    #[test]
+    fn accepted_modules_splits_global_bounds_from_module_dispatch() {
+        let hmac = HmacModule::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()));
+        let hmac_value = format!("{}.ABC123", "a".repeat(64));
+        let active = AcceptedModules::active(Some(&hmac));
+
+        // The global bounds come first and apply whoever created the value. A
+        // character outside the cookie-safe alphabet, or a value over the
+        // length cap, never reaches a module.
+        assert!(
+            !active.accepts(&format!("hmac~{hmac_value} with spaces")),
+            "the cookie-safe alphabet is a global bound"
+        );
+        assert!(
+            !active.accepts(&format!("hmac~{}", "a".repeat(300))),
+            "the length cap is a global bound"
+        );
+
+        // Then dispatch by code to the module that owns it.
+        assert!(
+            active.accepts(&format!("hmac~{hmac_value}")),
+            "the active module's own code is accepted"
+        );
+        assert!(
+            active.accepts(&hmac_value),
+            "the legacy bare form belongs to the built-in module"
+        );
+        assert!(
+            !active.accepts(&format!("t0ac~{hmac_value}")),
+            "a code no configured module reads is rejected even in the HMAC shape"
+        );
+
+        // A vendor module's own identifiers are accepted when it is the
+        // active one, and the built-in bare form then belongs to nobody.
+        let vendor = AcceptedModules::active(Some(&VendorModule));
+        assert!(
+            vendor.accepts(&format!("t0ac~{hmac_value}")),
+            "the vendor module's code is accepted when it is active"
+        );
+        assert!(
+            !vendor.accepts(&hmac_value),
+            "the legacy bare form is the built-in module's alone"
+        );
+
+        // With no module selected the deployment is stateless, so the
+        // built-in grammar is the fallback, as it has always been.
+        let stateless = AcceptedModules::active(None);
+        assert!(
+            stateless.accepts(&hmac_value),
+            "a stateless deployment falls back to the built-in grammar"
+        );
+        assert!(
+            !stateless.accepts("not-an-identifier"),
+            "the fallback is still the built-in grammar, not anything goes"
+        );
+    }
+
+    #[test]
+    fn the_selector_round_trips_through_serialization() {
+        // The typed selector must not change the configuration surface. The
+        // same TOML has to parse to the same choice, and serializing has to
+        // write the same key back, so an existing operator configuration keeps
+        // working and a config push does not rewrite the selector.
+        for (key, expected) in [
+            (EcModuleSelection::NONE_KEY, EcModuleSelection::None),
+            (
+                HMAC_MODULE_KEY,
+                EcModuleSelection::Named(HMAC_MODULE_KEY.to_owned()),
+            ),
+            ("acme", EcModuleSelection::Named("acme".to_owned())),
+        ] {
+            let ec: Ec = toml::from_str(&format!("module = \"{key}\""))
+                .expect("should parse the [ec] section");
+            assert_eq!(
+                ec.module.as_ref(),
+                Some(&expected),
+                "`{key}` should select the module it names"
+            );
+            assert_eq!(
+                expected.key(),
+                key,
+                "`{key}` should report itself under the key it was written as"
+            );
+
+            // The serialized form is the string itself, byte for byte, so an
+            // operator configuration written before the selector was typed
+            // parses and is written back identically.
+            let value =
+                toml::Value::try_from(expected.clone()).expect("should serialize the selection");
+            assert_eq!(
+                value,
+                toml::Value::String(key.to_owned()),
+                "`{key}` should serialize to exactly its own string"
+            );
+
+            let written = toml::to_string(&ec).expect("should serialize the [ec] section");
+            assert!(
+                written.contains(&format!("module = \"{key}\"")),
+                "`{key}` should be written back unchanged, got: {written}"
+            );
+
+            // A full round trip through the document leaves the same choice.
+            let reparsed: Ec = toml::from_str(&written).expect("should reparse the [ec] section");
+            assert_eq!(
+                reparsed.module.as_ref(),
+                Some(&expected),
+                "`{key}` should survive a serialize and parse round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn each_selection_builds_what_its_string_key_built_before() {
+        // `none` is stateless, exactly as omitting the selector is.
+        let none = Ec {
+            module: Some(EcModuleSelection::None),
+            ..Ec::default()
+        };
+        assert!(
+            build_module(&none, None)
+                .expect("explicit statelessness should build")
+                .is_none(),
+            "`none` should select no module"
+        );
+
+        // `hmac` with its block builds the built-in module.
+        let hmac = selected_hmac(HMAC_MODULE_KEY);
+        let built = build_module(&hmac, None)
+            .expect("the hmac selection should build")
+            .expect("the hmac selection should yield a module");
+        assert_eq!(
+            built.id(),
+            HMAC_MODULE_KEY,
+            "`hmac` should select the built-in module"
+        );
+        assert_eq!(
+            built.code(),
+            HMAC_MODULE_CODE,
+            "the built-in module should carry the built-in code"
+        );
+
+        // An arbitrary vendor name selects the module the adapter injected
+        // under that same implementation.
+        let vendor = Ec {
+            module: Some(EcModuleSelection::Named("acme".to_owned())),
+            ..Ec::default()
+        };
+        let built = build_module(&vendor, Some(Arc::new(VendorModule)))
+            .expect("the vendor selection should build")
+            .expect("the vendor selection should yield a module");
+        assert_eq!(
+            built.id(),
+            "acme",
+            "a vendor name should select the injected module of that id"
+        );
+    }
+
+    #[test]
+    fn a_label_builds_the_implementation_its_block_names() {
+        // The selector names a block, and the block names the implementation,
+        // so everything that resolves the selection has to read the
+        // implementation rather than the label the operator chose.
+        let labeled_hmac = selected_hmac("primary");
+        let built = build_module(&labeled_hmac, None)
+            .expect("a labeled hmac block should build")
+            .expect("a labeled hmac block should yield a module");
+        assert_eq!(
+            built.id(),
+            HMAC_MODULE_KEY,
+            "the label should build the implementation its block names"
+        );
+        assert_eq!(
+            built.code(),
+            HMAC_MODULE_CODE,
+            "the identifiers it creates carry the implementation's own code"
+        );
+
+        // The same for a module the adapter injects, which is matched on the
+        // implementation its block names and not on the label.
+        let labeled_vendor: Ec = toml::from_str(
+            "module = \"main\"\n\n[main]\nimplementation = \"acme\"\nendpoint = \"https://ec.acme.example.com\"\n",
+        )
+        .expect("should parse a labeled vendor block");
+        let built = build_module(&labeled_vendor, Some(Arc::new(VendorModule)))
+            .expect("a labeled vendor block should build")
+            .expect("a labeled vendor block should yield a module");
+        assert_eq!(
+            built.id(),
+            "acme",
+            "the label should build the injected module its block names"
+        );
+    }
+
+    #[test]
+    fn module_ownership_follows_the_code() {
+        let module = HmacModule::new(test_passphrase());
+        let legacy = format!("{}.ABC123", "a".repeat(64));
+        let coded = format!("hmac~{legacy}");
+        let foreign = format!("zz00~{legacy}");
+        assert!(
+            module_owns_id(&module, &coded),
+            "the module owns identifiers carrying its own code"
+        );
+        assert!(
+            module_owns_id(&module, &legacy),
+            "the built-in hmac module dual-reads the legacy bare form"
+        );
+        assert!(
+            !module_owns_id(&module, &foreign),
+            "an identifier with another module's code is never owned"
+        );
+    }
+    use crate::redacted::Redacted;
+
+    fn test_passphrase() -> Redacted<String> {
+        Redacted::from("a-test-passphrase-32-bytes-minimum".to_owned())
+    }
+
+    #[test]
+    fn default_id_semantics_match_the_builtin_shape() {
+        let module = HmacModule::new(test_passphrase());
+
+        // The default `accepts_id` accepts the built-in HMAC shape and rejects
+        // anything else, so a built-in module's identifiers round-trip while an
+        // opaque value is left to a module that overrides the check.
+        let valid = format!("{}.{}", "a".repeat(64), "abc123");
+        assert!(module.accepts_id(&valid), "should accept the HMAC shape");
+        assert!(
+            !module.accepts_id("not-hmac-shaped"),
+            "should reject a non-HMAC identifier by default"
+        );
+
+        // The default `normalize_id_for_kv` lowercases the hash segment. This is
+        // exactly the transform that would corrupt an opaque case-sensitive
+        // identifier, which is why such a module overrides it.
+        let mixed = format!("{}.{}", "A".repeat(64), "abc123");
+        assert_eq!(
+            module.normalize_id_for_kv(&mixed),
+            format!("{}.{}", "a".repeat(64), "abc123"),
+            "the default should lowercase the hash segment"
+        );
+    }
+
+    #[test]
+    fn shared_module_delegates_id_semantics_to_the_inner_module() {
+        // `SharedModule` wraps an adapter-injected module. It must forward
+        // every trait method to the inner module, including `accepts_id` and
+        // `normalize_id_for_kv`; a wrapper that silently used the defaults would
+        // drop an opaque vendor identifier on read-back. This guards that
+        // delegation directly.
+        #[derive(Debug)]
+        struct Inner;
+
+        impl EdgeCookieModule for Inner {
+            fn id(&self) -> &'static str {
+                "inner"
+            }
+
+            fn code(&self) -> ModuleCode {
+                crate::module_code!("t0in")
+            }
+
+            fn generate(
+                &self,
+                _request_info: &dyn RequestInfo,
+                _input: &IdentityInput<'_>,
+            ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+                Ok(GeneratedEdgeCookie::default())
+            }
+
+            fn accepts_id(&self, value: &str) -> bool {
+                value == "opaque-ok"
+            }
+
+            fn normalize_id_for_kv(&self, value: &str) -> String {
+                format!("kv:{value}")
+            }
+        }
+
+        let shared = SharedModule(Arc::new(Inner));
+
+        assert_eq!(shared.id(), "inner", "should delegate id");
+        assert!(
+            shared.accepts_id("opaque-ok"),
+            "should delegate accepts_id acceptance to the inner module"
+        );
+        assert!(
+            !shared.accepts_id("something-else"),
+            "should delegate accepts_id rejection to the inner module"
+        );
+        assert_eq!(
+            shared.normalize_id_for_kv("x"),
+            "kv:x",
+            "should delegate normalize_id_for_kv to the inner module"
+        );
+    }
+
+    /// A module whose identifier is a stable part followed by a part that
+    /// changes each time the identifier is issued, as a signed envelope does.
+    #[derive(Debug)]
+    struct ReissuedEnvelopeModule;
+
+    impl ReissuedEnvelopeModule {
+        fn stable_part(value: &str) -> &str {
+            value.split_once('.').map_or(value, |(stable, _)| stable)
+        }
+    }
+
+    impl EdgeCookieModule for ReissuedEnvelopeModule {
+        fn id(&self) -> &'static str {
+            "reissued_envelope"
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0re")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            // The identifier as issued, and its canonical form on its own.
+            Self::stable_part(value).starts_with("device-")
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            Self::stable_part(value).to_owned()
+        }
+    }
+
+    #[test]
+    fn two_issues_of_one_identity_share_one_identity_graph_key() {
+        // The key is the identity two visits must share. Two identifiers that
+        // differ only in the part reissued each time are one visitor and must
+        // reach one row, where a module returning the value unchanged would
+        // give each issue a row of its own.
+        let module = ReissuedEnvelopeModule;
+        let accepted = AcceptedModules::active(Some(&module));
+
+        let first = accepted
+            .canonical_kv_key("t0re~device-1.issued-monday")
+            .expect("should key the first issue");
+        let second = accepted
+            .canonical_kv_key("t0re~device-1.issued-tuesday")
+            .expect("should key the second issue");
+        assert_eq!(
+            first, second,
+            "two issues of one identity should share one identity-graph key"
+        );
+        assert_eq!(
+            first, "t0re~device-1",
+            "the key should be the module's code and the stable part"
+        );
+
+        let other = accepted
+            .canonical_kv_key("t0re~device-2.issued-monday")
+            .expect("should key another identity");
+        assert_ne!(
+            first, other,
+            "a different stable part should be a different visitor"
+        );
+    }
+
+    /// A vendor module that claims the name core already uses for its
+    /// built-in HMAC module.
+    #[derive(Debug)]
+    struct VendorNamedHmacModule;
+
+    impl EdgeCookieModule for VendorNamedHmacModule {
+        fn id(&self) -> &'static str {
+            HMAC_MODULE_KEY
+        }
+
+        fn code(&self) -> ModuleCode {
+            crate::module_code!("t0vh")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+    }
+
+    #[test]
+    fn two_modules_claiming_one_name_are_refused_and_both_are_named() {
+        // An adapter may inject a module called `hmac` while core supplies
+        // one of its own. Resolution order alone would prefer the built-in one
+        // and drop the injected one with nothing said, which is the fault this
+        // guards.
+        let hmac = selected_hmac(HMAC_MODULE_KEY);
+
+        let err = build_module(&hmac, Some(Arc::new(VendorNamedHmacModule)))
+            .expect_err("two modules claiming `hmac` should be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(HMAC_MODULE_KEY),
+            "the error should name the contested name, got: {message}"
+        );
+        assert!(
+            message.contains("core") && message.contains("adapter"),
+            "the error should name both claimants, got: {message}"
+        );
+
+        // The clash is a wiring fault, not a property of the selection, so
+        // selecting something else does not hide it and the operator still
+        // learns at startup.
+        let selected_elsewhere = Ec {
+            module: Some(EcModuleSelection::None),
+            ..Ec::default()
+        };
+        let err =
+            ensure_module_available(&selected_elsewhere, Some(Arc::new(VendorNamedHmacModule)))
+                .expect_err("the clash should be refused whatever the selector says");
+        assert!(
+            err.to_string().contains(HMAC_MODULE_KEY),
+            "the startup check should name the contested name too, got: {err}"
+        );
+
+        // A vendor name of its own is unaffected.
+        let vendor = Ec {
+            module: Some(EcModuleSelection::Named("acme".to_owned())),
+            ..Ec::default()
+        };
+        build_module(&vendor, Some(Arc::new(VendorModule)))
+            .expect("a vendor module under its own name should still build");
+    }
+
+    #[test]
+    fn an_unknown_implementation_fails_naming_the_known_ones() {
+        // A label hands the choice of implementation to its block, so a
+        // mistyped implementation has to be refused by name, alongside the
+        // implementations this deployment could have used instead.
+        let ec: Ec =
+            toml::from_str("module = \"primary\"\n\n[primary]\nimplementation = \"hmca\"\n")
+                .expect("should parse a labeled module block");
+
+        let err = build_module(&ec, None)
+            .expect_err("an implementation this deployment lacks should be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("`hmca`"),
+            "the error should name the unknown implementation, got: {message}"
+        );
+        assert!(
+            message.contains("`hmac`"),
+            "the error should name the built-in implementation, got: {message}"
+        );
+
+        let err = build_module(&ec, Some(Arc::new(VendorModule)))
+            .expect_err("an injected module of another implementation should not stand in");
+        let message = err.to_string();
+        assert!(
+            message.contains("`hmac`") && message.contains("`acme`"),
+            "the error should name every implementation this deployment has, got: {message}"
+        );
+    }
+
+    #[test]
+    fn selecting_hmac_without_its_block_fails_loudly() {
+        // `Ec::validate_module_selection` rejects this pair before settings
+        // reach the composition root, so the state is built directly here to
+        // reach the seam. If the two checks ever drift apart, `build_module`
+        // must still stop rather than hand back a stateless deployment.
+        let ec = Ec {
+            module: Some(EcModuleSelection::from(HMAC_MODULE_KEY)),
+            ..Ec::default()
+        };
+
+        let err = build_module(&ec, None)
+            .expect_err("selecting hmac with no [ec.hmac] block should error");
+        assert!(
+            err.to_string().contains("[ec.hmac]"),
+            "the error should name the missing block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_request_path_reuses_the_module_the_composition_root_resolved() {
+        // A composition root resolves the selection once while it builds
+        // application state, which is the same work `build_module` does on a
+        // request, so doing both means doing it twice for every request. The
+        // resolved module is threaded into `RuntimeServices`, and this is the
+        // assertion that the request path takes it rather than resolving again:
+        // the same allocation, not merely an equal one.
+        let ec = Ec {
+            module: Some(EcModuleSelection::Named("acme".to_owned())),
+            ..Ec::default()
+        };
+        let resolved = build_shared_module(&ec, Some(Arc::new(VendorModule)))
+            .expect("the composition root should resolve the selection")
+            .expect("the selection should yield a module");
+
+        let services =
+            crate::platform::test_support::noop_services_with_ec_module(Arc::clone(&resolved));
+        let for_request = request_module(&ec, &services)
+            .expect("the request path should take the resolved module")
+            .expect("the resolved module should be there");
+
+        assert!(
+            Arc::ptr_eq(&resolved, &for_request),
+            "the request path should reuse the resolved module, not build a second one"
+        );
+
+        // With nothing threaded the request path builds the selection from the
+        // settings. No module is injected on that path, so only a built-in
+        // selection can be built there.
+        let hmac = selected_hmac(HMAC_MODULE_KEY);
+        let built = request_module(&hmac, &crate::platform::test_support::noop_services())
+            .expect("an unthreaded request path should build a built-in selection")
+            .expect("the selection should yield a module");
+        assert_eq!(
+            built.id(),
+            HMAC_MODULE_KEY,
+            "the request path should build the built-in module the settings select"
+        );
+    }
+
+    #[test]
+    fn an_uninjected_module_is_refused_and_statelessness_is_allowed() {
+        // A selection the adapter cannot supply is knowable without a request,
+        // so the composition root rejects it while application state is built.
+        // The startup check wraps `build_module`, so both refuse it.
+        let selected = Ec {
+            module: Some(EcModuleSelection::from("acme")),
+            ..Ec::default()
+        };
+        for (case, outcome) in [
+            ("build_module", build_module(&selected, None).map(|_| ())),
+            (
+                "the startup check",
+                ensure_module_available(&selected, None),
+            ),
+        ] {
+            let Err(err) = outcome else {
+                panic!("{case} should refuse a module the adapter does not inject");
+            };
+            assert!(
+                err.to_string().contains("acme"),
+                "{case}: the error should name the selected module, got: {err}"
+            );
+        }
+
+        // Statelessness is a supported deployment, spelled either way, and must
+        // never be turned into a startup error.
+        ensure_module_available(&Ec::default(), None)
+            .expect("should allow a deployment that selects no module");
+        let explicit_none = Ec {
+            module: Some(EcModuleSelection::None),
+            ..Ec::default()
+        };
+        ensure_module_available(&explicit_none, None)
+            .expect("should allow the explicit `none` selection");
+    }
+}
