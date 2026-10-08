@@ -1,6 +1,6 @@
 # Design Spec: The Integration Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06 and 2026-10-07. This PR adds design
+**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07 and 2026-10-08. This PR adds design
 documents only and targets `main` directly. Following the review of #1043
 (27 August) the seam it defines is a precondition for the module series
 rather than a follow-up to it, so the order is now this spec, then its
@@ -13,7 +13,7 @@ the code lands.
 `2026-07-30-provider-migration-rollout-design.md`,
 `provider-code-registry.md`
 **Related PRs:** #986, #1043, #1044, #1045, #1046, #1047, #1054
-**Last updated:** 2026-10-06
+**Last updated:** 2026-10-08
 
 > **Why this spec exists.** PRs #1043 to #1047 open the identity, device and
 > geo seams, so a vendor can ship an Edge Cookie module in its own crate
@@ -23,7 +23,8 @@ the code lands.
 > can move out until that table is opened. This spec defines the one core
 > change that opens it, so the migration of every existing vendor is a
 > single defined piece of work rather than an open question repeated once
-> per vendor.
+> per vendor. The implementation (#1094) has since moved every one of them
+> out of core, which §4 records.
 
 > **Relationship to #986 and the #1043 review.** The pluggable-providers
 > spec in #986 (31 July) defines identity, device and geo as modules
@@ -210,13 +211,16 @@ plants a setting each of them must reject.
 
 ### 3.4 Demand and ad server providers
 
-This change does not open the auction to demand implementations from outside
-core. An earlier revision of this section gave `AuctionOrchestrator` a public
-provider-builder type and a second input. `main` has since replaced the
-provider table that revision addressed with a compiled auction plan, in PR
-#1016, and the orchestrator and the integration registry share that one
-compiled plan. This change follows that design and adds no auction provider
-builder.
+This change opens the auction to demand and ad server implementations from
+outside core, through the builder a page integration registers with. An
+earlier revision of this section gave `AuctionOrchestrator` a public
+provider-builder type and a second input, and a later one recorded the
+auction as closed, because `main` had replaced the provider table with a
+compiled auction plan in PR #1016. The implementation follows that plan. A
+builder supplies an implementation with `with_demand` or `with_adserver`, the
+plan compiler resolves each `implementation` line against what the
+deployment's builders supply, and the orchestrator and the integration
+registry share that one compiled plan.
 
 Demand and the ad server are two provider types in their own right, and
 neither is an integration. A demand provider is a source bids are requested
@@ -280,32 +284,35 @@ OpenRTB response extension under a `type` tag
 `crates/trusted-server-core/src/openrtb.rs:183`). It becomes an open
 descriptor, a type tag and a payload the demand provider supplies, with
 the same serialized form, so the response a page receives does not change
-and the APS renderer type moves out of the shared auction types into
-`crates/trusted-server-core/src/integrations/aps.rs`, which is where the APS
-demand implementation lives on `main`. The ad server mock uses the neutral
-form.
+and the APS renderer type moves out of the shared auction types into APS's
+own crate, `crates/auction/aps`. The ad server mock uses the neutral form.
 
-The plan keeps three things closed, read from `main` at 066ea3c69, and they
-are recorded here rather than solved.
+On `main` at 066ea3c69 the plan kept three things closed. The implementation
+opens each, because no auction-side vendor could leave core otherwise.
 
-- The set of demand implementations is fixed in core, being the profiles
+- The set of demand implementations was fixed in core, being the profiles
   `standard`, `prebid-server` and `aps`
-  (`crates/trusted-server-core/src/auction/profile.rs:170`), and the
-  compiled form is a closed enum (`profile.rs:63`) whose Prebid and APS
-  behavior is imported from those modules (`profile.rs:11` and `:12`).
-  Any number of demand providers may run the same implementation
-  (`compiler_supports_two_instances_of_the_same_profile` in
-  `crates/trusted-server-core/src/auction/plan.rs`), which is what
-  `implementation` expresses, but a vendor cannot add an implementation
-  without changing core.
-- The plan compiler treats `prebid-server` and `aps` specially by name
-  (`plan.rs:307`, `:585` and `:595`).
-- The only ad server implementation is `adserver_mock` (`plan.rs:20` and
-  `:556`), and the orchestrator builds it by calling that module directly
-  (`crates/trusted-server-core/src/auction/mod.rs:90`).
+  (`crates/trusted-server-core/src/auction/profile.rs:170`), compiled into a
+  closed enum (`profile.rs:63`) whose Prebid and APS behavior was imported
+  from those modules (`profile.rs:11` and `:12`). It is now whatever the
+  deployment's builders supply. Each implementation is a
+  `DemandImplementation` its crate declares, and core's own list holds none,
+  so `auction-protocol.openrtb`, `auction.prebid-server` and `auction.aps`
+  are three crates. Any number of demand providers may still run the same
+  implementation, which is what `implementation` expresses.
+- The plan compiler treated `prebid-server` and `aps` specially by name
+  (`plan.rs:307`, `:585` and `:595`). It names no implementation now. What
+  an implementation decides is in its own field policy, endpoint rule and
+  request extensions, and a builder that needs the compiled plan registers
+  and validates against it through a hook (§8 item 14).
+- The only ad server implementation was `adserver_mock` (`plan.rs:20` and
+  `:556`), which the orchestrator built by calling that module directly
+  (`crates/trusted-server-core/src/auction/mod.rs:90`). An ad server is an
+  `AdServerImplementation` a builder supplies, and the mock is the crate
+  `ad-server.mock`.
 
-Moving an auction-side vendor out of core therefore needs a change to the
-auction plan, which is outside this stack.
+Core's auction engine still builds and reads `OpenRTB` itself. `OpenRTB` as
+a translation at the edge of the auction is outside this stack.
 
 ### 3.5 The two neutral hooks
 
@@ -360,8 +367,8 @@ capability.
   a module shipping script for a module that is not selected.
 - No module is built into core. Everything goes through one method, so
   the HMAC identity module from #1043 and the User-Agent-only device
-  module from #1044 become Tech Lab-owned crates under
-  `crates/integrations/`, registered by an integration builder, selected by
+  module from #1044 become Tech Lab-owned crates under `crates/edgecookie/`
+  and `crates/device/`, registered by an integration builder, selected by
   `[ec] module` and `[device] module`, and validated through §3.3 like
   any other registration. Neither ships browser JavaScript and no section
   selects either, because a builder that supplies an implementation does
@@ -491,18 +498,19 @@ converts in a change of its own, checked against the differential harness,
 and the four traits, their contexts and the registry's four hook lists are
 deleted when the last implementation converts.
 
-## 4. Migration of the nine existing vendors
+## 4. Migration of the existing vendors
 
-One vendor per PR, after this change lands. Each migration PR gives its vendor crate a visible maintainers declaration, the way Prebid.js requires of every adapter, and per-crate code ownership, so the boundary carries a named owner from its first day. Each moves its Rust, its
-TypeScript, its config type and its tests into
-`crates/integrations/<vendor>`, and the adapter that wants it depends on it.
+The implementation (#1094) moves every integration module out of core, one module per commit, so each move can be read and reverted on its own. A module's Rust, its settings type, its deploy rules and its tests move into `crates/<type>/<vendor>`, and the module is named by that folder (§2). Each crate carries a visible maintainers declaration, the way Prebid.js requires of every adapter, so the boundary has a named owner from its first day. `crates/trusted-server-modules` lists the modules a stock build ships, in the order their hooks run, and every adapter and the `ts` tool take that list. A vendor's browser script stays in `crates/trusted-server-js` for now (§8 item 8).
 
-| Vendor                                                           | What it needs                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                                                                                                                                                                                        |
-| APS                                                              | A demand implementation rather than a page integration, so it is configured under `[demand.<name>]`, carries its `rendering_mode` there, and no section selects it. Needs the generalized renderer contract in §3.4, which this change delivers. It also needs a change to the auction plan so an auction-side vendor can live outside core (§3.4), and browser-side work, because core TypeScript imports APS directly (§8 item 8). This change delivers neither. |
-| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                                                                                                                                                                                                                                                                       |
-| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                                                                                                                                                                                                                                                                       |
+| Module                                                                               | What its move needed                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint, Testlight, Next.js | Moved as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                                                                                                                                                                                                                    |
+| Google Publisher Tags (the `gpt` proxy and its diagnostics)                          | The proxy moved as it is. The diagnostics half needed a module to act on one request without core naming it (§3.5, §8 item 12).                                                                                                                                                                                                                                                                                 |
+| DataDome                                                                             | Needed the same request state (§3.5, §8 item 12), and a module's own declaration of its secret settings (§8 items 9 and 13).                                                                                                                                                                                                                                                                                    |
+| APS                                                                                  | A demand implementation rather than a page integration, so it is configured under `[demand.<name>]`, carries its `rendering_mode` there, and no section selects it. Needed the open renderer descriptor and the open auction plan of §3.4, and a registration from the compiled plan for the page support its renderer needs (§8 item 14). Core TypeScript still imports the APS renderer directly (§8 item 8). |
+| Prebid and Prebid Server                                                             | One file on `main`. It was divided inside core into the page integration and the demand implementation, which share nothing, and the two moved as two crates. The page integration registers and validates against the plan as APS does (§8 item 14).                                                                                                                                                           |
+| The mock ad server                                                                   | An ad server implementation a builder supplies (§3.4).                                                                                                                                                                                                                                                                                                                                                          |
+| The plain `OpenRTB` demand                                                           | Moved as it is. The reader of an ordinary `OpenRTB` response stays in core's driver, for any implementation to use.                                                                                                                                                                                                                                                                                             |
 
 A vendor's `[<type>.<name>]` table needs no change when the vendor moves,
 because the sections are read into `TypeSections` in
@@ -520,23 +528,26 @@ Two more places every move must touch, found by mapping `main`:
   `.rs` files, being 2 infrastructure files (`mod.rs` and `registry.rs`),
   6 files in the `nextjs/` subdirectory, 2 in the `datadome/` submodule and
   13 top-level integration modules. The guard embeds 20 of those 23, and 9
-  of the 20 are files of the nine vendors in the table above. The three it
+  of the 20 are files of the nine vendors `main` holds. The three it
   does not embed are `osano.rs` and the two `datadome/` files, so the guard
   is already incomplete and the Osano move has no guard entry to delete.
   Separately, `builders()` registers 13 integrations, which is not the same
   13 as the file count, because `adserver_mock` is a file with no
   registration while `nextjs` is a registration held in a subdirectory. The
   guard cannot derive its list from the registrations, because
-  `include_str!` paths are fixed at compile time, so this change drops the
-  vendors' files from the guard instead, because a module crate is outside
-  the core neutrality guarantee, and a move then deletes nothing there.
+  `include_str!` paths are fixed at compile time, so the implementation
+  generates the list in `build.rs` from every `.rs` file under `src`. A file
+  that leaves core then leaves the guard with no edit, and a module crate is
+  outside the core neutrality guarantee.
 - The `ts audit` command carries its own vendor table (detection patterns
   and configuration section names in
   `crates/trusted-server-cli/src/commands/audit/analyzer.rs` and
   `commands/audit/mod.rs`). It is outside the registry and outside this
-  change. Each vendor move takes its `ts audit` rows with it, and how the
-  CLI learns a vendor's detection pattern from a crate is a follow-up this
-  spec records but does not solve.
+  change. The detection patterns stay in the CLI. What the audit writes for
+  a module it detects, being the section that selects the module and its
+  name there, comes from the list of stock modules, so the CLI names no
+  module's section. How the CLI learns a vendor's detection pattern from a
+  crate is a follow-up this spec records but does not solve.
 
 ## 5. What does not change
 
@@ -565,8 +576,8 @@ deployment that lists the same integrations gets the same responses.
    identifier carries its code, the resolved country and the device signals
    are its). With a selector naming a module that lacks the capability,
    startup fails with an error that names the module and the capability.
-3. **Parity.** The existing integration and parity suites pass unchanged,
-   because the built-in set still registers through the same path.
+3. **Parity.** The existing integration and parity suites pass with the
+   fixtures they had, because the stock set registers through the same path.
 4. **No vendor left behind.** The rewritten deploy-validation test shows
    every registered integration validates its configuration.
 5. **Page changes through the contract.** The test integration registers a
@@ -596,8 +607,9 @@ A probe integration built outside `trusted-server-core` and registered
 through an adapter exercised every seam end to end. Eight things surfaced
 that reading the code did not, and three more came from reading the
 settings loader and the Fastly entry point for what a vendor with a secret,
-an ad server or a device module would need. They are recorded here rather
-than left for each vendor to rediscover.
+an ad server or a device module would need. Moving every module out of core
+then found four more, items 12 to 15. They are recorded here rather than left
+for each vendor to rediscover.
 
 1. **A vendor's own deploy rules do not run through the operator CLI.**
    `ts config validate` and `ts config push` reach validation through
@@ -631,10 +643,12 @@ than left for each vendor to rediscover.
    that a vendor sharing one backend makes a single call per request needs
    a per-request module context to hang that on, which this change does
    not introduce.
-4. **One core reader still reaches into a vendor's payload.** The
-   `hb_adid` fallback in the publisher reads the APS renderer's fields, so
-   the APS migration needs a neutral answer for it rather than only the
-   renderer contract in §3.4.
+4. **One core reader reached into a vendor's payload.** The `hb_adid`
+   fallback in the publisher read the APS renderer's fields by APS's own
+   names, so the APS migration needed a neutral answer for it rather than
+   only the renderer contract in §3.4. A renderer descriptor now carries the
+   name of the field that holds its bid id, stated by the implementation
+   that builds it, and the publisher asks the descriptor for that id.
 
 5. **Request preparation covers different routes on each host.** Every
    adapter runs preparers before routing, but not on the same set of
@@ -704,8 +718,8 @@ than left for each vendor to rediscover.
    and moving DataDome out of core means changing all three. A declaration
    on the builder closes this, being the secret leaves a module reads,
    resolved only when a section selects the module and refused when one
-   points outside the module's own table. The DataDome move in §4 needs it
-   first.
+   points outside the module's own table. The DataDome move in §4 needed
+   it first, and item 13 is what was built.
 10. **A deployment hands its builders to the settings load as well as to
     the state build.** The settings are validated as they load, and that
     validation compiles the auction plan. With the built-in implementations
@@ -726,9 +740,43 @@ than left for each vendor to rediscover.
     registry resolved. Acceptance item 2 asks that a request's device
     signals be the test integration's, which can therefore be shown on
     Fastly and not on the dev server.
+12. **A module that acts on one request needs somewhere to leave what it
+    decided.** The diagnostics half of Google Publisher Tags and DataDome
+    each decide something about one request before it is routed and act on
+    it when the page is written. A request preparer or filter leaves a value
+    on the request under its integration id. The page path carries the value
+    to the module's own hooks in the document and to a response finalizer
+    the builder declares. A request that carries one keeps to the origin
+    path and its HTML is private, so it is never served from or stored as a
+    shared template. This is the neutral form of both hooks in §3.5.
+13. **A builder declares its module's secret settings.** This closes item 9. A builder lists the settings in its own table that hold the name of a
+    secret, each with a rule for whether the table as written puts the
+    setting to use. As the settings load, a setting in use in a selected
+    module's table is looked up and the others are cleared, and deploy
+    validation checks that each one in use names a key. Core's settings code
+    names no vendor's secret.
+14. **A module whose page support follows the auction plan registers from
+    the plan.** Prebid's page integration and the page support APS's
+    renderer needs are wanted when the plan selects them, whatever a section
+    says. A builder can register from the compiled plan, with its hooks
+    ahead of every module a section selects, and can check its settings
+    against the plan when a deployment is validated and as the settings
+    load. The registry named Prebid and APS before this.
+15. **Every process that validates or loads settings needs the builders.**
+    Items 6 and 10 found this for the settings load. Moving the demand
+    implementations found it three more times, in the integration tests'
+    Viceroy configuration generator, in their own configuration and in two
+    of the CLI's tests, each of which validated a configuration in a process
+    that had been handed no builders and so refused an implementation the
+    build ships. A path that takes no builders knows core's own modules
+    alone, which after the moves is the JavaScript asset proxy. The `ts`
+    tool registers the modules a stock build ships before it validates, so
+    their rules run when an operator validates or pushes. A deployment's own
+    crate is still unknown to the stock tool, which is the decision item 1
+    asks for.
 
 Items 1 and 6 are the ones a vendor meets on its first day, and item 9
-joins them for a vendor with a secret. Item 5 is the one
+joined them for a vendor with a secret until item 13. Item 5 is the one
 that produces a bug report nobody can reproduce, because whether it appears
 depends on which host the reporter runs.
 
@@ -736,28 +784,29 @@ Taken together these say the seam is proven but not yet finished. A vendor
 can register a module, ship its browser code, declare a geo module and
 serve a route, all from its own crate and proven end to end on Axum and
 on Fastly. Its own configuration rules are enforced at startup only for a
-deployment that loads its settings with its builders, and never when an
-operator pushes. That is a small change against what this document already
-defines, and it should land before the first vendor is asked to use it.
+deployment that loads its settings with its builders, and when an operator
+pushes only for the modules a stock build ships. That is a small change
+against what this document already defines, and it should land before the
+first vendor outside this repository is asked to use it.
 
 ## 9. Sign-off
 
-| #   | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Status               |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Proposed             |
-| 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Proposed, governance |
-| 3   | A registration may carry its own browser JavaScript                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Proposed             |
-| 4   | Deploy validation moves onto the registration                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Proposed             |
-| 5   | The nine existing integrations migrate one PR each, on the schedule in §4                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Proposed             |
-| 6   | This change completes the Rust side for a page integration that holds no secret, so after it moving one needs no Rust core change. An auction-side vendor still needs a change to the auction plan (§3.4). A vendor with a secret setting still has its path in core's secret list (§8 item 9), so a DataDome move needs a secret declaration on the builder first. The browser side is not complete, because TSJS core still imports the APS renderer directly (§8 item 8), so an APS move also needs a browser renderer contract | Proposed             |
-| 7   | Identity, geo and device modules are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                                                                                                                                                                                                    | Proposed             |
-| 8   | No module is built into core, because HMAC and the User-Agent-only device module are Tech Lab-owned crates registered by an integration builder and selected by `[ec] module` and `[device] module`, neither being a page integration, and core keeps only `none`                                                                                                                                                                                                                                                                  | Proposed             |
-| 9   | This spec and its core implementation precede #1043, so 51Degrees implements the core seam and the nine vendor moves in §4 stay one PR each                                                                                                                                                                                                                                                                                                                                                                                        | Proposed             |
-| 10  | What an operator selects is a module, selected with `module` or `modules` in every type's table (§2)                                                                                                                                                                                                                                                                                                                                                                                                                               | Proposed             |
-| 11  | The built-in integrations are discovered at build time, and an external crate registers through the adapter (§3.1)                                                                                                                                                                                                                                                                                                                                                                                                                 | Proposed             |
-| 12  | A page change is one middleware, run only where an ordered `[[fetch]]` or `[[serve]]` entry names it, in two phases (§3.7)                                                                                                                                                                                                                                                                                                                                                                                                         | Proposed             |
-| 13  | A vendor crate pins its own dependency versions and releases without a pull request here, and Tech Lab reviews it (§2)                                                                                                                                                                                                                                                                                                                                                                                                             | Proposed             |
-| 14  | A module is named by its crate folder, and a page integration is selected from the section of its type, so there is no `[integration]` section (§2)                                                                                                                                                                                                                                                                                                                                                                                | Proposed             |
+| #   | Decision                                                                                                                                                                                                                                                                                                                                                                                   | Status               |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------- |
+| 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                                                                                                                                                                                                                                  | Proposed             |
+| 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                                                                                                                                                                                                                                     | Proposed, governance |
+| 3   | A registration may carry its own browser JavaScript                                                                                                                                                                                                                                                                                                                                        | Proposed             |
+| 4   | Deploy validation moves onto the registration                                                                                                                                                                                                                                                                                                                                              | Proposed             |
+| 5   | Every integration module in core migrates inside the implementation (#1094), one commit each, as §4 records                                                                                                                                                                                                                                                                                | Proposed             |
+| 6   | This change completes the Rust side for every kind of module, so a vendor's module needs no Rust core change, whether it is a page integration, holds a secret (§8 item 13) or is an auction implementation (§3.4). The browser side is not complete, because TSJS core still imports the APS renderer directly (§8 item 8), so APS's browser code still needs a browser renderer contract | Proposed             |
+| 7   | Identity, geo and device modules are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                                                                                                                                                                                                                                            | Proposed             |
+| 8   | No module is built into core, because HMAC and the User-Agent-only device module are Tech Lab-owned crates registered by an integration builder and selected by `[ec] module` and `[device] module`, neither being a page integration, and core keeps only `none`                                                                                                                          | Proposed             |
+| 9   | This spec and its core implementation precede #1043, so 51Degrees implements the core seam and the moves in §4                                                                                                                                                                                                                                                                             | Proposed             |
+| 10  | What an operator selects is a module, selected with `module` or `modules` in every type's table (§2)                                                                                                                                                                                                                                                                                       | Proposed             |
+| 11  | The built-in integrations are discovered at build time, and an external crate registers through the adapter (§3.1)                                                                                                                                                                                                                                                                         | Proposed             |
+| 12  | A page change is one middleware, run only where an ordered `[[fetch]]` or `[[serve]]` entry names it, in two phases (§3.7)                                                                                                                                                                                                                                                                 | Proposed             |
+| 13  | A vendor crate pins its own dependency versions and releases without a pull request here, and Tech Lab reviews it (§2)                                                                                                                                                                                                                                                                     | Proposed             |
+| 14  | A module is named by its crate folder, and a page integration is selected from the section of its type, so there is no `[integration]` section (§2)                                                                                                                                                                                                                                        | Proposed             |
 
 ## Revision record
 
@@ -788,6 +837,20 @@ defines, and it should land before the first vendor is asked to use it.
   alone. Acceptance item 1 and §8 item 7 say the Fastly adapter is a
   library that takes a deployment's builders through `run_with`, and that
   the round trip runs on it.
+- 2026-10-08. The implementation moved every integration module out of core,
+  so the passages that described the moves as work to come say what was
+  built. Vendor crates sit under `crates/<type>/<vendor>` (§3.6, §4), where
+  earlier revisions said `crates/integrations/<vendor>`. The auction is open
+  to demand and ad server implementations from a crate (§3.4), where the
+  previous revision recorded it as closed. §4 says what each module's move
+  needed, and that the moves are one commit each inside the implementation
+  where earlier revisions planned one pull request each after it (sign-off
+  rows 5, 6 and 9). The source-file guard's list is generated, and the audit
+  takes a module's section from the list of stock modules (§4). Acceptance
+  item 3 names the stock set. §8 item 4 says how the publisher reads a
+  renderer's bid id now. §8 gains items 12 to 15, being request state
+  for a module, a module's own secret settings, registration from the
+  auction plan, and the builders every validating process needs.
 
 | Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
