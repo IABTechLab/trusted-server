@@ -16,7 +16,6 @@ use crate::settings::Settings;
 pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
-pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
 pub mod openrtb;
 pub mod prebid;
@@ -629,7 +628,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     #[cfg(test)]
     registry_test_support::request_fixture::BUILDER,
     datadome::BUILDER,
-    gpt_diagnostics::BUILDER,
     // Implementations `[demand]` and `[ad-server]` can name. None of them is
     // a module a section selects.
     IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),

@@ -5,26 +5,24 @@
 //! active documents load the module synchronously without adding diagnostics to
 //! the ordinary unified bundle.
 
+use std::sync::Arc;
+
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, Uri, header, uri::PathAndQuery};
 use serde::Deserialize;
 use validator::Validate;
 
-use edgezero_core::body::Body as EdgeBody;
-
-use std::sync::Arc;
-
-use crate::error::TrustedServerError;
-use crate::http_util::is_navigation_request;
-use crate::response_privacy::enforce_terminal_private_cache_privacy;
-use crate::settings::{IntegrationConfig, Settings};
-use crate::tsjs;
-use crate::tsjs_bundle::JsModulePart;
-
-use super::{
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::http_util::is_navigation_request;
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
     IntegrationRequestState,
 };
+use trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy;
+use trusted_server_core::settings::{IntegrationConfig, Settings};
+use trusted_server_core::tsjs;
+use trusted_server_core::tsjs_bundle::JsModulePart;
 
 /// Stable integration identifier.
 pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
@@ -32,18 +30,22 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 /// The name this module is selected by, in `[ad-tag]`.
 pub const MODULE: &str = "ad-tag.google.diagnostics";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(
         GPT_DIAGNOSTICS_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
     .with_module_name(MODULE)
     .with_request_preparer(prepare_request_hook)
     .with_response_finalizer(finalize_response_hook)
-    .with_auction_token();
+    .with_auction_token()
+}
+
 /// Reserved activation query parameter.
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
@@ -319,8 +321,8 @@ pub fn prepare_request(
     let cookie_state = console_cookie_state(request);
     let eligible_navigation = request.method() == Method::GET
         && is_navigation_request(request)
-        && !crate::publisher::is_prefetch_request(request)
-        && !crate::publisher::is_bot_user_agent(request);
+        && !trusted_server_core::publisher::is_prefetch_request(request)
+        && !trusted_server_core::publisher::is_bot_user_agent(request);
 
     sanitize_console_cookie(request);
     if had_reserved_query {
@@ -505,9 +507,9 @@ fn replace_path_and_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationRegistry;
-    use crate::test_support::tests::create_test_settings;
     use serde_json::json;
+    use trusted_server_core::integrations::IntegrationRegistry;
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     fn settings() -> Settings {
         let mut settings = create_test_settings();
@@ -531,11 +533,8 @@ mod tests {
     #[test]
     fn register_excludes_diagnostics_from_unified_and_deferred_bundles() {
         let settings = settings();
-        let plan = std::sync::Arc::new(
-            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
-        );
-        let registry =
-            IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build registry");
 
         assert!(registry.integration_runs(GPT_DIAGNOSTICS_INTEGRATION_ID));
         assert!(
@@ -709,7 +708,7 @@ mod tests {
         assert!(
             response
                 .extensions()
-                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .get::<trusted_server_core::response_privacy::TerminalPrivateResponse>()
                 .is_some(),
             "should mark request-scoped diagnostics HTML for terminal re-enforcement"
         );
@@ -736,7 +735,7 @@ mod tests {
         assert!(
             response
                 .extensions()
-                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .get::<trusted_server_core::response_privacy::TerminalPrivateResponse>()
                 .is_none(),
             "should not mark an untouched response terminal-private"
         );
@@ -758,5 +757,174 @@ mod tests {
             .expect_err("should reject unknown diagnostics config fields");
         let error_text = format!("{error:?}");
         assert!(error_text.contains("typo") || error_text.contains("unknown field"));
+    }
+
+    #[test]
+    fn module_constant_names_the_crate_folder_and_the_module_within_it() {
+        assert_eq!(
+            MODULE,
+            format!("{}.diagnostics", trusted_server_core::module_name!()),
+            "should be named by the folder this crate lives in"
+        );
+    }
+
+    #[test]
+    fn only_a_decision_that_acts_is_left_for_the_page_path() {
+        let mut ordinary = navigation("https://publisher.example/page", None);
+        prepare_request(&settings(), &mut ordinary).expect("should prepare");
+        assert!(
+            IntegrationRequestState::of(&ordinary).is_empty(),
+            "an ordinary request should stay on the shared template path"
+        );
+
+        let mut activating = navigation("https://publisher.example/page?ts_console=1", None);
+        let decision = prepare_request(&settings(), &mut activating).expect("should prepare");
+        assert_eq!(
+            IntegrationRequestState::of(&activating)
+                .get::<GptDiagnosticsRequestDecision>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+                .as_deref(),
+            Some(&decision),
+            "should leave the decision that acts for the page path"
+        );
+    }
+
+    #[test]
+    fn the_finalizer_acts_only_on_a_decision_left_for_the_page_path() {
+        let mut untouched = Response::builder()
+            .header(header::CACHE_CONTROL, "public, max-age=60")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        finalize_response_hook(&IntegrationRequestState::default(), &mut untouched);
+        assert_eq!(
+            untouched.headers()[header::CACHE_CONTROL],
+            "public, max-age=60",
+            "should leave a response alone when nothing was left for it"
+        );
+        assert!(
+            !untouched.headers().contains_key(header::SET_COOKIE),
+            "should set no cookie when nothing was left for it"
+        );
+
+        let mut request = navigation("https://publisher.example/?ts_console=1", None);
+        prepare_request(&settings(), &mut request).expect("should prepare");
+        let mut response = Response::builder()
+            .header(header::CACHE_CONTROL, "public, max-age=60")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        finalize_response_hook(&IntegrationRequestState::of(&request), &mut response);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, private",
+            "should make the activating response private"
+        );
+        assert_eq!(
+            response.headers()[header::SET_COOKIE],
+            SET_CONSOLE_COOKIE,
+            "should establish the session"
+        );
+    }
+
+    #[test]
+    fn an_active_document_loads_the_module_after_the_unified_bundle_once() {
+        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::streaming_processor::StreamProcessor as _;
+
+        let settings = settings();
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build registry");
+        let mut request = navigation("https://publisher.example/page?ts_console=1", None);
+        let decision = prepare_request(&settings, &mut request).expect("should prepare");
+        assert!(
+            decision.active(),
+            "should activate diagnostics for the query"
+        );
+        let config = HtmlProcessorConfig::from_settings(
+            &settings,
+            &registry,
+            "origin.example.com",
+            "publisher.example",
+            "https",
+        )
+        .with_request_state(IntegrationRequestState::of(&request));
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(
+                b"<html><head><title>Test</title></head><body></body></html>",
+                true,
+            )
+            .expect("should process HTML");
+        let processed = String::from_utf8(output).expect("should produce valid UTF-8");
+        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
+        let bundle_marker = "id=\"trustedserver-js\"";
+        let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
+
+        assert_eq!(
+            processed.matches(bootstrap_marker).count(),
+            1,
+            "should inject the diagnostics bootstrap once"
+        );
+        assert_eq!(
+            processed.matches(bundle_marker).count(),
+            1,
+            "should inject the immediate TSJS bundle once"
+        );
+        assert_eq!(
+            processed.matches(diagnostics_marker).count(),
+            1,
+            "should inject one standalone diagnostics module"
+        );
+        let bootstrap_index = processed
+            .find(bootstrap_marker)
+            .expect("should include diagnostics bootstrap");
+        let bundle_index = processed
+            .find(bundle_marker)
+            .expect("should include immediate TSJS bundle");
+        let diagnostics_index = processed
+            .find(diagnostics_marker)
+            .expect("should include standalone diagnostics module");
+        assert!(
+            bootstrap_index < bundle_index,
+            "should activate before core executes"
+        );
+        assert!(
+            bundle_index < diagnostics_index,
+            "should load diagnostics after core"
+        );
+    }
+
+    #[test]
+    fn an_inactive_document_gets_neither_script() {
+        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::streaming_processor::StreamProcessor as _;
+
+        let settings = settings();
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should build registry");
+        let mut request = navigation("https://publisher.example/page", None);
+        prepare_request(&settings, &mut request).expect("should prepare");
+        let config = HtmlProcessorConfig::from_settings(
+            &settings,
+            &registry,
+            "origin.example.com",
+            "publisher.example",
+            "https",
+        )
+        .with_request_state(IntegrationRequestState::of(&request));
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(
+                b"<html><head><title>Test</title></head><body></body></html>",
+                true,
+            )
+            .expect("should process HTML");
+        let processed = String::from_utf8(output).expect("should produce valid UTF-8");
+
+        assert!(
+            !processed.contains("__tsjs_gpt_diagnostics_active")
+                && !processed.contains("tsjs-gpt_diagnostics.min.js"),
+            "should write nothing into a document diagnostics is not active for: {processed}"
+        );
     }
 }

@@ -26,5 +26,7 @@ trusted-server-tag-google-tag-manager = { workspace = true }
 trusted-server-testing-testlight = { workspace = true }
 
 [dev-dependencies]
+edgezero-core = { workspace = true }
+http = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }

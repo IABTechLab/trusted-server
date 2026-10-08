@@ -3225,7 +3225,11 @@ pub(crate) const BOT_USER_AGENT_FRAGMENTS: &[&str] =
 
 /// Returns true when the request's User-Agent matches any well-known crawler
 /// fragment in [`BOT_USER_AGENT_FRAGMENTS`].
-pub(crate) fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
+///
+/// Public so a module outside this crate treats a crawler the way the page
+/// path does.
+#[must_use]
+pub fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
     let ua = req
         .headers()
         .get("user-agent")
@@ -3238,7 +3242,11 @@ pub(crate) fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
 
 /// Returns true when the request advertises itself as a prefetch via either
 /// the standard `Sec-Purpose` or the legacy `Purpose` header.
-pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
+///
+/// Public so a module outside this crate treats a prefetch the way the page
+/// path does.
+#[must_use]
+pub fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     let header = |name: &str| {
         req.headers()
             .get(name)
@@ -9264,28 +9272,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_publisher_body_injects_active_diagnostics_for_materialized_html() {
+    fn stream_publisher_body_writes_what_a_module_left_on_the_request_into_materialized_html() {
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
-        let integration_registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create integration registry");
-        let mut request = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example/article?ts_console=1")
-            .header("sec-fetch-dest", "document")
-            .body(EdgeBody::empty())
-            .expect("should build activation request");
-        crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
-            .expect("should prepare diagnostics request");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::request_fixture::MODULE,
+        );
+        let integration_registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
         let mut params = make_stream_params(&settings, "");
         params.content_type = "text/html".to_owned();
-        params.request_state = IntegrationRequestState::of(&request);
+        params.request_state =
+            crate::integrations::registry_test_support::request_fixture::marked();
         let mut output = Vec::new();
 
         stream_publisher_body(
@@ -9299,12 +9297,12 @@ mod tests {
 
         let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
         assert!(
-            html.contains("__tsjs_gpt_diagnostics_active"),
-            "should inject the activation flag"
+            html.contains(crate::integrations::registry_test_support::request_fixture::HEAD_FLAG),
+            "should write the module's head insert"
         );
         assert!(
-            html.contains("tsjs-gpt_diagnostics.min.js"),
-            "should inject the standalone diagnostics module"
+            html.contains(crate::integrations::registry_test_support::request_fixture::MODULE_FILE),
+            "should write the module's after-bundle insert"
         );
     }
 
@@ -14276,12 +14274,18 @@ mod tests {
             let cache = Arc::new(MemoryTemplateCache::default());
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
-            // Normal preparation strips invalid fields and empty pairs before origin
-            // forwarding. Preserve it; the cache policy sees the prepared request.
+            // A module's preparer may rewrite the Cookie header before origin
+            // forwarding, as the stand-in does when it strips the cookie it
+            // reserves, dropping a field it cannot read and an empty pair as it
+            // goes. The cache policy sees the prepared request.
+            let reserved = format!(
+                "{}=1",
+                crate::integrations::registry_test_support::request_fixture::COOKIE_NAME
+            );
             let cold = run(
                 &settings,
                 &services,
-                cookie_policy_request(&[b"ab_bucket=A;", b"unknown=\xff"]),
+                cookie_policy_request(&[b"ab_bucket=A;", b"unknown=\xff", reserved.as_bytes()]),
             )
             .await;
             assert_eq!(
@@ -14916,19 +14920,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn real_diagnostics_query_bypasses_template_cache_and_keeps_its_private_bootstrap() {
+        async fn a_query_a_module_acts_on_bypasses_template_cache_and_keeps_what_the_module_writes()
+        {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
-            raw.select_module("ad-tag", "ad-tag.google.diagnostics");
+            raw.select_module(
+                "testing",
+                crate::integrations::registry_test_support::request_fixture::MODULE,
+            );
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
 
+            // The handler prepares a request that reaches it unprepared, so the
+            // module's preparer reads its query here as it does behind an adapter.
             let mut request = navigation_request();
-            *request.uri_mut() = "https://ts.example.com/article?ts_console=1"
-                .parse()
-                .expect("should parse diagnostics URI");
+            *request.uri_mut() = format!(
+                "https://ts.example.com/article?{}",
+                crate::integrations::registry_test_support::request_fixture::QUERY
+            )
+            .parse()
+            .expect("should parse the URI");
             let response = run(&settings, &services, request).await;
             assert_eq!(
                 response
@@ -14944,23 +14957,37 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("no-store, private")
             );
-            assert!(response.headers().contains_key(header::SET_COOKIE));
-            let document = String::from_utf8(body_of(response).await)
-                .expect("diagnostics document should be UTF-8");
-            assert!(document.contains("__tsjs_gpt_diagnostics_active"));
-            assert!(document.contains("tsjs-gpt_diagnostics.min.js"));
+            assert!(
+                response.headers().contains_key(header::SET_COOKIE),
+                "the module's response finalizer should run on the page path"
+            );
+            assert!(
+                stub.recorded_request_uris().iter().all(|uri| !uri
+                    .contains(crate::integrations::registry_test_support::request_fixture::QUERY)),
+                "the origin should be asked without the query the module reserved"
+            );
+            let document =
+                String::from_utf8(body_of(response).await).expect("the document should be UTF-8");
+            assert!(
+                document.contains(
+                    crate::integrations::registry_test_support::request_fixture::HEAD_FLAG
+                )
+            );
+            assert!(document.contains(
+                crate::integrations::registry_test_support::request_fixture::MODULE_FILE
+            ));
             assert!(
                 cache
                     .lookups
                     .lock()
                     .expect("should lock lookups")
                     .is_empty(),
-                "the real query activation must bypass lookup before origin work"
+                "a query a module acts on must bypass lookup before origin work"
             );
         }
 
         #[tokio::test]
-        async fn real_diagnostics_cookie_bypasses_a_warm_cookie_independent_template() {
+        async fn a_request_a_module_left_state_on_bypasses_a_warm_cookie_independent_template() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let mut raw = settings_with_mode("esi");
@@ -14968,19 +14995,17 @@ mod tests {
                 .as_mut()
                 .expect("fixture configures creative opportunities")
                 .origin_is_cookie_independent = Some(true);
-            raw.select_module("ad-tag", "ad-tag.google.diagnostics");
+            raw.select_module(
+                "testing",
+                crate::integrations::registry_test_support::request_fixture::MODULE,
+            );
             let settings = Arc::new(raw);
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
             queue_shareable_html(&stub);
 
             let _ = body_of(run(&settings, &services, navigation_request()).await).await;
-            let mut diagnostics = navigation_request();
-            diagnostics.headers_mut().insert(
-                header::COOKIE,
-                HeaderValue::from_static("__Host-ts-console=1"),
-            );
-            let response = run(&settings, &services, diagnostics).await;
+            let response = run(&settings, &services, marked_navigation_request()).await;
             assert_eq!(
                 response
                     .headers()
@@ -14988,16 +15013,20 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("bypass-request")
             );
-            let document = String::from_utf8(body_of(response).await)
-                .expect("diagnostics document should be UTF-8");
+            let document =
+                String::from_utf8(body_of(response).await).expect("the document should be UTF-8");
 
             assert_eq!(stub.recorded_request_uris().len(), 2);
             assert_eq!(
                 cache.lookups.lock().expect("should lock lookups").len(),
                 1,
-                "the diagnostics cookie must bypass the otherwise-eligible warm lookup"
+                "a request a module left state on must bypass the otherwise-eligible warm lookup"
             );
-            assert!(document.contains("__tsjs_gpt_diagnostics_active"));
+            assert!(
+                document.contains(
+                    crate::integrations::registry_test_support::request_fixture::HEAD_FLAG
+                )
+            );
         }
 
         #[tokio::test]
@@ -17836,10 +17865,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn inactive_ad_stack_preserves_gpt_diagnostics_cache_privacy() {
+        async fn inactive_ad_stack_preserves_the_cache_privacy_of_a_request_a_module_acts_on() {
             // Arrange
             let mut settings = settings_with_disabled_ad_templates();
-            settings.select_module("ad-tag", "ad-tag.google.diagnostics");
+            settings.select_module(
+                "testing",
+                crate::integrations::registry_test_support::request_fixture::MODULE,
+            );
             let stub = Arc::new(StubHttpClient::new());
             queue_html_response_with_cache_control(&stub, "no-cache");
             let services = build_services_with_http_client(
@@ -17847,11 +17879,14 @@ mod tests {
             );
             let request = HttpRequest::builder()
                 .method(Method::GET)
-                .uri("https://ts.example.com/article?ts_console=1")
+                .uri(format!(
+                    "https://ts.example.com/article?{}",
+                    crate::integrations::registry_test_support::request_fixture::QUERY
+                ))
                 .header(header::HOST, "ts.example.com")
                 .header("sec-fetch-dest", "document")
                 .body(EdgeBody::empty())
-                .expect("should build GPT diagnostics request");
+                .expect("should build the request the module acts on");
 
             // Act
             let response = run_with_slots(&settings, &services, &[article_slot()], request).await;
@@ -17864,7 +17899,7 @@ mod tests {
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
                 Some("no-store, private"),
-                "active GPT diagnostics should retain cache privacy when server-side ad templates are inactive"
+                "a document a module wrote into should stay private when server-side ad templates are inactive"
             );
         }
 
@@ -19780,24 +19815,24 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_dynamic_serves_diagnostics_standalone_without_cookie_variance() {
+    fn tsjs_dynamic_serves_a_standalone_module_without_cookie_variance() {
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create integration registry");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::request_fixture::MODULE,
+        );
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
         let mut req = build_request(
             Method::GET,
-            "https://publisher.example/static/tsjs=tsjs-gpt_diagnostics.min.js",
+            &format!(
+                "https://publisher.example/static/tsjs={}",
+                crate::integrations::registry_test_support::request_fixture::MODULE_FILE
+            ),
         );
         req.headers_mut().insert(
             header::COOKIE,
-            HeaderValue::from_static("__Host-ts-console=1"),
+            HeaderValue::from_static("ts-request-fixture=1"),
         );
 
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)

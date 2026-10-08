@@ -952,34 +952,16 @@ mod tests {
     }
 
     #[test]
-    fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
+    fn what_a_module_left_on_the_request_is_written_around_the_unified_bundle_once() {
+        use crate::integrations::registry_test_support::request_fixture;
+
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
-
-        let mut request = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://publisher.example/page?ts_console=1")
-            .header("sec-fetch-dest", "document")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build activation request");
-        let decision =
-            crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
-                .expect("should prepare diagnostics request");
+        settings.select_module("testing", request_fixture::MODULE);
         let mut config = create_test_config();
-        config.integrations = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should build integration registry");
-        assert!(
-            decision.active(),
-            "should activate diagnostics for the query"
-        );
-        config.request_state = IntegrationRequestState::of(&request);
+        config.integrations =
+            IntegrationRegistry::new(&settings).expect("should build integration registry");
+        config.request_state = request_fixture::marked();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -994,14 +976,14 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
-        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
+        let head_marker = request_fixture::HEAD_FLAG;
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
+        let module_marker = request_fixture::MODULE_FILE;
 
         assert_eq!(
-            processed.matches(bootstrap_marker).count(),
+            processed.matches(head_marker).count(),
             1,
-            "should inject the diagnostics bootstrap once"
+            "should write the module's head insert once"
         );
         assert_eq!(
             processed.matches(bundle_marker).count(),
@@ -1009,26 +991,26 @@ mod tests {
             "should inject the immediate TSJS bundle once"
         );
         assert_eq!(
-            processed.matches(diagnostics_marker).count(),
+            processed.matches(module_marker).count(),
             1,
-            "should inject one standalone diagnostics module"
+            "should write the module's after-bundle insert once"
         );
-        let bootstrap_index = processed
-            .find(bootstrap_marker)
-            .expect("should include diagnostics bootstrap");
+        let head_index = processed
+            .find(head_marker)
+            .expect("should include the head insert");
         let bundle_index = processed
             .find(bundle_marker)
             .expect("should include immediate TSJS bundle");
-        let diagnostics_index = processed
-            .find(diagnostics_marker)
-            .expect("should include standalone diagnostics module");
+        let module_index = processed
+            .find(module_marker)
+            .expect("should include the after-bundle insert");
         assert!(
-            bootstrap_index < bundle_index,
-            "should activate before core executes"
+            head_index < bundle_index,
+            "should write the head insert before the bundle executes"
         );
         assert!(
-            bundle_index < diagnostics_index,
-            "should load diagnostics after core"
+            bundle_index < module_index,
+            "should write the after-bundle insert after the bundle"
         );
     }
 

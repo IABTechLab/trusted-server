@@ -2509,7 +2509,9 @@ pub(crate) mod test_support {
     ///
     /// Its preparer runs for every request, as any preparer does, and strips
     /// the query `fixture_request=1`. Where that query arrived on a document
-    /// navigation it also leaves a mark for the page path. Selected, the
+    /// navigation it also leaves a mark for the page path. It strips the
+    /// cookie it reserves too, and writes the Cookie header out again as it
+    /// does, the way a module that reserves a cookie does. Selected, the
     /// stand-in's head injector reads the mark from the document's state and
     /// writes one script at the start of `<head>` and the tag of its
     /// standalone module after the bundle. Its response finalizer sets a
@@ -2544,6 +2546,8 @@ pub(crate) mod test_support {
         pub(crate) const MODULE_FILE: &str = "tsjs-request_fixture.min.js";
         /// The cookie the finalizer sets on the response to a marked request.
         pub(crate) const COOKIE: &str = "ts-request-fixture=1; Path=/";
+        /// The name of that cookie, which the preparer strips from a request.
+        pub(crate) const COOKIE_NAME: &str = "ts-request-fixture";
 
         const JS: &str = "(function(){window.__ts_request_fixture_loaded=1;})();";
         // SHA-256 of JS, hex. The registry refuses a literal that is not.
@@ -2579,10 +2583,44 @@ pub(crate) mod test_support {
             state
         }
 
+        /// Strips the reserved cookie, which means writing the header again
+        /// from the pairs that can be read. A request without the cookie is
+        /// left exactly as it arrived.
+        fn strip_reserved_cookie(request: &mut Request<EdgeBody>) {
+            let is_reserved =
+                |pair: &str| pair.split('=').next().map(str::trim) == Some(COOKIE_NAME);
+            let pairs = request
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(';'))
+                .map(str::trim)
+                .filter(|pair| !pair.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !pairs.iter().any(|pair| is_reserved(pair)) {
+                return;
+            }
+            let kept = pairs
+                .into_iter()
+                .filter(|pair| !is_reserved(pair))
+                .collect::<Vec<_>>();
+            request.headers_mut().remove(header::COOKIE);
+            if !kept.is_empty() {
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&kept.join("; "))
+                        .expect("should keep already valid cookie pairs"),
+                );
+            }
+        }
+
         fn prepare(
             _settings: &Settings,
             request: &mut Request<EdgeBody>,
         ) -> Result<(), Report<TrustedServerError>> {
+            strip_reserved_cookie(request);
             let query = request.uri().query().unwrap_or_default();
             if !query.split('&').any(|pair| pair == QUERY) {
                 return Ok(());
@@ -4286,8 +4324,9 @@ mod tests {
             .expect("should insert prebid config");
     }
 
-    fn enable_gpt_diagnostics(settings: &mut Settings) {
-        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
+    /// Selects core's stand-in, which registers a standalone browser module.
+    fn enable_standalone_module(settings: &mut Settings) {
+        settings.select_module("testing", test_support::request_fixture::MODULE);
     }
 
     fn carried_probe_builder() -> crate::integrations::IntegrationBuilder {
@@ -4475,21 +4514,25 @@ mod tests {
     #[test]
     fn a_standalone_js_module_is_served_alone_and_not_in_the_bundle() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        enable_gpt_diagnostics(&mut settings);
+        enable_standalone_module(&mut settings);
 
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
 
         assert!(
-            !registry.js_module_ids().contains(&"gpt_diagnostics"),
+            !registry
+                .js_module_ids()
+                .contains(&test_support::request_fixture::ID),
             "should keep a standalone module out of the bundle module ids"
         );
         assert!(
-            registry.js_part("gpt_diagnostics").is_some(),
+            registry
+                .js_part(test_support::request_fixture::ID)
+                .is_some(),
             "should serve the standalone module as a part"
         );
         assert_eq!(
             registry.js_standalone_ids(),
-            vec!["gpt_diagnostics"],
+            vec![test_support::request_fixture::ID],
             "should list the standalone module that runs"
         );
         assert!(
@@ -4502,7 +4545,7 @@ mod tests {
     fn js_parts_all_covers_bundle_deferred_and_standalone_modules() {
         let mut settings = settings_naming("probe");
         enable_prebid(&mut settings);
-        enable_gpt_diagnostics(&mut settings);
+        enable_standalone_module(&mut settings);
         let extra = [carried_probe_builder()];
 
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
@@ -4513,7 +4556,13 @@ mod tests {
             .into_iter()
             .map(|part| part.id)
             .collect::<Vec<_>>();
-        for expected in ["core", "creative", "probe", "prebid", "gpt_diagnostics"] {
+        for expected in [
+            "core",
+            "creative",
+            "probe",
+            "prebid",
+            test_support::request_fixture::ID,
+        ] {
             assert_eq!(
                 ids.iter().filter(|id| **id == expected).count(),
                 1,
@@ -4900,41 +4949,6 @@ mod tests {
         assert!(
             IntegrationRequestState::of(&subresource).is_empty(),
             "should leave no mark on a request for something other than a document"
-        );
-    }
-
-    #[test]
-    fn prepare_request_runs_the_built_in_gpt_diagnostics_preparer() {
-        // The adapters call the registry rather than naming GPT diagnostics, so
-        // the built-in table is what attaches the sanitizing preparer. This is
-        // asserted here rather than through an adapter route test because the
-        // stripped query is only visible on the publisher HTML path, which needs
-        // a live origin the adapter test harnesses do not have.
-        let settings = crate::test_support::tests::create_test_settings();
-        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example.com/article?ts_console=1&keep=yes")
-            .header(header::COOKIE, "__Host-ts-console=1; keep-me=yes")
-            .body(EdgeBody::empty())
-            .expect("should build request");
-
-        registry
-            .prepare_request(&settings, &mut request)
-            .expect("should run the built-in preparers");
-
-        assert_eq!(
-            request.uri().query(),
-            Some("keep=yes"),
-            "should strip the reserved diagnostics query and keep the rest"
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get(header::COOKIE)
-                .map(|value| value.to_str().expect("cookie should be text")),
-            Some("keep-me=yes"),
-            "should strip the reserved diagnostics cookie and keep the rest"
         );
     }
 

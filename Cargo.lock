@@ -5785,6 +5785,8 @@ dependencies = [
 name = "trusted-server-modules"
 version = "0.1.0"
 dependencies = [
+ "edgezero-core",
+ "http",
  "serde_json",
  "trusted-server-ad-tag-google",
  "trusted-server-audience-permutive",

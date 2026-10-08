@@ -29,6 +29,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_cmp_osano::builder(),
         trusted_server_tag_google_tag_manager::builder(),
         trusted_server_ad_tag_google::builder(),
+        trusted_server_ad_tag_google::diagnostics::builder(),
     ]
 }
 
@@ -66,6 +67,7 @@ mod tests {
                 "cmp.osano",
                 "tag.google-tag-manager",
                 "ad-tag.google",
+                "ad-tag.google.diagnostics",
             ],
             "should offer the stock modules in the order their hooks run"
         );
@@ -221,5 +223,45 @@ mod tests {
                 "`{name}` should name its table and the unknown setting: {error}"
             );
         }
+    }
+
+    /// The adapters run the registry's request preparers and name no module,
+    /// so this list is what attaches the diagnostics module's preparer. It
+    /// strips the module's reserved query and cookie in a deployment that
+    /// does not select the module, as it does in one that does.
+    #[test]
+    fn the_stock_list_attaches_the_diagnostics_module_s_request_preparer() {
+        use edgezero_core::body::Body as EdgeBody;
+        use http::{Method, Request, header};
+        use trusted_server_core::integrations::IntegrationRegistry;
+        use trusted_server_core::test_support::tests::create_test_settings;
+
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::with_registrations(&settings, &builders())
+            .expect("should build registry");
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/article?ts_console=1&keep=yes")
+            .header(header::COOKIE, "__Host-ts-console=1; keep-me=yes")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should run the stock preparers");
+
+        assert_eq!(
+            request.uri().query(),
+            Some("keep=yes"),
+            "should strip the reserved diagnostics query and keep the rest"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(header::COOKIE)
+                .map(|value| value.to_str().expect("cookie should be text")),
+            Some("keep-me=yes"),
+            "should strip the reserved diagnostics cookie and keep the rest"
+        );
     }
 }

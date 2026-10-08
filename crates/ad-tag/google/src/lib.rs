@@ -31,6 +31,9 @@
 //!    `<script>` elements and rewrites their URLs to the first-party proxy.
 //!    This is the sole mechanism that routes the GPT cascade through the proxy.
 //!    The shim also hooks into the `googletag` API for targeting injection.
+//!
+//! The crate holds a second module, [`diagnostics`], which a deployment
+//! selects on its own as `ad-tag.google.diagnostics`.
 
 #![cfg_attr(
     test,
@@ -43,6 +46,8 @@
         reason = "tests use direct diagnostics and panic-on-failure helpers"
     )
 )]
+
+pub mod diagnostics;
 
 use std::sync::Arc;
 
