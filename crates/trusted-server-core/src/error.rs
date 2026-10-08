@@ -57,10 +57,6 @@ pub enum TrustedServerError {
     #[display("KV store error: {store_name} - {message}")]
     KvStore { store_name: String, message: String },
 
-    /// Prebid integration error.
-    #[display("Prebid error: {message}")]
-    Prebid { message: String },
-
     /// Integration module error.
     #[display("Integration error ({integration}): {message}")]
     Integration {
@@ -123,7 +119,6 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -212,12 +207,6 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                TrustedServerError::Prebid {
-                    message: String::from("adapter error"),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
                 TrustedServerError::Integration {
                     integration: String::from("example-integration"),
                     message: String::from("request failed"),
@@ -286,7 +275,6 @@ mod tests {
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
-                TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Forbidden { .. } => StatusCode::FORBIDDEN,
@@ -332,9 +320,6 @@ mod tests {
             },
             TrustedServerError::Gam {
                 message: "api key invalid".into(),
-            },
-            TrustedServerError::Prebid {
-                message: "adapter error".into(),
             },
             TrustedServerError::Integration {
                 integration: "foo".into(),
@@ -413,7 +398,6 @@ mod tests {
             | TrustedServerError::InvalidUtf8 { .. }
             | TrustedServerError::InvalidHeaderValue { .. }
             | TrustedServerError::KvStore { .. }
-            | TrustedServerError::Prebid { .. }
             | TrustedServerError::Integration { .. }
             | TrustedServerError::Proxy { .. }
             | TrustedServerError::Forbidden { .. }
@@ -508,12 +492,6 @@ mod tests {
             (
                 TrustedServerError::Gam {
                     message: "gam failed".to_string(),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                TrustedServerError::Prebid {
-                    message: "prebid failed".to_string(),
                 },
                 StatusCode::BAD_GATEWAY,
             ),

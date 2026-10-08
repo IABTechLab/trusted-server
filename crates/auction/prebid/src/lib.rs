@@ -826,7 +826,8 @@ impl PrebidIntegration {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, PREBID_BUNDLE_CONTENT_TYPE)
             .body(EdgeBody::from(body))
-            .change_context(TrustedServerError::Prebid {
+            .change_context(TrustedServerError::Integration {
+                integration: PREBID_INTEGRATION_ID.to_string(),
                 message: "Failed to build Prebid script handler response".to_string(),
             })?;
         CacheControlPolicy::NoStorePrivate
@@ -1167,7 +1168,8 @@ impl IntegrationProxy for PrebidIntegration {
             _ => http::Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(EdgeBody::from("Not Found"))
-                .change_context(TrustedServerError::Prebid {
+                .change_context(TrustedServerError::Integration {
+                    integration: PREBID_INTEGRATION_ID.to_string(),
                     message: "Failed to build Prebid not found response".to_string(),
                 }),
         }

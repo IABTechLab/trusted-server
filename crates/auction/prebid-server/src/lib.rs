@@ -1195,7 +1195,8 @@ pub(crate) async fn parse_planned_prebid_response(
         "prebid",
     )
     .await
-    .change_context(TrustedServerError::Prebid {
+    .change_context(TrustedServerError::Integration {
+        integration: MODULE.to_string(),
         message: "Failed to read Prebid response body".to_string(),
     });
 
@@ -1258,7 +1259,8 @@ pub(crate) async fn parse_planned_prebid_response(
 
     let body_bytes = body_bytes?;
     let response_json: Json =
-        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
+        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Integration {
+            integration: MODULE.to_string(),
             message: "Failed to parse Prebid response".to_string(),
         })?;
     if demand.debug && log::log_enabled!(log::Level::Trace) {
@@ -2140,7 +2142,8 @@ impl PrebidAuctionProvider {
             "prebid",
         )
         .await
-        .change_context(TrustedServerError::Prebid {
+        .change_context(TrustedServerError::Integration {
+            integration: MODULE.to_string(),
             message: "Failed to read Prebid response body".to_string(),
         });
 
@@ -2211,10 +2214,12 @@ impl PrebidAuctionProvider {
         }
 
         let body_bytes = body_bytes?;
-        let response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
+        let response_json: Json = serde_json::from_slice(&body_bytes).change_context(
+            TrustedServerError::Integration {
+                integration: MODULE.to_string(),
                 message: "Failed to parse Prebid response".to_string(),
-            })?;
+            },
+        )?;
 
         // Log the full response body when debug is enabled to surface
         // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
@@ -2472,7 +2477,8 @@ impl AuctionProvider for PrebidAuctionProvider {
             }
 
             log::info!("Prebid: skipping request — no valid impressions after filtering");
-            return Err(Report::new(TrustedServerError::Prebid {
+            return Err(Report::new(TrustedServerError::Integration {
+                integration: MODULE.to_string(),
                 message: "No valid impressions after filtering".to_string(),
             }));
         }
@@ -2496,7 +2502,8 @@ impl AuctionProvider for PrebidAuctionProvider {
             .method(http::Method::POST)
             .uri(self.auction_endpoint_url())
             .body(EdgeBody::empty())
-            .change_context(TrustedServerError::Prebid {
+            .change_context(TrustedServerError::Integration {
+                integration: MODULE.to_string(),
                 message: "Failed to build Prebid request".to_string(),
             })?;
         copy_request_headers(
@@ -2506,9 +2513,11 @@ impl AuctionProvider for PrebidAuctionProvider {
             context.services.client_info().client_ip,
         );
 
-        let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
-            message: "Failed to serialize Prebid request body".to_string(),
-        })?;
+        let pbs_body =
+            serde_json::to_vec(&openrtb).change_context(TrustedServerError::Integration {
+                integration: MODULE.to_string(),
+                message: "Failed to serialize Prebid request body".to_string(),
+            })?;
         pbs_req.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
@@ -2535,7 +2544,8 @@ impl AuctionProvider for PrebidAuctionProvider {
             .http_client()
             .send_async(PlatformHttpRequest::new(pbs_req, backend_name))
             .await
-            .change_context(TrustedServerError::Prebid {
+            .change_context(TrustedServerError::Integration {
+                integration: MODULE.to_string(),
                 message: "Failed to send async request to Prebid Server".to_string(),
             })?;
 
