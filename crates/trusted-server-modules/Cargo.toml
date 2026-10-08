@@ -36,3 +36,10 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. Which modules a stock build ships is the
+# project's own decision, so the Trusted Server maintainers own it.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "project owned"

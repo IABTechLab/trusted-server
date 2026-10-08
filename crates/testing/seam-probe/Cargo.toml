@@ -25,3 +25,10 @@ validator = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. The seam probe is a test fixture the project
+# keeps, so the Trusted Server maintainers own it.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "project owned"

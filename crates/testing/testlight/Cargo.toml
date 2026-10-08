@@ -27,7 +27,10 @@ validator = { workspace = true }
 futures = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
-# An example the project keeps for testing an auction integration end to end,
-# so the Trusted Server maintainers own it.
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. Testlight is an example the project keeps for
+# testing an auction integration end to end, so the Trusted Server maintainers
+# own it.
 [package.metadata.maintainers]
 owner = "Trusted Server maintainers"
+status = "project owned"

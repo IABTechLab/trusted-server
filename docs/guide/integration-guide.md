@@ -265,6 +265,23 @@ A crate at `crates/cmp/example` is the module `cmp.example`, so a deployment
 runs it with `[cmp] module = "example"` and gives it settings in
 `[cmp.example]`.
 
+### Who maintains the crate
+
+Every crate outside core names its maintainers in its manifest, the way
+Prebid.js requires a named maintainer of every adapter.
+
+```toml
+[package.metadata.maintainers]
+owner = "Example Vendor"
+status = "vendor owned"
+```
+
+`status` is `vendor owned` once the vendor has adopted the crate,
+`seeking vendor owner` while the Trusted Server maintainers hold it for a
+vendor, and `project owned` for a crate that is the project's own, such as a
+test module. A test in `crates/trusted-server-modules` fails for a crate in
+this repository that leaves the declaration out.
+
 ### What a registration can declare
 
 The build function returns an `IntegrationRegistration`, built with the
@@ -472,4 +489,5 @@ clean `ts config validate` as that module having agreed.
 3. Add source and behavior parity records.
 4. Add positive, negative, body-bound, header, and adapter-capability tests.
 5. Document configuration, failure behavior, and runtime limitations.
-6. Run the target aliases from [Testing](/guide/testing).
+6. Name the crate's maintainers in its manifest.
+7. Run the target aliases from [Testing](/guide/testing).

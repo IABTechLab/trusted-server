@@ -25,9 +25,9 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 validator = { workspace = true }
 
-# The visible owner of this vendor crate, the way Prebid.js requires a named
-# maintainer of every adapter. No vendor has not yet adopted this crate, so the
-# Trusted Server maintainers own it until a vendor owner steps up.
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. The demonstration ad server is the project's
+# own, so the Trusted Server maintainers own it.
 [package.metadata.maintainers]
 owner = "Trusted Server maintainers"
-status = "seeking vendor owner"
+status = "project owned"

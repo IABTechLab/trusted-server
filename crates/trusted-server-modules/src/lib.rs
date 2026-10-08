@@ -487,4 +487,69 @@ mod tests {
             Some("adserver_mock")
         );
     }
+
+    /// Every crate outside core says who maintains it, in the
+    /// `[package.metadata.maintainers]` table of its manifest. The manifests
+    /// are read from the source tree, which a Wasm test run cannot reach.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn every_crate_outside_core_declares_its_maintainers() {
+        const STATUSES: [&str; 3] = ["vendor owned", "seeking vendor owner", "project owned"];
+
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("should have the crates folder above this crate");
+        let mut manifests = vec![crates.join("trusted-server-modules").join("Cargo.toml")];
+        for entry in std::fs::read_dir(crates).expect("should list the crates folder") {
+            let type_folder = entry.expect("should read a folder entry").path();
+            // A crate directly under `crates/` is core, an adapter or a tool.
+            // A module crate is one folder further down, under its type.
+            if !type_folder.is_dir() || type_folder.join("Cargo.toml").is_file() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&type_folder).expect("should list a type folder") {
+                let manifest = entry
+                    .expect("should read a folder entry")
+                    .path()
+                    .join("Cargo.toml");
+                if manifest.is_file() {
+                    manifests.push(manifest);
+                }
+            }
+        }
+        assert!(
+            manifests.len() > 20,
+            "should find the module crates, found {}",
+            manifests.len()
+        );
+
+        for manifest in manifests {
+            let text = std::fs::read_to_string(&manifest).expect("should read a manifest");
+            let Some((_, after)) = text.split_once("[package.metadata.maintainers]") else {
+                panic!("{} should declare its maintainers", manifest.display());
+            };
+            let table = after.split("\n[").next().unwrap_or_default();
+            let value = |key: &str| {
+                table.lines().find_map(|line| {
+                    line.strip_prefix(key)?
+                        .trim_start()
+                        .strip_prefix('=')?
+                        .trim()
+                        .strip_prefix('"')?
+                        .strip_suffix('"')
+                })
+            };
+            assert!(
+                value("owner").is_some_and(|owner| !owner.is_empty()),
+                "{} should name an owner",
+                manifest.display()
+            );
+            let status = value("status").unwrap_or_default();
+            assert!(
+                STATUSES.contains(&status),
+                "{} should state one of {STATUSES:?}, and states `{status}`",
+                manifest.display()
+            );
+        }
+    }
 }
