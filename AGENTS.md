@@ -15,12 +15,23 @@ JavaScript injection.
 
 ```
 crates/
-  trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
+  trusted-server-core/                  # Core library — shared logic, the integration seam, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
+  trusted-server-modules/               # the modules a stock build ships, in the order their hooks run
+  ad-server/                            # ad server implementation crates (mock)
+  ad-tag/                               # ad tag module crates (google, which holds its diagnostics module too)
+  auction/                              # auction module crates (aps, prebid, prebid-server)
+  audience/                             # audience module crates (permutive)
+  bot-protection/                       # bot protection module crates (datadome)
+  cmp/                                  # consent tool module crates (didomi, osano, sourcepoint)
+  framework/                            # framework module crates (nextjs)
+  identity/                             # identity module crates (lockr)
+  tag/                                  # tag manager module crates (google-tag-manager)
+  testing/                              # test module crates (seam-probe, testlight)
   device/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)
   edgecookie/                           # vendor Edge Cookie module crates (built-in HMAC module is in core)
@@ -425,7 +436,7 @@ IntegrationRegistration::builder(ID)
 ```
 
 - Integration IDs match JS directory names: `prebid` (deferred), `lockr`, `permutive`, `datadome`, `didomi`, `testlight`.
-- An integration runs when the section of its type selects its module. A module with a crate of its own is named by that crate's path under `crates/` (`permission-signal.gpc`, `testing.seam-probe`). An integration still in core carries the name its crate will have, held in a `MODULE` constant (`cmp.didomi`, `tag.google-tag-manager`, `ad-tag.google`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`), so its section and table stay the same when it moves out. A name is written in its section with the type left off. There is no `enabled` flag and no `[integration]` table.
+- An integration runs when the section of its type selects its module. A module with a crate of its own is named by that crate's path under `crates/` (`permission-signal.gpc`, `testing.seam-probe`). Each page integration lives in a crate of its own and holds that name in a `MODULE` constant (`cmp.didomi`, `tag.google-tag-manager`, `ad-tag.google`, `bot-protection.datadome`, `identity.lockr`, `audience.permutive`, `framework.nextjs`, `auction.prebid`, `testing.testlight`), which a test in the crate holds to the crate's folder. A name is written in its section with the type left off. There is no `enabled` flag and no `[integration]` table.
 - `creative` is JS-only (no Rust registration), and `nextjs` is Rust-only. `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and `ad-server.mock` register demand or ad server implementations rather than page integrations.
 - Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.

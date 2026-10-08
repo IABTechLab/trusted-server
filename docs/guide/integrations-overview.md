@@ -84,7 +84,7 @@ extension path and a compiling `RuntimeServices` fixture. Add only the hooks a
 capability needs; do not create a catch-all proxy or assume an adapter-specific
 HTTP implementation in core code.
 
-An integration does not have to live in `trusted-server-core`. It can ship in
-its own crate that a deployment composes in at startup, which keeps the
-vendor's code and release cycle its own. See
+An integration lives in a crate of its own, under `crates/<type>/<vendor>/`
+here or in a repository of the vendor's, and a deployment composes it in at
+startup, which keeps the vendor's code and release cycle its own. See
 [Integrations that ship outside core](/guide/integration-guide#integrations-that-ship-outside-core).

@@ -1624,10 +1624,8 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 A page integration is a module, selected in the section of its type, and
 each one that has settings gets its own `[<section>.<name>]` table. A
-module's name is `<type>.<name>`. For a module with a crate of its own that
-is the crate's path under `crates/`, and an integration still in core
-carries the name its crate will have, so its section and table stay the
-same when it moves out. There is no `enabled` flag and no `[integration]`
+module's name is `<type>.<name>`, which is the path under `crates/` of the
+crate the module lives in. There is no `enabled` flag and no `[integration]`
 table, because a module no section selects does not run, and an `enabled`
 key left in a module's table refuses startup. The full rule set is in
 [Configuration Rules](/guide/configuration-rules). Every module that deploy

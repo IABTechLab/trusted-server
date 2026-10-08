@@ -216,10 +216,12 @@ untouched. See [Trusted Server JavaScript](/guide/tsjs) and
 
 ## Integrations that ship outside core
 
-Everything above describes an integration inside `trusted-server-core`. An
-integration can instead ship in its own crate, which a deployment composes in
-at startup. The vendor then owns the code, the release cycle and the
-integration's own rules, and core never names the vendor.
+Every integration ships in a crate of its own, which a deployment composes in
+at startup, and the hooks described above are what that crate implements.
+The vendor owns the code, the release cycle and the integration's own rules,
+and core never names the vendor. The crates in this repository sit under
+`crates/<type>/<vendor>/`, and a vendor's crate can equally live in a
+repository of its own.
 
 `crates/testing/seam-probe` is the worked example. It is a test fixture rather
 than something to deploy, and it exercises every part of the seam from a
@@ -265,8 +267,8 @@ runs it with `[cmp] module = "example"` and gives it settings in
 
 ### What a registration can declare
 
-The build function returns an `IntegrationRegistration`, built with the same
-builder the integrations in core use.
+The build function returns an `IntegrationRegistration`, built with the
+builder every integration uses.
 
 | Declaration                                           | What it does                                                                        |
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------- |

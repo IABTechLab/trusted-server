@@ -37,10 +37,9 @@ setting = "value"
 5. **A name is parts joined by `.`,** each of lower case letters, digits, `_`
    or `-`. A module from a crate is named by its folder below `crates/`, and
    may be written in full, as `permission-signal.gpc`, or with its section's
-   type folder left off. Core's own modules, such as `hmac`, take bare names,
-   and an integration still in core carries the name its crate will have,
-   such as `cmp.didomi`. A `[demand]` or `[ad-server]` name is snake_case,
-   because it may be a label of your own.
+   type folder left off. Core's own modules, such as `hmac`, take bare names.
+   A `[demand]` or `[ad-server]` name is snake_case, because it may be a label
+   of your own.
 6. **Secrets are key names.** A secret setting holds the name of a key in
    `trusted_server_secrets`, never the secret itself.
 
