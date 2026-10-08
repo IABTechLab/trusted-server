@@ -173,8 +173,10 @@ impl RuntimeStoreConfig {
 
 /// Application state built once per Wasm instance and shared for its lifetime.
 ///
-/// In Fastly Compute each request spawns a new Wasm instance, so this struct is
-/// effectively per-request. It holds pre-parsed settings and all service handles.
+/// By default Fastly serves one request per instance. With the opt-in reusable
+/// sandbox feature and complete runtime bounds, a successful application build
+/// retains this state across requests until the sandbox retires. Settings and
+/// shared services live here; request-specific state must remain request-local.
 pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
