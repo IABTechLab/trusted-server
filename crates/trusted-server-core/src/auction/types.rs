@@ -202,6 +202,11 @@ pub struct BidRenderer {
     renderer_type: String,
     #[serde(flatten)]
     payload: serde_json::Map<String, serde_json::Value>,
+    /// The payload key the code that built the descriptor said holds the
+    /// identifier the renderer picks its bid by. A statement about the
+    /// payload and no part of what is sent.
+    #[serde(skip)]
+    bid_id_key: Option<&'static str>,
 }
 
 impl BidRenderer {
@@ -243,6 +248,7 @@ impl BidRenderer {
         Ok(Self {
             renderer_type: renderer_type.to_string(),
             payload,
+            bid_id_key: None,
         })
     }
 
@@ -337,6 +343,45 @@ impl BidRenderer {
             return None;
         }
         self.payload.get(key)
+    }
+
+    /// States that the payload key `key` holds the identifier this renderer
+    /// picks its bid by.
+    ///
+    /// The statement is the builder's own about its payload. A descriptor
+    /// built without it has no such identifier, whatever its payload holds,
+    /// so a key of the same name under another renderer's type tag is not
+    /// read.
+    #[must_use]
+    pub fn picking_bid_by(mut self, key: &'static str) -> Self {
+        self.bid_id_key = Some(key);
+        self
+    }
+
+    /// The identifier the renderer picks its bid by, when the code that built
+    /// the descriptor said which payload key holds it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use trusted_server_core::auction::types::BidRenderer;
+    ///
+    /// let payload = json!({ "bidId": "fictional-bid-id" });
+    /// let unstated = BidRenderer::new("example", payload.clone())
+    ///     .expect("should accept an object payload");
+    /// assert_eq!(unstated.bid_id(), None);
+    ///
+    /// let stated = BidRenderer::new("example", payload)
+    ///     .expect("should accept an object payload")
+    ///     .picking_bid_by("bidId");
+    /// assert_eq!(stated.bid_id(), Some("fictional-bid-id"));
+    /// ```
+    #[must_use]
+    pub fn bid_id(&self) -> Option<&str> {
+        self.payload
+            .get(self.bid_id_key?)
+            .and_then(serde_json::Value::as_str)
     }
 }
 

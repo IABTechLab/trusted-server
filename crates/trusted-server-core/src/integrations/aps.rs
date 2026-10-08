@@ -805,7 +805,9 @@ fn planned_aps_renderer(
         width: input.width,
         height: input.height,
     };
-    BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor).ok()
+    BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
+        .ok()
+        .map(|renderer| renderer.picking_bid_by(APS_RENDERER_BID_ID_KEY))
 }
 
 fn planned_aps_valid_creative_url(value: &str, publisher_domain: &str) -> bool {
@@ -1522,7 +1524,7 @@ impl ApsAuctionProvider {
             height: input.height,
         };
         match BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor) {
-            Ok(renderer) => Some(renderer),
+            Ok(renderer) => Some(renderer.picking_bid_by(APS_RENDERER_BID_ID_KEY)),
             Err(error) => {
                 log::warn!(
                     "Dropping APS bid '{}': its renderer descriptor could not be built: {error:?}",
@@ -2079,6 +2081,7 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
 /// Returns an error when two selected APS sources set different rendering
 /// modes.
 pub fn register_for_plan(
+    _settings: &Settings,
     plan: &crate::auction::AuctionPlan,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
     let mut selected: Option<(&str, ApsRenderingMode)> = None;
@@ -3230,7 +3233,7 @@ mod tests {
 
     #[test]
     fn a_selected_aps_source_registers_the_trusted_server_renderer() {
-        let registration = register_for_plan(&aps_plan(&[None]))
+        let registration = register_for_plan(&create_test_settings(), &aps_plan(&[None]))
             .expect("should register APS renderer support")
             .expect("should return APS renderer registration");
 
@@ -3261,7 +3264,7 @@ mod tests {
         .expect("should compile an empty plan");
 
         assert!(
-            register_for_plan(&plan)
+            register_for_plan(&create_test_settings(), &plan)
                 .expect("should evaluate renderer registration")
                 .is_none(),
             "a plan with no APS source should register no renderer"
@@ -3270,9 +3273,12 @@ mod tests {
 
     #[test]
     fn publisher_native_rendering_drops_the_renderer_route_and_marks_the_bundle_tag() {
-        let registration = register_for_plan(&aps_plan(&[Some("publisher_native")]))
-            .expect("should register APS renderer support")
-            .expect("should return APS renderer registration");
+        let registration = register_for_plan(
+            &create_test_settings(),
+            &aps_plan(&[Some("publisher_native")]),
+        )
+        .expect("should register APS renderer support")
+        .expect("should return APS renderer registration");
         assert!(
             registration.proxies.is_empty(),
             "publisher-native rendering should not register the static renderer"
@@ -3307,7 +3313,7 @@ mod tests {
     #[test]
     fn two_aps_sources_that_disagree_on_rendering_are_refused() {
         let plan = aps_plan(&[None, Some("publisher_native")]);
-        let error = match register_for_plan(&plan) {
+        let error = match register_for_plan(&create_test_settings(), &plan) {
             Ok(_) => panic!("should refuse two rendering modes"),
             Err(error) => error,
         };

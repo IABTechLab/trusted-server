@@ -1373,11 +1373,8 @@ fn check_section_selections(
     settings: &Settings,
     extra: &[crate::integrations::IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
-    // Prebid registers through the auction plan rather than a builder, and is
-    // selected in `[auction]` all the same.
     let offered: Vec<&'static str> = crate::integrations::all_builders(extra)
         .filter_map(|builder| builder.module_name())
-        .chain([crate::integrations::prebid::MODULE])
         .collect();
     for (section, modules) in settings.module_sections() {
         for written in modules.selected() {
@@ -1494,24 +1491,10 @@ impl IntegrationRegistry {
         extra: &[crate::integrations::IntegrationBuilder],
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-        // Prebid registers through the auction plan rather than through a
-        // builder, but its id is core's all the same. Recording it with the
-        // builders refuses an outside builder that claims it, and lets a
-        // selector naming it while it does not run report it as registered but
-        // not running.
-        inner.builder_ids.push((
-            crate::integrations::prebid::PREBID_INTEGRATION_ID,
-            crate::integrations::CORE_SOURCE,
-        ));
-        // The plan-backed auction providers register first, so opening the
-        // builder table leaves every existing hook order unchanged.
-        let mut registrations: Vec<IntegrationRegistration> = [
-            crate::integrations::prebid::register_for_plan(settings, &plan)?,
-            crate::integrations::aps::register_for_plan(&plan)?,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        // What a builder registers from the auction plan goes first, so its
+        // hooks run ahead of every module a section selects.
+        let mut plan_registrations: Vec<IntegrationRegistration> = Vec::new();
+        let mut registrations: Vec<IntegrationRegistration> = Vec::new();
 
         for builder in crate::integrations::all_builders(extra) {
             if let Some((_, first_source)) =
@@ -1534,6 +1517,19 @@ impl IntegrationRegistry {
             }
             if let Some(finalize) = builder.finalize_response() {
                 inner.response_finalizers.push(finalize);
+            }
+            // A registration from the plan is made whatever the sections
+            // select, because the function decides from the plan and the
+            // settings whether the module runs.
+            if let Some(register) = builder.plan_registration()
+                && let Some(registration) = register(settings, &plan)?
+            {
+                debug_assert_eq!(
+                    registration.integration_id,
+                    builder.id(),
+                    "integration builder ID should match registration ID"
+                );
+                plan_registrations.push(registration);
             }
 
             // Only a builder whose module a section selects is built, so an
@@ -1569,7 +1565,7 @@ impl IntegrationRegistry {
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
         let mut claimed = Vec::new();
-        for registration in registrations {
+        for registration in plan_registrations.into_iter().chain(registrations) {
             inner
                 .running_integration_ids
                 .push(registration.integration_id);
@@ -4760,6 +4756,113 @@ mod tests {
                 .expect("should lock the after-failure record")
                 .is_empty(),
             "should not run a preparer registered after the failing one"
+        );
+    }
+
+    /// Writes one fixed insert, so a test can read the order hooks ran in.
+    struct FixedHeadInsert {
+        id: &'static str,
+        insert: &'static str,
+    }
+
+    impl IntegrationHeadInjector for FixedHeadInsert {
+        fn integration_id(&self) -> &'static str {
+            self.id
+        }
+
+        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            vec![self.insert.to_owned()]
+        }
+    }
+
+    const SECTION_INSERT: &str = "<!--from the section-->";
+    const PLAN_INSERT: &str = "<!--from the plan-->";
+
+    fn section_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe-section")
+                .with_head_injector(Arc::new(FixedHeadInsert {
+                    id: "probe-section",
+                    insert: SECTION_INSERT,
+                }))
+                .build(),
+        ))
+    }
+
+    /// Registers when the plan's auction is enabled, whatever the sections
+    /// select.
+    fn plan_probe_registration(
+        _settings: &Settings,
+        plan: &AuctionPlan,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(plan.enabled().then(|| {
+            IntegrationRegistration::builder("probe-plan")
+                .with_head_injector(Arc::new(FixedHeadInsert {
+                    id: "probe-plan",
+                    insert: PLAN_INSERT,
+                }))
+                .build()
+        }))
+    }
+
+    #[test]
+    fn a_registration_from_the_plan_runs_unselected_and_ahead_of_a_section_s_module() {
+        let mut settings = settings_naming("testing.probe-section");
+        // The section's module is listed first, and what the plan registers
+        // still goes ahead of it.
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-section",
+                "seam-probe",
+                section_probe_registration,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-section"),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-plan",
+                "seam-probe",
+                never_registering_builder,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-plan")
+            .with_plan_registration(plan_probe_registration),
+        ];
+        let probe_inserts = |registry: &IntegrationRegistry| {
+            let document_state = IntegrationDocumentState::default();
+            registry
+                .head_inserts(&IntegrationHtmlContext {
+                    request_host: "publisher.example.com",
+                    request_scheme: "https",
+                    origin_host: "origin.example.com",
+                    document_state: &document_state,
+                })
+                .into_iter()
+                .filter(|insert| insert == SECTION_INSERT || insert == PLAN_INSERT)
+                .collect::<Vec<_>>()
+        };
+
+        settings.auction.enabled = false;
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+        assert!(
+            !registry.integration_runs("probe-plan"),
+            "should register nothing where the function finds nothing in the plan"
+        );
+        assert_eq!(probe_inserts(&registry), vec![SECTION_INSERT]);
+
+        settings.auction.enabled = true;
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+        assert!(
+            registry.integration_runs("probe-plan"),
+            "should register from the plan a module no section selects"
+        );
+        assert_eq!(
+            probe_inserts(&registry),
+            vec![PLAN_INSERT, SECTION_INSERT],
+            "should run the hooks of what the plan registered ahead of a section's module"
         );
     }
 

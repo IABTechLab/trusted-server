@@ -8,6 +8,7 @@ use futures::StreamExt as _;
 use http::{Request, Response};
 use url::Url;
 
+use crate::auction::AuctionPlan;
 use crate::auction::demand::{AdServerImplementation, DemandImplementation};
 use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
@@ -335,6 +336,26 @@ pub type IntegrationPrepareRequestFn =
 /// does, and has nothing to do for a request its module left nothing on.
 pub type IntegrationFinalizeResponseFn = fn(&IntegrationRequestState, &mut Response<EdgeBody>);
 
+/// Builds a module's registration from the settings and the compiled auction
+/// plan, or `None` when the two give it nothing to register.
+///
+/// Runs for every builder that has one, whether or not a section selects the
+/// module, because a module registered this way follows what the plan
+/// selects and decides for itself whether it runs.
+pub type IntegrationPlanRegistrationFn =
+    fn(
+        &Settings,
+        &AuctionPlan,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
+
+/// Checks a module's configuration against the compiled auction plan, for a
+/// rule that depends on what the plan selects.
+///
+/// Runs for every builder that has one, when a deployment is validated and
+/// as the settings load.
+pub type IntegrationPlanValidateFn =
+    fn(&Settings, &AuctionPlan) -> Result<(), Report<TrustedServerError>>;
+
 /// A setting in a module's own table that holds the name of a secret.
 ///
 /// The name is looked up in the default secret store as the settings load,
@@ -400,6 +421,8 @@ pub struct IntegrationBuilder {
     validate: IntegrationValidateFn,
     prepare_request: Option<IntegrationPrepareRequestFn>,
     finalize_response: Option<IntegrationFinalizeResponseFn>,
+    plan_registration: Option<IntegrationPlanRegistrationFn>,
+    plan_validator: Option<IntegrationPlanValidateFn>,
     reads_auction_token: bool,
     secret_settings: &'static [ModuleSecretSetting],
     supplies_integration: bool,
@@ -438,6 +461,8 @@ impl IntegrationBuilder {
             validate,
             prepare_request: None,
             finalize_response: None,
+            plan_registration: None,
+            plan_validator: None,
             reads_auction_token: false,
             secret_settings: &[],
             supplies_integration: true,
@@ -463,6 +488,8 @@ impl IntegrationBuilder {
             validate: nothing_to_validate,
             prepare_request: None,
             finalize_response: None,
+            plan_registration: None,
+            plan_validator: None,
             reads_auction_token: false,
             secret_settings: &[],
             supplies_integration: false,
@@ -526,6 +553,27 @@ impl IntegrationBuilder {
         finalize: IntegrationFinalizeResponseFn,
     ) -> Self {
         self.finalize_response = Some(finalize);
+        self
+    }
+
+    /// Registers the module from the compiled auction plan as well as the
+    /// settings, for a module whose page support follows what the plan
+    /// selects.
+    ///
+    /// The function runs whether or not a section selects the module, and
+    /// what it registers has its hooks run ahead of the modules the sections
+    /// select.
+    #[must_use]
+    pub const fn with_plan_registration(mut self, register: IntegrationPlanRegistrationFn) -> Self {
+        self.plan_registration = Some(register);
+        self
+    }
+
+    /// Attaches a check of the module's configuration against the compiled
+    /// auction plan.
+    #[must_use]
+    pub const fn with_plan_validator(mut self, validate: IntegrationPlanValidateFn) -> Self {
+        self.plan_validator = Some(validate);
         self
     }
 
@@ -642,12 +690,25 @@ impl IntegrationBuilder {
     pub(crate) fn finalize_response(&self) -> Option<IntegrationFinalizeResponseFn> {
         self.finalize_response
     }
+
+    /// The registration from the auction plan, when one is attached.
+    pub(crate) fn plan_registration(&self) -> Option<IntegrationPlanRegistrationFn> {
+        self.plan_registration
+    }
+
+    /// The check against the auction plan, when one is attached.
+    pub(crate) fn plan_validator(&self) -> Option<IntegrationPlanValidateFn> {
+        self.plan_validator
+    }
 }
 
 /// The built-in integrations, in hook order.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
-    // This must remain first: attribute rewriters chain replacements and
-    // short-circuit removals.
+    // Prebid is registered from the auction plan, which puts its hooks ahead
+    // of every section's module whatever its place here.
+    prebid::BUILDER,
+    // This must remain the first module a section selects: attribute
+    // rewriters chain replacements and short-circuit removals.
     js_asset_proxy::BUILDER,
     // A stand-in for an integration that streams, which core's own tests
     // select where they need one.
@@ -666,7 +727,8 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     IntegrationBuilder::implementations(prebid_server::MODULE, CORE_SOURCE)
         .with_demand(&prebid_server::DEMAND),
     IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
-        .with_demand(&aps::DEMAND),
+        .with_demand(&aps::DEMAND)
+        .with_plan_registration(aps::register_for_plan),
     IntegrationBuilder::implementations(adserver_mock::MODULE, CORE_SOURCE)
         .with_adserver(&adserver_mock::ADSERVER),
 ];

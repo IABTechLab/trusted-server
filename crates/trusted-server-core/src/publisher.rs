@@ -49,7 +49,7 @@ use crate::auction::telemetry::{
     emit_auction_events_best_effort_lazy,
 };
 use crate::auction::types::{
-    AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
+    AuctionContext, AuctionRequest, Bid, BidRenderer, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
@@ -68,7 +68,6 @@ use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
-use crate::integrations::aps::{APS_RENDERER_BID_ID_KEY, APS_RENDERER_TYPE};
 use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
 use crate::permissions::PermissionState;
 use crate::platform::{
@@ -5854,13 +5853,7 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // whole descriptor, which would clone a payload carrying a
                 // base64 encoding of a creative envelope of up to 256 KB, once
                 // per bid per page view.
-                let renderer_bid_id = bid
-                    .renderer
-                    .as_ref()
-                    .and_then(|renderer| {
-                        renderer.payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
-                    })
-                    .and_then(serde_json::Value::as_str);
+                let renderer_bid_id = bid.renderer.as_ref().and_then(BidRenderer::bid_id);
                 let hb_adid = non_empty(bid.cache_id.as_deref())
                     .or_else(|| non_empty(renderer_bid_id))
                     .or_else(|| non_empty(bid.ad_id.as_deref()))
@@ -23890,7 +23883,8 @@ mod tests {
                         height: 250,
                     },
                 )
-                .expect("should build APS renderer descriptor"),
+                .expect("should build APS renderer descriptor")
+                .picking_bid_by(crate::integrations::aps::APS_RENDERER_BID_ID_KEY),
             );
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
@@ -23937,7 +23931,8 @@ mod tests {
                         height: 250,
                     },
                 )
-                .expect("should build APS renderer descriptor"),
+                .expect("should build APS renderer descriptor")
+                .picking_bid_by(crate::integrations::aps::APS_RENDERER_BID_ID_KEY),
             );
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
@@ -23953,7 +23948,7 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_ignores_a_renderer_bid_id_carried_under_another_type_tag() {
+        fn bid_map_ignores_a_renderer_bid_id_its_builder_did_not_state() {
             let mut settings = test_settings();
             settings.auction.sanitize_creatives = true;
             let mut bid = make_bid("atf_sidebar_ad", 1.50, "example", "ad-id-value", "", "");
@@ -23971,7 +23966,7 @@ mod tests {
 
             assert_eq!(
                 obj["hb_adid"], "ad-id-value",
-                "should ignore a bidId carried under a tag that is not the APS renderer"
+                "should ignore a bidId the code that built the renderer did not state it picks its bid by"
             );
         }
 

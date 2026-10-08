@@ -67,6 +67,49 @@ pub(crate) const PREBID_INTEGRATION_ID: &str = "prebid";
 
 /// The name this module is selected by, in `[auction]`.
 pub const MODULE: &str = "auction.prebid";
+
+/// The builder that offers Prebid: selected in `[auction]`, registered from
+/// the auction plan and checked against it.
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        PREBID_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        registered_from_the_plan,
+        validate,
+    )
+    .with_module_name(MODULE)
+    .with_plan_registration(register_for_plan)
+    .with_plan_validator(validate_against_plan);
+
+/// Prebid's registration needs the auction plan, so [`register_for_plan`]
+/// makes it and the settings alone add nothing.
+fn registered_from_the_plan(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(None)
+}
+
+/// Validates the browser configuration for deployment and reports whether
+/// `[auction]` selects Prebid.
+fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<PrebidIntegrationConfig>(MODULE)? else {
+        return Ok(false);
+    };
+    validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
+    Ok(true)
+}
+
+/// Refuses a bidder the browser configuration keeps client-side that the
+/// plan also runs server-side.
+fn validate_against_plan(
+    settings: &Settings,
+    plan: &AuctionPlan,
+) -> Result<(), Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<PrebidIntegrationConfig>(MODULE)? else {
+        return Ok(());
+    };
+    validate_browser_bidder_ownership(&config, plan)
+}
 const PREBID_BUNDLE_ROUTE: &str = "/integrations/prebid/bundle.js";
 const PREBID_BUNDLE_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";

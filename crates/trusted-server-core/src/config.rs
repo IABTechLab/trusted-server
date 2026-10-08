@@ -17,7 +17,7 @@ use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 
-use crate::integrations::{IntegrationBuilder, prebid};
+use crate::integrations::IntegrationBuilder;
 use crate::settings::{AssetOriginAuth, Ec, MODULE_IMPLEMENTATION_KEY, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
@@ -413,13 +413,11 @@ pub fn validate_settings_for_runtime_with(
     Ok(())
 }
 
-/// Validates every integration block against the compiled auction plan.
-///
-/// Prebid, APS and the ad server mock are auction plan providers rather than
-/// builders, so they are checked here by name, and a Prebid browser bidder is
-/// checked against the providers the plan carries. Every builder then
-/// validates its own block, the built-in ones first and then
+/// Validates every integration block, the built-in ones first and then
 /// `extra_integrations`.
+///
+/// Each builder validates its own block, and one with a rule that depends on
+/// what the auction plan selects then checks its block against the plan.
 ///
 /// # Errors
 ///
@@ -430,23 +428,13 @@ fn validate_integration_blocks(
     plan: &crate::auction::AuctionPlan,
     extra_integrations: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
-    validate_prebid(settings, plan)?;
     for builder in crate::integrations::all_builders(extra_integrations) {
         builder.validate(settings)?;
+        if let Some(validate) = builder.plan_validator() {
+            validate(settings, plan)?;
+        }
     }
     Ok(())
-}
-
-fn validate_prebid(
-    settings: &Settings,
-    plan: &crate::auction::AuctionPlan,
-) -> Result<(), Report<TrustedServerError>> {
-    let Some(config) = settings.module_config::<prebid::PrebidIntegrationConfig>(prebid::MODULE)?
-    else {
-        return Ok(());
-    };
-    prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
-    prebid::validate_browser_bidder_ownership(&config, plan)
 }
 
 fn validate_non_secret_deploy_placeholders(
@@ -1849,6 +1837,47 @@ password = "production-admin-password-32-bytes"
                 }),
             }
         }
+    }
+
+    const PLAN_RULE_MESSAGE: &str = "probe module refuses an enabled auction";
+
+    fn refuse_an_enabled_auction(
+        _settings: &Settings,
+        plan: &crate::auction::AuctionPlan,
+    ) -> Result<(), Report<TrustedServerError>> {
+        if plan.enabled() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: PLAN_RULE_MESSAGE.to_owned(),
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deploy_validation_runs_a_builder_s_check_against_the_auction_plan() {
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_module_name("testing.probe")
+        .with_plan_validator(refuse_an_enabled_auction)];
+        let mut settings = valid_settings();
+
+        settings.auction.enabled = false;
+        validate_settings_for_deploy_with(&settings, &extra)
+            .expect("should accept a plan the module's rule allows");
+
+        settings.auction.enabled = true;
+        let error = validate_settings_for_deploy_with(&settings, &extra)
+            .expect_err("should refuse a plan the module's rule does not allow");
+        assert!(
+            error.to_string().contains(PLAN_RULE_MESSAGE),
+            "should keep the module's message intact: {error:?}"
+        );
+        validate_settings_for_deploy(&settings)
+            .expect("should apply no such rule without the module's builder");
     }
 
     #[test]
