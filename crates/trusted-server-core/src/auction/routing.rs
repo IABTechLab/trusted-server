@@ -17,8 +17,8 @@ const STORED_REQUEST_FIELD: &str = "storedRequest";
 
 /// Maximum bidder entries admitted from one browser `bidderParams` envelope.
 pub(crate) const MAX_BIDDER_ENTRIES: usize = 128;
-/// Maximum UTF-8 byte length of the optional Prebid zone fact.
-pub(crate) const MAX_PREBID_ZONE_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of the zone a browser may name for a slot.
+pub(crate) const MAX_ZONE_BYTES: usize = 256;
 
 /// Immutable provider-local routing output in deterministic provider-ID order.
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ impl RoutedAuction {
         self.diagnostics
     }
 
-    /// Request headers approved for later Prebid transport forwarding.
+    /// Request headers approved for forwarding to a demand source.
     pub(crate) fn transport_headers(&self) -> &TransportHeaders {
         &self.transport_headers
     }
@@ -210,7 +210,7 @@ impl ProviderSlotInput {
     }
 }
 
-/// Request headers approved for later Prebid transport forwarding.
+/// Request headers approved for forwarding to a demand source.
 ///
 /// Values remain as raw [`HeaderValue`] instances so non-ASCII bytes retain
 /// the same legacy handling. Client-supplied `X-Forwarded-For` is never read.
@@ -536,7 +536,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     }
     let zone = match object.get(ZONE_FIELD) {
         None => None,
-        Some(Value::String(zone)) if zone.len() <= MAX_PREBID_ZONE_BYTES => Some(zone.clone()),
+        Some(Value::String(zone)) if zone.len() <= MAX_ZONE_BYTES => Some(zone.clone()),
         Some(_) => return None,
     };
     let params = match object.get(BIDDER_PARAMS_FIELD) {
@@ -913,7 +913,7 @@ mod tests {
             ("too many bidders", envelope(Some(too_many))),
             (
                 "oversized zone",
-                json!({"bidderParams": {}, "zone": "z".repeat(MAX_PREBID_ZONE_BYTES + 1)}),
+                json!({"bidderParams": {}, "zone": "z".repeat(MAX_ZONE_BYTES + 1)}),
             ),
             ("nonstring zone", json!({"bidderParams": {}, "zone": 1})),
         ];
