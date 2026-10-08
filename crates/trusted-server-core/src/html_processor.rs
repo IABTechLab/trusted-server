@@ -13,13 +13,10 @@ use lol_html::{
     text,
 };
 
-use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
-use crate::integrations::gpt_diagnostics::{
-    GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsRequestDecision,
-};
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
-    IntegrationHtmlContext, IntegrationRegistry, IntegrationScriptContext, ScriptRewriteAction,
+    IntegrationHtmlContext, IntegrationRegistry, IntegrationRequestState, IntegrationScriptContext,
+    ScriptRewriteAction,
 };
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
@@ -99,13 +96,14 @@ pub struct HtmlProcessorConfig {
     /// Maximum bytes an integration may retain while processing one script or
     /// unresolved streaming group.
     pub max_buffered_body_bytes: usize,
-    /// Request-scoped conditional diagnostics delivery decision.
-    pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// What modules left on the request for their page hooks, copied into the
+    /// document's state before parsing starts. Empty for a document that may
+    /// be stored and served to other readers, where nothing made for one
+    /// request may appear.
+    pub request_state: IntegrationRequestState,
     /// What the `</body>` seam injects. Decided by the caller rather than inferred
     /// from [`Self::ad_slots_script`].
     pub body_close: BodyCloseInjection,
-    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
-    pub suppress_datadome_client_side_tag: bool,
     /// Set when the document delivers a response-bound CSP nonce in its own markup.
     ///
     /// `None` on every path that cannot store a shared template, so an ordinary inline
@@ -132,9 +130,8 @@ impl HtmlProcessorConfig {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
-            gpt_diagnostics: None,
+            request_state: IntegrationRequestState::default(),
             body_close: BodyCloseInjection::None,
-            suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
         }
     }
@@ -179,10 +176,10 @@ impl HtmlProcessorConfig {
         self
     }
 
-    /// Attach the request-scoped conditional diagnostics decision.
+    /// Attach what modules left on the request for their page hooks.
     #[must_use]
-    pub fn with_gpt_diagnostics(mut self, decision: Option<GptDiagnosticsRequestDecision>) -> Self {
-        self.gpt_diagnostics = decision;
+    pub fn with_request_state(mut self, request_state: IntegrationRequestState) -> Self {
+        self.request_state = request_state;
         self
     }
 
@@ -193,13 +190,6 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
         self.csp_nonce_observed = observed;
-        self
-    }
-
-    /// Attach the request-scoped `DataDome` client-tag suppression decision.
-    #[must_use]
-    pub fn with_datadome_client_tag_suppression(mut self, suppress: bool) -> Self {
-        self.suppress_datadome_client_side_tag = suppress;
         self
     }
 }
@@ -218,9 +208,7 @@ impl HtmlProcessorConfig {
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
     let document_state = IntegrationDocumentState::default();
-    if config.suppress_datadome_client_side_tag {
-        document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
-    }
+    config.request_state.seed(&document_state);
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -293,7 +281,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let permissions_script = config.permissions_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
-    let gpt_diagnostics = config.gpt_diagnostics.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
     // to match the reserved marker would change publisher content bytes. Collisions are
@@ -324,7 +311,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             let permissions_script = permissions_script.clone();
-            let gpt_diagnostics = gpt_diagnostics.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -349,12 +335,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    if let Some(bootstrap) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::bootstrap_script)
-                    {
-                        snippet.push_str(&bootstrap);
-                    }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_parts = integrations.js_parts_immediate();
                     let script_attributes = integrations.tsjs_script_tag_attributes();
@@ -362,16 +342,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &immediate_parts,
                         &script_attributes,
                     ));
-                    // Active diagnostics loads synchronously after core so its
-                    // GPT listeners precede publisher scripts in the origin head.
-                    // The decision says whether to inject; the registry's part
-                    // says what to inject. Nothing is injected without a part.
-                    if let Some(module_tag) = gpt_diagnostics.as_ref().and_then(|decision| {
-                        integrations
-                            .js_part(GPT_DIAGNOSTICS_INTEGRATION_ID)
-                            .and_then(|part| decision.module_script_tag(&part))
-                    }) {
-                        snippet.push_str(&module_tag);
+                    // What an integration loads after the bundle and ahead of
+                    // the page's own scripts in the origin head.
+                    for insert in integrations.after_bundle_inserts(&ctx) {
+                        snippet.push_str(&insert);
                     }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
@@ -781,8 +755,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         }
     }
 
@@ -912,20 +885,22 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
-        fn process(gam_attribution_enabled: Option<bool>) -> String {
-            let integrations = if let Some(gam_attribution_enabled) = gam_attribution_enabled {
+    fn integration_head_injector_marks_only_the_bundle_it_asks_to_mark() {
+        use crate::integrations::registry_test_support::tag_fixture as tag;
+
+        fn process(mark_bundle: Option<bool>) -> String {
+            let integrations = if let Some(mark_bundle) = mark_bundle {
                 let mut settings = create_test_settings();
                 settings
                     .insert_module_config(
-                        "ad-tag",
-                        "ad-tag.google",
+                        "testing",
+                        tag::MODULE,
                         &json!({
-                            "gam_attribution_enabled": gam_attribution_enabled
+                            "mark_bundle": mark_bundle
                         }),
                     )
-                    .expect("should insert GPT config");
-                IntegrationRegistry::new(&settings).expect("should build GPT registry")
+                    .expect("should insert the stand-in's settings");
+                IntegrationRegistry::new(&settings).expect("should build the registry")
             } else {
                 IntegrationRegistry::empty_for_tests()
             };
@@ -939,34 +914,35 @@ mod tests {
             String::from_utf8(output).expect("should produce valid UTF-8")
         }
 
-        let attributed = process(Some(true));
-        let unattributed = process(Some(false));
-        let without_gpt = process(None);
+        let marked = process(Some(true));
+        let unmarked = process(Some(false));
+        let without_the_integration = process(None);
 
-        for html in [&attributed, &unattributed, &without_gpt] {
+        for html in [&marked, &unmarked, &without_the_integration] {
             assert_eq!(
                 html.matches("id=\"trustedserver-js\"").count(),
                 1,
                 "should emit exactly one publisher bundle tag: {html}"
             );
         }
+        let attribute = format!("{}=\"true\"", tag::BUNDLE_ATTRIBUTE);
         assert!(
-            attributed.contains("data-ts-gam-attribution=\"true\""),
-            "should mark only an attribution-enabled GPT publisher bundle"
+            marked.contains(&attribute),
+            "should mark the bundle an injector asks to mark"
         );
         assert!(
-            !unattributed.contains("data-ts-gam-attribution"),
-            "should leave an attribution-disabled GPT publisher bundle unmarked"
+            !unmarked.contains(tag::BUNDLE_ATTRIBUTE),
+            "should leave the bundle unmarked when the injector asks for nothing"
         );
         assert!(
-            !without_gpt.contains("data-ts-gam-attribution"),
-            "should leave a bundle unmarked when no section selects google"
+            !without_the_integration.contains(tag::BUNDLE_ATTRIBUTE),
+            "should leave the bundle unmarked when no section selects the integration"
         );
 
-        let head_insert_index = attributed
-            .find("window.__tsjs_installGptShim")
-            .expect("should include the GPT head insert");
-        let publisher_bundle_index = attributed
+        let head_insert_index = marked
+            .find(tag::HEAD_FLAG)
+            .expect("should include the integration's head insert");
+        let publisher_bundle_index = marked
             .find("id=\"trustedserver-js\"")
             .expect("should include the publisher bundle");
         assert!(
@@ -976,30 +952,16 @@ mod tests {
     }
 
     #[test]
-    fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
+    fn what_a_module_left_on_the_request_is_written_around_the_unified_bundle_once() {
+        use crate::integrations::registry_test_support::request_fixture;
+
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
-
-        let mut request = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://publisher.example/page?ts_console=1")
-            .header("sec-fetch-dest", "document")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build activation request");
-        let decision =
-            crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
-                .expect("should prepare diagnostics request");
+        settings.select_module("testing", request_fixture::MODULE);
         let mut config = create_test_config();
-        config.integrations = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should build integration registry");
-        config.gpt_diagnostics = Some(decision);
+        config.integrations =
+            IntegrationRegistry::new(&settings).expect("should build integration registry");
+        config.request_state = request_fixture::marked();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1014,14 +976,14 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
-        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
+        let head_marker = request_fixture::HEAD_FLAG;
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
+        let module_marker = request_fixture::MODULE_FILE;
 
         assert_eq!(
-            processed.matches(bootstrap_marker).count(),
+            processed.matches(head_marker).count(),
             1,
-            "should inject the diagnostics bootstrap once"
+            "should write the module's head insert once"
         );
         assert_eq!(
             processed.matches(bundle_marker).count(),
@@ -1029,26 +991,26 @@ mod tests {
             "should inject the immediate TSJS bundle once"
         );
         assert_eq!(
-            processed.matches(diagnostics_marker).count(),
+            processed.matches(module_marker).count(),
             1,
-            "should inject one standalone diagnostics module"
+            "should write the module's after-bundle insert once"
         );
-        let bootstrap_index = processed
-            .find(bootstrap_marker)
-            .expect("should include diagnostics bootstrap");
+        let head_index = processed
+            .find(head_marker)
+            .expect("should include the head insert");
         let bundle_index = processed
             .find(bundle_marker)
             .expect("should include immediate TSJS bundle");
-        let diagnostics_index = processed
-            .find(diagnostics_marker)
-            .expect("should include standalone diagnostics module");
+        let module_index = processed
+            .find(module_marker)
+            .expect("should include the after-bundle insert");
         assert!(
-            bootstrap_index < bundle_index,
-            "should activate before core executes"
+            head_index < bundle_index,
+            "should write the head insert before the bundle executes"
         );
         assert!(
-            bundle_index < diagnostics_index,
-            "should load diagnostics after core"
+            bundle_index < module_index,
+            "should write the after-bundle insert after the bundle"
         );
     }
 
@@ -1113,61 +1075,6 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
-    }
-
-    #[test]
-    fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &json!({
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-        let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
-        let config = HtmlProcessorConfig::from_settings(
-            &settings,
-            &registry,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        )
-        .with_datadome_client_tag_suppression(true);
-        let mut processor = create_html_processor(config);
-
-        let output = processor
-            .process_chunk(
-                br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#,
-                true,
-            )
-            .expect("should process HTML");
-        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
-
-        assert!(
-            !html.contains("window.ddjskey"),
-            "should omit the DataDome client configuration"
-        );
-        assert!(
-            html.contains("id=\"publisher-datadome\""),
-            "should preserve the publisher-originated DataDome tag"
-        );
-        assert!(
-            html.contains("src=\"/integrations/datadome/tags.js\""),
-            "should rewrite the publisher-originated DataDome tag"
-        );
-        assert!(
-            !html.contains("https://js.datadome.co/tags.js"),
-            "should remove the original third-party DataDome URL"
-        );
-        assert_eq!(
-            html.matches("/integrations/datadome/tags.js").count(),
-            1,
-            "should leave exactly one publisher-originated DataDome tag"
-        );
     }
 
     #[test]
@@ -1244,60 +1151,6 @@ mod tests {
         assert!(
             !result.contains("window.__trustedServerPrebid"),
             "HtmlProcessor should not inject Prebid config"
-        );
-    }
-
-    #[test]
-    fn test_integration_registry_rewrites_integration_scripts() {
-        let html = r#"<html><head>
-            <script src="https://cdn.testlight.com/v1/testlight.js"></script>
-        </head><body></body></html>"#;
-
-        let mut settings = Settings::default();
-        let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
-        settings
-            .insert_module_config(
-                "auction",
-                "testing.testlight",
-                &json!({
-                    "endpoint": "https://example.com/openrtb2/auction",
-                    "rewrite_scripts": true,
-                    "shim_src": shim_src,
-                }),
-            )
-            .expect("should insert testlight config");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-        let mut config = create_test_config();
-        config.integrations = registry;
-
-        let processor = create_html_processor(config);
-        let pipeline_config = PipelineConfig {
-            input_compression: Compression::None,
-            output_compression: Compression::None,
-            chunk_size: 8192,
-        };
-        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
-
-        let mut output = Vec::new();
-        let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        result.unwrap();
-
-        let processed = String::from_utf8_lossy(&output);
-        assert!(
-            processed.contains(&shim_src),
-            "Integration shim should replace integration script reference"
-        );
-        assert!(
-            !processed.contains("cdn.testlight.com"),
-            "Original integration URL should be removed"
         );
     }
 
@@ -1576,8 +1429,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1654,8 +1506,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1694,8 +1545,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1733,8 +1583,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1790,8 +1639,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1821,8 +1669,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1847,8 +1694,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         }
     }
 
@@ -1994,53 +1840,6 @@ mod tests {
     }
 
     #[test]
-    fn nextjs_output_overflow_restores_in_progress_script_at_every_split() {
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "framework",
-                "framework.nextjs",
-                &json!({"max_combined_payload_bytes": 128}),
-            )
-            .expect("should select the nextjs integration");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
-        )
-        .expect("should create registry");
-        let first = r#"<html><body><script>self.__next_f.push([1,"1:T3,ab"])</script>"#;
-        let script = r#"self.__next_f.push([1,"c"])"#;
-        let padding = "x".repeat(129);
-        let expected = format!("{first}{padding}<script>{script}</script></body></html>");
-
-        for split in 1..script.len() {
-            let mut config = create_test_config();
-            config.integrations = registry.clone();
-            let mut processor = create_html_processor(config);
-            let mut output = processor
-                .process_chunk(first.as_bytes(), false)
-                .expect("should process unresolved RSC group");
-            let second = format!("{padding}<script>{}", &script[..split]);
-            output.extend(
-                processor
-                    .process_chunk(second.as_bytes(), false)
-                    .expect("should process output overflow and partial script"),
-            );
-            let third = format!("{}</script></body></html>", &script[split..]);
-            output.extend(
-                processor
-                    .process_chunk(third.as_bytes(), true)
-                    .expect("should finish bypassed script"),
-            );
-            assert_eq!(
-                String::from_utf8(output).expect("should retain UTF-8"),
-                expected,
-                "should restore all original bytes when overflow occurs at script split {split}"
-            );
-        }
-    }
-
-    #[test]
     fn a_nonce_bearing_meta_policy_is_observed() {
         let observed = Arc::new(AtomicBool::new(false));
         let mut processor =
@@ -2112,8 +1911,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: IntegrationRequestState::default(),
         };
         let source =
             format!(r#"<html><head></head><script>var collision="{MARKER}";</script></html>"#);

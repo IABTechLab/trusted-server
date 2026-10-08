@@ -42,8 +42,15 @@ mod image_optimizer;
 mod kv;
 mod template_assembly;
 mod template_cache;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::new_without_default,
+    reason = "test doubles, offered to other crates' tests under the test-utils feature"
+)]
+pub mod test_support;
 mod traits;
 mod types;
 

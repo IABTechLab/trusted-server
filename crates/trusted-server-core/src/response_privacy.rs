@@ -95,7 +95,10 @@ pub fn enforce_private_no_store(response: &mut Response) {
 }
 
 /// Marks a Trusted Server response as terminal-private and applies its cache policy.
-pub(crate) fn enforce_terminal_private_cache_privacy(response: &mut Response) {
+///
+/// Public so a response an integration crate synthesizes for one reader is
+/// kept out of shared caches the same way.
+pub fn enforce_terminal_private_cache_privacy(response: &mut Response) {
     enforce_private_no_store(response);
     response.extensions_mut().insert(TerminalPrivateResponse);
 }

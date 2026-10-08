@@ -94,9 +94,9 @@ Next.js Pages Router embeds data in `__NEXT_DATA__` script:
 
 The Next.js integration is implemented across multiple files:
 
-- [crates/trusted-server-core/src/integrations/nextjs/mod.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/mod.rs) - Main integration
-- [crates/trusted-server-core/src/integrations/nextjs/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/rsc.rs) - RSC parsing
-- [crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs) - Script rewriting
+- [crates/framework/nextjs/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/lib.rs) - Main integration
+- [crates/framework/nextjs/src/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/rsc.rs) - RSC parsing
+- [crates/framework/nextjs/src/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/script_rewriter.rs) - Script rewriting
 
 ### Key Components
 

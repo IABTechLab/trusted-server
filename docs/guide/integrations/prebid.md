@@ -1033,9 +1033,10 @@ Optimize mobile ad serving with reduced JavaScript overhead.
 ## Implementation
 
 Production Prebid Server demand sources compile from `[demand.<name>]` into a
-shared OpenRTB request and response driver.
+shared OpenRTB request and response driver. The demand implementation lives in
+[crates/auction/prebid-server/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/auction/prebid-server/src/lib.rs).
 The browser integration lives in
-[crates/trusted-server-core/src/integrations/prebid.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs),
+[crates/auction/prebid/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/auction/prebid/src/lib.rs),
 while provider execution uses
 [crates/trusted-server-core/src/auction/provider.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs)
 and shared request construction uses

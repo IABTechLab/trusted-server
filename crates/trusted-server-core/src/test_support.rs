@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod tests {
     use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
     use crate::redacted::Redacted;
@@ -32,13 +32,6 @@ pub mod tests {
             assume_single_jurisdiction = true
 
             [auction]
-            modules = ["prebid"]
-
-            [auction.prebid]
-            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
-
-            [auction.prebid.bundle.modules]
-            bidder = ["exampleBidderBidAdapter"]
 
             [ec]
             module = "hmac"
@@ -61,8 +54,8 @@ pub mod tests {
         let written = crate::module_name::short_form(section, name);
         if section == "auction" {
             return crate_test_settings_str().replace(
-                "modules = [\"prebid\"]",
-                &format!("modules = [\"prebid\", \"{written}\"]"),
+                "[auction]\n",
+                &format!("[auction]\nmodules = [\"{written}\"]\n"),
             );
         }
         format!(
@@ -142,6 +135,10 @@ pub mod tests {
     /// Panics if `name` has no block, or if its block configures another
     /// module.
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "a fixture names the block it could not find, which `expect` cannot"
+    )]
     pub fn hmac_passphrase<'a>(ec: &'a Ec, name: &str) -> &'a str {
         ec.module_blocks
             .get(name)
@@ -154,6 +151,75 @@ pub mod tests {
     /// A valid EC ID in `{64-hex}.{6-alnum}` format for use in tests.
     pub const VALID_SYNTHETIC_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
+}
+
+/// Page fixtures shared by core's tests and the tests of a module crate.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fixtures {
+    /// A publisher page carrying the tags of several vendors, as an origin
+    /// would serve it.
+    pub const PUBLISHER_PAGE_HTML: &str = include_str!("html_processor.test.html");
+}
+
+/// The operator-facing settings template, for tests that check what it
+/// documents.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod template {
+    /// The source-controlled template an operator starts from.
+    pub const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../trusted-server.example.toml"
+    ));
+
+    /// The template with its required secret-store key references replaced by
+    /// resolved test values, so parsing it as settings can exercise the
+    /// optional blocks a test uncomments.
+    #[must_use]
+    pub fn template_with_resolved_required_secrets() -> String {
+        EXAMPLE_TEMPLATE
+            .replace(
+                "password = \"handler_password\"",
+                "password = \"unit-test-resolved-handler-password-0001\"",
+            )
+            .replace(
+                "proxy_secret = \"publisher_proxy_secret\"",
+                "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"unit-test-resolved-ec-passphrase-secret-0001\"",
+            )
+    }
+
+    /// Uncomments the contiguous `#`-prefixed block that begins at the line
+    /// `# {header}`, leaving the rest of the template untouched. Stops at the
+    /// first line that is not a comment, so a blank line ends the block.
+    #[must_use]
+    pub fn uncomment_block(template: &str, header: &str) -> String {
+        let header_line = format!("# {header}");
+        let mut out = Vec::new();
+        let mut uncommenting = false;
+
+        for line in template.lines() {
+            if line == header_line {
+                uncommenting = true;
+            } else if uncommenting && !line.trim_start().starts_with('#') {
+                uncommenting = false;
+            }
+
+            if uncommenting {
+                let bare = line
+                    .strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line);
+                out.push(bare.to_owned());
+            } else {
+                out.push(line.to_owned());
+            }
+        }
+
+        out.join("\n")
+    }
 }
 
 /// Shared Next.js + auction origin fixture.
@@ -220,7 +286,7 @@ pub mod nextjs_auction {
         settings
             .insert_module_config(
                 "framework",
-                crate::integrations::nextjs::MODULE,
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),

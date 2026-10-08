@@ -5,32 +5,17 @@ use std::time::Duration;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
-use http::Request;
+use http::{Request, Response};
 use url::Url;
 
+use crate::auction::AuctionPlan;
 use crate::auction::demand::{AdServerImplementation, DemandImplementation};
 use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
-pub mod adserver_mock;
-pub mod aps;
-pub mod datadome;
-pub mod didomi;
-pub mod google_tag_manager;
-pub mod gpt;
-pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
-pub mod lockr;
-pub mod nextjs;
-pub mod openrtb;
-pub mod osano;
-pub mod permutive;
-pub mod prebid;
-pub mod prebid_server;
 mod registry;
-pub mod sourcepoint;
-pub mod testlight;
 
 #[cfg(test)]
 pub(crate) use registry::test_support as registry_test_support;
@@ -40,10 +25,10 @@ pub use registry::{
     IntegrationDocumentState, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
     IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationMetadata,
     IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
-    IntegrationRequestFilter, IntegrationScriptContext, IntegrationScriptRewriter,
-    ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
-    RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
-    ScriptTextAccumulator,
+    IntegrationRequestFilter, IntegrationRequestState, IntegrationScriptContext,
+    IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects,
+    RequestFilterInput, RequestFilterRegistryInput, RequestFilterRegistryOutcome,
+    ScriptRewriteAction, ScriptTextAccumulator,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -52,11 +37,13 @@ pub use registry::{
 /// 15-second first-byte timeout, and delegates to
 /// [`crate::platform::PlatformBackend::ensure`].
 ///
+/// Public for the same reason as [`ensure_integration_backend_with_timeout`].
+///
 /// # Errors
 ///
 /// Returns an error when `url` cannot be parsed, is missing a host, or the
 /// backend registration fails.
-pub(crate) fn ensure_integration_backend(
+pub fn ensure_integration_backend(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
@@ -178,7 +165,9 @@ fn integration_backend_spec(
 }
 
 /// Maximum body size accepted by integration proxy endpoints (256 KiB).
-pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
+///
+/// Public so every integration crate bounds a request body at one size.
+pub const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Maximum response body size from RTB providers (prebid, aps, ad server).
 ///
@@ -186,17 +175,24 @@ pub(crate) const INTEGRATION_MAX_BODY_BYTES: usize = 256 * 1024;
 /// response at the size the built-in ones do.
 pub const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
-pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+///
+/// Public so every integration crate bounds an upstream script or proxied
+/// response at one size.
+pub const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Drains an [`EdgeBody`] into a byte vector, rejecting bodies larger than
 /// `max_bytes` with [`TrustedServerError::RequestTooLarge`].
+///
+/// Public because an integration crate outside this one reads request bodies
+/// too, and an unbounded read of a client's body is not a fault each crate
+/// should solve again.
 ///
 /// # Errors
 ///
 /// Returns an error when:
 /// - The body exceeds `max_bytes`.
 /// - A streaming body chunk cannot be read (mapped to an `Integration` error).
-pub(crate) async fn collect_body_bounded(
+pub async fn collect_body_bounded(
     body: EdgeBody,
     max_bytes: usize,
     integration: &'static str,
@@ -327,6 +323,49 @@ pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedSer
 pub type IntegrationPrepareRequestFn =
     fn(&Settings, &mut Request<EdgeBody>) -> Result<(), Report<TrustedServerError>>;
 
+/// Finishes the response the page path returns for one request, from what
+/// the module's request hooks left for it in the request's
+/// [`IntegrationRequestState`].
+///
+/// Runs whether or not a section selects the integration, as the preparer
+/// does, and has nothing to do for a request its module left nothing on.
+pub type IntegrationFinalizeResponseFn = fn(&IntegrationRequestState, &mut Response<EdgeBody>);
+
+/// Builds a module's registration from the settings and the compiled auction
+/// plan, or `None` when the two give it nothing to register.
+///
+/// Runs for every builder that has one, whether or not a section selects the
+/// module, because a module registered this way follows what the plan
+/// selects and decides for itself whether it runs.
+pub type IntegrationPlanRegistrationFn =
+    fn(
+        &Settings,
+        &AuctionPlan,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
+
+/// Checks a module's configuration against the compiled auction plan, for a
+/// rule that depends on what the plan selects.
+///
+/// Runs for every builder that has one, when a deployment is validated and
+/// as the settings load.
+pub type IntegrationPlanValidateFn =
+    fn(&Settings, &AuctionPlan) -> Result<(), Report<TrustedServerError>>;
+
+/// A setting in a module's own table that holds the name of a secret.
+///
+/// The name is looked up in the default secret store as the settings load,
+/// and the setting holds the secret from then on.
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleSecretSetting {
+    /// Where the setting sits inside the module's table, one name for each
+    /// level.
+    pub path: &'static [&'static str],
+    /// Whether the module's table, as written, puts the setting to use. A
+    /// setting not in use is cleared as the settings load and is not looked
+    /// up, and one in use has to name a key before a deployment is accepted.
+    pub in_use: fn(&serde_json::Map<String, serde_json::Value>) -> bool,
+}
+
 /// Source label for the built-in integrations.
 pub const CORE_SOURCE: &str = "trusted-server-core";
 
@@ -376,6 +415,11 @@ pub struct IntegrationBuilder {
     build: IntegrationBuilderFn,
     validate: IntegrationValidateFn,
     prepare_request: Option<IntegrationPrepareRequestFn>,
+    finalize_response: Option<IntegrationFinalizeResponseFn>,
+    plan_registration: Option<IntegrationPlanRegistrationFn>,
+    plan_validator: Option<IntegrationPlanValidateFn>,
+    reads_auction_token: bool,
+    secret_settings: &'static [ModuleSecretSetting],
     supplies_integration: bool,
     demand: Option<&'static DemandImplementation>,
     adserver: Option<&'static AdServerImplementation>,
@@ -411,6 +455,11 @@ impl IntegrationBuilder {
             build,
             validate,
             prepare_request: None,
+            finalize_response: None,
+            plan_registration: None,
+            plan_validator: None,
+            reads_auction_token: false,
+            secret_settings: &[],
             supplies_integration: true,
             demand: None,
             adserver: None,
@@ -433,6 +482,11 @@ impl IntegrationBuilder {
             build: no_registration,
             validate: nothing_to_validate,
             prepare_request: None,
+            finalize_response: None,
+            plan_registration: None,
+            plan_validator: None,
+            reads_auction_token: false,
+            secret_settings: &[],
             supplies_integration: false,
             demand: None,
             adserver: None,
@@ -484,6 +538,71 @@ impl IntegrationBuilder {
     pub const fn with_request_preparer(mut self, prepare: IntegrationPrepareRequestFn) -> Self {
         self.prepare_request = Some(prepare);
         self
+    }
+
+    /// Attaches a function that finishes the response the page path returns,
+    /// from what the module's request hooks left for the request.
+    #[must_use]
+    pub const fn with_response_finalizer(
+        mut self,
+        finalize: IntegrationFinalizeResponseFn,
+    ) -> Self {
+        self.finalize_response = Some(finalize);
+        self
+    }
+
+    /// Registers the module from the compiled auction plan as well as the
+    /// settings, for a module whose page support follows what the plan
+    /// selects.
+    ///
+    /// The function runs whether or not a section selects the module, and
+    /// what it registers has its hooks run ahead of the modules the sections
+    /// select.
+    #[must_use]
+    pub const fn with_plan_registration(mut self, register: IntegrationPlanRegistrationFn) -> Self {
+        self.plan_registration = Some(register);
+        self
+    }
+
+    /// Attaches a check of the module's configuration against the compiled
+    /// auction plan.
+    #[must_use]
+    pub const fn with_plan_validator(mut self, validate: IntegrationPlanValidateFn) -> Self {
+        self.plan_validator = Some(validate);
+        self
+    }
+
+    /// Declares that the module's browser script reads the token an auction
+    /// publishes with its winning bids.
+    ///
+    /// A token is made for each auction when a section selects such a
+    /// module, and none is made in a deployment where nothing reads it.
+    #[must_use]
+    pub const fn with_auction_token(mut self) -> Self {
+        self.reads_auction_token = true;
+        self
+    }
+
+    /// Whether the module's browser script reads the auction token.
+    #[must_use]
+    pub const fn reads_auction_token(&self) -> bool {
+        self.reads_auction_token
+    }
+
+    /// Declares the settings in the module's own table that hold the name of
+    /// a secret, so each is looked up as the settings load and checked when
+    /// a deployment is validated.
+    #[must_use]
+    pub const fn with_secret_settings(mut self, secrets: &'static [ModuleSecretSetting]) -> Self {
+        self.secret_settings = secrets;
+        self
+    }
+
+    /// The settings in the module's own table that hold the name of a
+    /// secret.
+    #[must_use]
+    pub const fn secret_settings(&self) -> &'static [ModuleSecretSetting] {
+        self.secret_settings
     }
 
     /// Runs this builder when a section selects the module `name`, which is a
@@ -561,33 +680,67 @@ impl IntegrationBuilder {
     pub(crate) fn prepare_request(&self) -> Option<IntegrationPrepareRequestFn> {
         self.prepare_request
     }
+
+    /// The response finalizer, when one is attached.
+    pub(crate) fn finalize_response(&self) -> Option<IntegrationFinalizeResponseFn> {
+        self.finalize_response
+    }
+
+    /// The registration from the auction plan, when one is attached.
+    pub(crate) fn plan_registration(&self) -> Option<IntegrationPlanRegistrationFn> {
+        self.plan_registration
+    }
+
+    /// The check against the auction plan, when one is attached.
+    pub(crate) fn plan_validator(&self) -> Option<IntegrationPlanValidateFn> {
+        self.plan_validator
+    }
 }
 
 /// The built-in integrations, in hook order.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
-    // This must remain first: attribute rewriters chain replacements and
-    // short-circuit removals.
+    // This must remain the first module a section selects: attribute
+    // rewriters chain replacements and short-circuit removals.
     js_asset_proxy::BUILDER,
-    testlight::BUILDER,
-    nextjs::BUILDER,
-    permutive::BUILDER,
-    lockr::BUILDER,
-    didomi::BUILDER,
-    sourcepoint::BUILDER,
-    osano::BUILDER,
-    google_tag_manager::BUILDER,
-    datadome::BUILDER,
-    gpt::BUILDER,
-    gpt_diagnostics::BUILDER,
-    // Implementations `[demand]` and `[ad-server]` can name. None of them is
-    // a module a section selects.
-    IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),
-    IntegrationBuilder::implementations(prebid_server::MODULE, CORE_SOURCE)
-        .with_demand(&prebid_server::DEMAND),
-    IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
-        .with_demand(&aps::DEMAND),
-    IntegrationBuilder::implementations(adserver_mock::MODULE, CORE_SOURCE)
-        .with_adserver(&adserver_mock::ADSERVER),
+    // A stand-in for an integration that streams, which core's own tests
+    // select where they need one.
+    #[cfg(test)]
+    registry_test_support::payload_fixture::BUILDER,
+    // A stand-in for an integration that tags a page, for the same tests.
+    #[cfg(test)]
+    registry_test_support::tag_fixture::BUILDER,
+    // A stand-in for an integration that acts on one request, for the same
+    // tests.
+    #[cfg(test)]
+    registry_test_support::request_fixture::BUILDER,
+    // A stand-in for an integration whose browser module loads deferred, for
+    // the same tests.
+    #[cfg(test)]
+    registry_test_support::deferred_fixture::BUILDER,
+    // A stand-in for the plainest demand implementation there can be, which
+    // core's own tests name where they need a source.
+    #[cfg(test)]
+    IntegrationBuilder::implementations(
+        crate::auction::test_support::plain_fixture::MODULE,
+        CORE_SOURCE,
+    )
+    .with_demand(&crate::auction::test_support::plain_fixture::DEMAND),
+    // A stand-in demand implementation, which core's own tests name where
+    // they need one that departs from the plain one.
+    #[cfg(test)]
+    IntegrationBuilder::implementations(
+        crate::auction::test_support::demand_fixture::MODULE,
+        CORE_SOURCE,
+    )
+    .with_demand(&crate::auction::test_support::demand_fixture::DEMAND),
+    // A stand-in ad server, which core's own tests select where they need
+    // one.
+    #[cfg(test)]
+    IntegrationBuilder::implementations(
+        crate::auction::test_support::adserver_fixture::MODULE,
+        CORE_SOURCE,
+    )
+    .with_adserver(&crate::auction::test_support::adserver_fixture::ADSERVER),
 ];
 
 /// The built-in integration builders, in hook order.

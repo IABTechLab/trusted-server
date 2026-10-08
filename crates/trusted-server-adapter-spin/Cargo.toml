@@ -32,6 +32,7 @@ futures = { workspace = true }
 http-body-util = { workspace = true }
 log = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-modules = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
 trusted-server-permission-signal-mtm = { workspace = true }

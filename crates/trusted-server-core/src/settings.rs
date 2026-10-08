@@ -3981,7 +3981,6 @@ impl Settings {
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
-        self.remove_legacy_static_secret_store_selectors();
         self.consent.validate();
     }
 
@@ -4417,6 +4416,21 @@ impl Settings {
         self.module_selection(name).is_some()
     }
 
+    /// The table `section` holds at the name `written`, as it was written,
+    /// or an empty one when the section holds none.
+    #[must_use]
+    pub fn section_table(
+        &self,
+        section: &str,
+        written: &str,
+    ) -> serde_json::Map<String, JsonValue> {
+        self.module_sections()
+            .find(|(candidate, _)| *candidate == section)
+            .and_then(|(_, modules)| modules.settings_of(written))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Reads and validates a selected module's settings, from the table at the
     /// name it is written under beneath the section that selects it, or
     /// returns `None` when no section selects it.
@@ -4549,32 +4563,6 @@ impl Settings {
             }
         }
         Ok(())
-    }
-
-    /// Drops the `DataDome` secret-store selectors a previous release read,
-    /// from the module's table when it is configured.
-    fn remove_legacy_static_secret_store_selectors(&mut self) {
-        let Some(datadome) = self
-            .sections
-            .0
-            .get_mut("bot-protection")
-            .and_then(|section| section.settings_of_mut("datadome"))
-        else {
-            return;
-        };
-
-        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
-        if let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(JsonValue::as_object_mut)
-        {
-            removed |= bypass.remove("credential_secret_store").is_some();
-        }
-        if removed {
-            log::warn!(
-                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default secret store"
-            );
-        }
     }
 }
 
@@ -4843,7 +4831,18 @@ where
     }
 }
 
-pub(crate) fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+/// Reads a list setting written as a sequence, as a map keyed by position,
+/// or as a string holding a JSON array or comma-separated values.
+///
+/// The map and string forms are what an environment overlay produces, so a
+/// list reads the same from a file and from the environment. Public so a
+/// module crate's own list settings read the same way.
+///
+/// # Errors
+///
+/// When the value is none of those forms, a map key is not a position, or an
+/// item cannot be read as `T`.
+pub fn vec_from_seq_or_map<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: DeserializeOwned,
@@ -4919,7 +4918,6 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     use crate::ec::resolve::NotAnOrigin;
 
@@ -4974,9 +4972,7 @@ mod tests {
         );
     }
 
-    use crate::integrations::{
-        IntegrationRegistry, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
-    };
+    use crate::integrations::IntegrationRegistry;
     use crate::redacted::Redacted;
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, create_test_settings,
@@ -5190,7 +5186,7 @@ module = \"none\"",
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
         const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
         const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
-        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
+        const CANARY_MODULE_KEY: &str = "CANARY-MODULE-TABLE-KEY-0123456789";
 
         let mut settings = create_test_settings();
 
@@ -5250,17 +5246,17 @@ module = \"none\"",
         };
 
         // A module's table is opaque JSON, and the section's hand-written
-        // `Debug` impl is the only thing keeping resolved DataDome
-        // credentials out of this output, so pin it here.
+        // `Debug` impl is the only thing keeping a secret a module's table
+        // holds out of this output, so pin it here.
         settings
             .insert_module_config(
-                "bot-protection",
-                crate::integrations::datadome::MODULE,
+                "testing",
+                "testing.example",
                 &json!({
-                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                    "key_name": CANARY_MODULE_KEY,
                 }),
             )
-            .expect("should insert datadome integration config");
+            .expect("should insert a module's table");
 
         let debug = format!("{settings:?}");
 
@@ -5304,10 +5300,7 @@ module = \"none\"",
                 CANARY_TINYBIRD_AUCTION_TOKEN,
             ),
             ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
-            (
-                "bot-protection.datadome.server_side_key_secret_name",
-                CANARY_DATADOME_SERVER_SIDE_KEY,
-            ),
+            ("testing.example.key_name", CANARY_MODULE_KEY),
         ];
 
         for (field, canary) in canaries {
@@ -5724,7 +5717,7 @@ module = \"none\"",
             .expect("should load the test settings fixture");
         let mut value = serde_json::to_value(settings)
             .expect("should serialize the test settings fixture to JSON");
-        value["auction"]["providers"] = json!(["prebid"]);
+        value["auction"]["providers"] = json!(["example"]);
 
         let error = Settings::from_json_value(value)
             .expect_err("should reject the removed auction provider list schema");
@@ -5744,7 +5737,7 @@ module = \"none\"",
         let toml = format!(
             "{}\n",
             crate_test_settings_str()
-                .replace("[auction]\n", "[auction]\nproviders = [\"prebid\"]\n")
+                .replace("[auction]\n", "[auction]\nproviders = [\"example\"]\n")
         );
 
         let error = Settings::from_toml(&toml)
@@ -6022,22 +6015,16 @@ module = \"none\"",
         assert!(settings.is_ok());
 
         let settings = settings.expect("should parse valid TOML");
-        let prebid_cfg = settings
-            .module_config::<PrebidIntegrationConfig>(crate::integrations::prebid::MODULE)
-            .expect("Prebid config query should succeed")
-            .expect("Prebid config should load from test settings");
-        assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
-                .module_config::<NextJsIntegrationConfig>(crate::integrations::nextjs::MODULE)
-                .expect("Next.js config query should succeed")
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .expect("a query for a module no section selects should succeed")
                 .is_none(),
             "a module no section selects should not run"
         );
-        assert_eq!(
-            settings.auction.modules.selected(),
-            ["prebid".to_owned()],
-            "the fixture should run exactly the module it selects"
+        assert!(
+            settings.auction.modules.selected().is_empty(),
+            "the fixture should select no auction module"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
@@ -8337,21 +8324,41 @@ source_domain = "partner.example.com"
         );
     }
 
+    /// The settings of an example module that takes none.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct NoSettings {}
+
+    impl IntegrationConfig for NoSettings {}
+
+    /// The settings of an example module that requires one.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct OneRequiredSetting {
+        #[validate(url)]
+        endpoint: String,
+    }
+
+    impl IntegrationConfig for OneRequiredSetting {}
+
+    /// The example modules' names, in a section of their own type.
+    const EXAMPLE_SECTION: &str = "example";
+    const PLAIN_MODULE: &str = "example.plain";
+    const ENDPOINT_MODULE: &str = "example.endpoint";
+
     /// A module no section selects has no configuration, whatever else the
     /// settings hold.
     #[test]
     fn a_module_that_is_not_selected_has_no_configuration() {
-        use crate::integrations::testlight::{self, TestlightConfig};
-
         let settings = create_test_settings();
 
         assert!(
-            !settings.selects_module(testlight::MODULE),
-            "the shared fixture should not select testlight"
+            !settings.selects_module(ENDPOINT_MODULE),
+            "the shared fixture should not select the example module"
         );
         assert!(
             settings
-                .module_config::<TestlightConfig>(testlight::MODULE)
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
                 .expect("reading an unselected module should succeed")
                 .is_none(),
             "a module that is not selected should have no configuration"
@@ -8362,14 +8369,12 @@ source_domain = "partner.example.com"
     /// so one that takes no settings runs on its selection alone.
     #[test]
     fn a_selected_module_with_no_table_is_read_from_an_empty_one() {
-        use crate::integrations::osano::{self, OsanoConfig};
-
         let mut settings = create_test_settings();
-        settings.select_module("cmp", osano::MODULE);
+        settings.select_module(EXAMPLE_SECTION, PLAIN_MODULE);
 
         assert!(
             settings
-                .module_config::<OsanoConfig>(osano::MODULE)
+                .module_config::<NoSettings>(PLAIN_MODULE)
                 .expect("a module that takes no settings should read from an empty table")
                 .is_some(),
             "selecting the module should be the whole configuration"
@@ -8380,56 +8385,17 @@ source_domain = "partner.example.com"
     /// setting it is missing, rather than starting without it.
     #[test]
     fn a_selected_module_without_a_required_setting_names_it() {
-        use crate::integrations::testlight::{self, TestlightConfig};
-
         let mut settings = create_test_settings();
-        settings.select_module("auction", testlight::MODULE);
+        settings.select_module(EXAMPLE_SECTION, ENDPOINT_MODULE);
 
         let error = settings
-            .module_config::<TestlightConfig>(testlight::MODULE)
+            .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
             .expect_err("should reject a selected module with no endpoint");
 
         let rendered = error.to_string();
         assert!(
-            rendered.contains("testlight") && rendered.contains("endpoint"),
-            "should name the module and the missing setting: {rendered}"
-        );
-    }
-
-    #[test]
-    fn removed_integration_fields_are_rejected() {
-        use crate::integrations::{datadome, prebid};
-
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "auction",
-                prebid::MODULE,
-                &json!({ "server_url": "removed-value" }),
-            )
-            .expect("should insert the removed Prebid field");
-        let error = settings
-            .module_config::<PrebidIntegrationConfig>(prebid::MODULE)
-            .expect_err("should reject the removed Prebid field");
-        assert!(
-            format!("{error:?}").contains("server_url"),
-            "should identify the removed field: {error:?}"
-        );
-
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "bot-protection",
-                datadome::MODULE,
-                &json!({ "account_id": "removed-value" }),
-            )
-            .expect("should insert the removed DataDome field");
-        let error = settings
-            .module_config::<datadome::DataDomeConfig>(datadome::MODULE)
-            .expect_err("should reject the removed DataDome field");
-        assert!(
-            format!("{error:?}").contains("account_id"),
-            "should identify the removed field: {error:?}"
+            rendered.contains("[example.endpoint]") && rendered.contains("endpoint"),
+            "should name the module's table and the missing setting: {rendered}"
         );
     }
 
@@ -8475,17 +8441,19 @@ source_domain = "partner.example.com"
     /// configuration cannot read as switched off while the module runs.
     #[test]
     fn an_enabled_key_left_in_a_table_is_refused() {
-        let toml = crate_test_settings_str()
-            .replace("[auction.prebid]", "[auction.prebid]\nenabled = false");
+        let toml = format!(
+            "{}\n[example]\nmodules = [\"endpoint\"]\n\n[example.endpoint]\nendpoint = \"https://endpoint.example\"\nenabled = false\n",
+            crate_test_settings_str()
+        );
         let settings = Settings::from_toml(&toml).expect("core reads no module's table itself");
 
         let error = settings
-            .module_config::<PrebidIntegrationConfig>(crate::integrations::prebid::MODULE)
+            .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
             .expect_err("should reject a leftover enabled key");
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[auction.prebid]") && rendered.contains("enabled"),
+            rendered.contains("[example.endpoint]") && rendered.contains("enabled"),
             "should name the table and the key: {rendered}"
         );
     }
@@ -8494,9 +8462,9 @@ source_domain = "partner.example.com"
     /// twice, so it is refused.
     #[test]
     fn naming_a_module_twice_is_refused() {
-        let toml = crate_test_settings_str().replace(
-            "modules = [\"prebid\"]",
-            "modules = [\"prebid\", \"prebid\"]",
+        let toml = format!(
+            "{}\n[example]\nmodules = [\"endpoint\", \"endpoint\"]\n",
+            crate_test_settings_str()
         );
 
         let error = Settings::from_toml(&toml).expect_err("should reject a repeated name");
@@ -8554,29 +8522,45 @@ source_domain = "partner.example.com"
 
     #[test]
     fn invalid_settings_for_a_selected_module_fail_registry_startup() {
+        fn build(
+            settings: &Settings,
+        ) -> Result<Option<crate::integrations::IntegrationRegistration>, Report<TrustedServerError>>
+        {
+            Ok(settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)?
+                .map(|_| crate::integrations::IntegrationRegistration::builder("endpoint").build()))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .map(|config| config.is_some())
+        }
+
         let mut settings = create_test_settings();
         settings
             .insert_module_config(
-                "ad-tag",
-                crate::integrations::gpt::MODULE,
+                EXAMPLE_SECTION,
+                ENDPOINT_MODULE,
                 &json!({
-                    "script_url": "not a url",
+                    "endpoint": "not a url",
                 }),
             )
-            .expect("should insert GPT config");
+            .expect("should insert the example module's table");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "endpoint",
+            "settings-tests",
+            build,
+            validate,
+        )
+        .with_module_name(ENDPOINT_MODULE)];
 
-        let err = match IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        ) {
+        let err = match IntegrationRegistry::with_registrations(&settings, &extra) {
             Ok(_) => panic!("a selected module with invalid settings should fail startup"),
             Err(err) => err,
         };
         assert!(
-            format!("{err:?}").contains("[ad-tag.google]"),
+            format!("{err:?}").contains("[example.endpoint]"),
             "should identify the invalid module table: {err:?}"
         );
     }

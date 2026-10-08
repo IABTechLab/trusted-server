@@ -2376,8 +2376,8 @@ mod tests {
             bidders: HashMap::new(),
         });
         let mut config = plan_config(vec![(
-            "pbs_primary",
-            demand_table("auction.prebid-server", "https://pbs.example.test/openrtb"),
+            "stored_primary",
+            demand_table("auction.fixture", "https://stored.example.test/openrtb"),
         )]);
         config.timeout_ms = 900;
         let plan = AuctionPlan::compile(config).expect("should compile plan");
@@ -2411,7 +2411,7 @@ mod tests {
                 !slot
                     .bidder_params()
                     .keys()
-                    .any(|bidder| bidder.as_str() == "pbs_primary")
+                    .any(|bidder| bidder.as_str() == "stored_primary")
             }),
             "provider ID should not reach client-controlled bidder input"
         );

@@ -1293,66 +1293,17 @@ mod tests {
         assert!(response.headers().get("cdn-cache-control").is_none());
     }
 
-    fn diagnostics_settings() -> Settings {
-        Settings::from_toml(
-            r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [publisher]
-            domain = "test-publisher.com"
-            cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
-            proxy_secret = "unit-test-proxy-secret"
-
-            [geo]
-            assume_single_jurisdiction = true
-
-            [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [request_signing]
-            enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
-
-            [ad-tag]
-            modules = ["google.diagnostics"]
-            "#,
-        )
-        .expect("should parse diagnostics settings")
-    }
-
     #[test]
-    fn late_filter_effects_cannot_make_an_active_diagnostics_response_public() {
-        // The narrowest hole: an established diagnostics session sets no new cookie, so
-        // the `Set-Cookie` privacy net never fires, and before this the decision only
-        // stamped `Cache-Control` without leaving a marker for the terminal guard.
-        let mut request = edgezero_core::http::request_builder()
-            .method(fastly::http::Method::GET)
-            .uri("https://test-publisher.com/article")
-            .header("sec-fetch-dest", "document")
-            .header("cookie", "__Host-ts-console=1")
-            .body(EdgeBody::empty())
-            .expect("should build request");
-        let decision = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-            &diagnostics_settings(),
-            &mut request,
-        )
-        .expect("should prepare the diagnostics decision");
-        assert!(
-            decision.active(),
-            "the session cookie should activate diagnostics"
-        );
-
+    fn late_filter_effects_cannot_make_a_response_a_module_made_private_public() {
+        // The narrowest hole: a module's response finalizer makes a response
+        // one reader's without setting a cookie, so the `Set-Cookie` privacy
+        // net never fires, and only the marker the finalizer leaves lets the
+        // terminal guard enforce the policy again.
         let mut response = response_builder()
             .header("cache-control", "public, max-age=600")
             .body(EdgeBody::empty())
             .expect("should build response");
-        trusted_server_core::integrations::gpt_diagnostics::finalize_response(
-            &decision,
+        trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy(
             &mut response,
         );
 
@@ -1376,7 +1327,7 @@ mod tests {
                 .get("cache-control")
                 .and_then(|value| value.to_str().ok()),
             Some("no-store, private"),
-            "request-scoped diagnostics HTML must never become shared-cacheable"
+            "a response made for one request must never become shared-cacheable"
         );
         assert!(
             response.headers().get("surrogate-control").is_none(),

@@ -148,9 +148,9 @@ pub(crate) const ERROR_TYPE_TRANSPORT: &str = "transport";
 pub(crate) const ERROR_TYPE_TIMEOUT: &str = "timeout";
 /// A non-2xx HTTP status from an upstream SSP (e.g. a PBS 4xx/5xx). Distinct
 /// from [`ERROR_TYPE_TRANSPORT`] (a connection-level failure) so telemetry can
-/// bucket it separately. `pub(crate)` so producers such as the prebid provider
-/// tag errors with the exact value the telemetry layer recognises.
-pub(crate) const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
+/// bucket it separately. Public so a producer in a crate of its own tags
+/// errors with the exact value the telemetry layer recognises.
+pub const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
 
 /// Every server-owned `error_type` classification.
 ///
@@ -828,6 +828,21 @@ impl AuctionOrchestrator {
     #[must_use]
     pub fn shares_plan(&self, plan: &Arc<AuctionPlan>) -> bool {
         Arc::ptr_eq(&self.plan, plan)
+    }
+
+    /// Return whether each auction publishes a token with its winning bids.
+    #[must_use]
+    pub fn publishes_auction_token(&self) -> bool {
+        self.plan.publishes_auction_token()
+    }
+
+    /// The same orchestrator in a deployment where a module reads the
+    /// auction token.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn publishing_auction_token(mut self) -> Self {
+        self.plan = Arc::new((*self.plan).clone().with_auction_token(true));
+        self
     }
 
     /// Register an auction provider in the legacy parity harness.
@@ -2567,7 +2582,6 @@ impl OrchestrationResult {
 mod tests {
     use std::time::Duration;
 
-    use base64::Engine as _;
     use web_time::Instant;
 
     use crate::auction::config::AuctionConfig;
@@ -2583,10 +2597,8 @@ mod tests {
         BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
-    use crate::integrations::adserver_mock::{AdServerMockProvider, AdServerMockSettings};
-    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use crate::platform::test_support::{
-        StubHttpClient, build_services_with_backend_and_http_client,
+        NamingBackend, StubHttpClient, build_services_with_backend_and_http_client,
         build_services_with_http_client, noop_services,
     };
     use crate::platform::{
@@ -2597,7 +2609,7 @@ mod tests {
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2636,7 +2648,7 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "auction-protocol.openrtb",
+                        "auction.plain-fixture",
                         "https://example.test/openrtb",
                         *routing,
                         &serde_json::json!({}),
@@ -2655,7 +2667,7 @@ mod tests {
         config
     }
 
-    fn planned_prebid_config(
+    fn planned_fixture_config(
         providers: &[(&str, serde_json::Value, NotificationConfig)],
     ) -> AuctionPlanConfig {
         let tables = providers
@@ -2664,40 +2676,9 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "auction.prebid-server",
+                        "auction.fixture",
                         &format!("https://{id}.example.test/openrtb"),
                         RoutingMode::Explicit,
-                        settings,
-                        notifications,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut config = plan_config(tables);
-        config.timeout_ms = 777;
-        config
-    }
-
-    fn planned_aps_config() -> AuctionPlanConfig {
-        planned_aps_instances_config(&[(
-            "aps_instance",
-            serde_json::json!({"account_id": "example-account"}),
-            NotificationConfig::default(),
-        )])
-    }
-
-    fn planned_aps_instances_config(
-        providers: &[(&str, serde_json::Value, NotificationConfig)],
-    ) -> AuctionPlanConfig {
-        let tables = providers
-            .iter()
-            .map(|(id, settings, notifications)| {
-                (
-                    *id,
-                    planned_table(
-                        "auction.aps",
-                        "https://aps.example/e/pb/bid",
-                        RoutingMode::AllEligible,
                         settings,
                         notifications,
                     ),
@@ -2738,7 +2719,7 @@ mod tests {
         }
     }
 
-    fn planned_prebid_request() -> AuctionRequest {
+    fn planned_envelope_request() -> AuctionRequest {
         let mut request = planned_request();
         request.slots[0]
             .bidders
@@ -2995,71 +2976,6 @@ mod tests {
             );
             assert!(result.metadata.contains_key("routing"));
             assert!(http.recorded_backend_names().is_empty());
-        }
-    }
-
-    struct NamingBackend {
-        policy: BackendNamingPolicy,
-        predicted: AtomicUsize,
-        ensured: AtomicUsize,
-        specs: Mutex<Vec<PlatformBackendSpec>>,
-        fail_ensure_for: Mutex<HashSet<String>>,
-    }
-
-    impl NamingBackend {
-        fn new(policy: BackendNamingPolicy) -> Self {
-            Self {
-                policy,
-                predicted: AtomicUsize::new(0),
-                ensured: AtomicUsize::new(0),
-                specs: Mutex::new(Vec::new()),
-                fail_ensure_for: Mutex::new(HashSet::new()),
-            }
-        }
-
-        fn fail_ensure_for(&self, provider_id: &str) {
-            self.fail_ensure_for
-                .lock()
-                .expect("should lock failing provider IDs")
-                .insert(provider_id.to_string());
-        }
-
-        fn name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.policy
-                .predict(spec)
-                .map(|prediction| prediction.name)
-                .change_context(PlatformError::Backend)
-        }
-    }
-
-    impl PlatformBackend for NamingBackend {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            self.policy
-        }
-
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            self.predicted.fetch_add(1, Ordering::Relaxed);
-            self.name(spec)
-        }
-
-        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.ensured.fetch_add(1, Ordering::Relaxed);
-            if spec.discriminator.as_deref().is_some_and(|provider_id| {
-                self.fail_ensure_for
-                    .lock()
-                    .expect("should lock failing provider IDs")
-                    .contains(provider_id)
-            }) {
-                return Err(Report::new(PlatformError::Backend));
-            }
-            self.specs
-                .lock()
-                .expect("should lock planned backend specs")
-                .push(spec.clone());
-            self.name(spec)
         }
     }
 
@@ -3725,28 +3641,23 @@ mod tests {
         }
     }
 
-    /// Ad server whose context-aware parse restores `nurl`/`ad_id` (mirroring
-    /// `adserver_mock`), while its context-free parse does not. Lets a test prove
+    /// Ad server whose context-aware parse restores `nurl`/`ad_id`, as one that
+    /// keeps them out of its request does, while its context-free parse does not. Lets a test prove
     /// the synchronous ad server decision path calls `parse_response_with_context`.
     struct CacheRestoringAdServer;
 
     fn auction_bid(bidder: &str, price: f64) -> Bid {
-        let renderer = (bidder == "aps").then(|| {
-            BidRenderer::from_typed(
-                APS_RENDERER_TYPE,
-                &ApsRendererV1 {
-                    version: 1,
-                    account_id: "example-account".to_string(),
-                    bid_id: "aps-selected-bid".to_string(),
-                    creative_id: None,
-                    tag_type: ApsTagType::Iframe,
-                    creative_url: "https://creative.example/render".to_string(),
-                    aax_response: "fictional-base64".to_string(),
-                    width: 300,
-                    height: 250,
-                },
+        let renderer = (bidder == "typed").then(|| {
+            BidRenderer::new(
+                "example",
+                serde_json::json!({
+                    "version": 1,
+                    "bidId": "typed-selected-bid",
+                    "creativeUrl": "https://creative.example/render",
+                    "envelope": "fictional-base64",
+                }),
             )
-            .expect("the APS renderer payload should be a JSON object")
+            .expect("should build the example renderer descriptor")
         });
         Bid {
             slot_id: "slot-1".to_string(),
@@ -3762,7 +3673,7 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
-            bid_id: (bidder == "aps").then(|| "aps-selected-bid".to_string()),
+            bid_id: (bidder == "typed").then(|| "typed-selected-bid".to_string()),
             ad_id: None,
             creative_id: None,
             renderer,
@@ -5096,9 +5007,9 @@ mod tests {
             let mut adserver_only = plan_config(Vec::new());
             adserver_only.timeout_ms = 49;
             adserver_only.adserver = crate::provider_table::ProviderChoice::new(
-                Some("mock".to_string()),
+                Some("fixture".to_string()),
                 BTreeMap::from([(
-                    "mock".to_string(),
+                    "fixture".to_string(),
                     serde_json::Map::from_iter([(
                         "endpoint".to_string(),
                         serde_json::json!("https://adserver.example/mediate"),
@@ -5937,10 +5848,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_prebid_stored_intent_filters_wire_demand_and_skips_empty_transports() {
+    async fn planned_stored_intent_filters_wire_demand_and_skips_empty_transports() {
         for inline_providers in 0..=2 {
             let http = Arc::new(StubHttpClient::new());
-            // Providers launch in ID order: APS, then only PBS instances with usable demand.
+            // Providers launch in ID order: the source that takes every slot, then
+            // only the stored-request sources with usable demand.
             http.push_response(204, Vec::new());
             for index in 0..inline_providers {
                 http.push_response(
@@ -5957,7 +5869,7 @@ mod tests {
                             }
                         ]}]
                     }))
-                    .expect("should serialize PBS response"),
+                    .expect("should serialize the upstream response"),
                 );
             }
             let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
@@ -5965,33 +5877,41 @@ mod tests {
                 Arc::clone(&backend) as Arc<_>,
                 Arc::clone(&http) as Arc<_>,
             );
-            let mut config = planned_prebid_config(&[
+            let mut config = planned_fixture_config(&[
                 (
-                    "pbs_a",
+                    "stored_a",
                     serde_json::json!({}),
                     NotificationConfig::default(),
                 ),
                 (
-                    "pbs_b",
+                    "stored_b",
                     serde_json::json!({}),
                     NotificationConfig::default(),
                 ),
             ]);
-            let aps = planned_aps_config();
+            let all_eligible =
+                planned_config(&[("all_eligible_source", RoutingMode::AllEligible)], false);
             let mut tables = config.demand.tables().clone();
-            tables.extend(aps.demand.tables().clone());
+            tables.extend(all_eligible.demand.tables().clone());
             let mut selected = config
                 .demand
                 .selected()
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            selected.extend(aps.demand.selected().into_iter().map(str::to_owned));
+            selected.extend(
+                all_eligible
+                    .demand
+                    .selected()
+                    .into_iter()
+                    .map(str::to_owned),
+            );
             // Sources launch in the order they are selected, and this test reads
-            // the APS request first, so the selection is in name order.
+            // the all-eligible source's request first, so the selection is in
+            // name order.
             selected.sort();
             config.demand = crate::provider_table::ProviderList::new(selected, tables);
-            for (bidder, provider) in [("alpha", "pbs_a"), ("beta", "pbs_b")] {
+            for (bidder, provider) in [("alpha", "stored_a"), ("beta", "stored_b")] {
                 config.bidders.insert(
                     bidder.parse().expect("should parse bidder"),
                     crate::auction::plan::BidderRouteConfig {
@@ -6003,7 +5923,7 @@ mod tests {
             let orchestrator = AuctionOrchestratorHarness::new(plan, None);
             let mut request = planned_request();
             let template = request.slots[0].clone();
-            // Both PBS instances must evaluate candidates but omit them after overrides.
+            // Both stored-request sources must evaluate candidates and omit them.
             request.slots[0].bidders.insert(
                 "trustedServer".to_string(),
                 serde_json::json!({
@@ -6011,7 +5931,7 @@ mod tests {
                 }),
             );
             request.slots.push(AdSlot {
-                id: "synthetic-no-pbs".to_string(),
+                id: "synthetic-no-demand".to_string(),
                 bidders: HashMap::from([(
                     "trustedServer".to_string(),
                     serde_json::json!({"storedRequest":false,"bidderParams":{}}),
@@ -6047,12 +5967,12 @@ mod tests {
             assert_eq!(
                 bodies.len(),
                 1 + inline_providers,
-                "should never transport an empty PBS request"
+                "should never transport an empty request"
             );
-            let aps: serde_json::Value =
-                serde_json::from_slice(&bodies[0]).expect("should parse APS wire request");
+            let all_eligible_wire: serde_json::Value = serde_json::from_slice(&bodies[0])
+                .expect("should parse the all-eligible source's wire request");
             assert_eq!(
-                aps["imp"]
+                all_eligible_wire["imp"]
                     .as_array()
                     .expect("should have impressions")
                     .len(),
@@ -6064,12 +5984,12 @@ mod tests {
                 "should reject a bid for an omitted impression"
             );
             for index in inline_providers..2 {
-                let provider_id = if index == 0 { "pbs_a" } else { "pbs_b" };
+                let provider_id = if index == 0 { "stored_a" } else { "stored_b" };
                 let response = result
                     .provider_responses
                     .iter()
                     .find(|response| response.provider == provider_id)
-                    .expect("should retain skipped PBS provider response");
+                    .expect("should retain the skipped source's response");
                 assert_eq!(
                     response.metadata["routing"]["skipped_no_usable_demand"],
                     true
@@ -6077,7 +5997,7 @@ mod tests {
             }
             for index in 0..inline_providers {
                 let wire: serde_json::Value = serde_json::from_slice(&bodies[index + 1])
-                    .expect("should parse PBS wire request");
+                    .expect("should parse the source's wire request");
                 assert_eq!(
                     wire["imp"]
                         .as_array()
@@ -6086,11 +6006,11 @@ mod tests {
                     1
                 );
                 assert_eq!(wire["imp"][0]["id"], format!("inline-{index}"));
-                let prebid = &wire["imp"][0]["ext"]["prebid"];
-                assert!(prebid.get("storedrequest").is_none());
+                let fixture = &wire["imp"][0]["ext"]["fixture"];
+                assert!(fixture.get("stored").is_none());
                 let bidder = if index == 0 { "alpha" } else { "beta" };
                 assert_eq!(
-                    prebid["bidder"],
+                    fixture["bidder"],
                     serde_json::json!({bidder:{"placement":index}})
                 );
                 assert_eq!(
@@ -6099,12 +6019,12 @@ mod tests {
                         .as_deref(),
                     Some(format!("bid-{index}").as_str())
                 );
-                let provider_id = if index == 0 { "pbs_a" } else { "pbs_b" };
+                let provider_id = if index == 0 { "stored_a" } else { "stored_b" };
                 let response = result
                     .provider_responses
                     .iter()
                     .find(|response| response.provider == provider_id)
-                    .expect("should retain PBS provider response");
+                    .expect("should retain the source's response");
                 assert_eq!(
                     response.metadata["response_admission"]["rejected_bid_count"],
                     1
@@ -6118,611 +6038,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_prebid_instances_preserve_headers_metadata_suppression_and_identity() {
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "suppress-exact", "bid": [
-                    {"id":"good-a","impid":"fictional-slot","price":1.25,"adm":"<div>a</div>","w":300,"h":250,"nurl":"https://notify.example/win","burl":"https://notify.example/bill","ext":{"prebid":{"cache":{"bids":{"cacheId":"cache-a","url":"https://cache-a.example/cache/path"}}}}},
-                    {"id":"bad-a","price":2.0}
-                ]}],
-                "ext": {"responsetimemillis":{"suppress-exact":4},"errors":{"other":["fictional"]},"warnings":{"other":["warning"]},"debug":{"httpcalls":[]},"prebid":{"bidstatus":{"suppress-exact":[{"bidid":"good-a"}]}}}
-            }))
-            .expect("should serialize PBS response a"),
-        );
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "keep-seat", "bid": [{
-                    "id":"good-b","impid":"fictional-slot","price":2.5,"adm":"<div>b</div>","w":300,"h":250,"nurl":"https://notify.example/win","burl":"https://notify.example/bill"
-                }]}]
-            }))
-            .expect("should serialize PBS response b"),
-        );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let notifications = NotificationConfig {
-            suppress_all: false,
-            suppress_seats: vec!["suppress-exact".to_string()],
-        };
-        let plan = AuctionPlan::compile(planned_prebid_config(&[
-            (
-                "pbs_a",
-                serde_json::json!({"debug":true,"test_mode":true,"consent_forwarding":"openrtb_only"}),
-                notifications,
-            ),
-            ("pbs_b", serde_json::json!({}), NotificationConfig::default()),
-        ]))
-        .expect("should compile planned PBS auction");
-        let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-        let request = planned_prebid_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::builder()
-            .uri("https://publisher.example/auction")
-            .header(
-                http::header::COOKIE,
-                "consent=keep; euconsent-v2=drop; other=value",
-            )
-            .header(http::header::USER_AGENT, "Fictional Browser/7")
-            .header(http::header::REFERER, "https://referrer.example/story")
-            .header(http::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .header("x-forwarded-for", "203.0.113.250")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build inbound request");
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should execute planned PBS auction");
-
-        assert_eq!(result.provider_responses.len(), 2);
-        let first = &result.provider_responses[0];
-        assert_eq!(first.provider, "pbs_a");
-        assert_eq!(first.bids.len(), 1, "should isolate malformed sibling");
-        assert_eq!(
-            first.bids[0].returned_seat.as_deref(),
-            Some("suppress-exact")
-        );
-        assert_eq!(first.bids[0].bidder, "suppress-exact");
-        assert!(
-            first.bids[0].nurl.is_none(),
-            "should suppress after normalization"
-        );
-        assert!(
-            first.bids[0].burl.is_none(),
-            "should suppress billing notification"
-        );
-        assert_eq!(first.bids[0].cache_id.as_deref(), Some("cache-a"));
-        assert_eq!(first.bids[0].cache_host.as_deref(), Some("cache-a.example"));
-        assert_eq!(first.bids[0].cache_path.as_deref(), Some("/cache/path"));
-        assert_eq!(first.metadata["responsetimemillis"]["suppress-exact"], 4);
-        assert!(first.metadata.contains_key("errors"));
-        assert!(first.metadata.contains_key("warnings"));
-        assert!(first.metadata.contains_key("debug"));
-        assert!(first.metadata.contains_key("bidstatus"));
-        let second = &result.provider_responses[1];
-        assert_eq!(second.provider, "pbs_b");
-        assert_eq!(second.bids[0].returned_seat.as_deref(), Some("keep-seat"));
-        assert!(second.bids[0].nurl.is_some());
-        assert!(!second.metadata.contains_key("debug"));
-        assert!(!second.metadata.contains_key("bidstatus"));
-
-        let headers = http.recorded_request_headers();
-        assert_eq!(headers.len(), 2);
-        for request_headers in &headers {
-            assert!(
-                request_headers
-                    .iter()
-                    .any(|(name, value)| name == "user-agent" && value == "Fictional Browser/7")
-            );
-            assert!(request_headers.iter().any(
-                |(name, value)| name == "referer" && value == "https://referrer.example/story"
-            ));
-            assert!(
-                request_headers
-                    .iter()
-                    .any(|(name, value)| name == "accept-language" && value == "en-US,en;q=0.9")
-            );
-            assert!(
-                request_headers
-                    .iter()
-                    .all(|(name, _)| name != "x-forwarded-for"),
-                "must ignore inbound XFF without attestation"
-            );
-            assert!(
-                request_headers.iter().all(|(name, _)| name != "accept"),
-                "planned PBS transport must not add Accept beyond legacy headers"
-            );
-        }
-        let first_cookie = headers[0]
-            .iter()
-            .find(|(name, _)| name == "cookie")
-            .map(|(_, value)| value.as_str());
-        assert_eq!(first_cookie, Some("consent=keep; other=value"));
-        let second_cookie = headers[1]
-            .iter()
-            .find(|(name, _)| name == "cookie")
-            .map(|(_, value)| value.as_str());
-        assert_eq!(
-            second_cookie,
-            Some("consent=keep; euconsent-v2=drop; other=value")
-        );
-    }
-
-    #[tokio::test]
-    async fn planned_aps_mock_adserver_preserves_three_identities_and_renderer() {
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "upstream-seat", "bid": [{
-                    "id": "aps-bid", "impid": "fictional-slot", "price": 2.0,
-                    "w": 300, "h": 250,
-                    "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}
-                }]}]
-            }))
-            .expect("should serialize APS response"),
-        );
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "aps_instance", "bid": [{
-                    "id": "adserver-aps", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "ignored", "w": 300, "h": 250, "crid": "aps-creative"
-                }]}]
-            }))
-            .expect("should serialize adserver response"),
-        );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let plan =
-            AuctionPlan::compile(planned_aps_config()).expect("should compile planned APS auction");
-        let adserver = AdServerMockProvider::new(
-            "adserver_mock",
-            AdServerMockSettings {
-                endpoint: "https://adserver.example/mediate".to_string(),
-                timeout_ms: 500,
-                ..AdServerMockSettings::default()
-            },
-        );
-        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(adserver)));
-        let request = planned_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should decide planned APS bid");
-
-        let provider_bid = &result.provider_responses[0].bids[0];
-        assert_eq!(result.provider_responses[0].provider, "aps_instance");
-        assert_eq!(provider_bid.returned_seat.as_deref(), Some("upstream-seat"));
-        assert_eq!(provider_bid.bidder, "aps");
-        let winner = &result.winning_bids["fictional-slot"];
-        assert_eq!(winner.returned_seat.as_deref(), Some("upstream-seat"));
-        assert_eq!(winner.bidder, "aps");
-        assert!(winner.renderer.is_some());
-        assert!(winner.creative.is_none());
-        assert_eq!(
-            result
-                .adserver_response
-                .as_ref()
-                .map(|response| response.provider.as_str()),
-            Some("adserver_mock")
-        );
-    }
-
-    #[tokio::test]
-    async fn planned_aps_transport_omits_accept_header() {
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(400, Vec::new());
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let plan =
-            AuctionPlan::compile(planned_aps_config()).expect("should compile planned APS auction");
-        let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-        let request = planned_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::builder()
-            .uri("https://publisher.example/auction")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build inbound request");
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should execute planned APS auction");
-
-        let headers = http.recorded_request_headers();
-        assert_eq!(headers.len(), 1);
-        assert!(
-            headers[0].iter().all(|(name, _)| name != "accept"),
-            "planned APS transport must not add Accept beyond legacy headers"
-        );
-    }
-
-    #[tokio::test]
-    async fn planned_aps_profile_normalizes_renderer_reduction_and_metadata() {
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response_with_headers(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "cur": "USD",
-                "seatbid": [
-                    {"seat": "returned-seat", "bid": [
-                        {"id": "z-high", "impid": "fictional-slot", "price": 2.0, "w": 300, "h": 250,
-                         "nurl": "https://notice.example/win", "burl": "https://notice.example/bill",
-                         "crid": "fictional-creative", "adomain": ["advertiser.example"],
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"id": "a-high", "impid": "fictional-slot", "price": 2.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-script", "impid": "fictional-slot", "price": 9.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "script"}},
-                        {"id": "bad-domain", "impid": "fictional-slot", "price": 8.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://publisher.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-credentials", "impid": "fictional-slot", "price": 8.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://user:password@creative.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-imp", "impid": "unknown-slot", "price": 8.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-dimensions", "impid": "fictional-slot", "price": 8.0, "w": 320, "h": 50,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-price", "impid": "fictional-slot", "price": "high", "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-mtype", "impid": "fictional-slot", "price": 8.0, "mtype": 2, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"id": "bad-tag", "impid": "fictional-slot", "price": 8.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "native"}},
-                        {"id": "bad-crid", "impid": "fictional-slot", "price": 8.0, "w": 300, "h": 250,
-                         "crid": "x".repeat(1025),
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}},
-                        {"impid": "fictional-slot", "price": 8.0, "w": 300, "h": 250,
-                         "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}}
-                    ]},
-                    {"seat": 7, "bid": "bad-shape"}
-                ]
-            }))
-            .expect("should serialize APS profile response"),
-            vec![
-                ("content-type", "application/json"),
-                ("authorization", "fictional-secret"),
-            ],
-        );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let plan = AuctionPlan::compile(planned_aps_instances_config(&[(
-            "aps_instance",
-            serde_json::json!({"account_id": "example-account", "debug": true}),
-            NotificationConfig {
-                suppress_all: false,
-                suppress_seats: vec!["returned-seat".to_string()],
-            },
-        )]))
-        .expect("should compile planned APS profile");
-        let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-        let request = planned_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should execute planned APS profile");
-
-        let response = &result.provider_responses[0];
-        assert_eq!(response.provider, "aps_instance");
-        assert_eq!(response.status, BidStatus::Success);
-        assert_eq!(
-            response.bids.len(),
-            1,
-            "should retain one bid per impression"
-        );
-        let bid = &response.bids[0];
-        assert_eq!(bid.bidder, "aps");
-        assert_eq!(bid.returned_seat.as_deref(), Some("returned-seat"));
-        assert_eq!(
-            bid.bid_id.as_deref(),
-            Some("a-high"),
-            "lexical ID should break equal-price tie"
-        );
-        assert!(bid.creative.is_none());
-        assert!(
-            bid.nurl.is_none() && bid.burl.is_none(),
-            "APS must discard notification URLs"
-        );
-        let renderer = bid
-            .renderer
-            .as_ref()
-            .and_then(|renderer| renderer.payload_as::<ApsRendererV1>(APS_RENDERER_TYPE))
-            .expect("should construct typed APS renderer");
-        assert_eq!(renderer.account_id, "example-account");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&renderer.aax_response)
-            .expect("should decode minimized APS response");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&decoded)
-                .expect("should parse minimized APS response"),
-            serde_json::json!({"seatbid":[{"bid":[{
-                "id":"a-high","price":2.0,"w":300,"h":250,
-                "ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}
-            }]}]})
-        );
-        assert_eq!(response.metadata["seatbid_count"], 2);
-        assert_eq!(response.metadata["accepted_bid_count"], 1);
-        assert_eq!(response.metadata["dropped_bid_count"], 12);
-        for reason in [
-            "lost_to_higher_bid",
-            "script_rendering_disabled",
-            "unknown_impid",
-            "invalid_dimensions",
-            "invalid_price",
-            "unsupported_media_type",
-            "unsupported_tagtype",
-            "creative_id_too_large",
-            "missing_render_source",
-            "empty_seatbid_bids",
-        ] {
-            assert_eq!(response.metadata["drop_reasons"][reason], 1, "{reason}");
-        }
-        assert_eq!(
-            response.metadata["drop_reasons"]["invalid_creative_url"], 2,
-            "same-publisher and credentialed URLs should both be rejected"
-        );
-        assert_eq!(
-            response.metadata["routing"]["unused_bidder_params_count"],
-            0
-        );
-        let debug = &response.metadata["debug"]["httpcalls"]["aps"][0];
-        assert_eq!(debug["uri"], "https://aps.example/e/pb/bid");
-        assert_eq!(
-            debug["responseheaders"],
-            serde_json::json!({"content-type": ["application/json"]}),
-            "async stub should preserve allowlisted response headers"
-        );
-        assert!(
-            debug["requestbody"]
-                .as_str()
-                .is_some_and(|body| body.contains("example-account"))
-        );
-        assert!(debug["requestheaders"].get("authorization").is_none());
-        assert!(debug["responseheaders"].get("authorization").is_none());
-    }
-
-    #[tokio::test]
-    async fn two_planned_aps_instances_correlate_independently() {
-        let http = Arc::new(StubHttpClient::new());
-        for (seat, id, price) in [("seat-a", "bid-a", 1.0), ("seat-b", "bid-b", 2.0)] {
-            http.push_response(
-                200,
-                serde_json::to_vec(&serde_json::json!({"seatbid":[{"seat":seat,"bid":[{
-                    "id":id,"impid":"fictional-slot","price":price,"w":300,"h":250,
-                    "ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}
-                }]}]}))
-                .expect("should serialize APS instance response"),
-            );
-        }
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let plan = AuctionPlan::compile(planned_aps_instances_config(&[
-            (
-                "aps_a",
-                serde_json::json!({"account_id":"account-a"}),
-                NotificationConfig::default(),
-            ),
-            (
-                "aps_b",
-                serde_json::json!({"account_id":"account-b"}),
-                NotificationConfig::default(),
-            ),
-        ]))
-        .expect("should compile two APS instances");
-        let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-        let request = planned_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should execute two APS instances");
-
-        assert_eq!(result.provider_responses.len(), 2);
-        assert_eq!(result.provider_responses[0].provider, "aps_a");
-        assert_eq!(
-            result.provider_responses[0].bids[0].bid_id.as_deref(),
-            Some("bid-a")
-        );
-        assert_eq!(result.provider_responses[1].provider, "aps_b");
-        assert_eq!(
-            result.provider_responses[1].bids[0].bid_id.as_deref(),
-            Some("bid-b")
-        );
-        assert_eq!(http.recorded_request_bodies().len(), 2);
-        assert_eq!(
-            result.winning_bids["fictional-slot"].bid_id.as_deref(),
-            Some("bid-b"),
-            "global ranking should remain orchestrator-owned"
-        );
-        let specs = backend.specs.lock().expect("should lock specs");
-        assert_eq!(specs.len(), 2);
-        assert_ne!(specs[0].discriminator, specs[1].discriminator);
-    }
-
-    #[tokio::test]
-    async fn planned_aps_returned_seat_accepts_only_valid_nonempty_strings() {
-        let plan = AuctionPlan::compile(planned_aps_config()).expect("should compile APS plan");
-        let routed = route_auction(
-            planned_request(),
-            &http::Request::new(edgezero_core::body::Body::empty()),
-            &plan,
-            None,
-        );
-        let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        for (seat, expected) in [
-            (serde_json::Value::Null, None),
-            (serde_json::json!(7), None),
-            (serde_json::json!(""), None),
-            (serde_json::json!("exact-seat"), Some("exact-seat")),
-        ] {
-            let state = provider.parse_state_for_test(routed.inputs()[0].clone());
-            let response = PlatformResponse::new(
-                edgezero_core::http::response_builder()
-                    .status(200)
-                    .body(edgezero_core::body::Body::from(
-                        serde_json::to_vec(&serde_json::json!({"seatbid":[{"seat":seat,"bid":[{
-                            "id":"bid","impid":"fictional-slot","price":1.0,"w":300,"h":250,
-                            "nurl":"https://notice.example/win","burl":"https://notice.example/bill",
-                            "ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}
-                        }]}]}))
-                        .expect("should serialize seat identity response"),
-                    ))
-                    .expect("should build seat identity response"),
-            );
-            let parsed = provider
-                .parse_response_with_state(response, 4, Some(state.as_ref()))
-                .await
-                .expect("should parse seat identity response");
-            assert_eq!(parsed.bids[0].returned_seat.as_deref(), expected);
-            assert!(parsed.bids[0].nurl.is_none() && parsed.bids[0].burl.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn planned_aps_response_status_shape_and_currency_matrix() {
-        let plan = AuctionPlan::compile(planned_aps_config()).expect("should compile APS plan");
-        let routed = route_auction(
-            planned_request(),
-            &http::Request::new(edgezero_core::body::Body::empty()),
-            &plan,
-            None,
-        );
-        let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let cases = [
-            (204, Vec::new(), BidStatus::NoBid, None, None),
-            (400, Vec::new(), BidStatus::Error, None, Some("http_status")),
-            (
-                200,
-                b"not-json".to_vec(),
-                BidStatus::Error,
-                Some("unexpected_response_shape"),
-                Some("parse_response"),
-            ),
-            (
-                200,
-                b"[]".to_vec(),
-                BidStatus::Error,
-                Some("unexpected_response_shape"),
-                Some("parse_response"),
-            ),
-            (
-                200,
-                br#"{"contextual":true}"#.to_vec(),
-                BidStatus::Error,
-                Some("unexpected_response_shape"),
-                Some("parse_response"),
-            ),
-            (
-                200,
-                br#"{"cur":"EUR","seatbid":[]}"#.to_vec(),
-                BidStatus::NoBid,
-                Some("unsupported_currency"),
-                None,
-            ),
-        ];
-        for (status, body, expected, reason, error_type) in cases {
-            let state = provider.parse_state_for_test(routed.inputs()[0].clone());
-            let response = PlatformResponse::new(
-                edgezero_core::http::response_builder()
-                    .status(status)
-                    .body(edgezero_core::body::Body::from(body))
-                    .expect("should build APS matrix response"),
-            );
-            let parsed = provider
-                .parse_response_with_state(response, 4, Some(state.as_ref()))
-                .await
-                .expect("should classify APS matrix response");
-            assert_eq!(parsed.status, expected, "status {status}");
-            if let Some(reason) = reason {
-                assert_eq!(
-                    parsed.metadata["drop_reasons"][reason], 1,
-                    "status {status}"
-                );
-            }
-            if let Some(error_type) = error_type {
-                assert_eq!(parsed.metadata["error_type"], error_type, "status {status}");
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn planned_provider_outcome_matrix_has_fixed_count_only_routing_metadata() {
         let standard_plan = AuctionPlan::compile(planned_config(
             &[("standard", RoutingMode::AllEligible)],
             false,
         ))
         .expect("should compile standard plan");
-        let prebid_plan = AuctionPlan::compile(planned_prebid_config(&[(
-            "pbs",
+        let fixture_plan = AuctionPlan::compile(planned_fixture_config(&[(
+            "stored",
             serde_json::json!({}),
             NotificationConfig::default(),
         )]))
-        .expect("should compile PBS plan");
+        .expect("should compile the stand-in plan");
         let cases = [
             (&standard_plan, 204, Vec::new(), BidStatus::NoBid),
             (&standard_plan, 502, Vec::new(), BidStatus::Error),
@@ -6733,11 +6060,11 @@ mod tests {
                 br#"{"seatbid":[]}"#.to_vec(),
                 BidStatus::NoBid,
             ),
-            (&prebid_plan, 204, b"{}".to_vec(), BidStatus::NoBid),
-            (&prebid_plan, 502, Vec::new(), BidStatus::Error),
-            (&prebid_plan, 200, b"not-json".to_vec(), BidStatus::Error),
+            (&fixture_plan, 204, b"{}".to_vec(), BidStatus::NoBid),
+            (&fixture_plan, 502, Vec::new(), BidStatus::Error),
+            (&fixture_plan, 200, b"not-json".to_vec(), BidStatus::Error),
             (
-                &prebid_plan,
+                &fixture_plan,
                 200,
                 br#"{"seatbid":[]}"#.to_vec(),
                 BidStatus::NoBid,
@@ -6746,7 +6073,7 @@ mod tests {
 
         for (plan, status, body, expected) in cases {
             let routed = route_auction(
-                planned_prebid_request(),
+                planned_envelope_request(),
                 &http::Request::new(edgezero_core::body::Body::empty()),
                 plan,
                 None,
@@ -6781,110 +6108,6 @@ mod tests {
             assert!(!serialized.contains("fictional_provider"));
             assert!(!serialized.contains("fictional-slot"));
         }
-    }
-
-    #[tokio::test]
-    async fn planned_aps_script_opt_in_matches_shared_renderer_fixture() {
-        let plan = AuctionPlan::compile(planned_aps_instances_config(&[(
-            "aps_instance",
-            serde_json::json!({
-                "account_id":"example-account-id",
-                "allow_script_creatives":true
-            }),
-            NotificationConfig::default(),
-        )]))
-        .expect("should compile script-enabled APS plan");
-        let routed = route_auction(
-            planned_request(),
-            &http::Request::new(edgezero_core::body::Body::empty()),
-            &plan,
-            None,
-        );
-        let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let state = provider.parse_state_for_test(routed.inputs()[0].clone());
-        let response = PlatformResponse::new(
-            edgezero_core::http::response_builder()
-                .status(200)
-                .body(edgezero_core::body::Body::from(
-                    serde_json::to_vec(&serde_json::json!({"seatbid":[{"bid":[{
-                        "id":"fictional-selected-bid-id","impid":"fictional-slot","price":1.23,
-                        "w":300,"h":250,"crid":"fictional-creative",
-                        "ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}
-                    },{
-                        "id":"script-bid","impid":"fictional-slot","price":1.0,
-                        "w":300,"h":250,
-                        "ext":{"creativeurl":"https://creative.example/script","tagtype":"script"}
-                    }]}]}))
-                    .expect("should serialize APS renderer fixture response"),
-                ))
-                .expect("should build APS renderer fixture response"),
-        );
-
-        let parsed = provider
-            .parse_response_with_state(response, 3, Some(state.as_ref()))
-            .await
-            .expect("should parse APS renderer fixture response");
-
-        assert_eq!(parsed.status, BidStatus::Success);
-        assert_eq!(
-            parsed.metadata["drop_reasons"]["lost_to_higher_bid"], 1,
-            "enabled script creative should be eligible before reduction"
-        );
-        let renderer = parsed.bids[0]
-            .renderer
-            .as_ref()
-            .and_then(|renderer| renderer.payload_as::<ApsRendererV1>(APS_RENDERER_TYPE))
-            .expect("should construct APS renderer");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&renderer.aax_response)
-            .expect("should decode APS fixture envelope");
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../trusted-server-js/lib/test/fixtures/aps-renderer-v1.json"
-        ))
-        .expect("should parse shared APS renderer fixture");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&decoded)
-                .expect("should parse decoded APS renderer"),
-            fixture
-        );
-    }
-
-    #[tokio::test]
-    async fn planned_aps_debug_response_headers_are_allowlisted() {
-        let plan = AuctionPlan::compile(planned_aps_instances_config(&[(
-            "aps_instance",
-            serde_json::json!({"account_id":"example-account","debug":true}),
-            NotificationConfig::default(),
-        )]))
-        .expect("should compile debug APS plan");
-        let routed = route_auction(
-            planned_request(),
-            &http::Request::new(edgezero_core::body::Body::empty()),
-            &plan,
-            None,
-        );
-        let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let state = provider.parse_state_for_test(routed.inputs()[0].clone());
-        let response = PlatformResponse::new(
-            edgezero_core::http::response_builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .header("authorization", "fictional-secret")
-                .body(edgezero_core::body::Body::from("{}"))
-                .expect("should build debug APS response"),
-        );
-
-        let parsed = provider
-            .parse_response_with_state(response, 3, Some(state.as_ref()))
-            .await
-            .expect("should parse debug APS response");
-
-        let headers = &parsed.metadata["debug"]["httpcalls"]["aps"][0]["responseheaders"];
-        assert_eq!(
-            headers,
-            &serde_json::json!({"content-type":["application/json"]})
-        );
-        assert!(headers.get("authorization").is_none());
     }
 
     #[tokio::test]
@@ -7202,22 +6425,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_prebid_rejects_cross_provider_parse_state() {
-        let plan = AuctionPlan::compile(planned_prebid_config(&[
+    async fn planned_source_rejects_cross_provider_parse_state() {
+        let plan = AuctionPlan::compile(planned_fixture_config(&[
             (
-                "pbs_a",
+                "stored_a",
                 serde_json::json!({}),
                 NotificationConfig::default(),
             ),
             (
-                "pbs_b",
+                "stored_b",
                 serde_json::json!({}),
                 NotificationConfig::default(),
             ),
         ]))
-        .expect("should compile planned PBS auction");
+        .expect("should compile the planned auction");
         let routed = route_auction(
-            planned_prebid_request(),
+            planned_envelope_request(),
             &http::Request::new(edgezero_core::body::Body::empty()),
             &plan,
             None,
@@ -7229,17 +6452,17 @@ mod tests {
             edgezero_core::http::response_builder()
                 .status(200)
                 .body(edgezero_core::body::Body::from_bytes(b"{}".as_slice()))
-                .expect("should build PBS response"),
+                .expect("should build the upstream response"),
         );
 
         let error = provider_b
             .parse_response_with_state(response, 1, Some(parse_state.as_ref()))
             .await
-            .expect_err("should reject another PBS provider's parse state");
+            .expect_err("should reject another source's parse state");
 
         assert!(
-            error.to_string().contains("owned by provider pbs_a"),
-            "should identify cross-provider PBS state ownership"
+            error.to_string().contains("owned by provider stored_a"),
+            "should identify cross-provider state ownership"
         );
     }
 
@@ -7307,9 +6530,9 @@ mod tests {
             );
             let mut config = planned_config(&[("provider", RoutingMode::AllEligible)], false);
             config.adserver = crate::provider_table::ProviderChoice::new(
-                Some("mock".to_string()),
+                Some("fixture".to_string()),
                 BTreeMap::from([(
-                    "mock".to_string(),
+                    "fixture".to_string(),
                     serde_json::Map::from_iter([(
                         "endpoint".to_string(),
                         serde_json::json!("https://adserver.example/mediate"),
@@ -7510,62 +6733,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_routing_count_survives_standard_and_aps_bounded_body_failures() {
-        for (profile, provider_id) in [("standard", "standard"), ("aps", "aps_instance")] {
-            let http = Arc::new(StubHttpClient::new());
-            http.push_response(200, vec![b'x'; 1024 * 1024 + 1]);
-            let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
-            let services = build_services_with_backend_and_http_client(
-                Arc::clone(&backend) as Arc<_>,
-                Arc::clone(&http) as Arc<_>,
-            );
-            let mut config = if profile == "standard" {
-                planned_config(&[(provider_id, RoutingMode::AllEligible)], false)
-            } else {
-                planned_aps_config()
-            };
-            config.bidders.insert(
-                "example-bidder"
+    async fn planned_routing_count_survives_a_bounded_body_failure() {
+        let (profile, provider_id) = ("standard", "standard");
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(200, vec![b'x'; 1024 * 1024 + 1]);
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let mut config = planned_config(&[(provider_id, RoutingMode::AllEligible)], false);
+        config.bidders.insert(
+            "example-bidder"
+                .parse()
+                .expect("should parse fictional bidder ID"),
+            crate::auction::plan::BidderRouteConfig {
+                module: provider_id
                     .parse()
-                    .expect("should parse fictional bidder ID"),
-                crate::auction::plan::BidderRouteConfig {
-                    module: provider_id
-                        .parse()
-                        .expect("should parse fictional provider ID"),
-                },
-            );
-            let plan = AuctionPlan::compile(config).expect("should compile bounded-body plan");
-            let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-            let mut request = planned_request();
-            request.slots[0].bidders.insert(
-                "example-bidder".to_string(),
-                serde_json::json!({"private": "value"}),
-            );
-            let settings = create_test_settings();
-            let inbound = http::Request::new(edgezero_core::body::Body::empty());
-            let context = AuctionContext {
-                settings: &settings,
-                request: &inbound,
-                timeout_ms: 777,
-                transport_timeout_ms: 777,
-                provider_responses: None,
-                services: &services,
-            };
+                    .expect("should parse fictional provider ID"),
+            },
+        );
+        let plan = AuctionPlan::compile(config).expect("should compile bounded-body plan");
+        let orchestrator = AuctionOrchestratorHarness::new(plan, None);
+        let mut request = planned_request();
+        request.slots[0].bidders.insert(
+            "example-bidder".to_string(),
+            serde_json::json!({"private": "value"}),
+        );
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
 
-            let result = orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect("should materialize bounded-body failure");
-            let response = &result.provider_responses[0];
-            assert_eq!(response.status, BidStatus::Error, "{profile}");
-            assert_eq!(
-                response.metadata["routing"]["unused_bidder_params_count"], 1,
-                "{profile} bounded-body failure should retain the input-derived count"
-            );
-            let routing = serde_json::to_string(&response.metadata["routing"])
-                .expect("should serialize routing metadata");
-            assert!(!routing.contains("example-bidder") && !routing.contains("private"));
-        }
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("should materialize bounded-body failure");
+        let response = &result.provider_responses[0];
+        assert_eq!(response.status, BidStatus::Error, "{profile}");
+        assert_eq!(
+            response.metadata["routing"]["unused_bidder_params_count"], 1,
+            "{profile} bounded-body failure should retain the input-derived count"
+        );
+        let routing = serde_json::to_string(&response.metadata["routing"])
+            .expect("should serialize routing metadata");
+        assert!(!routing.contains("example-bidder") && !routing.contains("private"));
     }
 
     #[tokio::test]
@@ -7978,26 +7196,28 @@ mod tests {
     }
 
     #[test]
-    fn decoded_aps_bid_competes_directly_by_cpm() {
+    fn a_bid_with_a_typed_renderer_competes_directly_by_cpm() {
         let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
         let floor_prices = HashMap::new();
         let response = |provider: &str, bid: Bid| AuctionResponse::success(provider, vec![bid], 1);
 
-        let aps_wins = orchestrator.select_winning_bids(
+        let typed_wins = orchestrator.select_winning_bids(
             &[
-                response("aps", auction_bid("aps", 2.0)),
+                response("typed", auction_bid("typed", 2.0)),
                 response("ordinary", auction_bid("ordinary", 1.0)),
             ],
             &floor_prices,
         );
-        let winner = aps_wins.get("slot-1").expect("should select APS bid");
-        assert_eq!(winner.bidder, "aps");
+        let winner = typed_wins
+            .get("slot-1")
+            .expect("should select the typed renderer bid");
+        assert_eq!(winner.bidder, "typed");
         assert!(winner.renderer.is_some());
         assert!(winner.creative.is_none());
 
         let ordinary_wins = orchestrator.select_winning_bids(
             &[
-                response("aps", auction_bid("aps", 2.0)),
+                response("typed", auction_bid("typed", 2.0)),
                 response("ordinary", auction_bid("ordinary", 3.0)),
             ],
             &floor_prices,

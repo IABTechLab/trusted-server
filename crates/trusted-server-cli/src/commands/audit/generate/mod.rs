@@ -668,25 +668,7 @@ fn select_js_asset_proxy(draft: &str) -> CliResult<String> {
 /// is written under there, or `None` for one no module in this build
 /// configures.
 fn module_section(id: &str) -> Option<(&'static str, &'static str)> {
-    use trusted_server_core::integrations as modules;
-    let (section, name) = match id {
-        "datadome" => ("bot-protection", modules::datadome::MODULE),
-        "didomi" => ("cmp", modules::didomi::MODULE),
-        "sourcepoint" => ("cmp", modules::sourcepoint::MODULE),
-        "osano" => ("cmp", modules::osano::MODULE),
-        "lockr" => ("identity", modules::lockr::MODULE),
-        "permutive" => ("audience", modules::permutive::MODULE),
-        "nextjs" => ("framework", modules::nextjs::MODULE),
-        "gpt" => ("ad-tag", modules::gpt::MODULE),
-        "google_tag_manager" => ("tag", modules::google_tag_manager::MODULE),
-        "prebid" => ("auction", modules::prebid::MODULE),
-        "testlight" => ("auction", modules::testlight::MODULE),
-        _ => return None,
-    };
-    Some((
-        section,
-        trusted_server_core::module_name::short_form(section, name),
-    ))
+    trusted_server_modules::selection_of(id)
 }
 
 fn select_js_asset_proxy_candidates(

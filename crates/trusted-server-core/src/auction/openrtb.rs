@@ -8,11 +8,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
+use http::StatusCode;
 use serde_json::{Map, Value, json};
 
 use super::demand::{
-    CompiledDemand, DemandFieldPolicy, ImpressionExtension, RegsPolicy, RequestExtensions,
+    CompiledDemand, DemandFieldPolicy, DemandResponse, ImpressionExtension, RegsPolicy,
+    RequestExtensions,
 };
 use super::plan::{NotificationPolicy, ProviderPlan};
 use super::routing::{ProviderAuctionInput, ProviderSlotInput, RoutedAuction, TransportHeaders};
@@ -22,6 +24,7 @@ use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
     RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
+use crate::platform::PlatformResponse;
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
 const DEFAULT_CURRENCY: &str = "USD";
@@ -29,11 +32,20 @@ const DEFAULT_CURRENCY: &str = "USD";
 const TRUSTED_SERVER_EXT_KEY: &str = "trusted_server";
 
 /// Fixed reasons why an upstream bid failed response admission.
+///
+/// Public, with the dimension helpers below, so an auction implementation in
+/// a crate of its own admits a bid by the rules core's own response reader
+/// applies.
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum BidRejectionReason {
+pub enum BidRejectionReason {
+    /// The bid is malformed.
     InvalidBid,
+    /// The bid names an impression the request did not carry.
     UnrequestedImpression,
+    /// The bid's dimensions match no format the impression asked for.
     DimensionMismatch,
+    /// The bid's dimensions match more than one format the impression asked
+    /// for.
     AmbiguousDimensions,
 }
 
@@ -50,21 +62,21 @@ impl BidRejectionReason {
 
 /// Bounded aggregate diagnostics for rejected upstream bids.
 #[derive(Debug, Default)]
-pub(crate) struct ResponseAdmissionDiagnostics {
+pub struct ResponseAdmissionDiagnostics {
     rejected_bid_count: u32,
     reason_counts: BTreeMap<BidRejectionReason, u32>,
 }
 
 impl ResponseAdmissionDiagnostics {
     /// Record one rejected bid without retaining upstream payload data.
-    pub(crate) fn record(&mut self, reason: BidRejectionReason) {
+    pub fn record(&mut self, reason: BidRejectionReason) {
         self.rejected_bid_count = self.rejected_bid_count.saturating_add(1);
         let count = self.reason_counts.entry(reason).or_default();
         *count = count.saturating_add(1);
     }
 
     /// Attach fixed-cardinality rejection counts to a provider response.
-    pub(crate) fn attach_to(self, response: &mut AuctionResponse) {
+    pub fn attach_to(self, response: &mut AuctionResponse) {
         if self.rejected_bid_count == 0 {
             return;
         }
@@ -105,7 +117,7 @@ impl DimensionMatch {
 }
 
 /// Precomputed dimension resolutions for one requested impression.
-pub(crate) struct SlotBidDimensions {
+pub struct SlotBidDimensions {
     exact: BTreeSet<(u32, u32)>,
     by_width: BTreeMap<u32, DimensionMatch>,
     by_height: BTreeMap<u32, DimensionMatch>,
@@ -148,17 +160,19 @@ impl SlotBidDimensions {
 }
 
 /// Precomputed requested banner dimensions keyed by impression ID.
-pub(crate) type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
+pub type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
 
 /// Build the requested-dimension index once for one provider response.
-pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+#[must_use]
+pub fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
     build_bid_dimension_index_from_slots(input.slots().iter().map(ProviderSlotInput::slot))
 }
 
 /// Build the requested-dimension index from plain [`AdSlot`]s.
 ///
 /// The first slot wins when several share an ID.
-pub(crate) fn build_bid_dimension_index_from_slots<'a>(
+#[must_use]
+pub fn build_bid_dimension_index_from_slots<'a>(
     slots: impl IntoIterator<Item = &'a AdSlot>,
 ) -> BidDimensionIndex {
     let mut index = BidDimensionIndex::new();
@@ -171,7 +185,12 @@ pub(crate) fn build_bid_dimension_index_from_slots<'a>(
 }
 
 /// Parse an optional positive `OpenRTB` bid dimension.
-pub(crate) fn parse_optional_bid_dimension(
+///
+/// # Errors
+///
+/// Returns [`BidRejectionReason::InvalidBid`] when the value is present and is
+/// not a positive whole number that fits.
+pub fn parse_optional_bid_dimension(
     value: &Value,
     key: &str,
 ) -> Result<Option<u32>, BidRejectionReason> {
@@ -199,7 +218,12 @@ pub(crate) fn parse_optional_bid_dimension(
 }
 
 /// Validate explicit dimensions or infer them from one matching banner format.
-pub(crate) fn resolve_bid_dimensions(
+///
+/// # Errors
+///
+/// Returns the reason the bid is refused: the impression was not requested,
+/// or the dimensions match none or more than one of its formats.
+pub fn resolve_bid_dimensions(
     dimensions_by_slot: &BidDimensionIndex,
     slot_id: &str,
     width: Option<u32>,
@@ -601,7 +625,7 @@ fn header_string(value: Option<&http::HeaderValue>) -> Option<String> {
 }
 
 /// Suppress notification URLs using exact returned-seat identity.
-pub(crate) fn apply_notification_policy(bids: &mut [Bid], policy: &NotificationPolicy) {
+pub fn apply_notification_policy(bids: &mut [Bid], policy: &NotificationPolicy) {
     for bid in bids {
         let suppress = policy.suppress_all
             || bid
@@ -756,8 +780,11 @@ pub(crate) fn unused_bidder_params_count(
 }
 
 /// Count routed bidder params for a demand source known to ignore them.
+///
+/// Public so an implementation that takes no bidder parameters reports the
+/// ones it was routed the way core's own reader does.
 #[must_use]
-pub(crate) fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
+pub fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
     saturating_bidder_param_counts(input.slots().iter().map(|slot| slot.bidder_params().len()))
 }
 
@@ -765,6 +792,65 @@ fn saturating_bidder_param_counts(counts: impl IntoIterator<Item = usize>) -> u3
     counts.into_iter().fold(0_u32, |count, slot_count| {
         count.saturating_add(u32::try_from(slot_count).unwrap_or(u32::MAX))
     })
+}
+
+/// The most a demand source's response body may hold.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Reads an ordinary `OpenRTB` response. A `204` is a no-bid, any other
+/// non-success status or unreadable JSON is an error response, and a body over
+/// the size limit is an `Err`.
+///
+/// Public so a demand implementation in a crate of its own, whose exchange
+/// answers the ordinary way, has its response read as core reads one.
+///
+/// # Errors
+///
+/// Returns an error when the response body cannot be read.
+pub async fn parse_openrtb_response(
+    context: DemandResponse<'_>,
+    response: PlatformResponse,
+) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    let provider_id = context.provider_id;
+    let response_time_ms = context.response_time_ms;
+    let response = response.response;
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        return Ok(AuctionResponse::no_bid(provider_id, response_time_ms));
+    }
+    if !status.is_success() {
+        if status.is_redirection() {
+            log::warn!(
+                "Provider '{provider_id}' returned a redirect; generic OpenRTB redirects are refused"
+            );
+        }
+        return Ok(AuctionResponse::error(provider_id, response_time_ms)
+            .with_metadata("error_type", json!("http_status"))
+            .with_metadata("http_status", json!(status.as_u16())));
+    }
+
+    let body = response
+        .into_body()
+        .into_bytes_bounded(MAX_RESPONSE_BYTES)
+        .await
+        .change_context(TrustedServerError::Auction {
+            message: format!("Provider {provider_id} response body failed"),
+        })?;
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!("Provider '{provider_id}' response JSON was invalid: {error}");
+            return Ok(AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("parse_response")));
+        }
+    };
+
+    Ok(extract_standard_response(
+        provider_id,
+        context.input,
+        &value,
+        response_time_ms,
+    ))
 }
 
 #[cfg(test)]
@@ -791,16 +877,8 @@ mod routing_metadata_tests {
 
     #[test]
     fn unused_bidder_param_count_follows_the_implementation() {
-        for (implementation, expected) in [
-            ("auction.prebid-server", 0),
-            ("auction-protocol.openrtb", 1),
-            ("auction.aps", 1),
-        ] {
-            let endpoint = if implementation == "auction.aps" {
-                "https://aps.example/e/pb/bid"
-            } else {
-                "https://provider.example/openrtb"
-            };
+        for (implementation, expected) in [("auction.fixture", 0), ("auction.plain-fixture", 1)] {
+            let endpoint = "https://provider.example/openrtb";
             let provider_id =
                 ProviderId::from_str("fictional_provider").expect("should parse provider ID");
             let mut config = plan_config(vec![(

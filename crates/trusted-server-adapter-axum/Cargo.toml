@@ -29,6 +29,7 @@ reqwest = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 trusted-server-core = { workspace = true }
+trusted-server-modules = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }
 trusted-server-permission-signal-gpp = { workspace = true }
 trusted-server-permission-signal-mtm = { workspace = true }

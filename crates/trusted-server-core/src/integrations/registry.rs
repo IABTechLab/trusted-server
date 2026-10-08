@@ -194,6 +194,104 @@ impl IntegrationDocumentState {
     }
 }
 
+/// Values a module's request hooks leave for its own page hooks, for one
+/// request.
+///
+/// A request preparer or a request filter leaves a value under its
+/// integration id with [`IntegrationRequestState::insert`]. When the request
+/// produces an HTML document for that one reader, every value is copied into
+/// the document's [`IntegrationDocumentState`] before parsing starts, so the
+/// module's head injector, rewriters and stream processors read it there, and
+/// the same values are handed to the module's response finalizer.
+///
+/// A request that carries any value keeps to the origin path. Its document is
+/// never read from a shared template and never stored as one, and an HTML
+/// response with a body is sent `private, no-store`. A document built to be
+/// shared starts with none of these values.
+#[derive(Clone, Default)]
+pub struct IntegrationRequestState {
+    values: IntegrationDocumentStateMap,
+}
+
+impl std::fmt::Debug for IntegrationRequestState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntegrationRequestState")
+            .field("keys", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl IntegrationRequestState {
+    /// Leaves `value` on `request` for the page hooks of `integration_id`,
+    /// in place of a value of the same type left earlier.
+    pub fn insert<T>(request: &mut Request<EdgeBody>, integration_id: &'static str, value: T)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let mut state = request
+            .extensions_mut()
+            .remove::<Self>()
+            .unwrap_or_default();
+        state.set(integration_id, value);
+        request.extensions_mut().insert(state);
+    }
+
+    /// Holds `value` for the page hooks of `integration_id`, in place of a
+    /// value of the same type held earlier.
+    pub fn set<T>(&mut self, integration_id: &'static str, value: T)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.values
+            .insert((integration_id, TypeId::of::<T>()), Arc::new(value));
+    }
+
+    /// The values left on `request`, which is none for a request no module
+    /// left one on.
+    #[must_use]
+    pub fn of(request: &Request<EdgeBody>) -> Self {
+        request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The value of type `T` left for `integration_id`.
+    #[must_use]
+    pub fn get<T>(&self, integration_id: &'static str) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let value = self.values.get(&(integration_id, TypeId::of::<T>()))?;
+        Arc::clone(value).downcast::<T>().ok()
+    }
+
+    /// Whether no module left a value.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Copies every value into the state of a document that is starting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the document state's lock is poisoned.
+    pub(crate) fn seed(&self, document: &IntegrationDocumentState) {
+        if self.values.is_empty() {
+            return;
+        }
+        let mut guard = document
+            .inner
+            .lock()
+            .expect("should lock integration document state");
+        for (key, value) in &self.values {
+            guard.insert(*key, Arc::clone(value));
+        }
+    }
+}
+
 /// Per-document buffer for script text fragments split across chunks.
 ///
 /// `lol_html` can deliver one text node as several chunks, so a rewriter that
@@ -624,6 +722,13 @@ pub trait IntegrationHeadInjector: Send + Sync {
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 
+    /// Return HTML snippets to insert straight after the main script bundle
+    /// and before any deferred one, for a script that needs the bundle to
+    /// have run and has to run before the page's own scripts.
+    fn after_bundle_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Return attributes to add to the publisher TSJS bundle tag.
     fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -845,6 +950,10 @@ impl IntegrationRegistrationBuilder {
 
 type RouteValue = (Arc<dyn IntegrationProxy>, &'static str);
 
+/// Marks a request the preparers have run for.
+#[derive(Clone, Copy)]
+struct RequestPrepared;
+
 struct IntegrationRegistryInner {
     // Method-specific routers for O(log n) lookups
     get_router: Router<RouteValue>,
@@ -878,6 +987,8 @@ struct IntegrationRegistryInner {
     extra_js_module_ids: Vec<&'static str>,
     // Preparers from every builder, named or not, in registration order.
     request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
+    // Finalizers from every builder, named or not, in registration order.
+    response_finalizers: Vec<crate::integrations::IntegrationFinalizeResponseFn>,
     // Geo modules the running registrations supply, each with the name
     // `[geo] module` selects it by, in registration order. Declaring one does
     // not activate it.
@@ -923,6 +1034,7 @@ impl Default for IntegrationRegistryInner {
             request_filters: Vec::new(),
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
+            response_finalizers: Vec::new(),
             geo_modules: Vec::new(),
             ec_modules: Vec::new(),
             device_modules: Vec::new(),
@@ -1261,11 +1373,8 @@ fn check_section_selections(
     settings: &Settings,
     extra: &[crate::integrations::IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
-    // Prebid registers through the auction plan rather than a builder, and is
-    // selected in `[auction]` all the same.
     let offered: Vec<&'static str> = crate::integrations::all_builders(extra)
         .filter_map(|builder| builder.module_name())
-        .chain([crate::integrations::prebid::MODULE])
         .collect();
     for (section, modules) in settings.module_sections() {
         for written in modules.selected() {
@@ -1332,7 +1441,7 @@ impl IntegrationRegistry {
     ///
     /// Returns an error if the auction plan or the integration registry is
     /// invalid.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_registrations(
         settings: &Settings,
         extra: &[crate::integrations::IntegrationBuilder],
@@ -1382,24 +1491,10 @@ impl IntegrationRegistry {
         extra: &[crate::integrations::IntegrationBuilder],
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-        // Prebid registers through the auction plan rather than through a
-        // builder, but its id is core's all the same. Recording it with the
-        // builders refuses an outside builder that claims it, and lets a
-        // selector naming it while it does not run report it as registered but
-        // not running.
-        inner.builder_ids.push((
-            crate::integrations::prebid::PREBID_INTEGRATION_ID,
-            crate::integrations::CORE_SOURCE,
-        ));
-        // The plan-backed auction providers register first, so opening the
-        // builder table leaves every existing hook order unchanged.
-        let mut registrations: Vec<IntegrationRegistration> = [
-            crate::integrations::prebid::register_for_plan(settings, &plan)?,
-            crate::integrations::aps::register_for_plan(&plan)?,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        // What a builder registers from the auction plan goes first, so its
+        // hooks run ahead of every module a section selects.
+        let mut plan_registrations: Vec<IntegrationRegistration> = Vec::new();
+        let mut registrations: Vec<IntegrationRegistration> = Vec::new();
 
         for builder in crate::integrations::all_builders(extra) {
             if let Some((_, first_source)) =
@@ -1419,6 +1514,22 @@ impl IntegrationRegistry {
             // deployment that does not run it.
             if let Some(prepare) = builder.prepare_request() {
                 inner.request_preparers.push(prepare);
+            }
+            if let Some(finalize) = builder.finalize_response() {
+                inner.response_finalizers.push(finalize);
+            }
+            // A registration from the plan is made whatever the sections
+            // select, because the function decides from the plan and the
+            // settings whether the module runs.
+            if let Some(register) = builder.plan_registration()
+                && let Some(registration) = register(settings, &plan)?
+            {
+                debug_assert_eq!(
+                    registration.integration_id,
+                    builder.id(),
+                    "integration builder ID should match registration ID"
+                );
+                plan_registrations.push(registration);
             }
 
             // Only a builder whose module a section selects is built, so an
@@ -1454,7 +1565,7 @@ impl IntegrationRegistry {
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
         let mut claimed = Vec::new();
-        for registration in registrations {
+        for registration in plan_registrations.into_iter().chain(registrations) {
             inner
                 .running_integration_ids
                 .push(registration.integration_id);
@@ -1667,7 +1778,9 @@ impl IntegrationRegistry {
     ///
     /// Preparers run whether or not their integration runs, so an
     /// integration can sanitize its own reserved query or cookie in a
-    /// deployment that has it switched off.
+    /// deployment that has it switched off. They run once for a request, so
+    /// a caller further along the request path can call this again and be
+    /// sure the request is prepared without running any of them twice.
     ///
     /// # Errors
     ///
@@ -1677,10 +1790,36 @@ impl IntegrationRegistry {
         settings: &Settings,
         request: &mut Request<EdgeBody>,
     ) -> Result<(), Report<TrustedServerError>> {
+        if request.extensions().get::<RequestPrepared>().is_some() {
+            return Ok(());
+        }
         for prepare in &self.inner.request_preparers {
             prepare(settings, request)?;
         }
+        request.extensions_mut().insert(RequestPrepared);
         Ok(())
+    }
+
+    /// Marks `request` as one the preparers have run for, for a test that
+    /// hands a handler the request an adapter would have prepared.
+    #[cfg(test)]
+    pub(crate) fn mark_prepared_for_tests(request: &mut Request<EdgeBody>) {
+        request.extensions_mut().insert(RequestPrepared);
+    }
+
+    /// Runs every registered integration's response finalizer, in
+    /// registration order, on the response the page path is about to return.
+    ///
+    /// Each is handed what the module's request hooks left for this request,
+    /// and one with nothing left for it has nothing to do.
+    pub fn finalize_response(
+        &self,
+        request_state: &IntegrationRequestState,
+        response: &mut Response<EdgeBody>,
+    ) {
+        for finalize in &self.inner.response_finalizers {
+            finalize(request_state, response);
+        }
     }
 
     /// Run pre-routing request filters.
@@ -1841,6 +1980,17 @@ impl IntegrationRegistry {
             }
         }
         inserts
+    }
+
+    /// Collect HTML snippets for insertion straight after the main script
+    /// bundle.
+    #[must_use]
+    pub fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        self.inner
+            .head_injectors
+            .iter()
+            .flat_map(|injector| injector.after_bundle_inserts(ctx))
+            .collect()
     }
 
     /// Collect static attributes for the publisher TSJS bundle tag.
@@ -2126,6 +2276,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 request_preparers: Vec::new(),
+                response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -2168,6 +2319,7 @@ impl IntegrationRegistry {
                 head_injectors,
                 request_filters: Vec::new(),
                 request_preparers: Vec::new(),
+                response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -2206,6 +2358,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters,
                 request_preparers: Vec::new(),
+                response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -2284,6 +2437,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 request_preparers: Vec::new(),
+                response_finalizers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -2344,6 +2498,733 @@ pub(crate) mod test_support {
         _settings: &Settings,
     ) -> Result<bool, Report<TrustedServerError>> {
         Ok(true)
+    }
+
+    /// A stand-in for an integration that acts on one request, for core's
+    /// own tests of the page path.
+    ///
+    /// Its preparer runs for every request, as any preparer does, and strips
+    /// the query `fixture_request=1`. Where that query arrived on a document
+    /// navigation it also leaves a mark for the page path. It strips the
+    /// cookie it reserves too, and writes the Cookie header out again as it
+    /// does, the way a module that reserves a cookie does. Selected, its
+    /// request filter leaves the same mark on a request that carries its
+    /// header, which is the route a module that decides in its filter takes.
+    /// Selected, the
+    /// stand-in's head injector reads the mark from the document's state and
+    /// writes one script at the start of `<head>` and the tag of its
+    /// standalone module after the bundle. Its response finalizer sets a
+    /// cookie on the response to a marked request, and its builder declares
+    /// that it reads the auction token.
+    pub(crate) mod request_fixture {
+        use std::sync::Arc;
+
+        use edgezero_core::body::Body as EdgeBody;
+        use error_stack::Report;
+        use http::{HeaderValue, Method, Request, Response, Uri, header};
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
+            IntegrationRegistration, IntegrationRequestFilter, IntegrationRequestState,
+            RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+        use crate::tsjs_bundle::JsModulePart;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "request_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.request-fixture";
+        /// The query a navigation asks the stand-in to act with.
+        pub(crate) const QUERY: &str = "fixture_request=1";
+        /// What the stand-in's head insert sets for a marked request.
+        pub(crate) const HEAD_FLAG: &str = "window.__ts_request_fixture=true;";
+        /// The file of the stand-in's standalone module, which the document
+        /// of a marked request loads after the bundle.
+        pub(crate) const MODULE_FILE: &str = "tsjs-request_fixture.min.js";
+        /// The cookie the finalizer sets on the response to a marked request.
+        pub(crate) const COOKIE: &str = "ts-request-fixture=1; Path=/";
+        /// The name of that cookie, which the preparer strips from a request.
+        pub(crate) const COOKIE_NAME: &str = "ts-request-fixture";
+        /// The request header that has the stand-in's request filter leave
+        /// the mark.
+        pub(crate) const FILTER_HEADER: &str = "x-ts-request-fixture";
+
+        const JS: &str = "(function(){window.__ts_request_fixture_loaded=1;})();";
+        // SHA-256 of JS, hex. The registry refuses a literal that is not.
+        const JS_SHA256: &str = "7160e730ce9301ed134c84fa13605d7cd979cf929679f1c3176ea88b1989477e";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate)
+                .with_module_name(MODULE)
+                .with_request_preparer(prepare)
+                .with_response_finalizer(finalize)
+                .with_auction_token();
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {}
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        /// What the preparer leaves for the page path.
+        #[derive(Debug, Clone, Copy)]
+        pub(crate) struct Mark;
+
+        /// Leaves the mark on `request`, as the preparer does for the query.
+        pub(crate) fn mark(request: &mut Request<EdgeBody>) {
+            IntegrationRequestState::insert(request, ID, Mark);
+        }
+
+        /// The request state of a marked request.
+        pub(crate) fn marked() -> IntegrationRequestState {
+            let mut state = IntegrationRequestState::default();
+            state.set(ID, Mark);
+            state
+        }
+
+        /// Strips the reserved cookie, which means writing the header again
+        /// from the pairs that can be read. A request without the cookie is
+        /// left exactly as it arrived.
+        fn strip_reserved_cookie(request: &mut Request<EdgeBody>) {
+            let is_reserved =
+                |pair: &str| pair.split('=').next().map(str::trim) == Some(COOKIE_NAME);
+            let pairs = request
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(';'))
+                .map(str::trim)
+                .filter(|pair| !pair.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !pairs.iter().any(|pair| is_reserved(pair)) {
+                return;
+            }
+            let kept = pairs
+                .into_iter()
+                .filter(|pair| !is_reserved(pair))
+                .collect::<Vec<_>>();
+            request.headers_mut().remove(header::COOKIE);
+            if !kept.is_empty() {
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&kept.join("; "))
+                        .expect("should keep already valid cookie pairs"),
+                );
+            }
+        }
+
+        fn prepare(
+            _settings: &Settings,
+            request: &mut Request<EdgeBody>,
+        ) -> Result<(), Report<TrustedServerError>> {
+            strip_reserved_cookie(request);
+            let query = request.uri().query().unwrap_or_default();
+            if !query.split('&').any(|pair| pair == QUERY) {
+                return Ok(());
+            }
+            let retained = query
+                .split('&')
+                .filter(|pair| *pair != QUERY)
+                .collect::<Vec<_>>()
+                .join("&");
+            let mut path_and_query = request.uri().path().to_owned();
+            if !retained.is_empty() {
+                path_and_query.push('?');
+                path_and_query.push_str(&retained);
+            }
+            let mut parts = request.uri().clone().into_parts();
+            parts.path_and_query = Some(
+                path_and_query
+                    .parse()
+                    .expect("should keep a valid path and query"),
+            );
+            *request.uri_mut() = Uri::from_parts(parts).expect("should keep a valid URI");
+
+            if request.method() == Method::GET && crate::http_util::is_navigation_request(request) {
+                mark(request);
+            }
+            Ok(())
+        }
+
+        fn finalize(request_state: &IntegrationRequestState, response: &mut Response<EdgeBody>) {
+            if request_state.get::<Mark>(ID).is_some() {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, HeaderValue::from_static(COOKIE));
+            }
+        }
+
+        struct Filter;
+
+        #[async_trait::async_trait(?Send)]
+        impl IntegrationRequestFilter for Filter {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            async fn filter_request(
+                &self,
+                input: RequestFilterInput<'_>,
+            ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+                if input.request.headers().contains_key(FILTER_HEADER) {
+                    mark(input.request);
+                }
+                Ok(RequestFilterDecision::Continue(
+                    RequestFilterEffects::default(),
+                ))
+            }
+        }
+
+        struct Head;
+
+        impl Head {
+            fn marked(ctx: &IntegrationHtmlContext<'_>) -> bool {
+                ctx.document_state.get::<Mark>(ID).is_some()
+            }
+        }
+
+        impl IntegrationHeadInjector for Head {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                if !Self::marked(ctx) {
+                    return Vec::new();
+                }
+                vec![format!("<script>{HEAD_FLAG}</script>")]
+            }
+
+            fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                if !Self::marked(ctx) {
+                    return Vec::new();
+                }
+                let module = JsModulePart {
+                    id: ID,
+                    source: JS,
+                    sha256: JS_SHA256,
+                };
+                vec![format!(
+                    "<script src=\"{}\"></script>",
+                    crate::tsjs::tsjs_single_module_script_src(&module)
+                )]
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(_config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .with_js_module(CarriedJsModule {
+                        source: JS,
+                        sha256: JS_SHA256,
+                    })
+                    .with_standalone_js()
+                    .with_head_injector(Arc::new(Head))
+                    .with_request_filter(Arc::new(Filter))
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
+    /// A stand-in for an integration whose browser module loads deferred, for
+    /// core's own tests of how modules are divided between the bundle and
+    /// deferred tags, and of how a module's settings reach a page template.
+    ///
+    /// Selected, it carries a deferred browser module and writes its two
+    /// settings into `<head>`.
+    pub(crate) mod deferred_fixture {
+        use std::sync::Arc;
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
+            IntegrationRegistration,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "deferred_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.deferred-fixture";
+        /// The file of the stand-in's deferred module.
+        pub(crate) const MODULE_FILE: &str = "tsjs-deferred_fixture.min.js";
+
+        const JS: &str = "(function(){window.__ts_deferred_fixture_loaded=1;})();";
+        // SHA-256 of JS, hex. The registry refuses a literal that is not.
+        const JS_SHA256: &str = "3947bc5e93ffb5d057f0d500d20ee25d53612b6c8b59cd3f9512c1b64b45f9f6";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {
+            #[serde(default)]
+            label: String,
+            #[serde(default)]
+            timeout_ms: u32,
+        }
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        struct Head {
+            label: String,
+            timeout_ms: u32,
+        }
+
+        impl IntegrationHeadInjector for Head {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                let config = serde_json::json!({
+                    "label": self.label,
+                    "timeoutMs": self.timeout_ms,
+                });
+                vec![format!(
+                    "<script>window.__ts_deferred_fixture={config};</script>"
+                )]
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .with_js_module(CarriedJsModule {
+                        source: JS,
+                        sha256: JS_SHA256,
+                    })
+                    .with_deferred_js()
+                    .with_head_injector(Arc::new(Head {
+                        label: config.label,
+                        timeout_ms: config.timeout_ms,
+                    }))
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
+    /// A stand-in for an integration that tags a page, for core's own tests
+    /// of the HTML processor and the JavaScript asset proxy.
+    ///
+    /// Selected, it inserts one script at the start of `<head>` and rewrites
+    /// the address of its own script to a first-party path. With
+    /// `mark_bundle` set it also asks for an attribute on the publisher
+    /// bundle tag.
+    pub(crate) mod tag_fixture {
+        use std::sync::Arc;
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+            IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "tag_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.tag-fixture";
+        /// The script the stand-in's vendor would serve.
+        pub(crate) const SCRIPT_URL: &str = "https://cdn.tag-fixture.example/sdk.js";
+        /// The first-party path the stand-in rewrites that script to.
+        pub(crate) const FIRST_PARTY_SCRIPT: &str = "/integrations/tag_fixture/script";
+        /// What the stand-in's head insert sets, so a test can find it.
+        pub(crate) const HEAD_FLAG: &str = "window.__ts_tag_fixture=true;";
+        /// The attribute the stand-in asks for on the publisher bundle tag.
+        pub(crate) const BUNDLE_ATTRIBUTE: &str = "data-ts-tag-fixture";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {
+            #[serde(default)]
+            mark_bundle: bool,
+        }
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        struct Tag {
+            mark_bundle: bool,
+        }
+
+        impl IntegrationHeadInjector for Tag {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                vec![format!("<script>{HEAD_FLAG}</script>")]
+            }
+
+            fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+                if self.mark_bundle {
+                    vec![(BUNDLE_ATTRIBUTE, "true")]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        impl IntegrationAttributeRewriter for Tag {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn handles_attribute(&self, attribute: &str) -> bool {
+                attribute == "src"
+            }
+
+            fn rewrite(
+                &self,
+                _attr_name: &str,
+                attr_value: &str,
+                _ctx: &IntegrationAttributeContext<'_>,
+            ) -> AttributeRewriteAction {
+                if attr_value == SCRIPT_URL {
+                    AttributeRewriteAction::Replace(FIRST_PARTY_SCRIPT.to_owned())
+                } else {
+                    AttributeRewriteAction::Keep
+                }
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            let tag = Arc::new(Tag {
+                mark_bundle: config.mark_bundle,
+            });
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .without_js()
+                    .with_attribute_rewriter(tag.clone())
+                    .with_head_injector(tag)
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
+    /// A stand-in for an integration that rewrites script payloads in two
+    /// passes, for core's own tests of the page pipeline.
+    ///
+    /// The script rewriter swaps the payload of each `fixture_payload("...")`
+    /// call for a placeholder that carries a namespace made per document, and
+    /// keeps the payload in the document state. The stream processor swaps
+    /// each placeholder back for its payload with the origin host rewritten.
+    /// A payload pushed with `fixture_payload_open` leaves its group
+    /// unresolved, and the processor holds its output from that placeholder
+    /// on until a `fixture_payload_close` arrives.
+    pub(crate) mod payload_fixture {
+        use std::io;
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+            IntegrationRegistration, IntegrationScriptContext, IntegrationScriptRewriter,
+            ScriptRewriteAction, ScriptTextAccumulator,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+        use crate::streaming_processor::StreamProcessor;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "payload_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.payload-fixture";
+        /// What every placeholder starts with, so a test can check that none
+        /// reaches a reader.
+        pub(crate) const PLACEHOLDER_PREFIX: &str = "__ts_fixture_";
+        const PLACEHOLDER_END: &str = "__";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        struct Payload {
+            placeholder: String,
+            original: String,
+            /// Whether the group this payload opened is still waiting for its
+            /// close.
+            unresolved: bool,
+        }
+
+        /// What one document's script rewriter has captured so far.
+        struct Captured {
+            namespace: String,
+            payloads: Vec<Payload>,
+        }
+
+        impl Default for Captured {
+            fn default() -> Self {
+                Self {
+                    namespace: uuid::Uuid::new_v4().simple().to_string(),
+                    payloads: Vec::new(),
+                }
+            }
+        }
+
+        fn captured(
+            state: &crate::integrations::registry::IntegrationDocumentState,
+        ) -> Arc<Mutex<Captured>> {
+            state.get_or_insert_with(ID, || Mutex::new(Captured::default()))
+        }
+
+        struct ScriptRewriter;
+
+        impl ScriptRewriter {
+            /// Swaps the payload of a whole script for a placeholder, or
+            /// leaves a script that pushes no payload as it is.
+            fn rewrite_whole(script: &str, ctx: &IntegrationScriptContext<'_>) -> Option<String> {
+                let (call, opens, closes) = [
+                    ("fixture_payload_open(\"", true, false),
+                    ("fixture_payload_close(\"", false, true),
+                    ("fixture_payload(\"", false, false),
+                ]
+                .into_iter()
+                .find(|(call, _, _)| script.contains(*call))?;
+                let start = script.find(call)? + call.len();
+                let end = script.rfind("\")")?;
+                if end < start {
+                    return None;
+                }
+
+                let shared = captured(ctx.document_state);
+                let mut captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let placeholder = format!(
+                    "{PLACEHOLDER_PREFIX}{}_{}{PLACEHOLDER_END}",
+                    captured.namespace,
+                    captured.payloads.len()
+                );
+                if closes {
+                    for payload in &mut captured.payloads {
+                        payload.unresolved = false;
+                    }
+                }
+                captured.payloads.push(Payload {
+                    placeholder: placeholder.clone(),
+                    original: script[start..end].to_owned(),
+                    unresolved: opens,
+                });
+
+                let mut rewritten = script.to_owned();
+                rewritten.replace_range(start..end, &placeholder);
+                Some(rewritten)
+            }
+        }
+
+        impl IntegrationScriptRewriter for ScriptRewriter {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn selector(&self) -> &'static str {
+                "script"
+            }
+
+            fn rewrite(
+                &self,
+                content: &str,
+                ctx: &IntegrationScriptContext<'_>,
+            ) -> ScriptRewriteAction {
+                let accumulator = ctx
+                    .document_state
+                    .get_or_insert_with(ID, ScriptTextAccumulator::default);
+                let mut buffer = accumulator.buffer();
+                let claimed = !buffer.is_empty() || content.contains("fixture_payload");
+                if !claimed {
+                    return ScriptRewriteAction::Keep;
+                }
+                buffer.push_str(content);
+                if !ctx.is_last_in_text_node {
+                    return ScriptRewriteAction::RemoveNode;
+                }
+                let script = std::mem::take(&mut *buffer);
+                let rewritten = Self::rewrite_whole(&script, ctx).unwrap_or(script);
+                ScriptRewriteAction::replace(rewritten)
+            }
+        }
+
+        struct StreamFactory;
+
+        impl IntegrationHtmlStreamProcessorFactory for StreamFactory {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+                Box::new(Processor {
+                    context,
+                    held: Vec::new(),
+                })
+            }
+        }
+
+        struct Processor {
+            context: IntegrationHtmlStreamContext,
+            /// Output not yet released, because it ends inside a placeholder
+            /// or starts at one whose group is unresolved.
+            held: Vec<u8>,
+        }
+
+        fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+            haystack
+                .get(from..)?
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .map(|at| at + from)
+        }
+
+        impl StreamProcessor for Processor {
+            fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+                self.held.extend_from_slice(chunk);
+                let shared = captured(&self.context.document_state);
+                let captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let prefix = PLACEHOLDER_PREFIX.as_bytes();
+                let mut out = Vec::with_capacity(self.held.len());
+                let mut at = 0;
+
+                while let Some(start) = find(&self.held, prefix, at) {
+                    let Some(end) =
+                        find(&self.held, PLACEHOLDER_END.as_bytes(), start + prefix.len())
+                    else {
+                        // The placeholder runs past this chunk.
+                        out.extend_from_slice(&self.held[at..start]);
+                        at = start;
+                        break;
+                    };
+                    let end = end + PLACEHOLDER_END.len();
+                    let found = std::str::from_utf8(&self.held[start..end])
+                        .ok()
+                        .and_then(|text| {
+                            captured
+                                .payloads
+                                .iter()
+                                .find(|payload| payload.placeholder == text)
+                        });
+                    match found {
+                        Some(payload) if payload.unresolved && !is_last => {
+                            out.extend_from_slice(&self.held[at..start]);
+                            at = start;
+                            break;
+                        }
+                        Some(payload) => {
+                            out.extend_from_slice(&self.held[at..start]);
+                            out.extend_from_slice(
+                                payload
+                                    .original
+                                    .replace(&self.context.origin_host, &self.context.request_host)
+                                    .as_bytes(),
+                            );
+                            at = end;
+                        }
+                        None => {
+                            out.extend_from_slice(&self.held[at..end]);
+                            at = end;
+                        }
+                    }
+                }
+
+                let stopped_at_placeholder = find(&self.held, prefix, at) == Some(at);
+                if is_last {
+                    out.extend_from_slice(&self.held[at..]);
+                    self.held.clear();
+                } else if stopped_at_placeholder {
+                    self.held.drain(..at);
+                } else {
+                    // Keep back a tail that could be the start of a
+                    // placeholder split across chunks.
+                    let rest = &self.held[at..];
+                    let keep = (1..prefix.len().min(rest.len() + 1))
+                        .rev()
+                        .find(|len| rest.ends_with(&prefix[..*len]))
+                        .unwrap_or(0);
+                    out.extend_from_slice(&rest[..rest.len() - keep]);
+                    let tail = rest[rest.len() - keep..].to_vec();
+                    self.held = tail;
+                }
+                Ok(out)
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            if settings.module_config::<FixtureSettings>(MODULE)?.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .with_script_rewriter(Arc::new(ScriptRewriter))
+                    .with_html_stream_processor(Arc::new(StreamFactory))
+                    .build(),
+            ))
+        }
+
+        /// The stand-in takes no settings, and refuses one it does not know
+        /// as any module does.
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {}
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
     }
 }
 
@@ -2470,7 +3351,7 @@ mod tests {
         ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
             input.request.extensions_mut().insert(RequestAnnotation);
             Ok(RequestFilterDecision::Continue(RequestFilterEffects {
-                request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
+                request_headers: vec![HeaderMutation::set("x-probe-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
             }))
         }
@@ -2707,10 +3588,10 @@ mod tests {
 
         assert_eq!(
             req.headers()
-                .get("x-datadome-isbot")
+                .get("x-probe-isbot")
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
-            "should apply DataDome-style request enrichment before routing"
+            "should apply a filter's request enrichment before routing"
         );
         assert!(
             req.extensions().get::<RequestAnnotation>().is_some(),
@@ -3233,25 +4114,14 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_defer_prebid_and_include_core_js_only_modules() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let mut settings_with_prebid = settings;
-        settings_with_prebid
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
-                    "timeout_ms": 1000,
-                    "debug": false
-                }),
-            )
-            .expect("should insert prebid config");
+    fn js_module_ids_defer_a_deferred_module_and_include_core_js_only_modules() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        enable_deferred_module(&mut settings);
 
         let registry = IntegrationRegistry::with_plan(
-            &settings_with_prebid,
+            &settings,
             Arc::new(
-                crate::auction::compile_auction_plan(&settings_with_prebid)
+                crate::auction::compile_auction_plan(&settings)
                     .expect("should compile auction plan"),
             ),
         )
@@ -3260,10 +4130,11 @@ mod tests {
         let all = registry.js_module_ids();
         let immediate = registry.js_module_ids_immediate();
         let deferred = registry.js_module_ids_deferred();
+        let module = test_support::deferred_fixture::ID;
 
         assert!(
-            all.contains(&"prebid"),
-            "should include the prebid shim in embedded TSJS module IDs"
+            all.contains(&module),
+            "should include the deferred module in the module IDs"
         );
         assert!(
             immediate.contains(&"creative"),
@@ -3274,40 +4145,38 @@ mod tests {
             "should not include Sourcepoint unless it is named"
         );
         assert!(
-            !immediate.contains(&"prebid"),
-            "should not include prebid in immediate IDs"
+            !immediate.contains(&module),
+            "should not include the deferred module in immediate IDs"
         );
         assert!(
-            deferred.contains(&"prebid"),
-            "should serve the prebid shim as a deferred module"
+            deferred.contains(&module),
+            "should serve the module as a deferred module"
         );
     }
 
     #[test]
     fn js_module_ids_skip_named_integrations_without_generated_js_module() {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings.select_module("framework", "framework.nextjs");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
+        let settings = settings_naming("testing.probe");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
         )
-        .expect("should create registry");
+        .with_module_name("testing.probe")];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should create registry");
         let all = registry.js_module_ids();
 
         assert!(
-            !all.contains(&"nextjs"),
+            !all.contains(&"probe"),
             "should not include named integrations without generated JS modules"
         );
 
         let metadata = registry.registered_integrations();
         assert!(
-            metadata
-                .iter()
-                .any(|integration| integration.id == "nextjs"),
+            metadata.iter().any(|integration| integration.id == "probe"),
             "should still register named Rust-only integrations"
         );
     }
@@ -3325,38 +4194,6 @@ mod tests {
                 .js_module_ids_immediate()
                 .contains(&"ec_client_fixed"),
             "selecting the `client_fixed` module should inject its demo page script"
-        );
-    }
-
-    #[test]
-    fn js_module_ids_include_named_cmp_mirrors() {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings.select_module("cmp", "cmp.sourcepoint");
-        settings.select_module("cmp", "cmp.osano");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-        let immediate = registry.js_module_ids_immediate();
-
-        assert!(
-            immediate.contains(&"sourcepoint"),
-            "should include Sourcepoint when it is named"
-        );
-        assert!(
-            immediate.contains(&"osano"),
-            "should include Osano when it is named"
-        );
-
-        let metadata = registry.registered_integrations();
-        assert!(
-            metadata.iter().any(|integration| integration.id == "osano"),
-            "should include JS-only Osano registration in metadata"
         );
     }
 
@@ -3398,17 +4235,9 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_defer_prebid_shim_when_external_bundle_is_configured() {
+    fn js_module_ids_split_is_exhaustive() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
-                }),
-            )
-            .expect("should update prebid config");
+        enable_deferred_module(&mut settings);
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -3419,50 +4248,11 @@ mod tests {
         )
         .expect("should create registry");
 
-        assert!(
-            registry.js_module_ids().contains(&"prebid"),
-            "external bundle mode should include the prebid shim in embedded TSJS modules"
-        );
-        assert!(
-            !registry.js_module_ids_immediate().contains(&"prebid"),
-            "the prebid shim should not load in the immediate TSJS bundle"
-        );
-        assert!(
-            registry.js_module_ids_deferred().contains(&"prebid"),
-            "the prebid shim should load as a deferred TSJS module"
-        );
-        assert!(
-            registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
-            "external bundle mode should register the first-party bundle route"
-        );
-    }
-
-    #[test]
-    fn js_module_ids_split_is_exhaustive() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let mut settings_with_prebid = settings;
-        settings_with_prebid
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
-                    "timeout_ms": 1000,
-                    "debug": false
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings_with_prebid,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings_with_prebid)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-
         let all = registry.js_module_ids();
+        assert!(
+            !registry.js_module_ids_deferred().is_empty(),
+            "should have a deferred module to divide from the bundle"
+        );
         let mut recombined = registry.js_module_ids_immediate();
         recombined.extend(registry.js_module_ids_deferred());
         recombined.sort_unstable();
@@ -3476,10 +4266,16 @@ mod tests {
         );
     }
 
-    fn duplicate_lockr_registration(
+    /// Claims the id of the JavaScript asset proxy, which is core's own.
+    fn duplicate_core_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-        Ok(Some(IntegrationRegistration::builder("lockr").build()))
+        Ok(Some(
+            IntegrationRegistration::builder(
+                crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
+            )
+            .build(),
+        ))
     }
 
     /// The shared fixture with the module `name` selected in its section, so a
@@ -3519,21 +4315,14 @@ mod tests {
 
     #[test]
     fn with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings
-            .insert_module_config(
-                "identity",
-                "identity.lockr",
-                &serde_json::json!({"app_id": "test-app-id" }),
-            )
-            .expect("should insert lockr config");
+        let settings = crate::test_support::tests::create_test_settings();
         let extra = [crate::integrations::IntegrationBuilder::new(
-            "lockr",
+            crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             "seam-probe",
-            duplicate_lockr_registration,
+            duplicate_core_registration,
             validate_nothing,
         )
-        .with_module_name("testing.lockr")];
+        .with_module_name("testing.duplicate")];
 
         let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
@@ -3541,64 +4330,69 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("lockr")
+            message.contains(crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID)
                 && message.contains("trusted-server-core")
                 && message.contains("seam-probe"),
             "error should name the id and both sources: {message}"
         );
     }
 
-    /// Prebid and APS are not builders, because the auction plan registers
-    /// them, yet an outside builder claiming either id is still refused, naming
-    /// both sources, whether or not the plan-backed integration runs.
+    /// A builder that registers from the auction plan holds its id like any
+    /// other, so a second builder claiming it is refused, naming both sources,
+    /// whether or not the plan-backed integration runs.
     #[test]
-    fn with_registrations_rejects_an_outside_builder_claiming_a_plan_backed_id() {
+    fn with_registrations_rejects_a_second_builder_claiming_a_plan_backed_id() {
         fn register_nothing(
             _settings: &Settings,
         ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
             Ok(None)
         }
+        fn nothing_from_the_plan(
+            _settings: &Settings,
+            _plan: &crate::auction::plan::AuctionPlan,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(None)
+        }
 
         let settings = crate::test_support::tests::create_test_settings();
-        for id in [
-            crate::integrations::prebid::PREBID_INTEGRATION_ID,
-            crate::integrations::aps::APS_INTEGRATION_ID,
-        ] {
-            let extra = [crate::integrations::IntegrationBuilder::new(
+        let id = "plan_backed";
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                id,
+                "plan-backed-crate",
+                register_nothing,
+                validate_nothing,
+            )
+            .with_plan_registration(nothing_from_the_plan),
+            crate::integrations::IntegrationBuilder::new(
                 id,
                 "seam-probe",
                 register_nothing,
                 validate_nothing,
-            )];
+            ),
+        ];
 
-            let Err(error) = IntegrationRegistry::with_registrations(&settings, &extra) else {
-                panic!("should refuse an outside builder claiming `{id}`");
-            };
+        let Err(error) = IntegrationRegistry::with_registrations(&settings, &extra) else {
+            panic!("should refuse a second builder claiming `{id}`");
+        };
 
-            let message = error.to_string();
-            assert!(
-                message.contains(id)
-                    && message.contains("trusted-server-core")
-                    && message.contains("seam-probe"),
-                "error should name `{id}` and both sources: {message}"
-            );
-        }
+        let message = error.to_string();
+        assert!(
+            message.contains(id)
+                && message.contains("plan-backed-crate")
+                && message.contains("seam-probe"),
+            "error should name `{id}` and both sources: {message}"
+        );
     }
 
-    fn enable_prebid(settings: &mut Settings) {
-        settings
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example.com/prebid/trusted-prebid.js",
-                }),
-            )
-            .expect("should insert prebid config");
+    /// Selects core's stand-in, which registers a deferred browser module.
+    fn enable_deferred_module(settings: &mut Settings) {
+        settings.select_module("testing", test_support::deferred_fixture::MODULE);
     }
 
-    fn enable_gpt_diagnostics(settings: &mut Settings) {
-        settings.select_module("ad-tag", "ad-tag.google.diagnostics");
+    /// Selects core's stand-in, which registers a standalone browser module.
+    fn enable_standalone_module(settings: &mut Settings) {
+        settings.select_module("testing", test_support::request_fixture::MODULE);
     }
 
     fn carried_probe_builder() -> crate::integrations::IntegrationBuilder {
@@ -3711,8 +4505,7 @@ mod tests {
     fn js_part_is_none_for_an_integration_registered_without_js() {
         // The carried lookup would answer `Some` on its own, so this proves the
         // without-JS check runs first. No built-in integration can stand in, because
-        // the only `without_js` built-in with a Rust registration, `aps`, has
-        // no compile-time module either.
+        // none registers without a browser script.
         let settings = settings_naming("probe");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "probe",
@@ -3786,21 +4579,25 @@ mod tests {
     #[test]
     fn a_standalone_js_module_is_served_alone_and_not_in_the_bundle() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        enable_gpt_diagnostics(&mut settings);
+        enable_standalone_module(&mut settings);
 
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
 
         assert!(
-            !registry.js_module_ids().contains(&"gpt_diagnostics"),
+            !registry
+                .js_module_ids()
+                .contains(&test_support::request_fixture::ID),
             "should keep a standalone module out of the bundle module ids"
         );
         assert!(
-            registry.js_part("gpt_diagnostics").is_some(),
+            registry
+                .js_part(test_support::request_fixture::ID)
+                .is_some(),
             "should serve the standalone module as a part"
         );
         assert_eq!(
             registry.js_standalone_ids(),
-            vec!["gpt_diagnostics"],
+            vec![test_support::request_fixture::ID],
             "should list the standalone module that runs"
         );
         assert!(
@@ -3812,8 +4609,8 @@ mod tests {
     #[test]
     fn js_parts_all_covers_bundle_deferred_and_standalone_modules() {
         let mut settings = settings_naming("probe");
-        enable_prebid(&mut settings);
-        enable_gpt_diagnostics(&mut settings);
+        enable_deferred_module(&mut settings);
+        enable_standalone_module(&mut settings);
         let extra = [carried_probe_builder()];
 
         let registry = IntegrationRegistry::with_registrations(&settings, &extra)
@@ -3824,7 +4621,13 @@ mod tests {
             .into_iter()
             .map(|part| part.id)
             .collect::<Vec<_>>();
-        for expected in ["core", "creative", "probe", "prebid", "gpt_diagnostics"] {
+        for expected in [
+            "core",
+            "creative",
+            "probe",
+            test_support::deferred_fixture::ID,
+            test_support::request_fixture::ID,
+        ] {
             assert_eq!(
                 ids.iter().filter(|id| **id == expected).count(),
                 1,
@@ -3996,38 +4799,328 @@ mod tests {
         );
     }
 
+    /// Writes one fixed insert, so a test can read the order hooks ran in.
+    struct FixedHeadInsert {
+        id: &'static str,
+        insert: &'static str,
+    }
+
+    impl IntegrationHeadInjector for FixedHeadInsert {
+        fn integration_id(&self) -> &'static str {
+            self.id
+        }
+
+        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            vec![self.insert.to_owned()]
+        }
+    }
+
+    const SECTION_INSERT: &str = "<!--from the section-->";
+    const PLAN_INSERT: &str = "<!--from the plan-->";
+
+    fn section_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe-section")
+                .with_head_injector(Arc::new(FixedHeadInsert {
+                    id: "probe-section",
+                    insert: SECTION_INSERT,
+                }))
+                .build(),
+        ))
+    }
+
+    /// Registers when the plan's auction is enabled, whatever the sections
+    /// select.
+    fn plan_probe_registration(
+        _settings: &Settings,
+        plan: &AuctionPlan,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(plan.enabled().then(|| {
+            IntegrationRegistration::builder("probe-plan")
+                .with_head_injector(Arc::new(FixedHeadInsert {
+                    id: "probe-plan",
+                    insert: PLAN_INSERT,
+                }))
+                .build()
+        }))
+    }
+
     #[test]
-    fn prepare_request_runs_the_built_in_gpt_diagnostics_preparer() {
-        // The adapters call the registry rather than naming GPT diagnostics, so
-        // the built-in table is what attaches the sanitizing preparer. This is
-        // asserted here rather than through an adapter route test because the
-        // stripped query is only visible on the publisher HTML path, which needs
-        // a live origin the adapter test harnesses do not have.
+    fn a_registration_from_the_plan_runs_unselected_and_ahead_of_a_section_s_module() {
+        let mut settings = settings_naming("testing.probe-section");
+        // The section's module is listed first, and what the plan registers
+        // still goes ahead of it.
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-section",
+                "seam-probe",
+                section_probe_registration,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-section"),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-plan",
+                "seam-probe",
+                never_registering_builder,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-plan")
+            .with_plan_registration(plan_probe_registration),
+        ];
+        let probe_inserts = |registry: &IntegrationRegistry| {
+            let document_state = IntegrationDocumentState::default();
+            registry
+                .head_inserts(&IntegrationHtmlContext {
+                    request_host: "publisher.example.com",
+                    request_scheme: "https",
+                    origin_host: "origin.example.com",
+                    document_state: &document_state,
+                })
+                .into_iter()
+                .filter(|insert| insert == SECTION_INSERT || insert == PLAN_INSERT)
+                .collect::<Vec<_>>()
+        };
+
+        settings.auction.enabled = false;
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+        assert!(
+            !registry.integration_runs("probe-plan"),
+            "should register nothing where the function finds nothing in the plan"
+        );
+        assert_eq!(probe_inserts(&registry), vec![SECTION_INSERT]);
+
+        settings.auction.enabled = true;
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+        assert!(
+            registry.integration_runs("probe-plan"),
+            "should register from the plan a module no section selects"
+        );
+        assert_eq!(
+            probe_inserts(&registry),
+            vec![PLAN_INSERT, SECTION_INSERT],
+            "should run the hooks of what the plan registered ahead of a section's module"
+        );
+    }
+
+    /// Appends to a header on each run, so a test can count the runs on the
+    /// request itself.
+    fn counting_preparer(
+        _settings: &Settings,
+        request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        request
+            .headers_mut()
+            .append("x-probe-prepared", HeaderValue::from_static("1"));
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_request_runs_the_preparers_once_for_a_request() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe-counting",
+            "seam-probe",
+            never_registering_builder,
+            validate_nothing,
+        )
+        .with_module_name("testing.probe-counting")
+        .with_request_preparer(counting_preparer)];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with a request preparer");
+        let mut request = plain_request();
+
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should prepare the request");
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should accept a request that is already prepared");
+
+        assert_eq!(
+            request.headers().get_all("x-probe-prepared").iter().count(),
+            1,
+            "should run a preparer once however often the request is prepared"
+        );
+
+        let mut next = plain_request();
+        registry
+            .prepare_request(&settings, &mut next)
+            .expect("should prepare the next request");
+        assert_eq!(
+            next.headers().get_all("x-probe-prepared").iter().count(),
+            1,
+            "should prepare each request"
+        );
+    }
+
+    /// What the second probe's request hook leaves for its finalizer.
+    #[derive(Debug, PartialEq)]
+    struct ProbeNote(&'static str);
+
+    fn first_finalizer(_state: &IntegrationRequestState, response: &mut Response<EdgeBody>) {
+        response
+            .headers_mut()
+            .append("x-probe-finalized", HeaderValue::from_static("first"));
+    }
+
+    fn second_finalizer(state: &IntegrationRequestState, response: &mut Response<EdgeBody>) {
+        let value = match state.get::<ProbeNote>("probe-second") {
+            Some(_) => "second-with-its-note",
+            None => "second",
+        };
+        response
+            .headers_mut()
+            .append("x-probe-finalized", HeaderValue::from_static(value));
+    }
+
+    #[test]
+    fn finalize_response_runs_every_finalizer_in_registration_order_with_the_request_state() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-first",
+                "seam-probe",
+                never_registering_builder,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-first")
+            .with_response_finalizer(first_finalizer),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-second",
+                "seam-probe",
+                never_registering_builder,
+                validate_nothing,
+            )
+            .with_module_name("testing.probe-second")
+            .with_response_finalizer(second_finalizer),
+        ];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with response finalizers");
+        let finalized = |response: &Response<EdgeBody>| {
+            response
+                .headers()
+                .get_all("x-probe-finalized")
+                .iter()
+                .map(|value| value.to_str().expect("should be text").to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let mut request = plain_request();
+        IntegrationRequestState::insert(&mut request, "probe-second", ProbeNote("left"));
+        let mut response = Response::builder()
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        registry.finalize_response(&IntegrationRequestState::of(&request), &mut response);
+
+        assert_eq!(
+            finalized(&response),
+            vec!["first", "second-with-its-note"],
+            "should run both finalizers in registration order, neither integration \
+             running, and hand each what was left on the request"
+        );
+
+        let mut unmarked = Response::builder()
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        registry.finalize_response(&IntegrationRequestState::default(), &mut unmarked);
+        assert_eq!(
+            finalized(&unmarked),
+            vec!["first", "second"],
+            "should hand a finalizer no state for a request nothing was left on"
+        );
+    }
+
+    #[test]
+    fn what_a_module_leaves_on_a_request_reaches_a_document_when_it_is_seeded() {
+        let mut request = plain_request();
+        assert!(
+            IntegrationRequestState::of(&request).is_empty(),
+            "should hold nothing for a request no module left a value on"
+        );
+
+        IntegrationRequestState::insert(&mut request, "probe", ProbeNote("first"));
+        IntegrationRequestState::insert(&mut request, "probe", ProbeNote("second"));
+        IntegrationRequestState::insert(&mut request, "other", ProbeNote("other"));
+        let state = IntegrationRequestState::of(&request);
+
+        assert!(!state.is_empty(), "should hold what was left");
+        assert_eq!(
+            state.get::<ProbeNote>("probe").as_deref(),
+            Some(&ProbeNote("second")),
+            "should keep the last value of one type left for an integration"
+        );
+        assert!(
+            state.get::<ProbeNote>("absent").is_none(),
+            "should hold nothing for an integration that left nothing"
+        );
+
+        let document = IntegrationDocumentState::default();
+        assert!(
+            document.get::<ProbeNote>("probe").is_none(),
+            "should start a document with none of the request's values"
+        );
+        state.seed(&document);
+        assert_eq!(
+            document.get::<ProbeNote>("probe").as_deref(),
+            Some(&ProbeNote("second")),
+            "should copy the value into the document's state"
+        );
+        assert_eq!(
+            document.get::<ProbeNote>("other").as_deref(),
+            Some(&ProbeNote("other")),
+            "should copy every integration's value"
+        );
+    }
+
+    #[test]
+    fn the_request_stand_in_marks_a_navigation_and_strips_its_query() {
+        use super::test_support::request_fixture;
+
         let settings = crate::test_support::tests::create_test_settings();
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let mut request = Request::builder()
+        let mut navigation = Request::builder()
             .method(Method::GET)
-            .uri("https://publisher.example.com/article?ts_console=1&keep=yes")
-            .header(header::COOKIE, "__Host-ts-console=1; keep-me=yes")
+            .uri("https://publisher.example.com/article?fixture_request=1&keep=yes")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut subresource = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/data.json?fixture_request=1")
+            .header("sec-fetch-dest", "empty")
             .body(EdgeBody::empty())
             .expect("should build request");
 
         registry
-            .prepare_request(&settings, &mut request)
-            .expect("should run the built-in preparers");
+            .prepare_request(&settings, &mut navigation)
+            .expect("should prepare the navigation");
+        registry
+            .prepare_request(&settings, &mut subresource)
+            .expect("should prepare the subresource request");
 
         assert_eq!(
-            request.uri().query(),
+            navigation.uri().query(),
             Some("keep=yes"),
-            "should strip the reserved diagnostics query and keep the rest"
+            "should strip the stand-in's query and keep the rest"
+        );
+        assert!(
+            IntegrationRequestState::of(&navigation)
+                .get::<request_fixture::Mark>(request_fixture::ID)
+                .is_some(),
+            "should leave the mark on a document navigation, selected or not"
         );
         assert_eq!(
-            request
-                .headers()
-                .get(header::COOKIE)
-                .map(|value| value.to_str().expect("cookie should be text")),
-            Some("keep-me=yes"),
-            "should strip the reserved diagnostics cookie and keep the rest"
+            subresource.uri().query(),
+            None,
+            "should strip the stand-in's query from any request"
+        );
+        assert!(
+            IntegrationRequestState::of(&subresource).is_empty(),
+            "should leave no mark on a request for something other than a document"
         );
     }
 
@@ -4314,8 +5407,15 @@ mod tests {
     #[test]
     fn an_id_no_builder_supplies_is_refused_at_registry_build() {
         let settings = settings_naming("a_vendors_own_integration");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )
+        .with_module_name("testing.probe")];
 
-        let error = IntegrationRegistry::new(&settings)
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
             .err()
             .expect("should refuse an id no builder in this deployment supplies");
 
@@ -4325,9 +5425,8 @@ mod tests {
             "should name the id nothing supplies: {message}"
         );
         assert!(
-            message.contains("The testing modules it supplies are")
-                && message.contains("testlight"),
-            "should list the module types this deployment does supply: {message}"
+            message.contains("The testing modules it supplies are") && message.contains("probe"),
+            "should list the modules of that type this deployment does supply: {message}"
         );
     }
 
@@ -4336,10 +5435,9 @@ mod tests {
     #[test]
     fn an_auction_implementation_named_in_a_section_is_refused() {
         for (section, name) in [
-            ("auction", "prebid-server"),
-            ("auction", "aps"),
-            ("auction", "ad-server.mock"),
-            ("auction-protocol", "openrtb"),
+            ("auction", "fixture"),
+            ("auction", "ad-server.fixture"),
+            ("auction", "plain-fixture"),
         ] {
             let mut settings = crate::test_support::tests::create_test_settings();
             settings.select_module(section, name);

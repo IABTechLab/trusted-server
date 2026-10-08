@@ -1,0 +1,33 @@
+[package]
+name = "trusted-server-ad-server-mock"
+description = "The demonstration ad server, which asks mocktioneer's decision endpoint to pick the winning bid, as an ad server module."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
+url = { workspace = true }
+validator = { workspace = true }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. The demonstration ad server is the project's
+# own, so the Trusted Server maintainers own it.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "project owned"

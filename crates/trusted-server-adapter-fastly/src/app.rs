@@ -222,17 +222,17 @@ pub(crate) fn build_state(
 pub(crate) fn load_settings_from_config_store(
     stores: &RuntimeStoreConfig,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    // The settings are validated as they load, so the builders a deployment
-    // registered are supplied here as well as to the state build. Without
-    // them a `[demand]` or `[ad-server]` name one of them supplies is refused
-    // before the state that knows them is built.
+    // The settings are validated as they load, so the stock builders and the
+    // ones a deployment registered are supplied here as well as to the state
+    // build. Without them a `[demand]` or `[ad-server]` name one of them
+    // supplies is refused before the state that knows them is built.
     get_settings_from_config_store_with(
         &FastlyPlatformConfigStore,
         &FastlyPlatformSecretStore,
         &stores.config_store_name,
         &stores.config_key,
         &stores.secret_store_name,
-        registered_integrations(),
+        &trusted_server_modules::builders_with(registered_integrations()),
     )
 }
 
@@ -271,8 +271,9 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
     REGISTERED_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
 }
 
-/// Build the application state from explicit settings, composing the built-in
-/// integrations with the externally supplied builders in `integrations`.
+/// Build the application state from explicit settings, composing the modules
+/// a stock build ships with the externally supplied builders in
+/// `integrations`.
 ///
 /// A deployment that ships a vendor crate calls this to add that crate's
 /// integration builder without the adapter naming the vendor. Auction
@@ -291,6 +292,11 @@ pub(crate) fn build_state_with_registrations(
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
+
+    // The modules a stock build ships come first and the deployment's own
+    // follow, which is the order their hooks run in.
+    let integrations = trusted_server_modules::builders_with(integrations);
+    let integrations = integrations.as_slice();
 
     // The plan is compiled with the integrations this adapter was given, so an
     // `[ad-server]` or `[demand]` name one of their builders supplies resolves
@@ -1638,10 +1644,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
-    // These fixtures supply no integration builders, so they compile the plan
-    // without them rather than through the module-aware compiler the adapter
-    // itself uses.
-    use trusted_server_core::auction::compile_auction_plan;
+    use trusted_server_core::auction::compile_auction_plan_with;
 
     use error_stack::Report;
     use futures::executor::block_on;
@@ -1854,7 +1857,7 @@ mod tests {
     ) -> RouterService {
         let settings = test_settings();
         let plan = Arc::new(
-            trusted_server_core::auction::compile_auction_plan(&settings)
+            compile_auction_plan_with(&settings, &trusted_server_modules::builders())
                 .expect("should compile auction plan"),
         );
         let orchestrator = trusted_server_core::auction::build_orchestrator_with_plan(plan)
@@ -3315,9 +3318,12 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();
-        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let stock = trusted_server_modules::builders();
+        let plan = Arc::new(
+            compile_auction_plan_with(&settings, &stock).expect("should compile auction plan"),
+        );
         let registry = Arc::new(
-            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+            IntegrationRegistry::with_plan_and_registrations(&settings, Arc::clone(&plan), &stock)
                 .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(

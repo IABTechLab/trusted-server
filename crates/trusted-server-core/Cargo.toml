@@ -69,8 +69,11 @@ edgezero-core = { workspace = true }
 client-fixed-demo = []
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
-# so downstream crates can build registries with stub integrations in their tests.
-test-utils = []
+# and the platform test doubles, so downstream crates can build registries with
+# stub integrations and run against stub services in their tests. The doubles
+# are built on the platform library's own, which its feature of the same name
+# offers.
+test-utils = ["edgezero-core/test-utils"]
 
 [dev-dependencies]
 config = { workspace = true }

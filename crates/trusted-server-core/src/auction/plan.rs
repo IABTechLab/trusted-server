@@ -283,6 +283,7 @@ pub struct AuctionPlan {
     bidder_routes: BTreeMap<BidderId, usize>,
     signing_enabled: bool,
     adserver: Option<AdServerPlan>,
+    publishes_auction_token: bool,
 }
 
 impl AuctionPlan {
@@ -292,8 +293,23 @@ impl AuctionPlan {
         self.enabled
     }
 
-    pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
+    /// Return the plan with auction execution switched on or off, which is how
+    /// `[auction] enabled` is applied to a compiled plan.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Return whether each auction publishes a token with its winning bids,
+    /// which it does when a module that runs reads one.
+    #[must_use]
+    pub fn publishes_auction_token(&self) -> bool {
+        self.publishes_auction_token
+    }
+
+    pub(crate) fn with_auction_token(mut self, publishes: bool) -> Self {
+        self.publishes_auction_token = publishes;
         self
     }
 
@@ -447,6 +463,7 @@ impl AuctionPlan {
             bidder_routes,
             signing_enabled,
             adserver,
+            publishes_auction_token: false,
         })
     }
 }
@@ -575,11 +592,11 @@ impl AuctionPlan {
             .any(|provider| provider.implementation.id == implementation_id)
     }
 
-    /// Borrow validated client-visible bidder route codes in deterministic order.
+    /// Borrow the validated bidder route codes in deterministic order.
     ///
-    /// This intentionally exposes route keys rather than provider identities or
-    /// implementation settings for the browser Prebid injection boundary.
-    pub(crate) fn browser_bidder_codes(&self) -> impl Iterator<Item = &str> {
+    /// These are the route keys alone, with no source name and no
+    /// implementation setting, so a page module may show them to a browser.
+    pub fn browser_bidder_codes(&self) -> impl Iterator<Item = &str> {
         self.bidder_routes.keys().map(BidderId::as_str)
     }
 
@@ -750,9 +767,7 @@ fn compile_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::aps::ApsDemand;
-    use crate::integrations::openrtb::OpenRtbDemand;
-    use crate::integrations::prebid_server::PrebidServerDemand;
+    use crate::auction::test_support::plain_fixture::PlainDemand;
     use crate::provider_table::IMPLEMENTATION_KEY;
     use serde_json::json;
 
@@ -772,21 +787,13 @@ mod tests {
 
     /// One `[demand.<name>]` table naming an implementation.
     fn table(implementation: &str) -> Map<String, Value> {
-        let mut table = Map::from_iter([
+        Map::from_iter([
             (IMPLEMENTATION_KEY.to_string(), json!(implementation)),
             (
                 ENDPOINT_KEY.to_string(),
                 json!("https://bid.example/openrtb2/auction"),
             ),
-        ]);
-        if implementation == "auction.aps" {
-            table.insert(
-                ENDPOINT_KEY.to_string(),
-                json!("https://aps.example/e/pb/bid"),
-            );
-            table.insert("account_id".to_string(), json!("example-account"));
-        }
-        table
+        ])
     }
 
     /// A `[demand]` table selecting every name given, in order.
@@ -814,7 +821,7 @@ mod tests {
 
     /// A plan with one ordinary `OpenRTB` source called `one`.
     fn one_source() -> AuctionPlanConfig {
-        config(vec![("one", table("auction-protocol.openrtb"))])
+        config(vec![("one", table("auction.plain-fixture"))])
     }
 
     fn id(value: &str) -> ProviderId {
@@ -825,27 +832,11 @@ mod tests {
         BidderId::from_str(value).expect("should parse bidder ID")
     }
 
-    fn nested_object(levels: usize) -> Value {
-        let mut value = Value::String("leaf".to_string());
-        for level in 0..levels {
-            value = Value::Object(Map::from_iter([(format!("level_{level}"), value)]));
-        }
-        value
-    }
-
-    fn nested_array(levels: usize) -> Value {
-        let mut value = Value::String("leaf".to_string());
-        for _ in 0..levels {
-            value = Value::Array(vec![value]);
-        }
-        value
-    }
-
     #[test]
     fn target_validation_accepts_fanout_and_rejects_unsupported_targets() {
         let plan = AuctionPlan::compile(config(vec![
-            ("provider_one", table("auction-protocol.openrtb")),
-            ("provider_two", table("auction-protocol.openrtb")),
+            ("provider_one", table("auction.plain-fixture")),
+            ("provider_two", table("auction.plain-fixture")),
         ]))
         .expect("should compile plan");
 
@@ -876,8 +867,8 @@ mod tests {
         raw.demand = ProviderList::new(
             vec!["one".to_string()],
             BTreeMap::from([
-                ("one".to_string(), table("auction-protocol.openrtb")),
-                ("left_behind".to_string(), table("auction-protocol.openrtb")),
+                ("one".to_string(), table("auction.plain-fixture")),
+                ("left_behind".to_string(), table("auction.plain-fixture")),
             ]),
         );
         let error = AuctionPlan::compile(raw).expect_err("should refuse a table nothing selects");
@@ -890,16 +881,15 @@ mod tests {
 
     #[test]
     fn an_unknown_implementation_names_the_ones_this_build_has() {
-        let mut absent = table("auction-protocol.openrtb");
+        let mut absent = table("auction.plain-fixture");
         absent.insert(IMPLEMENTATION_KEY.to_string(), json!("fictional_exchange"));
         let error = AuctionPlan::compile(config(vec![("one", absent)]))
             .expect_err("should refuse an implementation this build does not have");
         let message = error.to_string();
         for expected in [
             "fictional_exchange",
-            "auction-protocol.openrtb",
-            "auction.prebid-server",
-            "auction.aps",
+            "auction.plain-fixture",
+            "auction.fixture",
         ] {
             assert!(
                 message.contains(expected),
@@ -921,7 +911,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("uses implementation `exchange`")
-                && message.contains("auction-protocol.openrtb"),
+                && message.contains("auction.plain-fixture"),
             "should list the implementations by module path: {error:?}"
         );
     }
@@ -930,25 +920,25 @@ mod tests {
     fn an_ad_server_named_by_its_short_form_needs_no_implementation_line() {
         let mut raw = one_source();
         raw.adserver = ProviderChoice::new(
-            Some("mock".to_string()),
+            Some("fixture".to_string()),
             BTreeMap::from([(
-                "mock".to_string(),
+                "fixture".to_string(),
                 Map::from_iter([(
                     ENDPOINT_KEY.to_string(),
                     json!("https://adserver.example/mediate"),
                 )]),
             )]),
         );
-        let plan = AuctionPlan::compile(raw).expect("should resolve `mock` within [ad-server]");
+        let plan = AuctionPlan::compile(raw).expect("should resolve `fixture` within [ad-server]");
         assert_eq!(
             plan.adserver().map(|adserver| adserver.implementation.id),
-            Some("ad-server.mock")
+            Some("ad-server.fixture")
         );
     }
 
     #[test]
     fn a_demand_table_needs_an_endpoint() {
-        let mut without = table("auction-protocol.openrtb");
+        let mut without = table("auction.plain-fixture");
         without.remove(ENDPOINT_KEY);
         let error = AuctionPlan::compile(config(vec![("one", without)]))
             .expect_err("should refuse a source with no endpoint");
@@ -992,21 +982,21 @@ mod tests {
 
     #[test]
     fn all_eligible_is_refused_for_an_implementation_that_forbids_it() {
-        let mut prebid = table("auction.prebid-server");
-        prebid.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
-        let error = AuctionPlan::compile(config(vec![("pbs_main", prebid)]))
-            .expect_err("should refuse all_eligible Prebid Server routing");
+        let mut explicit_only = table("auction.fixture");
+        explicit_only.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        let error = AuctionPlan::compile(config(vec![("explicit_main", explicit_only)]))
+            .expect_err("should refuse all_eligible routing for the implementation");
         let message = error.to_string();
-        for expected in ["pbs_main", "all_eligible", "auction.prebid-server"] {
+        for expected in ["explicit_main", "all_eligible", "auction.fixture"] {
             assert!(
                 message.contains(expected),
                 "should name the source, the routing and the implementation: {error:?}"
             );
         }
 
-        let mut openrtb = table("auction-protocol.openrtb");
-        openrtb.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
-        AuctionPlan::compile(config(vec![("openrtb_main", openrtb)]))
+        let mut plain = table("auction.plain-fixture");
+        plain.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        AuctionPlan::compile(config(vec![("plain_main", plain)]))
             .expect("should keep all_eligible for an implementation that allows it");
     }
 
@@ -1036,8 +1026,8 @@ mod tests {
     #[test]
     fn sources_keep_the_order_they_were_selected_in_and_routes_are_deterministic() {
         let mut raw = config(vec![
-            ("z_provider", table("auction-protocol.openrtb")),
-            ("a_provider", table("auction-protocol.openrtb")),
+            ("z_provider", table("auction.plain-fixture")),
+            ("a_provider", table("auction.plain-fixture")),
         ]);
         raw.bidders.insert(
             bidder("z-bidder"),
@@ -1073,34 +1063,33 @@ mod tests {
     #[test]
     fn two_sources_can_run_one_implementation_under_their_own_names() {
         let plan = AuctionPlan::compile(config(vec![
-            ("pbs_a", table("auction.prebid-server")),
-            ("pbs_b", table("auction.prebid-server")),
+            ("source_a", table("auction.plain-fixture")),
+            ("source_b", table("auction.plain-fixture")),
         ]))
-        .expect("should compile two Prebid Server sources");
+        .expect("should compile two sources of one implementation");
         assert_eq!(plan.providers().len(), 2);
         assert!(
             plan.providers()
                 .iter()
-                .all(|provider| provider.implementation.id == "auction.prebid-server"),
+                .all(|provider| provider.implementation.id == "auction.plain-fixture"),
             "both names should resolve to the same implementation"
         );
         assert!(
             plan.providers()
                 .iter()
-                .all(|provider| provider.demand.as_any().is::<PrebidServerDemand>()),
+                .all(|provider| provider.demand.as_any().is::<PlainDemand>()),
             "each source should compile its own settings"
         );
     }
 
     #[test]
     fn implementation_defaults_and_an_explicit_timeout_are_resolved() {
-        let mut override_table = table("auction.prebid-server");
+        let mut override_table = table("auction.fixture");
         override_table.insert(TIMEOUT_KEY.to_string(), json!(321));
         let plan = AuctionPlan::compile(config(vec![
-            ("openrtb_one", table("auction-protocol.openrtb")),
-            ("pbs_one", table("auction.prebid-server")),
-            ("aps_one", table("auction.aps")),
-            ("pbs_override", override_table),
+            ("plain_one", table("auction.plain-fixture")),
+            ("fixed_one", table("auction.fixture")),
+            ("fixed_override", override_table),
         ]))
         .expect("should resolve timeouts");
         let timeouts = plan
@@ -1108,29 +1097,27 @@ mod tests {
             .iter()
             .map(|provider| (provider.id.as_str(), provider.timeout_ms))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(timeouts["openrtb_one"], 1500);
-        assert_eq!(timeouts["pbs_one"], 1000);
-        assert_eq!(timeouts["aps_one"], 800);
-        assert_eq!(timeouts["pbs_override"], 321);
+        assert_eq!(timeouts["plain_one"], 1500);
+        assert_eq!(timeouts["fixed_one"], 1000);
+        assert_eq!(timeouts["fixed_override"], 321);
     }
 
     #[test]
     fn the_plan_reports_which_implementations_it_selected() {
-        let plan = AuctionPlan::compile(config(vec![("pbs", table("auction.prebid-server"))]))
+        let plan = AuctionPlan::compile(config(vec![("source", table("auction.fixture"))]))
             .expect("should compile without Settings or browser integration state");
-        assert!(!plan.has_implementation("auction.aps"));
-        assert!(plan.has_implementation("auction.prebid-server"));
+        assert!(!plan.has_implementation("auction.plain-fixture"));
+        assert!(plan.has_implementation("auction.fixture"));
 
-        let plan = AuctionPlan::compile(config(vec![("aps_instance", table("auction.aps"))]))
-            .expect("should compile APS plan");
+        let plan = AuctionPlan::compile(one_source()).expect("should compile a plain source");
         assert!(
-            plan.has_implementation("auction.aps"),
-            "a validated plan should expose its APS renderer capability"
+            plan.has_implementation("auction.plain-fixture"),
+            "a validated plan should say which implementation it selected"
         );
-        assert!(!plan.has_implementation("auction.prebid-server"));
+        assert!(!plan.has_implementation("auction.fixture"));
         assert!(
-            plan.providers()[0].demand.as_any().is::<ApsDemand>(),
-            "the APS source should compile its own settings"
+            plan.providers()[0].demand.as_any().is::<PlainDemand>(),
+            "the source should compile its own settings"
         );
     }
 
@@ -1152,7 +1139,7 @@ mod tests {
 
     #[test]
     fn compiler_canonicalizes_https_endpoints_and_rejects_unsafe_forms() {
-        let mut canonical = table("auction-protocol.openrtb");
+        let mut canonical = table("auction.plain-fixture");
         canonical.insert(
             ENDPOINT_KEY.to_string(),
             json!("https://BID.EXAMPLE:443/path"),
@@ -1170,22 +1157,13 @@ mod tests {
             "https://bid.example/path#fragment",
             "/relative",
         ] {
-            let mut raw = table("auction-protocol.openrtb");
+            let mut raw = table("auction.plain-fixture");
             raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             assert!(
                 AuctionPlan::compile(config(vec![("one", raw)])).is_err(),
                 "should reject {endpoint}"
             );
         }
-        let mut aps = table("auction.aps");
-        aps.insert(
-            ENDPOINT_KEY.to_string(),
-            json!("https://aps.example/e/dtb/bid"),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("aps", aps)])).is_err(),
-            "should refuse the legacy APS path"
-        );
     }
 
     #[test]
@@ -1196,7 +1174,7 @@ mod tests {
             "http://localhost:8000/openrtb2/auction",
             "http://LOCALHOST:8000/openrtb2/auction",
         ] {
-            let mut raw = table("auction-protocol.openrtb");
+            let mut raw = table("auction.plain-fixture");
             raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             AuctionPlan::compile(config(vec![("local", raw)]))
                 .unwrap_or_else(|error| panic!("should accept {endpoint}: {error:?}"));
@@ -1206,7 +1184,7 @@ mod tests {
             "http://bid.example/openrtb2/auction",
             "http://localhost.example/openrtb2/auction",
         ] {
-            let mut raw = table("auction-protocol.openrtb");
+            let mut raw = table("auction.plain-fixture");
             raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             let error = AuctionPlan::compile(config(vec![("remote", raw)]))
                 .expect_err("should reject plain HTTP off the loopback");
@@ -1218,38 +1196,29 @@ mod tests {
     }
 
     #[test]
-    fn only_prebid_server_completes_an_endpoint_that_names_a_host_alone() {
+    fn an_implementation_completes_an_endpoint_and_the_plain_one_leaves_it_as_written() {
         for (configured, expected) in [
             (
-                "https://pbs.example",
-                "https://pbs.example/openrtb2/auction",
+                "https://exchange.example",
+                "https://exchange.example/fixture/auction",
             ),
             (
-                "https://pbs.example/",
-                "https://pbs.example/openrtb2/auction",
+                "https://exchange.example/",
+                "https://exchange.example/fixture/auction",
             ),
             (
-                "https://pbs.example/openrtb2/auction",
-                "https://pbs.example/openrtb2/auction",
+                "https://exchange.example?region=example",
+                "https://exchange.example/fixture/auction?region=example",
             ),
             (
-                "https://pbs.example/openrtb2/auction/",
-                "https://pbs.example/openrtb2/auction",
-            ),
-            (
-                "https://pbs.example?region=example",
-                "https://pbs.example/openrtb2/auction?region=example",
-            ),
-            ("https://pbs.example/bid", "https://pbs.example/bid"),
-            (
-                "https://pbs.example/custom/pbs",
-                "https://pbs.example/custom/pbs",
+                "https://exchange.example/bid",
+                "https://exchange.example/bid",
             ),
         ] {
-            let mut pbs = table("auction.prebid-server");
-            pbs.insert(ENDPOINT_KEY.to_string(), json!(configured));
-            let plan = AuctionPlan::compile(config(vec![("pbs", pbs)]))
-                .expect("should compile Prebid Server endpoint");
+            let mut source = table("auction.fixture");
+            source.insert(ENDPOINT_KEY.to_string(), json!(configured));
+            let plan = AuctionPlan::compile(config(vec![("source", source)]))
+                .expect("should compile the endpoint");
             assert_eq!(
                 plan.providers()[0].endpoint.as_str(),
                 expected,
@@ -1257,91 +1226,19 @@ mod tests {
             );
         }
 
-        let mut openrtb = table("auction-protocol.openrtb");
-        openrtb.insert(ENDPOINT_KEY.to_string(), json!("https://bid.example/"));
-        let plan = AuctionPlan::compile(config(vec![("openrtb", openrtb)]))
+        let mut plain = table("auction.plain-fixture");
+        plain.insert(ENDPOINT_KEY.to_string(), json!("https://bid.example/"));
+        let plan = AuctionPlan::compile(config(vec![("plain", plain)]))
             .expect("should compile a root endpoint unchanged");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
             "https://bid.example/"
         );
-
-        let plan = AuctionPlan::compile(config(vec![("aps", table("auction.aps"))]))
-            .expect("should compile APS endpoint");
-        assert_eq!(
-            plan.providers()[0].endpoint.as_str(),
-            "https://aps.example/e/pb/bid"
-        );
-    }
-
-    #[test]
-    fn openrtb_extensions_are_bounded_and_cannot_claim_reserved_fields() {
-        let mut valid = table("auction-protocol.openrtb");
-        valid.insert(
-            "request_ext".to_string(),
-            json!({"fictional_account": "example"}),
-        );
-        valid.insert("imp_ext".to_string(), json!({"placement_group": "display"}));
-        let plan = AuctionPlan::compile(config(vec![("one", valid)]))
-            .expect("should compile static extensions");
-        let openrtb = plan.providers()[0]
-            .demand
-            .as_any()
-            .downcast_ref::<OpenRtbDemand>()
-            .expect("should compile the OpenRTB implementation");
-        assert_eq!(
-            openrtb.request_ext.as_object()["fictional_account"],
-            "example"
-        );
-
-        let mut reserved = table("auction-protocol.openrtb");
-        reserved.insert(
-            "request_ext".to_string(),
-            json!({"trusted_server": {"signature": "forged"}}),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("one", reserved)])).is_err(),
-            "should refuse an extension claiming a reserved field"
-        );
-
-        let mut too_large = table("auction-protocol.openrtb");
-        too_large.insert(
-            "request_ext".to_string(),
-            json!({"padding": "x".repeat(17 * 1024)}),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("one", too_large)])).is_err(),
-            "should refuse an extension over the size bound"
-        );
-
-        let mut too_deep = table("auction-protocol.openrtb");
-        too_deep.insert("request_ext".to_string(), nested_object(9));
-        assert!(
-            AuctionPlan::compile(config(vec![("one", too_deep)])).is_err(),
-            "should refuse an extension over the depth bound"
-        );
-
-        let mut deep_array = table("auction-protocol.openrtb");
-        deep_array.insert(
-            "request_ext".to_string(),
-            json!({"levels": nested_array(8)}),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("one", deep_array)])).is_err(),
-            "should count array levels toward the depth bound"
-        );
-
-        let mut not_an_object = table("auction-protocol.openrtb");
-        not_an_object.insert("request_ext".to_string(), json!("string"));
-        assert!(
-            AuctionPlan::compile(config(vec![("one", not_an_object)])).is_err(),
-            "should refuse an extension that is not an object"
-        );
     }
 
     #[test]
     fn notification_policy_rejects_duplicates_and_bounds() {
-        let mut valid = table("auction-protocol.openrtb");
+        let mut valid = table("auction.plain-fixture");
         valid.insert(
             NOTIFICATIONS_KEY.to_string(),
             json!({"suppress_all": true, "suppress_seats": ["seat-b", "seat-a"]}),
@@ -1369,7 +1266,7 @@ mod tests {
                     .collect(),
             ),
         ] {
-            let mut invalid = table("auction-protocol.openrtb");
+            let mut invalid = table("auction.plain-fixture");
             invalid.insert(
                 NOTIFICATIONS_KEY.to_string(),
                 json!({"suppress_seats": seats}),
@@ -1383,27 +1280,13 @@ mod tests {
 
     #[test]
     fn an_implementation_rejects_settings_it_does_not_know() {
-        let mut pbs = table("auction.prebid-server");
-        pbs.insert("browser_only".to_string(), json!(true));
-        let error = AuctionPlan::compile(config(vec![("pbs", pbs)]))
+        let mut source = table("auction.fixture");
+        source.insert("browser_only".to_string(), json!(true));
+        let error = AuctionPlan::compile(config(vec![("source", source)]))
             .expect_err("should refuse a setting the implementation does not know");
         assert!(
             format!("{error:?}").contains("browser_only"),
             "should name the setting: {error:?}"
-        );
-
-        let mut aps = table("auction.aps");
-        aps.insert("inventory_domain".to_string(), json!("publisher.example"));
-        assert!(
-            AuctionPlan::compile(config(vec![("aps", aps)])).is_err(),
-            "should refuse an APS inventory domain without its page origin"
-        );
-
-        let mut without_account = table("auction.aps");
-        without_account.remove("account_id");
-        assert!(
-            AuctionPlan::compile(config(vec![("aps", without_account)])).is_err(),
-            "should refuse an APS source with no account"
         );
     }
 
@@ -1434,18 +1317,18 @@ mod tests {
 
     #[test]
     fn routing_signing_and_the_selected_ad_server_are_preserved_in_the_plan() {
-        let mut openrtb = table("auction-protocol.openrtb");
-        openrtb.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
-        let mut raw = config(vec![("one", openrtb)]);
+        let mut plain = table("auction.plain-fixture");
+        plain.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        let mut raw = config(vec![("one", plain)]);
         raw.request_signing = Some(RequestSigning {
             enabled: true,
             config_store_id: "example-config-store".to_string(),
             secret_store_id: "example-secret-store".to_string(),
         });
         raw.adserver = ProviderChoice::new(
-            Some("mock".to_string()),
+            Some("fixture".to_string()),
             BTreeMap::from([(
-                "mock".to_string(),
+                "fixture".to_string(),
                 Map::from_iter([(
                     ENDPOINT_KEY.to_string(),
                     json!("http://127.0.0.1:6767/adserver/mediate"),
@@ -1457,7 +1340,7 @@ mod tests {
         assert!(plan.signing_enabled());
         assert_eq!(
             plan.adserver().map(|adserver| adserver.id.as_str()),
-            Some("mock")
+            Some("fixture")
         );
 
         let mut invalid = config(Vec::new());
@@ -1479,7 +1362,7 @@ mod tests {
             BTreeMap::from([(
                 "house".to_string(),
                 Map::from_iter([
-                    (IMPLEMENTATION_KEY.to_string(), json!("mock")),
+                    (IMPLEMENTATION_KEY.to_string(), json!("fixture")),
                     (
                         ENDPOINT_KEY.to_string(),
                         json!("https://adserver.example/mediate"),
@@ -1491,13 +1374,13 @@ mod tests {
         let plan = AuctionPlan::compile(raw).expect("should compile a named ad server");
         let adserver = plan.adserver().expect("should select an ad server");
         assert_eq!(adserver.id.as_str(), "house");
-        assert_eq!(adserver.implementation.id, "ad-server.mock");
+        assert_eq!(adserver.implementation.id, "ad-server.fixture");
 
         let mut unknown_setting = one_source();
         unknown_setting.adserver = ProviderChoice::new(
-            Some("mock".to_string()),
+            Some("fixture".to_string()),
             BTreeMap::from([(
-                "mock".to_string(),
+                "fixture".to_string(),
                 Map::from_iter([
                     (
                         ENDPOINT_KEY.to_string(),

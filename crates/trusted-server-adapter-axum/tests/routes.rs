@@ -938,7 +938,7 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     );
 }
 
-/// Builds a registration claiming an id a built-in integration already owns.
+/// Builds a registration claiming an id a stock module already owns.
 fn duplicate_lockr_registration(
     _settings: &trusted_server_core::settings::Settings,
 ) -> Result<
@@ -972,7 +972,7 @@ fn routes_with_registrations_rejects_a_duplicate_integration_id_naming_both_sour
     let message = error.to_string();
     assert!(
         message.contains("lockr")
-            && message.contains("trusted-server-core")
+            && message.contains("trusted-server-identity-lockr")
             && message.contains("seam-probe"),
         "error should name the id and both sources: {message}"
     );

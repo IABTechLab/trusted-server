@@ -6487,6 +6487,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-ad-server-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-ad-tag-google"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-adapter-axum"
 version = "0.1.0"
 dependencies = [
@@ -6506,6 +6538,7 @@ dependencies = [
  "tower 0.4.13",
  "trusted-server-core",
  "trusted-server-integration-seam-probe",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -6532,6 +6565,7 @@ dependencies = [
  "toml",
  "trusted-server-core",
  "trusted-server-js",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -6565,6 +6599,7 @@ dependencies = [
  "trusted-server-device-fastly",
  "trusted-server-geo-fastly",
  "trusted-server-integration-seam-probe",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
@@ -6595,11 +6630,123 @@ dependencies = [
  "tokio",
  "trusted-server-core",
  "trusted-server-js",
+ "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+]
+
+[[package]]
+name = "trusted-server-auction-aps"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-auction-prebid"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-auction-prebid-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "url",
+ "validator",
+ "web-time",
+]
+
+[[package]]
+name = "trusted-server-auction-protocol-openrtb"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "error-stack",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-audience-permutive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "trusted-server-core",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-bot-protection-datadome"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "temp-env",
+ "toml",
+ "trusted-server-core",
+ "url",
+ "urlencoding",
+ "validator",
 ]
 
 [[package]]
@@ -6646,12 +6793,59 @@ dependencies = [
  "toml",
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
+ "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
  "trusted-server-core",
+ "trusted-server-modules",
  "url",
  "uuid",
  "webpki-roots",
  "which",
  "x509-parser",
+]
+
+[[package]]
+name = "trusted-server-cmp-didomi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-cmp-osano"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-cmp-sourcepoint"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "trusted-server-core",
+ "url",
+ "validator",
 ]
 
 [[package]]
@@ -6716,6 +6910,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-framework-nextjs"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "uuid",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-geo-fastly"
 version = "0.1.0"
 dependencies = [
@@ -6723,6 +6931,21 @@ dependencies = [
  "error-stack",
  "fastly",
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-identity-lockr"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "trusted-server-core",
+ "validator",
 ]
 
 [[package]]
@@ -6770,6 +6993,7 @@ dependencies = [
  "trusted-server-adapter-cloudflare",
  "trusted-server-adapter-spin",
  "trusted-server-core",
+ "trusted-server-modules",
  "urlencoding",
 ]
 
@@ -6781,6 +7005,32 @@ dependencies = [
  "hex",
  "sha2 0.10.9",
  "which",
+]
+
+[[package]]
+name = "trusted-server-modules"
+version = "0.1.0"
+dependencies = [
+ "edgezero-core",
+ "http",
+ "serde_json",
+ "tokio",
+ "trusted-server-ad-server-mock",
+ "trusted-server-ad-tag-google",
+ "trusted-server-auction-aps",
+ "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
+ "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
+ "trusted-server-cmp-didomi",
+ "trusted-server-cmp-osano",
+ "trusted-server-cmp-sourcepoint",
+ "trusted-server-core",
+ "trusted-server-framework-nextjs",
+ "trusted-server-identity-lockr",
+ "trusted-server-tag-google-tag-manager",
+ "trusted-server-testing-testlight",
 ]
 
 [[package]]
@@ -6833,6 +7083,40 @@ name = "trusted-server-permission-signal-us-privacy"
 version = "0.1.0"
 dependencies = [
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-tag-google-tag-manager"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "trusted-server-framework-nextjs",
+ "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-testing-testlight"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "validator",
 ]
 
 [[package]]

@@ -247,7 +247,7 @@ treated as invalid for experiment reporting.
 
 ## Implementation
 
-- **Rust**: [crates/trusted-server-core/src/integrations/gpt.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/gpt.rs)
+- **Rust**: [crates/ad-tag/google/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/ad-tag/google/src/lib.rs)
 - **TypeScript**: [crates/trusted-server-js/lib/src/integrations/gpt/](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-js/lib/src/integrations/gpt/)
 
 ## Next Steps

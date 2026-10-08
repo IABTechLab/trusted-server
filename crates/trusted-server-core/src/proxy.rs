@@ -98,7 +98,10 @@ const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 11] = [
 /// All three take effect against the serving origin, so leaving them in place
 /// would let an upstream write first-party cookies, pin HSTS, or clear the
 /// publisher's site data.
-pub(crate) const FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS: [&str; 3] =
+///
+/// Public so an integration crate that passes an upstream body through strips
+/// the same three.
+pub const FIRST_PARTY_PASSTHROUGH_STRIP_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Cache-control value used when asset proxy responses must not be stored.
@@ -1250,7 +1253,11 @@ fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
 ///
 /// Comparison is case-insensitive. The wildcard check requires a dot boundary,
 /// so `"*.example.com"` does **not** match `"evil-example.com"`.
-pub(crate) fn is_host_allowed(host: &str, pattern: &str) -> bool {
+///
+/// Public so an integration crate matches a host against an operator's
+/// allowed domains the way the proxy does.
+#[must_use]
+pub fn is_host_allowed(host: &str, pattern: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let pattern = pattern.to_ascii_lowercase();
 

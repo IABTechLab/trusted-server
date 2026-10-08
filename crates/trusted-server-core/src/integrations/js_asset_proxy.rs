@@ -658,8 +658,7 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: crate::integrations::IntegrationRequestState::default(),
             permissions_script: None,
         });
         let pipeline_config = PipelineConfig {
@@ -852,92 +851,117 @@ mod tests {
     #[test]
     fn js_asset_proxy_rewriter_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::tag_fixture::MODULE,
+        );
         settings
             .insert_module_config(
                 "proxy",
                 "js_asset_proxy",
                 &json!({
                     "assets": [{
-                        "path": "/assets/gpt.js",
-                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "path": "/assets/sdk.js",
+                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
                         "proxy": "enabled"
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></body></html>"#;
+        let html = format!(
+            r#"<html><body><script src="{}"></script></body></html>"#,
+            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+        );
 
-        let processed = process_html_with_registry(html, registry);
+        let processed = process_html_with_registry(&html, registry);
 
         assert!(
-            processed.contains(r#"<script src="/assets/gpt.js"></script>"#),
-            "JS asset proxy should rewrite before GPT native rewriter: {processed}"
+            processed.contains(r#"<script src="/assets/sdk.js"></script>"#),
+            "JS asset proxy should rewrite before the integration's own rewriter: {processed}"
         );
         assert!(
-            !processed.contains("/integrations/gpt/script"),
-            "GPT native rewrite should not override JS asset proxy"
+            !processed.contains(
+                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+            ),
+            "the integration's own rewrite should not override JS asset proxy"
         );
     }
 
     #[test]
     fn js_asset_proxy_blocking_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::tag_fixture::MODULE,
+        );
         settings
             .insert_module_config(
                 "proxy",
                 "js_asset_proxy",
                 &json!({
                     "assets": [{
-                        "path": "/assets/gpt.js",
-                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "path": "/assets/sdk.js",
+                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
                         "proxy": "blocked"
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js">googletag.cmd.push(() => {});</script></body></html>"#;
+        let html = format!(
+            r#"<html><body><script src="{}">vendor.cmd.push(() => {{}});</script></body></html>"#,
+            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+        );
 
-        let processed = process_html_with_registry(html, registry);
+        let processed = process_html_with_registry(&html, registry);
 
         assert!(
-            !processed.contains("googletag.cmd"),
-            "blocked JS asset should remove the script element before GPT can rewrite it"
+            !processed.contains("vendor.cmd"),
+            "blocked JS asset should remove the script element before the integration can rewrite it"
         );
         assert!(
-            !processed.contains("/integrations/gpt/script"),
-            "GPT native rewrite should not keep a blocked script"
+            !processed.contains(
+                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+            ),
+            "the integration's own rewrite should not keep a blocked script"
         );
     }
 
     #[test]
     fn disabled_js_asset_proxy_candidate_allows_native_rewriters() {
         let mut settings = create_test_settings();
-        settings.select_module("ad-tag", "ad-tag.google");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::tag_fixture::MODULE,
+        );
         settings
             .insert_module_config(
                 "proxy",
                 "js_asset_proxy",
                 &json!({
                     "assets": [{
-                        "path": "/assets/gpt.js",
-                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "path": "/assets/sdk.js",
+                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
                         "proxy": "disabled"
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></body></html>"#;
+        let html = format!(
+            r#"<html><body><script src="{}"></script></body></html>"#,
+            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+        );
 
-        let processed = process_html_with_registry(html, registry);
+        let processed = process_html_with_registry(&html, registry);
 
         assert!(
-            processed.contains(r#"<script src="/integrations/gpt/script"></script>"#),
-            "disabled JS asset proxy entries should not suppress native integration rewrites"
+            processed.contains(&format!(
+                r#"<script src="{}"></script>"#,
+                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+            )),
+            "disabled JS asset proxy entries should not suppress an integration's own rewrite"
         );
     }
 

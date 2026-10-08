@@ -109,26 +109,26 @@ diff; it does not move inline values to a secret store.
 The following table records the independent lifecycle, key-identity,
 serialization, runtime, and secret axes for every exceptional field:
 
-| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
-| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
-| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
-| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
-| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | deliberately inline      |
+| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime                 | Secret handling          |
+| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | ----------------------- | ------------------------ |
+| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only    | none                     |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | serialized    | discarded by the module | none                     |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | serialized    | discarded by the module | none                     |
+| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `Handler.password`                                           | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away         | none                     |
+| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away         | accepted, then discarded |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away         | none                     |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active                  | deliberately inline      |
 
 Prepare an initial reference-based deployment in this order:
 
@@ -1624,10 +1624,8 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 A page integration is a module, selected in the section of its type, and
 each one that has settings gets its own `[<section>.<name>]` table. A
-module's name is `<type>.<name>`. For a module with a crate of its own that
-is the crate's path under `crates/`, and an integration still in core
-carries the name its crate will have, so its section and table stay the
-same when it moves out. There is no `enabled` flag and no `[integration]`
+module's name is `<type>.<name>`, which is the path under `crates/` of the
+crate the module lives in. There is no `enabled` flag and no `[integration]`
 table, because a module no section selects does not run, and an `enabled`
 key left in a module's table refuses startup. The full rule set is in
 [Configuration Rules](/guide/configuration-rules). Every module that deploy

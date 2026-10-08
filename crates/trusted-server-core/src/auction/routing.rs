@@ -17,8 +17,8 @@ const STORED_REQUEST_FIELD: &str = "storedRequest";
 
 /// Maximum bidder entries admitted from one browser `bidderParams` envelope.
 pub(crate) const MAX_BIDDER_ENTRIES: usize = 128;
-/// Maximum UTF-8 byte length of the optional Prebid zone fact.
-pub(crate) const MAX_PREBID_ZONE_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of the zone a browser may name for a slot.
+pub(crate) const MAX_ZONE_BYTES: usize = 256;
 
 /// Immutable provider-local routing output in deterministic provider-ID order.
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ impl RoutedAuction {
         self.diagnostics
     }
 
-    /// Request headers approved for later Prebid transport forwarding.
+    /// Request headers approved for forwarding to a demand source.
     pub(crate) fn transport_headers(&self) -> &TransportHeaders {
         &self.transport_headers
     }
@@ -201,13 +201,16 @@ impl ProviderSlotInput {
         self.bidder_params.is_empty() && self.allows_stored_fallback()
     }
 
-    pub(crate) fn allows_stored_fallback(&self) -> bool {
+    /// Whether a stored request may stand in for this slot when it is left
+    /// with no usable inline bidder parameters.
+    #[must_use]
+    pub fn allows_stored_fallback(&self) -> bool {
         self.stored_request
             .allows_fallback(!self.bidder_params.is_empty())
     }
 }
 
-/// Request headers approved for later Prebid transport forwarding.
+/// Request headers approved for forwarding to a demand source.
 ///
 /// Values remain as raw [`HeaderValue`] instances so non-ASCII bytes retain
 /// the same legacy handling. Client-supplied `X-Forwarded-For` is never read.
@@ -533,7 +536,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     }
     let zone = match object.get(ZONE_FIELD) {
         None => None,
-        Some(Value::String(zone)) if zone.len() <= MAX_PREBID_ZONE_BYTES => Some(zone.clone()),
+        Some(Value::String(zone)) if zone.len() <= MAX_ZONE_BYTES => Some(zone.clone()),
         Some(_) => return None,
     };
     let params = match object.get(BIDDER_PARAMS_FIELD) {
@@ -600,20 +603,23 @@ mod tests {
         table
     }
 
-    fn routing_plan_config(aps_routing: RoutingMode) -> crate::auction::plan::AuctionPlanConfig {
+    fn routing_plan_config(open_routing: RoutingMode) -> crate::auction::plan::AuctionPlanConfig {
         let mut config = plan_config(vec![
-            ("aps_primary", provider("auction.aps", aps_routing)),
             (
-                "pbs_a",
-                provider("auction.prebid-server", RoutingMode::Explicit),
+                "open_primary",
+                provider("auction.plain-fixture", open_routing),
             ),
             (
-                "pbs_b",
-                provider("auction.prebid-server", RoutingMode::Explicit),
+                "stored_a",
+                provider("auction.fixture", RoutingMode::Explicit),
+            ),
+            (
+                "stored_b",
+                provider("auction.fixture", RoutingMode::Explicit),
             ),
             (
                 "openrtb_direct",
-                provider("auction-protocol.openrtb", RoutingMode::Explicit),
+                provider("auction.plain-fixture", RoutingMode::Explicit),
             ),
         ]);
         config.timeout_ms = 900;
@@ -626,7 +632,7 @@ mod tests {
             (
                 BidderId::from_str("alpha").expect("should parse bidder"),
                 BidderRouteConfig {
-                    module: ProviderId::from_str("pbs_a").expect("should parse provider"),
+                    module: ProviderId::from_str("stored_a").expect("should parse provider"),
                 },
             ),
             (
@@ -708,8 +714,8 @@ mod tests {
     }
 
     #[test]
-    fn pbs_admission_respects_intent_without_changing_aps_eligibility() {
-        for (params, pbs_ids) in [
+    fn stored_admission_respects_intent_without_changing_all_eligible_routing() {
+        for (params, stored_ids) in [
             (json!({"bidderParams":{}, "storedRequest":false}), vec![]),
             (
                 json!({"bidderParams":{"unknown":{"id":1}}, "storedRequest":false}),
@@ -718,18 +724,18 @@ mod tests {
             (json!({"bidderParams":{"unknown":{"id":1}}}), vec![]),
             (
                 json!({"bidderParams":{"alpha":{}}, "storedRequest":false}),
-                vec!["pbs_a"],
+                vec!["stored_a"],
             ),
-            (json!({"bidderParams":{"alpha":{}}}), vec!["pbs_a"]),
+            (json!({"bidderParams":{"alpha":{}}}), vec!["stored_a"]),
             (
                 json!({"bidderParams":{"alpha":{"id":1}}, "storedRequest":true}),
-                vec!["pbs_a", "pbs_b"],
+                vec!["stored_a", "stored_b"],
             ),
             (
                 json!({"bidderParams":{}, "storedRequest":true}),
-                vec!["pbs_a", "pbs_b"],
+                vec!["stored_a", "stored_b"],
             ),
-            (json!({"bidderParams":{}}), vec!["pbs_a", "pbs_b"]),
+            (json!({"bidderParams":{}}), vec!["stored_a", "stored_b"]),
         ] {
             let routed = route_auction(
                 request(vec![slot(HashMap::from([(
@@ -740,8 +746,8 @@ mod tests {
                 &plan(),
                 None,
             );
-            let mut expected = vec!["aps_primary"];
-            expected.extend(pbs_ids);
+            let mut expected = vec!["open_primary"];
+            expected.extend(stored_ids);
             assert_eq!(
                 routed
                     .inputs()
@@ -776,9 +782,9 @@ mod tests {
                         route_auction(request(vec![slot(bidders)]), &inbound(), &plan(), None);
                     assert_eq!(routed.diagnostics().malformed_envelope_count(), 1);
                     assert_eq!(routed.inputs().len(), if direct { 2 } else { 1 });
-                    assert_eq!(routed.inputs()[0].provider_id().as_str(), "aps_primary");
+                    assert_eq!(routed.inputs()[0].provider_id().as_str(), "open_primary");
                     if direct {
-                        let slot = &input(&routed, "pbs_a").slots()[0];
+                        let slot = &input(&routed, "stored_a").slots()[0];
                         assert!(!slot.allows_stored_fallback());
                         assert_eq!(slot.zone(), None);
                         assert_eq!(
@@ -796,11 +802,11 @@ mod tests {
         for (params, expected) in [
             (
                 json!({"bidderParams": {}, "storedRequest": true}),
-                vec!["aps_primary", "pbs_a", "pbs_b"],
+                vec!["open_primary", "stored_a", "stored_b"],
             ),
             (
                 json!({"bidderParams": {"alpha": {"placement": 1}}, "storedRequest": false}),
-                vec!["aps_primary", "pbs_a"],
+                vec!["open_primary", "stored_a"],
             ),
         ] {
             let routed = route_auction(
@@ -848,16 +854,16 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 ids,
-                vec!["aps_primary", "pbs_a", "pbs_b"],
-                "{name} should fan out to both PBS providers while APS remains all-eligible"
+                vec!["open_primary", "stored_a", "stored_b"],
+                "{name} should fan out to both stored-request sources while the all-eligible source keeps every slot"
             );
             assert!(
-                input(&routed, "pbs_a").slots()[0].allows_stored_fallback_without_candidates(),
+                input(&routed, "stored_a").slots()[0].allows_stored_fallback_without_candidates(),
                 "{name} should create stored intent"
             );
             assert!(
-                input(&routed, "pbs_b").slots()[0].allows_stored_fallback_without_candidates(),
-                "{name} should create stored intent for every PBS provider"
+                input(&routed, "stored_b").slots()[0].allows_stored_fallback_without_candidates(),
+                "{name} should create stored intent for every stored-request source"
             );
         }
     }
@@ -871,12 +877,12 @@ mod tests {
             None,
         );
         assert!(
-            input(&routed, "pbs_a").slots()[0].allows_stored_fallback_without_candidates(),
+            input(&routed, "stored_a").slots()[0].allows_stored_fallback_without_candidates(),
             "empty canonical demand should preserve stored-request behavior"
         );
         assert!(
-            input(&routed, "pbs_b").slots()[0].allows_stored_fallback_without_candidates(),
-            "empty canonical demand should fan out to same-profile PBS plans"
+            input(&routed, "stored_b").slots()[0].allows_stored_fallback_without_candidates(),
+            "empty canonical demand should fan out to the sources of one implementation"
         );
     }
 
@@ -907,7 +913,7 @@ mod tests {
             ("too many bidders", envelope(Some(too_many))),
             (
                 "oversized zone",
-                json!({"bidderParams": {}, "zone": "z".repeat(MAX_PREBID_ZONE_BYTES + 1)}),
+                json!({"bidderParams": {}, "zone": "z".repeat(MAX_ZONE_BYTES + 1)}),
             ),
             ("nonstring zone", json!({"bidderParams": {}, "zone": 1})),
         ];
@@ -924,10 +930,10 @@ mod tests {
             );
             assert!(
                 routed.inputs().iter().all(|provider| {
-                    provider.provider_id().as_str() != "pbs_a"
-                        && provider.provider_id().as_str() != "pbs_b"
+                    provider.provider_id().as_str() != "stored_a"
+                        && provider.provider_id().as_str() != "stored_b"
                 }),
-                "{name} should not produce stored or inline PBS demand"
+                "{name} should not produce stored or inline demand"
             );
             assert_eq!(
                 input(&routed, "openrtb_direct").slots()[0]
@@ -940,7 +946,7 @@ mod tests {
                 routed
                     .inputs()
                     .iter()
-                    .any(|provider| provider.provider_id().as_str() == "aps_primary"),
+                    .any(|provider| provider.provider_id().as_str() == "open_primary"),
                 "{name} should preserve independent all-eligible participation"
             );
         }
@@ -1011,12 +1017,12 @@ mod tests {
         assert_eq!(
             routed.inputs().len(),
             1,
-            "only all-eligible APS should remain"
+            "only the all-eligible source should remain"
         );
         assert_eq!(
             routed.inputs()[0].provider_id().as_str(),
-            "aps_primary",
-            "unknown demand should not cause PBS fallback"
+            "open_primary",
+            "unknown demand should not cause a stored fallback"
         );
     }
 
@@ -1041,7 +1047,7 @@ mod tests {
                 None,
             );
             assert_eq!(
-                input(&routed, "pbs_a").slots()[0].bidder_params()
+                input(&routed, "stored_a").slots()[0].bidder_params()
                     [&BidderId::from_str("alpha").expect("should parse bidder")]["source"],
                 expected_source,
                 "{name} should follow deterministic collision semantics"
@@ -1096,7 +1102,7 @@ mod tests {
                     TRUSTED_SERVER_ENVELOPE.to_string(),
                     json!({"zone": "home", "bidderParams": null}),
                 ),
-                ("alpha".to_string(), json!({"placement": "pbs"})),
+                ("alpha".to_string(), json!({"placement": "stored"})),
                 ("beta".to_string(), json!({"placement": "direct"})),
             ]))]),
             &inbound(),
@@ -1110,28 +1116,32 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["aps_primary", "pbs_a", "pbs_b", "openrtb_direct"],
+            vec!["open_primary", "stored_a", "stored_b", "openrtb_direct"],
             "inputs should follow deterministic provider-ID order"
         );
-        let aps = input(&routed, "aps_primary")
+        let open = input(&routed, "open_primary")
             .slots()
             .first()
             .expect("should have slot");
         assert!(
-            aps.bidder_params().is_empty(),
-            "APS must receive no foreign params"
+            open.bidder_params().is_empty(),
+            "a source that takes no bidder params must receive none"
         );
-        assert_eq!(aps.zone(), None, "APS must receive no Prebid zone");
-        let pbs_a = &input(&routed, "pbs_a").slots()[0];
-        assert_eq!(pbs_a.bidder_params().len(), 1);
+        assert_eq!(
+            open.zone(),
+            None,
+            "a source that takes no bidder params must receive no zone"
+        );
+        let stored_a = &input(&routed, "stored_a").slots()[0];
+        assert_eq!(stored_a.bidder_params().len(), 1);
         assert!(
-            !pbs_a.allows_stored_fallback_without_candidates(),
-            "inline params should win for this PBS provider"
+            !stored_a.allows_stored_fallback_without_candidates(),
+            "inline params should win for this source"
         );
-        assert_eq!(pbs_a.zone(), Some("home"));
-        let pbs_b = &input(&routed, "pbs_b").slots()[0];
-        assert!(pbs_b.bidder_params().is_empty());
-        assert!(pbs_b.allows_stored_fallback_without_candidates());
+        assert_eq!(stored_a.zone(), Some("home"));
+        let stored_b = &input(&routed, "stored_b").slots()[0];
+        assert!(stored_b.bidder_params().is_empty());
+        assert!(stored_b.allows_stored_fallback_without_candidates());
         let direct = &input(&routed, "openrtb_direct").slots()[0];
         assert_eq!(direct.bidder_params().len(), 1);
         assert!(direct.zone().is_none());
@@ -1184,7 +1194,7 @@ mod tests {
         assert_eq!(
             routed.inputs().len(),
             3,
-            "APS and two PBS providers should receive the eligible slot"
+            "the all-eligible source and two stored-request sources should receive the eligible slot"
         );
         for provider in routed.inputs() {
             assert_eq!(provider.slots().len(), 1);
@@ -1211,7 +1221,7 @@ mod tests {
                 .iter()
                 .map(ProviderId::as_str)
                 .collect::<Vec<_>>(),
-            vec!["aps_primary", "pbs_a", "pbs_b", "openrtb_direct"],
+            vec!["open_primary", "stored_a", "stored_b", "openrtb_direct"],
             "no-banner auction should retain every provider's deterministic skip outcome"
         );
     }
@@ -1233,15 +1243,15 @@ mod tests {
                 .iter()
                 .map(ProviderId::as_str)
                 .collect::<Vec<_>>(),
-            vec!["pbs_a", "pbs_b", "openrtb_direct"],
+            vec!["stored_a", "stored_b", "openrtb_direct"],
             "explicit providers with no routed demand should be retained as skipped"
         );
     }
 
     #[test]
-    fn trusted_routes_admit_explicit_aps_and_standard_and_ignore_unknown_provider() {
+    fn trusted_routes_admit_explicit_sources_and_ignore_unknown_provider() {
         let trusted_routes = TrustedProviderRoutes::new(vec![vec![
-            ProviderId::from_str("aps_primary").expect("should parse provider"),
+            ProviderId::from_str("open_primary").expect("should parse provider"),
             ProviderId::from_str("openrtb_direct").expect("should parse provider"),
             ProviderId::from_str("unknown_provider").expect("should parse provider"),
         ]]);
@@ -1261,7 +1271,7 @@ mod tests {
                 .iter()
                 .map(|input| input.provider_id().as_str())
                 .collect::<Vec<_>>(),
-            vec!["aps_primary", "openrtb_direct"],
+            vec!["open_primary", "openrtb_direct"],
             "only known server-owned provider routes should admit explicit providers"
         );
         assert_eq!(
@@ -1275,7 +1285,7 @@ mod tests {
                 .iter()
                 .map(ProviderId::as_str)
                 .collect::<Vec<_>>(),
-            vec!["pbs_a", "pbs_b"],
+            vec!["stored_a", "stored_b"],
             "unrouted explicit providers should retain skip outcomes"
         );
     }
@@ -1341,8 +1351,8 @@ mod tests {
         assert_eq!(routed.dnt(), Some(true));
         for provider in routed.inputs() {
             let expected_timeout = match provider.provider_id().as_str() {
-                "aps_primary" => 800,
-                id if id.starts_with("pbs_") => 1000,
+                "open_primary" => 900,
+                id if id.starts_with("stored_") => 1000,
                 _ => 900,
             };
             assert_eq!(provider.timeout_ms(), expected_timeout);
