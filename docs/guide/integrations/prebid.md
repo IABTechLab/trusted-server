@@ -45,7 +45,7 @@ name = "idl_env"
 expires = 15
 refresh_in_seconds = 1800
 
-# External bundle generation inputs used by `ts prebid bundle`.
+# External bundle generation inputs used by `ts prebid client`.
 # Values are exact Prebid module stems without `.js`.
 [integrations.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
@@ -198,11 +198,11 @@ versioned contract change. There is no time-based expiry in this fix.
 
 ## External Bundle Generation
 
-Use `ts prebid bundle` to build the publisher-specific browser bundle from
+Use `ts prebid client` to build the publisher-specific browser bundle from
 `[integrations.prebid.bundle.modules]` selections:
 
 ```bash
-ts prebid bundle
+ts prebid client
 ```
 
 The command writes generated artifacts to `dist/prebid/` by default and updates
@@ -248,7 +248,7 @@ upstream stems. For example, `adapters = ["rubicon"]` becomes
 `bidder = ["rubiconBidAdapter"]`; `client_side_bidders` continues to use the
 runtime code `rubicon`.
 
-`ts prebid bundle` rejects the removed `adapters`, `user_id_modules`, and
+`ts prebid client` rejects the removed `adapters`, `user_id_modules`, and
 `analytics_adapters` fields with the replacement path. Runtime config
 validation, `ts config push`, and server startup also reject the old bundle
 fields.
@@ -645,7 +645,7 @@ bidder = ["rubiconBidAdapter", "appnexusBidAdapter", "openxBidAdapter"]
 user_id = ["sharedIdSystem", "uid2IdSystem"]
 ```
 
-Run `ts prebid bundle` after changing the module list. The generator resolves
+Run `ts prebid client` after changing the module list. The generator resolves
 `prebid.js/modules/<stem>.js` through the pinned package and records both stems
 and registered bidder codes in `manifest.json`. At runtime, TSJS checks each
 `client_side_bidders` runtime code against that manifest.
@@ -749,7 +749,7 @@ The module must be present in the built bundle. Name it under
 `bundle.user_id_modules`, or omit that list to take the generator's default
 preset, which covers the commonly used modules.
 
-`ts prebid bundle` resolves every managed `name` through the checked-in
+`ts prebid client` resolves every managed `name` through the checked-in
 `user_id_modules.json` registry. An unknown name, a name that maps to more than
 one module, or two managed names that resolve to the same module — `sharedId`
 and `pubCommonId` both select `sharedIdSystem`, for example — fail before bundle
@@ -780,7 +780,7 @@ expires = 15
 refresh_in_seconds = 1800
 ```
 
-Run `ts prebid bundle`, upload the generated content-addressed bundle, copy its
+Run `ts prebid client`, upload the generated content-addressed bundle, copy its
 hash metadata into `[integrations.prebid]`, and validate the configuration
 before rollout.
 
