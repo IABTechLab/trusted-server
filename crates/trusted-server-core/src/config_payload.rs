@@ -750,6 +750,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_rewrite_clicks_follows_rewrite_creatives() {
+        for rewrite_creatives in [true, false] {
+            let mut original = test_settings();
+            original.auction.rewrite_creatives = rewrite_creatives;
+            let data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+            assert!(
+                data["auction"].get("rewrite_clicks").is_none(),
+                "should omit unset rewrite_clicks from the payload"
+            );
+
+            let reconstructed = load_settings(&envelope_json(&original))
+                .expect("should reconstruct settings without rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks, None,
+                "should load a blob without rewrite_clicks as unset"
+            );
+            assert_eq!(
+                reconstructed.auction.rewrites_auction_clicks(),
+                rewrite_creatives,
+                "should follow rewrite_creatives = {rewrite_creatives} when unset"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_rewrite_clicks_survives_blob_round_trip() {
+        for (rewrite_creatives, rewrite_clicks) in [(true, false), (false, true)] {
+            let mut original = test_settings();
+            original.auction.rewrite_creatives = rewrite_creatives;
+            original.auction.rewrite_clicks = Some(rewrite_clicks);
+
+            let reconstructed = load_settings(&envelope_json(&original))
+                .expect("should reconstruct explicit rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks,
+                Some(rewrite_clicks),
+                "should preserve rewrite_clicks = {rewrite_clicks} with rewrite_creatives = {rewrite_creatives}"
+            );
+        }
+    }
+
+    #[test]
     fn strings_that_look_like_json_scalars_round_trip_as_strings() {
         let mut original = test_settings();
         original.publisher.proxy_secret =

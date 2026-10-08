@@ -22669,6 +22669,50 @@ mod tests {
         }
 
         #[test]
+        fn build_bid_map_keeps_inline_anchors_raw_when_clicks_are_off() {
+            let mut settings = test_settings();
+            settings.auction.rewrite_creatives = true;
+            settings.auction.rewrite_clicks = Some(false);
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><a href=\"https://landing.example.com/page\"><img src=\"https://cdn.example.com/pixel.png\"></a></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("https://example.com/first-party/proxy?tsurl="),
+                "should still proxy the image with an absolute URL, got: {adm}"
+            );
+            assert!(
+                adm.contains("href=\"https://landing.example.com/page\""),
+                "should leave the landing link raw, got: {adm}"
+            );
+            assert!(
+                !adm.contains("data-tsclick") && !adm.contains("/first-party/click"),
+                "should not wrap the landing link, got: {adm}"
+            );
+        }
+
+        #[test]
         fn build_bid_map_uses_request_origin_for_inline_urls() {
             // The inline adm's absolute first-party URLs must resolve against the
             // origin the visitor is on (here an HTTP dev host with a port), not the
