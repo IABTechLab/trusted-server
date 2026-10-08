@@ -343,17 +343,35 @@ every publisher route returns 500 while `/health` keeps answering 200.
 
 When upgrading an existing service:
 
-- Deploy only through the managed path, `ts deploy --adapter fastly
---application-release <release-root>` or EdgeZero's `deploy-fastly` action, so
-  the `trusted_server_secrets` link exists before activation.
+- Deploy only through the managed path, so the `trusted_server_secrets` link
+  exists before activation: run
+  `ts deploy --adapter fastly --application-release <release-root>` with
+  `EDGEZERO_MANIFEST` set to the release's `edgezero.toml`, or use EdgeZero's
+  `deploy-fastly` action.
+- Move each physical-name selector into the deploy environment before the
+  first managed deploy. Copy every service-scoped
+  `EDGEZERO__SERVICES__<SERVICE_ID>__STORES__<KIND>__<ID>__NAME` entry from
+  `edgezero_runtime_env` to the unscoped
+  `EDGEZERO__STORES__<KIND>__<ID>__NAME` variable. An unset selector falls
+  back to the logical ID, so the deploy links whichever account-level store
+  carries that name, which can belong to another service.
+- Select a KV store for logical ID `trusted_server_kv`. The managed deploy
+  links every declared store, and this one is usually absent on Fastly. Set
+  `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` to an existing KV store or
+  run `ts provision --adapter fastly`; otherwise the deploy stops with
+  "selected Fastly KV store `trusted_server_kv` does not exist".
 - Re-push staging app config under the logical key into the staging Config
   Store. Entries previously pushed under `<logical-store-id>_staging` are
   ignored.
-- Remove any `EDGEZERO__STORES__CONFIG__<ID>__KEY` selectors. The CLI now
-  writes to that selector when `--key` is absent, instead of ignoring it, so a
-  leftover selector pushes app config to a key the Fastly runtime never reads.
-- Optionally delete the stale `edgezero_runtime_env` link and any `*_staging`
-  config entries once no active version reads them.
+- Remove any `EDGEZERO__STORES__CONFIG__<ID>__KEY` selectors. On Fastly the
+  CLI rejects any config key other than the logical store ID, so a leftover
+  selector makes `ts config push` and `ts deploy` fail until it is removed.
+- Delete the stale `edgezero_runtime_env` link and any `*_staging` config
+  entries once no active version reads them. Nothing in Trusted Server reads
+  that store any more. If you set the optional `TS__SANDBOX__*` reuse bounds
+  there, move them into the app-config store under the logical ID
+  `trusted_server_config`, without the `EDGEZERO__SERVICES__<SERVICE_ID>__`
+  prefix.
 
 ## Create EC KV Store
 

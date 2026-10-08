@@ -20,7 +20,7 @@ remove guidance for the superseded service-scoped and runtime-selector models.
 ## Design
 
 All EdgeZero workspace dependencies are pinned with `rev =` to the immutable
-commit `c2e862f436421cdcfbac620c06995f262d6788c9` on the upstream branch
+commit `0645339d1848332f4805259d29e3b4b881fccad3` on the upstream branch
 `fix/fastly-environment-store-selectors`. Pinning every crate to one commit
 ensures the adapter, CLI, core, and platform-specific crates resolve to the same
 revision while PR 381 is under review. Issue #1195 tracks replacing the rev with

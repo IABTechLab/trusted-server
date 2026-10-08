@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use edgezero_core::app::App;
 use trusted_server_core::settings::Settings;
+#[cfg(feature = "reusable-sandbox")]
+use trusted_server_core::settings_data::DEFAULT_CONFIG_STORE_ID;
 
 use crate::app::AppState;
 
@@ -258,7 +260,7 @@ pub(crate) fn resolve_mode(raw: RawLimits) -> ServeMode {
     })
 }
 
-/// Suffixes of the service-scoped runtime-environment keys holding the bounds.
+/// Keys holding the sandbox bounds in the application's own config store.
 #[cfg(any(feature = "reusable-sandbox", test))]
 const KEY_MAX_REQUESTS: &str = "TS__SANDBOX__MAX_REQUESTS";
 #[cfg(any(feature = "reusable-sandbox", test))]
@@ -267,22 +269,6 @@ const KEY_MAX_LIFETIME_MS: &str = "TS__SANDBOX__MAX_LIFETIME_MS";
 const KEY_TIMEOUT_MS: &str = "TS__SANDBOX__TIMEOUT_MS";
 #[cfg(any(feature = "reusable-sandbox", test))]
 const KEY_MAX_MEMORY_MIB: &str = "TS__SANDBOX__MAX_MEMORY_MIB";
-
-/// Builds the service-scoped runtime-environment key for a bound.
-///
-/// `EdgeZero`'s own `service_scoped_runtime_env_key` is private, so the shape is
-/// reproduced here. It must stay identical to the one `edgezero provision`
-/// writes.
-///
-/// Follow-up: a public `EdgeZero` key-construction or lookup helper would let
-/// this duplication go. Until such an API exists this implementation stays, so
-/// the key shape has exactly one definition on our side. The `TS__SANDBOX__*`
-/// suffixes and the limit-validation policy in [`resolve_mode`] are
-/// application-owned either way and would not move.
-#[cfg(any(feature = "reusable-sandbox", test))]
-fn scoped_key(service_id: &str, suffix: &str) -> String {
-    format!("EDGEZERO__SERVICES__{service_id}__{suffix}")
-}
 
 /// Collects raw limits from a fallible key lookup.
 ///
@@ -293,16 +279,15 @@ fn scoped_key(service_id: &str, suffix: &str) -> String {
 /// Diagnostics are returned rather than logged. This runs before the logger
 /// exists, so anything logged here would be discarded.
 #[cfg(any(feature = "reusable-sandbox", test))]
-fn collect_raw_limits<E, F>(service_id: &str, mut lookup: F) -> (RawLimits, Vec<String>)
+fn collect_raw_limits<E, F>(mut lookup: F) -> (RawLimits, Vec<String>)
 where
     E: core::fmt::Display,
     F: FnMut(&str) -> Result<Option<String>, E>,
 {
     let mut diagnostics = Vec::new();
 
-    let mut read = |suffix: &str| -> Option<u64> {
-        let key = scoped_key(service_id, suffix);
-        match lookup(&key) {
+    let mut read = |key: &str| -> Option<u64> {
+        match lookup(key) {
             Ok(Some(raw)) => match raw.trim().parse::<u64>() {
                 Ok(value) => Some(value),
                 Err(e) => {
@@ -332,45 +317,38 @@ where
     (limits, diagnostics)
 }
 
-/// Reads the sandbox bounds from the runtime-environment config store.
+/// Reads the sandbox bounds from the application's own config store.
 ///
-/// These keys deliberately bypass `edgezero_adapter_fastly::runtime_env_config`.
-/// That helper resolves a closed allowlist — adapter host and port, logging
-/// settings, and per-store `__NAME`/`__KEY` selectors — and silently drops
-/// everything else, so a sandbox key routed through it would always read as
-/// absent and reuse would never engage. Still true at the pinned revision.
+/// The bounds live beside the app config under the logical store ID that a
+/// managed deployment links, so no deprecated selector store is involved.
+/// `EdgeZero` removed `edgezero_runtime_env` when store selection moved to
+/// deploy-time resource links, and nothing in this repository provisions it.
+///
+/// These keys are read directly rather than through an `EdgeZero` environment
+/// helper. Those resolve a closed allowlist, adapter host and port, logging
+/// settings, and per-store `__NAME`/`__KEY` selectors, and silently drop
+/// everything else, so a sandbox key routed through one would always read as
+/// absent and reuse would never engage.
 ///
 /// Uses [`fastly::ConfigStore::try_get`], never `get`: `get` panics on a
 /// lookup error, and this runs in `main` before the health probe, so a panic
 /// here would take down liveness rather than merely disabling reuse.
 ///
 /// Any failure resolves to [`RawLimits::default`], and hence to
-/// [`ServeMode::Single`]: an absent or unopenable store, an empty service id,
-/// a failed lookup, or a value that does not parse as a `u64`.
+/// [`ServeMode::Single`]: an unopenable store, a failed lookup, or a value
+/// that does not parse as a `u64`.
 #[cfg(feature = "reusable-sandbox")]
 pub(crate) fn read_raw_limits() -> (RawLimits, Vec<String>) {
-    use edgezero_adapter_fastly::RUNTIME_ENV_STORE_NAME;
-
-    let Ok(store) = fastly::ConfigStore::try_open(RUNTIME_ENV_STORE_NAME) else {
+    let Ok(store) = fastly::ConfigStore::try_open(DEFAULT_CONFIG_STORE_ID) else {
         return (
             RawLimits::default(),
             vec![format!(
-                "sandbox reuse disabled: config store `{RUNTIME_ENV_STORE_NAME}` unavailable"
+                "sandbox reuse disabled: config store `{DEFAULT_CONFIG_STORE_ID}` unavailable"
             )],
         );
     };
 
-    // Viceroy reports a service id of twenty-two zeros, which is a valid
-    // scope for key construction. Only an empty id is unusable.
-    let service_id = fastly::compute_runtime::service_id();
-    if service_id.is_empty() {
-        return (
-            RawLimits::default(),
-            vec!["sandbox reuse disabled: no service id available for key scoping".to_owned()],
-        );
-    }
-
-    collect_raw_limits(service_id, |key| store.try_get(key))
+    collect_raw_limits(|key| store.try_get(key))
 }
 
 #[cfg(test)]
@@ -380,25 +358,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scoped_key_matches_the_edgezero_shape() {
-        // Viceroy reports twenty-two zeros locally; it is a valid scope.
-        let service_id = "0000000000000000000000";
-
-        assert_eq!(
-            scoped_key(service_id, KEY_MAX_REQUESTS),
-            "EDGEZERO__SERVICES__0000000000000000000000__TS__SANDBOX__MAX_REQUESTS",
-            "should reproduce the service-scoped key edgezero writes"
-        );
-        assert_eq!(
-            scoped_key(service_id, KEY_MAX_LIFETIME_MS),
-            "EDGEZERO__SERVICES__0000000000000000000000__TS__SANDBOX__MAX_LIFETIME_MS",
-            "should scope the lifetime bound the same way"
-        );
-        assert_eq!(
-            scoped_key(service_id, KEY_TIMEOUT_MS),
-            "EDGEZERO__SERVICES__0000000000000000000000__TS__SANDBOX__TIMEOUT_MS",
-            "should scope the wait timeout the same way"
-        );
+    fn limit_keys_are_unscoped_app_config_keys() {
+        // The bounds live in the application's own config store under the
+        // logical id a deployment links, so the keys carry no service scope and
+        // no reference to the removed selector store.
+        for key in [
+            KEY_MAX_REQUESTS,
+            KEY_MAX_LIFETIME_MS,
+            KEY_TIMEOUT_MS,
+            KEY_MAX_MEMORY_MIB,
+        ] {
+            assert!(
+                key.starts_with("TS__SANDBOX__"),
+                "sandbox limit key `{key}` should be an application-owned key"
+            );
+            assert!(
+                !key.contains("EDGEZERO__SERVICES__"),
+                "sandbox limit key `{key}` should carry no service scope"
+            );
+        }
     }
 
     fn full(max_requests: u64) -> RawLimits {
@@ -579,8 +557,7 @@ mod tests {
     fn a_failed_lookup_degrades_to_single_request_instead_of_panicking() {
         // `ConfigStore::get` panics on a lookup error and runs before the
         // health probe, so the fallible path must absorb the error.
-        let (limits, diagnostics) =
-            collect_raw_limits::<LookupFailed, _>("svc", |_key| Err(LookupFailed));
+        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>(|_key| Err(LookupFailed));
 
         assert_eq!(
             limits,
@@ -606,7 +583,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_value_degrades_to_single_request() {
-        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>("svc", |key| {
+        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>(|key| {
             Ok(Some(if key.ends_with(KEY_MAX_REQUESTS) {
                 "ten".to_owned()
             } else {
@@ -655,7 +632,7 @@ mod tests {
             Some("4294967295"),
             Some("4294967296"),
         ] {
-            let (limits, _) = collect_raw_limits::<LookupFailed, _>("example-service", |key| {
+            let (limits, _) = collect_raw_limits::<LookupFailed, _>(|key| {
                 Ok(if key.ends_with("TS__SANDBOX__MAX_MEMORY_MIB") {
                     memory.map(str::to_owned)
                 } else {
@@ -673,7 +650,7 @@ mod tests {
 
     #[test]
     fn absent_keys_report_nothing_and_stay_single_request() {
-        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>("svc", |_key| Ok(None));
+        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>(|_key| Ok(None));
 
         assert_eq!(
             limits,
@@ -688,7 +665,7 @@ mod tests {
 
     #[test]
     fn a_complete_store_enables_reuse_end_to_end() {
-        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>("svc", |key| {
+        let (limits, diagnostics) = collect_raw_limits::<LookupFailed, _>(|key| {
             Ok(Some(
                 if key.ends_with(KEY_MAX_REQUESTS) {
                     "10"
