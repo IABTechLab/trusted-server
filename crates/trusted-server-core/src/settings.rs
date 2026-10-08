@@ -4417,6 +4417,21 @@ impl Settings {
         self.module_selection(name).is_some()
     }
 
+    /// The table `section` holds at the name `written`, as it was written,
+    /// or an empty one when the section holds none.
+    #[must_use]
+    pub fn section_table(
+        &self,
+        section: &str,
+        written: &str,
+    ) -> serde_json::Map<String, JsonValue> {
+        self.module_sections()
+            .find(|(candidate, _)| *candidate == section)
+            .and_then(|(_, modules)| modules.settings_of(written))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Reads and validates a selected module's settings, from the table at the
     /// name it is written under beneath the section that selects it, or
     /// returns `None` when no section selects it.

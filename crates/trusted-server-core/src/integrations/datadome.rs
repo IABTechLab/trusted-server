@@ -105,7 +105,39 @@ pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
         register,
         validate,
     )
-    .with_module_name(MODULE);
+    .with_module_name(MODULE)
+    .with_secret_settings(SECRET_SETTINGS);
+
+/// The two settings that name a secret. The server-side key is in use when
+/// protection is on, and the test bypass credential when the bypass is on as
+/// well.
+const SECRET_SETTINGS: &[crate::integrations::ModuleSecretSetting] = &[
+    crate::integrations::ModuleSecretSetting {
+        path: &["server_side_key_secret_name"],
+        in_use: protection_is_on,
+    },
+    crate::integrations::ModuleSecretSetting {
+        path: &["protection_test_bypass", "credential_secret_name"],
+        in_use: test_bypass_is_on,
+    },
+];
+
+fn protection_is_on(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+    table
+        .get("enable_protection")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn test_bypass_is_on(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+    protection_is_on(table)
+        && table
+            .get("protection_test_bypass")
+            .and_then(|bypass| bypass.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
 pub(super) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
 /// Fixed request header used by the staging-only protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";

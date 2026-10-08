@@ -57,6 +57,7 @@ pub mod http_util;
 pub mod integrations;
 pub mod models;
 pub mod module_name;
+pub(crate) mod module_secrets;
 pub mod openrtb;
 pub mod permission_signal;
 pub mod permissions;

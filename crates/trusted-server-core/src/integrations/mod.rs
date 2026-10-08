@@ -336,6 +336,21 @@ pub type IntegrationPrepareRequestFn =
 /// does, and has nothing to do for a request its module left nothing on.
 pub type IntegrationFinalizeResponseFn = fn(&IntegrationRequestState, &mut Response<EdgeBody>);
 
+/// A setting in a module's own table that holds the name of a secret.
+///
+/// The name is looked up in the default secret store as the settings load,
+/// and the setting holds the secret from then on.
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleSecretSetting {
+    /// Where the setting sits inside the module's table, one name for each
+    /// level.
+    pub path: &'static [&'static str],
+    /// Whether the module's table, as written, puts the setting to use. A
+    /// setting not in use is cleared as the settings load and is not looked
+    /// up, and one in use has to name a key before a deployment is accepted.
+    pub in_use: fn(&serde_json::Map<String, serde_json::Value>) -> bool,
+}
+
 /// Source label for the built-in integrations.
 pub const CORE_SOURCE: &str = "trusted-server-core";
 
@@ -387,6 +402,7 @@ pub struct IntegrationBuilder {
     prepare_request: Option<IntegrationPrepareRequestFn>,
     finalize_response: Option<IntegrationFinalizeResponseFn>,
     reads_auction_token: bool,
+    secret_settings: &'static [ModuleSecretSetting],
     supplies_integration: bool,
     demand: Option<&'static DemandImplementation>,
     adserver: Option<&'static AdServerImplementation>,
@@ -424,6 +440,7 @@ impl IntegrationBuilder {
             prepare_request: None,
             finalize_response: None,
             reads_auction_token: false,
+            secret_settings: &[],
             supplies_integration: true,
             demand: None,
             adserver: None,
@@ -448,6 +465,7 @@ impl IntegrationBuilder {
             prepare_request: None,
             finalize_response: None,
             reads_auction_token: false,
+            secret_settings: &[],
             supplies_integration: false,
             demand: None,
             adserver: None,
@@ -527,6 +545,22 @@ impl IntegrationBuilder {
     #[must_use]
     pub const fn reads_auction_token(&self) -> bool {
         self.reads_auction_token
+    }
+
+    /// Declares the settings in the module's own table that hold the name of
+    /// a secret, so each is looked up as the settings load and checked when
+    /// a deployment is validated.
+    #[must_use]
+    pub const fn with_secret_settings(mut self, secrets: &'static [ModuleSecretSetting]) -> Self {
+        self.secret_settings = secrets;
+        self
+    }
+
+    /// The settings in the module's own table that hold the name of a
+    /// secret.
+    #[must_use]
+    pub const fn secret_settings(&self) -> &'static [ModuleSecretSetting] {
+        self.secret_settings
     }
 
     /// Runs this builder when a section selects the module `name`, which is a

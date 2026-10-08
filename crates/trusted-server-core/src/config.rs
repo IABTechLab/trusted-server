@@ -17,7 +17,6 @@ use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 
-use crate::integrations::datadome::DataDomeConfig;
 use crate::integrations::{IntegrationBuilder, prebid};
 use crate::settings::{AssetOriginAuth, Ec, MODULE_IMPLEMENTATION_KEY, Settings};
 
@@ -230,7 +229,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
         let optional_object =
             |name: &'static str| SecretPathSegment::OptionalField(Cow::Borrowed(name));
 
-        vec![
+        let mut fields = vec![
             field(vec![object("publisher"), object("proxy_secret")], false),
             field(vec![object("ec"), object("passphrase")], true),
             field(
@@ -284,23 +283,6 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    optional_object("bot-protection"),
-                    optional_object("datadome"),
-                    object("server_side_key_secret_name"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("bot-protection"),
-                    optional_object("datadome"),
-                    optional_object("protection_test_bypass"),
-                    object("credential_secret_name"),
-                ],
-                true,
-            ),
-            field(
-                vec![
                     optional_object("proxy"),
                     optional_object("asset_routes"),
                     SecretPathSegment::ArrayEach,
@@ -329,7 +311,12 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 ],
                 true,
             ),
-        ]
+        ];
+        // The settings a module declares in its own table, for core's
+        // modules and the ones a tool registered for deploy validation.
+        let builders = crate::integrations::all_builders(deploy_integrations()).collect::<Vec<_>>();
+        fields.extend(crate::module_secrets::secret_fields(&builders));
+        fields
     }
 }
 
@@ -367,7 +354,7 @@ pub fn validate_settings_for_deploy_with(
     // The selection is checked first, so a block nothing runs is reported as
     // that rather than as whatever its unread settings fail next.
     settings.validate_module_sections()?;
-    validate_secret_key_references(settings)?;
+    validate_secret_key_references(settings, extra_integrations)?;
     validate_non_secret_deploy_placeholders(settings)?;
 
     let mut structural_settings = settings.clone();
@@ -494,7 +481,10 @@ fn validate_non_secret_deploy_placeholders(
     }))
 }
 
-fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+fn validate_secret_key_references(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_reference(
         "publisher.proxy_secret",
         settings.publisher.proxy_secret.expose(),
@@ -550,37 +540,24 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
     }
 
-    if let Some(datadome) =
-        settings.module_config::<DataDomeConfig>(crate::integrations::datadome::MODULE)?
-    {
-        if datadome.enable_protection {
-            let key = datadome
-                .server_side_key_secret_name
-                .as_ref()
-                .ok_or_else(|| {
-                    missing_secret_key_reference(
-                        "bot-protection.datadome.server_side_key_secret_name",
-                    )
-                })?;
-            validate_secret_key_reference(
-                "bot-protection.datadome.server_side_key_secret_name",
-                key.expose(),
-            )?;
-        }
-        if let Some(bypass) = datadome
-            .protection_test_bypass
-            .as_ref()
-            .filter(|bypass| bypass.enabled)
-        {
-            let credential = bypass.credential_secret_name.as_ref().ok_or_else(|| {
-                missing_secret_key_reference(
-                    "bot-protection.datadome.protection_test_bypass.credential_secret_name",
-                )
-            })?;
-            validate_secret_key_reference(
-                "bot-protection.datadome.protection_test_bypass.credential_secret_name",
-                credential.expose(),
-            )?;
+    // Each setting a selected module declares as naming a secret, where the
+    // module's table puts it to use.
+    for builder in crate::integrations::all_builders(extra_integrations) {
+        let secrets = builder.secret_settings();
+        let Some((section, written)) = builder
+            .module_name()
+            .filter(|_| !secrets.is_empty())
+            .and_then(|name| settings.module_selection(name))
+        else {
+            continue;
+        };
+        let table = settings.section_table(section, written);
+        for secret in secrets.iter().filter(|secret| (secret.in_use)(&table)) {
+            let path = format!("{section}.{written}.{}", secret.path.join("."));
+            let reference = crate::module_secrets::value_at(&table, secret.path)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| missing_secret_key_reference(&path))?;
+            validate_secret_key_reference(&path, reference)?;
         }
     }
 
@@ -1018,8 +995,21 @@ formats = [{ width = 300, height = 250 }]
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
+                ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
+                (
+                    "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
+                    true,
+                ),
+                ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
+                // What a module declares in its own table follows, at the
+                // short name its section selects it by and at its full name.
                 (
                     "bot-protection.datadome.server_side_key_secret_name".to_owned(),
+                    true,
+                ),
+                (
+                    "bot-protection.bot-protection.datadome.server_side_key_secret_name"
+                        .to_owned(),
                     true,
                 ),
                 (
@@ -1027,12 +1017,11 @@ formats = [{ width = 300, height = 250 }]
                         .to_owned(),
                     true,
                 ),
-                ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
                 (
-                    "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
+                    "bot-protection.bot-protection.datadome.protection_test_bypass.credential_secret_name"
+                        .to_owned(),
                     true,
                 ),
-                ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );

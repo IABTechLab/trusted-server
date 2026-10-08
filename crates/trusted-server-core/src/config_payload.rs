@@ -12,7 +12,7 @@ use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::IntegrationBuilder;
 use crate::platform::{PlatformSecretStore, StoreName};
-use crate::secret_resolution::resolve_secret_references;
+use crate::secret_resolution::resolve_secret_references_with;
 use crate::settings::Settings;
 
 /// Canonical logical secret store used by Trusted Server app-config secrets.
@@ -83,12 +83,18 @@ pub fn settings_from_config_blob_with(
         .attach(error.to_string())
     })?;
 
+    // The modules' own secret settings are found through the builders the
+    // settings are validated against, so a module a deployment added has its
+    // secrets looked up here as a stock one does.
+    let builders = crate::integrations::all_builders(extra_integrations).collect::<Vec<_>>();
     let mut data = envelope.into_data();
     remove_inactive_secret_references(&mut data);
-    resolve_secret_references::<TrustedServerAppConfig>(
+    crate::module_secrets::clear_unused(&mut data, &builders);
+    resolve_secret_references_with::<TrustedServerAppConfig>(
         &mut data,
         secret_store,
         default_secret_store_name,
+        crate::module_secrets::secret_fields(&builders),
     )?;
     let settings = Settings::from_json_value(data)?;
     crate::config::validate_settings_for_runtime_with(&settings, extra_integrations)?;
@@ -120,53 +126,6 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
                 partner.remove("ts_pull_token");
             }
         }
-    }
-
-    // A module runs when its section selects it, so `[bot-protection]`
-    // decides whether DataDome's secrets are live. A table its section does
-    // not select is refused once the settings are deserialized, and clearing
-    // its references here means that refusal is what an operator sees rather
-    // than a secret lookup failing first.
-    let selects_datadome = |value: &serde_json::Value| {
-        value
-            .as_str()
-            .is_some_and(|name| name == "datadome" || name == crate::integrations::datadome::MODULE)
-    };
-    let datadome_runs = data
-        .pointer("/bot-protection/module")
-        .is_some_and(selects_datadome)
-        || data
-            .pointer("/bot-protection/modules")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|modules| modules.iter().any(selects_datadome));
-    let Some(datadome) = data
-        .pointer_mut("/bot-protection/datadome")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    let protection_enabled = datadome_runs
-        && datadome
-            .get("enable_protection")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-    if !protection_enabled {
-        datadome.remove("server_side_key_secret_name");
-    }
-
-    let bypass_enabled = protection_enabled
-        && datadome
-            .get("protection_test_bypass")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|bypass| bypass.get("enabled"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-    if !bypass_enabled
-        && let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        bypass.remove("credential_secret_name");
     }
 }
 
@@ -347,6 +306,137 @@ mod tests {
                 },
             ),
         ))
+    }
+
+    /// Holds the one key a deployment's module names, and refuses the secret
+    /// itself as a key, so a leaf looked up twice fails.
+    struct ModuleSecretStore;
+
+    impl PlatformSecretStore for ModuleSecretStore {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            match key {
+                "module-key" => Ok(b"resolved-module-secret".to_vec()),
+                "resolved-module-secret" | "unused-module-key" => {
+                    Err(Report::new(PlatformError::SecretStore))
+                }
+                _ => EchoSecretStore.get_bytes(store_name, key),
+            }
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    fn module_lock_is_on(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+        table.get("lock").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    const MODULE_SECRETS: &[crate::integrations::ModuleSecretSetting] =
+        &[crate::integrations::ModuleSecretSetting {
+            path: &["key_name"],
+            in_use: module_lock_is_on,
+        }];
+
+    /// A builder a deployment added, whose module names a secret in its own
+    /// table.
+    fn module_with_a_secret() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_module_name("testing.probe")
+        .with_secret_settings(MODULE_SECRETS)
+    }
+
+    fn load_with_module(settings: &Settings) -> Settings {
+        settings_from_config_blob_with(
+            &envelope_json(settings),
+            &ModuleSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+            &[module_with_a_secret()],
+        )
+        .expect("should load settings with the module's builder")
+    }
+
+    #[test]
+    fn the_load_looks_up_a_secret_a_deployment_s_module_declares() {
+        let mut settings = test_settings();
+        settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": true, "key_name": "module-key" }),
+            )
+            .expect("should insert the module's table");
+
+        let loaded = load_with_module(&settings);
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            Some(&serde_json::json!("resolved-module-secret")),
+            "should hold the secret where the table held the name of its key"
+        );
+    }
+
+    #[test]
+    fn the_load_clears_a_declared_secret_the_module_s_table_does_not_use() {
+        let mut settings = test_settings();
+        settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": false, "key_name": "unused-module-key" }),
+            )
+            .expect("should insert the module's table");
+
+        let loaded = load_with_module(&settings);
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            None,
+            "should clear a key name nothing uses, where looking it up would fail"
+        );
+    }
+
+    #[test]
+    fn a_table_s_key_name_is_left_as_written_without_its_module_s_builder() {
+        let mut settings = test_settings();
+        settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": true, "key_name": "module-key" }),
+            )
+            .expect("should insert the module's table");
+
+        let loaded = settings_from_config_blob(
+            &envelope_json(&settings),
+            &ModuleSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+        )
+        .expect("should load settings without the module's builder");
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            Some(&serde_json::json!("module-key")),
+            "should look nothing up for a table whose module declared nothing to this load"
+        );
     }
 
     /// The settings are validated as they load, so a deployment that composes
