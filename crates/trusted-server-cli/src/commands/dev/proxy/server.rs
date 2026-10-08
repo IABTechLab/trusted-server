@@ -767,7 +767,7 @@ fn requires_upstream_origin(method: &hyper::Method, path: &str) -> bool {
 
 /// With `--rewrite-host`, replaces a single same-origin `Origin` with the `TO`
 /// origin, so an upstream that compares `Origin` against its own origin (as
-/// Trusted Server's state-changing endpoints do) sees the same authority it
+/// Trusted Server's trace Enable/End actions do) sees the same authority it
 /// receives in `Host`.
 ///
 /// Must run before `Host` is rewritten: the browser's origin is `https://` plus

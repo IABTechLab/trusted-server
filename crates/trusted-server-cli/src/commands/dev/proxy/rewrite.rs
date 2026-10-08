@@ -253,7 +253,7 @@ pub struct RewriteOutcome {
     /// Whether the upstream leg is TLS (`!plaintext`).
     pub scheme_is_tls: bool,
     /// With `--rewrite-host`, the `TO` origin that replaces the browser's
-    /// same-origin `Origin` on Trusted Server requests, so `Origin` and `Host`
+    /// same-origin `Origin` on the trace Enable/End requests, so `Origin` and `Host`
     /// name the same authority. `None` without `--rewrite-host`, where `Host`
     /// stays `FROM`.
     pub upstream_origin: Option<HeaderValue>,

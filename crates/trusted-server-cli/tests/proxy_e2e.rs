@@ -116,7 +116,7 @@ async fn rewrite_host_presents_same_origin_origin_as_the_upstream_origin() {
     assert_eq!(
         response.seen_origin,
         format!("https://{}", upstream.addr),
-        "--rewrite-host should name the TO authority in Origin on /_ts requests"
+        "--rewrite-host should name the TO authority in Origin on trace actions"
     );
 }
 
