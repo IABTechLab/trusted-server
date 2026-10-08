@@ -831,6 +831,42 @@ mod tests {
     }
 
     #[test]
+    fn trace_path_classification_survives_core_request_conversion() {
+        // `main` skips client-IP sanitization when the native path is a trace
+        // path; the router hook later classifies the converted URI. Both must
+        // agree, or unsanitized forwarded headers could reach ordinary dispatch.
+        for url in [
+            "https://example.com/_ts/trace",
+            "https://example.com/_ts/trace/",
+            "https://example.com/_ts/trace/enable?source=example",
+            "https://example.com/_ts//trace",
+            "https://example.com/_ts/./trace",
+            "https://example.com/_ts/x/../trace",
+            "https://example.com/_ts/%2e%2e/trace",
+            "https://example.com/_ts%2Ftrace",
+            "https://example.com/_ts/trace%2Fenable",
+            "https://example.com/_TS/trace",
+            "https://example.com/_tsx",
+            "https://example.com/_ts-trace",
+            "https://example.com/_ts/admin/keys",
+            "https://example.com/auction",
+            "https://example.com/",
+        ] {
+            let req = FastlyRequest::get(url);
+            let native = is_trace_path(req.get_path());
+            let ingress = capture_request_ingress(&req);
+            let core = into_core_request_with_ingress(req, ingress)
+                .expect("should convert the native request");
+
+            assert_eq!(
+                is_trace_path(core.uri().path()),
+                native,
+                "should classify {url} identically before and after conversion"
+            );
+        }
+    }
+
+    #[test]
     fn health_response_short_circuits_get_health() {
         let req = FastlyRequest::get("https://example.com/health");
 

@@ -708,7 +708,7 @@ mod tests {
                     .expect("should insert diagnostics trace flag");
             }
 
-            for query in ["1", "true", "1"] {
+            for query in ["1", "true"] {
                 let mut request = navigation(
                     &format!("https://publisher.example/?ts_console={query}"),
                     Some("__Host-ts-console=1"),
