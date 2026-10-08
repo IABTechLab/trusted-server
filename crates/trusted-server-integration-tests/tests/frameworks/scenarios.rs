@@ -445,9 +445,10 @@ pub enum EcScenario {
     /// returns the scoped UID.
     FullLifecycle,
 
-    /// Consent withdrawal: GPC header triggers EC cookie deletion for a
-    /// seeded EC in the default US-state test geo.
-    ConsentWithdrawal,
+    /// Opt-out suppression: a GPC header suppresses use of a seeded EC
+    /// (identify answers 403) without expiring the cookie, in the default
+    /// US-state test geo. Opt-outs are never destructive.
+    OptOutSuppression,
 
     /// Identify without EC cookie returns 204.
     IdentifyWithoutEc,
@@ -470,7 +471,7 @@ impl EcScenario {
     pub fn all() -> Vec<Self> {
         vec![
             Self::FullLifecycle,
-            Self::ConsentWithdrawal,
+            Self::OptOutSuppression,
             Self::IdentifyWithoutEc,
             Self::IdentifyConsentDenied,
             Self::ConcurrentPartnerSyncs,
@@ -489,7 +490,7 @@ impl EcScenario {
     pub fn run(&self, base_url: &str) -> TestResult<()> {
         match self {
             Self::FullLifecycle => ec_full_lifecycle(base_url),
-            Self::ConsentWithdrawal => ec_consent_withdrawal(base_url),
+            Self::OptOutSuppression => ec_opt_out_suppression(base_url),
             Self::IdentifyWithoutEc => ec_identify_without_ec(base_url),
             Self::IdentifyConsentDenied => ec_identify_consent_denied(base_url),
             Self::ConcurrentPartnerSyncs => ec_concurrent_partner_syncs(base_url),
@@ -577,37 +578,48 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
 }
 
 /// Consent withdrawal: GPC header clears EC cookie.
-fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
+fn ec_opt_out_suppression(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
     let seeded_ec_id = seeded_ec_id('b', "test02");
     let ec_id = use_seeded_ec(&client, &seeded_ec_id);
-    log::info!("EC consent withdrawal: using seeded EC = {ec_id}");
+    log::info!("EC opt-out suppression: using seeded EC = {ec_id}");
 
-    // GPC overrides the allow cookie in US-CA, so this is an explicit
-    // withdrawal and must expire the EC cookie.
+    // GPC is a US-style opt-out. It suppresses use of the identifier for the
+    // request but is never destructive: the cookie is not expired and no
+    // tombstone is written, so lifting the opt-out restores the identity.
     let resp = client.get_with_headers("/", &[("sec-gpc", "1")])?;
-
-    if !is_ec_cookie_expired(&resp) {
+    if is_ec_cookie_expired(&resp) {
         return Err(Report::new(TestError::UnexpectedContent)
-            .attach("consent withdrawal should expire ts-ec cookie (expected Max-Age=0)"));
+            .attach("an opt-out must suppress without expiring the ts-ec cookie"));
     }
-    if client.ec_cookie_value().is_some() {
+    if client.ec_cookie_value().is_none() {
         return Err(Report::new(TestError::UnexpectedContent)
-            .attach("client should stop tracking ts-ec after explicit withdrawal"));
+            .attach("the client should keep tracking ts-ec through an opt-out"));
     }
 
-    // 3. With consent still granted and the EC cookie revoked, identify should
-    // now report no EC present.
-    let resp = identify(&client, INTTEST_API_TOKEN)?;
-    assert_status(&resp, 204).attach("identify should return 204 after cookie revocation")?;
-
-    // 4. With GPC still asserted, identify should reflect consent denial.
+    // With GPC asserted, identify reflects the suppressed permissions.
     let resp = identify_with_headers(&client, INTTEST_API_TOKEN, &[("sec-gpc", "1")])?;
     assert_status(&resp, 403)
-        .attach("identify with GPC should return 403 after consent withdrawal")?;
+        .attach("identify with GPC should return 403 while the opt-out is asserted")?;
 
-    log::info!("EC consent withdrawal: PASSED");
+    // Without GPC the identity is usable again: the cookie still carries the
+    // identifier, so identify answers 200 with consent ok. No row was seeded
+    // for this identifier, so there is no enrichment, and the absence of a
+    // 403 proves the opt-out destroyed nothing.
+    let resp = identify(&client, INTTEST_API_TOKEN)?;
+    let body = assert_json_response(resp, 200)?;
+    if body.get("consent").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(Report::new(TestError::UnexpectedContent).attach(format!(
+            "identify without GPC should report consent ok, got {body}"
+        )));
+    }
+    if body.get("uid").is_some() {
+        return Err(Report::new(TestError::UnexpectedContent)
+            .attach("no partner UID was seeded, so identify should carry no enrichment"));
+    }
+
+    log::info!("EC opt-out suppression: PASSED");
     Ok(())
 }
 

@@ -941,6 +941,70 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] with an injected geo module, so a test can
+/// drive a geo outcome through the [`PlatformGeo`] seam rather than
+/// constructing the resolved status by hand.
+///
+/// This is the only way to reach the lookup-failure path, because the seam is
+/// what turns an `Err` into the requires-signal floor.
+pub(crate) fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(geo)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
+/// Build a [`RuntimeServices`] carrying an Edge Cookie module, threaded the
+/// way a composition root threads the module it resolved, so a test can
+/// exercise the seam a vendor module reaches core through and check that the
+/// request path reuses that instance.
+pub(crate) fn noop_services_with_ec_module(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+) -> RuntimeServices {
+    // A fixed client IP, so a module that reads one (the built-in HMAC
+    // module does) can run.
+    noop_services_with_ec_module_and_ip(
+        ec_module,
+        Some("203.0.113.10".parse().expect("should parse test client IP")),
+    )
+}
+
+/// Build a [`RuntimeServices`] with an injected Edge Cookie module and no
+/// client IP, modeling a host that cannot determine one.
+///
+/// Whether that matters is the module's decision, so this exists to test both
+/// answers: a module reading other evidence still creates an identifier, and
+/// one that needs the IP refuses.
+pub(crate) fn noop_services_with_ec_module_without_client_ip(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+) -> RuntimeServices {
+    noop_services_with_ec_module_and_ip(ec_module, None)
+}
+
+fn noop_services_with_ec_module_and_ip(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+    client_ip: Option<IpAddr>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        })
+        .resolved_ec_module(ec_module)
+        .build()
+}
+
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
 /// recording (or otherwise custom) sink, so tests can assert which terminal
 /// auction events were emitted.

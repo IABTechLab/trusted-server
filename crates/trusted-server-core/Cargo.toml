@@ -41,6 +41,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 toml = { workspace = true }
@@ -63,6 +64,9 @@ uuid = { workspace = true, features = ["js"] }
 edgezero-core = { workspace = true }
 
 [features]
+# Compiles in the `client_fixed` demonstration Edge Cookie module. Off by
+# default so production builds cannot select a fixed shared word as identity.
+client-fixed-demo = []
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
 # so downstream crates can build registries with stub integrations in their tests.

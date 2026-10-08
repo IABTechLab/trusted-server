@@ -365,6 +365,11 @@ pub struct RequestFilterInput<'a> {
     pub services: &'a RuntimeServices,
     pub request: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// The permission state resolved for this request at the start of the
+    /// request cycle, so a filter reads the same permissions the rest of the
+    /// request uses rather than resolving its own. `None` only on paths that
+    /// build no EC context, such as batch sync and admin diagnostics.
+    pub permissions: Option<&'a crate::permissions::PermissionState>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
 }
@@ -445,6 +450,10 @@ pub struct RequestFilterRegistryInput<'a> {
     pub services: &'a RuntimeServices,
     pub req: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// The permission state resolved for this request at the start of the
+    /// request cycle, passed on to every filter. `None` only on paths that
+    /// build no EC context, such as batch sync and admin diagnostics.
+    pub permissions: Option<&'a crate::permissions::PermissionState>,
 }
 
 /// Outcome returned by [`IntegrationRegistry::filter_request`].
@@ -745,6 +754,10 @@ struct IntegrationRegistryInner {
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// JS module IDs to include in the bundle that come from a source other than
+    /// a registered integration, for example a module tied to the selected Edge
+    /// Cookie module. Populated in [`IntegrationRegistry::new`] from settings.
+    extra_js_module_ids: Vec<&'static str>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -766,6 +779,7 @@ impl Default for IntegrationRegistryInner {
             html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            extra_js_module_ids: Vec::new(),
         }
     }
 }
@@ -931,6 +945,20 @@ impl IntegrationRegistry {
             }
         }
 
+        // A client-cycle Edge Cookie module ships a page script that posts its
+        // result to the resolve endpoint. The script rides the tsjs bundle, so
+        // include its module when that module is selected. The same module
+        // list drives both the served bundle and the injected `<script>` hash,
+        // so they stay consistent.
+        if settings
+            .ec
+            .module
+            .as_ref()
+            .is_some_and(|selection| selection.key() == crate::ec::module::CLIENT_FIXED_MODULE_KEY)
+        {
+            inner.extra_js_module_ids.push("ec_client_fixed");
+        }
+
         Ok(Self {
             inner: Arc::new(inner),
             plan: Some(plan),
@@ -984,6 +1012,7 @@ impl IntegrationRegistry {
             services,
             req,
             geo_info,
+            permissions,
         } = input;
         let mut accumulated = RequestFilterEffects::default();
         let is_integration_route = self.has_route(req.method(), req.uri().path());
@@ -995,6 +1024,7 @@ impl IntegrationRegistry {
                     services,
                     request: req,
                     geo_info,
+                    permissions,
                     is_integration_route,
                 })
                 .await?;
@@ -1047,7 +1077,7 @@ impl IntegrationRegistry {
             // may lack consent signals such as the Sec-GPC header.
             if is_navigation_request(&req) {
                 if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-                    log::warn!("EC generation failed for integration proxy: {err:?}");
+                    log::error!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
                 log::debug!(
@@ -1226,6 +1256,14 @@ impl IntegrationRegistry {
             }
         }
 
+        // Modules not tied to a registered integration, for example the
+        // client-cycle module's page script.
+        for id in &self.inner.extra_js_module_ids {
+            if !ids.contains(id) {
+                ids.push(id);
+            }
+        }
+
         ids
     }
 
@@ -1286,6 +1324,7 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
             plan: None,
         }
@@ -1316,6 +1355,7 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
             plan: None,
         }
@@ -1342,6 +1382,7 @@ impl IntegrationRegistry {
                 request_filters,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
             plan: None,
         }
@@ -1408,6 +1449,7 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
             plan: None,
         }
@@ -1418,6 +1460,7 @@ impl IntegrationRegistry {
 mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
@@ -1536,6 +1579,45 @@ mod tests {
                 request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
             }))
+        }
+    }
+
+    /// Records the permission state each filter invocation received, so a test
+    /// can assert what the registry handed to the filter.
+    #[derive(Default)]
+    struct RecordingPermissionsFilter {
+        seen: std::sync::Mutex<Option<Option<crate::permissions::PermissionState>>>,
+    }
+
+    impl RecordingPermissionsFilter {
+        /// The permission state observed by the last invocation, or `None` when
+        /// the filter has not run.
+        fn seen(&self) -> Option<Option<crate::permissions::PermissionState>> {
+            self.seen
+                .lock()
+                .expect("should lock the recorded permission state")
+                .clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationRequestFilter for RecordingPermissionsFilter {
+        fn integration_id(&self) -> &'static str {
+            "recording-permissions"
+        }
+
+        async fn filter_request(
+            &self,
+            input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            *self
+                .seen
+                .lock()
+                .expect("should lock the recorded permission state") =
+                Some(input.permissions.cloned());
+            Ok(RequestFilterDecision::Continue(
+                RequestFilterEffects::default(),
+            ))
         }
     }
 
@@ -1725,6 +1807,7 @@ mod tests {
                 services: &services,
                 req: &mut req,
                 geo_info: None,
+                permissions: None,
             }))
             .expect("should run request filter");
 
@@ -1749,6 +1832,55 @@ mod tests {
             }
             RequestFilterRegistryOutcome::Respond { .. } => panic!("should continue routing"),
         }
+    }
+
+    #[test]
+    fn filter_request_passes_the_resolved_permission_state_to_each_filter() {
+        let filter = Arc::new(RecordingPermissionsFilter::default());
+        let registry = IntegrationRegistry::from_request_filters(vec![
+            filter.clone() as Arc<dyn IntegrationRequestFilter>
+        ]);
+        let settings = crate::test_support::tests::create_test_settings();
+        let services = crate::platform::test_support::noop_services();
+        let permissions =
+            PermissionState::new(PermissionSet::none().with(Permission::StoreOnDevice));
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/page")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+            settings: &settings,
+            services: &services,
+            req: &mut req,
+            geo_info: None,
+            permissions: Some(&permissions),
+        }))
+        .expect("should run request filter");
+
+        assert_eq!(
+            filter.seen(),
+            Some(Some(permissions)),
+            "the filter should observe exactly the permission state resolved for the request"
+        );
+
+        // A path that builds no EC context passes no permissions, and the
+        // filter must see that absence rather than an empty state.
+        futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+            settings: &settings,
+            services: &services,
+            req: &mut req,
+            geo_info: None,
+            permissions: None,
+        }))
+        .expect("should run request filter");
+
+        assert_eq!(
+            filter.seen(),
+            Some(None),
+            "an absent permission state should reach the filter as `None`"
+        );
     }
 
     #[test]
@@ -2291,6 +2423,22 @@ mod tests {
     }
 
     #[test]
+    fn js_module_ids_include_client_fixed_when_module_selected() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
+            crate::ec::module::CLIENT_FIXED_MODULE_KEY,
+        ));
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "selecting the `client_fixed` module should inject its demo page script"
+        );
+    }
+
+    #[test]
     fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
@@ -2325,6 +2473,20 @@ mod tests {
         assert!(
             metadata.iter().any(|integration| integration.id == "osano"),
             "should include JS-only Osano registration in metadata"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_exclude_client_fixed_without_module() {
+        let registry =
+            IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
+                .expect("should create registry");
+
+        assert!(
+            !registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "the demo page script should not ship unless the `client_fixed` module is selected"
         );
     }
 

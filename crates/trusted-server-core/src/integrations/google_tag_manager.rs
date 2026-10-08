@@ -3067,12 +3067,18 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 enabled = true
 container_id = "GTM-PARSED"
 upstream_url = "https://custom.gtm.example"
+
+[geo]
+assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings
@@ -3100,10 +3106,16 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"
+
+[geo]
+assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
         let config = settings

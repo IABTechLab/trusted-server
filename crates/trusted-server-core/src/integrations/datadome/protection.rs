@@ -866,6 +866,7 @@ mod tests {
                 services,
                 request,
                 geo_info: None,
+                permissions: None,
                 is_integration_route: false,
             }))
         })
@@ -906,6 +907,7 @@ mod tests {
                 services,
                 request: &mut request,
                 geo_info,
+                permissions: None,
                 is_integration_route: false,
             },
         ));
@@ -1099,6 +1101,7 @@ mod tests {
                         services: &services,
                         request: &mut request,
                         geo_info: None,
+                        permissions: None,
                         is_integration_route: false,
                     },
                 ))
@@ -1685,6 +1688,7 @@ mod tests {
                 services: &services,
                 request: &mut request,
                 geo_info: None,
+                permissions: None,
                 is_integration_route: false,
             },
         ));

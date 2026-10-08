@@ -6,20 +6,24 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 use url::Url;
-use validator::{Validate, ValidationError};
+use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::module::{
+    EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, check_named_module_configuration,
+};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -537,12 +541,62 @@ impl EcPartner {
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-#[serde(deny_unknown_fields)]
+///
+/// Every key in the section other than the fields below is one module's
+/// `[ec.<name>]` settings table, held in
+/// [`module_blocks`](Self::module_blocks), so the field names below are
+/// reserved and cannot name a module.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Ec {
-    /// Publisher passphrase used as HMAC key for EC generation.
-    #[validate(custom(function = Ec::validate_passphrase))]
-    pub passphrase: Redacted<String>,
+    /// The name of the Edge Cookie identity module to activate.
+    ///
+    /// Set it in the `[ec]` TOML section, for example `"hmac"`. The name is
+    /// the module's implementation unless its `[ec.<name>]` block names a
+    /// different one, in which case the name is a label of the operator's
+    /// choosing (see [`module_blocks`](Self::module_blocks)). Deployment
+    /// tooling can merge a `TRUSTED_SERVER__EC__MODULE` environment value
+    /// into the published configuration before it is loaded, so the same
+    /// compiled WebAssembly can switch modules at deployment. The running
+    /// server reads its settings from the platform config store, not the
+    /// environment. When absent, no Edge Cookie is generated and Trusted
+    /// Server runs statelessly, and the explicit `"none"` spells the same
+    /// choice. A selection whose implementation needs settings it has no block
+    /// for is rejected at startup by
+    /// [`validate_module_selection`](Self::validate_module_selection).
+    ///
+    /// Typed as [`EcModuleSelection`], which reads and writes the same
+    /// string, so every check that asks which module is selected matches on
+    /// one vocabulary rather than comparing string literals.
+    #[serde(default)]
+    pub module: Option<EcModuleSelection>,
+
+    /// Deprecated location of the HMAC passphrase, read so a configuration
+    /// written for the previous release still starts.
+    ///
+    /// [`migrate_legacy_ec_layout`](Self::migrate_legacy_ec_layout) maps it
+    /// to `module = "hmac"` with the passphrase in the `[ec.hmac]` block and
+    /// logs a deprecation warning, so a fleet can move configuration and
+    /// binaries independently. A configuration carrying both the old and the
+    /// new form is rejected rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<Redacted<String>>,
+
+    /// Extra exact origins allowed to POST the client resolve endpoint.
+    ///
+    /// The endpoint always accepts `https://{publisher.domain}` and nothing
+    /// else by default. A publisher whose pages are served from another origin,
+    /// `www` being the common case, lists those origins here. Each entry is a
+    /// serialized origin (RFC 6454 §6.1), being `http://` or `https://` and a
+    /// host with an optional port and nothing after it, and
+    /// [`validate_resolve_allowed_origins`](Self::validate_resolve_allowed_origins)
+    /// refuses any other entry when the settings load. Each is compared with
+    /// the request's `Origin` by the same-origin test of RFC 6454 §5, so the
+    /// scheme, the host and the port all have to match, with a missing port
+    /// meaning the scheme's default. A suffix or subdomain match is never
+    /// performed, because control of a DNS namespace does not make every host
+    /// under it a trusted identity-setting origin.
+    #[serde(default)]
+    pub resolve_allowed_origins: Vec<String>,
 
     /// Fastly KV store name for the EC identity graph.
     #[serde(default)]
@@ -568,8 +622,20 @@ pub struct Ec {
 
     /// Partners (SSPs, DSPs, identity vendors) for EC identity sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
-    #[validate(nested)]
     pub partners: Vec<EcPartner>,
+
+    /// The settings tables of the Edge Cookie identity modules, keyed by the
+    /// name each is written under.
+    ///
+    /// A module has a block only when it has settings of its own, so
+    /// `[ec] module = "hmac"` needs an `[ec.hmac]` block for its required
+    /// passphrase while a module with no settings needs none. The
+    /// [`module`](Self::module) selector names the active module and
+    /// [`validate_module_selection`](Self::validate_module_selection)
+    /// rejects a block it does not name, so at most one block survives
+    /// startup.
+    #[serde(flatten)]
+    pub module_blocks: EcModuleBlocks,
 }
 
 impl Ec {
@@ -628,6 +694,823 @@ impl Ec {
         }
         if passphrase.expose().len() < Self::MIN_PASSPHRASE_LENGTH {
             return Err(ValidationError::new("short_passphrase"));
+        }
+        Ok(())
+    }
+
+    /// Refuses a [`resolve_allowed_origins`](Self::resolve_allowed_origins)
+    /// entry that is not a serialized origin.
+    ///
+    /// The resolve endpoint reads each entry with
+    /// [`parse_serialized_origin`](crate::ec::resolve::parse_serialized_origin),
+    /// and an entry that parse rejects matches no request, so every resolve
+    /// from the origin it was meant to allow would answer `403`. Checking with
+    /// the same parse here means an entry that loads is one a request can
+    /// match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming the first entry
+    /// that is not a serialized origin and what is wrong with it.
+    pub fn validate_resolve_allowed_origins(&self) -> Result<(), Report<TrustedServerError>> {
+        for entry in &self.resolve_allowed_origins {
+            if let Err(reason) = crate::ec::resolve::parse_serialized_origin(entry) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "[ec] resolve_allowed_origins entry `{entry}` {reason}. \
+                         Each entry is a bare origin, being `http://` or `https://` and a \
+                         host with an optional port, such as `https://www.example.com`"
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the module selection against the configured blocks.
+    ///
+    /// When [`module`](Self::module) is set, the selection has to resolve
+    /// to an implementation this deployment can configure, and every block in
+    /// [`module_blocks`](Self::module_blocks) has to be the one the
+    /// selector names, so a deployment that selects a module (in TOML or via
+    /// the environment override) but has not configured it fails fast at
+    /// startup rather than silently running stateless. When no module is
+    /// selected, Trusted Server runs statelessly and this check passes.
+    ///
+    /// Whether the named implementation exists at all is settled by
+    /// [`build_module`](crate::ec::module::build_module), which is the
+    /// one place that knows both the implementations built into core and the
+    /// one this deployment's adapter injects.
+    ///
+    /// Whether this build compiles an implementation in at all is answered by
+    /// `check_named_module_configuration` in [`crate::ec::module`], beside
+    /// the resolution it belongs to, rather than here, because the settings
+    /// cannot know which implementations are compiled out of this build. Only
+    /// the resolution knows that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when a module name or
+    /// implementation is not a module name, when a block is configured with no
+    /// selector or alongside `"none"`, when the selector names a key `[ec]`
+    /// reads as its own setting, when the selected implementation is not
+    /// compiled into this build, when a block the selector does not name is
+    /// configured, or when the selected module resolves to an implementation
+    /// that needs settings and has no block.
+    pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        for (name, block) in self.module_blocks.iter() {
+            Self::validate_module_name(name)?;
+            if let Some(implementation) = &block.implementation {
+                Self::validate_module_name(implementation)?;
+            }
+        }
+
+        let Some(selection) = self.module.as_ref() else {
+            if !self.module_blocks.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec.<name>] module blocks are configured but no [ec] module \
+                              is selected. Set [ec] module = \"<name>\" to activate one, or \
+                              remove the blocks to run statelessly"
+                        .to_owned(),
+                }));
+            }
+            return Ok(());
+        };
+
+        // `"none"` is explicit statelessness, the same meaning as omitting the
+        // selector, spelled out. It is subject to the same rule that no
+        // module blocks may be left configured.
+        let EcModuleSelection::Named(name) = selection else {
+            if !self.module_blocks.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec] module = \"none\" selects stateless operation, but \
+                              [ec.<name>] module blocks are configured. Remove the blocks, \
+                              or select the module they configure"
+                        .to_owned(),
+                }));
+            }
+            return Ok(());
+        };
+
+        let name = name.as_str();
+        Self::validate_module_name(name)?;
+        if EC_SECTION_KEYS.contains(&name) || name == REMOVED_EC_PROVIDERS_TABLE {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec] module = \"{name}\" names a key the `[ec]` section reads as its \
+                     own setting, so no module can be configured under it. Give the \
+                     module a name of its own"
+                ),
+            }));
+        }
+
+        // Whether this build compiles the implementation in at all is the
+        // resolution's question, not the settings', so it is asked there.
+        let implementation = self.module_blocks.implementation(name);
+        check_named_module_configuration(implementation)?;
+
+        // A module has a block only when it has settings, and core knows
+        // which of its own implementations need them. Both modules that
+        // derive an identifier at the edge take a passphrase, so both need one.
+        // The demonstration module is built from nothing and needs none. A
+        // module an adapter injects has the contents of its block read by
+        // that adapter when it builds the module, so core cannot say whether
+        // it needs one.
+        if (implementation == HMAC_MODULE_KEY || implementation == HOST_SIGNALS_MODULE_KEY)
+            && !self.module_blocks.contains_key(name)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Edge Cookie module `{name}` is selected but has no `[ec.{name}]` configuration"
+                ),
+            }));
+        }
+
+        // Every configured block must be the selected one. An unreferenced
+        // block is almost always a mistake (a mistyped selector or a stale
+        // block), and accepting it silently invites configuration drift.
+        let unreferenced: Vec<&str> = self
+            .module_blocks
+            .keys()
+            .map(String::as_str)
+            .filter(|configured| *configured != name)
+            .collect();
+        if unreferenced.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec.{}] is configured but `{name}` is selected. Remove the unselected \
+                     block, or correct the selector",
+                    unreferenced.join("], [ec.")
+                ),
+            }))
+        }
+    }
+
+    /// Validates one module name or implementation id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when `name` is not a
+    /// module name, see [`crate::module_name::is_valid`].
+    fn validate_module_name(name: &str) -> Result<(), Report<TrustedServerError>> {
+        if crate::module_name::is_valid(name) {
+            return Ok(());
+        }
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "Edge Cookie module name `{name}` is not a module name, which is parts \
+                 joined by `.`, each of lower case letters, digits, `_` or `-`"
+            ),
+        }))
+    }
+
+    /// Migrates the deprecated `[ec] passphrase` form to the module layout.
+    ///
+    /// A configuration still carrying the old key keeps working for one
+    /// release cycle, mapping to `module = "hmac"` with the passphrase in
+    /// the `[ec.hmac]` block, and a deprecation warning names the new
+    /// location. A configuration carrying both forms is rejected so a
+    /// half-edited file fails loudly instead of one form silently winning.
+    ///
+    /// The deprecated key is held to the same passphrase rules as the new
+    /// `[ec.hmac]` block. Validation runs before this migration and the
+    /// deprecated field carries no check of its own, so without the check here
+    /// a short or empty passphrase in the old location would start a
+    /// deployment that the new location rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when both the deprecated
+    /// key and any part of the module configuration are present, or when the
+    /// deprecated passphrase fails [`Self::validate_passphrase`].
+    pub fn migrate_legacy_ec_layout(&mut self) -> Result<(), Report<TrustedServerError>> {
+        let Some(passphrase) = self.passphrase.take() else {
+            return Ok(());
+        };
+        if self.module.is_some() || !self.module_blocks.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] passphrase (deprecated) and the [ec] module configuration \
+                          are both present. Keep exactly one form, moving the passphrase to \
+                          [ec.hmac] and deleting the old key"
+                    .to_owned(),
+            }));
+        }
+        Self::validate_passphrase(&passphrase).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec] passphrase (deprecated) is invalid ({err}). Use a random secret \
+                     of at least {} bytes, placed in [ec.hmac]",
+                    Self::MIN_PASSPHRASE_LENGTH,
+                ),
+            })
+        })?;
+        log::warn!(
+            "[ec] passphrase is deprecated. Move it to [ec.hmac] passphrase and set \
+             [ec] module = \"hmac\""
+        );
+        self.module = Some(EcModuleSelection::from(HMAC_MODULE_KEY));
+        self.module_blocks.insert(
+            HMAC_MODULE_KEY.to_owned(),
+            EcModuleBlock::from(HmacModuleConfig { passphrase }),
+        );
+        Ok(())
+    }
+}
+
+impl Validate for Ec {
+    /// Validates the partner entries and the settings of every block that
+    /// configures a module built into core.
+    ///
+    /// Written out rather than derived because each block's errors are keyed
+    /// by the name the operator wrote the block under, so a passphrase
+    /// `[ec.primary]` rejects is reported at `ec.primary.passphrase`. A
+    /// derived nested validation would key them under this struct's own field
+    /// name, which is a path no configuration has.
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = ValidationErrors::new();
+        errors.merge_self("partners", self.partners.validate());
+        let blocks = self
+            .module_blocks
+            .hmac_blocks()
+            .map(|(name, config)| (name, config.validate()))
+            .chain(
+                self.module_blocks
+                    .host_signals_blocks()
+                    .map(|(name, config)| (name, config.validate())),
+            );
+        for (name, result) in blocks {
+            if let Err(block_errors) = result {
+                errors.errors_mut().insert(
+                    Cow::Owned(name.to_owned()),
+                    ValidationErrorsKind::Struct(Box::new(block_errors)),
+                );
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// The keys the `[ec]` section reads as its own settings.
+///
+/// Every other key in the section is one module's `[ec.<name>]` settings
+/// table, so these names are reserved and cannot name a module. They are
+/// written out because serde reads the [`Ec`] fields by name and has no way to
+/// report the list back for an error message.
+const EC_SECTION_KEYS: &[&str] = &[
+    "module",
+    "passphrase",
+    "resolve_allowed_origins",
+    "ec_store",
+    "pull_sync_concurrency",
+    "cluster_trust_threshold",
+    "cluster_recheck_secs",
+    "partners",
+];
+
+/// The removed table that used to hold every module's settings.
+const REMOVED_EC_PROVIDERS_TABLE: &str = "providers";
+
+/// The key in a module block that names the implementation it configures.
+///
+/// Anything reading a module block out of a serialized configuration rather
+/// than out of [`EcModuleBlock`] reads the same key from here, so the two
+/// cannot drift apart.
+pub(crate) const MODULE_IMPLEMENTATION_KEY: &str = "implementation";
+
+/// The `[ec.<name>]` settings tables of the Edge Cookie identity modules,
+/// keyed by the name each is written under.
+///
+/// A module that has settings is configured in its own table, for example:
+///
+/// ```toml
+/// [ec]
+/// module = "hmac"
+///
+/// [ec.hmac]
+/// passphrase = "replace-with-32-plus-byte-random-secret"
+/// ```
+///
+/// A table may name the implementation it configures, which makes its own name
+/// a label of the operator's choosing, so the same configuration can also be
+/// written as:
+///
+/// ```toml
+/// [ec]
+/// module = "primary"
+///
+/// [ec.primary]
+/// implementation = "hmac"
+/// passphrase = "replace-with-32-plus-byte-random-secret"
+/// ```
+///
+/// The active module is chosen by the [`Ec::module`] selector, and the one
+/// table present must be the one it names (see
+/// [`Ec::validate_module_selection`]).
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(transparent)]
+pub struct EcModuleBlocks(BTreeMap<String, EcModuleBlock>);
+
+impl EcModuleBlocks {
+    /// The implementation the module `name` resolves to.
+    ///
+    /// A block may name the implementation it configures. Without one, and
+    /// when the module has no block at all, the module's name is its
+    /// implementation.
+    #[must_use]
+    pub fn implementation<'a>(&'a self, name: &'a str) -> &'a str {
+        self.0
+            .get(name)
+            .and_then(|block| block.implementation.as_deref())
+            .unwrap_or(name)
+    }
+
+    /// Every configured block that sets the built-in HMAC module up, with
+    /// the name it is written under.
+    ///
+    /// The name is the label the operator chose, so a caller reporting one of
+    /// these settings names the path the operator wrote rather than the
+    /// implementation's own.
+    pub fn hmac_blocks(&self) -> impl Iterator<Item = (&str, &HmacModuleConfig)> {
+        self.0
+            .iter()
+            .filter_map(|(name, block)| block.hmac_settings().map(|config| (name.as_str(), config)))
+    }
+
+    /// Every configured block that sets the built-in host-signal module up,
+    /// with the name it is written under.
+    ///
+    /// The same contract as [`hmac_blocks`](Self::hmac_blocks), for the other
+    /// module core builds itself.
+    pub fn host_signals_blocks(&self) -> impl Iterator<Item = (&str, &HostSignalsModuleConfig)> {
+        self.0.iter().filter_map(|(name, block)| {
+            block
+                .host_signals_settings()
+                .map(|config| (name.as_str(), config))
+        })
+    }
+}
+
+impl Deref for EcModuleBlocks {
+    type Target = BTreeMap<String, EcModuleBlock>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for EcModuleBlocks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for EcModuleBlocks {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BlocksVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BlocksVisitor {
+            type Value = EcModuleBlocks;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the `[ec.<name>]` module settings tables")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut blocks = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    let table = map.next_value::<JsonValue>()?;
+                    blocks.insert(name.clone(), read_module_block::<A::Error>(&name, table)?);
+                }
+                Ok(EcModuleBlocks(blocks))
+            }
+        }
+
+        deserializer.deserialize_map(BlocksVisitor)
+    }
+}
+
+/// Reads one key left over from the `[ec]` section as the module block it
+/// names.
+///
+/// This is where the `[ec]` section gets the unknown-key check that the fixed
+/// fields lose by holding the module blocks alongside them. A key that is
+/// not a table cannot be a module, so it is reported as the mistyped setting
+/// it almost certainly is.
+fn read_module_block<E>(name: &str, table: JsonValue) -> Result<EcModuleBlock, E>
+where
+    E: serde::de::Error,
+{
+    if name == REMOVED_EC_PROVIDERS_TABLE {
+        return Err(E::custom(
+            "[ec.providers] is no longer read. Each module's settings moved to a table of \
+             its own under [ec], so a block written as [ec.providers.hmac] is now [ec.hmac]",
+        ));
+    }
+    let JsonValue::Object(mut table) = table else {
+        let known = EC_SECTION_KEYS
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(E::custom(format!(
+            "unknown field `{name}`, expected one of {known}, or an [ec.<name>] module \
+             settings table"
+        )));
+    };
+    let implementation = match table.remove(MODULE_IMPLEMENTATION_KEY) {
+        None => None,
+        Some(JsonValue::String(implementation)) => Some(implementation),
+        Some(_) => {
+            return Err(E::custom(format!(
+                "`implementation` in [ec.{name}] must be a string naming the module \
+                 implementation the block configures"
+            )));
+        }
+    };
+
+    // The implementation decides how the rest of the table is read. Core reads
+    // its own modules' settings here, so a mistyped key fails where the
+    // configuration is read rather than at the request that needed it, and
+    // keeps the settings of a module an adapter injects as the raw values
+    // that adapter deserializes for itself.
+    let invalid = |err| E::custom(format!("[ec.{name}] is invalid ({err})"));
+    let settings = match implementation.as_deref().unwrap_or(name) {
+        HMAC_MODULE_KEY => EcModuleSettings::Hmac(
+            serde_json::from_value(JsonValue::Object(table)).map_err(invalid)?,
+        ),
+        HOST_SIGNALS_MODULE_KEY => EcModuleSettings::HostSignals(
+            serde_json::from_value(JsonValue::Object(table)).map_err(invalid)?,
+        ),
+        _ => EcModuleSettings::Injected(table),
+    };
+    Ok(EcModuleBlock {
+        implementation,
+        settings,
+    })
+}
+
+/// One module's `[ec.<name>]` settings table.
+#[derive(Debug, Clone, Serialize)]
+pub struct EcModuleBlock {
+    /// The implementation this block configures, written as
+    /// `implementation = "<id>"`, when the block's own name is not it.
+    ///
+    /// Setting it makes the block name a label of the operator's choosing, so
+    /// one implementation can be configured under any name. Everything that
+    /// resolves the selected module reads the implementation rather than the
+    /// label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implementation: Option<String>,
+
+    /// Everything the block holds other than `implementation`.
+    #[serde(flatten)]
+    pub settings: EcModuleSettings,
+}
+
+impl EcModuleBlock {
+    /// The built-in HMAC module's settings, when this block configures it.
+    #[must_use]
+    pub fn hmac_settings(&self) -> Option<&HmacModuleConfig> {
+        match &self.settings {
+            EcModuleSettings::Hmac(config) => Some(config),
+            EcModuleSettings::HostSignals(_) | EcModuleSettings::Injected(_) => None,
+        }
+    }
+
+    /// The built-in host-signal module's settings, when this block
+    /// configures it.
+    #[must_use]
+    pub fn host_signals_settings(&self) -> Option<&HostSignalsModuleConfig> {
+        match &self.settings {
+            EcModuleSettings::HostSignals(config) => Some(config),
+            EcModuleSettings::Hmac(_) | EcModuleSettings::Injected(_) => None,
+        }
+    }
+}
+
+impl From<HmacModuleConfig> for EcModuleBlock {
+    /// Builds the `[ec.hmac]` block, the built-in HMAC module configured
+    /// under its own name. A block under a label names its implementation
+    /// instead.
+    fn from(config: HmacModuleConfig) -> Self {
+        Self {
+            implementation: None,
+            settings: EcModuleSettings::Hmac(config),
+        }
+    }
+}
+
+impl From<HostSignalsModuleConfig> for EcModuleBlock {
+    /// Builds the `[ec.host_signals]` block, the built-in host-signal module
+    /// configured under its own name. A block under a label names its
+    /// implementation instead.
+    fn from(config: HostSignalsModuleConfig) -> Self {
+        Self {
+            implementation: None,
+            settings: EcModuleSettings::HostSignals(config),
+        }
+    }
+}
+
+/// The settings one module block holds, read according to the
+/// implementation the block configures.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum EcModuleSettings {
+    /// The built-in HMAC module's settings.
+    Hmac(HmacModuleConfig),
+
+    /// The built-in host-signal module's settings.
+    HostSignals(HostSignalsModuleConfig),
+
+    /// The settings of a module an adapter injects, kept as the raw values
+    /// the block held. The adapter that builds the module deserializes them
+    /// into the vendor crate's own config type, so core never names a vendor
+    /// and a new module adds nothing here.
+    Injected(serde_json::Map<String, JsonValue>),
+}
+
+/// Configuration for the built-in HMAC Edge Cookie module.
+///
+/// Mapped from the `[ec.hmac]` TOML block, or from a block under a label whose
+/// `implementation` is `hmac`. Unknown keys are rejected, so a mistyped
+/// setting fails at startup instead of being accepted silently and leaving the
+/// intended setting at its default.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HmacModuleConfig {
+    /// Publisher passphrase used as the HMAC key for EC generation.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+}
+
+/// Configuration for the built-in host-signal Edge Cookie module.
+///
+/// Mapped from the `[ec.host_signals]` TOML block, or from a block under a
+/// label whose `implementation` is `host_signals`. Unknown keys are rejected,
+/// so a mistyped setting fails at startup instead of being accepted silently
+/// and leaving the intended setting at its default.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HostSignalsModuleConfig {
+    /// Passphrase used as the HMAC key over the host signals and client IP.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+}
+
+/// Device-detection configuration.
+///
+/// Mapped from the `[device]` TOML section. Selects which device-detection
+/// module classifies a request into device signals, mirroring the Edge
+/// Cookie module selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// The key of the device-detection module to activate.
+    ///
+    /// Defaults to the built-in `builtin` module when absent, which classifies
+    /// from the User-Agent alone, so device classification itself makes no
+    /// host-specific call. The opt-in `fastly` module strengthens the
+    /// browser/bot gate with the host's TLS and HTTP/2 signals, which the Fastly
+    /// entry point reads on every request regardless of this selector. Override
+    /// it with the
+    /// `TRUSTED_SERVER__device__module` environment variable so the same
+    /// compiled WebAssembly can switch modules at deployment. An unknown key is
+    /// rejected at startup by
+    /// [`validate_module_selection`](Self::validate_module_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+}
+
+impl DeviceConfig {
+    /// Returns the active device-detection module key, defaulting to the
+    /// built-in heuristic.
+    #[must_use]
+    pub fn module_key(&self) -> &str {
+        self.module.as_deref().unwrap_or("builtin")
+    }
+
+    /// Validates that the selected device-detection module is available in
+    /// this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected module
+    /// key is not one this build provides.
+    pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.module_key() {
+            "builtin" | "fastly" => Ok(()),
+            key => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Device detection module `{key}` is not available in this build"),
+            })),
+        }
+    }
+}
+
+/// Which permission signal modules run, and in what order.
+///
+/// Mapped from the `[permission-signal]` TOML section, where `modules`
+/// selects. `[ec]`, `[geo]` and `[device]` each name one module with
+/// `module`, whereas signals compose, because a request can carry a TCF string
+/// and a Global Privacy Control header at once and both have something to say.
+/// So here `modules` names a list, and the order is the policy, because the
+/// last module with an opinion decides.
+///
+/// A module that gains settings will take them in a
+/// `[permission-signal.<name>]` block named for it. None of the modules that
+/// ship has settings, so `modules` is the only key accepted, and any other key
+/// is refused as an unknown field rather than silently ignored.
+///
+/// See `crates/trusted-server-core/src/permission_signal/README.md`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Validate)]
+pub struct PermissionSignalConfig {
+    /// The modules to run, in order, named by their crate folders below
+    /// `crates/permission-signal`, for example `gpc`, `gpp`, `us-privacy`,
+    /// `tcf` and `mtm` for the five that ship.
+    ///
+    /// Absent means every module the adapter offers, in the order it offers
+    /// them. A publisher who does not want to act on one removes it from the
+    /// list, and there is no separate switch, because a module that is not
+    /// listed does not run. An empty list runs none of them, leaving every
+    /// permission at its country and region baseline.
+    ///
+    /// Which names are valid is only known where the module crates are
+    /// linked, so the check that each name matches an available module and
+    /// none is repeated happens at the adapter's composition root, through
+    /// [`build_permission_signal_modules`], and refuses startup rather than
+    /// silently ignoring a typo.
+    ///
+    /// [`build_permission_signal_modules`]:
+    ///     crate::permission_signal::build_permission_signal_modules
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modules: Option<Vec<String>>,
+}
+
+/// Read by hand rather than derived, so that `sources` and `module`, the keys
+/// `modules` replaced, are refused with a message saying what to write instead. A derived
+/// struct could only refuse it by name by declaring it as a field, and would
+/// then list it among the keys it expects whenever it refused any other.
+impl<'de> Deserialize<'de> for PermissionSignalConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut section = serde_json::Map::<String, JsonValue>::deserialize(deserializer)?;
+        if section.contains_key("sources") {
+            return Err(serde::de::Error::custom(
+                "[permission-signal] sources is no longer accepted. Name the modules \
+                 to run, in order, in [permission-signal] modules instead",
+            ));
+        }
+        if section.contains_key("module") {
+            return Err(serde::de::Error::custom(
+                "[permission-signal] module is `modules` here, a list, because signals \
+                 compose. Name the modules to run, in order, in [permission-signal] \
+                 modules instead",
+            ));
+        }
+        if let Some(key) = section.keys().find(|key| key.as_str() != "modules") {
+            return Err(serde::de::Error::custom(format!(
+                "unknown field `{key}` in [permission-signal], expected `modules`. No \
+                 permission signal module takes settings yet, so a \
+                 [permission-signal.<name>] block is not accepted"
+            )));
+        }
+        // Read as an option, so an explicit JSON null is the same as leaving
+        // the key out.
+        let modules = match section.remove("modules") {
+            Some(value) => serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            None => None,
+        };
+        Ok(Self { modules })
+    }
+}
+
+/// Geo / IP intelligence configuration.
+///
+/// Mapped from the `[geo]` TOML section. Selects which module resolves a
+/// client IP into [`GeoInfo`](crate::platform::GeoInfo), mirroring the Edge
+/// Cookie module selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct GeoConfig {
+    /// The key of the geo module to activate.
+    ///
+    /// No module is the default: Trusted Server resolves no geolocation and
+    /// makes no host geo call, so a default deployment is not tied to any host
+    /// geo service, and the permission baseline comes from the top of the
+    /// `rules` tree in `permissions.yaml`. `module = "none"` spells
+    /// the same choice explicitly. The host platform's own geo lookup is
+    /// opt-in via `module = "platform"`. Override it with the
+    /// `TRUSTED_SERVER__geo__module` environment variable so the same compiled
+    /// WebAssembly can switch modules at deployment. An unknown key is rejected
+    /// at startup by
+    /// [`validate_module_selection`](Self::validate_module_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+
+    /// Acknowledges that, with no geo module, every request is treated as
+    /// coming from the place at the top of the `permissions.yaml` `rules` tree.
+    ///
+    /// With geolocation off, a visitor from any other jurisdiction silently
+    /// receives that top node's permission rules. A deployment that
+    /// runs an Edge Cookie module without a geo module must set this to
+    /// `true`, checked at startup by
+    /// [`validate_jurisdiction_acknowledgment`](Self::validate_jurisdiction_acknowledgment),
+    /// so serving a single jurisdiction is an explicit operator decision rather
+    /// than an accident of the default configuration.
+    #[serde(default)]
+    pub assume_single_jurisdiction: bool,
+}
+
+impl GeoConfig {
+    /// Validates that the selected geo module is available in this build.
+    ///
+    /// No selector is valid and is the default, running without geolocation,
+    /// the same way the Edge Cookie module runs statelessly when none is
+    /// selected. The explicit `"none"` spells the same choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected module
+    /// key is not one this build provides.
+    pub fn validate_module_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.module.as_deref() {
+            None | Some("platform") | Some("none") => Ok(()),
+            Some(key) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Geo module `{key}` is not available in this build"),
+            })),
+        }
+    }
+
+    /// Validates that the compiled `permissions.yaml` parses and declares its
+    /// top node.
+    ///
+    /// The top node is required: its `group` is the permission baseline for a
+    /// request the geo module leaves unmatched, and its `jurisdiction` is the
+    /// consent handling for that same request, so there must always be one.
+    /// Checking it here turns a malformed policy into a configuration error at
+    /// startup rather than a panic on the first lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the compiled policy
+    /// fails to parse, most usefully when its top node omits `group` or
+    /// `jurisdiction`.
+    pub fn validate_permission_policy() -> Result<(), Report<TrustedServerError>> {
+        crate::permissions::validate_default_policy().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("permissions.yaml is not usable: {error}"),
+            })
+        })
+    }
+
+    /// Validates that running jurisdiction consumers without geolocation is
+    /// explicitly acknowledged.
+    ///
+    /// With no geo module, every request resolves to the permission baseline
+    /// at the top of the `permissions.yaml` `rules` tree, so a visitor from any
+    /// other jurisdiction silently receives that node's rules. That is
+    /// acceptable only as an explicit operator
+    /// decision. When an Edge Cookie module is configured (the permission
+    /// model gates it by jurisdiction) and no geo module is selected,
+    /// [`assume_single_jurisdiction`](Self::assume_single_jurisdiction) must be
+    /// `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when an Edge Cookie
+    /// module is configured, no geo module is selected, and
+    /// `assume_single_jurisdiction` is not set.
+    pub fn validate_jurisdiction_acknowledgment(
+        &self,
+        ec: &Ec,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let geo_disabled = !matches!(self.module.as_deref(), Some("platform"));
+        // The selector is a typed enum, so statelessness is the absent
+        // selector or the explicit `none`, matched rather than compared as a
+        // string.
+        let ec_active = !matches!(ec.module, None | Some(EcModuleSelection::None));
+        if geo_disabled && ec_active && !self.assume_single_jurisdiction {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] module is configured but no [geo] module is selected, so \
+                          every request would be treated as the top of the permissions.yaml \
+                          rules tree. Set [geo] assume_single_jurisdiction = true to \
+                          acknowledge single-jurisdiction operation, or select a geo module"
+                    .to_owned(),
+            }));
         }
         Ok(())
     }
@@ -2620,6 +3503,53 @@ fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) 
     *value == AuctionDebugCommentOptions::default()
 }
 
+// The module selectors are new sections, so a serialized blob that carries
+// them is rejected by a base-revision binary that has never heard of them.
+// Omitting the default table keeps an unchanged `ts config push` readable
+// across a rollout or a rollback.
+fn is_default_device_config(value: &DeviceConfig) -> bool {
+    *value == DeviceConfig::default()
+}
+
+fn is_default_geo_config(value: &GeoConfig) -> bool {
+    *value == GeoConfig::default()
+}
+
+fn is_default_permission_signal_config(value: &PermissionSignalConfig) -> bool {
+    *value == PermissionSignalConfig::default()
+}
+
+/// A table that is no longer read under its old name, refused with directions
+/// to its new one when a configuration still carries it.
+macro_rules! refused_table {
+    ($(#[$doc:meta])* $name:ident => $message:expr) => {
+        $(#[$doc])*
+        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                // The value is read and discarded first so that a table, a
+                // string or anything else all reach the same message. A type
+                // error instead would send an operator looking for a type
+                // problem in a table that has simply moved.
+                serde::de::IgnoredAny::deserialize(deserializer)?;
+                Err(serde::de::Error::custom($message))
+            }
+        }
+    };
+}
+
+refused_table! {
+    /// The `[permission_signal]` table, renamed `[permission-signal]`.
+    RenamedPermissionSignalTable => "Configuration table `[permission_signal]` is now \
+        `[permission-signal]`, named exactly as its folder crates/permission-signal. Move its \
+        settings there unchanged"
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -2916,6 +3846,27 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default, skip_serializing_if = "is_default_device_config")]
+    #[validate(nested)]
+    pub device: DeviceConfig,
+    #[serde(default, skip_serializing_if = "is_default_geo_config")]
+    #[validate(nested)]
+    pub geo: GeoConfig,
+    #[serde(
+        rename = "permission-signal",
+        default,
+        skip_serializing_if = "is_default_permission_signal_config"
+    )]
+    #[validate(nested)]
+    pub permission_signal: PermissionSignalConfig,
+    /// The `[permission_signal]` table, kept so a configuration carrying it is
+    /// told its new name.
+    #[serde(rename = "permission_signal", default, skip_serializing)]
+    #[allow(
+        dead_code,
+        reason = "the field exists so that reading the renamed table fails with directions"
+    )]
+    renamed_permission_signal: RenamedPermissionSignalTable,
 }
 
 impl Settings {
@@ -3012,8 +3963,33 @@ impl Settings {
             })
         })?;
 
+        settings.ec.migrate_legacy_ec_layout()?;
+        settings.ec.validate_module_selection()?;
+        settings.ec.validate_resolve_allowed_origins()?;
+        settings.device.validate_module_selection()?;
+        settings.geo.validate_module_selection()?;
+        GeoConfig::validate_permission_policy()?;
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
+
+        // Log the policy's declared default once per settings load, so an
+        // operator can see which permissions an unmatched request is granted
+        // without a signal, and which jurisdiction its consent gates apply.
+        let maps = crate::permissions::PermissionMaps::standard();
+        let granted: Vec<String> = maps
+            .baseline(None, None)
+            .permissions()
+            .iter()
+            .map(|permission| permission.to_string())
+            .collect();
+        log::debug!(
+            "Permission baseline: permissions.yaml top node, jurisdiction {}; granted without a signal: [{}]",
+            maps.default_jurisdiction(),
+            granted.join(", ")
+        );
 
         Ok(settings)
     }
@@ -3096,8 +4072,15 @@ impl Settings {
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
         let mut insecure_fields: Vec<String> = Vec::new();
 
-        if Ec::is_placeholder_passphrase(self.ec.passphrase.expose()) {
-            insecure_fields.push("ec.passphrase".to_owned());
+        for (name, hmac) in self.ec.module_blocks.hmac_blocks() {
+            if Ec::is_placeholder_passphrase(hmac.passphrase.expose()) {
+                insecure_fields.push(format!("ec.{name}.passphrase"));
+            }
+        }
+        for (name, host_signals) in self.ec.module_blocks.host_signals_blocks() {
+            if Ec::is_placeholder_passphrase(host_signals.passphrase.expose()) {
+                insecure_fields.push(format!("ec.{name}.passphrase"));
+            }
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
@@ -3724,6 +4707,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    use crate::ec::resolve::NotAnOrigin;
+
     /// `DebugConfig` denies unknown fields, so a binary built before
     /// `sandbox_metrics_enabled` existed must still accept a default blob.
     /// That only holds while the flag is skipped during serialization.
@@ -3781,7 +4766,10 @@ mod tests {
         prebid::PrebidIntegrationConfig,
     };
     use crate::redacted::Redacted;
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        crate_test_settings_str, crate_test_settings_str_with_ec_section, create_test_settings,
+        hmac_passphrase, select_hmac_module,
+    };
 
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
@@ -3862,8 +4850,17 @@ mod tests {
 
     #[test]
     fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
-        let settings = Settings::from_toml(&crate_test_settings_str())
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without trusted client IP configuration");
+
+        // The guarantee covers a config that configures none of the sections
+        // added since the base revision. A configured section is serialized and,
+        // like a configured `trusted_client_ip`, needs a compatible blob restored
+        // before rolling back to a binary that predates it. The shared test
+        // config sets `[geo]` because the permission model requires a default
+        // country, so both selector tables are reset to unset here.
+        settings.geo = GeoConfig::default();
+        settings.device = DeviceConfig::default();
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
@@ -3931,7 +4928,7 @@ mod tests {
         let mut settings = create_test_settings();
 
         settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
-        settings.ec.passphrase = Redacted::new(CANARY_EC_PASSPHRASE.to_string());
+        select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, CANARY_EC_PASSPHRASE);
 
         settings.handlers = vec![Handler {
             path: "^/secure".to_string(),
@@ -4013,7 +5010,7 @@ mod tests {
 
         let canaries = [
             ("publisher.proxy_secret", CANARY_PROXY_SECRET),
-            ("ec.passphrase", CANARY_EC_PASSPHRASE),
+            ("ec.hmac.passphrase", CANARY_EC_PASSPHRASE),
             ("handlers[].username", CANARY_HANDLER_USERNAME),
             ("handlers[].password", CANARY_HANDLER_PASSWORD),
             ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
@@ -4798,7 +5795,12 @@ mod tests {
         );
         assert_eq!(settings.publisher.origin_host_header_override, None);
         assert_eq!(
-            settings.ec.passphrase.expose(),
+            settings.ec.module.as_ref(),
+            Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
+            "test settings should select the hmac EC module"
+        );
+        assert_eq!(
+            hmac_passphrase(&settings.ec, HMAC_MODULE_KEY),
             "test-secret-key-32-bytes-minimum"
         );
 
@@ -4968,6 +5970,140 @@ mod tests {
     }
 
     #[test]
+    fn module_selection_allows_no_module_for_stateless_operation() {
+        let ec = Ec::default();
+        assert!(ec.module.is_none(), "default Ec selects no module");
+        ec.validate_module_selection()
+            .expect("should allow no module selected and run statelessly");
+    }
+
+    #[test]
+    fn selecting_an_implementation_that_needs_settings_without_its_block_is_rejected() {
+        // The built-in HMAC module has a required passphrase, so selecting
+        // it with no `[ec.hmac]` block is a deployment that would run
+        // stateless under a selector saying otherwise.
+        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nmodule = \"hmac\"\n");
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an implementation with no settings block should fail at startup");
+        assert!(
+            format!("{err:?}").contains("`hmac` is selected but has no `[ec.hmac]` configuration"),
+            "should name the missing block: {err:?}"
+        );
+    }
+
+    #[test]
+    fn selecting_a_module_with_no_settings_needs_no_block() {
+        // A block exists only when a module has settings, and only the
+        // adapter that injects a module knows whether it has any, so a
+        // selector naming one core does not supply is left to
+        // `build_module`, which is where the injected modules are known.
+        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nmodule = \"acme\"\n");
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("a module with no settings should need no block");
+        assert!(
+            settings.ec.module_blocks.is_empty(),
+            "the selection should stand on its own with no block configured"
+        );
+    }
+
+    /// The fixture settings with `line` added to `[ec]`.
+    fn settings_toml_with_ec_line(line: &str) -> String {
+        crate_test_settings_str_with_ec_section(&format!(
+            "[ec]\nmodule = \"hmac\"\n{line}\n\n[ec.hmac]\n\
+             passphrase = \"test-secret-key-32-bytes-minimum\"\n"
+        ))
+    }
+
+    /// The `resolve_allowed_origins` line listing `entries`, each written as a
+    /// TOML basic string.
+    fn resolve_allowed_origins_line(entries: &[&str]) -> String {
+        let written: Vec<String> = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).expect("should write a string"))
+            .collect();
+        format!("resolve_allowed_origins = [{}]", written.join(", "))
+    }
+
+    #[test]
+    fn resolve_allowed_origins_load_only_as_bare_origins() {
+        let accepted: [(&str, Option<&[&str]>); 7] = [
+            ("an absent list", None),
+            ("an empty list", Some(&[])),
+            ("https with no port", Some(&["https://www.example.com"])),
+            ("https with :443", Some(&["https://www.example.com:443"])),
+            ("http with :80", Some(&["http://www.example.com:80"])),
+            (
+                "a non-default port",
+                Some(&["https://www.example.com:8443"]),
+            ),
+            (
+                "the generator's https://{domain} shape",
+                Some(&["https://www.example.com", "https://m.example.com"]),
+            ),
+        ];
+        for (label, entries) in accepted {
+            let line = entries
+                .map(resolve_allowed_origins_line)
+                .unwrap_or_default();
+
+            let settings = Settings::from_toml(&settings_toml_with_ec_line(&line))
+                .unwrap_or_else(|err| panic!("should load {label}: {err:?}"));
+
+            assert_eq!(
+                settings.ec.resolve_allowed_origins,
+                entries.unwrap_or_default(),
+                "should keep the entries of {label} as written"
+            );
+        }
+
+        let refused = [
+            ("https://www.example.com/", NotAnOrigin::Path),
+            ("https://www.example.com/path", NotAnOrigin::Path),
+            ("https://www.example.com\\", NotAnOrigin::Path),
+            ("https://www.example.com?a=1", NotAnOrigin::Query),
+            ("https://www.example.com#top", NotAnOrigin::Fragment),
+            ("https://user@www.example.com", NotAnOrigin::Userinfo),
+            ("https://user:pass@www.example.com", NotAnOrigin::Userinfo),
+            ("www.example.com", NotAnOrigin::Scheme),
+            ("www.example.com:443", NotAnOrigin::Scheme),
+            ("ftp://www.example.com", NotAnOrigin::Scheme),
+            ("wss://www.example.com", NotAnOrigin::Scheme),
+            ("null", NotAnOrigin::Scheme),
+            ("", NotAnOrigin::Empty),
+            ("https://", NotAnOrigin::Host),
+            ("https://www.example.com ", NotAnOrigin::Host),
+        ];
+        for (entry, reason) in refused {
+            let line = resolve_allowed_origins_line(&["https://www.example.com", entry]);
+
+            let Err(err) = Settings::from_toml(&settings_toml_with_ec_line(&line)) else {
+                panic!("should refuse `{entry}` at load");
+            };
+
+            assert!(
+                format!("{err:?}")
+                    .contains(&format!("resolve_allowed_origins entry `{entry}` {reason}")),
+                "should name `{entry}` and say it {reason}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolve_allowed_origin_with_a_trailing_slash_is_refused_at_load() {
+        let line = resolve_allowed_origins_line(&["https://www.example.com/"]);
+
+        let err = Settings::from_toml(&settings_toml_with_ec_line(&line))
+            .expect_err("should refuse an entry that would never match a request's Origin");
+
+        assert!(
+            format!("{err:?}").contains("`https://www.example.com/`"),
+            "should name the entry: {err:?}"
+        );
+    }
+
+    #[test]
     fn cache_asset_rule_globs_respect_path_separators() {
         let toml_str = format!(
             r#"{}
@@ -5070,6 +6206,25 @@ mod tests {
                 .expect("should evaluate disabled cache rules")
                 .is_none(),
             "disabled rules should never match"
+        );
+    }
+
+    #[test]
+    fn module_blocks_without_a_selector_are_rejected() {
+        // A half-migrated configuration that carries an [ec.hmac] block but
+        // never selects it would silently run stateless, so it is rejected at
+        // startup instead.
+        let toml_str = crate_test_settings_str().replace("module = \"hmac\"\n", "");
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a module block with no selector should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
         );
     }
 
@@ -5187,6 +6342,78 @@ mod tests {
     }
 
     #[test]
+    fn legacy_passphrase_migrates_to_the_hmac_module() {
+        let mut ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            ..Ec::default()
+        };
+        ec.migrate_legacy_ec_layout()
+            .expect("should migrate the deprecated form");
+        assert_eq!(
+            ec.module.as_ref(),
+            Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
+            "the deprecated passphrase should select the hmac module"
+        );
+        assert_eq!(
+            hmac_passphrase(&ec, HMAC_MODULE_KEY),
+            "test-secret-key-32-bytes-minimum",
+            "the passphrase should move into the hmac block"
+        );
+        assert!(
+            ec.passphrase.is_none(),
+            "the deprecated field should be consumed by the migration"
+        );
+    }
+
+    /// The crate test configuration with its `[ec]` section rewritten to the
+    /// deprecated single-passphrase form.
+    fn legacy_ec_settings_str(passphrase: &str) -> String {
+        let legacy = crate_test_settings_str_with_ec_section(&format!(
+            "[ec]\npassphrase = \"{passphrase}\"\n"
+        ));
+        assert!(
+            !legacy.contains("[ec.hmac]"),
+            "the legacy configuration should carry no module block"
+        );
+        legacy
+    }
+
+    #[test]
+    fn a_legacy_passphrase_is_held_to_the_passphrase_rules() {
+        // Validation runs before the migration and the deprecated field
+        // carries no check of its own, so the migration itself has to apply
+        // the passphrase rules. Without that, a value the new `[ec.hmac]`
+        // block rejects would still start a deployment from the old location.
+        let short = Settings::from_toml(&legacy_ec_settings_str("short"))
+            .expect_err("a short legacy passphrase should be rejected");
+        assert!(
+            format!("{short:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {short:?}"
+        );
+
+        let empty = Settings::from_toml(&legacy_ec_settings_str(""))
+            .expect_err("an empty legacy passphrase should be rejected");
+        assert!(
+            format!("{empty:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {empty:?}"
+        );
+
+        let settings =
+            Settings::from_toml(&legacy_ec_settings_str("test-secret-key-32-bytes-minimum"))
+                .expect("a legacy passphrase of adequate length should still start");
+        assert_eq!(
+            settings.ec.module.as_ref(),
+            Some(&EcModuleSelection::from(HMAC_MODULE_KEY)),
+            "an adequate legacy passphrase should still select the hmac module"
+        );
+        assert_eq!(
+            hmac_passphrase(&settings.ec, HMAC_MODULE_KEY),
+            "test-secret-key-32-bytes-minimum",
+            "an adequate legacy passphrase should still move into the hmac block"
+        );
+    }
+
+    #[test]
     fn cache_asset_rule_validation_rejects_invalid_config() {
         let duplicate_ids = format!(
             r#"{}
@@ -5261,6 +6488,448 @@ mod tests {
             format!("{missing_matcher_err:?}").contains("exactly one matcher"),
             "should explain missing matcher: {missing_matcher_err:?}"
         );
+    }
+
+    #[test]
+    fn legacy_passphrase_alongside_module_config_is_rejected() {
+        let mut ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            module: Some(EcModuleSelection::from(HMAC_MODULE_KEY)),
+            ..Ec::default()
+        };
+        let err = ec
+            .migrate_legacy_ec_layout()
+            .expect_err("both forms present should be rejected");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_hmac_module_block_is_rejected() {
+        // A mistyped key dropped silently would leave the setting the
+        // operator meant to change at its default.
+        let toml_str = crate_test_settings_str().replace(
+            "passphrase = \"test-secret-key-32-bytes-minimum\"",
+            "passphrase = \"test-secret-key-32-bytes-minimum\"\n            typo_key = \"x\"",
+        );
+        assert!(
+            toml_str.contains("typo_key"),
+            "the test configuration should carry the unknown key"
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an unknown key in [ec.hmac] should be rejected");
+        assert!(
+            format!("{err:?}").contains("typo_key"),
+            "should name the unknown key: {err:?}"
+        );
+    }
+
+    #[test]
+    fn module_none_is_explicit_stateless() {
+        let ec = Ec {
+            module: Some(EcModuleSelection::None),
+            ..Ec::default()
+        };
+        ec.validate_module_selection()
+            .expect("explicit none with no blocks should be valid");
+    }
+
+    #[test]
+    fn module_none_with_configured_blocks_is_rejected() {
+        let mut ec = Ec::default();
+        select_hmac_module(&mut ec, HMAC_MODULE_KEY, "test-secret-key-32-bytes-minimum");
+        ec.module = Some(EcModuleSelection::None);
+        assert!(
+            ec.validate_module_selection().is_err(),
+            "none alongside configured blocks should be rejected"
+        );
+    }
+
+    #[test]
+    fn device_module_defaults_to_builtin_and_rejects_unknown() {
+        let config = DeviceConfig::default();
+        assert_eq!(
+            config.module_key(),
+            "builtin",
+            "no selector should default to the built-in module"
+        );
+        config
+            .validate_module_selection()
+            .expect("should validate the built-in default");
+
+        let fastly = DeviceConfig {
+            module: Some("fastly".to_owned()),
+        };
+        fastly
+            .validate_module_selection()
+            .expect("should validate the fastly opt-in");
+
+        let unknown = DeviceConfig {
+            module: Some("acme".to_owned()),
+        };
+        assert!(
+            unknown.validate_module_selection().is_err(),
+            "an unknown device module should be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn an_unselected_module_block_is_rejected() {
+        // A vendor selector with the vendor block present, plus a stray hmac
+        // block, is almost always a stale or mistyped configuration.
+        let toml_str = crate_test_settings_str().replace(
+            "module = \"hmac\"",
+            "module = \"acme\"\n\n            [ec.acme]\n            api_key = \"example\"",
+        );
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a configured but unselected block should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn a_host_signals_block_is_read_as_the_built_in_modules_settings() {
+        // The block is the built-in module's own settings, rather than kept as
+        // the raw values of a module an adapter injects.
+        let settings = Settings::from_toml(&crate_test_settings_str_with_ec_section(&format!(
+            "[ec]
+module = \"{HOST_SIGNALS_MODULE_KEY}\"
+
+\
+             [ec.{HOST_SIGNALS_MODULE_KEY}]
+\
+             passphrase = \"test-secret-key-32-bytes-minimum\"
+"
+        )))
+        .expect("a host_signals selection with its block should load");
+        assert!(
+            settings
+                .ec
+                .module_blocks
+                .get(HOST_SIGNALS_MODULE_KEY)
+                .and_then(EcModuleBlock::host_signals_settings)
+                .is_some(),
+            "the block should be read as the host-signal module's settings"
+        );
+    }
+    #[test]
+    fn a_labeled_block_the_selector_does_not_name_is_rejected() {
+        // A block under a label is still a module block, so it is held to
+        // the rule every block is held to, which is that the selector names
+        // it.
+        let toml_str = crate_test_settings_str_with_ec_section(
+            r#"[ec]
+module = "hmac"
+
+[ec.hmac]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[ec.primary]
+implementation = "hmac"
+passphrase = "another-test-secret-key-32-bytes"
+"#,
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a labeled block the selector does not name should fail at startup");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("[ec.primary] is configured but `hmac` is selected"),
+            "should name the unselected labeled block, got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_removed_providers_table_is_rejected_with_its_new_location() {
+        let toml_str = crate_test_settings_str_with_ec_section(
+            "[ec]\nmodule = \"hmac\"\n\n[ec.providers.hmac]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("the removed [ec.providers] table should be rejected");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("[ec.providers] is no longer read") && message.contains("[ec.hmac]"),
+            "should send the operator to the new location, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_key_under_ec_that_is_not_a_table_is_an_unknown_field() {
+        // Holding the module blocks alongside the fixed keys costs the
+        // section serde's own unknown-key check, so a mistyped setting has to
+        // be caught where the blocks are read.
+        let toml_str = crate_test_settings_str_with_ec_section(
+            "[ec]\nmodule = \"hmac\"\nec_stor = \"ec_identity_store\"\n\n[ec.hmac]\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+        );
+
+        let err =
+            Settings::from_toml(&toml_str).expect_err("a mistyped [ec] key should be rejected");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("unknown field `ec_stor`") && message.contains("`ec_store`"),
+            "should name the mistyped key and the keys it could have been, got: {message}"
+        );
+    }
+
+    #[test]
+    fn geo_module_accepts_default_platform_and_none_and_rejects_unknown() {
+        let config = GeoConfig::default();
+        assert!(
+            config.module.is_none(),
+            "geo should default to no selector, which selects no geo module"
+        );
+        config
+            .validate_module_selection()
+            .expect("should validate the default of running without geolocation");
+
+        let platform = GeoConfig {
+            module: Some("platform".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        platform
+            .validate_module_selection()
+            .expect("should validate the explicit platform selection");
+
+        let none = GeoConfig {
+            module: Some("none".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        none.validate_module_selection()
+            .expect("should validate the explicit opt-out of geolocation");
+
+        let unknown = GeoConfig {
+            module: Some("acme".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        assert!(
+            unknown.validate_module_selection().is_err(),
+            "an unknown geo module should be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn the_reserved_ec_keys_are_the_ones_the_section_reads() {
+        // The list is written out for the unknown-field message and the
+        // reserved-name check, so it has to stay level with the struct.
+        let ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            ..Ec::default()
+        };
+        let value = serde_json::to_value(&ec).expect("should serialize the [ec] section");
+        let written = value
+            .as_object()
+            .expect("the section should serialize as a table")
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            written,
+            EC_SECTION_KEYS.iter().copied().collect::<HashSet<_>>(),
+            "EC_SECTION_KEYS should name every key the [ec] section reads as its own"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_module_sections_are_rejected() {
+        // A mistyped key must fail at startup rather than silently selecting
+        // a default behind the operator's back.
+        for (section, bad_key) in [
+            ("[geo]", "providr = \"platform\""),
+            ("[device]", "providr = \"builtin\""),
+        ] {
+            let toml_str = format!(
+                "{}\n\n            {section}\n            {bad_key}\n",
+                crate_test_settings_str()
+            );
+            assert!(
+                Settings::from_toml(&toml_str).is_err(),
+                "an unknown key in {section} should be rejected"
+            );
+        }
+
+        let toml_str = crate_test_settings_str()
+            .replace("[ec.hmac]", "[ec.hmac]\n            unexpected = \"value\"");
+        assert!(
+            Settings::from_toml(&toml_str).is_err(),
+            "an unknown key in [ec.hmac] should be rejected"
+        );
+    }
+
+    #[test]
+    fn a_reserved_key_cannot_name_a_module() {
+        let toml_str = crate_test_settings_str_with_ec_section("[ec]\nmodule = \"ec_store\"\n");
+
+        let err =
+            Settings::from_toml(&toml_str).expect_err("a reserved key should not name a module");
+        assert!(
+            format!("{err:?}").contains("names a key the `[ec]` section reads as its own setting"),
+            "should say why the name cannot be used: {err:?}"
+        );
+    }
+
+    #[test]
+    fn module_names_and_implementations_follow_the_module_name_rule() {
+        for ec_section in [
+            "[ec]\nmodule = \"Primary\"\n",
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"Hmac\"\n",
+            "[ec]\nmodule = \"primary\"\n\n[ec.Primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+        ] {
+            let err = Settings::from_toml(&crate_test_settings_str_with_ec_section(ec_section))
+                .expect_err("a name that is not a module name should be rejected");
+            assert!(
+                format!("{err:?}").contains("is not a module name"),
+                "should hold `{ec_section}` to the module name rule: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_hmac_block_without_its_passphrase_names_the_block() {
+        // The implementation the block names decides how its settings are
+        // read, so the block the operator wrote is what the error names.
+        let toml_str = crate_test_settings_str_with_ec_section(
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\n",
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an hmac block without its passphrase should be rejected");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("[ec.primary] is invalid") && message.contains("passphrase"),
+            "should name the block and the setting it lacks, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_labeled_block_round_trips_through_serialization() {
+        // The pushed configuration is the serialized settings, so a label and
+        // the implementation it names have to survive being written back.
+        let toml_str = crate_test_settings_str_with_ec_section(
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\npassphrase = \"test-secret-key-32-bytes-minimum\"\n",
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse a labeled module block");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+        assert_eq!(
+            value["ec"]["primary"]["implementation"], "hmac",
+            "the label should keep the implementation it names"
+        );
+
+        let reparsed =
+            Settings::from_json_value(value).expect("should reparse the serialized settings");
+        assert_eq!(
+            reparsed.ec.module_blocks.implementation("primary"),
+            HMAC_MODULE_KEY,
+            "the implementation should survive the round trip"
+        );
+        assert_eq!(
+            hmac_passphrase(&reparsed.ec, "primary"),
+            "test-secret-key-32-bytes-minimum"
+        );
+
+        // A block under the implementation's own name is written back as it
+        // was, without gaining a key the operator never wrote.
+        let written = serde_json::to_value(create_test_settings())
+            .expect("should serialize the test settings");
+        assert!(
+            written["ec"]["hmac"].get("implementation").is_none(),
+            "an unlabeled block should not gain an implementation key: {}",
+            written["ec"]["hmac"]
+        );
+    }
+
+    #[test]
+    fn an_injected_modules_settings_are_kept_as_written() {
+        // Core never names a vendor, so the block of a module an adapter
+        // injects is kept as the values it held for that adapter to read.
+        let toml_str = crate_test_settings_str_with_ec_section(
+            "[ec]\nmodule = \"acme\"\n\n[ec.acme]\nendpoint = \"https://ec.acme.example.com\"\n",
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse a vendor module block");
+
+        let block = settings
+            .ec
+            .module_blocks
+            .get("acme")
+            .expect("should configure the acme block");
+        assert_eq!(
+            settings.ec.module_blocks.implementation("acme"),
+            "acme",
+            "a block that names no implementation is its own name's"
+        );
+        let EcModuleSettings::Injected(injected) = &block.settings else {
+            panic!("a vendor block should keep its settings as the raw values it held");
+        };
+        assert_eq!(injected["endpoint"], "https://ec.acme.example.com");
+
+        // They survive being written back into the pushed configuration, so
+        // the adapter reads what the operator wrote.
+        let written = serde_json::to_value(&settings).expect("should serialize settings");
+        assert_eq!(
+            written["ec"]["acme"]["endpoint"],
+            "https://ec.acme.example.com"
+        );
+    }
+
+    #[test]
+    fn the_compiled_permission_policy_validates_at_startup() {
+        // The compiled-in sample declares its top node, so startup
+        // accepts it. A policy that omitted `group` or `jurisdiction` would be
+        // rejected here rather than panicking on the first lookup, which the
+        // parser tests in `permissions` cover directly.
+        GeoConfig::validate_permission_policy()
+            .expect("the compiled-in sample should validate at startup");
+    }
+
+    #[test]
+    fn ec_without_geo_requires_the_single_jurisdiction_acknowledgment() {
+        // The base test settings acknowledge single-jurisdiction operation.
+        // Removing the acknowledgment while an EC module is configured and
+        // no geo module is selected must fail at startup.
+        let toml_str = crate_test_settings_str().replace("assume_single_jurisdiction = true\n", "");
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an EC module with no geo module needs the acknowledgment");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+
+        // Selecting a geo module removes the requirement.
+        let toml_str = crate_test_settings_str()
+            .replace("assume_single_jurisdiction = true\n", "")
+            .replace("[geo]", "[geo]\n            module = \"platform\"");
+        Settings::from_toml(&toml_str)
+            .expect("a geo module resolves jurisdictions, so no acknowledgment is needed");
+
+        // With no EC module there is no jurisdiction consumer to protect.
+        let toml_str = crate_test_settings_str()
+            .replace("assume_single_jurisdiction = true\n", "")
+            .replace("module = \"hmac\"", "")
+            .replace(
+                "[ec.hmac]\n            passphrase = \"test-secret-key-32-bytes-minimum\"",
+                "",
+            );
+        Settings::from_toml(&toml_str)
+            .expect("stateless operation needs no jurisdiction acknowledgment");
     }
 
     #[test]
@@ -5675,7 +7344,11 @@ source_domain = "partner.example.com"
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        select_hmac_module(
+            &mut settings.ec,
+            HMAC_MODULE_KEY,
+            "test-secret-key-32-bytes-minimum",
+        );
         settings.handlers[0].password =
             Redacted::new("replace-with-admin-password-32-bytes".to_owned());
 
@@ -5714,7 +7387,6 @@ source_domain = "partner.example.com"
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
         settings.ec.partners = vec![test_partner_with_pull_token(
             "partner-api-token-32-bytes-minimum",
         )];
@@ -5733,7 +7405,6 @@ source_domain = "partner.example.com"
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
         settings.ec.partners = vec![test_partner_with_pull_token(
             "unit-test-realistic-pull-sync-token-32-bytes-min",
         )];
@@ -5748,7 +7419,6 @@ source_domain = "partner.example.com"
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
         settings.ec.partners = vec![test_partner_with_tokens(
             Some("partner-api-token-32-bytes-minimum"),
             "replace-with-partner-api-token-32-bytes-minimum",
@@ -6313,7 +7983,13 @@ source_domain = "partner.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            module = "hmac"
+
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse settings without max_buffered_body_bytes");
@@ -6343,13 +8019,20 @@ source_domain = "partner.example.com"
             proxy_secret = "unit-test-proxy-secret"
             max_buffered_body_bytes = 0
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [ec]
+            module = "hmac"
+
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         );
+        let error = result.expect_err("should reject a zero buffered-body cap");
         assert!(
-            result.is_err(),
-            "publisher.max_buffered_body_bytes = 0 must fail config validation"
+            error.to_string().contains("max_buffered_body_bytes"),
+            "the rejection should be for the zero cap, not another validation, got: {error}"
         );
     }
 
@@ -7475,7 +9158,13 @@ source_domain = "partner.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            module = "hmac"
+
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [request_signing]
             config_store_id = "test-config-store-id"
@@ -7809,7 +9498,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7893,7 +9588,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7929,7 +9630,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7971,7 +9678,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -8072,6 +9785,29 @@ formats = [{{ width = 300, height = 250 }}]
         );
     }
 
+    /// An unset selector must not serialize as `"module": null`.
+    ///
+    /// The section as a whole is skipped while every field is default, so this
+    /// serializes the struct directly. Once a later change makes another field
+    /// required, the section is always emitted and a null selector would then
+    /// reach a config blob, where a binary that predates the field rejects it.
+    #[test]
+    fn an_unset_module_selector_is_omitted_from_the_serialized_section() {
+        let geo = GeoConfig::default();
+        let json = serde_json::to_string(&geo).expect("should serialize the geo section");
+        assert!(
+            !json.contains("module"),
+            "an unset geo selector should be omitted rather than serialized as null, got {json}"
+        );
+
+        let device = DeviceConfig::default();
+        let json = serde_json::to_string(&device).expect("should serialize the device section");
+        assert!(
+            !json.contains("module"),
+            "an unset device selector should be omitted rather than serialized as null, got {json}"
+        );
+    }
+
     #[test]
     fn admin_endpoints_match_fastly_router() {
         let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");
@@ -8112,5 +9848,187 @@ formats = [{{ width = 300, height = 250 }}]
                  Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod permission_signal_config_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::config::TrustedServerAppConfig;
+    use crate::test_support::tests::crate_test_settings_str;
+
+    // Which names are valid is only known where the scheme crates are linked,
+    // so the checks that a name matches an available module, and that none
+    // is repeated, live with the seam in `permission_signal::select`. What is
+    // tested here is the shape of the section itself.
+
+    /// The test fixture's configuration with `section` written as its
+    /// `[permission-signal]` section.
+    fn settings_toml_with(section: &str) -> String {
+        format!(
+            "{}\n[permission-signal]\n{section}\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn no_section_is_allowed_and_means_every_module() {
+        let config = PermissionSignalConfig::default();
+        assert!(
+            config.modules.is_none(),
+            "absent rather than empty, because the two mean opposite things"
+        );
+    }
+
+    #[test]
+    fn the_section_round_trips_through_toml() {
+        let parsed: PermissionSignalConfig =
+            toml::from_str(r#"modules = ["gpc", "tcf"]"#).expect("should parse the section");
+        assert_eq!(
+            parsed.modules.as_deref(),
+            Some(["gpc".to_owned(), "tcf".to_owned()].as_slice()),
+            "the order written is the order read, because the order is the policy"
+        );
+    }
+
+    #[test]
+    fn the_section_round_trips_through_a_config_blob() {
+        // The section is written by derive and read by hand, so what a push
+        // writes into a blob must be what a deployment reads back from it.
+        let written = PermissionSignalConfig {
+            modules: Some(vec!["tcf".to_owned(), "gpc".to_owned()]),
+        };
+        let blob = serde_json::to_value(&written).expect("should write the section");
+        let read: PermissionSignalConfig =
+            serde_json::from_value(blob).expect("should read back what was written");
+        assert_eq!(read, written, "the list and its order survive the blob");
+
+        let null: PermissionSignalConfig = serde_json::from_value(json!({ "modules": null }))
+            .expect("should read an explicit null");
+        assert_eq!(
+            null,
+            PermissionSignalConfig::default(),
+            "an explicit null is the same as leaving the key out"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_is_kept_apart_from_no_list() {
+        let parsed: PermissionSignalConfig =
+            toml::from_str("modules = []").expect("should parse an empty list");
+        assert_eq!(
+            parsed.modules.as_deref(),
+            Some(&[][..]),
+            "a publisher acting on no signal at all writes an empty list, and it must \
+             not read back as having written nothing"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        let error = toml::from_str::<PermissionSignalConfig>(r#"module_list = ["gpc"]"#)
+            .expect_err("should refuse a misspelled key rather than silently ignore it");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `module_list` in [permission-signal], expected `modules`"),
+            "the refusal names the key it did not recognize and the one it accepts: {error}"
+        );
+    }
+
+    #[test]
+    fn the_singular_key_is_refused_naming_modules() {
+        let error = toml::from_str::<PermissionSignalConfig>(r#"module = ["gpc"]"#)
+            .expect_err("should refuse the singular key the other sections use");
+        assert!(
+            error
+                .to_string()
+                .contains("[permission-signal] module is `modules` here"),
+            "the refusal says which key to write instead: {error}"
+        );
+    }
+
+    #[test]
+    fn the_removed_sources_key_is_refused_naming_modules() {
+        for written in [
+            r#"sources = ["gpc", "tcf"]"#,
+            "modules = [\"gpc\", \"tcf\"]\nsources = [\"gpc\", \"tcf\"]",
+        ] {
+            let error = toml::from_str::<PermissionSignalConfig>(written)
+                .expect_err("should refuse the removed key, alone or beside its replacement");
+            assert!(
+                error.to_string().contains(
+                    "[permission-signal] sources is no longer accepted. Name the modules \
+                     to run, in order, in [permission-signal] modules instead"
+                ),
+                "the refusal says which key to write instead: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_settings_are_read_refuses_the_removed_sources_key() {
+        let written = settings_toml_with(r#"sources = ["gpc", "tcf"]"#);
+
+        let error = Settings::from_toml(&written).expect_err("should refuse the removed key");
+        assert!(
+            format!("{error:?}").contains("[permission-signal] modules"),
+            "reading a TOML file names the key that replaced it: {error:?}"
+        );
+
+        // `ts config push` parses the file into a TOML value before reading the
+        // settings from it.
+        let value: toml::Value = toml::from_str(&written).expect("should parse as TOML");
+        let error = value
+            .try_into::<TrustedServerAppConfig>()
+            .expect_err("should refuse the removed key before a push");
+        assert!(
+            error.to_string().contains("[permission-signal] modules"),
+            "a push names the key that replaced it: {error}"
+        );
+
+        // A deployment reads its settings from a JSON config blob.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut blob = serde_json::to_value(settings).expect("should serialize the fixture");
+        blob["permission-signal"] = json!({ "sources": ["gpc", "tcf"] });
+        let error =
+            Settings::from_json_value(blob).expect_err("should refuse the removed key at startup");
+        assert!(
+            format!("{error:?}").contains("[permission-signal] modules"),
+            "startup names the key that replaced it: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_old_table_name_is_refused_with_its_new_name() {
+        let written = format!(
+            "{}\n[permission_signal]\nmodules = [\"gpc\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&written).expect_err("should refuse the old table name");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("[permission_signal]") && message.contains("[permission-signal]"),
+            "the refusal names the old table and the new one: {message}"
+        );
+    }
+
+    #[test]
+    fn a_block_of_module_settings_is_refused_as_an_unknown_field() {
+        // No module takes settings yet, so a block for one is refused rather
+        // than read and then ignored.
+        let written =
+            settings_toml_with("modules = [\"gpc\"]\n\n[permission-signal.gpc]\nenabled = true");
+        let error =
+            Settings::from_toml(&written).expect_err("should refuse settings no module takes");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("unknown field `gpc` in [permission-signal]")
+                && message.contains("[permission-signal.<name>] block is not accepted"),
+            "the refusal names the block and says why it is refused: {message}"
+        );
     }
 }
