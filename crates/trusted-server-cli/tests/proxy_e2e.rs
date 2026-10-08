@@ -121,6 +121,24 @@ async fn rewrite_host_presents_same_origin_origin_as_the_upstream_origin() {
 }
 
 #[tokio::test]
+async fn rewrite_host_keeps_origin_on_integration_routes_under_ts() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_rewrite_host(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let origin = format!("https://{}", support::FROM_HOST);
+
+    // An integration mounted under `/_ts` (e.g. a Didomi `proxy_path` of
+    // `_ts/consent`) forwards Origin to its vendor, so it must stay the browser's.
+    let response =
+        support::drive_request_with_origin(cfg, ca, "/_ts/consent/api/events", &origin).await;
+
+    assert_eq!(
+        response.seen_origin, origin,
+        "vendor-bound routes under /_ts should keep the browser's real Origin"
+    );
+}
+
+#[tokio::test]
 async fn rewrite_host_keeps_origin_on_publisher_paths() {
     let upstream = support::start_echo_upstream().await;
     let cfg = support::test_config_rewrite_host(&upstream.addr);

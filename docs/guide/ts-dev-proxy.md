@@ -329,22 +329,17 @@ With `--rewrite-host`, the proxy also replaces a single same-origin `Origin`
 (`https://<FROM>`, plus the port the browser connected to when it isn't 443)
 with the `TO` origin (`http://` with `--upstream-plaintext`, `https://`
 otherwise, plus any non-default port), so `Origin` names the same authority as
-`Host`. Trusted Server's state-changing endpoints compare `Origin` against their
-own origin, so they then accept proxied same-origin requests. Cross-site,
-`null`, plain `http://`, and duplicated `Origin` values pass through unchanged.
+`Host`. Trusted Server's trace actions compare `Origin` against their own
+origin, so they then accept proxied same-origin requests. Cross-site, `null`,
+plain `http://`, and duplicated `Origin` values pass through unchanged.
 
-The rewrite applies only to Trusted Server's `/_ts` namespace: the path `/_ts`
-or anything under `/_ts/` (not `/_tsx` or `/_ts-foo`). Trusted Server forwards
-the browser's request headers to the publisher origin and to integration
-vendors, so every other request keeps the browser's real `Origin`, as in
-production, and publisher or vendor `Origin` checks keep working. Trusted Server
-routes outside `/_ts` — `/auction`, `/first-party/*`, and `/integrations/*` —
-are not rewritten; none of them check `Origin` today.
-
-Inside `/_ts`, `/_ts/api/v1/identify` answers CORS only for an `https` `Origin`
-on the publisher domain. It is GET-only, so a same-origin call carries no
-`Origin` and a cross-site one is never rewritten, but a same-origin POST added
-under `/_ts` later would see the rewritten `TO` origin.
+The rewrite applies only to the requests Trusted Server consumes itself and that
+check `Origin`: `POST /_ts/trace/enable` and `POST /_ts/trace/end`, matched by
+exact path with any query string ignored. Trusted Server forwards the browser's
+request headers to the publisher origin and to integration vendors — including
+integrations an operator mounts under `/_ts`, such as a Didomi `proxy_path` of
+`_ts/consent` — so every other request keeps the browser's real `Origin`, as in
+production, and publisher or vendor `Origin` checks keep working.
 
 > **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
 > request paths strip inbound `X-Forwarded-Host` before routing, so with

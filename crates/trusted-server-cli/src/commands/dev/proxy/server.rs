@@ -572,7 +572,7 @@ async fn proxy_to_upstream(
 
     let metadata = super::upstream::RequestMetadata::capture(&req);
     // Runs before `rewrite_headers` replaces the inbound `Host` it compares against.
-    if is_trusted_server_path(req.uri().path()) {
+    if requires_upstream_origin(req.method(), req.uri().path()) {
         rewrite_first_party_origin(req.headers_mut(), outcome);
     }
     rewrite_headers(req.headers_mut(), outcome, basic_auth);
@@ -753,16 +753,16 @@ fn rewrite_headers(
     trailer_metadata.regenerate(headers);
 }
 
-/// Whether `path` (query excluded) is in Trusted Server's `/_ts` namespace:
-/// `/_ts` itself or anything under `/_ts/`, but not `/_tsx` or `/_ts-foo`.
+/// Whether the request is one Trusted Server consumes itself *and* that
+/// compares `Origin` against its own origin: the trace Enable/End actions.
 ///
-/// Only those requests get their `Origin` rewritten. Trusted Server's own
-/// endpoints there compare `Origin` against the `Host` they receive; every
-/// other path may be forwarded to the publisher origin or a third-party vendor,
-/// which must keep seeing the browser's real `Origin`, as in production.
-fn is_trusted_server_path(path: &str) -> bool {
-    path.strip_prefix("/_ts")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+/// Only those requests get their `Origin` rewritten, matched by exact method
+/// and path (query excluded). Every other path — including integration routes
+/// an operator mounts under `/_ts`, such as a Didomi `proxy_path` of
+/// `_ts/consent` — may be forwarded to the publisher origin or a third-party
+/// vendor, which must keep seeing the browser's real `Origin`, as in production.
+fn requires_upstream_origin(method: &hyper::Method, path: &str) -> bool {
+    method == hyper::Method::POST && matches!(path, "/_ts/trace/enable" | "/_ts/trace/end")
 }
 
 /// With `--rewrite-host`, replaces a single same-origin `Origin` with the `TO`
@@ -790,6 +790,12 @@ fn rewrite_first_party_origin(
                 .is_some_and(|authority| authority.eq_ignore_ascii_case(host.as_bytes()))
         });
     if is_first_party {
+        log::debug!(
+            "rewriting same-origin Origin to {}",
+            upstream_origin
+                .to_str()
+                .expect("should prevalidate upstream origin")
+        );
         headers.insert(hyper::header::ORIGIN, upstream_origin.clone());
     }
 }
@@ -1185,24 +1191,31 @@ mod tests {
     }
 
     #[test]
-    fn matches_only_the_trusted_server_namespace() {
-        for path in ["/_ts", "/_ts/", "/_ts/trace/enable", "/_ts/api/v1/identify"] {
+    fn requires_upstream_origin_only_for_trace_actions() {
+        for path in ["/_ts/trace/enable", "/_ts/trace/end"] {
             assert!(
-                is_trusted_server_path(path),
-                "should treat {path} as a Trusted Server path"
+                requires_upstream_origin(&hyper::Method::POST, path),
+                "should rewrite Origin for POST {path}"
+            );
+            assert!(
+                !requires_upstream_origin(&hyper::Method::GET, path),
+                "should leave Origin for GET {path}"
             );
         }
         for path in [
             "/",
-            "/_tsx",
-            "/_ts-foo",
-            "/api/_ts/trace",
+            "/_ts",
+            "/_ts/trace",
+            "/_ts/trace/state",
+            "/_ts/trace/enable/",
+            "/_ts/trace/enabled",
+            "/_ts/consent/api/events",
+            "/_ts/api/v1/identify",
             "/auction",
-            "/integrations/lockr/api",
-            "/_TS/trace",
+            "/integrations/didomi/consent/api/events",
         ] {
             assert!(
-                !is_trusted_server_path(path),
+                !requires_upstream_origin(&hyper::Method::POST, path),
                 "should leave {path} with the browser's Origin"
             );
         }
