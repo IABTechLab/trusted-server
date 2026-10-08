@@ -12,14 +12,19 @@ use validator::Validate;
 
 use edgezero_core::body::Body as EdgeBody;
 
+use std::sync::Arc;
+
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
-use crate::response_privacy::enforce_synthesized_html_cache_privacy;
+use crate::response_privacy::enforce_terminal_private_cache_privacy;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 use crate::tsjs_bundle::JsModulePart;
 
-use super::IntegrationRegistration;
+use super::{
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
+    IntegrationRequestState,
+};
 
 /// Stable integration identifier.
 pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
@@ -36,7 +41,9 @@ pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
         validate,
     )
     .with_module_name(MODULE)
-    .with_request_preparer(prepare_request_hook);
+    .with_request_preparer(prepare_request_hook)
+    .with_response_finalizer(finalize_response_hook)
+    .with_auction_token();
 /// Reserved activation query parameter.
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
@@ -125,19 +132,6 @@ impl GptDiagnosticsRequestDecision {
                 tsjs::tsjs_single_module_script_src(module)
             )
         })
-    }
-    /// An active decision, for tests in other modules that need one.
-    ///
-    /// The fields are private and built by `prepare_request` from a cookie or query
-    /// parameter; there is no other way to obtain an active decision across a module
-    /// boundary.
-    #[cfg(test)]
-    pub(crate) fn active_for_tests() -> Self {
-        Self {
-            active: true,
-            clean_browser_path_and_query: None,
-            cookie_action: GptDiagnosticsCookieAction::None,
-        }
     }
 }
 
@@ -259,24 +253,45 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(GPT_DIAGNOSTICS_INTEGRATION_ID)
             .with_standalone_js()
+            .with_head_injector(Arc::new(DiagnosticsHead))
             .build(),
     ))
 }
 
-/// Whether `[ad-tag] modules` names the diagnostics module.
-///
-/// This says whether the deployment runs diagnostics at all, rather than the
-/// per-document activation state, so a caller that only needs to know whether
-/// diagnostics could consume a value uses this, while document behavior uses
-/// [`GptDiagnosticsRequestDecision::active`].
-/// A configuration that cannot be parsed reads as not running.
-#[must_use]
-pub fn runs(settings: &Settings) -> bool {
-    settings
-        .module_config::<GptDiagnosticsConfig>(MODULE)
-        .ok()
-        .flatten()
-        .is_some()
+/// Writes what an active decision adds to a document's head.
+struct DiagnosticsHead;
+
+impl DiagnosticsHead {
+    /// The decision the preparer left for this document, when it left one.
+    fn decision(ctx: &IntegrationHtmlContext<'_>) -> Option<Arc<GptDiagnosticsRequestDecision>> {
+        ctx.document_state
+            .get::<GptDiagnosticsRequestDecision>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+    }
+}
+
+impl IntegrationHeadInjector for DiagnosticsHead {
+    fn integration_id(&self) -> &'static str {
+        GPT_DIAGNOSTICS_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        Self::decision(ctx)
+            .and_then(|decision| decision.bootstrap_script())
+            .into_iter()
+            .collect()
+    }
+
+    /// The module loads synchronously after the bundle, so its listeners are
+    /// in place before the publisher's scripts in the origin head run.
+    fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        Self::decision(ctx)
+            .and_then(|decision| {
+                JsModulePart::compile_time(GPT_DIAGNOSTICS_INTEGRATION_ID)
+                    .and_then(|module| decision.module_script_tag(&module))
+            })
+            .into_iter()
+            .collect()
+    }
 }
 
 /// Evaluate activation and sanitize the request before generic cookie handling.
@@ -335,6 +350,11 @@ pub fn prepare_request(
     }
 
     request.extensions_mut().insert(decision.clone());
+    // Only a decision that changes the document or the response is left for
+    // the page path, so an ordinary request stays on the shared template path.
+    if decision.requires_private_no_store() {
+        IntegrationRequestState::insert(request, GPT_DIAGNOSTICS_INTEGRATION_ID, decision.clone());
+    }
     Ok(decision)
 }
 
@@ -351,14 +371,17 @@ pub(crate) fn prepare_request_hook(
     prepare_request(settings, request).map(|_| ())
 }
 
-/// Read the request decision, defaulting to inactive when not prepared.
-#[must_use]
-pub fn request_decision(request: &Request<EdgeBody>) -> GptDiagnosticsRequestDecision {
-    request
-        .extensions()
-        .get::<GptDiagnosticsRequestDecision>()
-        .cloned()
-        .unwrap_or_default()
+/// Builder hook: finalizes the response from the decision the preparer left
+/// for the page path, and leaves the response alone when it left none.
+pub(crate) fn finalize_response_hook(
+    request_state: &IntegrationRequestState,
+    response: &mut Response<EdgeBody>,
+) {
+    if let Some(decision) =
+        request_state.get::<GptDiagnosticsRequestDecision>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+    {
+        finalize_response(&decision, response);
+    }
 }
 
 /// Apply activation cookie and strict cache privacy to an origin response.
@@ -385,7 +408,7 @@ pub fn finalize_response(
         // `RequestFilterEffects` mutation such as `Cache-Control: public` replaced it,
         // and the adapter's terminal guard had no marker to re-enforce from, so
         // request-scoped diagnostics HTML became shared-cacheable.
-        enforce_synthesized_html_cache_privacy(response);
+        enforce_terminal_private_cache_privacy(response);
     }
 }
 

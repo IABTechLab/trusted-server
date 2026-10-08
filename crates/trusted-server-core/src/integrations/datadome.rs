@@ -110,10 +110,20 @@ pub(super) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
 /// Fixed request header used by the staging-only protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 
-/// Request marker indicating that Trusted Server should omit its automatic
+/// Marker indicating that Trusted Server should omit its automatic
 /// `DataDome` client-side tag for the current response.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DataDomeClientTagSuppressed;
+
+/// Leaves the marker on `request` for the head injector of the document the
+/// request produces.
+pub(crate) fn suppress_client_tag(request: &mut http::Request<EdgeBody>) {
+    crate::integrations::IntegrationRequestState::insert(
+        request,
+        DATADOME_INTEGRATION_ID,
+        DataDomeClientTagSuppressed,
+    );
+}
 
 /// Regex pattern for matching and rewriting `DataDome` URLs in script content.
 ///

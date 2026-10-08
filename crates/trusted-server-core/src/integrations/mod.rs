@@ -5,7 +5,7 @@ use std::time::Duration;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
-use http::Request;
+use http::{Request, Response};
 use url::Url;
 
 use crate::auction::demand::{AdServerImplementation, DemandImplementation};
@@ -31,10 +31,10 @@ pub use registry::{
     IntegrationDocumentState, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
     IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationMetadata,
     IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
-    IntegrationRequestFilter, IntegrationScriptContext, IntegrationScriptRewriter,
-    ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
-    RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
-    ScriptTextAccumulator,
+    IntegrationRequestFilter, IntegrationRequestState, IntegrationScriptContext,
+    IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects,
+    RequestFilterInput, RequestFilterRegistryInput, RequestFilterRegistryOutcome,
+    ScriptRewriteAction, ScriptTextAccumulator,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -329,6 +329,14 @@ pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedSer
 pub type IntegrationPrepareRequestFn =
     fn(&Settings, &mut Request<EdgeBody>) -> Result<(), Report<TrustedServerError>>;
 
+/// Finishes the response the page path returns for one request, from what
+/// the module's request hooks left for it in the request's
+/// [`IntegrationRequestState`].
+///
+/// Runs whether or not a section selects the integration, as the preparer
+/// does, and has nothing to do for a request its module left nothing on.
+pub type IntegrationFinalizeResponseFn = fn(&IntegrationRequestState, &mut Response<EdgeBody>);
+
 /// Source label for the built-in integrations.
 pub const CORE_SOURCE: &str = "trusted-server-core";
 
@@ -378,6 +386,8 @@ pub struct IntegrationBuilder {
     build: IntegrationBuilderFn,
     validate: IntegrationValidateFn,
     prepare_request: Option<IntegrationPrepareRequestFn>,
+    finalize_response: Option<IntegrationFinalizeResponseFn>,
+    reads_auction_token: bool,
     supplies_integration: bool,
     demand: Option<&'static DemandImplementation>,
     adserver: Option<&'static AdServerImplementation>,
@@ -413,6 +423,8 @@ impl IntegrationBuilder {
             build,
             validate,
             prepare_request: None,
+            finalize_response: None,
+            reads_auction_token: false,
             supplies_integration: true,
             demand: None,
             adserver: None,
@@ -435,6 +447,8 @@ impl IntegrationBuilder {
             build: no_registration,
             validate: nothing_to_validate,
             prepare_request: None,
+            finalize_response: None,
+            reads_auction_token: false,
             supplies_integration: false,
             demand: None,
             adserver: None,
@@ -486,6 +500,34 @@ impl IntegrationBuilder {
     pub const fn with_request_preparer(mut self, prepare: IntegrationPrepareRequestFn) -> Self {
         self.prepare_request = Some(prepare);
         self
+    }
+
+    /// Attaches a function that finishes the response the page path returns,
+    /// from what the module's request hooks left for the request.
+    #[must_use]
+    pub const fn with_response_finalizer(
+        mut self,
+        finalize: IntegrationFinalizeResponseFn,
+    ) -> Self {
+        self.finalize_response = Some(finalize);
+        self
+    }
+
+    /// Declares that the module's browser script reads the token an auction
+    /// publishes with its winning bids.
+    ///
+    /// A token is made for each auction when a section selects such a
+    /// module, and none is made in a deployment where nothing reads it.
+    #[must_use]
+    pub const fn with_auction_token(mut self) -> Self {
+        self.reads_auction_token = true;
+        self
+    }
+
+    /// Whether the module's browser script reads the auction token.
+    #[must_use]
+    pub const fn reads_auction_token(&self) -> bool {
+        self.reads_auction_token
     }
 
     /// Runs this builder when a section selects the module `name`, which is a
@@ -563,6 +605,11 @@ impl IntegrationBuilder {
     pub(crate) fn prepare_request(&self) -> Option<IntegrationPrepareRequestFn> {
         self.prepare_request
     }
+
+    /// The response finalizer, when one is attached.
+    pub(crate) fn finalize_response(&self) -> Option<IntegrationFinalizeResponseFn> {
+        self.finalize_response
+    }
 }
 
 /// The built-in integrations, in hook order.
@@ -577,6 +624,10 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // A stand-in for an integration that tags a page, for the same tests.
     #[cfg(test)]
     registry_test_support::tag_fixture::BUILDER,
+    // A stand-in for an integration that acts on one request, for the same
+    // tests.
+    #[cfg(test)]
+    registry_test_support::request_fixture::BUILDER,
     datadome::BUILDER,
     gpt_diagnostics::BUILDER,
     // Implementations `[demand]` and `[ad-server]` can name. None of them is

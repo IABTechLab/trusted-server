@@ -658,8 +658,7 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: crate::integrations::IntegrationRequestState::default(),
             permissions_script: None,
         });
         let pipeline_config = PipelineConfig {

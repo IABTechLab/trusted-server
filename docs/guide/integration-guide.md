@@ -239,7 +239,9 @@ points at the functions that do the work.
 | Build function                                | Reads `Settings` and returns the registration. It is called only when a section selects the module                                                                                 |
 | Validate function                             | The integration's own deploy rules. It runs for every builder, selected or not                                                                                                     |
 | `.with_module_name("<type>.<name>")`          | The name a section selects the module by, which is the crate's path under `crates/` with `.` between the parts. `module_name!()` derives it from the crate's folder                |
-| `.with_request_preparer(...)`                 | Optional. Runs before routing, whether or not the module is selected                                                                                                               |
+| `.with_request_preparer(...)`                 | Optional. Runs before routing, once for a request, whether or not the module is selected                                                                                           |
+| `.with_response_finalizer(...)`               | Optional. Finishes the response the page path returns, from what the module's request hooks left for the request                                                                   |
+| `.with_auction_token()`                       | Optional. Declares that the module's browser script reads the token an auction publishes with its winning bids, which is made only when a selected module reads one                |
 | `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)` |
 
 ```rust
@@ -266,7 +268,7 @@ builder the integrations in core use.
 | Declaration                                           | What it does                                                                        |
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                 |
-| `.with_head_injector(...)`                            | Emits markup at the start of `<head>`                                               |
+| `.with_head_injector(...)`                            | Emits markup at the start of `<head>` and, if it chooses, after the script bundle   |
 | `.with_attribute_rewriter(...)`                       | Rewrites attribute values in publisher HTML                                         |
 | `.with_script_rewriter(...)`                          | Rewrites inline script contents                                                     |
 | `.with_html_stream_processor(...)`                    | Works on the document as it streams                                                 |
@@ -306,6 +308,34 @@ selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
 startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
 module of that type.
+
+### Acting on one request
+
+A module that decides something about one request and acts on it later
+carries the decision in the request's `IntegrationRequestState`. A request
+preparer or a request filter leaves a value under the integration's id.
+
+```rust
+IntegrationRequestState::insert(request, EXAMPLE_ID, ExampleDecision::default());
+```
+
+When the request produces an HTML document, each value is copied into the
+document's state before parsing starts, so the head injector, the rewriters
+and the stream processors read it with
+`ctx.document_state.get::<ExampleDecision>(EXAMPLE_ID)`. The same values are
+handed to the response finalizer the builder declared, which runs on the
+response the page path returns.
+
+A request that carries any value gets a document made for it alone. The
+document is fetched from the origin, never read from a shared template and
+never stored as one, and an HTML response with a body is sent
+`private, no-store`. So a module leaves a value only for a request it will
+act on, and an ordinary request stays on the shared path.
+
+A head injector has two places to write. `head_inserts` writes at the start
+of `<head>`, before the script bundle, and `after_bundle_inserts` writes
+straight after the bundle, for a script that needs the bundle to have run and
+has to run before the page's own scripts.
 
 ### How an adapter composes it in
 

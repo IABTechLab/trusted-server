@@ -44,12 +44,14 @@ impl DataDomeIntegration {
         let test_bypass_matched = self.take_protection_test_bypass_header(input.request);
         if test_bypass_matched {
             // Both markers travel together. The first is DataDome's own
-            // tag-suppression signal, read by its head injector. The second tells
+            // tag-suppression signal, left for its head injector. The second tells
             // core the response is personalized to this request and cannot be
             // shared through a cache or a template.
-            let extensions = input.request.extensions_mut();
-            extensions.insert(super::DataDomeClientTagSuppressed);
-            extensions.insert(crate::response_privacy::PersonalizedResponse);
+            super::suppress_client_tag(input.request);
+            input
+                .request
+                .extensions_mut()
+                .insert(crate::response_privacy::PersonalizedResponse);
             log_protection_test_bypass(&input);
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
@@ -163,12 +165,14 @@ impl DataDomeIntegration {
             } => {
                 if suppress_client_tag {
                     // Both markers travel together. The first is DataDome's own
-                    // tag-suppression signal, read by its head injector. The second
+                    // tag-suppression signal, left for its head injector. The second
                     // tells core the response is personalized to this request and
                     // cannot be shared through a cache or a template.
-                    let extensions = input.request.extensions_mut();
-                    extensions.insert(super::DataDomeClientTagSuppressed);
-                    extensions.insert(crate::response_privacy::PersonalizedResponse);
+                    super::suppress_client_tag(input.request);
+                    input
+                        .request
+                        .extensions_mut()
+                        .insert(crate::response_privacy::PersonalizedResponse);
                 }
                 log_protection_skip(input, &rule_id, reason, suppress_client_tag);
                 return false;
@@ -924,9 +928,8 @@ mod tests {
     }
 
     fn has_client_tag_suppression_marker(request: &Request<EdgeBody>) -> bool {
-        request
-            .extensions()
-            .get::<super::super::DataDomeClientTagSuppressed>()
+        crate::integrations::IntegrationRequestState::of(request)
+            .get::<super::super::DataDomeClientTagSuppressed>(super::super::DATADOME_INTEGRATION_ID)
             .is_some()
     }
 

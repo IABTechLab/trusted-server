@@ -90,7 +90,15 @@ pub fn compile_auction_plan_with(
             .filter_map(IntegrationBuilder::adserver)
             .collect(),
     })
-    .map(|plan| plan.with_enabled(settings.auction.enabled))
+    .map(|plan| {
+        plan.with_enabled(settings.auction.enabled)
+            .with_auction_token(builders.iter().any(|builder| {
+                builder.reads_auction_token()
+                    && builder
+                        .module_name()
+                        .is_some_and(|name| settings.selects_module(name))
+            }))
+    })
 }
 
 /// Build a new auction orchestrator from one shared compiled plan.
@@ -133,6 +141,64 @@ pub fn build_orchestrator(
 ) -> Result<AuctionOrchestrator, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(settings)?);
     build_orchestrator_with_plan(plan)
+}
+
+#[cfg(test)]
+mod auction_token_tests {
+    use super::*;
+    use crate::integrations::registry_test_support::{
+        probe_registration, request_fixture, validate_nothing,
+    };
+    use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn the_plan_publishes_a_token_only_where_a_selected_module_reads_one() {
+        let mut settings = create_test_settings();
+        assert!(
+            !compile_auction_plan(&settings)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish no token where no module is selected"
+        );
+
+        settings.select_module("testing", request_fixture::MODULE);
+        assert!(
+            compile_auction_plan(&settings)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish a token once a module that reads one is selected"
+        );
+    }
+
+    #[test]
+    fn a_selected_module_that_reads_no_token_does_not_turn_one_on() {
+        let mut settings = create_test_settings();
+        settings.select_module("testing", "testing.probe");
+        let reads_nothing =
+            [
+                IntegrationBuilder::new(
+                    "probe",
+                    "seam-probe",
+                    probe_registration,
+                    validate_nothing,
+                )
+                .with_module_name("testing.probe"),
+            ];
+        assert!(
+            !compile_auction_plan_with(&settings, &reads_nothing)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish no token for a selected module that reads none"
+        );
+
+        let reads_one = [reads_nothing[0].with_auction_token()];
+        assert!(
+            compile_auction_plan_with(&settings, &reads_one)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish a token for a module a vendor crate supplies that reads one"
+        );
+    }
 }
 
 #[cfg(test)]

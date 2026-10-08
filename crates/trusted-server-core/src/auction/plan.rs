@@ -283,6 +283,7 @@ pub struct AuctionPlan {
     bidder_routes: BTreeMap<BidderId, usize>,
     signing_enabled: bool,
     adserver: Option<AdServerPlan>,
+    publishes_auction_token: bool,
 }
 
 impl AuctionPlan {
@@ -294,6 +295,18 @@ impl AuctionPlan {
 
     pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Return whether each auction publishes a token with its winning bids,
+    /// which it does when a module that runs reads one.
+    #[must_use]
+    pub fn publishes_auction_token(&self) -> bool {
+        self.publishes_auction_token
+    }
+
+    pub(crate) fn with_auction_token(mut self, publishes: bool) -> Self {
+        self.publishes_auction_token = publishes;
         self
     }
 
@@ -447,6 +460,7 @@ impl AuctionPlan {
             bidder_routes,
             signing_enabled,
             adserver,
+            publishes_auction_token: false,
         })
     }
 }

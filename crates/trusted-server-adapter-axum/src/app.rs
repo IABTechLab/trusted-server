@@ -351,8 +351,8 @@ async fn build_ec_context(
 /// The request arrives already prepared. Every route that reaches here is
 /// registered to [`fallback_handler`], which runs the request through
 /// [`execute_handler`], and [`execute_handler`] calls
-/// `registry.prepare_request` before it calls this function, so preparing
-/// again here would run each module's preparer twice for one request.
+/// `registry.prepare_request` before it calls this function, so there is
+/// nothing left to prepare here.
 async fn dispatch_fallback(
     state: &AppState,
     services: &RuntimeServices,

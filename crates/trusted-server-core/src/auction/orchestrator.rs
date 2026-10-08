@@ -830,6 +830,21 @@ impl AuctionOrchestrator {
         Arc::ptr_eq(&self.plan, plan)
     }
 
+    /// Return whether each auction publishes a token with its winning bids.
+    #[must_use]
+    pub fn publishes_auction_token(&self) -> bool {
+        self.plan.publishes_auction_token()
+    }
+
+    /// The same orchestrator in a deployment where a module reads the
+    /// auction token.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn publishing_auction_token(mut self) -> Self {
+        self.plan = Arc::new((*self.plan).clone().with_auction_token(true));
+        self
+    }
+
     /// Register an auction provider in the legacy parity harness.
     #[cfg(test)]
     pub(crate) fn register_provider(&mut self, provider: Arc<dyn AuctionProvider>) {
