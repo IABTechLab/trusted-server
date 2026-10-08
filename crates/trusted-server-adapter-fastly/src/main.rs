@@ -2,8 +2,6 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_adapter_fastly::runtime_env_config;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -318,8 +316,7 @@ fn heap_mib() -> String {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
-    let runtime_env = runtime_env_config(TrustedServerApp::stores());
-    let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
+    let runtime_stores = RuntimeStoreConfig::logical();
 
     // Short-circuit the sandbox counters probe before app construction. It must
     // not build the application: polling it would otherwise increment the very

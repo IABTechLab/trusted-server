@@ -40,9 +40,18 @@ accounts and harmless for single-service ones, so prefer it by default.
 - **Always `ts config push --dry-run` first.** It prints the exact target
   physical store; confirm it is the service-scoped one, not a shared default,
   before writing.
-- **Always pass `--service-id=<SID>`** to `fastly compute publish`. A checked-in
-  `fastly.toml` may pin a different (or dead) `service_id`; without the flag,
-  publish targets that one.
+- **Never deploy with `fastly compute publish`.** This app declares Config, KV,
+  and Secret Stores, and only EdgeZero's managed deploy links each selected
+  physical store to the service version under its logical ID. Publishing with
+  the Fastly CLI clones the active version's links, so the new version is
+  missing the links the runtime opens: app config fails to load and every
+  publisher route returns 500 while `/health` still answers 200. Deploy with
+  `ts deploy --adapter fastly --service-id=<SID> --application-release <root>`,
+  with `EDGEZERO_MANIFEST` set to the release's `edgezero.toml`, or EdgeZero's
+  `deploy-fastly` action.
+- **Always pass `--service-id=<SID>`** to any deploy or publish command. A
+  checked-in `fastly.toml` may pin a different (or dead) `service_id`; without
+  the flag, the command targets that one.
 - **`ts config push` only upserts entries**; the target store must already exist
   (`fastly config-store create`) before pushing.
 - **Verify a shared store stayed untouched** by recording its `updated`

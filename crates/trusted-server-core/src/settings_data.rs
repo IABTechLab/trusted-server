@@ -42,10 +42,10 @@ pub fn config_key(env: &EnvConfig) -> String {
 
 /// Resolves the `EdgeZero` app-config store name from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper. Fastly instead supplies an
-/// `EnvConfig` populated from service-scoped entries in `edgezero_runtime_env`
-/// and resolves the store name from that configuration. Without an override,
-/// both paths use the manifest default logical store ID.
+/// Native adapters such as Axum use this wrapper. Fastly reads no selector at
+/// runtime: it opens the store under the logical ID that a managed deployment
+/// links to the selected physical store. Without an override, this wrapper
+/// also returns the manifest default logical store ID.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())
@@ -53,10 +53,10 @@ pub fn default_config_store_name() -> StoreName {
 
 /// Resolves the app-config blob key from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper. Fastly resolves the key from
-/// service-scoped entries in `edgezero_runtime_env` instead. A runtime `__KEY`
-/// override must match `ts config push --key`; an ordinary push without that
-/// flag writes at the logical store ID, regardless of the `__KEY` override.
+/// Native adapters such as Axum use this wrapper and honour a `__KEY`
+/// override. The Fastly runtime always reads the entry under the logical store
+/// ID, and its CLI rejects any other `--key` or `__KEY` value, so no override
+/// applies there.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
