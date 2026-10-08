@@ -289,6 +289,39 @@ jobs:
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
             --test proxy_trust_linux -- --ignored
 
+  lint-domains:
+    # Server-side counterpart to the `ts dev install-hooks` pre-commit hook,
+    # which `--no-verify` skips and fresh clones never install: fail the PR
+    # when an added line introduces a non-allowlisted URL host. PR-only, so
+    # direct pushes to main are not linted.
+    name: ts dev lint domains (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # A PR checkout is GitHub's merge commit; depth 2 also fetches its
+      # parents, so `HEAD^1` is the exact base commit the PR merges into.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          cache-shared-key: cargo-lint-domains-${{ runner.os }}
+
+      # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
+      - name: Lint URL hosts on lines added by this PR
+        run: |
+          cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
+            --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- \
+            dev lint domains --changed-vs HEAD^1
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
