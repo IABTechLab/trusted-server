@@ -69,9 +69,8 @@ use trusted_server_core::integrations::{
 };
 #[cfg(test)]
 use trusted_server_core::openrtb::{
-    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
-    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt, to_openrtb_i32,
+    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
+    RegsExt, Site, ToExt, TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
 use trusted_server_core::platform::PlatformHttpRequest;
@@ -1462,6 +1461,60 @@ fn parse_planned_prebid_bid(
 // ============================================================================
 // Prebid Auction Provider
 // ============================================================================
+
+/// The request extension [`PrebidAuctionProvider`] writes.
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+struct RequestExt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prebid: Option<PrebidExt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trusted_server: Option<TrustedServerExt>,
+}
+
+#[cfg(test)]
+impl ToExt for RequestExt {}
+
+/// The `ext.prebid` object of a request.
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize)]
+struct PrebidExt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    returnallbidstatus: Option<bool>,
+}
+
+/// The impression extension [`PrebidAuctionProvider`] writes.
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+struct ImpExt {
+    prebid: PrebidImpExt,
+}
+
+#[cfg(test)]
+impl ToExt for ImpExt {}
+
+/// The `imp.ext.prebid` object: inline bidder parameters, or a stored
+/// request reference.
+#[cfg(test)]
+#[derive(Debug, Default, Serialize)]
+struct PrebidImpExt {
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    bidder: HashMap<String, Json>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storedrequest: Option<ImpStoredRequest>,
+}
+
+/// PBS imp-level stored request reference.
+///
+/// PBS merges the stored imp JSON (keyed by `id`) into the outgoing request,
+/// populating bidder params that are not sent inline.
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+struct ImpStoredRequest {
+    id: String,
+}
 
 /// Legacy Prebid Server auction provider retained only for parity tests.
 #[cfg(test)]
