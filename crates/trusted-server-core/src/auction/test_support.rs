@@ -374,15 +374,15 @@ pub fn plan_config_with(
     }
 }
 
-/// A `[demand]` selection of ordinary `OpenRTB` sources under the names given,
-/// each taking every eligible slot.
-pub fn demand_named(names: &[&str]) -> crate::provider_table::ProviderList {
+/// A `[demand]` selection of sources under the names given, each running
+/// `implementation` at an endpoint of its own and taking every eligible slot.
+pub fn demand_named(implementation: &str, names: &[&str]) -> crate::provider_table::ProviderList {
     demand_selection(
         names
             .iter()
             .map(|name| {
                 let mut table = demand_table(
-                    "auction-protocol.openrtb",
+                    implementation,
                     &format!("https://{name}.example/openrtb2/auction"),
                 );
                 table.insert("routing".to_string(), json!("all_eligible"));
@@ -645,7 +645,116 @@ pub(crate) mod demand_fixture {
             context: DemandResponse<'_>,
             response: PlatformResponse,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            crate::integrations::openrtb::parse_openrtb_response(context, response).await
+            crate::auction::openrtb::parse_openrtb_response(context, response).await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+}
+
+/// A stand-in for the plainest demand implementation there can be, which
+/// core's own tests of the plan compiler and the request driver name where
+/// they need a source.
+///
+/// It takes every eligible slot, inherits the auction's timeout, leaves its
+/// endpoint as written and has its response read the ordinary way. Its table
+/// may set `request_ext` and `imp_ext`, which it writes into the request and
+/// into every impression as given, so the driver's tests have an
+/// implementation that adds extensions.
+#[cfg(test)]
+pub(crate) mod plain_fixture {
+    use core::any::Any;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use error_stack::Report;
+    use serde::Deserialize;
+    use serde_json::{Map, Value};
+
+    use crate::auction::demand::{
+        CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy, DemandImplementation,
+        DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, RequestExtensions,
+        accept_endpoint,
+    };
+    use crate::auction::types::AuctionResponse;
+    use crate::error::TrustedServerError;
+    use crate::platform::PlatformResponse;
+
+    /// The name an `implementation` line gives the stand-in.
+    pub(crate) const MODULE: &str = "auction.plain-fixture";
+
+    /// The stand-in demand implementation.
+    pub(crate) static DEMAND: DemandImplementation = DemandImplementation {
+        id: MODULE,
+        default_timeout: DemandTimeoutDefault::Auction,
+        allows_all_eligible: true,
+        serves_stored_requests: false,
+        canonicalize_endpoint: accept_endpoint,
+        compile,
+    };
+
+    /// One compiled stand-in source.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct PlainDemand {
+        request_ext: Map<String, Value>,
+        imp_ext: Map<String, Value>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct PlainSettings {
+        #[serde(default)]
+        request_ext: Map<String, Value>,
+        #[serde(default)]
+        imp_ext: Map<String, Value>,
+    }
+
+    fn compile(
+        settings: &Map<String, Value>,
+    ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
+        let settings =
+            PlainSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("invalid `{MODULE}` settings: {error}"),
+                })
+            })?;
+        Ok(Arc::new(PlainDemand {
+            request_ext: settings.request_ext,
+            imp_ext: settings.imp_ext,
+        }))
+    }
+
+    #[async_trait(?Send)]
+    impl CompiledDemand for PlainDemand {
+        fn field_policy(&self) -> DemandFieldPolicy {
+            DemandFieldPolicy {
+                language_max_bytes: Some(CONSERVATIVE_LANGUAGE_MAX_BYTES),
+                regs: RegsPolicy::Jurisdiction,
+                accept_json: true,
+                ..DemandFieldPolicy::default()
+            }
+        }
+
+        fn augment_request(
+            &self,
+            extensions: &mut RequestExtensions<'_>,
+            _input: &ProviderAuctionInput,
+        ) -> Result<(), Report<TrustedServerError>> {
+            *extensions.request = (!self.request_ext.is_empty()).then(|| self.request_ext.clone());
+            for impression in &mut extensions.impressions {
+                *impression.ext = (!self.imp_ext.is_empty()).then(|| self.imp_ext.clone());
+            }
+            Ok(())
+        }
+
+        async fn parse_response(
+            &self,
+            context: DemandResponse<'_>,
+            response: PlatformResponse,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            crate::auction::openrtb::parse_openrtb_response(context, response).await
         }
 
         fn as_any(&self) -> &dyn Any {

@@ -8,11 +8,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
+use http::StatusCode;
 use serde_json::{Map, Value, json};
 
 use super::demand::{
-    CompiledDemand, DemandFieldPolicy, ImpressionExtension, RegsPolicy, RequestExtensions,
+    CompiledDemand, DemandFieldPolicy, DemandResponse, ImpressionExtension, RegsPolicy,
+    RequestExtensions,
 };
 use super::plan::{NotificationPolicy, ProviderPlan};
 use super::routing::{ProviderAuctionInput, ProviderSlotInput, RoutedAuction, TransportHeaders};
@@ -22,6 +24,7 @@ use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
     RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
+use crate::platform::PlatformResponse;
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
 const DEFAULT_CURRENCY: &str = "USD";
@@ -791,6 +794,65 @@ fn saturating_bidder_param_counts(counts: impl IntoIterator<Item = usize>) -> u3
     })
 }
 
+/// The most a demand source's response body may hold.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Reads an ordinary `OpenRTB` response. A `204` is a no-bid, any other
+/// non-success status or unreadable JSON is an error response, and a body over
+/// the size limit is an `Err`.
+///
+/// Public so a demand implementation in a crate of its own, whose exchange
+/// answers the ordinary way, has its response read as core reads one.
+///
+/// # Errors
+///
+/// Returns an error when the response body cannot be read.
+pub async fn parse_openrtb_response(
+    context: DemandResponse<'_>,
+    response: PlatformResponse,
+) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    let provider_id = context.provider_id;
+    let response_time_ms = context.response_time_ms;
+    let response = response.response;
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        return Ok(AuctionResponse::no_bid(provider_id, response_time_ms));
+    }
+    if !status.is_success() {
+        if status.is_redirection() {
+            log::warn!(
+                "Provider '{provider_id}' returned a redirect; generic OpenRTB redirects are refused"
+            );
+        }
+        return Ok(AuctionResponse::error(provider_id, response_time_ms)
+            .with_metadata("error_type", json!("http_status"))
+            .with_metadata("http_status", json!(status.as_u16())));
+    }
+
+    let body = response
+        .into_body()
+        .into_bytes_bounded(MAX_RESPONSE_BYTES)
+        .await
+        .change_context(TrustedServerError::Auction {
+            message: format!("Provider {provider_id} response body failed"),
+        })?;
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!("Provider '{provider_id}' response JSON was invalid: {error}");
+            return Ok(AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("parse_response")));
+        }
+    };
+
+    Ok(extract_standard_response(
+        provider_id,
+        context.input,
+        &value,
+        response_time_ms,
+    ))
+}
+
 #[cfg(test)]
 mod routing_metadata_tests {
     use std::collections::BTreeMap;
@@ -815,8 +877,7 @@ mod routing_metadata_tests {
 
     #[test]
     fn unused_bidder_param_count_follows_the_implementation() {
-        for (implementation, expected) in [("auction.fixture", 0), ("auction-protocol.openrtb", 1)]
-        {
+        for (implementation, expected) in [("auction.fixture", 0), ("auction.plain-fixture", 1)] {
             let endpoint = "https://provider.example/openrtb";
             let provider_id =
                 ProviderId::from_str("fictional_provider").expect("should parse provider ID");

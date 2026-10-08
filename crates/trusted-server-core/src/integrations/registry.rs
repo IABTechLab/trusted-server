@@ -5437,7 +5437,7 @@ mod tests {
         for (section, name) in [
             ("auction", "fixture"),
             ("auction", "ad-server.fixture"),
-            ("auction-protocol", "openrtb"),
+            ("auction", "plain-fixture"),
         ] {
             let mut settings = crate::test_support::tests::create_test_settings();
             settings.select_module(section, name);

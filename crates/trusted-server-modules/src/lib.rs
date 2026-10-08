@@ -36,6 +36,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::diagnostics::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
+        trusted_server_auction_protocol_openrtb::builder(),
         trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
         trusted_server_ad_server_mock::builder(),
@@ -103,6 +104,7 @@ mod tests {
                 "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
+                "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",
                 "ad-server.mock",

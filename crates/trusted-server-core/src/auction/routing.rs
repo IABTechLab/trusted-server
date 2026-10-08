@@ -607,7 +607,7 @@ mod tests {
         let mut config = plan_config(vec![
             (
                 "open_primary",
-                provider("auction-protocol.openrtb", open_routing),
+                provider("auction.plain-fixture", open_routing),
             ),
             (
                 "stored_a",
@@ -619,7 +619,7 @@ mod tests {
             ),
             (
                 "openrtb_direct",
-                provider("auction-protocol.openrtb", RoutingMode::Explicit),
+                provider("auction.plain-fixture", RoutingMode::Explicit),
             ),
         ]);
         config.timeout_ms = 900;

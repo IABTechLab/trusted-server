@@ -767,7 +767,7 @@ fn compile_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::openrtb::OpenRtbDemand;
+    use crate::auction::test_support::plain_fixture::PlainDemand;
     use crate::provider_table::IMPLEMENTATION_KEY;
     use serde_json::json;
 
@@ -821,7 +821,7 @@ mod tests {
 
     /// A plan with one ordinary `OpenRTB` source called `one`.
     fn one_source() -> AuctionPlanConfig {
-        config(vec![("one", table("auction-protocol.openrtb"))])
+        config(vec![("one", table("auction.plain-fixture"))])
     }
 
     fn id(value: &str) -> ProviderId {
@@ -832,27 +832,11 @@ mod tests {
         BidderId::from_str(value).expect("should parse bidder ID")
     }
 
-    fn nested_object(levels: usize) -> Value {
-        let mut value = Value::String("leaf".to_string());
-        for level in 0..levels {
-            value = Value::Object(Map::from_iter([(format!("level_{level}"), value)]));
-        }
-        value
-    }
-
-    fn nested_array(levels: usize) -> Value {
-        let mut value = Value::String("leaf".to_string());
-        for _ in 0..levels {
-            value = Value::Array(vec![value]);
-        }
-        value
-    }
-
     #[test]
     fn target_validation_accepts_fanout_and_rejects_unsupported_targets() {
         let plan = AuctionPlan::compile(config(vec![
-            ("provider_one", table("auction-protocol.openrtb")),
-            ("provider_two", table("auction-protocol.openrtb")),
+            ("provider_one", table("auction.plain-fixture")),
+            ("provider_two", table("auction.plain-fixture")),
         ]))
         .expect("should compile plan");
 
@@ -883,8 +867,8 @@ mod tests {
         raw.demand = ProviderList::new(
             vec!["one".to_string()],
             BTreeMap::from([
-                ("one".to_string(), table("auction-protocol.openrtb")),
-                ("left_behind".to_string(), table("auction-protocol.openrtb")),
+                ("one".to_string(), table("auction.plain-fixture")),
+                ("left_behind".to_string(), table("auction.plain-fixture")),
             ]),
         );
         let error = AuctionPlan::compile(raw).expect_err("should refuse a table nothing selects");
@@ -897,14 +881,14 @@ mod tests {
 
     #[test]
     fn an_unknown_implementation_names_the_ones_this_build_has() {
-        let mut absent = table("auction-protocol.openrtb");
+        let mut absent = table("auction.plain-fixture");
         absent.insert(IMPLEMENTATION_KEY.to_string(), json!("fictional_exchange"));
         let error = AuctionPlan::compile(config(vec![("one", absent)]))
             .expect_err("should refuse an implementation this build does not have");
         let message = error.to_string();
         for expected in [
             "fictional_exchange",
-            "auction-protocol.openrtb",
+            "auction.plain-fixture",
             "auction.fixture",
         ] {
             assert!(
@@ -927,7 +911,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("uses implementation `exchange`")
-                && message.contains("auction-protocol.openrtb"),
+                && message.contains("auction.plain-fixture"),
             "should list the implementations by module path: {error:?}"
         );
     }
@@ -954,7 +938,7 @@ mod tests {
 
     #[test]
     fn a_demand_table_needs_an_endpoint() {
-        let mut without = table("auction-protocol.openrtb");
+        let mut without = table("auction.plain-fixture");
         without.remove(ENDPOINT_KEY);
         let error = AuctionPlan::compile(config(vec![("one", without)]))
             .expect_err("should refuse a source with no endpoint");
@@ -1010,9 +994,9 @@ mod tests {
             );
         }
 
-        let mut openrtb = table("auction-protocol.openrtb");
-        openrtb.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
-        AuctionPlan::compile(config(vec![("openrtb_main", openrtb)]))
+        let mut plain = table("auction.plain-fixture");
+        plain.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        AuctionPlan::compile(config(vec![("plain_main", plain)]))
             .expect("should keep all_eligible for an implementation that allows it");
     }
 
@@ -1042,8 +1026,8 @@ mod tests {
     #[test]
     fn sources_keep_the_order_they_were_selected_in_and_routes_are_deterministic() {
         let mut raw = config(vec![
-            ("z_provider", table("auction-protocol.openrtb")),
-            ("a_provider", table("auction-protocol.openrtb")),
+            ("z_provider", table("auction.plain-fixture")),
+            ("a_provider", table("auction.plain-fixture")),
         ]);
         raw.bidders.insert(
             bidder("z-bidder"),
@@ -1079,21 +1063,21 @@ mod tests {
     #[test]
     fn two_sources_can_run_one_implementation_under_their_own_names() {
         let plan = AuctionPlan::compile(config(vec![
-            ("source_a", table("auction-protocol.openrtb")),
-            ("source_b", table("auction-protocol.openrtb")),
+            ("source_a", table("auction.plain-fixture")),
+            ("source_b", table("auction.plain-fixture")),
         ]))
         .expect("should compile two sources of one implementation");
         assert_eq!(plan.providers().len(), 2);
         assert!(
             plan.providers()
                 .iter()
-                .all(|provider| provider.implementation.id == "auction-protocol.openrtb"),
+                .all(|provider| provider.implementation.id == "auction.plain-fixture"),
             "both names should resolve to the same implementation"
         );
         assert!(
             plan.providers()
                 .iter()
-                .all(|provider| provider.demand.as_any().is::<OpenRtbDemand>()),
+                .all(|provider| provider.demand.as_any().is::<PlainDemand>()),
             "each source should compile its own settings"
         );
     }
@@ -1103,7 +1087,7 @@ mod tests {
         let mut override_table = table("auction.fixture");
         override_table.insert(TIMEOUT_KEY.to_string(), json!(321));
         let plan = AuctionPlan::compile(config(vec![
-            ("openrtb_one", table("auction-protocol.openrtb")),
+            ("plain_one", table("auction.plain-fixture")),
             ("fixed_one", table("auction.fixture")),
             ("fixed_override", override_table),
         ]))
@@ -1113,7 +1097,7 @@ mod tests {
             .iter()
             .map(|provider| (provider.id.as_str(), provider.timeout_ms))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(timeouts["openrtb_one"], 1500);
+        assert_eq!(timeouts["plain_one"], 1500);
         assert_eq!(timeouts["fixed_one"], 1000);
         assert_eq!(timeouts["fixed_override"], 321);
     }
@@ -1122,17 +1106,17 @@ mod tests {
     fn the_plan_reports_which_implementations_it_selected() {
         let plan = AuctionPlan::compile(config(vec![("source", table("auction.fixture"))]))
             .expect("should compile without Settings or browser integration state");
-        assert!(!plan.has_implementation("auction-protocol.openrtb"));
+        assert!(!plan.has_implementation("auction.plain-fixture"));
         assert!(plan.has_implementation("auction.fixture"));
 
         let plan = AuctionPlan::compile(one_source()).expect("should compile a plain source");
         assert!(
-            plan.has_implementation("auction-protocol.openrtb"),
+            plan.has_implementation("auction.plain-fixture"),
             "a validated plan should say which implementation it selected"
         );
         assert!(!plan.has_implementation("auction.fixture"));
         assert!(
-            plan.providers()[0].demand.as_any().is::<OpenRtbDemand>(),
+            plan.providers()[0].demand.as_any().is::<PlainDemand>(),
             "the source should compile its own settings"
         );
     }
@@ -1155,7 +1139,7 @@ mod tests {
 
     #[test]
     fn compiler_canonicalizes_https_endpoints_and_rejects_unsafe_forms() {
-        let mut canonical = table("auction-protocol.openrtb");
+        let mut canonical = table("auction.plain-fixture");
         canonical.insert(
             ENDPOINT_KEY.to_string(),
             json!("https://BID.EXAMPLE:443/path"),
@@ -1173,7 +1157,7 @@ mod tests {
             "https://bid.example/path#fragment",
             "/relative",
         ] {
-            let mut raw = table("auction-protocol.openrtb");
+            let mut raw = table("auction.plain-fixture");
             raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             assert!(
                 AuctionPlan::compile(config(vec![("one", raw)])).is_err(),
@@ -1190,7 +1174,7 @@ mod tests {
             "http://localhost:8000/openrtb2/auction",
             "http://LOCALHOST:8000/openrtb2/auction",
         ] {
-            let mut raw = table("auction-protocol.openrtb");
+            let mut raw = table("auction.plain-fixture");
             raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             AuctionPlan::compile(config(vec![("local", raw)]))
                 .unwrap_or_else(|error| panic!("should accept {endpoint}: {error:?}"));
@@ -1200,7 +1184,7 @@ mod tests {
             "http://bid.example/openrtb2/auction",
             "http://localhost.example/openrtb2/auction",
         ] {
-            let mut raw = table("auction-protocol.openrtb");
+            let mut raw = table("auction.plain-fixture");
             raw.insert(ENDPOINT_KEY.to_string(), json!(endpoint));
             let error = AuctionPlan::compile(config(vec![("remote", raw)]))
                 .expect_err("should reject plain HTTP off the loopback");
@@ -1242,9 +1226,9 @@ mod tests {
             );
         }
 
-        let mut openrtb = table("auction-protocol.openrtb");
-        openrtb.insert(ENDPOINT_KEY.to_string(), json!("https://bid.example/"));
-        let plan = AuctionPlan::compile(config(vec![("openrtb", openrtb)]))
+        let mut plain = table("auction.plain-fixture");
+        plain.insert(ENDPOINT_KEY.to_string(), json!("https://bid.example/"));
+        let plan = AuctionPlan::compile(config(vec![("plain", plain)]))
             .expect("should compile a root endpoint unchanged");
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
@@ -1253,73 +1237,8 @@ mod tests {
     }
 
     #[test]
-    fn openrtb_extensions_are_bounded_and_cannot_claim_reserved_fields() {
-        let mut valid = table("auction-protocol.openrtb");
-        valid.insert(
-            "request_ext".to_string(),
-            json!({"fictional_account": "example"}),
-        );
-        valid.insert("imp_ext".to_string(), json!({"placement_group": "display"}));
-        let plan = AuctionPlan::compile(config(vec![("one", valid)]))
-            .expect("should compile static extensions");
-        let openrtb = plan.providers()[0]
-            .demand
-            .as_any()
-            .downcast_ref::<OpenRtbDemand>()
-            .expect("should compile the OpenRTB implementation");
-        assert_eq!(
-            openrtb.request_ext.as_object()["fictional_account"],
-            "example"
-        );
-
-        let mut reserved = table("auction-protocol.openrtb");
-        reserved.insert(
-            "request_ext".to_string(),
-            json!({"trusted_server": {"signature": "forged"}}),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("one", reserved)])).is_err(),
-            "should refuse an extension claiming a reserved field"
-        );
-
-        let mut too_large = table("auction-protocol.openrtb");
-        too_large.insert(
-            "request_ext".to_string(),
-            json!({"padding": "x".repeat(17 * 1024)}),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("one", too_large)])).is_err(),
-            "should refuse an extension over the size bound"
-        );
-
-        let mut too_deep = table("auction-protocol.openrtb");
-        too_deep.insert("request_ext".to_string(), nested_object(9));
-        assert!(
-            AuctionPlan::compile(config(vec![("one", too_deep)])).is_err(),
-            "should refuse an extension over the depth bound"
-        );
-
-        let mut deep_array = table("auction-protocol.openrtb");
-        deep_array.insert(
-            "request_ext".to_string(),
-            json!({"levels": nested_array(8)}),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("one", deep_array)])).is_err(),
-            "should count array levels toward the depth bound"
-        );
-
-        let mut not_an_object = table("auction-protocol.openrtb");
-        not_an_object.insert("request_ext".to_string(), json!("string"));
-        assert!(
-            AuctionPlan::compile(config(vec![("one", not_an_object)])).is_err(),
-            "should refuse an extension that is not an object"
-        );
-    }
-
-    #[test]
     fn notification_policy_rejects_duplicates_and_bounds() {
-        let mut valid = table("auction-protocol.openrtb");
+        let mut valid = table("auction.plain-fixture");
         valid.insert(
             NOTIFICATIONS_KEY.to_string(),
             json!({"suppress_all": true, "suppress_seats": ["seat-b", "seat-a"]}),
@@ -1347,7 +1266,7 @@ mod tests {
                     .collect(),
             ),
         ] {
-            let mut invalid = table("auction-protocol.openrtb");
+            let mut invalid = table("auction.plain-fixture");
             invalid.insert(
                 NOTIFICATIONS_KEY.to_string(),
                 json!({"suppress_seats": seats}),
@@ -1398,9 +1317,9 @@ mod tests {
 
     #[test]
     fn routing_signing_and_the_selected_ad_server_are_preserved_in_the_plan() {
-        let mut openrtb = table("auction-protocol.openrtb");
-        openrtb.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
-        let mut raw = config(vec![("one", openrtb)]);
+        let mut plain = table("auction.plain-fixture");
+        plain.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        let mut raw = config(vec![("one", plain)]);
         raw.request_signing = Some(RequestSigning {
             enabled: true,
             config_store_id: "example-config-store".to_string(),

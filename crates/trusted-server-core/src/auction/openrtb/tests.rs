@@ -205,7 +205,7 @@ fn consent_matrix_holds_under_each_implementation() {
         ),
     ];
     for (name, consent) in cases {
-        for implementation in ["auction-protocol.openrtb", "auction.fixture"] {
+        for implementation in ["auction.plain-fixture", "auction.fixture"] {
             let mut canonical = canonical_parity_auction_request();
             canonical.user.consent = Some(consent.clone());
             let value = serde_json::to_value(build_with_request(
@@ -254,7 +254,7 @@ fn language_limits_are_profile_specific() {
     let language = "abcdefghijk";
     for (implementation, expected) in [
         ("auction.fixture", Some(language)),
-        ("auction-protocol.openrtb", None),
+        ("auction.plain-fixture", None),
     ] {
         let request = build_with_request(
             implementation,
@@ -267,7 +267,7 @@ fn language_limits_are_profile_specific() {
             expected
         );
     }
-    for implementation in ["auction.fixture", "auction-protocol.openrtb"] {
+    for implementation in ["auction.fixture", "auction.plain-fixture"] {
         let request = build_with_request(
             implementation,
             json!({}),
@@ -398,7 +398,7 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
     let signer = deterministic_signer();
     for (implementation, config) in [
         (
-            "auction-protocol.openrtb",
+            "auction.plain-fixture",
             json!({"request_ext": {"fictional": true}}),
         ),
         ("auction.fixture", json!({})),
@@ -446,7 +446,7 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
 fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
     let signer = deterministic_signer();
     let cases = [(
-        "auction-protocol.openrtb",
+        "auction.plain-fixture",
         json!({"request_ext": {"fictional": true}}),
         r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true,"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
     )];
@@ -461,7 +461,7 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
 
     assert_eq!(
         serde_json::to_string(&build(
-            "auction-protocol.openrtb",
+            "auction.plain-fixture",
             json!({"request_ext": {"fictional": true}}),
             None,
         ))
@@ -472,27 +472,8 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
 }
 
 #[test]
-fn standard_static_extensions_have_no_invented_bidder_param_location() {
-    let request = build(
-        "auction-protocol.openrtb",
-        json!({
-            "request_ext": {"fictional_request": {"enabled": true}},
-            "imp_ext": {"fictional_imp": "value"}
-        }),
-        None,
-    );
-    let value = serde_json::to_value(request).expect("should serialize request");
-    assert_eq!(value["ext"]["fictional_request"]["enabled"], true);
-    assert_eq!(value["imp"][0]["ext"]["fictional_imp"], "value");
-    assert!(
-        !value.to_string().contains("exampleBidder"),
-        "standard implementation must not invent bidder params placement"
-    );
-}
-
-#[test]
 fn defensive_no_impression_outcome_does_not_build_transportable_request() {
-    let (plan, mut routed) = routed("auction-protocol.openrtb", json!({}));
+    let (plan, mut routed) = routed("auction.plain-fixture", json!({}));
     let mut common = routed.inputs()[0].common_request().clone();
     common.slots = vec![AdSlot {
         id: "video-only".to_string(),
@@ -520,7 +501,7 @@ fn standard_fixture_with_formats(
     formats: Vec<AdFormat>,
 ) -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
     let mut raw = config(
-        "auction-protocol.openrtb",
+        "auction.plain-fixture",
         json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
     );
     raw.bidders.insert(
@@ -1118,7 +1099,7 @@ impl CompiledDemand for ForgingDemand {
 
 #[test]
 fn the_driver_refuses_an_implementation_that_claims_the_trusted_server_extension() {
-    let (plan, routed) = routed("auction-protocol.openrtb", json!({}));
+    let (plan, routed) = routed("auction.plain-fixture", json!({}));
     let mut provider = plan.providers()[0].clone();
     provider.demand = Arc::new(ForgingDemand);
 

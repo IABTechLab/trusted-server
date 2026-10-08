@@ -1415,7 +1415,15 @@ mod tests {
     }
 
     fn validate_for_runtime(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-        trusted_server_core::config::validate_settings_for_runtime_with(settings, &[builder()])
+        // The plain `OpenRTB` implementation is what the overlap tests' demand
+        // source runs.
+        trusted_server_core::config::validate_settings_for_runtime_with(
+            settings,
+            &[
+                builder(),
+                trusted_server_auction_protocol_openrtb::builder(),
+            ],
+        )
     }
 
     /// The setting that named the Prebid Server endpoint belongs to a
@@ -1507,7 +1515,10 @@ mod tests {
         let mut settings = make_settings();
         settings.proxy.allowed_domains = vec!["*.example".to_string()];
         settings.auction.enabled = auction_enabled;
-        settings.demand = trusted_server_core::auction::test_support::demand_named(&["pbs"]);
+        settings.demand = trusted_server_core::auction::test_support::demand_named(
+            trusted_server_auction_protocol_openrtb::MODULE,
+            &["pbs"],
+        );
         settings.auction.bidders.insert(
             "exampleBidder"
                 .parse()

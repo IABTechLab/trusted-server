@@ -327,7 +327,10 @@ mod plan_sharing_tests {
     fn cloudflare_and_spin_reject_multi_provider_plans_before_runtime_construction() {
         let mut settings = create_test_settings();
         settings.auction.enabled = true;
-        settings.demand = demand_named(&["provider_a", "provider_b"]);
+        settings.demand = demand_named(
+            crate::auction::test_support::plain_fixture::MODULE,
+            &["provider_a", "provider_b"],
+        );
         let plan = compile_auction_plan(&settings).expect("should compile target-independent plan");
 
         for target in [

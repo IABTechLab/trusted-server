@@ -15,7 +15,6 @@ use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeSe
 use crate::settings::Settings;
 
 pub mod js_asset_proxy;
-pub mod openrtb;
 mod registry;
 
 #[cfg(test)]
@@ -718,8 +717,14 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // the same tests.
     #[cfg(test)]
     registry_test_support::deferred_fixture::BUILDER,
-    // The implementation `[demand]` can name, which no section selects.
-    IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),
+    // A stand-in for the plainest demand implementation there can be, which
+    // core's own tests name where they need a source.
+    #[cfg(test)]
+    IntegrationBuilder::implementations(
+        crate::auction::test_support::plain_fixture::MODULE,
+        CORE_SOURCE,
+    )
+    .with_demand(&crate::auction::test_support::plain_fixture::DEMAND),
     // A stand-in demand implementation, which core's own tests name where
     // they need one that departs from the plain one.
     #[cfg(test)]

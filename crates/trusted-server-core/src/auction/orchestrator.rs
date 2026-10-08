@@ -2648,7 +2648,7 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "auction-protocol.openrtb",
+                        "auction.plain-fixture",
                         "https://example.test/openrtb",
                         *routing,
                         &serde_json::json!({}),

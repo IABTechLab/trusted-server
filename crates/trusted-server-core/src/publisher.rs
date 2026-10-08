@@ -7881,7 +7881,10 @@ mod tests {
             crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
         );
         let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
-        settings.demand = crate::auction::test_support::demand_named(&[SCHEDULING_PROVIDER]);
+        settings.demand = crate::auction::test_support::demand_named(
+            crate::auction::test_support::plain_fixture::MODULE,
+            &[SCHEDULING_PROVIDER],
+        );
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         settings.select_module(
             "testing",
@@ -10828,7 +10831,10 @@ mod tests {
         /// [`settings_with_mode`], with an auction provider that actually bids.
         fn settings_with_bidder(mode: &str) -> Settings {
             let mut settings = settings_with_mode(mode);
-            settings.demand = crate::auction::test_support::demand_named(&[STUB_BIDDER]);
+            settings.demand = crate::auction::test_support::demand_named(
+                crate::auction::test_support::plain_fixture::MODULE,
+                &[STUB_BIDDER],
+            );
             settings
         }
 
@@ -16958,7 +16964,7 @@ mod tests {
 
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
-                "{}\n[demand]\nmodules = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"auction-protocol.openrtb\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[demand]\nmodules = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n[demand.{UNEXPECTED_304_PROVIDER}]\nimplementation = \"auction.plain-fixture\"\nendpoint = \"https://unexpected.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );
@@ -24685,8 +24691,10 @@ mod tests {
         #[tokio::test]
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
-            settings.demand =
-                crate::auction::test_support::demand_named(&[AUCTION_ID_TEST_PROVIDER]);
+            settings.demand = crate::auction::test_support::demand_named(
+                crate::auction::test_support::plain_fixture::MODULE,
+                &[AUCTION_ID_TEST_PROVIDER],
+            );
             settings.select_module(
                 "testing",
                 crate::integrations::registry_test_support::request_fixture::MODULE,
@@ -24842,8 +24850,10 @@ mod tests {
             }
 
             let mut settings = settings_with_co();
-            settings.demand =
-                crate::auction::test_support::demand_named(&[AUCTION_ID_TEST_PROVIDER]);
+            settings.demand = crate::auction::test_support::demand_named(
+                crate::auction::test_support::plain_fixture::MODULE,
+                &[AUCTION_ID_TEST_PROVIDER],
+            );
             settings.select_module(
                 "testing",
                 crate::integrations::registry_test_support::request_fixture::MODULE,
@@ -25535,7 +25545,7 @@ mod tests {
 
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
-                "{}\n[demand]\nmodules = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"auction-protocol.openrtb\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
+                "{}\n[demand]\nmodules = [\"{CAPTURING_PROVIDER}\"]\n\n[demand.{CAPTURING_PROVIDER}]\nimplementation = \"auction.plain-fixture\"\nendpoint = \"https://capture.example/openrtb2/auction\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str().replace("[auction]\n", "[auction]\nenabled = true\n")
             );

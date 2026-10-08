@@ -6672,6 +6672,7 @@ dependencies = [
  "serde",
  "serde_json",
  "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "url",
  "validator",
@@ -6696,6 +6697,17 @@ dependencies = [
  "url",
  "validator",
  "web-time",
+]
+
+[[package]]
+name = "trusted-server-auction-protocol-openrtb"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "error-stack",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
 ]
 
 [[package]]
@@ -7008,6 +7020,7 @@ dependencies = [
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-audience-permutive",
  "trusted-server-bot-protection-datadome",
  "trusted-server-cmp-didomi",

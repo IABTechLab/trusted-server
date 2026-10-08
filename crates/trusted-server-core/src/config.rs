@@ -699,12 +699,12 @@ formats = [{ width = 300, height = 250 }]
         source["demand"] = serde_json::json!({
             "modules": ["secondary", "primary"],
             "secondary": {
-                "implementation": "auction-protocol.openrtb", "endpoint": "https://secondary.example.com/auction",
+                "implementation": "auction.plain-fixture", "endpoint": "https://secondary.example.com/auction",
                 "routing": "all_eligible",
                 "notifications": {"suppress_seats": ["seat-b", "seat-a"]}
             },
             "primary": {
-                "implementation": "auction-protocol.openrtb", "endpoint": "https://primary.example.com/auction",
+                "implementation": "auction.plain-fixture", "endpoint": "https://primary.example.com/auction",
                 "routing": "all_eligible",
                 "notifications": {"suppress_seats": ["seat-b", "seat-a"]}
             }
