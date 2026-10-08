@@ -12,13 +12,11 @@ use serde::Serialize;
 use crate::error::CliError;
 
 /// Prints an informational line to stdout.
-#[cfg(target_os = "macos")]
 pub fn info(message: &str) {
     println!("{message}");
 }
 
 /// Prints a warning line to stderr.
-#[cfg(target_os = "macos")]
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }

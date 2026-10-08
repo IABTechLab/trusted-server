@@ -27,7 +27,8 @@ pub use run::{RunOutcome, run_from_env};
 #[cfg(not(target_arch = "wasm32"))]
 pub mod commands;
 // Console output wrappers, cross-host: `ts dev lint` uses the `write_*`
-// helpers on every target, and `ts dev sandbox-probe` builds on every host
-// target and needs them too. The `info` / `warn` helpers are proxy-facing.
+// helpers on every target, and `info` / `warn` are called by both the
+// macOS/Linux proxy and `ts dev sandbox-probe`, which builds on every host
+// target, so neither is gated.
 #[cfg(not(target_arch = "wasm32"))]
 mod output;
