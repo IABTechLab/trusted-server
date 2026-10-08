@@ -5397,7 +5397,7 @@ mod tests {
         for (section, name) in [
             ("auction", "prebid-server"),
             ("auction", "aps"),
-            ("auction", "ad-server.mock"),
+            ("auction", "ad-server.fixture"),
             ("auction-protocol", "openrtb"),
         ] {
             let mut settings = crate::test_support::tests::create_test_settings();

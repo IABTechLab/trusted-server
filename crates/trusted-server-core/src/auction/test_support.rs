@@ -205,3 +205,110 @@ pub(crate) fn legacy_auction_config(settings: &Settings) -> crate::auction::Auct
         .collect();
     config
 }
+
+/// A stand-in ad server implementation for core's own tests of the ad server
+/// seam, selected with `[ad-server] module = "fixture"`.
+///
+/// It reads an `endpoint`, which has to be a URL, and an optional
+/// `timeout_ms` from its table and refuses any other setting, as an
+/// implementation of a vendor's does. Its provider answers every request
+/// with no bid and calls nothing.
+pub(crate) mod adserver_fixture {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use error_stack::Report;
+    use serde::Deserialize;
+
+    use crate::auction::demand::AdServerImplementation;
+    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+    use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
+    use crate::error::TrustedServerError;
+    use crate::platform::PlatformResponse;
+
+    /// The name the stand-in is selected by, which `[ad-server]` shortens to
+    /// `fixture`.
+    pub(crate) const MODULE: &str = "ad-server.fixture";
+
+    /// The stand-in ad server implementation.
+    pub(crate) static ADSERVER: AdServerImplementation =
+        AdServerImplementation { id: MODULE, build };
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureSettings {
+        endpoint: String,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u32,
+    }
+
+    fn default_timeout_ms() -> u32 {
+        500
+    }
+
+    fn build(
+        name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
+        let settings: FixtureSettings = serde_json::from_value(serde_json::Value::Object(
+            settings.clone(),
+        ))
+        .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("invalid `{MODULE}` settings: {error}"),
+            })
+        })?;
+        url::Url::parse(&settings.endpoint).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("invalid `{MODULE}` endpoint: {error}"),
+            })
+        })?;
+        Ok(Arc::new(FixtureAdServer::new(name, settings.timeout_ms)))
+    }
+
+    /// The stand-in's provider.
+    pub(crate) struct FixtureAdServer {
+        name: String,
+        timeout_ms: u32,
+    }
+
+    impl FixtureAdServer {
+        /// A provider called `name`.
+        pub(crate) fn new(name: &str, timeout_ms: u32) -> Self {
+            Self {
+                name: name.to_owned(),
+                timeout_ms,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AuctionProvider for FixtureAdServer {
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
+                self.name.clone(),
+                0,
+            )))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::no_bid(self.name.clone(), response_time_ms))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            self.timeout_ms
+        }
+    }
+}

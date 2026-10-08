@@ -29,11 +29,20 @@ const DEFAULT_CURRENCY: &str = "USD";
 const TRUSTED_SERVER_EXT_KEY: &str = "trusted_server";
 
 /// Fixed reasons why an upstream bid failed response admission.
+///
+/// Public, with the dimension helpers below, so an auction implementation in
+/// a crate of its own admits a bid by the rules core's own response reader
+/// applies.
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum BidRejectionReason {
+pub enum BidRejectionReason {
+    /// The bid is malformed.
     InvalidBid,
+    /// The bid names an impression the request did not carry.
     UnrequestedImpression,
+    /// The bid's dimensions match no format the impression asked for.
     DimensionMismatch,
+    /// The bid's dimensions match more than one format the impression asked
+    /// for.
     AmbiguousDimensions,
 }
 
@@ -105,7 +114,7 @@ impl DimensionMatch {
 }
 
 /// Precomputed dimension resolutions for one requested impression.
-pub(crate) struct SlotBidDimensions {
+pub struct SlotBidDimensions {
     exact: BTreeSet<(u32, u32)>,
     by_width: BTreeMap<u32, DimensionMatch>,
     by_height: BTreeMap<u32, DimensionMatch>,
@@ -148,7 +157,7 @@ impl SlotBidDimensions {
 }
 
 /// Precomputed requested banner dimensions keyed by impression ID.
-pub(crate) type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
+pub type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
 
 /// Build the requested-dimension index once for one provider response.
 pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
@@ -158,7 +167,8 @@ pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDime
 /// Build the requested-dimension index from plain [`AdSlot`]s.
 ///
 /// The first slot wins when several share an ID.
-pub(crate) fn build_bid_dimension_index_from_slots<'a>(
+#[must_use]
+pub fn build_bid_dimension_index_from_slots<'a>(
     slots: impl IntoIterator<Item = &'a AdSlot>,
 ) -> BidDimensionIndex {
     let mut index = BidDimensionIndex::new();
@@ -171,7 +181,12 @@ pub(crate) fn build_bid_dimension_index_from_slots<'a>(
 }
 
 /// Parse an optional positive `OpenRTB` bid dimension.
-pub(crate) fn parse_optional_bid_dimension(
+///
+/// # Errors
+///
+/// Returns [`BidRejectionReason::InvalidBid`] when the value is present and is
+/// not a positive whole number that fits.
+pub fn parse_optional_bid_dimension(
     value: &Value,
     key: &str,
 ) -> Result<Option<u32>, BidRejectionReason> {
@@ -199,7 +214,12 @@ pub(crate) fn parse_optional_bid_dimension(
 }
 
 /// Validate explicit dimensions or infer them from one matching banner format.
-pub(crate) fn resolve_bid_dimensions(
+///
+/// # Errors
+///
+/// Returns the reason the bid is refused: the impression was not requested,
+/// or the dimensions match none or more than one of its formats.
+pub fn resolve_bid_dimensions(
     dimensions_by_slot: &BidDimensionIndex,
     slot_id: &str,
     width: Option<u32>,

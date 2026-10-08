@@ -17,7 +17,7 @@ pub mod context;
 pub mod demand;
 pub mod endpoints;
 pub mod formats;
-pub(crate) mod openrtb;
+pub mod openrtb;
 pub mod orchestrator;
 pub mod plan;
 pub mod provider;
@@ -257,13 +257,7 @@ mod plan_sharing_tests {
         _settings: &Map<String, serde_json::Value>,
     ) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
         Ok(Arc::new(
-            crate::integrations::adserver_mock::AdServerMockProvider::new(
-                name,
-                crate::integrations::adserver_mock::AdServerMockSettings {
-                    endpoint: "https://external.example/mediate".to_string(),
-                    ..Default::default()
-                },
-            ),
+            crate::auction::test_support::adserver_fixture::FixtureAdServer::new(name, 500),
         ))
     }
 
@@ -301,7 +295,7 @@ mod plan_sharing_tests {
     fn the_selected_ad_server_is_built_from_its_own_table() {
         let mut settings = create_test_settings();
         settings.adserver = adserver(
-            "mock",
+            "fixture",
             Map::from_iter([(
                 "endpoint".to_string(),
                 json!("https://adserver.example/mediate"),
@@ -315,7 +309,7 @@ mod plan_sharing_tests {
     #[test]
     fn an_ad_server_table_with_no_endpoint_fails_the_plan() {
         let mut settings = create_test_settings();
-        settings.adserver = adserver("mock", Map::new());
+        settings.adserver = adserver("fixture", Map::new());
         let error = compile_auction_plan(&settings)
             .expect_err("should refuse an ad server with no endpoint");
         assert!(

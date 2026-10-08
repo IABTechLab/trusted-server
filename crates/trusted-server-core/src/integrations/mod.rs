@@ -14,7 +14,6 @@ use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
-pub mod adserver_mock;
 pub mod aps;
 pub mod js_asset_proxy;
 pub mod openrtb;
@@ -729,8 +728,14 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
         .with_demand(&aps::DEMAND)
         .with_plan_registration(aps::register_for_plan),
-    IntegrationBuilder::implementations(adserver_mock::MODULE, CORE_SOURCE)
-        .with_adserver(&adserver_mock::ADSERVER),
+    // A stand-in ad server, which core's own tests select where they need
+    // one.
+    #[cfg(test)]
+    IntegrationBuilder::implementations(
+        crate::auction::test_support::adserver_fixture::MODULE,
+        CORE_SOURCE,
+    )
+    .with_adserver(&crate::auction::test_support::adserver_fixture::ADSERVER),
 ];
 
 /// The built-in integration builders, in hook order.

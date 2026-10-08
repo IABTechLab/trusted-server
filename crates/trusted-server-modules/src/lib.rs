@@ -31,6 +31,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
+        trusted_server_ad_server_mock::builder(),
     ]
 }
 
@@ -67,9 +68,17 @@ mod tests {
 
     #[test]
     fn stock_modules_are_offered_in_hook_order() {
+        // A module is named by what its section selects, and an
+        // implementation by what `[demand]` or `[ad-server]` names.
         let names: Vec<&str> = builders()
             .iter()
-            .filter_map(IntegrationBuilder::module_name)
+            .map(|builder| {
+                builder
+                    .module_name()
+                    .or_else(|| builder.demand().map(|demand| demand.id))
+                    .or_else(|| builder.adserver().map(|adserver| adserver.id))
+                    .unwrap_or_else(|| builder.id())
+            })
             .collect();
 
         assert_eq!(
@@ -86,6 +95,7 @@ mod tests {
                 "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
+                "ad-server.mock",
             ],
             "should offer the stock modules in the order their hooks run"
         );
@@ -336,5 +346,134 @@ mod tests {
                 "should list `{expected}` among {paths:?}"
             );
         }
+    }
+
+    /// The mock ad server decides between the bids APS returned, and the
+    /// winner keeps the seat the exchange returned, APS's own bidder name and
+    /// its renderer.
+    #[tokio::test]
+    async fn the_mock_ad_server_keeps_an_aps_winner_s_identities_and_renderer() {
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::Arc;
+
+        use trusted_server_ad_server_mock::{AdServerMockProvider, AdServerMockSettings};
+        use trusted_server_core::auction::orchestrator::AuctionOrchestrator;
+        use trusted_server_core::auction::types::{
+            AdFormat, AdSlot, AuctionContext, AuctionRequest, MediaType, PublisherInfo, UserInfo,
+        };
+        use trusted_server_core::platform::test_support::{
+            StubHttpClient, build_services_with_http_client,
+        };
+        use trusted_server_core::provider_table::ProviderList;
+        use trusted_server_core::test_support::tests::create_test_settings;
+
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "seatbid": [{"seat": "upstream-seat", "bid": [{
+                    "id": "aps-bid", "impid": "fictional-slot", "price": 2.0,
+                    "w": 300, "h": 250,
+                    "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}
+                }]}]
+            }))
+            .expect("should serialize APS response"),
+        );
+        http.push_response(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "seatbid": [{"seat": "aps_instance", "bid": [{
+                    "id": "adserver-aps", "impid": "fictional-slot", "price": 2.0,
+                    "adm": "ignored", "w": 300, "h": 250, "crid": "aps-creative"
+                }]}]
+            }))
+            .expect("should serialize adserver response"),
+        );
+        let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+
+        let mut settings = create_test_settings();
+        settings.auction.enabled = true;
+        settings.auction.timeout_ms = 777;
+        let serde_json::Value::Object(aps) = serde_json::json!({
+            "implementation": "auction.aps",
+            "endpoint": "https://aps.example/e/pb/bid",
+            "account_id": "example-account",
+            "timeout_ms": 1000,
+            "routing": "all_eligible",
+        }) else {
+            panic!("should build the APS table");
+        };
+        settings.demand = ProviderList::new(
+            vec!["aps_instance".to_string()],
+            BTreeMap::from([("aps_instance".to_string(), aps)]),
+        );
+        let plan = trusted_server_core::auction::compile_auction_plan_with(&settings, &builders())
+            .expect("should compile the planned APS auction");
+        let adserver = AdServerMockProvider::new(
+            "adserver_mock",
+            AdServerMockSettings {
+                endpoint: "https://adserver.example/mediate".to_string(),
+                timeout_ms: 500,
+                ..AdServerMockSettings::default()
+            },
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(Arc::new(adserver)));
+        let request = AuctionRequest {
+            id: "fictional-auction".to_string(),
+            slots: vec![AdSlot {
+                id: "fictional-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: Some(1.0),
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "publisher.example".to_string(),
+                page_url: Some("https://publisher.example/article".to_string()),
+            },
+            user: UserInfo {
+                id: None,
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        };
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("should decide planned APS bid");
+
+        let provider_bid = &result.provider_responses[0].bids[0];
+        assert_eq!(result.provider_responses[0].provider, "aps_instance");
+        assert_eq!(provider_bid.returned_seat.as_deref(), Some("upstream-seat"));
+        assert_eq!(provider_bid.bidder, "aps");
+        let winner = &result.winning_bids["fictional-slot"];
+        assert_eq!(winner.returned_seat.as_deref(), Some("upstream-seat"));
+        assert_eq!(winner.bidder, "aps");
+        assert!(winner.renderer.is_some());
+        assert!(winner.creative.is_none());
+        assert_eq!(
+            result
+                .adserver_response
+                .as_ref()
+                .map(|response| response.provider.as_str()),
+            Some("adserver_mock")
+        );
     }
 }

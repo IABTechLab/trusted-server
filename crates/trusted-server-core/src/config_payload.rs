@@ -296,13 +296,7 @@ mod tests {
         Report<TrustedServerError>,
     > {
         Ok(std::sync::Arc::new(
-            crate::integrations::adserver_mock::AdServerMockProvider::new(
-                name,
-                crate::integrations::adserver_mock::AdServerMockSettings {
-                    endpoint: "https://external.example/mediate".to_string(),
-                    ..Default::default()
-                },
-            ),
+            crate::auction::test_support::adserver_fixture::FixtureAdServer::new(name, 500),
         ))
     }
 

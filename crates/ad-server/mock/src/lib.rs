@@ -4,6 +4,18 @@
 //! price, so a deployment can exercise the ad server seam without a real ad
 //! server.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -15,22 +27,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use validator::Validate;
 
-use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
-use crate::auction::demand::AdServerImplementation;
-use crate::auction::openrtb::{
+use trusted_server_core::auction::context::{ContextQueryParams, build_url_with_context_params};
+use trusted_server_core::auction::demand::AdServerImplementation;
+use trusted_server_core::auction::openrtb::{
     BidDimensionIndex, BidRejectionReason, build_bid_dimension_index_from_slots,
     parse_optional_bid_dimension, resolve_bid_dimensions,
 };
-use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::types::{
+use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+use trusted_server_core::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
-use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
+use trusted_server_core::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 
 // ============================================================================
 // Configuration
@@ -42,6 +54,17 @@ pub const MODULE: &str = "ad-server.mock";
 
 /// The demonstration ad server implementation.
 pub static ADSERVER: AdServerImplementation = AdServerImplementation { id: MODULE, build };
+
+/// The builder a deployment hands to an adapter, which offers this ad server
+/// to `[ad-server]`.
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::implementations(
+        MODULE,
+        env!("CARGO_PKG_NAME"),
+    )
+    .with_adserver(&ADSERVER)
+}
 
 fn build(
     name: &str,
@@ -609,8 +632,8 @@ impl AuctionProvider for AdServerMockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::context::ContextValue;
-    use crate::auction::types::*;
+    use trusted_server_core::auction::context::ContextValue;
+    use trusted_server_core::auction::types::*;
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
@@ -1245,7 +1268,7 @@ mod tests {
 
     #[test]
     fn test_adserver_request_includes_consent() {
-        use crate::consent::ConsentContext;
+        use trusted_server_core::consent::ConsentContext;
 
         let config = AdServerMockSettings {
             endpoint: "http://localhost:6767/mediate".to_string(),
@@ -1801,6 +1824,15 @@ mod tests {
         assert_eq!(
             url,
             "http://localhost:6767/adserver/mediate?debug=true&permutive=123%2Cadv"
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
         );
     }
 }

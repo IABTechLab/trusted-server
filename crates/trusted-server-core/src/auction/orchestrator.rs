@@ -2598,7 +2598,6 @@ mod tests {
         BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
-    use crate::integrations::adserver_mock::{AdServerMockProvider, AdServerMockSettings};
     use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_backend_and_http_client,
@@ -3740,8 +3739,8 @@ mod tests {
         }
     }
 
-    /// Ad server whose context-aware parse restores `nurl`/`ad_id` (mirroring
-    /// `adserver_mock`), while its context-free parse does not. Lets a test prove
+    /// Ad server whose context-aware parse restores `nurl`/`ad_id`, as one that
+    /// keeps them out of its request does, while its context-free parse does not. Lets a test prove
     /// the synchronous ad server decision path calls `parse_response_with_context`.
     struct CacheRestoringAdServer;
 
@@ -5111,9 +5110,9 @@ mod tests {
             let mut adserver_only = plan_config(Vec::new());
             adserver_only.timeout_ms = 49;
             adserver_only.adserver = crate::provider_table::ProviderChoice::new(
-                Some("mock".to_string()),
+                Some("fixture".to_string()),
                 BTreeMap::from([(
-                    "mock".to_string(),
+                    "fixture".to_string(),
                     serde_json::Map::from_iter([(
                         "endpoint".to_string(),
                         serde_json::json!("https://adserver.example/mediate"),
@@ -6277,81 +6276,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_aps_mock_adserver_preserves_three_identities_and_renderer() {
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "upstream-seat", "bid": [{
-                    "id": "aps-bid", "impid": "fictional-slot", "price": 2.0,
-                    "w": 300, "h": 250,
-                    "ext": {"creativeurl": "https://creative.example/render", "tagtype": "iframe"}
-                }]}]
-            }))
-            .expect("should serialize APS response"),
-        );
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "aps_instance", "bid": [{
-                    "id": "adserver-aps", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "ignored", "w": 300, "h": 250, "crid": "aps-creative"
-                }]}]
-            }))
-            .expect("should serialize adserver response"),
-        );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let plan =
-            AuctionPlan::compile(planned_aps_config()).expect("should compile planned APS auction");
-        let adserver = AdServerMockProvider::new(
-            "adserver_mock",
-            AdServerMockSettings {
-                endpoint: "https://adserver.example/mediate".to_string(),
-                timeout_ms: 500,
-                ..AdServerMockSettings::default()
-            },
-        );
-        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(adserver)));
-        let request = planned_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should decide planned APS bid");
-
-        let provider_bid = &result.provider_responses[0].bids[0];
-        assert_eq!(result.provider_responses[0].provider, "aps_instance");
-        assert_eq!(provider_bid.returned_seat.as_deref(), Some("upstream-seat"));
-        assert_eq!(provider_bid.bidder, "aps");
-        let winner = &result.winning_bids["fictional-slot"];
-        assert_eq!(winner.returned_seat.as_deref(), Some("upstream-seat"));
-        assert_eq!(winner.bidder, "aps");
-        assert!(winner.renderer.is_some());
-        assert!(winner.creative.is_none());
-        assert_eq!(
-            result
-                .adserver_response
-                .as_ref()
-                .map(|response| response.provider.as_str()),
-            Some("adserver_mock")
-        );
-    }
-
-    #[tokio::test]
     async fn planned_aps_transport_omits_accept_header() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(400, Vec::new());
@@ -7322,9 +7246,9 @@ mod tests {
             );
             let mut config = planned_config(&[("provider", RoutingMode::AllEligible)], false);
             config.adserver = crate::provider_table::ProviderChoice::new(
-                Some("mock".to_string()),
+                Some("fixture".to_string()),
                 BTreeMap::from([(
-                    "mock".to_string(),
+                    "fixture".to_string(),
                     serde_json::Map::from_iter([(
                         "endpoint".to_string(),
                         serde_json::json!("https://adserver.example/mediate"),

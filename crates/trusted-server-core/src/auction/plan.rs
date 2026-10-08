@@ -944,19 +944,19 @@ mod tests {
     fn an_ad_server_named_by_its_short_form_needs_no_implementation_line() {
         let mut raw = one_source();
         raw.adserver = ProviderChoice::new(
-            Some("mock".to_string()),
+            Some("fixture".to_string()),
             BTreeMap::from([(
-                "mock".to_string(),
+                "fixture".to_string(),
                 Map::from_iter([(
                     ENDPOINT_KEY.to_string(),
                     json!("https://adserver.example/mediate"),
                 )]),
             )]),
         );
-        let plan = AuctionPlan::compile(raw).expect("should resolve `mock` within [ad-server]");
+        let plan = AuctionPlan::compile(raw).expect("should resolve `fixture` within [ad-server]");
         assert_eq!(
             plan.adserver().map(|adserver| adserver.implementation.id),
-            Some("ad-server.mock")
+            Some("ad-server.fixture")
         );
     }
 
@@ -1457,9 +1457,9 @@ mod tests {
             secret_store_id: "example-secret-store".to_string(),
         });
         raw.adserver = ProviderChoice::new(
-            Some("mock".to_string()),
+            Some("fixture".to_string()),
             BTreeMap::from([(
-                "mock".to_string(),
+                "fixture".to_string(),
                 Map::from_iter([(
                     ENDPOINT_KEY.to_string(),
                     json!("http://127.0.0.1:6767/adserver/mediate"),
@@ -1471,7 +1471,7 @@ mod tests {
         assert!(plan.signing_enabled());
         assert_eq!(
             plan.adserver().map(|adserver| adserver.id.as_str()),
-            Some("mock")
+            Some("fixture")
         );
 
         let mut invalid = config(Vec::new());
@@ -1493,7 +1493,7 @@ mod tests {
             BTreeMap::from([(
                 "house".to_string(),
                 Map::from_iter([
-                    (IMPLEMENTATION_KEY.to_string(), json!("mock")),
+                    (IMPLEMENTATION_KEY.to_string(), json!("fixture")),
                     (
                         ENDPOINT_KEY.to_string(),
                         json!("https://adserver.example/mediate"),
@@ -1505,13 +1505,13 @@ mod tests {
         let plan = AuctionPlan::compile(raw).expect("should compile a named ad server");
         let adserver = plan.adserver().expect("should select an ad server");
         assert_eq!(adserver.id.as_str(), "house");
-        assert_eq!(adserver.implementation.id, "ad-server.mock");
+        assert_eq!(adserver.implementation.id, "ad-server.fixture");
 
         let mut unknown_setting = one_source();
         unknown_setting.adserver = ProviderChoice::new(
-            Some("mock".to_string()),
+            Some("fixture".to_string()),
             BTreeMap::from([(
-                "mock".to_string(),
+                "fixture".to_string(),
                 Map::from_iter([
                     (
                         ENDPOINT_KEY.to_string(),

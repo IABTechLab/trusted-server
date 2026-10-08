@@ -5379,6 +5379,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-ad-server-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-ad-tag-google"
 version = "0.1.0"
 dependencies = [
@@ -5812,6 +5828,8 @@ dependencies = [
  "edgezero-core",
  "http",
  "serde_json",
+ "tokio",
+ "trusted-server-ad-server-mock",
  "trusted-server-ad-tag-google",
  "trusted-server-audience-permutive",
  "trusted-server-bot-protection-datadome",
