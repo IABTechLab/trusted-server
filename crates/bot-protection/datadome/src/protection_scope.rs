@@ -8,8 +8,8 @@ use error_stack::Report;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::error::TrustedServerError;
-use crate::platform::{RuntimeServices, StoreName};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::platform::{RuntimeServices, StoreName};
 
 use super::{DATADOME_INTEGRATION_ID, DataDomeConfig};
 
@@ -37,7 +37,10 @@ pub struct ProtectionExclusionRuleConfig {
     #[serde(default = "default_enabled_rule")]
     pub enabled: bool,
     /// Optional methods this rule applies to. Empty means every method.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub methods: Vec<String>,
     /// Matcher-specific rule configuration.
     #[serde(flatten)]
@@ -50,32 +53,32 @@ pub struct ProtectionExclusionRuleConfig {
 pub enum ProtectionMatcherConfig {
     /// Match exact request paths.
     PathExact {
-        #[serde(deserialize_with = "crate::settings::vec_from_seq_or_map")]
+        #[serde(deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map")]
         paths: Vec<String>,
     },
     /// Match request path prefixes.
     PathPrefix {
-        #[serde(deserialize_with = "crate::settings::vec_from_seq_or_map")]
+        #[serde(deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map")]
         prefixes: Vec<String>,
     },
     /// Match request paths with one or more regexes.
     PathRegex {
-        #[serde(deserialize_with = "crate::settings::vec_from_seq_or_map")]
+        #[serde(deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map")]
         patterns: Vec<String>,
     },
     /// Match when any query parameter has a non-empty value.
     QueryParamNonEmpty {
-        #[serde(deserialize_with = "crate::settings::vec_from_seq_or_map")]
+        #[serde(deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map")]
         names: Vec<String>,
     },
     /// Match client autonomous system numbers.
     Asn {
-        #[serde(deserialize_with = "crate::settings::vec_from_seq_or_map")]
+        #[serde(deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map")]
         values: Vec<u32>,
     },
     /// Match client IP CIDRs configured inline.
     IpCidr {
-        #[serde(deserialize_with = "crate::settings::vec_from_seq_or_map")]
+        #[serde(deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map")]
         cidrs: Vec<String>,
     },
     /// Match client IP CIDRs loaded from Config Store.
@@ -720,7 +723,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::platform::test_support::{
+    use trusted_server_core::platform::test_support::{
         HashMapConfigStore, NoopSecretStore, build_services_with_config_and_secret,
     };
 
@@ -797,7 +800,7 @@ mod tests {
         let mut config = config_with_protection();
         config.protection_excluded_methods = vec!["OPTIONS".to_string(), "FASTLYPURGE".to_string()];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         let decision = scope.evaluate(&facts("FASTLYPURGE", "/page", None, None, None), &services);
 
@@ -816,7 +819,7 @@ mod tests {
         let mut config = config_with_protection();
         config.protection_excluded_asns = vec![19750, 209366];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         let decision = scope.evaluate(&facts("GET", "/page", None, None, Some(19750)), &services);
 
@@ -835,7 +838,7 @@ mod tests {
         let mut config = config_with_protection();
         config.protection_excluded_ip_cidrs = vec!["198.51.100.0/24".to_string()];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         let decision = scope.evaluate(
             &facts(
@@ -960,7 +963,7 @@ mod tests {
             },
         }];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         assert!(matches!(
             scope.evaluate(&facts("GET", "/app.JSON", None, None, None), &services),
@@ -982,7 +985,7 @@ mod tests {
         config.protection_excluded_methods = vec!["GET".to_string()];
         config.protection_excluded_ip_cidrs = vec!["192.0.2.0/24".to_string()];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         let decision = scope.evaluate(
             &facts(
@@ -1029,7 +1032,7 @@ mod tests {
                 },
             ];
             let scope = ProtectionScope::compile(&config).expect("should compile scope");
-            let services = crate::platform::test_support::noop_services();
+            let services = trusted_server_core::platform::test_support::noop_services();
 
             let decision = scope.evaluate(
                 &facts(
@@ -1066,7 +1069,7 @@ mod tests {
             },
         }];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         let decision = scope.evaluate(
             &facts(
@@ -1101,7 +1104,7 @@ mod tests {
             },
         }];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
 
         assert!(matches!(
             scope.evaluate(

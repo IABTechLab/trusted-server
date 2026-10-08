@@ -6275,8 +6275,8 @@ pub(crate) enum TemplateCacheBypassReason {
     /// concern rather than a hypothetical one.
     #[display("request carried Authorization")]
     AuthorizedRequest,
-    /// Not a 200. This is also what covers a `DataDome` block, which replaces the
-    /// document with a `403` (`integrations/datadome/protection.rs:778`).
+    /// Not a 200. This is also what covers a bot protection module's block, which
+    /// replaces the document with a `403`.
     #[display("status was not 200 OK")]
     NonOkStatus,
     /// Not HTML, so there is no template to transform.
@@ -7687,8 +7687,7 @@ mod tests {
     };
     use crate::permissions::{Permission, PermissionSet};
     use crate::platform::test_support::{
-        NoopSecretStore, StubHttpClient, build_services_with_http_client,
-        build_services_with_secret_http_client_and_client_ip, noop_services,
+        StubHttpClient, build_services_with_http_client, noop_services,
         noop_services_with_telemetry_sink,
     };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -7822,7 +7821,7 @@ mod tests {
         response_is_private: bool,
         auction_preserved_client_snapshot: bool,
         origin_kv_auction_order: bool,
-        datadome_tag_suppressed: bool,
+        module_state_written: bool,
         ok: bool,
     }
 
@@ -7879,7 +7878,7 @@ mod tests {
             .header(header::USER_AGENT, "scheduling-browser")
             .body(EdgeBody::empty())
             .expect("should build navigation request");
-        crate::integrations::datadome::suppress_client_tag(&mut request);
+        crate::integrations::registry_test_support::request_fixture::mark(&mut request);
         request
     }
 
@@ -7892,15 +7891,10 @@ mod tests {
         let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
         settings.demand = crate::auction::test_support::demand_named(&[SCHEDULING_PROVIDER]);
         settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
-        settings
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "client_side_key": "scheduling-test-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::request_fixture::MODULE,
+        );
         settings
     }
 
@@ -7937,9 +7931,11 @@ mod tests {
         http.set_streaming_responses_supported(streaming_responses);
         http.set_pending_streaming_responses_supported(pending_streaming_responses);
         if queue_origin {
+            // The document has a head, so what a module writes there for the
+            // request has somewhere to go.
             http.push_response_with_headers(
                 200,
-                b"<html><body>ok</body></html>".to_vec(),
+                b"<html><head></head><body>ok</body></html>".to_vec(),
                 vec![("content-type", "text/html; charset=utf-8")],
             );
         }
@@ -8049,9 +8045,9 @@ mod tests {
         let origin_kv_auction_order = captured_auction.as_ref().is_some_and(|captured| {
             captured.http_calls_at_dispatch == 1 && captured.lookups_at_dispatch == 1
         });
-        let datadome_tag_suppressed = if let Ok(response) = result {
+        let module_state_written = if let Ok(response) = result {
             let registry = IntegrationRegistry::new(&settings)
-                .expect("should create integration registry with DataDome");
+                .expect("should create integration registry with the stand-in");
             buffer_publisher_response_async(
                 response,
                 &Method::GET,
@@ -8065,7 +8061,9 @@ mod tests {
             .and_then(|response| response.into_body().into_bytes())
             .and_then(|body| String::from_utf8(body.to_vec()).ok())
             .is_some_and(|html| {
-                !html.contains("window.ddjskey") && !html.contains("/integrations/datadome/tags.js")
+                html.contains(
+                    crate::integrations::registry_test_support::request_fixture::HEAD_FLAG,
+                )
             })
         } else {
             false
@@ -8081,7 +8079,7 @@ mod tests {
             response_is_private,
             auction_preserved_client_snapshot,
             origin_kv_auction_order,
-            datadome_tag_suppressed,
+            module_state_written,
             ok,
         }
     }
@@ -8279,7 +8277,7 @@ mod tests {
         );
         assert!(
             outcome.response_is_private,
-            "DataDome-suppressed pending HTML should remain private"
+            "pending HTML a module wrote into should remain private"
         );
         assert!(
             outcome.origin_kv_auction_order,
@@ -8290,8 +8288,8 @@ mod tests {
             "auction dispatch should retain the original client URI and headers"
         );
         assert!(
-            outcome.datadome_tag_suppressed,
-            "configured DataDome client injection should remain suppressed"
+            outcome.module_state_written,
+            "what a module left on the request should reach the pending document"
         );
     }
 
@@ -14858,64 +14856,43 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn datadome_suppressed_request_bypasses_a_warm_shared_template() {
+        async fn a_personalized_request_bypasses_a_warm_shared_template() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
-            let mut raw = settings_with_mode("esi");
-            raw.insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-            let settings = Arc::new(raw);
+            let settings = Arc::new(settings_with_mode("esi"));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
             queue_shareable_html(&stub);
 
-            let ordinary = run(&settings, &services, navigation_request()).await;
-            let ordinary_document = String::from_utf8(body_of(ordinary).await)
-                .expect("ordinary document should be UTF-8");
-            assert!(
-                ordinary_document.contains("/integrations/datadome/tags.js"),
-                "the warm template fixture must contain the ordinary DataDome tag"
-            );
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
 
-            let mut suppressed_request = navigation_request();
-            suppressed_request
+            let mut personalized_request = navigation_request();
+            personalized_request
                 .headers_mut()
                 .insert("sec-fetch-dest", HeaderValue::from_static("script"));
-            crate::integrations::datadome::suppress_client_tag(&mut suppressed_request);
-            suppressed_request
+            personalized_request
                 .extensions_mut()
                 .insert(crate::response_privacy::PersonalizedResponse);
-            let suppressed = run(&settings, &services, suppressed_request).await;
+            let personalized = run(&settings, &services, personalized_request).await;
             assert_eq!(
-                suppressed
+                personalized
                     .headers()
                     .get(HEADER_X_TS_TEMPLATE_CACHE)
                     .and_then(|value| value.to_str().ok()),
                 Some("bypass-request"),
-                "request-scoped tag suppression must not read a shared template"
+                "a personalized request must not read a shared template"
             );
-            let suppressed_document = String::from_utf8(body_of(suppressed).await)
-                .expect("suppressed document should be UTF-8");
+            let _ = body_of(personalized).await;
 
             assert_eq!(
                 stub.recorded_request_uris().len(),
                 2,
-                "the suppressed navigation must reach the origin even when template cache is warm"
+                "the personalized request must reach the origin even when template cache is warm"
             );
             assert_eq!(
                 cache.lookups.lock().expect("should lock lookups").len(),
                 1,
-                "the suppressed request must bypass template cache before lookup"
-            );
-            assert!(
-                !suppressed_document.contains("/integrations/datadome/tags.js"),
-                "the request-scoped suppression decision must survive origin processing"
+                "the personalized request must bypass template cache before lookup"
             );
         }
 
@@ -16417,10 +16394,9 @@ mod tests {
         }
 
         #[test]
-        fn a_datadome_block_is_refused_by_the_status_check() {
-            // DataDome replaces the document with a 403
-            // (`integrations/datadome/protection.rs:778`). There is no separate
-            // marker to detect, and none is needed.
+        fn a_bot_protection_block_is_refused_by_the_status_check() {
+            // A bot protection module replaces the document with a 403. There
+            // is no separate marker to detect, and none is needed.
             assert_eq!(
                 template_cache_bypass_reason(
                     AssemblyMode::Esi,
@@ -18215,7 +18191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppressed_navigation_removes_conditional_and_range_headers() {
+    async fn personalized_navigation_removes_conditional_and_range_headers() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
@@ -18237,7 +18213,6 @@ mod tests {
             .header(header::IF_RANGE, "\"cached-page\"")
             .body(EdgeBody::empty())
             .expect("should build conditional request");
-        crate::integrations::datadome::suppress_client_tag(&mut req);
         req.extensions_mut()
             .insert(crate::response_privacy::PersonalizedResponse);
 
@@ -18258,13 +18233,13 @@ mod tests {
                 headers
                     .iter()
                     .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
-                "suppressed navigations must not forward {header_name}"
+                "personalized navigations must not forward {header_name}"
             );
         }
     }
 
     #[tokio::test]
-    async fn suppressed_iframe_removes_conditional_and_range_headers() {
+    async fn personalized_iframe_removes_conditional_and_range_headers() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
@@ -18286,7 +18261,6 @@ mod tests {
             .header(header::IF_RANGE, "\"cached-frame\"")
             .body(EdgeBody::empty())
             .expect("should build conditional iframe request");
-        crate::integrations::datadome::suppress_client_tag(&mut req);
         req.extensions_mut()
             .insert(crate::response_privacy::PersonalizedResponse);
 
@@ -18307,13 +18281,13 @@ mod tests {
                 headers
                     .iter()
                     .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
-                "suppressed iframe documents must not forward {header_name}"
+                "personalized iframe documents must not forward {header_name}"
             );
         }
     }
 
     #[tokio::test]
-    async fn suppressed_subresource_preserves_conditional_and_range_headers() {
+    async fn personalized_subresource_preserves_conditional_and_range_headers() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
@@ -18335,7 +18309,6 @@ mod tests {
             .header(header::IF_RANGE, "\"cached-video\"")
             .body(EdgeBody::empty())
             .expect("should build conditional subresource request");
-        crate::integrations::datadome::suppress_client_tag(&mut req);
         req.extensions_mut()
             .insert(crate::response_privacy::PersonalizedResponse);
 
@@ -18358,7 +18331,7 @@ mod tests {
                     .find(|(name, _)| name.eq_ignore_ascii_case(header_name.as_str()))
                     .map(|(_, value)| value.as_str()),
                 Some(expected),
-                "suppressed subresources should preserve {header_name}"
+                "personalized subresources should preserve {header_name}"
             );
         }
     }
@@ -18486,38 +18459,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadome_filter_marker_survives_into_publisher_html_pipeline() {
+    async fn what_a_request_filter_leaves_survives_into_the_publisher_html_pipeline() {
         let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "server-side-key",
-                    "protection_excluded_ip_cidrs": ["192.0.2.0/24"],
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::request_fixture::MODULE,
+        );
         let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
+            .expect("should create integration registry with the stand-in");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
             b"<html><head></head><body>content</body></html>".to_vec(),
             vec![("content-type", "text/html; charset=utf-8")],
         );
-        let services = build_services_with_secret_http_client_and_client_ip(
-            NoopSecretStore,
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
-            Some("192.0.2.10".parse().expect("should parse client IP")),
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let mut req = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/page")
             .header(header::HOST, "publisher.example")
             .header("sec-fetch-dest", "document")
+            .header(
+                crate::integrations::registry_test_support::request_fixture::FILTER_HEADER,
+                "1",
+            )
             .body(EdgeBody::empty())
             .expect("should build request");
 
@@ -18530,7 +18497,7 @@ mod tests {
                 permissions: None,
             })
             .await
-            .expect("should run DataDome filter");
+            .expect("should run the stand-in's filter");
         assert!(matches!(
             filter_outcome,
             crate::integrations::RequestFilterRegistryOutcome::Continue(_)
@@ -18550,8 +18517,10 @@ mod tests {
         .expect("should buffer publisher response");
         let html = response_body_string(response);
 
-        assert!(!html.contains("window.ddjskey"));
-        assert!(!html.contains("/integrations/datadome/tags.js"));
+        assert!(
+            html.contains(crate::integrations::registry_test_support::request_fixture::HEAD_FLAG),
+            "what the filter left on the request should reach the document"
+        );
         assert_eq!(
             stub.recorded_backend_names().len(),
             1,
@@ -18560,51 +18529,7 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-        let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
-        let mut params = make_stream_params(&settings, "identity");
-        params.content_type = "text/html; charset=utf-8".to_string();
-        let mut suppressed = IntegrationRequestState::default();
-        suppressed.set(
-            crate::integrations::datadome::DATADOME_INTEGRATION_ID,
-            crate::integrations::datadome::DataDomeClientTagSuppressed,
-        );
-        params.request_state = suppressed;
-        let mut output = Vec::new();
-
-        stream_publisher_body(
-            EdgeBody::from(b"<html><head></head><body>content</body></html>".to_vec()),
-            &mut output,
-            &params,
-            &settings,
-            &registry,
-        )
-        .expect("should process suppressed HTML");
-
-        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
-        assert!(
-            !html.contains("window.ddjskey"),
-            "publisher processing should omit the DataDome client configuration"
-        );
-        assert!(
-            !html.contains("/integrations/datadome/tags.js"),
-            "publisher processing should omit the DataDome client tag URL"
-        );
-    }
-
-    #[test]
-    fn suppressed_datadome_html_is_private_and_not_shared_cached() {
+    fn personalized_html_is_private_and_not_shared_cached() {
         let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, "public, max-age=600")
@@ -18630,31 +18555,31 @@ mod tests {
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
             Some("no-store, private"),
-            "suppressed HTML should be private and non-storable"
+            "personalized HTML should be private and non-storable"
         );
         assert!(
             response.headers().get("surrogate-control").is_none(),
-            "suppressed HTML should not retain Surrogate-Control"
+            "personalized HTML should not retain Surrogate-Control"
         );
         assert!(
             response.headers().get("fastly-surrogate-control").is_none(),
-            "suppressed HTML should not retain Fastly-Surrogate-Control"
+            "personalized HTML should not retain Fastly-Surrogate-Control"
         );
         assert!(
             response
                 .headers()
                 .get("cloudflare-cdn-cache-control")
                 .is_none(),
-            "suppressed HTML should not retain Cloudflare-CDN-Cache-Control"
+            "personalized HTML should not retain Cloudflare-CDN-Cache-Control"
         );
         assert!(
             response.headers().get("cdn-cache-control").is_none(),
-            "suppressed HTML should not retain CDN-Cache-Control"
+            "personalized HTML should not retain CDN-Cache-Control"
         );
         for header_name in [header::ETAG, header::LAST_MODIFIED] {
             assert!(
                 !response.headers().contains_key(&header_name),
-                "suppressed HTML should not retain {header_name}"
+                "personalized HTML should not retain {header_name}"
             );
         }
 
@@ -18675,12 +18600,12 @@ mod tests {
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
             Some("no-store, private"),
-            "suppressed HTML should use the exact synthesized-HTML policy"
+            "personalized HTML should use the exact synthesized-HTML policy"
         );
     }
 
     #[test]
-    fn datadome_cache_privacy_does_not_change_non_html_or_unsuppressed_responses() {
+    fn personalized_cache_privacy_does_not_change_non_html_or_ordinary_responses() {
         let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, "public, max-age=600")
@@ -18700,7 +18625,7 @@ mod tests {
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
             Some("public, max-age=600"),
-            "unsuppressed HTML should retain its existing cache policy"
+            "ordinary HTML should retain its existing cache policy"
         );
 
         super::apply_personalized_response_cache_privacy(
@@ -18768,7 +18693,7 @@ mod tests {
     }
 
     #[test]
-    fn core_reads_the_neutral_marker_not_the_datadome_type() {
+    fn the_neutral_marker_alone_marks_a_response_personalized() {
         let mut personalized = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/page")

@@ -8,13 +8,13 @@ use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use url::Url;
 
-use crate::error::TrustedServerError;
-use crate::http_util::is_navigation_request;
-use crate::integrations::{
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::http_util::is_navigation_request;
+use trusted_server_core::integrations::{
     HeaderMutation, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
-use crate::redacted::Redacted;
+use trusted_server_core::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use trusted_server_core::redacted::Redacted;
 
 use super::DataDomeIntegration;
 use super::protection_scope::{
@@ -51,7 +51,7 @@ impl DataDomeIntegration {
             input
                 .request
                 .extensions_mut()
-                .insert(crate::response_privacy::PersonalizedResponse);
+                .insert(trusted_server_core::response_privacy::PersonalizedResponse);
             log_protection_test_bypass(&input);
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
@@ -172,7 +172,7 @@ impl DataDomeIntegration {
                     input
                         .request
                         .extensions_mut()
-                        .insert(crate::response_privacy::PersonalizedResponse);
+                        .insert(trusted_server_core::response_privacy::PersonalizedResponse);
                 }
                 log_protection_skip(input, &rule_id, reason, suppress_client_tag);
                 return false;
@@ -824,17 +824,17 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
 
-    use crate::integrations::datadome::{
+    use crate::{
         DataDomeConfig, ProtectionExclusionRuleConfig, ProtectionMatcherConfig,
         ProtectionTestBypassConfig,
     };
-    use crate::platform::GeoInfo;
-    use crate::platform::test_support::{
+    use trusted_server_core::platform::GeoInfo;
+    use trusted_server_core::platform::test_support::{
         HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopSecretStore, StubHttpClient,
         build_services_with_config_and_secret, build_services_with_config_and_secret_and_client_ip,
         build_services_with_secret_and_http_client, noop_services_with_client_ip,
     };
-    use crate::settings::Settings;
+    use trusted_server_core::settings::Settings;
 
     use super::*;
 
@@ -869,16 +869,22 @@ mod tests {
         let _guard = FASTLY_IS_STAGING_ENV_LOCK
             .lock()
             .expect("should lock staging environment test guard");
-        temp_env::with_var(crate::constants::ENV_FASTLY_IS_STAGING, Some("1"), || {
-            futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
-                settings,
-                services,
-                request,
-                geo_info: None,
-                permissions: None,
-                is_integration_route: false,
-            }))
-        })
+        temp_env::with_var(
+            trusted_server_core::constants::ENV_FASTLY_IS_STAGING,
+            Some("1"),
+            || {
+                futures::executor::block_on(integration.filter_protection_request(
+                    RequestFilterInput {
+                        settings,
+                        services,
+                        request,
+                        geo_info: None,
+                        permissions: None,
+                        is_integration_route: false,
+                    },
+                ))
+            },
+        )
     }
 
     fn filter_marks_request(
@@ -928,7 +934,7 @@ mod tests {
     }
 
     fn has_client_tag_suppression_marker(request: &Request<EdgeBody>) -> bool {
-        crate::integrations::IntegrationRequestState::of(request)
+        trusted_server_core::integrations::IntegrationRequestState::of(request)
             .get::<super::super::DataDomeClientTagSuppressed>(super::super::DATADOME_INTEGRATION_ID)
             .is_some()
     }
@@ -940,7 +946,7 @@ mod tests {
     fn has_personalized_response_marker(request: &Request<EdgeBody>) -> bool {
         request
             .extensions()
-            .get::<crate::response_privacy::PersonalizedResponse>()
+            .get::<trusted_server_core::response_privacy::PersonalizedResponse>()
             .is_some()
     }
 
@@ -1116,7 +1122,7 @@ mod tests {
             .lock()
             .expect("should lock staging environment test guard");
         let decision = temp_env::with_var(
-            crate::constants::ENV_FASTLY_IS_STAGING,
+            trusted_server_core::constants::ENV_FASTLY_IS_STAGING,
             None::<&str>,
             || {
                 futures::executor::block_on(integration.filter_protection_request(

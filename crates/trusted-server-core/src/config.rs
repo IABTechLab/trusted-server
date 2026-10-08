@@ -1001,27 +1001,6 @@ formats = [{ width = 300, height = 250 }]
                     true,
                 ),
                 ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
-                // What a module declares in its own table follows, at the
-                // short name its section selects it by and at its full name.
-                (
-                    "bot-protection.datadome.server_side_key_secret_name".to_owned(),
-                    true,
-                ),
-                (
-                    "bot-protection.bot-protection.datadome.server_side_key_secret_name"
-                        .to_owned(),
-                    true,
-                ),
-                (
-                    "bot-protection.datadome.protection_test_bypass.credential_secret_name"
-                        .to_owned(),
-                    true,
-                ),
-                (
-                    "bot-protection.bot-protection.datadome.protection_test_bypass.credential_secret_name"
-                        .to_owned(),
-                    true,
-                ),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );
@@ -1068,19 +1047,6 @@ formats = [{ width = 300, height = 250 }]
     fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
         let mut settings = valid_settings();
         settings.tinybird.secret_store = Some("legacy-tinybird-store".to_string());
-        settings
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "server_side_key_secret_store": "legacy-datadome-store",
-                    "protection_test_bypass": {
-                        "enabled": false,
-                        "credential_secret_store": "legacy-bypass-store",
-                    },
-                }),
-            )
-            .expect("should insert legacy DataDome selectors");
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -1098,12 +1064,7 @@ formats = [{ width = 300, height = 250 }]
         settings.normalize_deserialized();
         let serialized = serde_json::to_string(&settings).expect("should serialize settings");
 
-        for legacy_store in [
-            "legacy-tinybird-store",
-            "legacy-datadome-store",
-            "legacy-bypass-store",
-            "legacy-s3-store",
-        ] {
+        for legacy_store in ["legacy-tinybird-store", "legacy-s3-store"] {
             assert!(
                 !serialized.contains(legacy_store),
                 "serialized config should omit deprecated selector {legacy_store}"
@@ -1118,19 +1079,19 @@ formats = [{ width = 300, height = 250 }]
             Some(Redacted::new("resolved-tinybird-secret".to_string()));
         settings
             .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
+                "testing",
+                "testing.example",
                 &serde_json::json!({
-                    "server_side_key_secret_name": "resolved-datadome-secret",
+                    "key_name": "resolved-module-secret",
                 }),
             )
-            .expect("should insert resolved DataDome config");
+            .expect("should insert a module's table holding a resolved secret");
 
         let debug = format!("{settings:?}");
 
         assert!(!debug.contains("resolved-tinybird-secret"));
-        assert!(!debug.contains("resolved-datadome-secret"));
-        assert!(debug.contains("datadome"));
+        assert!(!debug.contains("resolved-module-secret"));
+        assert!(debug.contains("example"));
     }
 
     #[test]
@@ -1827,35 +1788,82 @@ password = "production-admin-password-32-bytes"
         );
     }
 
+    fn module_key_is_in_use(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+        table.get("lock").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    const MODULE_SECRETS: &[crate::integrations::ModuleSecretSetting] =
+        &[crate::integrations::ModuleSecretSetting {
+            path: &["spare", "key_name"],
+            in_use: module_key_is_in_use,
+        }];
+
+    /// A builder a deployment added, whose module names a secret in its own
+    /// table.
+    fn module_with_a_secret() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_module_name("testing.probe")
+        .with_secret_settings(MODULE_SECRETS)
+    }
+
     #[test]
-    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
-        for (enable_protection, name, expected_message) in [
-            (false, "datadome_test_bypass", "requires enable_protection"),
-            (true, "", "credential_secret_name"),
+    fn deploy_validation_refuses_a_module_s_secret_setting_in_use_that_names_no_key() {
+        for (table, expected) in [
+            (
+                serde_json::json!({ "lock": true }),
+                Some("testing.probe.spare.key_name"),
+            ),
+            (
+                serde_json::json!({ "lock": true, "spare": { "key_name": "  " } }),
+                Some("testing.probe.spare.key_name"),
+            ),
+            (
+                serde_json::json!({ "lock": true, "spare": { "key_name": "module_key" } }),
+                None,
+            ),
+            // A setting the table does not put to use is not checked.
+            (serde_json::json!({ "lock": false }), None),
         ] {
             let mut settings = valid_settings();
             settings
-                .insert_module_config(
-                    "bot-protection",
-                    "bot-protection.datadome",
-                    &serde_json::json!({
-                        "enable_protection": enable_protection,
-                        "server_side_key_secret_name": "datadome_server_side_key",
-                        "protection_test_bypass": {
-                            "enabled": true,
-                            "credential_secret_name": name,
-                        },
-                    }),
-                )
-                .expect("should insert DataDome config");
+                .insert_module_config("testing", "testing.probe", &table)
+                .expect("should insert the module's table");
 
-            let err = validate_settings_for_deploy(&settings)
-                .expect_err("should reject invalid DataDome test bypass");
-            assert!(
-                format!("{err:?}").contains(expected_message),
-                "error should mention the invalid bypass setting: {err:?}"
-            );
+            let result = validate_settings_for_deploy_with(&settings, &[module_with_a_secret()]);
+
+            match expected {
+                Some(path) => {
+                    let error = result.expect_err("should refuse a setting that names no key");
+                    assert!(
+                        format!("{error:?}").contains(path),
+                        "should name the setting for {table}: {error:?}"
+                    );
+                }
+                None => result.unwrap_or_else(|error| {
+                    panic!("should accept {table}: {error:?}");
+                }),
+            }
         }
+    }
+
+    #[test]
+    fn deploy_validation_checks_no_secret_setting_without_the_module_s_builder() {
+        let mut settings = valid_settings();
+        settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": true }),
+            )
+            .expect("should insert the module's table");
+
+        validate_settings_for_deploy(&settings)
+            .expect("should check nothing for a module that declared nothing to this validation");
     }
 
     #[test]

@@ -2511,7 +2511,10 @@ pub(crate) mod test_support {
     /// the query `fixture_request=1`. Where that query arrived on a document
     /// navigation it also leaves a mark for the page path. It strips the
     /// cookie it reserves too, and writes the Cookie header out again as it
-    /// does, the way a module that reserves a cookie does. Selected, the
+    /// does, the way a module that reserves a cookie does. Selected, its
+    /// request filter leaves the same mark on a request that carries its
+    /// header, which is the route a module that decides in its filter takes.
+    /// Selected, the
     /// stand-in's head injector reads the mark from the document's state and
     /// writes one script at the start of `<head>` and the tag of its
     /// standalone module after the bundle. Its response finalizer sets a
@@ -2527,7 +2530,8 @@ pub(crate) mod test_support {
         use crate::error::TrustedServerError;
         use crate::integrations::registry::{
             CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
-            IntegrationRegistration, IntegrationRequestState,
+            IntegrationRegistration, IntegrationRequestFilter, IntegrationRequestState,
+            RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
         };
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
         use crate::settings::Settings;
@@ -2548,6 +2552,9 @@ pub(crate) mod test_support {
         pub(crate) const COOKIE: &str = "ts-request-fixture=1; Path=/";
         /// The name of that cookie, which the preparer strips from a request.
         pub(crate) const COOKIE_NAME: &str = "ts-request-fixture";
+        /// The request header that has the stand-in's request filter leave
+        /// the mark.
+        pub(crate) const FILTER_HEADER: &str = "x-ts-request-fixture";
 
         const JS: &str = "(function(){window.__ts_request_fixture_loaded=1;})();";
         // SHA-256 of JS, hex. The registry refuses a literal that is not.
@@ -2657,6 +2664,27 @@ pub(crate) mod test_support {
             }
         }
 
+        struct Filter;
+
+        #[async_trait::async_trait(?Send)]
+        impl IntegrationRequestFilter for Filter {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            async fn filter_request(
+                &self,
+                input: RequestFilterInput<'_>,
+            ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+                if input.request.headers().contains_key(FILTER_HEADER) {
+                    mark(input.request);
+                }
+                Ok(RequestFilterDecision::Continue(
+                    RequestFilterEffects::default(),
+                ))
+            }
+        }
+
         struct Head;
 
         impl Head {
@@ -2707,6 +2735,7 @@ pub(crate) mod test_support {
                     })
                     .with_standalone_js()
                     .with_head_injector(Arc::new(Head))
+                    .with_request_filter(Arc::new(Filter))
                     .build(),
             ))
         }
@@ -3232,7 +3261,7 @@ mod tests {
         ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
             input.request.extensions_mut().insert(RequestAnnotation);
             Ok(RequestFilterDecision::Continue(RequestFilterEffects {
-                request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
+                request_headers: vec![HeaderMutation::set("x-probe-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
             }))
         }
@@ -3469,10 +3498,10 @@ mod tests {
 
         assert_eq!(
             req.headers()
-                .get("x-datadome-isbot")
+                .get("x-probe-isbot")
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
-            "should apply DataDome-style request enrichment before routing"
+            "should apply a filter's request enrichment before routing"
         );
         assert!(
             req.extensions().get::<RequestAnnotation>().is_some(),

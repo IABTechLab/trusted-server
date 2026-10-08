@@ -1,0 +1,44 @@
+[package]
+name = "trusted-server-bot-protection-datadome"
+description = "DataDome bot protection, its first-party script delivery and its Protection API request filter as a bot protection module."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+trusted-server-core = { workspace = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+temp-env = { workspace = true }
+toml = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this vendor crate, the way Prebid.js requires a named
+# maintainer of every adapter. DataDome has not yet adopted this crate, so the
+# Trusted Server maintainers own it until a vendor owner steps up.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "seeking vendor owner"

@@ -57,6 +57,18 @@
 //!   `<script src="/integrations/datadome/tags.js">`
 //! - Handles both `src` and `href` attributes (for preload/prefetch links)
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -70,18 +82,18 @@ use serde_json::Value as JsonValue;
 use url::Url;
 use validator::Validate;
 
-use crate::constants::ENV_FASTLY_IS_STAGING;
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::constants::ENV_FASTLY_IS_STAGING;
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
     RequestFilterDecision, RequestFilterInput, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
 };
-use crate::platform::{PlatformHttpRequest, RuntimeServices};
-use crate::redacted::Redacted;
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
+use trusted_server_core::redacted::Redacted;
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 mod protection;
 mod protection_scope;
@@ -97,26 +109,29 @@ pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
 /// The name this module is selected by, in `[bot-protection]`.
 pub const MODULE: &str = "bot-protection.datadome";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         DATADOME_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
     .with_module_name(MODULE)
-    .with_secret_settings(SECRET_SETTINGS);
+    .with_secret_settings(SECRET_SETTINGS)
+}
 
 /// The two settings that name a secret. The server-side key is in use when
 /// protection is on, and the test bypass credential when the bypass is on as
 /// well.
-const SECRET_SETTINGS: &[crate::integrations::ModuleSecretSetting] = &[
-    crate::integrations::ModuleSecretSetting {
+const SECRET_SETTINGS: &[trusted_server_core::integrations::ModuleSecretSetting] = &[
+    trusted_server_core::integrations::ModuleSecretSetting {
         path: &["server_side_key_secret_name"],
         in_use: protection_is_on,
     },
-    crate::integrations::ModuleSecretSetting {
+    trusted_server_core::integrations::ModuleSecretSetting {
         path: &["protection_test_bypass", "credential_secret_name"],
         in_use: test_bypass_is_on,
     },
@@ -138,7 +153,7 @@ fn test_bypass_is_on(table: &serde_json::Map<String, serde_json::Value>) -> bool
             == Some(true)
 }
 
-pub(super) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
+pub(crate) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
 /// Fixed request header used by the staging-only protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 
@@ -150,7 +165,7 @@ pub(crate) struct DataDomeClientTagSuppressed;
 /// Leaves the marker on `request` for the head injector of the document the
 /// request produces.
 pub(crate) fn suppress_client_tag(request: &mut http::Request<EdgeBody>) {
-    crate::integrations::IntegrationRequestState::insert(
+    trusted_server_core::integrations::IntegrationRequestState::insert(
         request,
         DATADOME_INTEGRATION_ID,
         DataDomeClientTagSuppressed,
@@ -257,20 +272,29 @@ pub struct DataDomeConfig {
     /// HTTP methods excluded from Protection API validation.
     #[serde(
         default = "default_protection_excluded_methods",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     pub protection_excluded_methods: Vec<String>,
 
     /// Client autonomous system numbers excluded from Protection API validation.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub protection_excluded_asns: Vec<u32>,
 
     /// Client IP CIDR ranges excluded from Protection API validation.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub protection_excluded_ip_cidrs: Vec<String>,
 
     /// Config Store-backed client IP CIDR ranges excluded from Protection API validation.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub protection_excluded_ip_cidr_sources: Vec<ProtectionIpCidrSourceConfig>,
 
     /// Cache TTL for Config Store-backed IP CIDR lists, in seconds.
@@ -281,7 +305,7 @@ pub struct DataDomeConfig {
     /// Structured exclusion rules for Protection API validation.
     #[serde(
         default = "default_protection_exclusion_rules",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     pub protection_exclusion_rules: Vec<ProtectionExclusionRuleConfig>,
 
@@ -1066,8 +1090,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
-    use crate::test_support::tests::create_test_settings;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     fn test_config() -> DataDomeConfig {
         DataDomeConfig {
@@ -1252,7 +1278,7 @@ mod tests {
     }
 
     fn html_context_for_tests(
-        document_state: &crate::integrations::IntegrationDocumentState,
+        document_state: &trusted_server_core::integrations::IntegrationDocumentState,
     ) -> IntegrationHtmlContext<'_> {
         IntegrationHtmlContext {
             request_host: "publisher.example.com",
@@ -1487,7 +1513,7 @@ mod tests {
         config.client_side_key = "test-client-key".to_string();
         config.client_side_tag_url = "/integrations/datadome/tags.js?one=1&two=2".to_string();
         let integration = DataDomeIntegration::new(config);
-        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
         let ctx = html_context_for_tests(&document_state);
 
         let inserts = integration.head_inserts(&ctx);
@@ -1506,7 +1532,7 @@ mod tests {
         config.client_side_key = "test-client-key".to_string();
         config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
         let integration = DataDomeIntegration::new(config);
-        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
         let ctx = html_context_for_tests(&document_state);
 
         let inserts = integration.head_inserts(&ctx);
@@ -1531,7 +1557,8 @@ mod tests {
         let mut suppressed = test_config();
         suppressed.client_side_key = "test-client-key".to_string();
         let suppressed_integration = DataDomeIntegration::new(suppressed);
-        let suppressed_state = crate::integrations::IntegrationDocumentState::default();
+        let suppressed_state =
+            trusted_server_core::integrations::IntegrationDocumentState::default();
         suppressed_state
             .get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
         let suppressed_ctx = html_context_for_tests(&suppressed_state);
@@ -1545,7 +1572,7 @@ mod tests {
         let mut blank_key = test_config();
         blank_key.client_side_key = " ".to_string();
         let integration = DataDomeIntegration::new(blank_key);
-        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
         let ctx = html_context_for_tests(&document_state);
         assert!(
             integration.head_inserts(&ctx).is_empty(),
@@ -1689,7 +1716,7 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"ok".to_vec());
         let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
         let integration = DataDomeIntegration::new(test_config());
@@ -1711,6 +1738,298 @@ mod tests {
             stub.recorded_backend_names(),
             vec!["stub-backend".to_string()],
             "should route outbound request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The origin document the page tests process, which carries the
+    /// publisher's own `DataDome` tag.
+    const PUBLISHER_TAGGED_DOCUMENT: &[u8] = br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#;
+
+    fn process_document(suppress: bool) -> String {
+        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::integrations::{IntegrationRegistry, IntegrationRequestState};
+        use trusted_server_core::streaming_processor::StreamProcessor as _;
+
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "bot-protection",
+                MODULE,
+                &serde_json::json!({ "client_side_key": "test-client-key" }),
+            )
+            .expect("should configure DataDome integration");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create integration registry with DataDome");
+        let mut request = http::Request::builder()
+            .uri("https://test.example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        if suppress {
+            suppress_client_tag(&mut request);
+        }
+        let config = HtmlProcessorConfig::from_settings(
+            &settings,
+            &registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        )
+        .with_request_state(IntegrationRequestState::of(&request));
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(PUBLISHER_TAGGED_DOCUMENT, true)
+            .expect("should process HTML");
+        String::from_utf8(output).expect("should produce UTF-8 HTML")
+    }
+
+    #[test]
+    fn a_suppressed_document_keeps_the_publisher_s_own_tag_and_rewrites_it() {
+        let html = process_document(true);
+
+        assert!(
+            !html.contains("window.ddjskey"),
+            "should omit the DataDome client configuration"
+        );
+        assert!(
+            html.contains("id=\"publisher-datadome\""),
+            "should preserve the publisher-originated DataDome tag"
+        );
+        assert!(
+            html.contains("src=\"/integrations/datadome/tags.js\""),
+            "should rewrite the publisher-originated DataDome tag"
+        );
+        assert!(
+            !html.contains("https://js.datadome.co/tags.js"),
+            "should remove the original third-party DataDome URL"
+        );
+        assert_eq!(
+            html.matches("/integrations/datadome/tags.js").count(),
+            1,
+            "should leave exactly one publisher-originated DataDome tag"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_document_gets_the_client_configuration() {
+        let html = process_document(false);
+
+        assert!(
+            html.contains("window.ddjskey"),
+            "should write the DataDome client configuration when nothing suppresses it"
+        );
+    }
+
+    /// Holds the two keys the settings name, and refuses a key that is
+    /// unused or is itself a resolved secret, so a lookup that should not
+    /// happen fails.
+    struct KeyStore;
+
+    impl trusted_server_core::platform::PlatformSecretStore for KeyStore {
+        fn get_bytes(
+            &self,
+            _store_name: &trusted_server_core::platform::StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<trusted_server_core::platform::PlatformError>> {
+            let value = match key {
+                "datadome-server-key" => "resolved-datadome-server-key",
+                "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
+                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
+                key if key.starts_with("unused-") || key.starts_with("resolved-") => {
+                    return Err(Report::new(
+                        trusted_server_core::platform::PlatformError::SecretStore,
+                    ));
+                }
+                other => other,
+            };
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &trusted_server_core::platform::StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<trusted_server_core::platform::PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(
+            &self,
+            _store_id: &trusted_server_core::platform::StoreId,
+            _name: &str,
+        ) -> Result<(), Report<trusted_server_core::platform::PlatformError>> {
+            Ok(())
+        }
+    }
+
+    /// Loads settings carrying `table` as this module's, the way a deployment
+    /// that ships this crate loads them.
+    fn load_with_table(table: &serde_json::Value) -> DataDomeConfig {
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config("bot-protection", MODULE, table)
+            .expect("should insert DataDome's table");
+        let data = serde_json::to_value(&settings).expect("should serialize settings to JSON");
+        let envelope = edgezero_core::blob_envelope::BlobEnvelope::new(
+            data,
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        let envelope = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        trusted_server_core::config_payload::settings_from_config_blob_with(
+            &envelope,
+            &KeyStore,
+            &trusted_server_core::platform::StoreName::from("ts_secrets"),
+            &[builder()],
+        )
+        .expect("should load the settings")
+        .module_config::<DataDomeConfig>(MODULE)
+        .expect("should parse DataDome's table")
+        .expect("should select DataDome")
+    }
+
+    #[test]
+    fn the_settings_load_looks_up_both_secrets_when_both_are_in_use() {
+        let config = load_with_table(&serde_json::json!({
+            "enable_protection": true,
+            "server_side_key_secret_name": "datadome-server-key",
+            "protection_test_bypass": {
+                "enabled": true,
+                "credential_secret_name": "datadome-bypass-key",
+            },
+        }));
+
+        assert_eq!(
+            config
+                .server_side_key_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-datadome-server-key"),
+            "should hold the server-side key where the table named it"
+        );
+        assert_eq!(
+            config
+                .protection_test_bypass
+                .as_ref()
+                .and_then(|bypass| bypass.credential_secret_name.as_ref())
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-datadome-bypass-credential-32-bytes"),
+            "should hold the bypass credential where the table named it"
+        );
+    }
+
+    #[test]
+    fn the_settings_load_clears_the_secrets_protection_does_not_use() {
+        let config = load_with_table(&serde_json::json!({
+            "enable_protection": false,
+            "server_side_key_secret_name": "unused-datadome-key",
+            "protection_test_bypass": {
+                "enabled": false,
+                "credential_secret_name": "unused-bypass-key",
+            },
+        }));
+
+        assert!(
+            config.server_side_key_secret_name.is_none(),
+            "should clear a server-side key name protection does not use"
+        );
+        assert!(
+            config
+                .protection_test_bypass
+                .as_ref()
+                .is_some_and(|bypass| bypass.credential_secret_name.is_none()),
+            "should clear a bypass credential name the bypass does not use"
+        );
+    }
+
+    #[test]
+    fn the_settings_load_clears_a_bypass_credential_when_only_protection_is_on() {
+        let config = load_with_table(&serde_json::json!({
+            "enable_protection": true,
+            "server_side_key_secret_name": "datadome-server-key",
+            "protection_test_bypass": {
+                "enabled": false,
+                "credential_secret_name": "unused-bypass-key",
+            },
+        }));
+
+        assert!(
+            config.server_side_key_secret_name.is_some(),
+            "should keep the key protection uses"
+        );
+        assert!(
+            config
+                .protection_test_bypass
+                .as_ref()
+                .is_some_and(|bypass| bypass.credential_secret_name.is_none()),
+            "should clear a credential name a disabled bypass does not use"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_an_invalid_test_bypass() {
+        for (enable_protection, name, expected_message) in [
+            (false, "datadome_test_bypass", "requires enable_protection"),
+            (true, "", "credential_secret_name"),
+        ] {
+            let mut settings = create_test_settings();
+            settings
+                .insert_module_config(
+                    "bot-protection",
+                    MODULE,
+                    &serde_json::json!({
+                        "enable_protection": enable_protection,
+                        "server_side_key_secret_name": "datadome_server_side_key",
+                        "protection_test_bypass": {
+                            "enabled": true,
+                            "credential_secret_name": name,
+                        },
+                    }),
+                )
+                .expect("should insert DataDome config");
+
+            let err = trusted_server_core::config::validate_settings_for_deploy_with(
+                &settings,
+                &[builder()],
+            )
+            .expect_err("should reject invalid DataDome test bypass");
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "error should mention the invalid bypass setting: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_removed_setting_is_rejected() {
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "bot-protection",
+                MODULE,
+                &serde_json::json!({ "account_id": "removed-value" }),
+            )
+            .expect("should insert the removed DataDome field");
+
+        let error = settings
+            .module_config::<DataDomeConfig>(MODULE)
+            .expect_err("should reject the removed DataDome field");
+
+        assert!(
+            format!("{error:?}").contains("account_id"),
+            "should identify the removed field: {error:?}"
         );
     }
 }

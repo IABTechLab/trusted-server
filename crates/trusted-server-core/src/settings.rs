@@ -3981,7 +3981,6 @@ impl Settings {
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
-        self.remove_legacy_static_secret_store_selectors();
         self.consent.validate();
     }
 
@@ -4564,32 +4563,6 @@ impl Settings {
             }
         }
         Ok(())
-    }
-
-    /// Drops the `DataDome` secret-store selectors a previous release read,
-    /// from the module's table when it is configured.
-    fn remove_legacy_static_secret_store_selectors(&mut self) {
-        let Some(datadome) = self
-            .sections
-            .0
-            .get_mut("bot-protection")
-            .and_then(|section| section.settings_of_mut("datadome"))
-        else {
-            return;
-        };
-
-        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
-        if let Some(bypass) = datadome
-            .get_mut("protection_test_bypass")
-            .and_then(JsonValue::as_object_mut)
-        {
-            removed |= bypass.remove("credential_secret_store").is_some();
-        }
-        if removed {
-            log::warn!(
-                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default secret store"
-            );
-        }
     }
 }
 
@@ -5213,7 +5186,7 @@ module = \"none\"",
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
         const CANARY_TINYBIRD_AUCTION_TOKEN: &str = "CANARY-TINYBIRD-AUCTION-TOKEN-0123456789";
         const CANARY_TINYBIRD_ACCESS_TOKEN: &str = "CANARY-TINYBIRD-ACCESS-TOKEN-0123456789";
-        const CANARY_DATADOME_SERVER_SIDE_KEY: &str = "CANARY-DATADOME-SERVER-SIDE-KEY-0123456789";
+        const CANARY_MODULE_KEY: &str = "CANARY-MODULE-TABLE-KEY-0123456789";
 
         let mut settings = create_test_settings();
 
@@ -5273,17 +5246,17 @@ module = \"none\"",
         };
 
         // A module's table is opaque JSON, and the section's hand-written
-        // `Debug` impl is the only thing keeping resolved DataDome
-        // credentials out of this output, so pin it here.
+        // `Debug` impl is the only thing keeping a secret a module's table
+        // holds out of this output, so pin it here.
         settings
             .insert_module_config(
-                "bot-protection",
-                crate::integrations::datadome::MODULE,
+                "testing",
+                "testing.example",
                 &json!({
-                    "server_side_key_secret_name": CANARY_DATADOME_SERVER_SIDE_KEY,
+                    "key_name": CANARY_MODULE_KEY,
                 }),
             )
-            .expect("should insert datadome integration config");
+            .expect("should insert a module's table");
 
         let debug = format!("{settings:?}");
 
@@ -5327,10 +5300,7 @@ module = \"none\"",
                 CANARY_TINYBIRD_AUCTION_TOKEN,
             ),
             ("tinybird.access_token_secret", CANARY_TINYBIRD_ACCESS_TOKEN),
-            (
-                "bot-protection.datadome.server_side_key_secret_name",
-                CANARY_DATADOME_SERVER_SIDE_KEY,
-            ),
+            ("testing.example.key_name", CANARY_MODULE_KEY),
         ];
 
         for (field, canary) in canaries {
@@ -8437,7 +8407,7 @@ source_domain = "partner.example.com"
 
     #[test]
     fn removed_integration_fields_are_rejected() {
-        use crate::integrations::{datadome, prebid};
+        use crate::integrations::prebid;
 
         let mut settings = create_test_settings();
         settings
@@ -8452,22 +8422,6 @@ source_domain = "partner.example.com"
             .expect_err("should reject the removed Prebid field");
         assert!(
             format!("{error:?}").contains("server_url"),
-            "should identify the removed field: {error:?}"
-        );
-
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "bot-protection",
-                datadome::MODULE,
-                &json!({ "account_id": "removed-value" }),
-            )
-            .expect("should insert the removed DataDome field");
-        let error = settings
-            .module_config::<datadome::DataDomeConfig>(datadome::MODULE)
-            .expect_err("should reject the removed DataDome field");
-        assert!(
-            format!("{error:?}").contains("account_id"),
             "should identify the removed field: {error:?}"
         );
     }

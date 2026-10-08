@@ -5530,6 +5530,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-bot-protection-datadome"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "temp-env",
+ "toml",
+ "trusted-server-core",
+ "url",
+ "urlencoding",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-cli"
 version = "0.1.0"
 dependencies = [
@@ -5790,6 +5814,7 @@ dependencies = [
  "serde_json",
  "trusted-server-ad-tag-google",
  "trusted-server-audience-permutive",
+ "trusted-server-bot-protection-datadome",
  "trusted-server-cmp-didomi",
  "trusted-server-cmp-osano",
  "trusted-server-cmp-sourcepoint",

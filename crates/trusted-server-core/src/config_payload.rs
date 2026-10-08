@@ -198,8 +198,6 @@ mod tests {
             let value = match key {
                 "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
                 "tinybird-token-key" => "resolved-tinybird-token",
-                "datadome-server-key" => "resolved-datadome-server-key",
-                "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
                 "access_key_id" | "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
                 "secret_access_key" | "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
                 "s3-session-key" => "resolved-session-token",
@@ -546,20 +544,6 @@ mod tests {
         original.tinybird.api_host = "api.example.com".to_string();
         original.tinybird.auction_token_secret =
             Some(Redacted::new("tinybird-token-key".to_string()));
-        original
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "enable_protection": true,
-                    "server_side_key_secret_name": "datadome-server-key",
-                    "protection_test_bypass": {
-                        "enabled": true,
-                        "credential_secret_name": "datadome-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure DataDome references");
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -593,32 +577,6 @@ mod tests {
                 .map(Redacted::expose)
                 .map(String::as_str),
             Some("resolved-tinybird-token")
-        );
-        let datadome = reconstructed
-            .module_config::<crate::integrations::datadome::DataDomeConfig>(
-                crate::integrations::datadome::MODULE,
-            )
-            .expect("should parse DataDome config")
-            .expect("should enable DataDome");
-        assert_eq!(
-            datadome
-                .server_side_key_secret_name
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-datadome-server-key")
-        );
-        let bypass = datadome
-            .protection_test_bypass
-            .as_ref()
-            .expect("should configure bypass");
-        assert_eq!(
-            bypass
-                .credential_secret_name
-                .as_ref()
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-datadome-bypass-credential-32-bytes")
         );
         let auth = reconstructed.proxy.asset_routes[0]
             .auth
@@ -950,20 +908,6 @@ mod tests {
         original.tinybird.auction_token_secret =
             Some(Redacted::new("unused-tinybird-key".to_string()));
         original
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &serde_json::json!({
-                    "enable_protection": false,
-                    "server_side_key_secret_name": "unused-datadome-key",
-                    "protection_test_bypass": {
-                        "enabled": false,
-                        "credential_secret_name": "unused-bypass-key",
-                    },
-                }),
-            )
-            .expect("should configure inactive references");
-        original
             .ec
             .partners
             .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
@@ -977,19 +921,6 @@ mod tests {
 
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
-        let datadome = reconstructed
-            .module_config::<crate::integrations::datadome::DataDomeConfig>(
-                crate::integrations::datadome::MODULE,
-            )
-            .expect("should parse inactive DataDome config")
-            .expect("client-side DataDome remains enabled");
-        assert!(datadome.server_side_key_secret_name.is_none());
-        assert!(
-            datadome
-                .protection_test_bypass
-                .as_ref()
-                .is_some_and(|bypass| bypass.credential_secret_name.is_none())
-        );
     }
 
     /// A table for a module its section does not select is refused, and its
@@ -997,41 +928,35 @@ mod tests {
     /// the table's own fault rather than a secret-store failure that follows
     /// from it.
     #[test]
-    fn an_unselected_datadome_table_is_refused_without_resolving_its_secrets() {
+    fn an_unselected_module_s_table_is_refused_without_resolving_its_secrets() {
         let original = test_settings();
         let mut data = serde_json::to_value(&original).expect("should serialize settings to JSON");
         data.as_object_mut()
             .expect("settings should serialize as an object")
             .insert(
-                "bot-protection".to_owned(),
+                "testing".to_owned(),
                 serde_json::json!({
-                    "datadome": {
-                        "enable_protection": true,
-                        "server_side_key_secret_name": "unused-datadome-key",
-                        "protection_test_bypass": {
-                            "enabled": true,
-                            "credential_secret_name": "unused-bypass-key",
-                        },
-                    },
+                    "probe": { "lock": true, "key_name": "unused-module-key" },
                 }),
             );
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         let envelope = serde_json::to_string(&envelope).expect("should serialize envelope");
 
-        let error = settings_from_config_blob(
+        let error = settings_from_config_blob_with(
             &envelope,
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
+            &ModuleSecretStore,
+            &StoreName::from("trusted_server_secrets"),
+            &[module_with_a_secret()],
         )
         .expect_err("should refuse a table its section does not select");
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[bot-protection] selects no module"),
+            rendered.contains("[testing] selects no module"),
             "should name the section and what it is missing: {rendered}"
         );
         assert!(
-            !rendered.contains("unused-datadome-key"),
+            !rendered.contains("unused-module-key"),
             "should not have tried to resolve the stale secret reference: {rendered}"
         );
     }

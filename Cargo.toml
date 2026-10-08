@@ -22,6 +22,7 @@ members = [
     "crates/testing/testlight",
     "crates/framework/nextjs",
     "crates/ad-tag/google",
+    "crates/bot-protection/datadome",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -152,6 +153,7 @@ trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager"
 trusted-server-testing-testlight = { path = "crates/testing/testlight" }
 trusted-server-framework-nextjs = { path = "crates/framework/nextjs" }
 trusted-server-ad-tag-google = { path = "crates/ad-tag/google" }
+trusted-server-bot-protection-datadome = { path = "crates/bot-protection/datadome" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

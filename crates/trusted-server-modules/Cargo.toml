@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 trusted-server-ad-tag-google = { workspace = true }
 trusted-server-audience-permutive = { workspace = true }
+trusted-server-bot-protection-datadome = { workspace = true }
 trusted-server-cmp-didomi = { workspace = true }
 trusted-server-cmp-osano = { workspace = true }
 trusted-server-cmp-sourcepoint = { workspace = true }

@@ -1078,66 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "bot-protection",
-                "bot-protection.datadome",
-                &json!({
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-        let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
-        let mut suppressed = IntegrationRequestState::default();
-        suppressed.set(
-            crate::integrations::datadome::DATADOME_INTEGRATION_ID,
-            crate::integrations::datadome::DataDomeClientTagSuppressed,
-        );
-        let config = HtmlProcessorConfig::from_settings(
-            &settings,
-            &registry,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        )
-        .with_request_state(suppressed);
-        let mut processor = create_html_processor(config);
-
-        let output = processor
-            .process_chunk(
-                br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#,
-                true,
-            )
-            .expect("should process HTML");
-        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
-
-        assert!(
-            !html.contains("window.ddjskey"),
-            "should omit the DataDome client configuration"
-        );
-        assert!(
-            html.contains("id=\"publisher-datadome\""),
-            "should preserve the publisher-originated DataDome tag"
-        );
-        assert!(
-            html.contains("src=\"/integrations/datadome/tags.js\""),
-            "should rewrite the publisher-originated DataDome tag"
-        );
-        assert!(
-            !html.contains("https://js.datadome.co/tags.js"),
-            "should remove the original third-party DataDome URL"
-        );
-        assert_eq!(
-            html.matches("/integrations/datadome/tags.js").count(),
-            1,
-            "should leave exactly one publisher-originated DataDome tag"
-        );
-    }
-
-    #[test]
     fn test_real_publisher_html() {
         // Test with publisher HTML from test_publisher.html
         let html = include_str!("html_processor.test.html");

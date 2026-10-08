@@ -28,6 +28,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
         trusted_server_tag_google_tag_manager::builder(),
+        trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
     ]
@@ -66,6 +67,7 @@ mod tests {
                 "cmp.sourcepoint",
                 "cmp.osano",
                 "tag.google-tag-manager",
+                "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
             ],
@@ -263,5 +265,31 @@ mod tests {
             Some("keep-me=yes"),
             "should strip the reserved diagnostics cookie and keep the rest"
         );
+    }
+
+    /// The `ts` tool registers the stock builders, so the secret settings a
+    /// stock module declares are among the leaves a push treats as naming a
+    /// key.
+    #[test]
+    fn a_stock_module_s_secret_settings_are_listed_once_the_list_is_registered() {
+        use edgezero_core::app_config::AppConfigMeta as _;
+        use trusted_server_core::config::{TrustedServerAppConfig, register_deploy_integrations};
+
+        register_deploy_integrations(builders());
+
+        let paths = TrustedServerAppConfig::secret_fields()
+            .iter()
+            .map(edgezero_core::app_config::SecretField::dotted_path)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "bot-protection.datadome.server_side_key_secret_name",
+            "bot-protection.datadome.protection_test_bypass.credential_secret_name",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == expected),
+                "should list `{expected}` among {paths:?}"
+            );
+        }
     }
 }
