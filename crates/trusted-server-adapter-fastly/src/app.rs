@@ -1644,10 +1644,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
-    // These fixtures supply no integration builders, so they compile the plan
-    // without them rather than through the module-aware compiler the adapter
-    // itself uses.
-    use trusted_server_core::auction::compile_auction_plan;
+    use trusted_server_core::auction::compile_auction_plan_with;
 
     use error_stack::Report;
     use futures::executor::block_on;
@@ -1860,7 +1857,7 @@ mod tests {
     ) -> RouterService {
         let settings = test_settings();
         let plan = Arc::new(
-            trusted_server_core::auction::compile_auction_plan(&settings)
+            compile_auction_plan_with(&settings, &trusted_server_modules::builders())
                 .expect("should compile auction plan"),
         );
         let orchestrator = trusted_server_core::auction::build_orchestrator_with_plan(plan)
@@ -3321,9 +3318,12 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();
-        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let stock = trusted_server_modules::builders();
+        let plan = Arc::new(
+            compile_auction_plan_with(&settings, &stock).expect("should compile auction plan"),
+        );
         let registry = Arc::new(
-            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+            IntegrationRegistry::with_plan_and_registrations(&settings, Arc::clone(&plan), &stock)
                 .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(
