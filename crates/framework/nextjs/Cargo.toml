@@ -1,6 +1,6 @@
 [package]
-name = "trusted-server-tag-google-tag-manager"
-description = "Google Tag Manager first-party tag delivery as a tag module."
+name = "trusted-server-framework-nextjs"
+description = "Next.js support, which rewrites origin URLs in a page's data and in React Server Components payloads, as a framework module."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -14,27 +14,20 @@ doctest = false
 workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
-edgezero-core = { workspace = true }
 error-stack = { workspace = true }
-futures = { workspace = true }
-http = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 trusted-server-core = { workspace = true }
-url = { workspace = true }
+uuid = { workspace = true }
 validator = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
-# Two tests check that this module leaves another module's script rewrite
-# alone, and Next.js is the module they run beside.
-trusted-server-framework-nextjs = { workspace = true }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named
-# maintainer of every adapter. Google has not yet adopted this crate, so the
+# maintainer of every adapter. Vercel has not yet adopted this crate, so the
 # Trusted Server maintainers own it until a vendor owner steps up.
 [package.metadata.maintainers]
 owner = "Trusted Server maintainers"

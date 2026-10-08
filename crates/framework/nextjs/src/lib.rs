@@ -1,27 +1,41 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
 use std::sync::Arc;
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::error::TrustedServerError;
-use crate::integrations::IntegrationRegistration;
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::IntegrationRegistration;
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 
 /// The name this module is selected by, in `[framework]`.
 pub const MODULE: &str = "framework.nextjs";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         NEXTJS_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
-    .with_module_name(MODULE);
+    .with_module_name(MODULE)
+}
 
 mod rsc;
 mod rsc_placeholders;
@@ -40,7 +54,7 @@ use script_rewriter::NextJsNextDataRewriter;
 pub struct NextJsIntegrationConfig {
     #[serde(
         default = "default_rewrite_attributes",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     #[validate(length(min = 1))]
     pub rewrite_attributes: Vec<String>,
@@ -58,7 +72,7 @@ fn default_max_combined_payload_bytes() -> usize {
     10 * 1024 * 1024
 }
 
-pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedServerError> {
+pub(crate) fn configuration_error(message: impl Into<String>) -> Report<TrustedServerError> {
     Report::new(TrustedServerError::Configuration {
         message: format!(
             "Integration '{NEXTJS_INTEGRATION_ID}' configuration error: {}",
@@ -129,12 +143,14 @@ fn build(
 mod tests {
     use super::rsc_placeholders::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
     use super::*;
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::IntegrationRegistry;
-    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::tests::create_test_settings;
     use serde_json::json;
     use std::io::Cursor;
+    use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use trusted_server_core::integrations::IntegrationRegistry;
+    use trusted_server_core::streaming_processor::{
+        Compression, PipelineConfig, StreamingPipeline,
+    };
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     fn config_from_settings(
         settings: &Settings,
@@ -167,14 +183,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -259,14 +269,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -335,14 +339,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -387,14 +385,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -442,14 +434,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -511,14 +497,8 @@ mod tests {
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -586,14 +566,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         // Use small chunk size to force fragmentation
@@ -653,14 +627,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -714,14 +682,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -777,14 +739,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let processor = create_html_processor(config_from_settings(&settings, &registry));
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
@@ -890,14 +846,8 @@ mod tests {
                 }),
             )
             .expect("should update nextjs config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let processor = create_html_processor(config_from_settings(&settings, &registry));
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
@@ -939,6 +889,59 @@ mod tests {
             assert_eq!(
                 processed, html,
                 "an unqualified `__next_f` receiver should stream through unchanged at chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+
+    #[test]
+    fn output_overflow_restores_an_in_progress_script_at_every_split() {
+        use trusted_server_core::streaming_processor::StreamProcessor as _;
+
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "framework",
+                MODULE,
+                &json!({"max_combined_payload_bytes": 128}),
+            )
+            .expect("should select the nextjs integration");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+        let first = r#"<html><body><script>self.__next_f.push([1,"1:T3,ab"])</script>"#;
+        let script = r#"self.__next_f.push([1,"c"])"#;
+        let padding = "x".repeat(129);
+        let expected = format!("{first}{padding}<script>{script}</script></body></html>");
+
+        for split in 1..script.len() {
+            let mut processor = create_html_processor(config_from_settings(&settings, &registry));
+            let mut output = processor
+                .process_chunk(first.as_bytes(), false)
+                .expect("should process unresolved RSC group");
+            let second = format!("{padding}<script>{}", &script[..split]);
+            output.extend(
+                processor
+                    .process_chunk(second.as_bytes(), false)
+                    .expect("should process output overflow and partial script"),
+            );
+            let third = format!("{}</script></body></html>", &script[split..]);
+            output.extend(
+                processor
+                    .process_chunk(third.as_bytes(), true)
+                    .expect("should finish bypassed script"),
+            );
+            assert_eq!(
+                String::from_utf8(output).expect("should retain UTF-8"),
+                expected,
+                "should restore all original bytes when overflow occurs at script split {split}"
             );
         }
     }

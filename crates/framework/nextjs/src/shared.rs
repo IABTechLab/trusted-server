@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::host_rewrite::rewrite_bare_host_at_boundaries;
+use trusted_server_core::host_rewrite::rewrite_bare_host_at_boundaries;
 
 // These are static code-defined literals, not config-derived patterns, so they
 // intentionally remain lazy statics instead of participating in

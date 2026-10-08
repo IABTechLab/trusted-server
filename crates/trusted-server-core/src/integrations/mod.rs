@@ -19,7 +19,6 @@ pub mod datadome;
 pub mod gpt;
 pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
-pub mod nextjs;
 pub mod openrtb;
 pub mod prebid;
 pub mod prebid_server;
@@ -572,7 +571,10 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // This must remain first: attribute rewriters chain replacements and
     // short-circuit removals.
     js_asset_proxy::BUILDER,
-    nextjs::BUILDER,
+    // A stand-in for an integration that streams, which core's own tests
+    // select where they need one.
+    #[cfg(test)]
+    registry_test_support::payload_fixture::BUILDER,
     datadome::BUILDER,
     gpt::BUILDER,
     gpt_diagnostics::BUILDER,

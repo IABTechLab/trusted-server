@@ -2345,6 +2345,280 @@ pub(crate) mod test_support {
     ) -> Result<bool, Report<TrustedServerError>> {
         Ok(true)
     }
+
+    /// A stand-in for an integration that rewrites script payloads in two
+    /// passes, for core's own tests of the page pipeline.
+    ///
+    /// The script rewriter swaps the payload of each `fixture_payload("...")`
+    /// call for a placeholder that carries a namespace made per document, and
+    /// keeps the payload in the document state. The stream processor swaps
+    /// each placeholder back for its payload with the origin host rewritten.
+    /// A payload pushed with `fixture_payload_open` leaves its group
+    /// unresolved, and the processor holds its output from that placeholder
+    /// on until a `fixture_payload_close` arrives.
+    pub(crate) mod payload_fixture {
+        use std::io;
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+            IntegrationRegistration, IntegrationScriptContext, IntegrationScriptRewriter,
+            ScriptRewriteAction, ScriptTextAccumulator,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+        use crate::streaming_processor::StreamProcessor;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "payload_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.payload-fixture";
+        /// What every placeholder starts with, so a test can check that none
+        /// reaches a reader.
+        pub(crate) const PLACEHOLDER_PREFIX: &str = "__ts_fixture_";
+        const PLACEHOLDER_END: &str = "__";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        struct Payload {
+            placeholder: String,
+            original: String,
+            /// Whether the group this payload opened is still waiting for its
+            /// close.
+            unresolved: bool,
+        }
+
+        /// What one document's script rewriter has captured so far.
+        struct Captured {
+            namespace: String,
+            payloads: Vec<Payload>,
+        }
+
+        impl Default for Captured {
+            fn default() -> Self {
+                Self {
+                    namespace: uuid::Uuid::new_v4().simple().to_string(),
+                    payloads: Vec::new(),
+                }
+            }
+        }
+
+        fn captured(
+            state: &crate::integrations::registry::IntegrationDocumentState,
+        ) -> Arc<Mutex<Captured>> {
+            state.get_or_insert_with(ID, || Mutex::new(Captured::default()))
+        }
+
+        struct ScriptRewriter;
+
+        impl ScriptRewriter {
+            /// Swaps the payload of a whole script for a placeholder, or
+            /// leaves a script that pushes no payload as it is.
+            fn rewrite_whole(script: &str, ctx: &IntegrationScriptContext<'_>) -> Option<String> {
+                let (call, opens, closes) = [
+                    ("fixture_payload_open(\"", true, false),
+                    ("fixture_payload_close(\"", false, true),
+                    ("fixture_payload(\"", false, false),
+                ]
+                .into_iter()
+                .find(|(call, _, _)| script.contains(*call))?;
+                let start = script.find(call)? + call.len();
+                let end = script.rfind("\")")?;
+                if end < start {
+                    return None;
+                }
+
+                let shared = captured(ctx.document_state);
+                let mut captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let placeholder = format!(
+                    "{PLACEHOLDER_PREFIX}{}_{}{PLACEHOLDER_END}",
+                    captured.namespace,
+                    captured.payloads.len()
+                );
+                if closes {
+                    for payload in &mut captured.payloads {
+                        payload.unresolved = false;
+                    }
+                }
+                captured.payloads.push(Payload {
+                    placeholder: placeholder.clone(),
+                    original: script[start..end].to_owned(),
+                    unresolved: opens,
+                });
+
+                let mut rewritten = script.to_owned();
+                rewritten.replace_range(start..end, &placeholder);
+                Some(rewritten)
+            }
+        }
+
+        impl IntegrationScriptRewriter for ScriptRewriter {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn selector(&self) -> &'static str {
+                "script"
+            }
+
+            fn rewrite(
+                &self,
+                content: &str,
+                ctx: &IntegrationScriptContext<'_>,
+            ) -> ScriptRewriteAction {
+                let accumulator = ctx
+                    .document_state
+                    .get_or_insert_with(ID, ScriptTextAccumulator::default);
+                let mut buffer = accumulator.buffer();
+                let claimed = !buffer.is_empty() || content.contains("fixture_payload");
+                if !claimed {
+                    return ScriptRewriteAction::Keep;
+                }
+                buffer.push_str(content);
+                if !ctx.is_last_in_text_node {
+                    return ScriptRewriteAction::RemoveNode;
+                }
+                let script = std::mem::take(&mut *buffer);
+                let rewritten = Self::rewrite_whole(&script, ctx).unwrap_or(script);
+                ScriptRewriteAction::replace(rewritten)
+            }
+        }
+
+        struct StreamFactory;
+
+        impl IntegrationHtmlStreamProcessorFactory for StreamFactory {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+                Box::new(Processor {
+                    context,
+                    held: Vec::new(),
+                })
+            }
+        }
+
+        struct Processor {
+            context: IntegrationHtmlStreamContext,
+            /// Output not yet released, because it ends inside a placeholder
+            /// or starts at one whose group is unresolved.
+            held: Vec<u8>,
+        }
+
+        fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+            haystack
+                .get(from..)?
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .map(|at| at + from)
+        }
+
+        impl StreamProcessor for Processor {
+            fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+                self.held.extend_from_slice(chunk);
+                let shared = captured(&self.context.document_state);
+                let captured = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let prefix = PLACEHOLDER_PREFIX.as_bytes();
+                let mut out = Vec::with_capacity(self.held.len());
+                let mut at = 0;
+
+                while let Some(start) = find(&self.held, prefix, at) {
+                    let Some(end) =
+                        find(&self.held, PLACEHOLDER_END.as_bytes(), start + prefix.len())
+                    else {
+                        // The placeholder runs past this chunk.
+                        out.extend_from_slice(&self.held[at..start]);
+                        at = start;
+                        break;
+                    };
+                    let end = end + PLACEHOLDER_END.len();
+                    let found = std::str::from_utf8(&self.held[start..end])
+                        .ok()
+                        .and_then(|text| {
+                            captured
+                                .payloads
+                                .iter()
+                                .find(|payload| payload.placeholder == text)
+                        });
+                    match found {
+                        Some(payload) if payload.unresolved && !is_last => {
+                            out.extend_from_slice(&self.held[at..start]);
+                            at = start;
+                            break;
+                        }
+                        Some(payload) => {
+                            out.extend_from_slice(&self.held[at..start]);
+                            out.extend_from_slice(
+                                payload
+                                    .original
+                                    .replace(&self.context.origin_host, &self.context.request_host)
+                                    .as_bytes(),
+                            );
+                            at = end;
+                        }
+                        None => {
+                            out.extend_from_slice(&self.held[at..end]);
+                            at = end;
+                        }
+                    }
+                }
+
+                let stopped_at_placeholder = find(&self.held, prefix, at) == Some(at);
+                if is_last {
+                    out.extend_from_slice(&self.held[at..]);
+                    self.held.clear();
+                } else if stopped_at_placeholder {
+                    self.held.drain(..at);
+                } else {
+                    // Keep back a tail that could be the start of a
+                    // placeholder split across chunks.
+                    let rest = &self.held[at..];
+                    let keep = (1..prefix.len().min(rest.len() + 1))
+                        .rev()
+                        .find(|len| rest.ends_with(&prefix[..*len]))
+                        .unwrap_or(0);
+                    out.extend_from_slice(&rest[..rest.len() - keep]);
+                    let tail = rest[rest.len() - keep..].to_vec();
+                    self.held = tail;
+                }
+                Ok(out)
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            if settings.module_config::<FixtureSettings>(MODULE)?.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .with_script_rewriter(Arc::new(ScriptRewriter))
+                    .with_html_stream_processor(Arc::new(StreamFactory))
+                    .build(),
+            ))
+        }
+
+        /// The stand-in takes no settings, and refuses one it does not know
+        /// as any module does.
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {}
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3285,29 +3559,27 @@ mod tests {
 
     #[test]
     fn js_module_ids_skip_named_integrations_without_generated_js_module() {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings.select_module("framework", "framework.nextjs");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
+        let settings = settings_naming("testing.probe");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
         )
-        .expect("should create registry");
+        .with_module_name("testing.probe")];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should create registry");
         let all = registry.js_module_ids();
 
         assert!(
-            !all.contains(&"nextjs"),
+            !all.contains(&"probe"),
             "should not include named integrations without generated JS modules"
         );
 
         let metadata = registry.registered_integrations();
         assert!(
-            metadata
-                .iter()
-                .any(|integration| integration.id == "nextjs"),
+            metadata.iter().any(|integration| integration.id == "probe"),
             "should still register named Rust-only integrations"
         );
     }

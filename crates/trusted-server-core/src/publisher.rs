@@ -13027,30 +13027,25 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn nextjs_stored_templates_are_identical_across_request_shapes() {
+        async fn two_pass_integration_templates_are_identical_across_request_shapes() {
             let mut settings = settings_with_mode("esi");
             settings.publisher.origin_url = "https://origin.example.com".to_owned();
-            settings
-                .insert_module_config(
-                    "framework",
-                    "framework.nextjs",
-                    &serde_json::json!({
-                        "rewrite_attributes": ["href", "link", "url"],
-                    }),
-                )
-                .expect("should enable Next.js processing");
+            settings.select_module(
+                "testing",
+                crate::integrations::registry_test_support::payload_fixture::MODULE,
+            );
             let registry = IntegrationRegistry::new(&settings).expect("should create registry");
             assert!(
                 !registry.html_stream_processor_factories().is_empty(),
-                "should exercise the Next.js stream processor"
+                "should exercise the stand-in's stream processor"
             );
             let settings = Arc::new(settings);
-            let html = br#"<html><head></head><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script><div id="test-slot"></div></body></html>"#;
+            let html = br#"<html><head></head><body><script>fixture_payload("link=https://origin.example.com/page")</script><div id="test-slot"></div></body></html>"#;
 
             for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
                 let mut templates = Vec::new();
                 for request in [navigation_request(), prefetch_navigation_request()] {
-                    // Independent fills force distinct per-request RSC namespaces.
+                    // Independent fills force distinct per-document namespaces.
                     let stub = Arc::new(StubHttpClient::new());
                     let cache = Arc::new(MemoryTemplateCache::default());
                     let services = services(Arc::clone(&stub), Arc::clone(&cache));
@@ -13067,11 +13062,7 @@ mod tests {
                     let _ = body_of(response).await;
 
                     let entries = cache.entries.lock().expect("should lock stored templates");
-                    assert_eq!(
-                        entries.len(),
-                        1,
-                        "should store a Next.js template on every fill"
-                    );
+                    assert_eq!(entries.len(), 1, "should store a template on every fill");
                     let template = entries
                         .values()
                         .next()
@@ -13081,14 +13072,14 @@ mod tests {
                     let text = core::str::from_utf8(&template).expect("should store UTF-8 HTML");
                     assert!(
                         text.contains("ts.example.com/page"),
-                        "should rewrite the RSC URL"
+                        "should rewrite the URL in the payload"
                     );
                     assert!(
                         text.contains(AD_ASSEMBLY_SEAM),
                         "should store before per-reader assembly"
                     );
                     for marker in [
-                        "__ts_rsc_",
+                        crate::integrations::registry_test_support::payload_fixture::PLACEHOLDER_PREFIX,
                         ".adSlots",
                         ".bids=",
                         "gpt-diagnostics",
@@ -13103,7 +13094,7 @@ mod tests {
                 }
                 assert_eq!(
                     templates[0], templates[1],
-                    "should store identical bytes across request shapes and RSC namespaces"
+                    "should store identical bytes across request shapes and per-document namespaces"
                 );
             }
         }
@@ -21573,17 +21564,12 @@ mod tests {
     fn streaming_finalize_auction_hold_emits_prefix_before_origin_eof() {
         // A body-close literal in script data must not stop streaming. Only the
         // request token emitted by lol_html at the structural end is a seam.
-        let page = br#"<html><head></head><body><script>self.__next_f.push([1,'{"href":"https://origin.example.com/app","text":"</body>"}'])</script><article>still streaming</article>"#;
+        let page = br#"<html><head></head><body><script>fixture_payload("href=https://origin.example.com/app text=</body>")</script><article>still streaming</article>"#;
         let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "framework",
-                "framework.nextjs",
-                &serde_json::json!({
-                    "rewrite_attributes": ["href", "link", "url"],
-                }),
-            )
-            .expect("should enable Next.js");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        );
         let params = html_stream_params(
             "",
             Some(DispatchedAuction::empty_for_test(
@@ -21601,11 +21587,11 @@ mod tests {
         let html = String::from_utf8(first.to_vec()).expect("should be valid UTF-8");
         assert!(
             html.contains("</body>") && html.contains("still streaming"),
-            "RSC script data and later article bytes must stream before EOF. Got: {html}"
+            "script data and later article bytes must stream before EOF. Got: {html}"
         );
         assert!(
             html.contains("proxy.example.com/app") && !html.contains("origin.example.com/app"),
-            "Next.js rewriting must complete before the parser seam: {html}"
+            "the stand-in's rewriting must complete before the parser seam: {html}"
         );
         assert!(
             html.contains(".adSlots=JSON.parse"),
@@ -21751,21 +21737,16 @@ mod tests {
     }
 
     #[test]
-    fn parser_confirmed_auction_seam_streams_nextjs_for_every_encoding() {
+    fn parser_confirmed_auction_seam_streams_a_two_pass_integration_for_every_encoding() {
         for encoding in ["", "gzip", "deflate", "br"] {
             let mut settings = create_test_settings();
             settings.auction.enabled = true;
             settings.auction.provider_names = vec!["seam_test".to_owned()];
             settings.auction.timeout_ms = 60_000;
-            settings
-                .insert_module_config(
-                    "framework",
-                    "framework.nextjs",
-                    &serde_json::json!({
-                        "rewrite_attributes": ["href", "link", "url"],
-                    }),
-                )
-                .expect("should select Next.js");
+            settings.select_module(
+                "testing",
+                crate::integrations::registry_test_support::payload_fixture::MODULE,
+            );
             let client = Arc::new(GatedAuctionHttpClient {
                 inner: StubHttpClient::new(),
                 released: std::sync::atomic::AtomicBool::new(false),
@@ -21792,15 +21773,10 @@ mod tests {
             else {
                 panic!("should dispatch a pending auction");
             };
-            let payload = r#"{"url":"https://origin.example.com/path","text":"</body>"}"#;
-            let split = payload.find("/path").expect("should find payload split");
-            let first_payload = format!("1:T{:x},{}", payload.len(), &payload[..split]);
-            let first_script =
-                serde_json::to_string(&first_payload).expect("should encode first payload");
-            let second_script =
-                serde_json::to_string(&payload[split..]).expect("should encode second payload");
-            let prefix = format!(
-                "<html><head></head><body><p>before RSC</p><script>self.__next_f.push([1,{first_script}])</script><span>between scripts</span><script>self.__next_f.push([1,{second_script}])</script><article>still streaming</article>"
+            // One group split across two scripts, so the stand-in holds its
+            // output from the first script until the second arrives.
+            let prefix = String::from(
+                "<html><head></head><body><p>before the group</p><script>fixture_payload_open(\"url=https://origin.example.com\")</script><span>between scripts</span><script>fixture_payload_close(\"/path text=</body>\")</script><article>still streaming</article>",
             );
             let page = format!("{prefix}</body></html>");
             let encoded = match encoding {
@@ -21863,7 +21839,7 @@ mod tests {
             );
             assert!(
                 prefix.contains("proxy.example.com") && !prefix.contains("origin.example.com"),
-                "should rewrite the split RSC group for {encoding}: {prefix}"
+                "should rewrite the split group for {encoding}: {prefix}"
             );
             assert!(
                 !prefix.contains("var b=JSON.parse("),
@@ -21911,7 +21887,8 @@ mod tests {
                 "should inject once"
             );
             assert!(
-                !html.contains("ts-inline-body-close-") && !html.contains("__ts_rsc_"),
+                !html.contains("ts-inline-body-close-")
+                    && !html.contains(crate::integrations::registry_test_support::payload_fixture::PLACEHOLDER_PREFIX),
                 "should remove internal markers for {encoding}: {html}"
             );
             assert_eq!(
@@ -22577,17 +22554,12 @@ mod tests {
     /// routes through `Stream`, and the shared processor pipeline applies it.
     #[test]
     fn streaming_html_with_stream_processors_rewrites_body() {
-        // Configure nextjs so a stream processor is registered.
+        // Select the stand-in so a stream processor is registered.
         let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "framework",
-                "framework.nextjs",
-                &serde_json::json!({
-                    "rewrite_attributes": ["href", "link", "url"],
-                }),
-            )
-            .expect("should update nextjs config");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        );
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -22600,7 +22572,7 @@ mod tests {
 
         assert!(
             !registry.html_stream_processor_factories().is_empty(),
-            "nextjs integration must register an HTML stream processor"
+            "the stand-in must register an HTML stream processor"
         );
         assert_eq!(
             classify_response_route(
@@ -22659,21 +22631,16 @@ mod tests {
     }
 
     /// Document-state survives from the parser pass into the stream processor.
-    /// `NextJsRscPlaceholderRewriter` writes into `IntegrationDocumentState`
-    /// during parsing; the request-local stream processor reads it and substitutes.
+    /// A script rewriter writes into `IntegrationDocumentState` during
+    /// parsing, and the request-local stream processor reads it and substitutes.
     /// Regression test: placeholders must be inserted and removed from final output.
     #[test]
     fn document_state_placeholders_substitute_through_streaming_path() {
         let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "framework",
-                "framework.nextjs",
-                &serde_json::json!({
-                    "rewrite_attributes": ["href", "link", "url"],
-                }),
-            )
-            .expect("should update nextjs config");
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::payload_fixture::MODULE,
+        );
         let registry = IntegrationRegistry::with_plan(
             &settings,
             Arc::new(
@@ -22683,8 +22650,8 @@ mod tests {
         )
         .expect("should create integration registry");
 
-        // Small, single-fragment RSC script — placeholder path (not fallback).
-        let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
+        // One small script whose payload is swapped for a placeholder.
+        let html = br#"<html><body><script>fixture_payload("link=https://origin.example.com/page")</script></body></html>"#;
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
             template_cache_key: None,
@@ -22715,11 +22682,13 @@ mod tests {
             &settings,
             &registry,
         )
-        .expect("should process RSC push");
+        .expect("should process the payload script");
 
         let processed = String::from_utf8(output).expect("valid UTF-8");
         assert!(
-            !processed.contains("__ts_rsc_payload_"),
+            !processed.contains(
+                crate::integrations::registry_test_support::payload_fixture::PLACEHOLDER_PREFIX
+            ),
             "placeholder must be substituted before reaching output. Got: {processed}"
         );
         assert!(

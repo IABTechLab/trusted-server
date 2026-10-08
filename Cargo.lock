@@ -5669,6 +5669,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-framework-nextjs"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "uuid",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-geo-fastly"
 version = "0.1.0"
 dependencies = [
@@ -5761,6 +5775,7 @@ dependencies = [
  "trusted-server-cmp-osano",
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
+ "trusted-server-framework-nextjs",
  "trusted-server-identity-lockr",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-testlight",
@@ -5832,6 +5847,7 @@ dependencies = [
  "serde",
  "serde_json",
  "trusted-server-core",
+ "trusted-server-framework-nextjs",
  "url",
  "validator",
 ]

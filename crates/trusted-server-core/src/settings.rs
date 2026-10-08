@@ -4985,9 +4985,7 @@ mod tests {
         );
     }
 
-    use crate::integrations::{
-        IntegrationRegistry, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
-    };
+    use crate::integrations::{IntegrationRegistry, prebid::PrebidIntegrationConfig};
     use crate::redacted::Redacted;
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, create_test_settings,
@@ -6040,8 +6038,8 @@ module = \"none\"",
         assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
-                .module_config::<NextJsIntegrationConfig>(crate::integrations::nextjs::MODULE)
-                .expect("Next.js config query should succeed")
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .expect("a query for a module no section selects should succeed")
                 .is_none(),
             "a module no section selects should not run"
         );

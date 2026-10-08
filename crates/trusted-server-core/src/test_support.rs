@@ -293,7 +293,7 @@ pub mod nextjs_auction {
         settings
             .insert_module_config(
                 "framework",
-                crate::integrations::nextjs::MODULE,
+                "framework.nextjs",
                 &serde_json::json!({
                     "rewrite_attributes": ["href", "link", "url"],
                 }),

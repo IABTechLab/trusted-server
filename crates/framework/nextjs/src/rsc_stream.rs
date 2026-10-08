@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crate::integrations::{
+use trusted_server_core::integrations::{
     IntegrationDocumentState, IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
 };
-use crate::streaming_processor::StreamProcessor;
+use trusted_server_core::streaming_processor::StreamProcessor;
 
 use super::rsc::{
     DEFAULT_MAX_COMBINED_PAYLOAD_BYTES, PendingTChunk, TChunkStep, next_tchunk,
@@ -869,7 +869,7 @@ impl SegmentInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::nextjs::rsc::{TChunkScan, scan_tchunks};
+    use crate::rsc::{TChunkScan, scan_tchunks};
 
     // Keep the reference independent of the incremental classifier: discover all
     // chunks first, then inspect each non-chunk segment from scratch.

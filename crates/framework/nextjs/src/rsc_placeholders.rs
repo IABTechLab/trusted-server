@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::integrations::{
+use trusted_server_core::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
 };
 
@@ -344,8 +344,8 @@ fn remember_released(context: &mut String, released: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::IntegrationDocumentState;
-    use crate::integrations::nextjs::rsc_stream::NextJsDocumentState;
+    use crate::rsc_stream::NextJsDocumentState;
+    use trusted_server_core::integrations::IntegrationDocumentState;
 
     fn ctx(
         is_last_in_text_node: bool,

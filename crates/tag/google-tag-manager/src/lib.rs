@@ -3779,8 +3779,12 @@ assume_single_jurisdiction = true
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
-            .expect("should create registry");
+        // Next.js first, as a stock build orders the two.
+        let registry = IntegrationRegistry::with_registrations(
+            &settings,
+            &[trusted_server_framework_nextjs::builder(), builder()],
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
@@ -3846,8 +3850,12 @@ assume_single_jurisdiction = true
             )
             .expect("should update nextjs config");
 
-        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
-            .expect("should create registry");
+        // Next.js first, as a stock build orders the two.
+        let registry = IntegrationRegistry::with_registrations(
+            &settings,
+            &[trusted_server_framework_nextjs::builder(), builder()],
+        )
+        .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 

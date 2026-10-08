@@ -21,6 +21,7 @@ use trusted_server_core::integrations::IntegrationBuilder;
 pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
         trusted_server_testing_testlight::builder(),
+        trusted_server_framework_nextjs::builder(),
         trusted_server_audience_permutive::builder(),
         trusted_server_identity_lockr::builder(),
         trusted_server_cmp_didomi::builder(),
@@ -56,6 +57,7 @@ mod tests {
             names,
             [
                 "testing.testlight",
+                "framework.nextjs",
                 "audience.permutive",
                 "identity.lockr",
                 "cmp.didomi",
@@ -177,6 +179,45 @@ mod tests {
                     .is_some(),
             };
             assert!(valid, "{header} should resolve to a valid config");
+        }
+    }
+
+    /// Every stock page module refuses a setting it does not know, so a
+    /// misspelt key in its table fails deploy validation naming the table and
+    /// the key, where it would otherwise be ignored.
+    #[test]
+    fn every_stock_module_rejects_a_setting_it_does_not_know() {
+        use serde_json::json;
+        use trusted_server_core::config::validate_settings_for_deploy_with;
+        use trusted_server_core::module_name::short_form;
+        use trusted_server_core::test_support::tests::create_test_settings;
+
+        let stock = builders();
+        for builder in stock
+            .iter()
+            .filter(|builder| builder.supplies_integration())
+        {
+            let name = builder
+                .module_name()
+                .expect("every stock page module names itself");
+            let section = builder
+                .section()
+                .expect("every stock page module has a section");
+            let mut settings = create_test_settings();
+            settings
+                .insert_module_config(section, name, &json!({ "no_such_setting": true }))
+                .expect("should insert the planted table");
+
+            let error = match validate_settings_for_deploy_with(&settings, &stock) {
+                Ok(()) => panic!("`{name}` should refuse a setting it does not know"),
+                Err(error) => format!("{error:?}"),
+            };
+            let written = short_form(section, name);
+            assert!(
+                error.contains(&format!("[{section}.{written}]"))
+                    && error.contains("no_such_setting"),
+                "`{name}` should name its table and the unknown setting: {error}"
+            );
         }
     }
 }
