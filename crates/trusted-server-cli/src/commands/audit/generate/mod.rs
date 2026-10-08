@@ -668,17 +668,6 @@ fn select_js_asset_proxy(draft: &str) -> CliResult<String> {
 /// is written under there, or `None` for one no module in this build
 /// configures.
 fn module_section(id: &str) -> Option<(&'static str, &'static str)> {
-    // Prebid is registered through the auction plan, so no builder in the
-    // stock list carries its module's name.
-    if id == "prebid" {
-        return Some((
-            "auction",
-            trusted_server_core::module_name::short_form(
-                "auction",
-                trusted_server_core::integrations::prebid::MODULE,
-            ),
-        ));
-    }
     trusted_server_modules::selection_of(id)
 }
 

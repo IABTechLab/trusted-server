@@ -293,7 +293,10 @@ impl AuctionPlan {
         self.enabled
     }
 
-    pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
+    /// Return the plan with auction execution switched on or off, which is how
+    /// `[auction] enabled` is applied to a compiled plan.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
@@ -589,11 +592,11 @@ impl AuctionPlan {
             .any(|provider| provider.implementation.id == implementation_id)
     }
 
-    /// Borrow validated client-visible bidder route codes in deterministic order.
+    /// Borrow the validated bidder route codes in deterministic order.
     ///
-    /// This intentionally exposes route keys rather than provider identities or
-    /// implementation settings for the browser Prebid injection boundary.
-    pub(crate) fn browser_bidder_codes(&self) -> impl Iterator<Item = &str> {
+    /// These are the route keys alone, with no source name and no
+    /// implementation setting, so a page module may show them to a browser.
+    pub fn browser_bidder_codes(&self) -> impl Iterator<Item = &str> {
         self.bidder_routes.keys().map(BidderId::as_str)
     }
 

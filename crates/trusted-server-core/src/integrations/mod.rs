@@ -16,7 +16,6 @@ use crate::settings::Settings;
 
 pub mod js_asset_proxy;
 pub mod openrtb;
-pub mod prebid;
 pub mod prebid_server;
 mod registry;
 
@@ -704,7 +703,6 @@ impl IntegrationBuilder {
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // Prebid is registered from the auction plan, which puts its hooks ahead
     // of every section's module whatever its place here.
-    prebid::BUILDER,
     // This must remain the first module a section selects: attribute
     // rewriters chain replacements and short-circuit removals.
     js_asset_proxy::BUILDER,
@@ -719,6 +717,10 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // tests.
     #[cfg(test)]
     registry_test_support::request_fixture::BUILDER,
+    // A stand-in for an integration whose browser module loads deferred, for
+    // the same tests.
+    #[cfg(test)]
+    registry_test_support::deferred_fixture::BUILDER,
     // Implementations `[demand]` and `[ad-server]` can name. None of them is
     // a module a section selects.
     IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),

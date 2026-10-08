@@ -2743,6 +2743,100 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A stand-in for an integration whose browser module loads deferred, for
+    /// core's own tests of how modules are divided between the bundle and
+    /// deferred tags, and of how a module's settings reach a page template.
+    ///
+    /// Selected, it carries a deferred browser module and writes its two
+    /// settings into `<head>`.
+    pub(crate) mod deferred_fixture {
+        use std::sync::Arc;
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            CarriedJsModule, IntegrationHeadInjector, IntegrationHtmlContext,
+            IntegrationRegistration,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "deferred_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.deferred-fixture";
+        /// The file of the stand-in's deferred module.
+        pub(crate) const MODULE_FILE: &str = "tsjs-deferred_fixture.min.js";
+
+        const JS: &str = "(function(){window.__ts_deferred_fixture_loaded=1;})();";
+        // SHA-256 of JS, hex. The registry refuses a literal that is not.
+        const JS_SHA256: &str = "3947bc5e93ffb5d057f0d500d20ee25d53612b6c8b59cd3f9512c1b64b45f9f6";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {
+            #[serde(default)]
+            label: String,
+            #[serde(default)]
+            timeout_ms: u32,
+        }
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        struct Head {
+            label: String,
+            timeout_ms: u32,
+        }
+
+        impl IntegrationHeadInjector for Head {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                let config = serde_json::json!({
+                    "label": self.label,
+                    "timeoutMs": self.timeout_ms,
+                });
+                vec![format!(
+                    "<script>window.__ts_deferred_fixture={config};</script>"
+                )]
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .with_js_module(CarriedJsModule {
+                        source: JS,
+                        sha256: JS_SHA256,
+                    })
+                    .with_deferred_js()
+                    .with_head_injector(Arc::new(Head {
+                        label: config.label,
+                        timeout_ms: config.timeout_ms,
+                    }))
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
     /// A stand-in for an integration that tags a page, for core's own tests
     /// of the HTML processor and the JavaScript asset proxy.
     ///
@@ -4020,25 +4114,14 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_defer_prebid_and_include_core_js_only_modules() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let mut settings_with_prebid = settings;
-        settings_with_prebid
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
-                    "timeout_ms": 1000,
-                    "debug": false
-                }),
-            )
-            .expect("should insert prebid config");
+    fn js_module_ids_defer_a_deferred_module_and_include_core_js_only_modules() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        enable_deferred_module(&mut settings);
 
         let registry = IntegrationRegistry::with_plan(
-            &settings_with_prebid,
+            &settings,
             Arc::new(
-                crate::auction::compile_auction_plan(&settings_with_prebid)
+                crate::auction::compile_auction_plan(&settings)
                     .expect("should compile auction plan"),
             ),
         )
@@ -4047,10 +4130,11 @@ mod tests {
         let all = registry.js_module_ids();
         let immediate = registry.js_module_ids_immediate();
         let deferred = registry.js_module_ids_deferred();
+        let module = test_support::deferred_fixture::ID;
 
         assert!(
-            all.contains(&"prebid"),
-            "should include the prebid shim in embedded TSJS module IDs"
+            all.contains(&module),
+            "should include the deferred module in the module IDs"
         );
         assert!(
             immediate.contains(&"creative"),
@@ -4061,12 +4145,12 @@ mod tests {
             "should not include Sourcepoint unless it is named"
         );
         assert!(
-            !immediate.contains(&"prebid"),
-            "should not include prebid in immediate IDs"
+            !immediate.contains(&module),
+            "should not include the deferred module in immediate IDs"
         );
         assert!(
-            deferred.contains(&"prebid"),
-            "should serve the prebid shim as a deferred module"
+            deferred.contains(&module),
+            "should serve the module as a deferred module"
         );
     }
 
@@ -4151,17 +4235,9 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_defer_prebid_shim_when_external_bundle_is_configured() {
+    fn js_module_ids_split_is_exhaustive() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
-                }),
-            )
-            .expect("should update prebid config");
+        enable_deferred_module(&mut settings);
 
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -4172,50 +4248,11 @@ mod tests {
         )
         .expect("should create registry");
 
-        assert!(
-            registry.js_module_ids().contains(&"prebid"),
-            "external bundle mode should include the prebid shim in embedded TSJS modules"
-        );
-        assert!(
-            !registry.js_module_ids_immediate().contains(&"prebid"),
-            "the prebid shim should not load in the immediate TSJS bundle"
-        );
-        assert!(
-            registry.js_module_ids_deferred().contains(&"prebid"),
-            "the prebid shim should load as a deferred TSJS module"
-        );
-        assert!(
-            registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
-            "external bundle mode should register the first-party bundle route"
-        );
-    }
-
-    #[test]
-    fn js_module_ids_split_is_exhaustive() {
-        let settings = crate::test_support::tests::create_test_settings();
-        let mut settings_with_prebid = settings;
-        settings_with_prebid
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
-                    "timeout_ms": 1000,
-                    "debug": false
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let registry = IntegrationRegistry::with_plan(
-            &settings_with_prebid,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings_with_prebid)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-
         let all = registry.js_module_ids();
+        assert!(
+            !registry.js_module_ids_deferred().is_empty(),
+            "should have a deferred module to divide from the bundle"
+        );
         let mut recombined = registry.js_module_ids_immediate();
         recombined.extend(registry.js_module_ids_deferred());
         recombined.sort_unstable();
@@ -4300,49 +4337,57 @@ mod tests {
         );
     }
 
-    /// Prebid registers from the auction plan, and an outside builder claiming
-    /// its id is refused all the same, naming both sources, whether or not the
-    /// plan-backed integration runs.
+    /// A builder that registers from the auction plan holds its id like any
+    /// other, so a second builder claiming it is refused, naming both sources,
+    /// whether or not the plan-backed integration runs.
     #[test]
-    fn with_registrations_rejects_an_outside_builder_claiming_a_plan_backed_id() {
+    fn with_registrations_rejects_a_second_builder_claiming_a_plan_backed_id() {
         fn register_nothing(
             _settings: &Settings,
         ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
             Ok(None)
         }
+        fn nothing_from_the_plan(
+            _settings: &Settings,
+            _plan: &crate::auction::plan::AuctionPlan,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(None)
+        }
 
         let settings = crate::test_support::tests::create_test_settings();
-        let id = crate::integrations::prebid::PREBID_INTEGRATION_ID;
-        let extra = [crate::integrations::IntegrationBuilder::new(
-            id,
-            "seam-probe",
-            register_nothing,
-            validate_nothing,
-        )];
+        let id = "plan_backed";
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                id,
+                "plan-backed-crate",
+                register_nothing,
+                validate_nothing,
+            )
+            .with_plan_registration(nothing_from_the_plan),
+            crate::integrations::IntegrationBuilder::new(
+                id,
+                "seam-probe",
+                register_nothing,
+                validate_nothing,
+            ),
+        ];
 
         let Err(error) = IntegrationRegistry::with_registrations(&settings, &extra) else {
-            panic!("should refuse an outside builder claiming `{id}`");
+            panic!("should refuse a second builder claiming `{id}`");
         };
 
         let message = error.to_string();
         assert!(
             message.contains(id)
-                && message.contains("trusted-server-core")
+                && message.contains("plan-backed-crate")
                 && message.contains("seam-probe"),
             "error should name `{id}` and both sources: {message}"
         );
     }
 
-    fn enable_prebid(settings: &mut Settings) {
-        settings
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "external_bundle_url": "https://assets.example.com/prebid/trusted-prebid.js",
-                }),
-            )
-            .expect("should insert prebid config");
+    /// Selects core's stand-in, which registers a deferred browser module.
+    fn enable_deferred_module(settings: &mut Settings) {
+        settings.select_module("testing", test_support::deferred_fixture::MODULE);
     }
 
     /// Selects core's stand-in, which registers a standalone browser module.
@@ -4564,7 +4609,7 @@ mod tests {
     #[test]
     fn js_parts_all_covers_bundle_deferred_and_standalone_modules() {
         let mut settings = settings_naming("probe");
-        enable_prebid(&mut settings);
+        enable_deferred_module(&mut settings);
         enable_standalone_module(&mut settings);
         let extra = [carried_probe_builder()];
 
@@ -4580,7 +4625,7 @@ mod tests {
             "core",
             "creative",
             "probe",
-            "prebid",
+            test_support::deferred_fixture::ID,
             test_support::request_fixture::ID,
         ] {
             assert_eq!(

@@ -495,7 +495,7 @@ client_side_bidders = 'examplebidder\'
             let text = format!("[auction.prebid]\nclient_side_bidders={input}\n");
             let file = tempfile::NamedTempFile::new().expect("should create config");
             fs::write(file.path(), &text).expect("should write config");
-            let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
+            let runtime: trusted_server_auction_prebid::PrebidIntegrationConfig =
                 toml::from_str(&format!("client_side_bidders={input}"))
                     .expect("runtime should accept encoding");
             let output = inspect(file.path()).expect("inspect should accept runtime encoding");
@@ -517,7 +517,7 @@ client_side_bidders = 'examplebidder\'
             "[bundle.modules]\nuser_id = ['sharedIdSystem']",
             "[bundle.modules]\nanalytics = ['exampleAnalyticsAdapter']",
         ] {
-            let runtime: trusted_server_core::integrations::prebid::PrebidIntegrationConfig =
+            let runtime: trusted_server_auction_prebid::PrebidIntegrationConfig =
                 toml::from_str(input).expect("should parse current core bundle schema");
             let text = format!(
                 "[auction.prebid]\n{}",
@@ -546,10 +546,8 @@ client_side_bidders = 'examplebidder\'
         let input =
             "[bundle]\nadapters = ['exampleBidAdapter']\nuser_id_modules = ['sharedIdSystem']";
         assert!(
-            toml::from_str::<trusted_server_core::integrations::prebid::PrebidIntegrationConfig>(
-                input
-            )
-            .is_err(),
+            toml::from_str::<trusted_server_auction_prebid::PrebidIntegrationConfig>(input)
+                .is_err(),
             "core should reject the retired bundle schema"
         );
         let file = tempfile::NamedTempFile::new().expect("should create config");

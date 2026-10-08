@@ -4972,7 +4972,7 @@ mod tests {
         );
     }
 
-    use crate::integrations::{IntegrationRegistry, prebid::PrebidIntegrationConfig};
+    use crate::integrations::IntegrationRegistry;
     use crate::redacted::Redacted;
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, create_test_settings,
@@ -5717,7 +5717,7 @@ module = \"none\"",
             .expect("should load the test settings fixture");
         let mut value = serde_json::to_value(settings)
             .expect("should serialize the test settings fixture to JSON");
-        value["auction"]["providers"] = json!(["prebid"]);
+        value["auction"]["providers"] = json!(["example"]);
 
         let error = Settings::from_json_value(value)
             .expect_err("should reject the removed auction provider list schema");
@@ -5737,7 +5737,7 @@ module = \"none\"",
         let toml = format!(
             "{}\n",
             crate_test_settings_str()
-                .replace("[auction]\n", "[auction]\nproviders = [\"prebid\"]\n")
+                .replace("[auction]\n", "[auction]\nproviders = [\"example\"]\n")
         );
 
         let error = Settings::from_toml(&toml)
@@ -6015,11 +6015,6 @@ module = \"none\"",
         assert!(settings.is_ok());
 
         let settings = settings.expect("should parse valid TOML");
-        let prebid_cfg = settings
-            .module_config::<PrebidIntegrationConfig>(crate::integrations::prebid::MODULE)
-            .expect("Prebid config query should succeed")
-            .expect("Prebid config should load from test settings");
-        assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
                 .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
@@ -6027,10 +6022,9 @@ module = \"none\"",
                 .is_none(),
             "a module no section selects should not run"
         );
-        assert_eq!(
-            settings.auction.modules.selected(),
-            ["prebid".to_owned()],
-            "the fixture should run exactly the module it selects"
+        assert!(
+            settings.auction.modules.selected().is_empty(),
+            "the fixture should select no auction module"
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
@@ -8405,27 +8399,6 @@ source_domain = "partner.example.com"
         );
     }
 
-    #[test]
-    fn removed_integration_fields_are_rejected() {
-        use crate::integrations::prebid;
-
-        let mut settings = create_test_settings();
-        settings
-            .insert_module_config(
-                "auction",
-                prebid::MODULE,
-                &json!({ "server_url": "removed-value" }),
-            )
-            .expect("should insert the removed Prebid field");
-        let error = settings
-            .module_config::<PrebidIntegrationConfig>(prebid::MODULE)
-            .expect_err("should reject the removed Prebid field");
-        assert!(
-            format!("{error:?}").contains("server_url"),
-            "should identify the removed field: {error:?}"
-        );
-    }
-
     /// A table written for a module its section does not select is refused,
     /// rather than sitting in the configuration doing nothing.
     #[test]
@@ -8468,17 +8441,19 @@ source_domain = "partner.example.com"
     /// configuration cannot read as switched off while the module runs.
     #[test]
     fn an_enabled_key_left_in_a_table_is_refused() {
-        let toml = crate_test_settings_str()
-            .replace("[auction.prebid]", "[auction.prebid]\nenabled = false");
+        let toml = format!(
+            "{}\n[example]\nmodules = [\"endpoint\"]\n\n[example.endpoint]\nendpoint = \"https://endpoint.example\"\nenabled = false\n",
+            crate_test_settings_str()
+        );
         let settings = Settings::from_toml(&toml).expect("core reads no module's table itself");
 
         let error = settings
-            .module_config::<PrebidIntegrationConfig>(crate::integrations::prebid::MODULE)
+            .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
             .expect_err("should reject a leftover enabled key");
         let rendered = format!("{error:?}");
 
         assert!(
-            rendered.contains("[auction.prebid]") && rendered.contains("enabled"),
+            rendered.contains("[example.endpoint]") && rendered.contains("enabled"),
             "should name the table and the key: {rendered}"
         );
     }
@@ -8487,9 +8462,9 @@ source_domain = "partner.example.com"
     /// twice, so it is refused.
     #[test]
     fn naming_a_module_twice_is_refused() {
-        let toml = crate_test_settings_str().replace(
-            "modules = [\"prebid\"]",
-            "modules = [\"prebid\", \"prebid\"]",
+        let toml = format!(
+            "{}\n[example]\nmodules = [\"endpoint\", \"endpoint\"]\n",
+            crate_test_settings_str()
         );
 
         let error = Settings::from_toml(&toml).expect_err("should reject a repeated name");

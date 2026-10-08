@@ -20,6 +20,7 @@ use trusted_server_core::integrations::IntegrationBuilder;
 #[must_use]
 pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
+        trusted_server_auction_prebid::builder(),
         trusted_server_testing_testlight::builder(),
         trusted_server_framework_nextjs::builder(),
         trusted_server_audience_permutive::builder(),
@@ -85,6 +86,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "auction.prebid",
                 "testing.testlight",
                 "framework.nextjs",
                 "audience.permutive",
@@ -298,6 +300,7 @@ mod tests {
     #[test]
     fn a_stock_module_s_selection_is_found_by_its_integration_id() {
         for (id, section, written) in [
+            ("prebid", "auction", "prebid"),
             ("datadome", "bot-protection", "datadome"),
             ("didomi", "cmp", "didomi"),
             ("sourcepoint", "cmp", "sourcepoint"),

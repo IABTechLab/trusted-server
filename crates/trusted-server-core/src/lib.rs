@@ -12,7 +12,6 @@
 //! - [`consent`]: Consent signal extraction and logging
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`models`]: Data models for ad serving and callbacks
-//! - [`integrations::prebid`]: Prebid integration and real-time bidding support
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
 //! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle

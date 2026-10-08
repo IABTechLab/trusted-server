@@ -1084,7 +1084,7 @@ formats = [{ width = 300, height = 250 }]
         let toml = format!(
             "{}\n",
             crate_test_settings_str()
-                .replace("[auction]\n", "[auction]\nproviders = [\"prebid\"]\n")
+                .replace("[auction]\n", "[auction]\nproviders = [\"example\"]\n")
         );
 
         let error = toml::from_str::<TrustedServerAppConfig>(&toml)
@@ -1387,20 +1387,6 @@ password = "production-admin-password-32-bytes"
             .expect("deploy validation should leave unknown ids to the registry");
     }
 
-    #[test]
-    fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
-        let mut settings = valid_settings();
-        settings.proxy.allowed_domains.clear();
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject external Prebid bundle without proxy allowlist");
-
-        assert!(
-            err.to_string().contains("proxy.allowed_domains"),
-            "error should mention proxy.allowed_domains: {err:?}"
-        );
-    }
-
     /// Counts calls to [`record_validate_call`]. A builder holds plain fn
     /// pointers and cannot capture, so the recording has to go through a
     /// static.
@@ -1546,30 +1532,6 @@ password = "production-admin-password-32-bytes"
         }
     }
 
-    /// A selected Prebid block that names bundle modules has to name where the
-    /// bundle is served from as well, and deploy validation says so. Selection
-    /// is what makes Prebid run, so the check applies to a selected block.
-    #[test]
-    fn deploy_validation_requires_external_bundle_url_for_selected_prebid() {
-        let mut settings = valid_settings();
-        settings.select_module("auction", "auction.prebid");
-        settings
-            .insert_module_config(
-                "auction",
-                "auction.prebid",
-                &serde_json::json!({
-                    "bundle": {
-                        "modules": { "bidder": ["exampleBidderBidAdapter"] }
-                    }
-                }),
-            )
-            .expect("should insert the Prebid config");
-
-        let error = validate_settings_for_deploy(&settings)
-            .expect_err("should require enabled Prebid external bundle URL");
-        assert!(error.to_string().contains("external_bundle_url"));
-    }
-
     /// Every built-in page integration refuses a setting it does not know, so
     /// a misspelt key in its block fails deploy validation naming the
     /// integration and the key, rather than being ignored.
@@ -1603,44 +1565,6 @@ password = "production-admin-password-32-bytes"
                 error.contains(&format!("[{section}.{written}]"))
                     && error.contains("no_such_setting"),
                 "`{name}` should name its table and the unknown setting: {error}"
-            );
-        }
-    }
-
-    /// Validation reaches the block of the one integration the auction plan
-    /// still carries, being Prebid, which has no builder and so is not covered
-    /// by `deploy_validation_reaches_every_built_in_builder`. It is planted
-    /// with a block its config type cannot deserialize, and the rejection must
-    /// name the integration, so a failure elsewhere in validation cannot pass
-    /// for it.
-    #[test]
-    fn validation_reaches_the_plan_backed_prebid_block() {
-        {
-            let id = "prebid";
-            let mut settings = valid_settings();
-            settings
-                .insert_module_config(
-                    "auction",
-                    crate::integrations::prebid::MODULE,
-                    &serde_json::json!({ "no_such_setting": true }),
-                )
-                .expect("should insert the planted table");
-            let expected = "[auction.prebid]".to_owned();
-
-            let Err(deploy_error) = validate_settings_for_deploy(&settings) else {
-                panic!("deploy validation should reject the planted `{id}` block");
-            };
-            assert!(
-                format!("{deploy_error:?}").contains(&expected),
-                "deploy validation should reject the `{id}` block by name: {deploy_error:?}"
-            );
-
-            let Err(runtime_error) = validate_settings_for_runtime(&settings) else {
-                panic!("runtime validation should reject the planted `{id}` block");
-            };
-            assert!(
-                format!("{runtime_error:?}").contains(&expected),
-                "runtime validation should reject the `{id}` block by name: {runtime_error:?}"
             );
         }
     }

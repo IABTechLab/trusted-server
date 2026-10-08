@@ -103,3 +103,4 @@ flate2 = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+trusted-server-auction-prebid = { workspace = true }

@@ -1,3 +1,22 @@
+//! Prebid.js on the page, the module `auction.prebid`.
+//!
+//! Selected in `[auction]`, it writes the configuration Prebid.js reads into
+//! `<head>`, serves the publisher's Prebid bundle from a first-party route and
+//! removes the publisher's own Prebid script from the page. The bidders it
+//! tells the browser to leave to the server are the auction plan's routes.
+
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -18,35 +37,37 @@ use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
 use validator::{Validate, ValidationError};
 
-use crate::auction::plan::AuctionPlan;
-use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::auction::plan::AuctionPlan;
+use trusted_server_core::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
-use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 pub(crate) const PREBID_INTEGRATION_ID: &str = "prebid";
 
 /// The name this module is selected by, in `[auction]`.
 pub const MODULE: &str = "auction.prebid";
 
-/// The builder that offers Prebid: selected in `[auction]`, registered from
-/// the auction plan and checked against it.
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter. Prebid is selected in
+/// `[auction]`, registered from the auction plan and checked against it.
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         PREBID_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         registered_from_the_plan,
         validate,
     )
     .with_module_name(MODULE)
     .with_plan_registration(register_for_plan)
-    .with_plan_validator(validate_against_plan);
+    .with_plan_validator(validate_against_plan)
+}
 
 /// Prebid's registration needs the auction plan, so [`register_for_plan`]
 /// makes it and the settings alone add nothing.
@@ -221,7 +242,7 @@ pub struct LegacyPrebidConfig {
     pub timeout_ms: u32,
     #[serde(
         default = "default_bidders",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     pub bidders: Vec<String>,
     #[serde(default)]
@@ -231,7 +252,7 @@ pub struct LegacyPrebidConfig {
     /// and wildcard patterns (e.g., "/static/prebid/*" matches paths under that prefix).
     #[serde(
         default = "default_script_patterns",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
     /// Absolute HTTPS URL of the generated external Prebid bundle.
@@ -259,13 +280,19 @@ pub struct LegacyPrebidConfig {
     ///
     /// This list is independent of [`bidders`](Self::bidders) — the operator
     /// manages both lists explicitly.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub client_side_bidders: Vec<String>,
     /// GAM ad-unit-path suffixes excluded from Trusted Server refresh auctions.
     ///
     /// Matching is exact and case-sensitive. Excluded slots still refresh through
     /// GAM, but are not included in synthetic Prebid refresh ad units.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
     pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
 }
@@ -312,7 +339,7 @@ pub struct PrebidIntegrationConfig {
     pub debug: bool,
     #[serde(
         default = "default_script_patterns",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
     #[serde(default)]
@@ -327,9 +354,15 @@ pub struct PrebidIntegrationConfig {
     #[serde(default)]
     #[validate(custom(function = "validate_external_bundle_sri"))]
     pub external_bundle_sri: Option<String>,
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub client_side_bidders: Vec<String>,
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
     pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
     /// Prebid User ID modules that Trusted Server installs and keeps installed.
@@ -1303,18 +1336,22 @@ mod tests {
 
     use super::*;
 
-    use crate::auction::plan::{BidderId, BidderRouteConfig, ProviderId};
+    use trusted_server_core::auction::plan::{BidderId, BidderRouteConfig, ProviderId};
 
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
-    use crate::integrations::{
+    use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use trusted_server_core::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
-    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
 
-    use crate::settings::Settings;
-    use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
+    use trusted_server_core::settings::Settings;
+    use trusted_server_core::streaming_processor::{
+        Compression, PipelineConfig, StreamingPipeline,
+    };
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     use http::Method;
     use serde_json::json;
@@ -1354,8 +1391,191 @@ mod tests {
         }
     }
 
+    /// The shared test settings with Prebid selected and its bundle served
+    /// from an external URL.
     fn make_settings() -> Settings {
-        create_test_settings()
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "auction",
+                MODULE,
+                &json!({
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "bundle": { "modules": { "bidder": ["exampleBidderBidAdapter"] } }
+                }),
+            )
+            .expect("should select Prebid");
+        settings
+    }
+
+    fn validate_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+        trusted_server_core::config::validate_settings_for_deploy_with(settings, &[builder()])
+    }
+
+    fn validate_for_runtime(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+        trusted_server_core::config::validate_settings_for_runtime_with(settings, &[builder()])
+    }
+
+    /// The setting that named the Prebid Server endpoint belongs to a
+    /// `[demand]` source, so Prebid's table refuses it.
+    #[test]
+    fn removed_integration_fields_are_rejected() {
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config("auction", MODULE, &json!({ "server_url": "removed-value" }))
+            .expect("should insert the removed Prebid field");
+        let error = settings
+            .module_config::<PrebidIntegrationConfig>(MODULE)
+            .expect_err("should reject the removed Prebid field");
+        assert!(
+            format!("{error:?}").contains("server_url"),
+            "should identify the removed field: {error:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
+        let mut settings = make_settings();
+        settings.proxy.allowed_domains.clear();
+
+        let err = validate_for_deploy(&settings)
+            .expect_err("should reject external Prebid bundle without proxy allowlist");
+
+        assert!(
+            err.to_string().contains("proxy.allowed_domains"),
+            "error should mention proxy.allowed_domains: {err:?}"
+        );
+    }
+
+    /// A selected Prebid table that names bundle modules has to name where the
+    /// bundle is served from as well, and deploy validation says so. Selection
+    /// is what makes Prebid run, so the check applies to a selected table.
+    #[test]
+    fn deploy_validation_requires_external_bundle_url_for_selected_prebid() {
+        let mut settings = make_settings();
+        settings
+            .insert_module_config(
+                "auction",
+                MODULE,
+                &json!({
+                    "bundle": {
+                        "modules": { "bidder": ["exampleBidderBidAdapter"] }
+                    }
+                }),
+            )
+            .expect("should insert the Prebid config");
+
+        let error = validate_for_deploy(&settings)
+            .expect_err("should require enabled Prebid external bundle URL");
+        assert!(error.to_string().contains("external_bundle_url"));
+    }
+
+    /// Deploy and runtime validation both reach Prebid's table. It is planted
+    /// with a setting its config type does not have, and the rejection must
+    /// name the table, so a failure elsewhere in validation cannot pass for
+    /// it.
+    #[test]
+    fn validation_reaches_the_prebid_table() {
+        let mut settings = make_settings();
+        settings
+            .insert_module_config("auction", MODULE, &json!({ "no_such_setting": true }))
+            .expect("should insert the planted table");
+        let expected = "[auction.prebid]";
+
+        let Err(deploy_error) = validate_for_deploy(&settings) else {
+            panic!("deploy validation should reject the planted table");
+        };
+        assert!(
+            format!("{deploy_error:?}").contains(expected),
+            "deploy validation should reject the table by name: {deploy_error:?}"
+        );
+
+        let Err(runtime_error) = validate_for_runtime(&settings) else {
+            panic!("runtime validation should reject the planted table");
+        };
+        assert!(
+            format!("{runtime_error:?}").contains(expected),
+            "runtime validation should reject the table by name: {runtime_error:?}"
+        );
+    }
+
+    /// Settings in which `exampleBidder` runs server-side through a demand
+    /// source and is also listed as a client-side bidder.
+    fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
+        let mut settings = make_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_string()];
+        settings.auction.enabled = auction_enabled;
+        settings.demand = trusted_server_core::auction::test_support::demand_named(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            BidderRouteConfig {
+                module: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .module_config::<PrebidIntegrationConfig>(MODULE)
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .insert_module_config("auction", MODULE, &prebid)
+            .expect("should replace Prebid config");
+        settings
+    }
+
+    #[test]
+    fn runtime_validation_rejects_enabled_browser_bidder_ownership_conflict() {
+        let settings = settings_with_browser_bidder_overlap(true);
+
+        let error = validate_for_runtime(&settings)
+            .expect_err("should reject enabled browser bidder ownership conflict");
+
+        assert!(error.to_string().contains("exampleBidder"));
+        assert!(
+            error
+                .to_string()
+                .contains("both client-side and server-side")
+        );
+    }
+
+    #[test]
+    fn runtime_validation_accepts_disabled_browser_bidder_ownership_overlap() {
+        let settings = settings_with_browser_bidder_overlap(false);
+
+        validate_for_runtime(&settings)
+            .expect("runtime should accept disabled browser bidder ownership overlap");
+    }
+
+    #[test]
+    fn js_module_ids_defer_prebid_shim_when_external_bundle_is_configured() {
+        let settings = make_settings();
+        let plan = Arc::new(
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
+        );
+
+        let registry =
+            IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder()])
+                .expect("should create registry");
+
+        assert!(
+            registry.js_module_ids().contains(&"prebid"),
+            "external bundle mode should include the prebid shim in embedded TSJS modules"
+        );
+        assert!(
+            !registry.js_module_ids_immediate().contains(&"prebid"),
+            "the prebid shim should not load in the immediate TSJS bundle"
+        );
+        assert!(
+            registry.js_module_ids_deferred().contains(&"prebid"),
+            "the prebid shim should load as a deferred TSJS module"
+        );
+        assert!(
+            registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
+            "external bundle mode should register the first-party bundle route"
+        );
     }
 
     #[test]
@@ -1604,10 +1824,12 @@ server_url = "https://prebid.example/openrtb2/auction"
             )
             .expect("should replace Prebid test configuration");
         let plan = Arc::new(
-            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
         );
-        let registry = IntegrationRegistry::with_plan(&settings, plan)
-            .expect("should build integration registry");
+        let registry =
+            IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder()])
+                .expect("should build integration registry");
         let document_state = IntegrationDocumentState::default();
         let context = IntegrationHtmlContext {
             request_host: "pub.example",
@@ -1944,14 +2166,8 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
                 }),
             )
             .expect("should update prebid config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1999,14 +2215,8 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
                 }),
             )
             .expect("should update prebid config");
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -2187,19 +2397,21 @@ external_bundle_sri = "sha384-AAAA"
     #[test]
     fn external_bundle_registration_requires_bundle_url() {
         let mut settings = make_settings();
-        // The shared fixture configures a bundle URL, and this asks what the
-        // registry does without one.
+        // The settings name a bundle URL, and this asks what the registry
+        // does without one.
         settings
             .insert_module_config("auction", "auction.prebid", &json!({}))
             .expect("should replace the prebid block");
         let plan = Arc::new(
-            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
         );
 
-        let error = match IntegrationRegistry::with_plan(&settings, plan) {
-            Ok(_) => panic!("should reject missing external bundle URL"),
-            Err(error) => error,
-        };
+        let error =
+            match IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder()]) {
+                Ok(_) => panic!("should reject missing external bundle URL"),
+                Err(error) => error,
+            };
 
         assert!(
             error.to_string().contains("external_bundle_url"),
@@ -2221,14 +2433,8 @@ external_bundle_sri = "sha384-AAAA"
             )
             .expect("should update prebid config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry with valid SHA-256 and no SRI");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry with valid SHA-256 and no SRI");
 
         assert!(
             registry.has_route(&Method::GET, PREBID_BUNDLE_ROUTE),
@@ -2251,14 +2457,8 @@ external_bundle_sri = "sha384-AAAA"
             )
             .expect("should update prebid config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry with valid SHA-256 and SHA-384 SRI");
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry with valid SHA-256 and SHA-384 SRI");
 
         assert!(
             registry.has_route(&Method::GET, PREBID_BUNDLE_ROUTE),
@@ -2280,13 +2480,7 @@ external_bundle_sri = "sha384-AAAA"
             )
             .expect("should update prebid config");
 
-        let err = match IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        ) {
+        let err = match IntegrationRegistry::with_registrations(&settings, &[builder()]) {
             Ok(_) => panic!("should reject bundle host outside proxy.allowed_domains"),
             Err(err) => err,
         };
@@ -2606,13 +2800,15 @@ external_bundle_sri = "sha384-AAAA"
         let mut settings = make_settings();
         settings.proxy.allowed_domains.clear();
         let plan = Arc::new(
-            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
         );
 
-        let error = match IntegrationRegistry::with_plan(&settings, plan) {
-            Ok(_) => panic!("should reject external bundle without proxy allowlist"),
-            Err(error) => error,
-        };
+        let error =
+            match IntegrationRegistry::with_plan_and_registrations(&settings, plan, &[builder()]) {
+                Ok(_) => panic!("should reject external bundle without proxy allowlist"),
+                Err(error) => error,
+            };
 
         assert!(
             error.to_string().contains("proxy.allowed_domains"),
@@ -2641,7 +2837,7 @@ external_bundle_sri = "sha384-AAAA"
                 ],
             );
             let services = build_services_with_http_client(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
             );
             let req = http::Request::builder()
                 .method(Method::GET)
@@ -2806,8 +3002,8 @@ external_bundle_sri = "sha384-AAAA"
                 }),
             )
             .expect("should configure prebid");
-        let plan =
-            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan");
+        let plan = trusted_server_core::auction::compile_auction_plan(&settings)
+            .expect("should compile auction plan");
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
             request_host: "pub.example",
@@ -2930,19 +3126,19 @@ external_bundle_sri = "sha384-AAAA"
         browser_config.account_id = Some("browser-account".to_string());
         browser_config.timeout_ms = 1750;
         browser_config.debug = false;
-        let mut primary = crate::auction::test_support::demand_table(
+        let mut primary = trusted_server_core::auction::test_support::demand_table(
             "auction.prebid-server",
             "https://primary.example.test/openrtb",
         );
         primary.insert("timeout_ms".to_string(), json!(3000));
         primary.insert("debug".to_string(), json!(true));
-        let mut secondary = crate::auction::test_support::demand_table(
+        let mut secondary = trusted_server_core::auction::test_support::demand_table(
             "auction.prebid-server",
             "https://secondary.example.test/openrtb",
         );
         secondary.insert("timeout_ms".to_string(), json!(4000));
         secondary.insert("debug".to_string(), json!(true));
-        let mut config = crate::auction::test_support::plan_config(vec![
+        let mut config = trusted_server_core::auction::test_support::plan_config(vec![
             ("pbs_primary", primary),
             ("pbs_secondary", secondary),
         ]);
@@ -3242,5 +3438,14 @@ server_url = "https://prebid.example"
             ));
             assert!(result.is_ok(), "should accept legacy APS in {field}");
         }
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
     }
 }

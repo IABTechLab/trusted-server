@@ -5550,6 +5550,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-auction-prebid"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-audience-permutive"
 version = "0.1.0"
 dependencies = [
@@ -5629,6 +5648,7 @@ dependencies = [
  "toml",
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
+ "trusted-server-auction-prebid",
  "trusted-server-core",
  "trusted-server-modules",
  "url",
@@ -5851,6 +5871,7 @@ dependencies = [
  "trusted-server-ad-server-mock",
  "trusted-server-ad-tag-google",
  "trusted-server-auction-aps",
+ "trusted-server-auction-prebid",
  "trusted-server-audience-permutive",
  "trusted-server-bot-protection-datadome",
  "trusted-server-cmp-didomi",

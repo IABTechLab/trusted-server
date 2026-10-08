@@ -32,13 +32,6 @@ pub mod tests {
             assume_single_jurisdiction = true
 
             [auction]
-            modules = ["prebid"]
-
-            [auction.prebid]
-            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
-
-            [auction.prebid.bundle.modules]
-            bidder = ["exampleBidderBidAdapter"]
 
             [ec]
             module = "hmac"
@@ -61,8 +54,8 @@ pub mod tests {
         let written = crate::module_name::short_form(section, name);
         if section == "auction" {
             return crate_test_settings_str().replace(
-                "modules = [\"prebid\"]",
-                &format!("modules = [\"prebid\", \"{written}\"]"),
+                "[auction]\n",
+                &format!("[auction]\nmodules = [\"{written}\"]\n"),
             );
         }
         format!(

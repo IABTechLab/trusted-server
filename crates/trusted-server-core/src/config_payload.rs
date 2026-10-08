@@ -255,32 +255,6 @@ mod tests {
         )
     }
 
-    fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
-        let mut settings = test_settings();
-        settings.proxy.allowed_domains = vec!["*.example".to_string()];
-        settings.auction.enabled = auction_enabled;
-        settings.demand = crate::auction::test_support::demand_named(&["pbs"]);
-        settings.auction.bidders.insert(
-            "exampleBidder"
-                .parse()
-                .expect("should parse server-side bidder"),
-            crate::auction::BidderRouteConfig {
-                module: "pbs".parse().expect("should parse provider"),
-            },
-        );
-        let mut prebid = settings
-            .module_config::<crate::integrations::prebid::PrebidIntegrationConfig>(
-                crate::integrations::prebid::MODULE,
-            )
-            .expect("should parse Prebid config")
-            .expect("should have enabled Prebid config");
-        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
-        settings
-            .insert_module_config("auction", "auction.prebid", &prebid)
-            .expect("should replace Prebid config");
-        settings
-    }
-
     /// The ad server implementation a crate outside core supplies.
     static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
         crate::auction::demand::AdServerImplementation {
@@ -1041,20 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_blob_rejects_enabled_browser_bidder_ownership_conflict() {
-        let original = settings_with_browser_bidder_overlap(true);
-        let error = load_settings(&envelope_json(&original))
-            .expect_err("should reject enabled browser bidder ownership conflict");
-
-        assert!(error.to_string().contains("exampleBidder"));
-        assert!(
-            error
-                .to_string()
-                .contains("both client-side and server-side")
-        );
-    }
-
-    #[test]
     fn runtime_validation_rejects_short_resolved_passphrase() {
         let mut settings = test_settings();
         select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "short_key");
@@ -1129,14 +1089,6 @@ mod tests {
             !err.to_string().contains("change-me-proxy-secret"),
             "error should not expose the resolved secret value"
         );
-    }
-
-    #[test]
-    fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
-        let original = settings_with_browser_bidder_overlap(false);
-
-        load_settings(&envelope_json(&original))
-            .expect("runtime should accept disabled browser bidder ownership overlap");
     }
 
     #[test]

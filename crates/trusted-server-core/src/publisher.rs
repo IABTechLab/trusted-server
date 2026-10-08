@@ -3423,11 +3423,10 @@ pub(crate) fn write_bids_to_state(
 /// enabled cannot bloat every page render without bound.
 const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
 
-/// Per-bid creative preview length (in bytes) in the `ts-debug` dump. Mirrors
-/// the 512-byte upstream-body preview the prebid provider logs on an HTTP error
-/// (`integrations/prebid.rs`): enough to identify a creative without copying
-/// megabytes of `adm` markup into every page render. The full creative still
-/// renders via the injected bids `<script>`.
+/// Per-bid creative preview length (in bytes) in the `ts-debug` dump: enough
+/// to identify a creative without copying megabytes of `adm` markup into
+/// every page render. The full creative still renders via the injected bids
+/// `<script>`.
 const MAX_BID_CREATIVE_DUMP_BYTES: usize = 512;
 
 /// Truncate `value` to at most `max` bytes on a UTF-8 char boundary, appending
@@ -9811,27 +9810,21 @@ mod tests {
             template_fingerprint(settings, &registry)
         }
 
-        /// Base settings with one integration's config replaced, and the
-        /// integration itself run or not.
-        ///
-        /// Edits the parsed `[auction]` section rather than appending TOML, so the two
-        /// fixtures differ in exactly the field under test — the base settings already
-        /// declare `[auction.prebid]`, and a second table would not parse.
-        fn settings_with_prebid(runs: bool, timeout_ms: u32) -> Settings {
+        /// Base settings with one integration, core's stand-in, configured a
+        /// stated way, or with no integration selected at all.
+        fn settings_with_integration(runs: bool, timeout_ms: u32) -> Settings {
             let mut settings = create_test_settings();
             if runs {
                 settings
                     .insert_module_config(
-                        "auction",
-                        "auction.prebid",
+                        "testing",
+                        crate::integrations::registry_test_support::deferred_fixture::MODULE,
                         &serde_json::json!({
-                            "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                            "label": "example",
                             "timeout_ms": timeout_ms,
                         }),
                     )
-                    .expect("should insert the prebid table");
-            } else {
-                settings.auction.modules.clear();
+                    .expect("should insert the stand-in's table");
             }
             settings
         }
@@ -9843,19 +9836,19 @@ mod tests {
             // integration off changed the injected `<script>` set and left the cache key
             // untouched, and every reader kept getting the template built while it was on.
             assert_ne!(
-                fingerprint(&settings_with_prebid(true, 1000)),
-                fingerprint(&settings_with_prebid(false, 1000)),
+                fingerprint(&settings_with_integration(true, 1000)),
+                fingerprint(&settings_with_integration(false, 1000)),
                 "the set of integrations that run must select a different template"
             );
         }
 
         #[test]
         fn reconfiguring_an_integration_changes_the_fingerprint() {
-            // Config reaches the template directly: the prebid head insert carries the
-            // account ID, timeout and bidder list into bytes shared between readers.
+            // Config reaches the template directly: an integration's head insert
+            // carries its settings into bytes shared between readers.
             assert_ne!(
-                fingerprint(&settings_with_prebid(true, 1000)),
-                fingerprint(&settings_with_prebid(true, 2500)),
+                fingerprint(&settings_with_integration(true, 1000)),
+                fingerprint(&settings_with_integration(true, 2500)),
                 "an integration's configuration must select a different template"
             );
         }
@@ -9865,7 +9858,7 @@ mod tests {
             // `IntegrationSettings` derefs to a `HashMap`, whose iteration order varies.
             // An unsorted digest would differ between two requests to the same binary and
             // the cache would never hit — a fix that quietly disables the feature.
-            let settings = settings_with_prebid(true, 1000);
+            let settings = settings_with_integration(true, 1000);
             let first = fingerprint(&settings);
 
             for _ in 0..16 {
@@ -9878,7 +9871,7 @@ mod tests {
             // A second, independently parsed `Settings` builds a fresh `HashMap` with a
             // different iteration order, which is what actually exercises the sort.
             assert_eq!(
-                fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_integration(true, 1000)),
                 first,
                 "two equal configurations must fingerprint identically"
             );
@@ -13432,22 +13425,23 @@ mod tests {
             );
         }
 
-        /// [`settings_with_mode`], with one integration configured a stated way.
+        /// [`settings_with_mode`], with one integration, core's stand-in,
+        /// configured a stated way.
         ///
-        /// Edits the parsed `[auction]` section rather than appending TOML, so two
+        /// Edits the parsed settings rather than appending TOML, so two
         /// fixtures differ in exactly the field under test.
-        fn settings_with_prebid_timeout(mode: &str, timeout_ms: u32) -> Settings {
+        fn settings_with_integration_timeout(mode: &str, timeout_ms: u32) -> Settings {
             let mut settings = settings_with_mode(mode);
             settings
                 .insert_module_config(
-                    "auction",
-                    "auction.prebid",
+                    "testing",
+                    crate::integrations::registry_test_support::deferred_fixture::MODULE,
                     &serde_json::json!({
-                        "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                        "label": "example",
                         "timeout_ms": timeout_ms,
                     }),
                 )
-                .expect("should insert the prebid table");
+                .expect("should insert the stand-in's table");
             settings
         }
 
@@ -13485,8 +13479,8 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
-            let first = Arc::new(settings_with_prebid_timeout("esi", 1000));
-            let second = Arc::new(settings_with_prebid_timeout("esi", 2500));
+            let first = Arc::new(settings_with_integration_timeout("esi", 1000));
+            let second = Arc::new(settings_with_integration_timeout("esi", 2500));
             queue_shareable_html(&stub);
             queue_shareable_html(&stub);
 
@@ -13501,7 +13495,7 @@ mod tests {
             );
             assert_ne!(
                 stored[0], stored[1],
-                "two `[auction.prebid]` configurations must key different templates, because \
+                "two configurations of one integration must key different templates, because \
                  one key serves the first configuration's injected markup to the second"
             );
             assert_eq!(
@@ -13519,13 +13513,13 @@ mod tests {
             // moves between two equal configurations is a cache that never hits, which
             // this would read as "no measurable benefit" rather than as a bug.
             //
-            // The two `Settings` are parsed independently, so their `[auction.prebid]`
-            // maps iterate in different orders — which is what exercises the sort.
+            // The two `Settings` are parsed independently, so the integration's
+            // table iterates in different orders, which is what exercises the sort.
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
-            let first = Arc::new(settings_with_prebid_timeout("esi", 1000));
-            let second = Arc::new(settings_with_prebid_timeout("esi", 1000));
+            let first = Arc::new(settings_with_integration_timeout("esi", 1000));
+            let second = Arc::new(settings_with_integration_timeout("esi", 1000));
             queue_shareable_html(&stub);
 
             let _ = run(&first, &services, navigation_request()).await;
@@ -19775,14 +19769,14 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
 
         assert_eq!(
-            parse_single_module_filename("tsjs-prebid.min.js", &registry),
-            Some("prebid"),
-            "should extract prebid from minified filename"
+            parse_single_module_filename("tsjs-creative.min.js", &registry),
+            Some("creative"),
+            "should extract the module id from a minified filename"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-prebid.js", &registry),
-            Some("prebid"),
-            "should extract prebid from unminified filename"
+            parse_single_module_filename("tsjs-creative.js", &registry),
+            Some("creative"),
+            "should extract the module id from an unminified filename"
         );
     }
 
@@ -19824,19 +19818,50 @@ mod tests {
             "should not resolve core, which is only ever served inside the bundle"
         );
         assert_eq!(
-            parse_single_module_filename("prebid.min.js", &registry),
+            parse_single_module_filename("creative.min.js", &registry),
             None,
             "should reject without tsjs- prefix"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-prebid.txt", &registry),
+            parse_single_module_filename("tsjs-creative.txt", &registry),
             None,
             "should reject non-js extension"
         );
     }
 
     #[test]
-    fn tsjs_dynamic_serves_prebid_shim_when_enabled() {
+    fn tsjs_dynamic_serves_a_deferred_module_when_it_is_selected() {
+        use crate::integrations::registry_test_support::deferred_fixture;
+
+        let mut settings = create_test_settings();
+        settings.select_module("testing", deferred_fixture::MODULE);
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create integration registry");
+        let req = build_request(
+            Method::GET,
+            &format!(
+                "https://publisher.example/static/tsjs={}",
+                deferred_fixture::MODULE_FILE
+            ),
+        );
+
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should serve the deferred module when its integration is selected"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_returns_not_found_for_a_module_that_is_not_named() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -19848,35 +19873,10 @@ mod tests {
         .expect("should create integration registry");
         let req = build_request(
             Method::GET,
-            "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
-        );
-
-        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
-            .expect("should handle tsjs request");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "should serve the deferred prebid shim module when prebid is enabled"
-        );
-    }
-
-    #[test]
-    fn tsjs_dynamic_returns_not_found_for_a_module_that_is_not_named() {
-        let mut settings = create_test_settings();
-        // The shared fixture names prebid, and this asks what is served when
-        // it does not.
-        settings.auction.modules.clear();
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
+            &format!(
+                "https://publisher.example/static/tsjs={}",
+                crate::integrations::registry_test_support::deferred_fixture::MODULE_FILE
             ),
-        )
-        .expect("should create integration registry");
-        let req = build_request(
-            Method::GET,
-            "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
