@@ -168,7 +168,7 @@ mod tests {
     use super::*;
     use error_stack::Report;
     use std::collections::HashMap;
-    use trusted_server_core::config_payload::settings_from_config_blob;
+    use trusted_server_core::config_payload::settings_from_config_blob_with;
     use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
 
     const TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
@@ -320,10 +320,11 @@ mod tests {
     fn generated_blob_verifies_and_applies_origin_override() {
         let envelope = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"))
             .expect("should build envelope");
-        let settings = settings_from_config_blob(
+        let settings = settings_from_config_blob_with(
             &envelope,
             &integration_secret_store(),
             &StoreName::from("trusted_server_secrets"),
+            &trusted_server_modules::builders(),
         )
         .expect("should verify blob");
 
