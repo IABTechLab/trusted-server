@@ -11,7 +11,6 @@
 //! - [`error`]: Error types and error handling utilities
 //! - [`consent`]: Consent signal extraction and logging
 //! - [`geo`]: Geographic location utilities and DMA code extraction
-//! - [`models`]: Data models for ad serving and callbacks
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
 //! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle
@@ -54,7 +53,6 @@ pub mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
 pub mod integrations;
-pub mod models;
 pub mod module_name;
 pub(crate) mod module_secrets;
 pub mod openrtb;

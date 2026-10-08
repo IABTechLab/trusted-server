@@ -30,9 +30,6 @@ pub enum TrustedServerError {
     #[display("Auction error: {message}")]
     Auction { message: String },
 
-    /// GAM (Google Ad Manager) integration error.
-    #[display("GAM error: {message}")]
-    Gam { message: String },
     /// GDPR consent handling error.
     ///
     /// **Note:** Unlike [`BadRequest`](Self::BadRequest), the detail `message`
@@ -114,7 +111,6 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Auction { .. } => StatusCode::BAD_GATEWAY,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -166,12 +162,6 @@ mod tests {
             (
                 TrustedServerError::Auction {
                     message: String::from("bid timeout"),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                TrustedServerError::Gam {
-                    message: String::from("request failed"),
                 },
                 StatusCode::BAD_GATEWAY,
             ),
@@ -269,7 +259,6 @@ mod tests {
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
                 TrustedServerError::Auction { .. } => StatusCode::BAD_GATEWAY,
-                TrustedServerError::Gam { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -317,9 +306,6 @@ mod tests {
             },
             TrustedServerError::Auction {
                 message: "bid timeout".into(),
-            },
-            TrustedServerError::Gam {
-                message: "api key invalid".into(),
             },
             TrustedServerError::Integration {
                 integration: "foo".into(),
@@ -393,7 +379,6 @@ mod tests {
             TrustedServerError::BadRequest { .. }
             | TrustedServerError::Configuration { .. }
             | TrustedServerError::Auction { .. }
-            | TrustedServerError::Gam { .. }
             | TrustedServerError::GdprConsent { .. }
             | TrustedServerError::InvalidUtf8 { .. }
             | TrustedServerError::InvalidHeaderValue { .. }
@@ -486,12 +471,6 @@ mod tests {
             (
                 TrustedServerError::Auction {
                     message: "auction failed".to_string(),
-                },
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                TrustedServerError::Gam {
-                    message: "gam failed".to_string(),
                 },
                 StatusCode::BAD_GATEWAY,
             ),
