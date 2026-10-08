@@ -32,11 +32,11 @@ pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
     IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
-    IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy, IntegrationRegistration,
-    IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
-    IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
-    RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome, ScriptRewriteAction,
+    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationMetadata,
+    IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
+    IntegrationRequestFilter, IntegrationScriptContext, IntegrationScriptRewriter,
+    ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+    RequestFilterRegistryInput, RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -294,14 +294,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         IntegrationBuilder {
             id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             build: js_asset_proxy::register,
-        },
-        IntegrationBuilder {
-            id: "aps",
-            build: aps::register,
-        },
-        IntegrationBuilder {
-            id: "prebid",
-            build: prebid::register,
         },
         IntegrationBuilder {
             id: "testlight",

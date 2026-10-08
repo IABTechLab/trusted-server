@@ -307,7 +307,8 @@ winner row. Never mark both an original and mediator copy as the same win.
 Emission is not gated by consent. `gdpr_applies` comes from
 `ConsentContext.gdpr_applies`; `consent_present` is `!ConsentContext::is_empty()`
 because an `EcContext` always contains a consent context, even when no signal was
-supplied.
+supplied. The complete request User-Agent is emitted for downstream data-sync
+classification, including on consent-denied observations.
 
 #### `auction_events_raw` row schema
 
@@ -325,6 +326,7 @@ All row kinds share these columns:
 | `region`           | Nullable(String)       | coarse geo                                        |
 | `is_mobile`        | UInt8                  | 0=desktop, 1=mobile, 2=unknown                    |
 | `is_known_browser` | UInt8                  | 0=bot, 1=browser, 2=unknown                       |
+| `user_agent`       | Nullable(String)       | complete request User-Agent for data syncs        |
 | `gdpr_applies`     | UInt8                  | 0/1                                               |
 | `consent_present`  | UInt8                  | 0/1                                               |
 
@@ -364,11 +366,13 @@ Bid fields:
 | `ad_domain`  | Nullable(String)                 | advertiser domain, optional                              |
 | `ad_id`      | Nullable(String)                 | creative ID, optional                                    |
 
-Privacy note: `auction_id` is generated independently for telemetry. No EC ID,
-internal auction request ID, full URL, IP, or raw user-agent string is emitted.
-Page paths use the same bounded route-normalization principle as access logs so
-a dynamic path segment cannot become a per-user identifier. Geo remains at
-country/region granularity.
+Data contract note: `auction_id` is generated independently for telemetry. No
+EC ID, internal auction request ID, full URL, or IP is emitted. The complete
+User-Agent is intentionally retained in the raw datasource so downstream data
+syncs, rather than edge code, own browser classification. Page paths use the
+same bounded route-normalization principle as access logs so a dynamic path
+segment cannot become a per-user identifier. Geo remains at country/region
+granularity.
 
 Device signals note: both `is_mobile` (0/1/2) and the bot-vs-browser bit come
 from the adapter's already-derived device signals. Phase 1 snapshots that struct
@@ -605,7 +609,8 @@ the direct-ingest architecture.
 - Provider launch, parse, transport, timeout, no-bid, and success outcomes are
   represented consistently on synchronous and split-phase paths.
 - Telemetry auction IDs are fresh random UUIDs unrelated to internal request IDs
-  and EC values. No EC ID, full URL, IP, or raw user-agent string is emitted.
+  and EC values. No EC ID, full URL, or IP is emitted. The complete User-Agent
+  is retained for downstream data-sync classification.
 - The Fastly adapter sends auction rows to Tinybird through a direct asynchronous
   backend POST using a Secret Store token scoped to APPEND on
   `auction_events_raw`; it does not configure or require Fastly real-time

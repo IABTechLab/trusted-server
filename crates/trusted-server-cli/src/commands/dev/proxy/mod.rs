@@ -76,8 +76,13 @@ async fn finish_interrupted_run<Restore, Stop, Drain>(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain_manager).await;
 }
 
+/// Default `--listen` address, shared with the `config` tests so they cannot
+/// silently drift from the real default.
+pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:18080";
+
 /// `ts dev proxy [OPTIONS]` — see the design spec §4.
 #[derive(Debug, clap::Args)]
+#[command(arg_required_else_help = true)]
 pub struct ProxyArgs {
     /// Rewrite rule `FROM=TO` (repeatable).
     #[arg(long = "map", value_name = "FROM=TO")]
@@ -94,7 +99,7 @@ pub struct ProxyArgs {
     pub to: Option<String>,
 
     /// Proxy listen address. Non-loopback requires `--allow-non-loopback`.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:18080")]
+    #[arg(long, value_name = "ADDR", default_value = DEFAULT_LISTEN)]
     pub listen: String,
 
     /// Permit binding a non-loopback `--listen` (disables blind tunnel/forward).
@@ -247,13 +252,18 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
         return Ok(());
     }
 
-    // Recover a leftover Safari proxy state from a previously hard-killed run
-    // BEFORE resolving rules: a missing/bad rule must not strand the system
-    // proxy. `ca_dir` needs no rule. Non-interactive so an unrelated startup
-    // never blocks on a sudo password prompt.
-    browser::restore_system_proxy_if_pending(&config::ca_dir(args), false);
-
+    // Resolve rules BEFORE recovering leftover Safari proxy state: an
+    // invocation with no usable rule must fail without touching system proxy
+    // state or attempting sudo. Tradeoff: a proxy stranded by a previously
+    // hard-killed run stays stranded until the next run with a valid config,
+    // which restores it here before anything else starts. `resolve` only
+    // validates arguments (and reads `--basic-auth-file`); it neither reads
+    // nor changes system proxy state, so it is safe to run first.
     let mut cfg = config::resolve(args).change_context(ProxyError::Config)?;
+
+    // Non-interactive so an unrelated startup never blocks on a sudo password
+    // prompt.
+    browser::restore_system_proxy_if_pending(&cfg.ca_dir, false);
 
     let ca = Arc::new(
         ca::CertAuthority::load_or_generate(&cfg.ca_dir)
@@ -385,5 +395,38 @@ mod tests {
             ["restore", "stop", "drain"]
         );
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn no_rule_fails_before_touching_pending_system_proxy_restore() {
+        #[derive(clap::Parser)]
+        struct W {
+            #[command(flatten)]
+            a: ProxyArgs,
+        }
+
+        // A malformed restore file (no service name) is deleted by
+        // `restore_system_proxy_if_pending` without running `networksetup`, so
+        // whether it survives shows whether the restore ran, without touching
+        // the real system proxy.
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let restore_path = dir.path().join(browser::SAFARI_RESTORE_FILE);
+        std::fs::write(&restore_path, "\nhttp://127.0.0.1:18080/proxy.pac\noff\n")
+            .expect("should write restore file");
+        let ca_dir = dir.path().to_string_lossy().into_owned();
+        let args = <W as clap::Parser>::try_parse_from(["ts", "--insecure", "--ca-dir", &ca_dir])
+            .expect("should parse proxy args")
+            .a;
+
+        let err = run(&args).expect_err("should fail without a rewrite rule");
+
+        assert!(
+            matches!(err.current_context(), ProxyError::Config),
+            "should fail with a config error"
+        );
+        assert!(
+            restore_path.exists(),
+            "should fail before attempting to restore the system proxy"
+        );
     }
 }

@@ -1,25 +1,22 @@
 //! Fastly-backed implementations of the platform traits defined in
 //! `trusted-server-core::platform`.
 
-use std::io::Read as _;
-use std::net::IpAddr;
-use std::sync::Arc;
-
 use bytes::Bytes;
-use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{Geo, geo_lookup};
 use fastly::{ConfigStore, Request, SecretStore};
+use std::io::Read as _;
+use std::net::IpAddr;
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
-    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    PlatformCacheIntent, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
+    PlatformHttpRequest, PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode,
+    PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
+    StoreName,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
 
@@ -150,6 +147,11 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 /// timeout → unique name).
 pub struct FastlyPlatformBackend;
 
+#[cfg(test)]
+const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
+#[cfg(test)]
+const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
         .port(spec.port)
@@ -160,83 +162,15 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .discriminator(spec.discriminator.as_deref())
 }
 
-/// Transport-timeout quantum for auction backends (see
-/// [`FastlyPlatformBackend::canonicalize_transport_timeout_ms`]).
-const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-
-/// Upper bound of the fine-grained quantum range.
-///
-/// Budget-bound values below this ceiling are floored to a
-/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple (the issue #847 behavior for the
-/// default 2000 ms auction). At or above it, values snap to the coarse
-/// [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] instead so the total number of
-/// distinct budget-derived buckets stays globally bounded regardless of how
-/// large the configured ceiling is.
-const TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
-
-/// Coarse rungs for budget-bound transport timeouts below one quantum,
-/// ordered high to low.
-///
-/// Below one quantum, passing the exact wall-clock remainder through would mint
-/// a distinct backend name for every millisecond in `1..250`, so the
-/// near-exhausted tail alone could exceed Fastly's per-service dynamic backend
-/// limit. Snapping to this finite ladder instead bounds the number of
-/// budget-derived names an origin can produce. Budgets below the smallest rung
-/// round to zero, which callers treat as "budget exhausted — skip the launch".
-const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
-
-/// Coarse rungs for budget-bound transport timeouts at or above the quantum
-/// ceiling, ascending. Every rung is a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-/// multiple.
-///
-/// Above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], flooring to a 250 ms multiple
-/// would let a large configured ceiling (e.g. 60,000 ms) mint hundreds of
-/// distinct backend names — recreating the per-service dynamic backend
-/// exhaustion this quantization exists to prevent. This fixed, globally finite
-/// ladder caps the number of high-budget buckets instead: values are floored to
-/// the greatest rung no larger than the remaining budget, and anything above
-/// the top rung clamps to it. Rounding down never extends a transport cap past
-/// the remaining budget.
-///
-/// The rung spacing trades transport window for cardinality: just below a rung
-/// the haircut approaches the gap to the rung beneath (worst case ~50%, e.g. a
-/// remaining budget of 9,999 ms snaps to 5,000 ms). This is accepted — on the
-/// mediator path this value is the effective bound, but a denser ladder would
-/// buy back at most half a bucket of transport time at the cost of
-/// proportionally more backend names.
-const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
-    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
-
-/// Round a budget-bound transport timeout down to a stable, globally bounded
-/// bucket.
-///
-/// - At or above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], floors to the
-///   greatest [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] rung no larger than
-///   `remaining_ms` (clamping to the top rung above it).
-/// - Within the quantum range, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-///   multiple.
-/// - Below one quantum, snaps down to the greatest [`SUB_QUANTUM_LADDER_MS`]
-///   rung no larger than `remaining_ms` (or zero).
-fn quantize_transport_timeout_ms(remaining_ms: u32) -> u32 {
-    if remaining_ms >= TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
-        return TRANSPORT_TIMEOUT_COARSE_LADDER_MS
-            .into_iter()
-            .rev()
-            .find(|&rung| rung <= remaining_ms)
-            .unwrap_or(TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
-    }
-    let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
-    if floored > 0 {
-        return floored;
-    }
-    SUB_QUANTUM_LADDER_MS
-        .into_iter()
-        .find(|&rung| rung <= remaining_ms)
-        .unwrap_or(0)
-}
-
 impl PlatformBackend for FastlyPlatformBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Fastly
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        // Use the same host normalization as registration. In particular,
+        // URL-derived IPv6 hosts arrive bracketed, but both forms must predict
+        // the backend that `ensure` actually registers.
         backend_config_from_spec(spec)
             .predict_name()
             .change_context(PlatformError::Backend)
@@ -246,28 +180,6 @@ impl PlatformBackend for FastlyPlatformBackend {
         backend_config_from_spec(spec)
             .ensure()
             .change_context(PlatformError::Backend)
-    }
-
-    /// Quantize the transport timeout so budget-derived values do not mint a
-    /// new dynamic backend name on every request.
-    ///
-    /// Fastly embeds the first-byte and between-bytes timeouts in the dynamic
-    /// backend name (see [`BackendConfig`]) and pools connections per backend
-    /// name. A per-request wall-clock budget would otherwise defeat that
-    /// pooling and accumulate registrations toward the per-service dynamic
-    /// backend limit.
-    ///
-    /// A provider's own configured timeout is a constant, so when it is the
-    /// binding constraint it is returned verbatim — including sub-quantum
-    /// configured values, which must not be rounded away or the provider could
-    /// never launch. Only the budget-bound value is snapped to a stable bucket
-    /// via [`quantize_transport_timeout_ms`]. Rounding down never extends a
-    /// transport cap past the remaining budget.
-    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
-        if remaining_ms >= configured_ms {
-            return configured_ms;
-        }
-        quantize_transport_timeout_ms(remaining_ms)
     }
 }
 
@@ -526,9 +438,37 @@ fn fastly_response_to_platform(
 // FastlyPlatformHttpClient
 // ---------------------------------------------------------------------------
 
-fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) {
-    if bypass_cache {
-        request.set_pass(true);
+/// Apply the caller's cache intent to a Fastly request.
+///
+/// The two branches are mutually exclusive by construction, which is the point of
+/// [`PlatformCacheIntent`]: `set_surrogate_key` "overrides any previous
+/// `Request::set_pass` call" (`fastly-0.12.1/src/http/request.rs:2462`), so calling both
+/// would silently cancel the bypass.
+///
+/// Readthrough is enabled by *omitting* `set_pass`, never by adding a TTL. `set_ttl`
+/// carries the same override note and additionally overrides the origin's own
+/// `Cache-Control`, including `private` and `no-store` — it would turn the hazard this
+/// gate exists to avoid into an API.
+fn apply_fastly_cache_intent(request: &mut fastly::Request, intent: &PlatformCacheIntent) {
+    match intent {
+        PlatformCacheIntent::Bypass => request.set_pass(true),
+        PlatformCacheIntent::Shared { surrogate_key } => {
+            match fastly::http::HeaderValue::from_str(surrogate_key) {
+                Ok(value) => request.set_surrogate_key(value),
+                Err(error) => {
+                    // Fail closed. Caching without the key would store an object no purge
+                    // can reach, which is worse than not caching it: the whole rollback
+                    // story for readthrough is "purge the key".
+                    log::error!(
+                        "Surrogate key {surrogate_key:?} is not a valid header value \
+                         ({error}); bypassing the cache rather than storing an \
+                         unpurgeable object"
+                    );
+                    request.set_pass(true);
+                }
+            }
+        }
+        PlatformCacheIntent::Default => {}
     }
 }
 
@@ -544,6 +484,14 @@ fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) 
 /// - [`select`](PlatformHttpClient::select) downcasts each
 ///   [`PlatformPendingRequest`] back to `fastly::PendingRequest` and calls
 ///   `fastly::http::request::select()`.
+///
+/// Fastly's Compute HTTP API sends one request to the named backend and returns
+/// the origin response; it has no client-side redirect-follow mode. Consequently
+/// each trait call below performs exactly one underlying `.send()` or
+/// `.send_async()`, and an original 3xx remains visible to core. The host test
+/// environment cannot register a real Fastly backend, so the common
+/// `StubHttpClient` driver test records the one-send 3xx behavior while adapter
+/// tests cover request conversion and the single-send boundary.
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
@@ -563,13 +511,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
-        let bypass_cache = request.bypass_cache;
+        let cache_intent = request.cache_intent.clone();
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
         }
-        apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
+        apply_fastly_cache_intent(&mut fastly_req, &cache_intent);
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -587,9 +535,9 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         }
         let stream_response = request.stream_response;
         let request_method = request.request.method().clone();
-        let bypass_cache = request.bypass_cache;
+        let cache_intent = request.cache_intent.clone();
         let mut fastly_req = edge_request_to_fastly(request.request)?;
-        apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
+        apply_fastly_cache_intent(&mut fastly_req, &cache_intent);
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -805,16 +753,6 @@ pub fn client_info_from_request(req: &Request, client_ip: Option<IpAddr>) -> Cli
     }
 }
 
-/// Open a named KV store as a [`PlatformKvStore`] implementation.
-///
-/// # Errors
-///
-/// Returns [`KvError::Unavailable`] when the store does not exist, or
-/// [`KvError::Internal`] when the Fastly SDK fails to open it.
-pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
-    FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1024,6 +962,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edge_request_to_fastly_preserves_query_encoding_order_and_duplicates() {
+        let expected_query = "space=a+b&plus=%2B&quote=%27&empty=&x=1&x=2&country=US&region=CA";
+        let request = request_builder()
+            .method("GET")
+            .uri(format!(
+                "https://sdk.example.com/key/loader.js?{expected_query}"
+            ))
+            .body(Body::empty())
+            .expect("should build request with encoded query");
+
+        let fastly_req = edge_request_to_fastly(request).expect("should convert request");
+
+        assert_eq!(
+            fastly_req.get_url().query(),
+            Some(expected_query),
+            "should preserve query encoding and order across Fastly conversion"
+        );
+        assert_eq!(
+            fastly_req
+                .get_url()
+                .query_pairs()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("country"))
+                .count(),
+            1,
+            "should retain exactly one country pair"
+        );
+        assert_eq!(
+            fastly_req
+                .get_url()
+                .query_pairs()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("region"))
+                .count(),
+            1,
+            "should retain exactly one region pair"
+        );
+    }
+
     // --- FastlyPlatformBackend::predict_name --------------------------------
 
     #[test]
@@ -1175,25 +1151,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bracketed_ipv6_predict_name_matches_bare_and_ensured_backend_name() {
+        let backend = FastlyPlatformBackend;
+        let bracketed = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "[2001:db8::9]".to_string(),
+            port: Some(8443),
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+            discriminator: Some("ipv6-provider".to_string()),
+        };
+        let mut bare = bracketed.clone();
+        bare.host = "2001:db8::9".to_string();
+
+        let predicted = backend
+            .predict_name(&bracketed)
+            .expect("should predict bracketed IPv6 backend name");
+        let bare_predicted = backend
+            .predict_name(&bare)
+            .expect("should predict bare IPv6 backend name");
+        let ensured = backend
+            .ensure(&bracketed)
+            .expect("should register bracketed IPv6 backend");
+
+        assert_eq!(predicted, bare_predicted);
+        assert_eq!(predicted, ensured);
+    }
+
     // --- FastlyPlatformHttpClient -------------------------------------------
 
     #[test]
-    fn apply_fastly_cache_bypass_sets_pass_when_enabled() {
-        let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_bypass(&mut request, true);
+    fn auction_http_capabilities_are_explicit() {
+        let client = FastlyPlatformHttpClient;
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Fastly
+            .descriptor()
+            .capabilities();
+        assert!(client.supports_concurrent_fanout());
+        assert!(capabilities.supports_concurrent_provider_fanout());
+        assert!(!client.has_enforceable_total_request_deadline());
         assert!(
-            format!("{request:?}").contains("cache_override: Pass"),
-            "enabled bypass should select Fastly pass mode"
+            !capabilities.has_enforceable_total_request_deadline(),
+            "first-byte and between-byte timers are not a hard total request deadline"
         );
     }
 
     #[test]
-    fn apply_fastly_cache_bypass_preserves_default_when_disabled() {
+    fn response_conversion_preserves_original_redirect_at_single_send_boundary() {
+        let mut response = fastly::Response::from_status(fastly::http::StatusCode::FOUND);
+        response.set_header("location", "https://redirect.example/next");
+
+        let platform = fastly_response_to_platform(response, "origin", false, false)
+            .expect("should convert redirect response");
+
+        assert_eq!(platform.response.status().as_u16(), 302);
+        assert_eq!(
+            platform
+                .response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://redirect.example/next")
+        );
+    }
+
+    #[test]
+    fn apply_fastly_cache_intent_sets_pass_for_bypass() {
         let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_bypass(&mut request, false);
+        apply_fastly_cache_intent(&mut request, &PlatformCacheIntent::Bypass);
+        assert!(
+            format!("{request:?}").contains("cache_override: Pass"),
+            "bypass should select Fastly pass mode"
+        );
+    }
+
+    #[test]
+    fn apply_fastly_cache_intent_leaves_default_alone() {
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_intent(&mut request, &PlatformCacheIntent::Default);
         assert!(
             format!("{request:?}").contains("cache_override: None"),
-            "disabled bypass should preserve Fastly read-through caching"
+            "the default intent should preserve Fastly read-through caching"
+        );
+    }
+
+    #[test]
+    fn apply_fastly_cache_intent_never_passes_on_the_shared_branch() {
+        // Readthrough is enabled by *omitting* set_pass. If this branch ever set pass as
+        // well, the surrogate key would reverse it — and the resulting behavior would
+        // depend on call order rather than on what the code says.
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_intent(
+            &mut request,
+            &PlatformCacheIntent::Shared {
+                surrogate_key: "ts-origin".to_owned(),
+            },
+        );
+        let rendered = format!("{request:?}");
+        assert!(
+            !rendered.contains("cache_override: Pass"),
+            "the shared branch must not bypass, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("ts-origin"),
+            "the shared branch must attach the surrogate key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_surrogate_key_that_cannot_be_a_header_value_falls_back_to_bypass() {
+        // Fail closed: caching without the key would store an object no purge can reach,
+        // and "purge the key" is the entire rollback story for readthrough.
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_intent(
+            &mut request,
+            &PlatformCacheIntent::Shared {
+                surrogate_key: "bad\nkey".to_owned(),
+            },
+        );
+        assert!(
+            format!("{request:?}").contains("cache_override: Pass"),
+            "an unusable key must bypass rather than store something unpurgeable"
         );
     }
 

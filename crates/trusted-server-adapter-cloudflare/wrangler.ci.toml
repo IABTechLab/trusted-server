@@ -14,3 +14,12 @@ id = "ci-local-kv"
 # Placeholder replaced by the integration test harness with a JSON object that
 # contains the runtime Trusted Server app-config blob envelope.
 TRUSTED_SERVER_CONFIG = "{}"
+
+# Fictitious integration-only secret values. `worker::Env::secret` reads these
+# string bindings in local Wrangler runs; production values are provisioned with
+# `wrangler secret put` instead of being committed to a manifest.
+integration_admin_password = "integration-admin-password-32-bytes-ok"
+integration_proxy_secret = "integration-test-proxy-secret-32-bytes-ok"
+integration_ec_passphrase = "integration-test-ec-secret-padded-32"
+integration_partner_token_alpha = "integration-test-token-alpha-32-bytes-ok"
+integration_partner_token_bravo = "integration-test-token-bravo-32-bytes-ok"

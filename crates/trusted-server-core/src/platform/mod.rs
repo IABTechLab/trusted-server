@@ -34,6 +34,7 @@
 
 use std::time::Duration;
 
+mod backend_naming;
 mod error;
 mod http;
 mod image_optimizer;
@@ -46,11 +47,15 @@ mod timed_kv;
 mod traits;
 mod types;
 
+pub use backend_naming::{
+    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
+    BackendNamingPolicy, PredictedBackend,
+};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult, UnavailableHttpClient,
+    PlatformCacheIntent, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, PlatformSelectResult, UnavailableHttpClient,
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
@@ -65,8 +70,8 @@ pub use template_cache::{
     PlatformTemplateCache, PlatformTemplateCacheReservation, REPLAYABLE_POLICY_HEADERS,
     TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
     TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
-    TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
-    VaryHeaderValues, VarySpec,
+    TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
+    UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
 pub use timed_kv::TimedKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};

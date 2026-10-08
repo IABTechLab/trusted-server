@@ -5,18 +5,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-    PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore, PlatformSecretStore,
-    RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    BackendNamingPolicy, ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore,
+    PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
 use trusted_server_core::platform::UnavailableHttpClient;
 
-#[cfg(target_arch = "wasm32")]
-use error_stack::ResultExt as _;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
@@ -61,27 +59,15 @@ impl PlatformSecretStore for NoopSecretStore {
 struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Cloudflare
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        let port = spec
-            .port
-            .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
-        let timeout_ms = spec.first_byte_timeout.as_millis();
-        let cert_suffix = if spec.certificate_check {
-            ""
-        } else {
-            "_nocert"
-        };
-        // Keep two providers that share an origin on distinct names so auction
-        // response correlation cannot cross providers.
-        let discriminator = spec
-            .discriminator
-            .as_deref()
-            .map(|d| format!("_p_{d}"))
-            .unwrap_or_default();
-        Ok(format!(
-            "{}_{}_{}_{timeout_ms}ms{cert_suffix}{discriminator}",
-            spec.scheme, spec.host, port
-        ))
+        self.naming_policy()
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
     }
 
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -254,7 +240,7 @@ fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bo
 }
 
 /// Cache policy for the outbound Workers `fetch` derived from
-/// [`PlatformHttpRequest::bypass_cache`].
+/// [`PlatformHttpRequest::cache_intent`].
 ///
 /// Workers subrequests are eligible for Cloudflare's cache by default, so an
 /// ad-stack navigation could otherwise be satisfied from cache (or revalidated
@@ -276,12 +262,25 @@ enum OutboundCacheMode {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn outbound_cache_mode(bypass_cache: bool) -> OutboundCacheMode {
-    if bypass_cache {
+fn outbound_cache_mode(
+    intent: &trusted_server_core::platform::PlatformCacheIntent,
+) -> OutboundCacheMode {
+    // Workers has no surrogate-key concept, so `Shared` falls in with `Default`: let the
+    // runtime apply its own behavior rather than pretending to honor a key it cannot use.
+    if intent.is_bypass() {
         OutboundCacheMode::NoStore
     } else {
         OutboundCacheMode::RuntimeDefault
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn outbound_request_init(method: worker::Method, headers: worker::Headers) -> worker::RequestInit {
+    let mut init = worker::RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_redirect(worker::RequestRedirect::Manual);
+    init
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -290,7 +289,7 @@ impl CloudflareHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{CacheMode, Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+        use worker::{CacheMode, Fetch, Headers, Method, Request};
 
         // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
         // metadata, and it always buffers the response body (see below). The
@@ -310,7 +309,7 @@ impl CloudflareHttpClient {
             ));
         }
 
-        let cache_mode = outbound_cache_mode(request.bypass_cache);
+        let cache_mode = outbound_cache_mode(&request.cache_intent);
 
         let uri = request.request.uri().to_string();
         // http::Method always stores uppercase; worker 0.7 implements From<String> only.
@@ -340,7 +339,6 @@ impl CloudflareHttpClient {
             }
         };
 
-        let mut init = RequestInit::new();
         // Force manual redirect handling: the Workers runtime otherwise defaults
         // to `RequestRedirect::Follow` and transparently chases 3xx responses to
         // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
@@ -348,9 +346,7 @@ impl CloudflareHttpClient {
         // `allowed_domains`; auto-following here would bypass that allowlist
         // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
         // matching the Axum adapter's `redirect::Policy::none()`.
-        init.with_method(method)
-            .with_headers(headers)
-            .with_redirect(RequestRedirect::Manual);
+        let mut init = outbound_request_init(method, headers);
         // Setting the `cache` field requires the `cache_option_enabled`
         // compatibility flag, which is only on by default from compatibility
         // date 2024-11-11. `wrangler.toml`/`wrangler.ci.toml` pin an earlier
@@ -547,8 +543,8 @@ impl PlatformHttpClient for CloudflareHttpClient {
 /// Bridges [`worker::Env`] secrets to [`PlatformSecretStore`] by calling
 /// `env.secret(key)` synchronously. Writes and deletes return errors.
 #[cfg(target_arch = "wasm32")]
-struct CloudflareSecretStoreAdapter {
-    env: worker::Env,
+pub(crate) struct CloudflareSecretStoreAdapter {
+    pub(crate) env: worker::Env,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -762,6 +758,25 @@ fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>>
 mod tests {
     use super::*;
     use edgezero_core::context::RequestContext;
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn outbound_request_creation_sets_manual_redirect_mode() {
+        let init = outbound_request_init(worker::Method::Get, worker::Headers::new());
+        assert!(matches!(init.redirect, worker::RequestRedirect::Manual));
+    }
+
+    #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Cloudflare
+            .descriptor()
+            .capabilities();
+        assert!(!capabilities.supports_concurrent_provider_fanout());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "Workers fetch does not expose an enforceable hard total request deadline"
+        );
+    }
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
 
@@ -918,18 +933,18 @@ mod tests {
     #[test]
     fn outbound_cache_mode_maps_bypass_to_no_store() {
         assert_eq!(
-            outbound_cache_mode(true),
+            outbound_cache_mode(&trusted_server_core::platform::PlatformCacheIntent::Bypass),
             OutboundCacheMode::NoStore,
-            "bypass_cache should force the Workers `no-store` cache mode"
+            "a bypass intent should force the Workers `no-store` cache mode"
         );
     }
 
     #[test]
     fn outbound_cache_mode_leaves_default_when_not_bypassing() {
         assert_eq!(
-            outbound_cache_mode(false),
+            outbound_cache_mode(&trusted_server_core::platform::PlatformCacheIntent::Default),
             OutboundCacheMode::RuntimeDefault,
-            "requests without bypass_cache should keep the runtime default cache behavior"
+            "a default intent should keep the runtime default cache behavior"
         );
     }
 }

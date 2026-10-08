@@ -12,6 +12,7 @@ jobs:
   test-rust:
     name: cargo test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -63,6 +64,9 @@ jobs:
 
       - name: Run inline control harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
+
+      - name: Run cache purge harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh purge
 
   test-axum:
     name: cargo test (axum native)
@@ -230,9 +234,14 @@ jobs:
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
+      - name: Set up Chrome for browser fixture tests
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: cargo test
-        run: |
-          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
+        run: ./scripts/test-cli.sh
+        env:
+          CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
 
   test-typescript:
     name: vitest

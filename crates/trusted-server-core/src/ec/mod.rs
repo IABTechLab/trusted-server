@@ -46,17 +46,24 @@ pub mod kv_types;
 pub mod partner;
 pub mod prebid_eids;
 pub mod pull_sync;
+pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
 pub mod registry;
 
+/// Characters of an identifier kept when redacting it for a log.
+const LOG_ID_PREFIX_CHARS: usize = 8;
+
 /// Truncates an EC ID for safe inclusion in log messages.
 ///
-/// Returns the first 8 characters followed by `…` to aid debugging without
-/// writing the full user identifier to logs (satisfies the `CodeQL`
-/// "cleartext logging of sensitive information" rule).
+/// Returns the first [`LOG_ID_PREFIX_CHARS`] characters followed by `…` to aid
+/// debugging without writing the full user identifier to logs (satisfies the
+/// `CodeQL` "cleartext logging of sensitive information" rule).
 #[must_use]
 pub fn log_id(ec_id: &str) -> String {
-    let prefix = ec_id.get(..8).unwrap_or(ec_id);
+    // Truncated by character, not by byte. A byte index that lands inside a
+    // multi-byte character makes `get` return `None`, and falling back to the
+    // whole value would print in full the identifier this exists to redact.
+    let prefix: String = ec_id.chars().take(LOG_ID_PREFIX_CHARS).collect();
     format!("{prefix}\u{2026}")
 }
 
@@ -66,7 +73,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::COOKIE_TS_EC;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -77,6 +84,29 @@ use device::DeviceSignals;
 
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
+use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
+
+/// Bounded request classifications that may persist browser EID cookies.
+///
+/// Adapters classify publisher navigations and `POST /auction` only after
+/// pre-route filters allow dispatch. The shared page-bids handler classifies an
+/// admitted SPA navigation, while EC finalization classifies new identities.
+/// Challenged or blocked requests remain unclassified and cannot persist EIDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub enum EidSyncSource {
+    /// Publisher top-level document navigation.
+    #[display("navigation")]
+    Navigation,
+    /// `POST /auction` request.
+    #[display("auction")]
+    Auction,
+    /// Admitted `GET /_ts/page-bids` SPA navigation.
+    #[display("page_bids")]
+    PageBids,
+    /// Request that generated a new EC identity during finalization.
+    #[display("new_ec")]
+    NewEc,
+}
 
 /// Request-scoped view of one EC identity-graph lookup.
 ///
@@ -90,6 +120,9 @@ pub enum EcKvSnapshot {
     /// The store authoritatively reported that this EC ID does not exist.
     Missing { ec_id: String },
     /// Persisted entry data, optionally with a generation usable for CAS.
+    ///
+    /// A generation never authorizes a write by itself. Callers must first
+    /// enforce entry policy such as rejecting a withdrawal tombstone.
     Present {
         ec_id: String,
         entry: Box<KvEntry>,
@@ -148,6 +181,8 @@ pub use generation::{
 struct RequestEc {
     /// EC ID from the `ts-ec` cookie, if present.
     cookie_ec: Option<String>,
+    /// Pull-sync completeness marker, if present.
+    pull_sync_marker: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
 }
@@ -164,8 +199,17 @@ fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<Tr
         .and_then(|j| j.get(COOKIE_TS_EC))
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
+    let pull_sync_marker = jar
+        .as_ref()
+        .and_then(|j| j.get(COOKIE_TS_EC_PULL_COMPLETE))
+        .map(cookie::Cookie::value)
+        .map(str::to_owned);
 
-    Ok(RequestEc { cookie_ec, jar })
+    Ok(RequestEc {
+        cookie_ec,
+        pull_sync_marker,
+        jar,
+    })
 }
 
 fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
@@ -227,6 +271,10 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
+    /// Browser-carried proof of recent pull-partner completeness.
+    pull_sync_marker: PullSyncMarkerState,
+    /// Allowed returning-user EID persistence source, assigned only after request filters pass.
+    eid_sync_source: Option<EidSyncSource>,
 }
 
 impl EcContext {
@@ -285,8 +333,6 @@ impl EcContext {
             req,
             config: &settings.consent,
             geo: geo_info,
-            ec_id: None,
-            kv_store: None,
         });
 
         log::info!(
@@ -308,6 +354,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
+            eid_sync_source: None,
         })
     }
 
@@ -394,6 +442,7 @@ impl EcContext {
 
             self.ec_value = Some(ec_id);
             self.ec_generated = true;
+            self.pull_sync_marker.invalidate_for_replaced_ec();
             return Ok(());
         }
 
@@ -490,10 +539,52 @@ impl EcContext {
         self.recovery_eligible = eligible;
     }
 
+    /// Allows returning-user EID cookie persistence for this request source.
+    pub fn set_eid_sync_source(&mut self, source: EidSyncSource) {
+        self.eid_sync_source = Some(source);
+    }
+
+    /// Returns the allowed returning-user EID persistence source.
+    #[must_use]
+    pub fn eid_sync_source(&self) -> Option<EidSyncSource> {
+        self.eid_sync_source
+    }
+
     /// Returns whether orphan recovery is allowed for this request.
     #[must_use]
     pub fn recovery_eligible(&self) -> bool {
         self.recovery_eligible
+    }
+
+    /// Validates a browser completeness marker against the active EC and partner set.
+    pub(crate) fn validate_pull_sync_marker(
+        &mut self,
+        settings: &Settings,
+        registry: &registry::PartnerRegistry,
+    ) {
+        validate_marker_state(
+            &mut self.pull_sync_marker,
+            settings,
+            registry,
+            self.ec_value.as_deref(),
+        );
+    }
+
+    /// Returns the current pull-sync marker state.
+    #[must_use]
+    pub(crate) fn pull_sync_marker(&self) -> &PullSyncMarkerState {
+        &self.pull_sync_marker
+    }
+
+    /// Returns mutable pull-sync marker state for response reconciliation.
+    pub(crate) fn pull_sync_marker_mut(&mut self) -> &mut PullSyncMarkerState {
+        &mut self.pull_sync_marker
+    }
+
+    /// Sets pull-sync marker state in focused unit tests.
+    #[cfg(test)]
+    pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
+        self.pull_sync_marker = state;
     }
 
     /// Replaces an orphaned active ID after its new backing row is persisted.
@@ -501,6 +592,7 @@ impl EcContext {
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
         self.kv_snapshot = snapshot;
+        self.pull_sync_marker.invalidate_for_replaced_ec();
     }
 
     /// Returns whether EC creation is permitted by consent for this request.
@@ -550,6 +642,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 
@@ -572,6 +666,8 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 
@@ -597,24 +693,34 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            pull_sync_marker: PullSyncMarkerState::Absent,
+            eid_sync_source: None,
         }
     }
 }
 
-/// Returns the current Unix timestamp in seconds.
+/// Returns the current Unix timestamp in seconds, falling back to zero on clock failure.
 ///
 /// Uses [`web_time::SystemTime`], which maps to `std::time::SystemTime` on
 /// native and `wasm32-wasip1` targets and to a JS-backed clock on
 /// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
 /// available.
 pub(crate) fn current_timestamp() -> u64 {
+    checked_current_timestamp().unwrap_or(0)
+}
+
+/// Returns the current Unix timestamp, or `None` when the clock precedes the epoch.
+///
+/// Use this instead of [`current_timestamp`] when a fallback could authorize
+/// a time-bounded correctness decision.
+pub(crate) fn checked_current_timestamp() -> Option<u64> {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_else(|err| {
-            log::error!("SystemTime::now() failed, falling back to epoch 0: {err}");
-            0
+        .map(|duration| duration.as_secs())
+        .map_err(|err| {
+            log::error!("SystemTime::now() failed: {err}");
         })
+        .ok()
 }
 
 #[cfg(test)]
@@ -652,6 +758,10 @@ mod tests {
         fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
             self.inner.lookup(key)
         }
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
         fn insert(
             &self,
             key: &str,
@@ -669,12 +779,12 @@ mod tests {
             }
             self.inner.insert(key, write)
         }
-        fn count_keys_with_prefix(
+        fn list_keys_with_prefix(
             &self,
             prefix: &str,
             limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
         }
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             self.inner.delete(key)
@@ -945,6 +1055,30 @@ mod tests {
             "should keep existing EC"
         );
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn log_id_never_emits_more_than_the_redacted_prefix() {
+        // A byte index inside a multi-byte character used to make the
+        // truncation fall back to the whole value, printing in full the
+        // identifier this redacts.
+        let boundary_splitting = "abcdefg\u{e9}-tail-that-must-not-be-logged";
+        let redacted = log_id(boundary_splitting);
+
+        assert!(
+            !redacted.contains("must-not-be-logged"),
+            "should not disclose the rest of the identifier: {redacted}"
+        );
+        assert_eq!(
+            redacted.chars().count(),
+            9,
+            "should be eight characters plus the ellipsis: {redacted}"
+        );
+
+        // The ordinary case is unchanged.
+        assert_eq!(log_id("0123456789abcdef.ABC123"), "01234567\u{2026}");
+        // A value shorter than the prefix is emitted whole, which is all there is.
+        assert_eq!(log_id("abc"), "abc\u{2026}");
     }
 
     #[test]
