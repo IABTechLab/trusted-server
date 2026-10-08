@@ -4,8 +4,8 @@ use std::path::Path;
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use trusted_server_auction_prebid_server::MODULE as PREBID_SERVER_MODULE;
 use trusted_server_core::auction_config_types::{BidderId, ProviderId};
-use trusted_server_core::integrations::prebid_server::MODULE as PREBID_SERVER_MODULE;
 
 use super::{Output, PbsError, Result, identifier, read_text};
 

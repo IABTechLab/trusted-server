@@ -20,6 +20,8 @@ use trusted_server_core::integrations::IntegrationBuilder;
 #[must_use]
 pub fn builders() -> Vec<IntegrationBuilder> {
     vec![
+        // Prebid registers from the auction plan, and what it registers runs
+        // ahead of the modules below.
         trusted_server_auction_prebid::builder(),
         trusted_server_testing_testlight::builder(),
         trusted_server_framework_nextjs::builder(),
@@ -32,6 +34,9 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
+        // Implementations `[demand]` and `[ad-server]` can name, which no
+        // section selects.
+        trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
         trusted_server_ad_server_mock::builder(),
     ]
@@ -98,6 +103,7 @@ mod tests {
                 "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
+                "auction.prebid-server",
                 "auction.aps",
                 "ad-server.mock",
             ],

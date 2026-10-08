@@ -3138,10 +3138,10 @@ external_bundle_sri = "sha384-AAAA"
         );
         secondary.insert("timeout_ms".to_string(), json!(4000));
         secondary.insert("debug".to_string(), json!(true));
-        let mut config = trusted_server_core::auction::test_support::plan_config(vec![
-            ("pbs_primary", primary),
-            ("pbs_secondary", secondary),
-        ]);
+        let mut config = trusted_server_core::auction::test_support::plan_config_with(
+            vec![("pbs_primary", primary), ("pbs_secondary", secondary)],
+            &[trusted_server_auction_prebid_server::builder()],
+        );
         config.timeout_ms = 2500;
         config.bidders = BTreeMap::from([
             (

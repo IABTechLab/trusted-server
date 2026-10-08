@@ -579,10 +579,10 @@ mod tests {
         create_test_settings()
     }
 
-    fn single_prebid_plan() -> AuctionPlan {
+    fn single_stored_plan() -> AuctionPlan {
         let mut config = plan_config(vec![(
-            "pbs_primary",
-            demand_table("auction.prebid-server", "https://pbs.example.test/openrtb"),
+            "stored_primary",
+            demand_table("auction.fixture", "https://stored.example.test/openrtb"),
         )]);
         config.timeout_ms = 900;
         AuctionPlan::compile(config).expect("should compile plan")
@@ -741,7 +741,7 @@ mod tests {
                     "bids":[{"bidder":"trustedServer","params":{"bidderParams":{},"storedRequest":intent}}]}]
             })).expect("should deserialize wire request");
             let request = convert_body_to_auction_request(&body, &make_settings());
-            let routed = route_auction(request, &make_request(), &single_prebid_plan(), None);
+            let routed = route_auction(request, &make_request(), &single_stored_plan(), None);
             assert_eq!(routed.inputs().len(), expected_inputs);
             assert_eq!(routed.diagnostics().malformed_envelope_count(), malformed);
         }
@@ -763,7 +763,7 @@ mod tests {
             eids: None,
         };
         let request = convert_body_to_auction_request(&body, &make_settings());
-        let routed = route_auction(request, &make_request(), &single_prebid_plan(), None);
+        let routed = route_auction(request, &make_request(), &single_stored_plan(), None);
 
         assert_eq!(routed.inputs().len(), 1);
         assert!(

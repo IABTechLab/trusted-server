@@ -18,6 +18,7 @@ trusted-server-ad-server-mock = { workspace = true }
 trusted-server-ad-tag-google = { workspace = true }
 trusted-server-auction-aps = { workspace = true }
 trusted-server-auction-prebid = { workspace = true }
+trusted-server-auction-prebid-server = { workspace = true }
 trusted-server-audience-permutive = { workspace = true }
 trusted-server-bot-protection-datadome = { workspace = true }
 trusted-server-cmp-didomi = { workspace = true }

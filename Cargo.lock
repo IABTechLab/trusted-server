@@ -5563,9 +5563,31 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "trusted-server-auction-prebid-server",
  "trusted-server-core",
  "url",
  "validator",
+]
+
+[[package]]
+name = "trusted-server-auction-prebid-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "url",
+ "validator",
+ "web-time",
 ]
 
 [[package]]
@@ -5649,6 +5671,7 @@ dependencies = [
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
  "trusted-server-core",
  "trusted-server-modules",
  "url",
@@ -5872,6 +5895,7 @@ dependencies = [
  "trusted-server-ad-tag-google",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
+ "trusted-server-auction-prebid-server",
  "trusted-server-audience-permutive",
  "trusted-server-bot-protection-datadome",
  "trusted-server-cmp-didomi",

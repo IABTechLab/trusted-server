@@ -248,6 +248,45 @@ pub fn build_for_first_source(
     })
 }
 
+/// Routes `request` through `plan` and returns the input its first demand
+/// source receives, or `None` when no source takes a slot.
+///
+/// A test in an implementation's own crate hands this input to its own
+/// response reader.
+#[must_use]
+pub fn route_to_first_source(
+    plan: &crate::auction::AuctionPlan,
+    request: AuctionRequest,
+    inbound: &Request<EdgeBody>,
+) -> Option<crate::auction::demand::ProviderAuctionInput> {
+    crate::auction::routing::route_auction(request, inbound, plan, None)
+        .inputs()
+        .first()
+        .cloned()
+}
+
+/// The transport headers a routed auction admits from `inbound`, with the
+/// attested client address it carries to every source's outbound request.
+///
+/// A test in an implementation's own crate checks what it forwards upstream
+/// through this.
+#[must_use]
+pub fn routed_transport(
+    plan: &crate::auction::AuctionPlan,
+    request: AuctionRequest,
+    inbound: &Request<EdgeBody>,
+    attested_client_ip: Option<std::net::IpAddr>,
+) -> (
+    crate::auction::demand::TransportHeaders,
+    Option<std::net::IpAddr>,
+) {
+    let routed = crate::auction::routing::route_auction(request, inbound, plan, attested_client_ip);
+    (
+        routed.transport_headers().clone(),
+        routed.attested_client_ip(),
+    )
+}
+
 /// Reads `response` as the first demand source of `plan` would, once
 /// `request` is routed to it.
 ///
@@ -474,6 +513,143 @@ pub(crate) mod adserver_fixture {
 
         fn timeout_ms(&self) -> u32 {
             self.timeout_ms
+        }
+    }
+}
+
+/// A stand-in demand implementation for core's own tests of what the driver
+/// does for an implementation that departs from the plain one. It serves
+/// stored requests, forbids all-eligible routing, takes bidder parameters,
+/// keeps the unsigned request identity and completes an endpoint that names
+/// a host alone.
+///
+/// It writes each impression's usable bidder parameters under
+/// `ext.fixture.bidder`, or the slot id under `ext.fixture.stored` where the
+/// slot allows a stored request, and leaves out an impression that has
+/// neither.
+#[cfg(test)]
+pub(crate) mod demand_fixture {
+    use core::any::Any;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use error_stack::Report;
+    use serde::Deserialize;
+    use serde_json::{Map, Value, json};
+    use url::Url;
+
+    use crate::auction::demand::{
+        CompiledDemand, DemandFieldPolicy, DemandImplementation, DemandResponse,
+        DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, RequestExtensions,
+    };
+    use crate::auction::types::AuctionResponse;
+    use crate::error::TrustedServerError;
+    use crate::platform::PlatformResponse;
+
+    /// The name an `implementation` line gives the stand-in.
+    pub(crate) const MODULE: &str = "auction.fixture";
+
+    /// The path the stand-in completes a bare host with.
+    pub(crate) const AUCTION_PATH: &str = "/fixture/auction";
+
+    /// The stand-in demand implementation.
+    pub(crate) static DEMAND: DemandImplementation = DemandImplementation {
+        id: MODULE,
+        default_timeout: DemandTimeoutDefault::Fixed(1000),
+        allows_all_eligible: false,
+        serves_stored_requests: true,
+        canonicalize_endpoint,
+        compile,
+    };
+
+    /// One compiled stand-in source.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct FixtureDemand;
+
+    #[derive(Debug, Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct FixtureSettings {}
+
+    fn compile(
+        settings: &Map<String, Value>,
+    ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
+        FixtureSettings::deserialize(Value::Object(settings.clone())).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("invalid `{MODULE}` settings: {error}"),
+            })
+        })?;
+        Ok(Arc::new(FixtureDemand))
+    }
+
+    fn canonicalize_endpoint(endpoint: &mut Url) -> Result<(), String> {
+        if matches!(endpoint.path(), "" | "/") {
+            endpoint.set_path(AUCTION_PATH);
+        }
+        Ok(())
+    }
+
+    #[async_trait(?Send)]
+    impl CompiledDemand for FixtureDemand {
+        fn field_policy(&self) -> DemandFieldPolicy {
+            DemandFieldPolicy {
+                imp_tagid: true,
+                site_ref: true,
+                precise_geo: true,
+                additional_consent: true,
+                unsigned_request_identity: true,
+                consumes_bidder_params: true,
+                regs: RegsPolicy::Jurisdiction,
+                ..DemandFieldPolicy::default()
+            }
+        }
+
+        fn augment_request(
+            &self,
+            extensions: &mut RequestExtensions<'_>,
+            _input: &ProviderAuctionInput,
+        ) -> Result<(), Report<TrustedServerError>> {
+            for impression in &mut extensions.impressions {
+                let slot = impression.slot;
+                let bidder = slot
+                    .bidder_params()
+                    .iter()
+                    .filter(|(_, params)| {
+                        params.as_object().is_some_and(|params| !params.is_empty())
+                    })
+                    .map(|(bidder, params)| (bidder.as_str().to_string(), params.clone()))
+                    .collect::<Map<_, _>>();
+                let mut fixture = Map::new();
+                if !bidder.is_empty() {
+                    fixture.insert("bidder".to_string(), Value::Object(bidder));
+                } else if slot.allows_stored_fallback() {
+                    fixture.insert("stored".to_string(), json!(slot.slot().id));
+                }
+                if fixture.is_empty() {
+                    impression.omitted = true;
+                    continue;
+                }
+                *impression.ext = Some(Map::from_iter([(
+                    "fixture".to_string(),
+                    Value::Object(fixture),
+                )]));
+            }
+            *extensions.request = Some(Map::from_iter([(
+                "fixture".to_string(),
+                Value::Object(Map::new()),
+            )]));
+            Ok(())
+        }
+
+        async fn parse_response(
+            &self,
+            context: DemandResponse<'_>,
+            response: PlatformResponse,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            crate::integrations::openrtb::parse_openrtb_response(context, response).await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 }

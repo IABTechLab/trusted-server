@@ -5435,7 +5435,7 @@ mod tests {
     #[test]
     fn an_auction_implementation_named_in_a_section_is_refused() {
         for (section, name) in [
-            ("auction", "prebid-server"),
+            ("auction", "fixture"),
             ("auction", "ad-server.fixture"),
             ("auction-protocol", "openrtb"),
         ] {

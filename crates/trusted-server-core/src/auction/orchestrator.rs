@@ -2667,7 +2667,7 @@ mod tests {
         config
     }
 
-    fn planned_prebid_config(
+    fn planned_fixture_config(
         providers: &[(&str, serde_json::Value, NotificationConfig)],
     ) -> AuctionPlanConfig {
         let tables = providers
@@ -2676,7 +2676,7 @@ mod tests {
                 (
                     *id,
                     planned_table(
-                        "auction.prebid-server",
+                        "auction.fixture",
                         &format!("https://{id}.example.test/openrtb"),
                         RoutingMode::Explicit,
                         settings,
@@ -2719,7 +2719,7 @@ mod tests {
         }
     }
 
-    fn planned_prebid_request() -> AuctionRequest {
+    fn planned_envelope_request() -> AuctionRequest {
         let mut request = planned_request();
         request.slots[0]
             .bidders
@@ -5848,11 +5848,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_prebid_stored_intent_filters_wire_demand_and_skips_empty_transports() {
+    async fn planned_stored_intent_filters_wire_demand_and_skips_empty_transports() {
         for inline_providers in 0..=2 {
             let http = Arc::new(StubHttpClient::new());
             // Providers launch in ID order: the source that takes every slot, then
-            // only the PBS instances with usable demand.
+            // only the stored-request sources with usable demand.
             http.push_response(204, Vec::new());
             for index in 0..inline_providers {
                 http.push_response(
@@ -5869,7 +5869,7 @@ mod tests {
                             }
                         ]}]
                     }))
-                    .expect("should serialize PBS response"),
+                    .expect("should serialize the upstream response"),
                 );
             }
             let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
@@ -5877,14 +5877,14 @@ mod tests {
                 Arc::clone(&backend) as Arc<_>,
                 Arc::clone(&http) as Arc<_>,
             );
-            let mut config = planned_prebid_config(&[
+            let mut config = planned_fixture_config(&[
                 (
-                    "pbs_a",
+                    "stored_a",
                     serde_json::json!({}),
                     NotificationConfig::default(),
                 ),
                 (
-                    "pbs_b",
+                    "stored_b",
                     serde_json::json!({}),
                     NotificationConfig::default(),
                 ),
@@ -5911,7 +5911,7 @@ mod tests {
             // name order.
             selected.sort();
             config.demand = crate::provider_table::ProviderList::new(selected, tables);
-            for (bidder, provider) in [("alpha", "pbs_a"), ("beta", "pbs_b")] {
+            for (bidder, provider) in [("alpha", "stored_a"), ("beta", "stored_b")] {
                 config.bidders.insert(
                     bidder.parse().expect("should parse bidder"),
                     crate::auction::plan::BidderRouteConfig {
@@ -5923,7 +5923,7 @@ mod tests {
             let orchestrator = AuctionOrchestratorHarness::new(plan, None);
             let mut request = planned_request();
             let template = request.slots[0].clone();
-            // Both PBS instances must evaluate candidates but omit them after overrides.
+            // Both stored-request sources must evaluate candidates and omit them.
             request.slots[0].bidders.insert(
                 "trustedServer".to_string(),
                 serde_json::json!({
@@ -5931,7 +5931,7 @@ mod tests {
                 }),
             );
             request.slots.push(AdSlot {
-                id: "synthetic-no-pbs".to_string(),
+                id: "synthetic-no-demand".to_string(),
                 bidders: HashMap::from([(
                     "trustedServer".to_string(),
                     serde_json::json!({"storedRequest":false,"bidderParams":{}}),
@@ -5967,7 +5967,7 @@ mod tests {
             assert_eq!(
                 bodies.len(),
                 1 + inline_providers,
-                "should never transport an empty PBS request"
+                "should never transport an empty request"
             );
             let all_eligible_wire: serde_json::Value = serde_json::from_slice(&bodies[0])
                 .expect("should parse the all-eligible source's wire request");
@@ -5984,12 +5984,12 @@ mod tests {
                 "should reject a bid for an omitted impression"
             );
             for index in inline_providers..2 {
-                let provider_id = if index == 0 { "pbs_a" } else { "pbs_b" };
+                let provider_id = if index == 0 { "stored_a" } else { "stored_b" };
                 let response = result
                     .provider_responses
                     .iter()
                     .find(|response| response.provider == provider_id)
-                    .expect("should retain skipped PBS provider response");
+                    .expect("should retain the skipped source's response");
                 assert_eq!(
                     response.metadata["routing"]["skipped_no_usable_demand"],
                     true
@@ -5997,7 +5997,7 @@ mod tests {
             }
             for index in 0..inline_providers {
                 let wire: serde_json::Value = serde_json::from_slice(&bodies[index + 1])
-                    .expect("should parse PBS wire request");
+                    .expect("should parse the source's wire request");
                 assert_eq!(
                     wire["imp"]
                         .as_array()
@@ -6006,11 +6006,11 @@ mod tests {
                     1
                 );
                 assert_eq!(wire["imp"][0]["id"], format!("inline-{index}"));
-                let prebid = &wire["imp"][0]["ext"]["prebid"];
-                assert!(prebid.get("storedrequest").is_none());
+                let fixture = &wire["imp"][0]["ext"]["fixture"];
+                assert!(fixture.get("stored").is_none());
                 let bidder = if index == 0 { "alpha" } else { "beta" };
                 assert_eq!(
-                    prebid["bidder"],
+                    fixture["bidder"],
                     serde_json::json!({bidder:{"placement":index}})
                 );
                 assert_eq!(
@@ -6019,12 +6019,12 @@ mod tests {
                         .as_deref(),
                     Some(format!("bid-{index}").as_str())
                 );
-                let provider_id = if index == 0 { "pbs_a" } else { "pbs_b" };
+                let provider_id = if index == 0 { "stored_a" } else { "stored_b" };
                 let response = result
                     .provider_responses
                     .iter()
                     .find(|response| response.provider == provider_id)
-                    .expect("should retain PBS provider response");
+                    .expect("should retain the source's response");
                 assert_eq!(
                     response.metadata["response_admission"]["rejected_bid_count"],
                     1
@@ -6038,162 +6038,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_prebid_instances_preserve_headers_metadata_suppression_and_identity() {
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "suppress-exact", "bid": [
-                    {"id":"good-a","impid":"fictional-slot","price":1.25,"adm":"<div>a</div>","w":300,"h":250,"nurl":"https://notify.example/win","burl":"https://notify.example/bill","ext":{"prebid":{"cache":{"bids":{"cacheId":"cache-a","url":"https://cache-a.example/cache/path"}}}}},
-                    {"id":"bad-a","price":2.0}
-                ]}],
-                "ext": {"responsetimemillis":{"suppress-exact":4},"errors":{"other":["fictional"]},"warnings":{"other":["warning"]},"debug":{"httpcalls":[]},"prebid":{"bidstatus":{"suppress-exact":[{"bidid":"good-a"}]}}}
-            }))
-            .expect("should serialize PBS response a"),
-        );
-        http.push_response(
-            200,
-            serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "keep-seat", "bid": [{
-                    "id":"good-b","impid":"fictional-slot","price":2.5,"adm":"<div>b</div>","w":300,"h":250,"nurl":"https://notify.example/win","burl":"https://notify.example/bill"
-                }]}]
-            }))
-            .expect("should serialize PBS response b"),
-        );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
-        let services = build_services_with_backend_and_http_client(
-            Arc::clone(&backend) as Arc<_>,
-            Arc::clone(&http) as Arc<_>,
-        );
-        let notifications = NotificationConfig {
-            suppress_all: false,
-            suppress_seats: vec!["suppress-exact".to_string()],
-        };
-        let plan = AuctionPlan::compile(planned_prebid_config(&[
-            (
-                "pbs_a",
-                serde_json::json!({"debug":true,"test_mode":true,"consent_forwarding":"openrtb_only"}),
-                notifications,
-            ),
-            ("pbs_b", serde_json::json!({}), NotificationConfig::default()),
-        ]))
-        .expect("should compile planned PBS auction");
-        let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-        let request = planned_prebid_request();
-        let settings = create_test_settings();
-        let inbound = http::Request::builder()
-            .uri("https://publisher.example/auction")
-            .header(
-                http::header::COOKIE,
-                "consent=keep; euconsent-v2=drop; other=value",
-            )
-            .header(http::header::USER_AGENT, "Fictional Browser/7")
-            .header(http::header::REFERER, "https://referrer.example/story")
-            .header(http::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .header("x-forwarded-for", "203.0.113.250")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build inbound request");
-        let context = AuctionContext {
-            settings: &settings,
-            request: &inbound,
-            timeout_ms: 777,
-            transport_timeout_ms: 777,
-            provider_responses: None,
-            services: &services,
-        };
-
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should execute planned PBS auction");
-
-        assert_eq!(result.provider_responses.len(), 2);
-        let first = &result.provider_responses[0];
-        assert_eq!(first.provider, "pbs_a");
-        assert_eq!(first.bids.len(), 1, "should isolate malformed sibling");
-        assert_eq!(
-            first.bids[0].returned_seat.as_deref(),
-            Some("suppress-exact")
-        );
-        assert_eq!(first.bids[0].bidder, "suppress-exact");
-        assert!(
-            first.bids[0].nurl.is_none(),
-            "should suppress after normalization"
-        );
-        assert!(
-            first.bids[0].burl.is_none(),
-            "should suppress billing notification"
-        );
-        assert_eq!(first.bids[0].cache_id.as_deref(), Some("cache-a"));
-        assert_eq!(first.bids[0].cache_host.as_deref(), Some("cache-a.example"));
-        assert_eq!(first.bids[0].cache_path.as_deref(), Some("/cache/path"));
-        assert_eq!(first.metadata["responsetimemillis"]["suppress-exact"], 4);
-        assert!(first.metadata.contains_key("errors"));
-        assert!(first.metadata.contains_key("warnings"));
-        assert!(first.metadata.contains_key("debug"));
-        assert!(first.metadata.contains_key("bidstatus"));
-        let second = &result.provider_responses[1];
-        assert_eq!(second.provider, "pbs_b");
-        assert_eq!(second.bids[0].returned_seat.as_deref(), Some("keep-seat"));
-        assert!(second.bids[0].nurl.is_some());
-        assert!(!second.metadata.contains_key("debug"));
-        assert!(!second.metadata.contains_key("bidstatus"));
-
-        let headers = http.recorded_request_headers();
-        assert_eq!(headers.len(), 2);
-        for request_headers in &headers {
-            assert!(
-                request_headers
-                    .iter()
-                    .any(|(name, value)| name == "user-agent" && value == "Fictional Browser/7")
-            );
-            assert!(request_headers.iter().any(
-                |(name, value)| name == "referer" && value == "https://referrer.example/story"
-            ));
-            assert!(
-                request_headers
-                    .iter()
-                    .any(|(name, value)| name == "accept-language" && value == "en-US,en;q=0.9")
-            );
-            assert!(
-                request_headers
-                    .iter()
-                    .all(|(name, _)| name != "x-forwarded-for"),
-                "must ignore inbound XFF without attestation"
-            );
-            assert!(
-                request_headers.iter().all(|(name, _)| name != "accept"),
-                "planned PBS transport must not add Accept beyond legacy headers"
-            );
-        }
-        let first_cookie = headers[0]
-            .iter()
-            .find(|(name, _)| name == "cookie")
-            .map(|(_, value)| value.as_str());
-        assert_eq!(first_cookie, Some("consent=keep; other=value"));
-        let second_cookie = headers[1]
-            .iter()
-            .find(|(name, _)| name == "cookie")
-            .map(|(_, value)| value.as_str());
-        assert_eq!(
-            second_cookie,
-            Some("consent=keep; euconsent-v2=drop; other=value")
-        );
-    }
-
-    #[tokio::test]
     async fn planned_provider_outcome_matrix_has_fixed_count_only_routing_metadata() {
         let standard_plan = AuctionPlan::compile(planned_config(
             &[("standard", RoutingMode::AllEligible)],
             false,
         ))
         .expect("should compile standard plan");
-        let prebid_plan = AuctionPlan::compile(planned_prebid_config(&[(
-            "pbs",
+        let fixture_plan = AuctionPlan::compile(planned_fixture_config(&[(
+            "stored",
             serde_json::json!({}),
             NotificationConfig::default(),
         )]))
-        .expect("should compile PBS plan");
+        .expect("should compile the stand-in plan");
         let cases = [
             (&standard_plan, 204, Vec::new(), BidStatus::NoBid),
             (&standard_plan, 502, Vec::new(), BidStatus::Error),
@@ -6204,11 +6060,11 @@ mod tests {
                 br#"{"seatbid":[]}"#.to_vec(),
                 BidStatus::NoBid,
             ),
-            (&prebid_plan, 204, b"{}".to_vec(), BidStatus::NoBid),
-            (&prebid_plan, 502, Vec::new(), BidStatus::Error),
-            (&prebid_plan, 200, b"not-json".to_vec(), BidStatus::Error),
+            (&fixture_plan, 204, b"{}".to_vec(), BidStatus::NoBid),
+            (&fixture_plan, 502, Vec::new(), BidStatus::Error),
+            (&fixture_plan, 200, b"not-json".to_vec(), BidStatus::Error),
             (
-                &prebid_plan,
+                &fixture_plan,
                 200,
                 br#"{"seatbid":[]}"#.to_vec(),
                 BidStatus::NoBid,
@@ -6217,7 +6073,7 @@ mod tests {
 
         for (plan, status, body, expected) in cases {
             let routed = route_auction(
-                planned_prebid_request(),
+                planned_envelope_request(),
                 &http::Request::new(edgezero_core::body::Body::empty()),
                 plan,
                 None,
@@ -6569,22 +6425,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_prebid_rejects_cross_provider_parse_state() {
-        let plan = AuctionPlan::compile(planned_prebid_config(&[
+    async fn planned_source_rejects_cross_provider_parse_state() {
+        let plan = AuctionPlan::compile(planned_fixture_config(&[
             (
-                "pbs_a",
+                "stored_a",
                 serde_json::json!({}),
                 NotificationConfig::default(),
             ),
             (
-                "pbs_b",
+                "stored_b",
                 serde_json::json!({}),
                 NotificationConfig::default(),
             ),
         ]))
-        .expect("should compile planned PBS auction");
+        .expect("should compile the planned auction");
         let routed = route_auction(
-            planned_prebid_request(),
+            planned_envelope_request(),
             &http::Request::new(edgezero_core::body::Body::empty()),
             &plan,
             None,
@@ -6596,17 +6452,17 @@ mod tests {
             edgezero_core::http::response_builder()
                 .status(200)
                 .body(edgezero_core::body::Body::from_bytes(b"{}".as_slice()))
-                .expect("should build PBS response"),
+                .expect("should build the upstream response"),
         );
 
         let error = provider_b
             .parse_response_with_state(response, 1, Some(parse_state.as_ref()))
             .await
-            .expect_err("should reject another PBS provider's parse state");
+            .expect_err("should reject another source's parse state");
 
         assert!(
-            error.to_string().contains("owned by provider pbs_a"),
-            "should identify cross-provider PBS state ownership"
+            error.to_string().contains("owned by provider stored_a"),
+            "should identify cross-provider state ownership"
         );
     }
 

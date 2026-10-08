@@ -1,6 +1,6 @@
 [package]
-name = "trusted-server-auction-prebid"
-description = "Prebid.js on the page: the configuration written for it, the route its bundle is served from and the removal of a publisher's own Prebid script."
+name = "trusted-server-auction-prebid-server"
+description = "Prebid Server as a demand implementation: its request extensions, bidder parameter overrides, transport headers and response reader."
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -15,21 +15,22 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-base64 = { workspace = true }
-edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
-validator = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+edgezero-core = { workspace = true }
 futures = { workspace = true }
-trusted-server-auction-prebid-server = { workspace = true }
+tokio = { workspace = true }
+validator = { workspace = true }
+web-time = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named

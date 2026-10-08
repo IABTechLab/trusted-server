@@ -4,6 +4,18 @@
 //! and request extensions, forwards the raw headers its auction needs, and
 //! answers with Prebid's own response shape.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use core::any::Any;
 #[cfg(test)]
 use std::collections::HashSet;
@@ -28,47 +40,48 @@ use url::{Url, Url as ParsedUrl};
 #[cfg(test)]
 use validator::Validate;
 
-use crate::auction::demand::{
+use trusted_server_core::auction::demand::{
     CompiledDemand, DemandFieldPolicy, DemandImplementation, DemandResponse, DemandTimeoutDefault,
-    DemandTransport, ProviderAuctionInput, RegsPolicy, RequestExtensions,
+    DemandTransport, ProviderAuctionInput, RegsPolicy, RequestExtensions, TransportHeaders,
 };
-use crate::auction::openrtb::{
+use trusted_server_core::auction::openrtb::{
     BidDimensionIndex, BidRejectionReason, ResponseAdmissionDiagnostics, build_bid_dimension_index,
     parse_optional_bid_dimension, resolve_bid_dimensions,
 };
-use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
+use trusted_server_core::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 #[cfg(test)]
-use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::routing::TransportHeaders;
+use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 #[cfg(test)]
-use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
-use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
-use crate::consent::{ConsentContext, ConsentSource};
-use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
-use crate::error::TrustedServerError;
+use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, MediaType};
+use trusted_server_core::auction::types::{AuctionResponse, Bid as AuctionBid};
+use trusted_server_core::consent::{ConsentContext, ConsentSource};
+use trusted_server_core::consent_config::ConsentForwardingMode;
+use trusted_server_core::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use trusted_server_core::error::TrustedServerError;
 #[cfg(test)]
-use crate::http_util::RequestInfo;
-use crate::integrations::{UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded};
+use trusted_server_core::http_util::RequestInfo;
+use trusted_server_core::integrations::{
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+};
 #[cfg(test)]
-use crate::integrations::{
+use trusted_server_core::integrations::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 #[cfg(test)]
-use crate::openrtb::{
+use trusted_server_core::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 #[cfg(test)]
-use crate::platform::PlatformHttpRequest;
-use crate::platform::PlatformResponse;
+use trusted_server_core::platform::PlatformHttpRequest;
+use trusted_server_core::platform::PlatformResponse;
 #[cfg(test)]
-use crate::platform::RuntimeServices;
+use trusted_server_core::platform::RuntimeServices;
 #[cfg(test)]
-use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
+use trusted_server_core::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 #[cfg(test)]
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 /// The name an `implementation` line gives this implementation, its module
 /// path, which also serves as its builder's id.
@@ -86,6 +99,17 @@ pub static DEMAND: DemandImplementation = DemandImplementation {
     canonicalize_endpoint,
     compile,
 };
+
+/// The builder a deployment hands to an adapter, which offers Prebid Server
+/// to `[demand]`.
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::implementations(
+        MODULE,
+        env!("CARGO_PKG_NAME"),
+    )
+    .with_demand(&DEMAND)
+}
 
 /// One compiled Prebid Server demand source.
 #[derive(Debug, Clone)]
@@ -456,7 +480,7 @@ pub struct LegacyPrebidServerConfig {
     pub timeout_ms: u32,
     #[serde(
         default = "default_bidders",
-        deserialize_with = "crate::settings::vec_from_seq_or_map"
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
     )]
     pub bidders: Vec<String>,
     #[serde(default)]
@@ -479,7 +503,10 @@ pub struct LegacyPrebidServerConfig {
     ///
     /// This list is independent of [`bidders`](Self::bidders) — the operator
     /// manages both lists explicitly.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub client_side_bidders: Vec<String>,
     /// Compatibility sugar for per-bidder, per-zone param overrides.
     ///
@@ -549,7 +576,10 @@ pub struct LegacyPrebidServerConfig {
     /// Use this when only specific PBS seats fire win/billing notifications
     /// internally. The global [`suppress_nurl`](Self::suppress_nurl) switch still
     /// suppresses every bidder when set.
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[serde(
+        default,
+        deserialize_with = "trusted_server_core::settings::vec_from_seq_or_map"
+    )]
     pub suppress_nurl_bidders: Vec<String>,
 }
 
@@ -1728,7 +1758,10 @@ impl PrebidAuctionProvider {
         // to forward, so carry it in the OpenRTB body instead.
         let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
             self.config.consent_forwarding.includes_body_consent()
-                || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
+                || !matches!(
+                    ctx.source,
+                    trusted_server_core::consent::ConsentSource::Cookie
+                )
         });
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
@@ -1936,7 +1969,9 @@ impl PrebidAuctionProvider {
     ///
     /// Returns [`None`] if no consent-relevant data is present (avoids sending
     /// an empty `regs` object to Prebid Server).
-    fn build_regs(consent_ctx: Option<&crate::consent::ConsentContext>) -> Option<Regs> {
+    fn build_regs(
+        consent_ctx: Option<&trusted_server_core::consent::ConsentContext>,
+    ) -> Option<Regs> {
         let ctx = consent_ctx?;
 
         let has_data = ctx.gdpr_applies
@@ -1956,13 +1991,13 @@ impl PrebidAuctionProvider {
         // "GDPR does not apply."
         let in_gdpr_jurisdiction = matches!(
             ctx.jurisdiction,
-            crate::consent::jurisdiction::Jurisdiction::Gdpr
+            trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr
         );
         let gdpr = if ctx.gdpr_applies || in_gdpr_jurisdiction {
             Some(true)
         } else if matches!(
             ctx.jurisdiction,
-            crate::consent::jurisdiction::Jurisdiction::Unknown
+            trusted_server_core::consent::jurisdiction::Jurisdiction::Unknown
         ) {
             None
         } else {
@@ -2592,32 +2627,32 @@ pub fn register_auction_provider(
 mod tests {
     use super::*;
 
-    use crate::auction::formats::convert_to_openrtb_response;
-    use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::plan::{BidderId, BidderRouteConfig, ProviderId};
-    use crate::auction::test_support::{
+    use std::sync::Arc;
+    use trusted_server_core::auction::formats::convert_to_openrtb_response;
+    use trusted_server_core::auction::orchestrator::OrchestrationResult;
+    use trusted_server_core::auction::plan::{BidderId, BidderRouteConfig, ProviderId};
+    use trusted_server_core::auction::test_support::{
         canonical_parity_auction_request,
         create_test_auction_context as shared_test_auction_context,
     };
-    use crate::auction::types::{
+    use trusted_server_core::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
-    use std::sync::Arc;
 
-    use crate::consent::{ConsentContext, ConsentSource};
-    use crate::geo::GeoInfo;
+    use trusted_server_core::consent::{ConsentContext, ConsentSource};
+    use trusted_server_core::geo::GeoInfo;
 
-    use crate::platform::test_support::{
+    use trusted_server_core::platform::test_support::{
         HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopGeo, NoopHttpClient,
         NoopSecretStore, StubHttpClient, build_services_with_config_secret_and_http_client,
         build_services_with_http_client, build_services_with_http_client_and_client_ip,
     };
-    use crate::platform::{
+    use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
     };
-    use crate::settings::Settings;
+    use trusted_server_core::settings::Settings;
 
-    use crate::test_support::tests::create_test_settings;
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     use bytes::Bytes;
 
@@ -2720,8 +2755,8 @@ mod tests {
     struct PredictOnlyBackend;
 
     impl PlatformBackend for PredictOnlyBackend {
-        fn naming_policy(&self) -> crate::platform::BackendNamingPolicy {
-            crate::platform::BackendNamingPolicy::Axum
+        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
+            trusted_server_core::platform::BackendNamingPolicy::Axum
         }
 
         fn predict_name(
@@ -2841,7 +2876,7 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
         let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
         let settings = make_settings();
         let provider = PrebidAuctionProvider::new(base_config());
@@ -2883,7 +2918,7 @@ mod tests {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
         let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>
         );
         let settings = make_settings();
         let provider = PrebidAuctionProvider::new(base_config());
@@ -3562,7 +3597,7 @@ assume_single_jurisdiction = true
         let ctx = ConsentContext {
             gpc: true,
             raw_us_privacy: Some("1YYN".to_string()),
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr,
             ..Default::default()
         };
 
@@ -3583,7 +3618,7 @@ assume_single_jurisdiction = true
         let ctx = ConsentContext {
             gpc: true,
             raw_us_privacy: Some("1YYN".to_string()),
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Unknown,
+            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::Unknown,
             ..Default::default()
         };
 
@@ -3601,7 +3636,7 @@ assume_single_jurisdiction = true
         // Non-EU, non-US-state user with a US privacy string.
         let ctx = ConsentContext {
             raw_us_privacy: Some("1NNN".to_string()),
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..Default::default()
         };
 
@@ -3622,7 +3657,7 @@ assume_single_jurisdiction = true
             raw_us_privacy: Some("1YNN".to_string()),
             raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
             gpp_section_ids: Some(vec![7]),
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+            jurisdiction: trusted_server_core::consent::jurisdiction::Jurisdiction::Gdpr,
             ..Default::default()
         };
 
@@ -4096,25 +4131,25 @@ assume_single_jurisdiction = true
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            crate::openrtb::Eid {
+            trusted_server_core::openrtb::Eid {
                 source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                uids: vec![trusted_server_core::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
             },
-            crate::openrtb::Eid {
+            trusted_server_core::openrtb::Eid {
                 source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                uids: vec![trusted_server_core::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
             },
-            crate::openrtb::Eid {
+            trusted_server_core::openrtb::Eid {
                 source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                uids: vec![trusted_server_core::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
@@ -4393,7 +4428,7 @@ assume_single_jurisdiction = true
 
         assert_eq!(
             auction_response.status,
-            crate::auction::types::BidStatus::Error
+            trusted_server_core::auction::types::BidStatus::Error
         );
         assert_eq!(
             auction_response.metadata["error_type"],
@@ -4450,7 +4485,7 @@ assume_single_jurisdiction = true
     ) {
         assert_eq!(
             auction_response.status,
-            crate::auction::types::BidStatus::Error
+            trusted_server_core::auction::types::BidStatus::Error
         );
         assert_eq!(
             auction_response.metadata["error_type"],
@@ -4637,7 +4672,7 @@ assume_single_jurisdiction = true
         config: LegacyPrebidServerConfig,
         request: &AuctionRequest,
     ) -> OpenRtbRequest {
-        use crate::platform::test_support::noop_services;
+        use trusted_server_core::platform::test_support::noop_services;
         let provider = PrebidAuctionProvider::new(config);
         let settings = make_settings();
         let http_req = http::Request::builder()
@@ -6091,20 +6126,23 @@ set = { networkId = 42 }
     ) -> ProviderAuctionInput {
         let provider_id = ProviderId::from_str("pbs_instance").expect("should parse provider ID");
         let bidder_id = BidderId::from_str("exampleBidder").expect("should parse bidder ID");
-        let mut config = crate::auction::test_support::plan_config(vec![(
-            "pbs_instance",
-            crate::auction::test_support::demand_table(
-                "auction.prebid-server",
-                "https://pbs.example/openrtb2/auction",
-            ),
-        )]);
+        let mut config = trusted_server_core::auction::test_support::plan_config_with(
+            vec![(
+                "pbs_instance",
+                trusted_server_core::auction::test_support::demand_table(
+                    MODULE,
+                    "https://pbs.example/openrtb2/auction",
+                ),
+            )],
+            &[builder()],
+        );
         config.bidders = BTreeMap::from([(
             bidder_id,
             BidderRouteConfig {
                 module: provider_id,
             },
         )]);
-        let plan = crate::auction::plan::AuctionPlan::compile(config)
+        let plan = trusted_server_core::auction::plan::AuctionPlan::compile(config)
             .expect("should compile planned PBS test plan");
         let inbound = http::Request::new(EdgeBody::empty());
         let request = make_auction_request(
@@ -6123,11 +6161,8 @@ set = { networkId = 42 }
                 })
                 .collect(),
         );
-        crate::auction::routing::route_auction(request, &inbound, &plan, None)
-            .inputs()
-            .first()
+        trusted_server_core::auction::test_support::route_to_first_source(&plan, request, &inbound)
             .expect("should route planned PBS test slots")
-            .clone()
     }
 
     fn planned_prebid_input(slot_ids: &[&str]) -> ProviderAuctionInput {
@@ -6158,7 +6193,10 @@ set = { networkId = 42 }
         ))
         .expect("should classify non-success response");
         assert_eq!(error.provider, "pbs_instance");
-        assert_eq!(error.status, crate::auction::types::BidStatus::Error);
+        assert_eq!(
+            error.status,
+            trusted_server_core::auction::types::BidStatus::Error
+        );
         assert_eq!(error.metadata["error_type"], ERROR_TYPE_HTTP_STATUS);
         assert_eq!(error.metadata["http_status"], 502);
         assert_eq!(error.metadata["upstream_message"], "fictional rejection");
@@ -6186,35 +6224,35 @@ set = { networkId = 42 }
             (
                 "omitted",
                 None,
-                crate::auction::types::BidStatus::Success,
+                trusted_server_core::auction::types::BidStatus::Success,
                 None,
                 None,
             ),
             (
                 "usd",
                 Some(json!("USD")),
-                crate::auction::types::BidStatus::Success,
+                trusted_server_core::auction::types::BidStatus::Success,
                 None,
                 None,
             ),
             (
                 "lowercase-usd",
                 Some(json!("usd")),
-                crate::auction::types::BidStatus::Success,
+                trusted_server_core::auction::types::BidStatus::Success,
                 None,
                 None,
             ),
             (
                 "eur",
                 Some(json!("EUR")),
-                crate::auction::types::BidStatus::NoBid,
+                trusted_server_core::auction::types::BidStatus::NoBid,
                 Some("EUR"),
                 None,
             ),
             (
                 "malformed",
                 Some(json!(["USD"])),
-                crate::auction::types::BidStatus::Error,
+                trusted_server_core::auction::types::BidStatus::Error,
                 None,
                 Some("parse_response"),
             ),
@@ -6285,7 +6323,7 @@ set = { networkId = 42 }
                 "{name}"
             );
 
-            if expected_status == crate::auction::types::BidStatus::Success {
+            if expected_status == trusted_server_core::auction::types::BidStatus::Success {
                 assert_eq!(parsed.bids.len(), 1, "{name}");
                 assert_eq!(parsed.bids[0].currency, DEFAULT_CURRENCY, "{name}");
             } else {
@@ -6318,9 +6356,9 @@ set = { networkId = 42 }
             assert!(bid.returned_seat.is_none());
         }
 
-        crate::auction::openrtb::apply_notification_policy(
+        trusted_server_core::auction::openrtb::apply_notification_policy(
             &mut parsed.bids,
-            &crate::auction::plan::NotificationPolicy {
+            &trusted_server_core::auction::plan::NotificationPolicy {
                 suppress_all: false,
                 suppress_seats: std::collections::BTreeSet::from(["unknown".to_string()]),
             },
@@ -6404,7 +6442,7 @@ set = { networkId = 42 }
         .expect("should parse planned PBS response");
         assert_eq!(
             inferred.status,
-            crate::auction::types::BidStatus::Success,
+            trusted_server_core::auction::types::BidStatus::Success,
             "should admit a bid with inferable dimensions"
         );
         assert_eq!(
@@ -6444,7 +6482,7 @@ set = { networkId = 42 }
         .expect("should parse planned PBS response");
         assert_eq!(
             ambiguous.status,
-            crate::auction::types::BidStatus::NoBid,
+            trusted_server_core::auction::types::BidStatus::NoBid,
             "should reject a bid with ambiguous dimensions"
         );
         assert_eq!(
@@ -6885,28 +6923,30 @@ set = { networkId = 42 }
             .header("x-forwarded-for", "198.51.100.8")
             .body(EdgeBody::empty())
             .expect("should build inbound request");
-        let plan =
-            crate::auction::plan::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
+        let plan = trusted_server_core::auction::plan::AuctionPlan::compile(
+            trusted_server_core::auction::plan::AuctionPlanConfig {
                 timeout_ms: 321,
-                ..crate::auction::plan::AuctionPlanConfig::default()
-            })
-            .expect("should compile empty plan");
-        let routed = crate::auction::routing::route_auction(
-            canonical_parity_auction_request(),
-            &inbound,
-            &plan,
-            Some(std::net::IpAddr::from([203, 0, 113, 9])),
-        );
+                ..trusted_server_core::auction::plan::AuctionPlanConfig::default()
+            },
+        )
+        .expect("should compile empty plan");
+        let (transport_headers, attested_client_ip) =
+            trusted_server_core::auction::test_support::routed_transport(
+                &plan,
+                canonical_parity_auction_request(),
+                &inbound,
+                Some(std::net::IpAddr::from([203, 0, 113, 9])),
+            );
         let mut outbound = http::Request::builder()
             .uri("https://pbs.example.test/openrtb2/auction")
             .body(EdgeBody::empty())
             .expect("should build outbound request");
 
         apply_prebid_transport_headers(
-            routed.transport_headers(),
+            &transport_headers,
             outbound.headers_mut(),
             ConsentForwardingMode::OpenrtbOnly,
-            routed.attested_client_ip(),
+            attested_client_ip,
         );
 
         assert_eq!(
@@ -7023,7 +7063,7 @@ set = { networkId = 42 }
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(204, Vec::new());
             let services = build_services_with_http_client_and_client_ip(
-                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&stub) as Arc<dyn trusted_server_core::platform::PlatformHttpClient>,
                 std::net::IpAddr::from([203, 0, 113, 9]),
             );
             let settings = make_settings();
@@ -7104,7 +7144,7 @@ set = { networkId = 42 }
             .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .body(EdgeBody::empty())
             .expect("should build inbound request");
-        let services = crate::platform::test_support::noop_services();
+        let services = trusted_server_core::platform::test_support::noop_services();
         let context = AuctionContext {
             settings: &settings,
             request: &inbound,
@@ -7170,6 +7210,804 @@ set = { networkId = 42 }
             enabled,
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "should preserve the complete enabled PBS wire shape"
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+}
+
+/// Tests of this implementation run through core's request builder and
+/// orchestrator, the way a deployment runs it.
+#[cfg(test)]
+mod engine_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{Request, header};
+    use serde_json::{Value, json};
+    use trusted_server_core::auction::orchestrator::AuctionOrchestrator;
+    use trusted_server_core::auction::plan::{AuctionPlan, AuctionPlanConfig, NotificationConfig};
+    use trusted_server_core::auction::test_support::{
+        build_for_first_source, canonical_parity_auction_request, demand_table,
+        deterministic_signer, golden_inbound_request, golden_plan_config, plan_config_with,
+        route_to_first_source,
+    };
+    use trusted_server_core::auction::types::{
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, MediaType, PublisherInfo, UserInfo,
+    };
+    use trusted_server_core::consent::jurisdiction::Jurisdiction;
+    use trusted_server_core::consent::{ConsentContext, ConsentSource};
+    use trusted_server_core::openrtb::OpenRtbRequest;
+    use trusted_server_core::platform::BackendNamingPolicy;
+    use trusted_server_core::platform::test_support::{
+        NamingBackend, StubHttpClient, build_services_with_backend_and_http_client,
+    };
+    use trusted_server_core::test_support::tests::create_test_settings;
+
+    use super::{MODULE, builder};
+
+    /// The one-source plan the request tests run: `fictional_provider`
+    /// running this implementation with `settings`, reached through the
+    /// bidder `exampleBidder`.
+    fn plan_with(settings: Value) -> AuctionPlan {
+        AuctionPlan::compile(golden_plan_config(MODULE, settings, false, &[builder()]))
+            .expect("should compile plan")
+    }
+
+    fn bare_inbound() -> Request<EdgeBody> {
+        Request::builder()
+            .uri("https://publisher.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request")
+    }
+
+    /// The request core's driver builds for the source, or `None` when the
+    /// source keeps no impression.
+    fn try_build(
+        plan: &AuctionPlan,
+        request: AuctionRequest,
+        inbound: &Request<EdgeBody>,
+    ) -> Option<OpenRtbRequest> {
+        build_for_first_source(plan, request, inbound, 321, None).expect("should build request")
+    }
+
+    fn build_with_request(
+        settings: Value,
+        request: AuctionRequest,
+        accept_language: Option<&str>,
+    ) -> OpenRtbRequest {
+        let plan = plan_with(settings);
+        let mut inbound = Request::builder().uri("https://publisher.example/auction");
+        if let Some(language) = accept_language {
+            inbound = inbound.header(header::ACCEPT_LANGUAGE, language);
+        }
+        let inbound = inbound
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        try_build(&plan, request, &inbound).expect("should retain impression")
+    }
+
+    #[test]
+    fn consent_matrix_holds_for_prebid_server() {
+        let cases = [
+            ("empty", ConsentContext::default()),
+            (
+                "gdpr",
+                ConsentContext {
+                    gdpr_applies: true,
+                    raw_tc_string: Some("tc-string".to_string()),
+                    jurisdiction: Jurisdiction::Gdpr,
+                    ..Default::default()
+                },
+            ),
+            (
+                "unknown-gpc",
+                ConsentContext {
+                    gpc: true,
+                    jurisdiction: Jurisdiction::Unknown,
+                    ..Default::default()
+                },
+            ),
+            (
+                "nonregulated-gpc",
+                ConsentContext {
+                    gpc: true,
+                    jurisdiction: Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            ),
+            (
+                "usp-gpp",
+                ConsentContext {
+                    raw_us_privacy: Some("1YNN".to_string()),
+                    raw_gpp_string: Some("gpp-string".to_string()),
+                    gpp_section_ids: Some(vec![7, 8]),
+                    jurisdiction: Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, consent) in cases {
+            let mut canonical = canonical_parity_auction_request();
+            canonical.user.consent = Some(consent.clone());
+            let value = serde_json::to_value(build_with_request(json!({}), canonical, None))
+                .expect("should serialize request");
+            let regs = value.get("regs");
+            if name == "empty" {
+                assert!(regs.is_none(), "should omit empty regs");
+            } else {
+                let regs = regs.expect("should emit actionable regs");
+                let expected_gdpr = match consent.jurisdiction {
+                    Jurisdiction::Gdpr => Some(true),
+                    Jurisdiction::Unknown if !consent.gdpr_applies => None,
+                    _ => Some(consent.gdpr_applies),
+                };
+                assert_eq!(
+                    regs.get("gdpr"),
+                    expected_gdpr.map(|value| json!(u8::from(value))).as_ref(),
+                    "{name}"
+                );
+            }
+            let serialized = value.to_string();
+            assert!(
+                !serialized.contains("1YYY"),
+                "must never synthesize USP from GPC"
+            );
+            if name == "usp-gpp" {
+                let regs = regs.expect("should have explicit fields");
+                assert_eq!(regs["us_privacy"], "1YNN");
+                assert_eq!(regs["gpp"], "gpp-string");
+                assert_eq!(regs["gpp_sid"], json!([7, 8]));
+                assert_eq!(regs["ext"]["us_privacy"], "1YNN");
+                assert_eq!(regs["ext"]["gpp"], "gpp-string");
+                assert_eq!(regs["ext"]["gpp_sid"], json!([7, 8]));
+            }
+        }
+    }
+
+    #[test]
+    fn pbs_body_consent_respects_source_and_forwarding_mode() {
+        for (mode, source, expected) in [
+            ("cookies_only", ConsentSource::Cookie, false),
+            ("cookies_only", ConsentSource::PolicyDefault, true),
+            ("openrtb_only", ConsentSource::Cookie, true),
+            ("both", ConsentSource::Cookie, true),
+        ] {
+            let mut canonical = canonical_parity_auction_request();
+            canonical
+                .user
+                .consent
+                .as_mut()
+                .expect("should have consent context")
+                .source = source;
+            let value = serde_json::to_value(build_with_request(
+                json!({"consent_forwarding": mode}),
+                canonical,
+                None,
+            ))
+            .expect("should serialize request");
+            assert_eq!(
+                value["user"].get("consent").is_some(),
+                expected,
+                "{mode:?} {source:?}"
+            );
+            assert_eq!(value.get("regs").is_some(), expected, "{mode:?} {source:?}");
+        }
+    }
+
+    #[test]
+    fn the_primary_language_tag_is_sent_whole() {
+        let language = "abcdefghijk";
+        let request = build_with_request(
+            json!({}),
+            canonical_parity_auction_request(),
+            Some(language),
+        );
+        assert_eq!(
+            request.device.and_then(|device| device.language).as_deref(),
+            Some(language),
+            "should apply no length limit to the language tag"
+        );
+
+        let request = build_with_request(
+            json!({}),
+            canonical_parity_auction_request(),
+            Some("en-US,en;q=0.9"),
+        );
+        assert_eq!(
+            request.device.and_then(|device| device.language).as_deref(),
+            Some("en")
+        );
+    }
+
+    #[test]
+    fn pbs_debug_query_fragment_preserves_exact_legacy_configured_semantics() {
+        for (page, fragment, expected) in [
+            (
+                "https://publisher.example/article",
+                "pbjs_debug=true",
+                "https://publisher.example/article?pbjs_debug=true",
+            ),
+            (
+                "https://publisher.example/article?existing=1",
+                "pbjs_debug=true",
+                "https://publisher.example/article?existing=1&pbjs_debug=true",
+            ),
+            (
+                "https://publisher.example/article",
+                "?pbjs_debug=true",
+                "https://publisher.example/article??pbjs_debug=true",
+            ),
+            (
+                "https://publisher.example/article?pbjs_debug=true",
+                "pbjs_debug=true",
+                "https://publisher.example/article?pbjs_debug=true",
+            ),
+            (
+                "https://publisher.example/article",
+                "",
+                "https://publisher.example/article",
+            ),
+        ] {
+            let mut request = canonical_parity_auction_request();
+            request.publisher.page_url = Some(page.to_string());
+            let built = build_with_request(json!({"debug_query_params": fragment}), request, None);
+            assert_eq!(
+                built.site.and_then(|site| site.page).as_deref(),
+                Some(expected),
+                "should preserve exact legacy query fragment semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
+        let plan = plan_with(json!({
+            "debug": true,
+            "test_mode": true,
+            "bid_param_overrides": {"exampleBidder": {"generic": 1, "shared": "generic"}},
+            "bid_param_zone_overrides": {"exampleBidder": {"zone-a": {"zone": 2, "shared": "zone"}}},
+            "bid_param_override_rules": [
+                {"when":{"bidder":"exampleBidder"},"set":{"ordered":1,"shared":"rule-one"}},
+                {"when":{"bidder":"exampleBidder","zone":"zone-a"},"set":{"ordered":2,"shared":"rule-two"}}
+            ]
+        }));
+        let mut request = canonical_parity_auction_request();
+        request.slots[0].bidders = HashMap::from([(
+            "trustedServer".to_string(),
+            json!({"zone":"zone-a","bidderParams":{"exampleBidder":{"original":true,"shared":"original"}}}),
+        )]);
+        let inbound = bare_inbound();
+        let built = try_build(&plan, request, &inbound).expect("should retain impression");
+        let value = serde_json::to_value(built).expect("should serialize request");
+        assert_eq!(
+            value["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+            json!({"generic":1,"ordered":2,"original":true,"shared":"rule-two","zone":2})
+        );
+        assert_eq!(value["ext"]["prebid"]["debug"], true);
+        assert_eq!(value["ext"]["prebid"]["returnallbidstatus"], true);
+        assert_eq!(value["test"], 1);
+
+        let mut empty_overridden = canonical_parity_auction_request();
+        empty_overridden.slots[0].bidders = HashMap::from([(
+            "trustedServer".to_string(),
+            json!({"zone":"zone-a","bidderParams":{"exampleBidder":{}}}),
+        )]);
+        let built = try_build(&plan, empty_overridden, &inbound)
+            .expect("should retain overridden impression");
+        let value = serde_json::to_value(built).expect("should serialize overridden request");
+        assert_eq!(
+            value["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+            json!({"generic":1,"ordered":2,"shared":"rule-two","zone":2}),
+            "should allow implementation overrides to populate empty browser params"
+        );
+
+        let mut stored = canonical_parity_auction_request();
+        stored.slots[0].bidders.clear();
+        let built = try_build(&plan, stored, &inbound).expect("should retain impression");
+        let value = serde_json::to_value(built).expect("should serialize stored request");
+        assert_eq!(
+            value["imp"][0]["ext"]["prebid"]["storedrequest"]["id"],
+            "fictional-slot"
+        );
+    }
+
+    #[test]
+    fn pbs_pairs_each_impression_with_its_routed_slot_params() {
+        let plan = plan_with(json!({}));
+        let mut request = canonical_parity_auction_request();
+        request.slots[0].id = "first-slot".to_string();
+        request.slots[0].bidders = HashMap::from([(
+            "trustedServer".to_string(),
+            json!({"bidderParams":{"exampleBidder":{"placement":"first"}}}),
+        )]);
+        let mut second_slot = request.slots[0].clone();
+        second_slot.id = "second-slot".to_string();
+        second_slot.bidders = HashMap::from([(
+            "trustedServer".to_string(),
+            json!({"bidderParams":{"exampleBidder":{"placement":"second"}}}),
+        )]);
+        request.slots.push(second_slot);
+
+        let built = try_build(&plan, request, &bare_inbound()).expect("should retain impressions");
+        let value = serde_json::to_value(built).expect("should serialize request");
+
+        assert_eq!(value["imp"][0]["id"], "first-slot");
+        assert_eq!(
+            value["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+            json!({"placement":"first"})
+        );
+        assert_eq!(value["imp"][1]["id"], "second-slot");
+        assert_eq!(
+            value["imp"][1]["ext"]["prebid"]["bidder"]["exampleBidder"],
+            json!({"placement":"second"})
+        );
+    }
+
+    #[test]
+    fn pbs_stored_intent_is_applied_after_overrides_with_inline_first() {
+        for intent in [None, Some(false), Some(true)] {
+            for inline in [false, true] {
+                for fill_override in [false, true] {
+                    let profile = if fill_override {
+                        json!({"bid_param_overrides":{"exampleBidder":{"filled":1}}})
+                    } else {
+                        json!({})
+                    };
+                    let plan = plan_with(profile);
+                    let mut request = canonical_parity_auction_request();
+                    let mut envelope = json!({"bidderParams":{"exampleBidder":if inline { json!({"original":1}) } else { json!({}) }}});
+                    if let Some(intent) = intent {
+                        envelope["storedRequest"] = json!(intent);
+                    }
+                    request.slots[0].bidders =
+                        HashMap::from([("trustedServer".to_string(), envelope)]);
+                    let inbound = Request::new(EdgeBody::empty());
+                    let result = try_build(&plan, request, &inbound);
+                    if !inline && !fill_override && intent == Some(false) {
+                        assert!(result.is_none(), "should keep no impression");
+                        continue;
+                    }
+                    let request = result.expect("should retain demand");
+                    let wire = serde_json::to_value(request).expect("should serialize request");
+                    let prebid = &wire["imp"][0]["ext"]["prebid"];
+                    if inline || fill_override {
+                        assert!(prebid.get("storedrequest").is_none());
+                        assert_eq!(
+                            prebid["bidder"]["exampleBidder"].get("original"),
+                            inline.then_some(&json!(1))
+                        );
+                        assert_eq!(
+                            prebid["bidder"]["exampleBidder"].get("filled"),
+                            fill_override.then_some(&json!(1))
+                        );
+                    } else {
+                        assert_eq!(prebid["storedrequest"]["id"], "fictional-slot");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pbs_disabled_empty_candidate_does_not_become_stored_demand() {
+        let plan = plan_with(json!({"routing": "explicit"}));
+        let mut request = canonical_parity_auction_request();
+        request.slots[0].bidders = HashMap::from([(
+            "trustedServer".to_string(),
+            json!({"bidderParams":{"exampleBidder":{}}, "storedRequest": false}),
+        )]);
+        let inbound = Request::builder()
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+
+        assert!(
+            route_to_first_source(&plan, request.clone(), &inbound).is_some(),
+            "should route candidate for overrides"
+        );
+        assert!(
+            try_build(&plan, request, &inbound).is_none(),
+            "should keep no impression for the empty candidate"
+        );
+    }
+
+    #[test]
+    fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
+        let plan = plan_with(json!({}));
+        let mut request = canonical_parity_auction_request();
+        request.slots[0].bidders = HashMap::from([(
+            "trustedServer".to_string(),
+            json!({"bidderParams":{"exampleBidder":{}}}),
+        )]);
+
+        let built =
+            try_build(&plan, request, &bare_inbound()).expect("should retain stored impression");
+        let value = serde_json::to_value(built).expect("should serialize stored request");
+
+        assert_eq!(
+            value["imp"][0]["ext"]["prebid"]["storedrequest"]["id"],
+            "fictional-slot"
+        );
+        assert!(value["imp"][0]["ext"]["prebid"].get("bidder").is_none());
+    }
+
+    #[test]
+    fn pbs_driver_exact_golden_preserves_profile_policy() {
+        let plan = plan_with(json!({"consent_forwarding": "both"}));
+        let mut common = canonical_parity_auction_request();
+        common.slots[0].bidders = HashMap::from([(
+            "exampleBidder".to_string(),
+            json!({"placement": "fictional-placement"}),
+        )]);
+
+        let request =
+            try_build(&plan, common, &golden_inbound_request()).expect("should retain impression");
+
+        assert_eq!(
+            serde_json::to_string(&request).expect("should serialize PBS driver request"),
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+            "should preserve PBS parity differences"
+        );
+    }
+
+    #[test]
+    fn the_signed_request_has_an_exact_full_golden() {
+        let signer = deterministic_signer();
+        let request = build_for_first_source(
+            &plan_with(json!({})),
+            canonical_parity_auction_request(),
+            &golden_inbound_request(),
+            321,
+            Some(&signer),
+        )
+        .expect("should build request")
+        .expect("should retain impression");
+
+        assert_eq!(
+            serde_json::to_string(&request).expect("should serialize signed request"),
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            "signed wire fixture should stay exact"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_request_keeps_the_host_and_scheme_and_a_signed_one_is_complete() {
+        let plan = plan_with(json!({}));
+        let inbound = golden_inbound_request();
+        let unsigned = serde_json::to_value(
+            try_build(&plan, canonical_parity_auction_request(), &inbound)
+                .expect("should retain impression"),
+        )
+        .expect("should serialize unsigned request");
+        assert_eq!(
+            unsigned["ext"].get("trusted_server"),
+            Some(&json!({"request_host": "publisher.example", "request_scheme": "https"})),
+            "should retain only the host and scheme when unsigned"
+        );
+
+        let signer = deterministic_signer();
+        let signed = serde_json::to_value(
+            build_for_first_source(
+                &plan,
+                canonical_parity_auction_request(),
+                &inbound,
+                321,
+                Some(&signer),
+            )
+            .expect("should build request")
+            .expect("should retain impression"),
+        )
+        .expect("should serialize signed request");
+        let extension = &signed["ext"]["trusted_server"];
+        assert_eq!(extension["version"], "1.1", "should set signing version");
+        assert_eq!(extension["kid"], "fictional-kid", "should set key ID");
+        assert_eq!(
+            extension["request_host"], "publisher.example",
+            "should set host"
+        );
+        assert_eq!(extension["request_scheme"], "https", "should set scheme");
+        assert_eq!(
+            extension["ts"], 1_706_900_000_u64,
+            "should set explicit time"
+        );
+        assert!(
+            extension["signature"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "should set signature"
+        );
+    }
+
+    fn compile_sources(
+        tables: Vec<(&str, serde_json::Map<String, Value>)>,
+    ) -> Result<AuctionPlan, error_stack::Report<trusted_server_core::error::TrustedServerError>>
+    {
+        AuctionPlan::compile(plan_config_with(tables, &[builder()]))
+    }
+
+    #[test]
+    fn the_plan_completes_an_endpoint_that_names_a_host_alone() {
+        for (configured, expected) in [
+            (
+                "https://pbs.example",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example/",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example/openrtb2/auction",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example/openrtb2/auction/",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example?region=example",
+                "https://pbs.example/openrtb2/auction?region=example",
+            ),
+            ("https://pbs.example/bid", "https://pbs.example/bid"),
+            (
+                "https://pbs.example/custom/pbs",
+                "https://pbs.example/custom/pbs",
+            ),
+        ] {
+            let plan = compile_sources(vec![("pbs", demand_table(MODULE, configured))])
+                .expect("should compile Prebid Server endpoint");
+            assert_eq!(
+                plan.providers()[0].endpoint.as_str(),
+                expected,
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_refuses_all_eligible_routing() {
+        let mut table = demand_table(MODULE, "https://bid.example/openrtb2/auction");
+        table.insert("routing".to_string(), json!("all_eligible"));
+
+        let error = compile_sources(vec![("pbs_main", table)])
+            .expect_err("should refuse all_eligible Prebid Server routing");
+
+        let message = error.to_string();
+        for expected in ["pbs_main", "all_eligible", MODULE] {
+            assert!(
+                message.contains(expected),
+                "should name the source, the routing and the implementation: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_gives_a_source_this_implementation_s_default_timeout() {
+        let mut override_table = demand_table(MODULE, "https://bid.example/openrtb2/auction");
+        override_table.insert("timeout_ms".to_string(), json!(321));
+
+        let plan = compile_sources(vec![
+            (
+                "pbs_one",
+                demand_table(MODULE, "https://bid.example/openrtb2/auction"),
+            ),
+            ("pbs_override", override_table),
+        ])
+        .expect("should resolve timeouts");
+
+        let timeouts = plan
+            .providers()
+            .iter()
+            .map(|provider| (provider.id.as_str(), provider.timeout_ms))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(timeouts["pbs_one"], 1000);
+        assert_eq!(timeouts["pbs_override"], 321);
+    }
+
+    /// A plan configuration of Prebid Server sources, each with the settings
+    /// and the notification policy given.
+    fn instances_config(providers: &[(&str, Value, NotificationConfig)]) -> AuctionPlanConfig {
+        let tables = providers
+            .iter()
+            .map(|(id, settings, notifications)| {
+                let mut entry = demand_table(MODULE, &format!("https://{id}.example.test/openrtb"));
+                entry.insert("timeout_ms".to_string(), json!(1_000));
+                entry.insert(
+                    "notifications".to_string(),
+                    serde_json::to_value(notifications).expect("should serialize notifications"),
+                );
+                if let Value::Object(settings) = settings {
+                    entry.extend(settings.clone());
+                }
+                (*id, entry)
+            })
+            .collect::<Vec<_>>();
+        let mut config = plan_config_with(tables, &[builder()]);
+        config.timeout_ms = 777;
+        config
+    }
+
+    /// One banner slot whose demand arrives in an empty `trustedServer`
+    /// envelope, which leaves it to a stored request.
+    fn planned_envelope_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "fictional-auction".to_string(),
+            slots: vec![AdSlot {
+                id: "fictional-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: Some(1.0),
+                targeting: HashMap::new(),
+                bidders: HashMap::from([("trustedServer".to_string(), json!({}))]),
+            }],
+            publisher: PublisherInfo {
+                domain: "publisher.example".to_string(),
+                page_url: Some("https://publisher.example/article".to_string()),
+            },
+            user: UserInfo {
+                id: None,
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_prebid_instances_preserve_headers_metadata_suppression_and_identity() {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(
+            200,
+            serde_json::to_vec(&json!({
+                "seatbid": [{"seat": "suppress-exact", "bid": [
+                    {"id":"good-a","impid":"fictional-slot","price":1.25,"adm":"<div>a</div>","w":300,"h":250,"nurl":"https://notify.example/win","burl":"https://notify.example/bill","ext":{"prebid":{"cache":{"bids":{"cacheId":"cache-a","url":"https://cache-a.example/cache/path"}}}}},
+                    {"id":"bad-a","price":2.0}
+                ]}],
+                "ext": {"responsetimemillis":{"suppress-exact":4},"errors":{"other":["fictional"]},"warnings":{"other":["warning"]},"debug":{"httpcalls":[]},"prebid":{"bidstatus":{"suppress-exact":[{"bidid":"good-a"}]}}}
+            }))
+            .expect("should serialize PBS response a"),
+        );
+        http.push_response(
+            200,
+            serde_json::to_vec(&json!({
+                "seatbid": [{"seat": "keep-seat", "bid": [{
+                    "id":"good-b","impid":"fictional-slot","price":2.5,"adm":"<div>b</div>","w":300,"h":250,"nurl":"https://notify.example/win","burl":"https://notify.example/bill"
+                }]}]
+            }))
+            .expect("should serialize PBS response b"),
+        );
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let notifications = NotificationConfig {
+            suppress_all: false,
+            suppress_seats: vec!["suppress-exact".to_string()],
+        };
+        let plan = AuctionPlan::compile(instances_config(&[
+            (
+                "pbs_a",
+                json!({"debug":true,"test_mode":true,"consent_forwarding":"openrtb_only"}),
+                notifications,
+            ),
+            ("pbs_b", json!({}), NotificationConfig::default()),
+        ]))
+        .expect("should compile planned PBS auction");
+        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), None);
+        let request = planned_envelope_request();
+        let settings = create_test_settings();
+        let inbound = Request::builder()
+            .uri("https://publisher.example/auction")
+            .header(
+                header::COOKIE,
+                "consent=keep; euconsent-v2=drop; other=value",
+            )
+            .header(header::USER_AGENT, "Fictional Browser/7")
+            .header(header::REFERER, "https://referrer.example/story")
+            .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header("x-forwarded-for", "203.0.113.250")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("should execute planned PBS auction");
+
+        assert_eq!(result.provider_responses.len(), 2);
+        let first = &result.provider_responses[0];
+        assert_eq!(first.provider, "pbs_a");
+        assert_eq!(first.bids.len(), 1, "should isolate malformed sibling");
+        assert_eq!(
+            first.bids[0].returned_seat.as_deref(),
+            Some("suppress-exact")
+        );
+        assert_eq!(first.bids[0].bidder, "suppress-exact");
+        assert!(
+            first.bids[0].nurl.is_none(),
+            "should suppress after normalization"
+        );
+        assert!(
+            first.bids[0].burl.is_none(),
+            "should suppress billing notification"
+        );
+        assert_eq!(first.bids[0].cache_id.as_deref(), Some("cache-a"));
+        assert_eq!(first.bids[0].cache_host.as_deref(), Some("cache-a.example"));
+        assert_eq!(first.bids[0].cache_path.as_deref(), Some("/cache/path"));
+        assert_eq!(first.metadata["responsetimemillis"]["suppress-exact"], 4);
+        assert!(first.metadata.contains_key("errors"));
+        assert!(first.metadata.contains_key("warnings"));
+        assert!(first.metadata.contains_key("debug"));
+        assert!(first.metadata.contains_key("bidstatus"));
+        let second = &result.provider_responses[1];
+        assert_eq!(second.provider, "pbs_b");
+        assert_eq!(second.bids[0].returned_seat.as_deref(), Some("keep-seat"));
+        assert!(second.bids[0].nurl.is_some());
+        assert!(!second.metadata.contains_key("debug"));
+        assert!(!second.metadata.contains_key("bidstatus"));
+
+        let headers = http.recorded_request_headers();
+        assert_eq!(headers.len(), 2);
+        for request_headers in &headers {
+            assert!(
+                request_headers
+                    .iter()
+                    .any(|(name, value)| name == "user-agent" && value == "Fictional Browser/7")
+            );
+            assert!(request_headers.iter().any(
+                |(name, value)| name == "referer" && value == "https://referrer.example/story"
+            ));
+            assert!(
+                request_headers
+                    .iter()
+                    .any(|(name, value)| name == "accept-language" && value == "en-US,en;q=0.9")
+            );
+            assert!(
+                request_headers
+                    .iter()
+                    .all(|(name, _)| name != "x-forwarded-for"),
+                "must ignore inbound XFF without attestation"
+            );
+            assert!(
+                request_headers.iter().all(|(name, _)| name != "accept"),
+                "planned PBS transport must not add Accept beyond legacy headers"
+            );
+        }
+        let first_cookie = headers[0]
+            .iter()
+            .find(|(name, _)| name == "cookie")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(first_cookie, Some("consent=keep; other=value"));
+        let second_cookie = headers[1]
+            .iter()
+            .find(|(name, _)| name == "cookie")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            second_cookie,
+            Some("consent=keep; euconsent-v2=drop; other=value")
         );
     }
 }

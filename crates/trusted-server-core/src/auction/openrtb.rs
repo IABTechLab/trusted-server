@@ -59,21 +59,21 @@ impl BidRejectionReason {
 
 /// Bounded aggregate diagnostics for rejected upstream bids.
 #[derive(Debug, Default)]
-pub(crate) struct ResponseAdmissionDiagnostics {
+pub struct ResponseAdmissionDiagnostics {
     rejected_bid_count: u32,
     reason_counts: BTreeMap<BidRejectionReason, u32>,
 }
 
 impl ResponseAdmissionDiagnostics {
     /// Record one rejected bid without retaining upstream payload data.
-    pub(crate) fn record(&mut self, reason: BidRejectionReason) {
+    pub fn record(&mut self, reason: BidRejectionReason) {
         self.rejected_bid_count = self.rejected_bid_count.saturating_add(1);
         let count = self.reason_counts.entry(reason).or_default();
         *count = count.saturating_add(1);
     }
 
     /// Attach fixed-cardinality rejection counts to a provider response.
-    pub(crate) fn attach_to(self, response: &mut AuctionResponse) {
+    pub fn attach_to(self, response: &mut AuctionResponse) {
         if self.rejected_bid_count == 0 {
             return;
         }
@@ -160,7 +160,8 @@ impl SlotBidDimensions {
 pub type BidDimensionIndex = BTreeMap<String, SlotBidDimensions>;
 
 /// Build the requested-dimension index once for one provider response.
-pub(crate) fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
+#[must_use]
+pub fn build_bid_dimension_index(input: &ProviderAuctionInput) -> BidDimensionIndex {
     build_bid_dimension_index_from_slots(input.slots().iter().map(ProviderSlotInput::slot))
 }
 
@@ -621,7 +622,7 @@ fn header_string(value: Option<&http::HeaderValue>) -> Option<String> {
 }
 
 /// Suppress notification URLs using exact returned-seat identity.
-pub(crate) fn apply_notification_policy(bids: &mut [Bid], policy: &NotificationPolicy) {
+pub fn apply_notification_policy(bids: &mut [Bid], policy: &NotificationPolicy) {
     for bid in bids {
         let suppress = policy.suppress_all
             || bid
@@ -814,10 +815,8 @@ mod routing_metadata_tests {
 
     #[test]
     fn unused_bidder_param_count_follows_the_implementation() {
-        for (implementation, expected) in [
-            ("auction.prebid-server", 0),
-            ("auction-protocol.openrtb", 1),
-        ] {
+        for (implementation, expected) in [("auction.fixture", 0), ("auction-protocol.openrtb", 1)]
+        {
             let endpoint = "https://provider.example/openrtb";
             let provider_id =
                 ProviderId::from_str("fictional_provider").expect("should parse provider ID");

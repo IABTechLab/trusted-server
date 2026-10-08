@@ -16,7 +16,6 @@ use crate::settings::Settings;
 
 pub mod js_asset_proxy;
 pub mod openrtb;
-pub mod prebid_server;
 mod registry;
 
 #[cfg(test)]
@@ -701,8 +700,6 @@ impl IntegrationBuilder {
 
 /// The built-in integrations, in hook order.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
-    // Prebid is registered from the auction plan, which puts its hooks ahead
-    // of every section's module whatever its place here.
     // This must remain the first module a section selects: attribute
     // rewriters chain replacements and short-circuit removals.
     js_asset_proxy::BUILDER,
@@ -721,11 +718,16 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // the same tests.
     #[cfg(test)]
     registry_test_support::deferred_fixture::BUILDER,
-    // Implementations `[demand]` and `[ad-server]` can name. None of them is
-    // a module a section selects.
+    // The implementation `[demand]` can name, which no section selects.
     IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),
-    IntegrationBuilder::implementations(prebid_server::MODULE, CORE_SOURCE)
-        .with_demand(&prebid_server::DEMAND),
+    // A stand-in demand implementation, which core's own tests name where
+    // they need one that departs from the plain one.
+    #[cfg(test)]
+    IntegrationBuilder::implementations(
+        crate::auction::test_support::demand_fixture::MODULE,
+        CORE_SOURCE,
+    )
+    .with_demand(&crate::auction::test_support::demand_fixture::DEMAND),
     // A stand-in ad server, which core's own tests select where they need
     // one.
     #[cfg(test)]

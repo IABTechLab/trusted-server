@@ -26,6 +26,7 @@ members = [
     "crates/ad-server/mock",
     "crates/auction/aps",
     "crates/auction/prebid",
+    "crates/auction/prebid-server",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -160,6 +161,7 @@ trusted-server-bot-protection-datadome = { path = "crates/bot-protection/datadom
 trusted-server-ad-server-mock = { path = "crates/ad-server/mock" }
 trusted-server-auction-aps = { path = "crates/auction/aps" }
 trusted-server-auction-prebid = { path = "crates/auction/prebid" }
+trusted-server-auction-prebid-server = { path = "crates/auction/prebid-server" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

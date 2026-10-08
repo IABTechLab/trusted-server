@@ -768,7 +768,6 @@ fn compile_notifications(
 mod tests {
     use super::*;
     use crate::integrations::openrtb::OpenRtbDemand;
-    use crate::integrations::prebid_server::PrebidServerDemand;
     use crate::provider_table::IMPLEMENTATION_KEY;
     use serde_json::json;
 
@@ -906,7 +905,7 @@ mod tests {
         for expected in [
             "fictional_exchange",
             "auction-protocol.openrtb",
-            "auction.prebid-server",
+            "auction.fixture",
         ] {
             assert!(
                 message.contains(expected),
@@ -999,12 +998,12 @@ mod tests {
 
     #[test]
     fn all_eligible_is_refused_for_an_implementation_that_forbids_it() {
-        let mut prebid = table("auction.prebid-server");
-        prebid.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
-        let error = AuctionPlan::compile(config(vec![("pbs_main", prebid)]))
-            .expect_err("should refuse all_eligible Prebid Server routing");
+        let mut explicit_only = table("auction.fixture");
+        explicit_only.insert(ROUTING_KEY.to_string(), json!("all_eligible"));
+        let error = AuctionPlan::compile(config(vec![("explicit_main", explicit_only)]))
+            .expect_err("should refuse all_eligible routing for the implementation");
         let message = error.to_string();
-        for expected in ["pbs_main", "all_eligible", "auction.prebid-server"] {
+        for expected in ["explicit_main", "all_eligible", "auction.fixture"] {
             assert!(
                 message.contains(expected),
                 "should name the source, the routing and the implementation: {error:?}"
@@ -1080,33 +1079,33 @@ mod tests {
     #[test]
     fn two_sources_can_run_one_implementation_under_their_own_names() {
         let plan = AuctionPlan::compile(config(vec![
-            ("pbs_a", table("auction.prebid-server")),
-            ("pbs_b", table("auction.prebid-server")),
+            ("source_a", table("auction-protocol.openrtb")),
+            ("source_b", table("auction-protocol.openrtb")),
         ]))
-        .expect("should compile two Prebid Server sources");
+        .expect("should compile two sources of one implementation");
         assert_eq!(plan.providers().len(), 2);
         assert!(
             plan.providers()
                 .iter()
-                .all(|provider| provider.implementation.id == "auction.prebid-server"),
+                .all(|provider| provider.implementation.id == "auction-protocol.openrtb"),
             "both names should resolve to the same implementation"
         );
         assert!(
             plan.providers()
                 .iter()
-                .all(|provider| provider.demand.as_any().is::<PrebidServerDemand>()),
+                .all(|provider| provider.demand.as_any().is::<OpenRtbDemand>()),
             "each source should compile its own settings"
         );
     }
 
     #[test]
     fn implementation_defaults_and_an_explicit_timeout_are_resolved() {
-        let mut override_table = table("auction.prebid-server");
+        let mut override_table = table("auction.fixture");
         override_table.insert(TIMEOUT_KEY.to_string(), json!(321));
         let plan = AuctionPlan::compile(config(vec![
             ("openrtb_one", table("auction-protocol.openrtb")),
-            ("pbs_one", table("auction.prebid-server")),
-            ("pbs_override", override_table),
+            ("fixed_one", table("auction.fixture")),
+            ("fixed_override", override_table),
         ]))
         .expect("should resolve timeouts");
         let timeouts = plan
@@ -1115,23 +1114,23 @@ mod tests {
             .map(|provider| (provider.id.as_str(), provider.timeout_ms))
             .collect::<BTreeMap<_, _>>();
         assert_eq!(timeouts["openrtb_one"], 1500);
-        assert_eq!(timeouts["pbs_one"], 1000);
-        assert_eq!(timeouts["pbs_override"], 321);
+        assert_eq!(timeouts["fixed_one"], 1000);
+        assert_eq!(timeouts["fixed_override"], 321);
     }
 
     #[test]
     fn the_plan_reports_which_implementations_it_selected() {
-        let plan = AuctionPlan::compile(config(vec![("pbs", table("auction.prebid-server"))]))
+        let plan = AuctionPlan::compile(config(vec![("source", table("auction.fixture"))]))
             .expect("should compile without Settings or browser integration state");
         assert!(!plan.has_implementation("auction-protocol.openrtb"));
-        assert!(plan.has_implementation("auction.prebid-server"));
+        assert!(plan.has_implementation("auction.fixture"));
 
         let plan = AuctionPlan::compile(one_source()).expect("should compile a plain source");
         assert!(
             plan.has_implementation("auction-protocol.openrtb"),
             "a validated plan should say which implementation it selected"
         );
-        assert!(!plan.has_implementation("auction.prebid-server"));
+        assert!(!plan.has_implementation("auction.fixture"));
         assert!(
             plan.providers()[0].demand.as_any().is::<OpenRtbDemand>(),
             "the source should compile its own settings"
@@ -1213,38 +1212,29 @@ mod tests {
     }
 
     #[test]
-    fn only_prebid_server_completes_an_endpoint_that_names_a_host_alone() {
+    fn an_implementation_completes_an_endpoint_and_the_plain_one_leaves_it_as_written() {
         for (configured, expected) in [
             (
-                "https://pbs.example",
-                "https://pbs.example/openrtb2/auction",
+                "https://exchange.example",
+                "https://exchange.example/fixture/auction",
             ),
             (
-                "https://pbs.example/",
-                "https://pbs.example/openrtb2/auction",
+                "https://exchange.example/",
+                "https://exchange.example/fixture/auction",
             ),
             (
-                "https://pbs.example/openrtb2/auction",
-                "https://pbs.example/openrtb2/auction",
+                "https://exchange.example?region=example",
+                "https://exchange.example/fixture/auction?region=example",
             ),
             (
-                "https://pbs.example/openrtb2/auction/",
-                "https://pbs.example/openrtb2/auction",
-            ),
-            (
-                "https://pbs.example?region=example",
-                "https://pbs.example/openrtb2/auction?region=example",
-            ),
-            ("https://pbs.example/bid", "https://pbs.example/bid"),
-            (
-                "https://pbs.example/custom/pbs",
-                "https://pbs.example/custom/pbs",
+                "https://exchange.example/bid",
+                "https://exchange.example/bid",
             ),
         ] {
-            let mut pbs = table("auction.prebid-server");
-            pbs.insert(ENDPOINT_KEY.to_string(), json!(configured));
-            let plan = AuctionPlan::compile(config(vec![("pbs", pbs)]))
-                .expect("should compile Prebid Server endpoint");
+            let mut source = table("auction.fixture");
+            source.insert(ENDPOINT_KEY.to_string(), json!(configured));
+            let plan = AuctionPlan::compile(config(vec![("source", source)]))
+                .expect("should compile the endpoint");
             assert_eq!(
                 plan.providers()[0].endpoint.as_str(),
                 expected,
@@ -1371,9 +1361,9 @@ mod tests {
 
     #[test]
     fn an_implementation_rejects_settings_it_does_not_know() {
-        let mut pbs = table("auction.prebid-server");
-        pbs.insert("browser_only".to_string(), json!(true));
-        let error = AuctionPlan::compile(config(vec![("pbs", pbs)]))
+        let mut source = table("auction.fixture");
+        source.insert("browser_only".to_string(), json!(true));
+        let error = AuctionPlan::compile(config(vec![("source", source)]))
             .expect_err("should refuse a setting the implementation does not know");
         assert!(
             format!("{error:?}").contains("browser_only"),
