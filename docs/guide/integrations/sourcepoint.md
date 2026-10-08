@@ -38,7 +38,7 @@ The Sourcepoint browser module is now opt-in through `[integrations.sourcepoint]
 | `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                                                                                                  |
 | `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                                                                                                     |
 | `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies. Names must be 1-64 characters and contain only letters, numbers, `_`, or `-` |
-| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers                                                                                          |
+| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL for successful CDN responses without upstream cache headers; always applied to rewritten static JavaScript unless the response sets cookies                      |
 
 ## Endpoints
 
@@ -89,7 +89,9 @@ Trusted Server forwards only Sourcepoint's documented cookie names upstream, plu
 
 Responses that include `Set-Cookie` are forced to `Cache-Control: private, no-store` so cookie-bearing Sourcepoint traffic is never marked as publicly cacheable content by the proxy.
 
-Rewritten `/mms/v2/get_site_data` responses preserve upstream cache policy rather than receiving the static JavaScript cache policy. When upstream omits `Cache-Control`, they use `private, max-age=0` if Sourcepoint cookies were forwarded, or the configured public TTL otherwise. Rewritten HTML uses the same policy. Other rewritten JavaScript retains the existing configured public TTL, except for responses that set cookies.
+Rewritten JavaScript on `.js`, `.mjs`, and `/unified/` paths is treated as a static bundle and receives `public, max-age=<cache_ttl_seconds>`, replacing any upstream `Cache-Control`, unless the response sets cookies.
+
+Other rewritten JavaScript, including `/mms/v2/get_site_data`, keeps upstream `Cache-Control`. When upstream omits it, these responses use `private, max-age=0` if Sourcepoint cookies were forwarded, or `public, max-age=<cache_ttl_seconds>` otherwise. Rewritten HTML uses the same policy.
 
 ## Notes
 

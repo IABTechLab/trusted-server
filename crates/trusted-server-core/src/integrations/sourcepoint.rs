@@ -602,7 +602,7 @@ impl SourcepointIntegration {
             .is_some_and(|ct| ct.contains("text/html"))
     }
 
-    /// Returns `true` for CDN paths that are likely JavaScript bundles.
+    /// Returns `true` for CDN paths likely to return JavaScript.
     ///
     /// Used to decide whether to request uncompressed content from upstream so
     /// the body can be read and rewritten.  Paths that don't match still get
@@ -610,10 +610,12 @@ impl SourcepointIntegration {
     /// is a conservative preflight — false negatives just mean we skip the
     /// `Accept-Encoding: identity` optimisation for that request.
     fn is_likely_javascript_path(path: &str) -> bool {
-        path.ends_with(".js")
-            || path.ends_with(".mjs")
-            || path.starts_with("/unified/")
-            || path == SOURCEPOINT_SITE_DATA_PATH
+        Self::is_static_javascript_path(path) || path == SOURCEPOINT_SITE_DATA_PATH
+    }
+
+    /// Returns `true` for likely static bundles that take the fixed public TTL.
+    fn is_static_javascript_path(path: &str) -> bool {
+        path.ends_with(".js") || path.ends_with(".mjs") || path.starts_with("/unified/")
     }
 
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
@@ -663,9 +665,9 @@ impl SourcepointIntegration {
     ) {
         self.finalize_rewritten_body(response, rewritten, "application/javascript; charset=utf-8");
 
-        // Site data is a dynamic API response despite its JavaScript content
-        // type. Preserve its upstream cache policy and cookie-aware defaults.
-        if target_path == SOURCEPOINT_SITE_DATA_PATH {
+        // JavaScript content type alone does not identify a static bundle.
+        // Preserve upstream policy and cookie-aware defaults for other paths.
+        if !Self::is_static_javascript_path(target_path) {
             self.apply_cache_headers(response, forwarded_cookies);
             return;
         }
@@ -887,6 +889,11 @@ impl IntegrationProxy for SourcepointIntegration {
             None,
         )?;
 
+        let requested_identity_encoding = proxy_req
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"));
         // Keep the body streaming where supported so the rewrite collector
         // enforces its limit before the adapter buffers the entire response.
         let mut platform_request = PlatformHttpRequest::new(proxy_req, backend_name);
@@ -944,12 +951,23 @@ impl IntegrationProxy for SourcepointIntegration {
                     .to_str()
                     .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
             });
-        if method == Method::GET
+        let rewrite_eligible = method == Method::GET
             && response.status() == StatusCode::OK
             && self.config.rewrite_sdk
-            && response_is_identity_encoded
-            && (response_is_javascript || response_is_html)
-        {
+            && (response_is_javascript || response_is_html);
+        if rewrite_eligible && !response_is_identity_encoded {
+            let level = if requested_identity_encoding {
+                log::Level::Warn
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
+                level,
+                "Sourcepoint: response body for {path} is not identity-encoded, \
+                 skipping rewrite (reason: encoded_response)"
+            );
+        }
+        if rewrite_eligible && response_is_identity_encoded {
             let kind = if response_is_javascript {
                 "JavaScript"
             } else {
@@ -991,7 +1009,7 @@ impl IntegrationProxy for SourcepointIntegration {
                 log::warn!(
                     "Sourcepoint: response body collection for {path} failed \
                      (limit: {MAX_REWRITE_BODY_SIZE} bytes), returning 502 \
-                     (reason: response_collection_failed): {error:?}"
+                     (reason: response_collection_failed): {error}"
                 );
             })?;
             let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
@@ -1306,14 +1324,19 @@ mod tests {
                             .collect();
                         let expected_encodings: Vec<_> =
                             encodings.iter().map(|value| value.as_bytes()).collect();
-                        assert_eq!(returned_encodings, expected_encodings);
+                        assert_eq!(
+                            returned_encodings, expected_encodings,
+                            "should preserve Content-Encoding {encodings:?} on pass-through"
+                        );
                         assert_eq!(
                             get_header_str(&response, header::CACHE_CONTROL),
-                            Some("no-store")
+                            Some("no-store"),
+                            "should preserve upstream cache policy for {encodings:?}"
                         );
                         assert_eq!(
                             get_header_str(&response, header::VARY),
-                            Some("Accept-Encoding, Origin")
+                            Some("Accept-Encoding, Origin"),
+                            "should preserve upstream Vary for {encodings:?}"
                         );
                         assert_eq!(
                             response
@@ -1372,8 +1395,14 @@ mod tests {
                         .await
                         .expect("should rewrite explicitly identity-encoded responses");
 
-                    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-                    assert!(client.reads.load(Ordering::Relaxed) > 0);
+                    assert!(
+                        response.headers().get(header::CONTENT_ENCODING).is_none(),
+                        "should drop {encoding:?} Content-Encoding after rewriting"
+                    );
+                    assert!(
+                        client.reads.load(Ordering::Relaxed) > 0,
+                        "should collect {encoding:?} bodies for rewriting"
+                    );
                     assert_eq!(
                         take_body_bytes(response),
                         expected,
@@ -1559,7 +1588,7 @@ mod tests {
                     b"unchanged".to_vec(),
                     vec![
                         ("content-type", content_type),
-                        ("content-encoding", "gzip"),
+                        ("content-encoding", "identity"),
                         ("cache-control", "no-store"),
                     ],
                 );
@@ -1591,7 +1620,7 @@ mod tests {
                 );
                 assert_eq!(
                     get_header_str(&response, header::CONTENT_ENCODING),
-                    Some("gzip"),
+                    Some("identity"),
                     "should preserve pass-through encoding"
                 );
                 assert_eq!(
@@ -1684,6 +1713,90 @@ mod tests {
                     br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
                     "should rewrite with either header state"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn handle_javascript_cache_policy_follows_static_path_classification() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for (path, is_static) in [
+                ("/wrapper/v2/script", false),
+                ("/consent/tcfv2", false),
+                ("/mms/v2/get_site_data/other", false),
+                ("/wrapper.js", true),
+                ("/module/sourcepoint.mjs", true),
+                ("/unified/bundle", true),
+            ] {
+                for (upstream_cache, forwarded_cookies, sets_cookie, dynamic_cache) in [
+                    (Some("no-store"), false, false, "no-store"),
+                    (
+                        Some("private, max-age=60"),
+                        true,
+                        false,
+                        "private, max-age=60",
+                    ),
+                    (None, true, false, "private, max-age=0"),
+                    (None, false, false, "public, max-age=3600"),
+                    (
+                        Some("public, max-age=3600"),
+                        true,
+                        true,
+                        "private, no-store",
+                    ),
+                ] {
+                    for has_length in [false, true] {
+                        let client = Arc::new(StreamingHttpClient::new());
+                        let input =
+                            format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
+                        let length = input.len().to_string();
+                        let mut headers = vec![("content-type", "application/javascript")];
+                        if has_length {
+                            headers.push(("content-length", length.as_str()));
+                        }
+                        if let Some(cache) = upstream_cache {
+                            headers.push(("cache-control", cache));
+                        }
+                        if sets_cookie {
+                            headers.push(("set-cookie", "consentUUID=example; Path=/"));
+                        }
+                        client
+                            .stub
+                            .push_response_with_headers(200, input.into_bytes(), headers);
+                        let services = build_services_with_http_client(client.clone());
+                        let mut request = make_req(
+                            Method::GET,
+                            &format!("https://publisher.example.com{SOURCEPOINT_CDN_PREFIX}{path}"),
+                        );
+                        if forwarded_cookies {
+                            set_req_header(&mut request, header::COOKIE, "consentUUID=example");
+                        }
+
+                        let response = integration
+                            .handle(&settings, &services, request)
+                            .await
+                            .expect("should rewrite JavaScript with path-aware cache policy");
+                        let expected_cache = if is_static && !sets_cookie {
+                            "public, max-age=3600"
+                        } else {
+                            dynamic_cache
+                        };
+                        assert_eq!(
+                            get_header_str(&response, header::CACHE_CONTROL),
+                            Some(expected_cache),
+                            "should apply cache policy for {path}, upstream {upstream_cache:?}, \
+                             forwarded cookies {forwarded_cookies}, Set-Cookie {sets_cookie}, \
+                             declared length {has_length}"
+                        );
+                        assert_eq!(
+                            take_body_bytes(response),
+                            br#"var api="/integrations/sourcepoint/cdn/consent/tcfv2";"#,
+                            "should rewrite JavaScript at {path} regardless of cache classification"
+                        );
+                    }
+                }
             }
         });
     }
