@@ -6550,6 +6550,8 @@ dependencies = [
  "serde_json",
  "toml",
  "trusted-server-core",
+ "trusted-server-device-fastly",
+ "trusted-server-geo-fastly",
  "url",
  "urlencoding",
 ]
@@ -6677,6 +6679,23 @@ dependencies = [
  "uuid",
  "validator",
  "web-time",
+]
+
+[[package]]
+name = "trusted-server-device-fastly"
+version = "0.1.0"
+dependencies = [
+ "fastly",
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-geo-fastly"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "fastly",
+ "trusted-server-core",
 ]
 
 [[package]]
