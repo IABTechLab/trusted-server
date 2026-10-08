@@ -6504,6 +6504,11 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-mtm",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
 ]
 
 [[package]]
@@ -6525,6 +6530,11 @@ dependencies = [
  "toml",
  "trusted-server-core",
  "trusted-server-js",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-mtm",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
  "worker",
 ]
 
@@ -6550,6 +6560,13 @@ dependencies = [
  "serde_json",
  "toml",
  "trusted-server-core",
+ "trusted-server-device-fastly",
+ "trusted-server-geo-fastly",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-mtm",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
  "url",
  "urlencoding",
 ]
@@ -6574,6 +6591,11 @@ dependencies = [
  "tokio",
  "trusted-server-core",
  "trusted-server-js",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-mtm",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
 ]
 
 [[package]]
@@ -6665,6 +6687,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.10.9",
  "subtle",
  "temp-env",
@@ -6677,6 +6700,23 @@ dependencies = [
  "uuid",
  "validator",
  "web-time",
+]
+
+[[package]]
+name = "trusted-server-device-fastly"
+version = "0.1.0"
+dependencies = [
+ "fastly",
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-geo-fastly"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "fastly",
+ "trusted-server-core",
 ]
 
 [[package]]
@@ -6733,6 +6773,42 @@ name = "trusted-server-openrtb-codegen"
 version = "0.1.0"
 dependencies = [
  "prost-build",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-gpc"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-gpp"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-mtm"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-tcf"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-permission-signal-us-privacy"
+version = "0.1.0"
+dependencies = [
+ "trusted-server-core",
 ]
 
 [[package]]
