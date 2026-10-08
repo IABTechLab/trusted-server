@@ -37,6 +37,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
+assert_cmd = "2"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
@@ -55,12 +56,12 @@ cssparser = "0.36"
 derive_more = { version = "2.0", features = ["display", "error"] }
 directories = "5"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "75067d2c9a3cf865591665e88a736db4c8a13be0", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "75067d2c9a3cf865591665e88a736db4c8a13be0", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "75067d2c9a3cf865591665e88a736db4c8a13be0", default-features = false }
-edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", rev = "75067d2c9a3cf865591665e88a736db4c8a13be0", default-features = false }
-edgezero-cli = { git = "https://github.com/stackpop/edgezero", rev = "75067d2c9a3cf865591665e88a736db4c8a13be0" }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "75067d2c9a3cf865591665e88a736db4c8a13be0", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "965d482fe1066279ea409a2e629aa13c49de98d0", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "965d482fe1066279ea409a2e629aa13c49de98d0", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "965d482fe1066279ea409a2e629aa13c49de98d0", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", rev = "965d482fe1066279ea409a2e629aa13c49de98d0", default-features = false }
+edgezero-cli = { git = "https://github.com/stackpop/edgezero", rev = "965d482fe1066279ea409a2e629aa13c49de98d0" }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "965d482fe1066279ea409a2e629aa13c49de98d0", default-features = false }
 env_logger = "0.11"
 error-stack = "0.6"
 esi = "0.7.2"
@@ -68,6 +69,10 @@ fastly = "0.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
+# `ts dev lint domains` / `install-hooks` drive all git access through
+# gitoxide (no `git` subprocess). Verified via `cargo tree -p gix` to
+# avoid duplicate versions in the lock.
+gix = { version = "0.83", default-features = false }
 glob = "0.3"
 getrandom = "0.2"
 hex = "0.4.3"
@@ -86,6 +91,7 @@ log-fastly = "0.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
+predicates = "3"
 prost-build = "0.13"
 rand = "0.8"
 rcgen = { version = "0.13", features = ["x509-parser"] }

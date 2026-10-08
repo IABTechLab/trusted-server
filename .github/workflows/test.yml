@@ -64,6 +64,9 @@ jobs:
           cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_skipped_emitted_script_leaves_ad_state_untouched -- --ignored
           cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_emitted_script_deep_freezes_owned_context_in_node -- --ignored
 
+      - name: Run tests (reusable-sandbox feature)
+        run: cargo test-fastly-reuse
+
       - name: Run template cache ESI local harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
 
