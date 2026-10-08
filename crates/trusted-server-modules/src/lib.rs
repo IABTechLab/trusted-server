@@ -43,11 +43,27 @@ pub fn builders_with(extra: &[IntegrationBuilder]) -> Vec<IntegrationBuilder> {
     all
 }
 
+/// The section that selects the stock module with the integration id `id`,
+/// and the name the module is written under there.
+///
+/// A tool that knows an integration by its id, as the `ts` audit does from
+/// what it finds on a page, writes a configuration with this and names no
+/// module itself.
+#[must_use]
+pub fn selection_of(id: &str) -> Option<(&'static str, &'static str)> {
+    let builder = builders().into_iter().find(|builder| builder.id() == id)?;
+    let section = builder.section()?;
+    Some((
+        section,
+        trusted_server_core::module_name::short_form(section, builder.module_name()?),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use trusted_server_core::integrations::IntegrationBuilder;
 
-    use super::{builders, builders_with};
+    use super::{builders, builders_with, selection_of};
 
     #[test]
     fn stock_modules_are_offered_in_hook_order() {
@@ -264,6 +280,35 @@ mod tests {
                 .map(|value| value.to_str().expect("cookie should be text")),
             Some("keep-me=yes"),
             "should strip the reserved diagnostics cookie and keep the rest"
+        );
+    }
+
+    #[test]
+    fn a_stock_module_s_selection_is_found_by_its_integration_id() {
+        for (id, section, written) in [
+            ("datadome", "bot-protection", "datadome"),
+            ("didomi", "cmp", "didomi"),
+            ("sourcepoint", "cmp", "sourcepoint"),
+            ("osano", "cmp", "osano"),
+            ("lockr", "identity", "lockr"),
+            ("permutive", "audience", "permutive"),
+            ("nextjs", "framework", "nextjs"),
+            ("gpt", "ad-tag", "google"),
+            ("google_tag_manager", "tag", "google-tag-manager"),
+            // Testlight says `[auction]` selects it, where its full name is
+            // written.
+            ("testlight", "auction", "testing.testlight"),
+        ] {
+            assert_eq!(
+                selection_of(id),
+                Some((section, written)),
+                "should find where `{id}` is selected"
+            );
+        }
+        assert_eq!(
+            selection_of("no-such-integration"),
+            None,
+            "should find nothing for an id no stock module has"
         );
     }
 
