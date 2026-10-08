@@ -32,6 +32,18 @@
 //!    This is the sole mechanism that routes the GPT cascade through the proxy.
 //!    The shim also hooks into the `googletag` API for targeting injection.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -42,31 +54,36 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::Validate;
 
-use crate::constants::{HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE};
-use crate::error::TrustedServerError;
-use crate::integrations::{
+use trusted_server_core::constants::{
+    HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE,
+};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
-use crate::proxy::{ProxyRequestConfig, proxy_request};
-use crate::settings::{IntegrationConfig, Settings};
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::proxy::{ProxyRequestConfig, proxy_request};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const GPT_INTEGRATION_ID: &str = "gpt";
 
 /// The name this module is selected by, in `[ad-tag]`.
 pub const MODULE: &str = "ad-tag.google";
 
-/// The builder the registry runs when a section selects [`MODULE`].
-pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
-    crate::integrations::IntegrationBuilder::new(
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
         GPT_INTEGRATION_ID,
-        crate::integrations::CORE_SOURCE,
+        env!("CARGO_PKG_NAME"),
         register,
         validate,
     )
-    .with_module_name(MODULE);
+    .with_module_name(MODULE)
+}
 
 /// Primary Google domain that serves GPT scripts.
 const SECUREPUBADS_HOST: &str = "securepubads.g.doubleclick.net";
@@ -575,10 +592,10 @@ fn default_rewrite_script() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::HEADER_X_FORWARDED_FOR;
-    use crate::integrations::IntegrationDocumentState;
-    use crate::test_support::tests::create_test_settings;
     use http::Method;
+    use trusted_server_core::constants::HEADER_X_FORWARDED_FOR;
+    use trusted_server_core::integrations::IntegrationDocumentState;
+    use trusted_server_core::test_support::tests::create_test_settings;
 
     fn test_config() -> GptConfig {
         GptConfig {
@@ -1564,6 +1581,15 @@ mod tests {
                 .iter()
                 .all(|s| !s.contains("__tsjs_slim_prebid_url")),
             "should not emit slim-Prebid URL tag when not configured"
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
         );
     }
 }

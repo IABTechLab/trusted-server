@@ -912,20 +912,22 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
-        fn process(gam_attribution_enabled: Option<bool>) -> String {
-            let integrations = if let Some(gam_attribution_enabled) = gam_attribution_enabled {
+    fn integration_head_injector_marks_only_the_bundle_it_asks_to_mark() {
+        use crate::integrations::registry_test_support::tag_fixture as tag;
+
+        fn process(mark_bundle: Option<bool>) -> String {
+            let integrations = if let Some(mark_bundle) = mark_bundle {
                 let mut settings = create_test_settings();
                 settings
                     .insert_module_config(
-                        "ad-tag",
-                        "ad-tag.google",
+                        "testing",
+                        tag::MODULE,
                         &json!({
-                            "gam_attribution_enabled": gam_attribution_enabled
+                            "mark_bundle": mark_bundle
                         }),
                     )
-                    .expect("should insert GPT config");
-                IntegrationRegistry::new(&settings).expect("should build GPT registry")
+                    .expect("should insert the stand-in's settings");
+                IntegrationRegistry::new(&settings).expect("should build the registry")
             } else {
                 IntegrationRegistry::empty_for_tests()
             };
@@ -939,34 +941,35 @@ mod tests {
             String::from_utf8(output).expect("should produce valid UTF-8")
         }
 
-        let attributed = process(Some(true));
-        let unattributed = process(Some(false));
-        let without_gpt = process(None);
+        let marked = process(Some(true));
+        let unmarked = process(Some(false));
+        let without_the_integration = process(None);
 
-        for html in [&attributed, &unattributed, &without_gpt] {
+        for html in [&marked, &unmarked, &without_the_integration] {
             assert_eq!(
                 html.matches("id=\"trustedserver-js\"").count(),
                 1,
                 "should emit exactly one publisher bundle tag: {html}"
             );
         }
+        let attribute = format!("{}=\"true\"", tag::BUNDLE_ATTRIBUTE);
         assert!(
-            attributed.contains("data-ts-gam-attribution=\"true\""),
-            "should mark only an attribution-enabled GPT publisher bundle"
+            marked.contains(&attribute),
+            "should mark the bundle an injector asks to mark"
         );
         assert!(
-            !unattributed.contains("data-ts-gam-attribution"),
-            "should leave an attribution-disabled GPT publisher bundle unmarked"
+            !unmarked.contains(tag::BUNDLE_ATTRIBUTE),
+            "should leave the bundle unmarked when the injector asks for nothing"
         );
         assert!(
-            !without_gpt.contains("data-ts-gam-attribution"),
-            "should leave a bundle unmarked when no section selects google"
+            !without_the_integration.contains(tag::BUNDLE_ATTRIBUTE),
+            "should leave the bundle unmarked when no section selects the integration"
         );
 
-        let head_insert_index = attributed
-            .find("window.__tsjs_installGptShim")
-            .expect("should include the GPT head insert");
-        let publisher_bundle_index = attributed
+        let head_insert_index = marked
+            .find(tag::HEAD_FLAG)
+            .expect("should include the integration's head insert");
+        let publisher_bundle_index = marked
             .find("id=\"trustedserver-js\"")
             .expect("should include the publisher bundle");
         assert!(

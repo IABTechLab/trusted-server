@@ -2346,6 +2346,122 @@ pub(crate) mod test_support {
         Ok(true)
     }
 
+    /// A stand-in for an integration that tags a page, for core's own tests
+    /// of the HTML processor and the JavaScript asset proxy.
+    ///
+    /// Selected, it inserts one script at the start of `<head>` and rewrites
+    /// the address of its own script to a first-party path. With
+    /// `mark_bundle` set it also asks for an attribute on the publisher
+    /// bundle tag.
+    pub(crate) mod tag_fixture {
+        use std::sync::Arc;
+
+        use error_stack::Report;
+
+        use crate::error::TrustedServerError;
+        use crate::integrations::registry::{
+            AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+            IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
+        };
+        use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
+        use crate::settings::Settings;
+
+        /// The integration id the stand-in registers under.
+        pub(crate) const ID: &str = "tag_fixture";
+        /// The name a test's settings select the stand-in by, in `[testing]`.
+        pub(crate) const MODULE: &str = "testing.tag-fixture";
+        /// The script the stand-in's vendor would serve.
+        pub(crate) const SCRIPT_URL: &str = "https://cdn.tag-fixture.example/sdk.js";
+        /// The first-party path the stand-in rewrites that script to.
+        pub(crate) const FIRST_PARTY_SCRIPT: &str = "/integrations/tag_fixture/script";
+        /// What the stand-in's head insert sets, so a test can find it.
+        pub(crate) const HEAD_FLAG: &str = "window.__ts_tag_fixture=true;";
+        /// The attribute the stand-in asks for on the publisher bundle tag.
+        pub(crate) const BUNDLE_ATTRIBUTE: &str = "data-ts-tag-fixture";
+
+        /// The builder core's test build lists beside its own.
+        pub(crate) const BUILDER: IntegrationBuilder =
+            IntegrationBuilder::new(ID, CORE_SOURCE, register, validate).with_module_name(MODULE);
+
+        #[derive(Debug, serde::Deserialize, validator::Validate)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureSettings {
+            #[serde(default)]
+            mark_bundle: bool,
+        }
+
+        impl crate::settings::IntegrationConfig for FixtureSettings {}
+
+        struct Tag {
+            mark_bundle: bool,
+        }
+
+        impl IntegrationHeadInjector for Tag {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                vec![format!("<script>{HEAD_FLAG}</script>")]
+            }
+
+            fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+                if self.mark_bundle {
+                    vec![(BUNDLE_ATTRIBUTE, "true")]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        impl IntegrationAttributeRewriter for Tag {
+            fn integration_id(&self) -> &'static str {
+                ID
+            }
+
+            fn handles_attribute(&self, attribute: &str) -> bool {
+                attribute == "src"
+            }
+
+            fn rewrite(
+                &self,
+                _attr_name: &str,
+                attr_value: &str,
+                _ctx: &IntegrationAttributeContext<'_>,
+            ) -> AttributeRewriteAction {
+                if attr_value == SCRIPT_URL {
+                    AttributeRewriteAction::Replace(FIRST_PARTY_SCRIPT.to_owned())
+                } else {
+                    AttributeRewriteAction::Keep
+                }
+            }
+        }
+
+        fn register(
+            settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            let Some(config) = settings.module_config::<FixtureSettings>(MODULE)? else {
+                return Ok(None);
+            };
+            let tag = Arc::new(Tag {
+                mark_bundle: config.mark_bundle,
+            });
+            Ok(Some(
+                IntegrationRegistration::builder(ID)
+                    .without_js()
+                    .with_attribute_rewriter(tag.clone())
+                    .with_head_injector(tag)
+                    .build(),
+            ))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<FixtureSettings>(MODULE)
+                .map(|config| config.is_some())
+        }
+    }
+
     /// A stand-in for an integration that rewrites script payloads in two
     /// passes, for core's own tests of the page pipeline.
     ///

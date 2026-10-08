@@ -5379,6 +5379,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-ad-tag-google"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-adapter-axum"
 version = "0.1.0"
 dependencies = [
@@ -5770,6 +5786,7 @@ name = "trusted-server-modules"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "trusted-server-ad-tag-google",
  "trusted-server-audience-permutive",
  "trusted-server-cmp-didomi",
  "trusted-server-cmp-osano",

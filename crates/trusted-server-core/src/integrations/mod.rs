@@ -16,7 +16,6 @@ use crate::settings::Settings;
 pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
-pub mod gpt;
 pub mod gpt_diagnostics;
 pub mod js_asset_proxy;
 pub mod openrtb;
@@ -575,8 +574,10 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // select where they need one.
     #[cfg(test)]
     registry_test_support::payload_fixture::BUILDER,
+    // A stand-in for an integration that tags a page, for the same tests.
+    #[cfg(test)]
+    registry_test_support::tag_fixture::BUILDER,
     datadome::BUILDER,
-    gpt::BUILDER,
     gpt_diagnostics::BUILDER,
     // Implementations `[demand]` and `[ad-server]` can name. None of them is
     // a module a section selects.

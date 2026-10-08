@@ -4930,7 +4930,6 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     use crate::ec::resolve::NotAnOrigin;
 
@@ -8357,7 +8356,7 @@ source_domain = "partner.example.com"
     #[derive(Debug, Deserialize, Validate)]
     #[serde(deny_unknown_fields)]
     struct OneRequiredSetting {
-        #[expect(dead_code, reason = "read only by deserialization")]
+        #[validate(url)]
         endpoint: String,
     }
 
@@ -8579,29 +8578,45 @@ source_domain = "partner.example.com"
 
     #[test]
     fn invalid_settings_for_a_selected_module_fail_registry_startup() {
+        fn build(
+            settings: &Settings,
+        ) -> Result<Option<crate::integrations::IntegrationRegistration>, Report<TrustedServerError>>
+        {
+            Ok(settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)?
+                .map(|_| crate::integrations::IntegrationRegistration::builder("endpoint").build()))
+        }
+
+        fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+            settings
+                .module_config::<OneRequiredSetting>(ENDPOINT_MODULE)
+                .map(|config| config.is_some())
+        }
+
         let mut settings = create_test_settings();
         settings
             .insert_module_config(
-                "ad-tag",
-                crate::integrations::gpt::MODULE,
+                EXAMPLE_SECTION,
+                ENDPOINT_MODULE,
                 &json!({
-                    "script_url": "not a url",
+                    "endpoint": "not a url",
                 }),
             )
-            .expect("should insert GPT config");
+            .expect("should insert the example module's table");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "endpoint",
+            "settings-tests",
+            build,
+            validate,
+        )
+        .with_module_name(ENDPOINT_MODULE)];
 
-        let err = match IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        ) {
+        let err = match IntegrationRegistry::with_registrations(&settings, &extra) {
             Ok(_) => panic!("a selected module with invalid settings should fail startup"),
             Err(err) => err,
         };
         assert!(
-            format!("{err:?}").contains("[ad-tag.google]"),
+            format!("{err:?}").contains("[example.endpoint]"),
             "should identify the invalid module table: {err:?}"
         );
     }

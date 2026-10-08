@@ -21488,17 +21488,19 @@ mod tests {
     }
 
     #[test]
-    fn streaming_finalize_emits_gam_attribution_head_before_origin_eof() {
+    fn streaming_finalize_emits_an_integration_s_head_before_origin_eof() {
+        use crate::integrations::registry_test_support::tag_fixture as tag;
+
         let mut settings = create_test_settings();
         settings
             .insert_module_config(
-                "ad-tag",
-                "ad-tag.google",
+                "testing",
+                tag::MODULE,
                 &serde_json::json!({
-                    "gam_attribution_enabled": true
+                    "mark_bundle": true
                 }),
             )
-            .expect("should insert GPT config");
+            .expect("should insert the stand-in's settings");
 
         let body = streaming_finalize_response_with_settings(
             html_stream_params("", None),
@@ -21511,12 +21513,12 @@ mod tests {
             .expect("should emit UTF-8 HTML");
 
         assert!(
-            html.contains("__tsjs_gam_attribution_enabled=true"),
-            "first rewritten head chunk should carry the primary activation flag: {html}"
+            html.contains(tag::HEAD_FLAG),
+            "first rewritten head chunk should carry the integration's head insert: {html}"
         );
         assert!(
-            html.contains("data-ts-gam-attribution=\"true\""),
-            "first rewritten head chunk should authorize the bundle fallback: {html}"
+            html.contains(&format!("{}=\"true\"", tag::BUNDLE_ATTRIBUTE)),
+            "first rewritten head chunk should carry the bundle tag's attribute: {html}"
         );
     }
 
