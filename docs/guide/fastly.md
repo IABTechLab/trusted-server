@@ -336,8 +336,11 @@ Configure the secret-store key name in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
+module = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.hmac]
+passphrase = "ec_passphrase"
 ```
 
 Store the high-entropy passphrase under that key in `ts_secrets`. The resolved
