@@ -215,7 +215,7 @@ impl GenericOpenRtbProvider {
         self.plan.timeout_ms
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn parse_state_for_test(&self, input: ProviderAuctionInput) -> ProviderParseState {
         Box::new(GenericOpenRtbParseState {
             provider_id: self.provider_name().to_string(),

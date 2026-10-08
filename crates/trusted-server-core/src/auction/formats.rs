@@ -559,7 +559,6 @@ mod tests {
     use crate::auction::routing::route_auction;
     use crate::auction::test_support::{demand_table, plan_config};
     use crate::auction::types::{AuctionResponse, Bid, BidRenderer, BidStatus};
-    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -1521,26 +1520,21 @@ mod tests {
         rejected.creative = Some("<script>reject()</script>".to_string());
         let unpriced = make_bid("unpriced", "invalid", None);
         let ordinary = make_bid("ordinary", "appnexus", Some(2.75));
-        let mut renderer = make_bid("renderer", "aps", Some(2.5));
+        let mut renderer = make_bid("renderer", "example", Some(2.5));
         renderer.creative = Some("<script>reject()</script>".to_string());
         renderer.bid_id = Some("upstream-renderer-bid".to_string());
         renderer.creative_id = None;
         renderer.renderer = Some(
-            BidRenderer::from_typed(
-                APS_RENDERER_TYPE,
-                &ApsRendererV1 {
-                    version: 1,
-                    account_id: "example-account".to_string(),
-                    bid_id: "upstream-renderer-bid".to_string(),
-                    creative_id: None,
-                    tag_type: ApsTagType::Iframe,
-                    creative_url: "https://creative.example/render".to_string(),
-                    aax_response: "fictional-base64".to_string(),
-                    width: 300,
-                    height: 250,
-                },
+            BidRenderer::new(
+                "example",
+                json!({
+                    "version": 1,
+                    "bidId": "upstream-renderer-bid",
+                    "creativeUrl": "https://creative.example/render",
+                    "envelope": "fictional-base64",
+                }),
             )
-            .expect("the APS renderer payload should be a JSON object"),
+            .expect("should build the example renderer descriptor"),
         );
         let result = OrchestrationResult {
             provider_responses: vec![],
@@ -1628,23 +1622,18 @@ mod tests {
     fn convert_to_openrtb_response_prefers_creative_when_both_render_sources_exist() {
         let settings = make_settings();
         let auction_request = make_auction_request();
-        let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        let mut bid = make_bid("div-gpt-top", "example", Some(2.75));
         bid.renderer = Some(
-            BidRenderer::from_typed(
-                APS_RENDERER_TYPE,
-                &ApsRendererV1 {
-                    version: 1,
-                    account_id: "example-account".to_string(),
-                    bid_id: "fictional-bid".to_string(),
-                    creative_id: None,
-                    tag_type: ApsTagType::Iframe,
-                    creative_url: "https://creative.example/render".to_string(),
-                    aax_response: "fictional-base64".to_string(),
-                    width: 300,
-                    height: 250,
-                },
+            BidRenderer::new(
+                "example",
+                json!({
+                    "version": 1,
+                    "bidId": "fictional-bid",
+                    "creativeUrl": "https://creative.example/render",
+                    "envelope": "fictional-base64",
+                }),
             )
-            .expect("the APS renderer payload should be a JSON object"),
+            .expect("should build the example renderer descriptor"),
         );
         let result = make_result(bid);
 
@@ -1667,35 +1656,30 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_emits_typed_aps_renderer_without_adm() {
+    fn convert_to_openrtb_response_emits_a_typed_renderer_without_adm() {
         let settings = make_settings();
         let auction_request = make_auction_request();
-        let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        let mut bid = make_bid("div-gpt-top", "example", Some(2.75));
         bid.creative = None;
         bid.bid_id = Some("fictional-bid".to_string());
         bid.ad_id = Some("fictional-ad".to_string());
         bid.creative_id = Some("fictional-creative".to_string());
         bid.renderer = Some(
-            BidRenderer::from_typed(
-                APS_RENDERER_TYPE,
-                &ApsRendererV1 {
-                    version: 1,
-                    account_id: "example-account".to_string(),
-                    bid_id: "fictional-bid".to_string(),
-                    creative_id: Some("fictional-creative".to_string()),
-                    tag_type: ApsTagType::Iframe,
-                    creative_url: "https://creative.example/render".to_string(),
-                    aax_response: "fictional-base64".to_string(),
-                    width: 300,
-                    height: 250,
-                },
+            BidRenderer::new(
+                "example",
+                json!({
+                    "version": 1,
+                    "bidId": "fictional-bid",
+                    "creativeUrl": "https://creative.example/render",
+                    "envelope": "fictional-base64",
+                }),
             )
-            .expect("the APS renderer payload should be a JSON object"),
+            .expect("should build the example renderer descriptor"),
         );
         let result = make_result(bid);
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should convert APS renderer bid");
+            .expect("should convert a typed renderer bid");
         let json = response_json(response);
         let bid = json["seatbid"][0]["bid"][0]
             .as_object()
@@ -1706,12 +1690,12 @@ mod tests {
             "should omit adm for renderer bids"
         );
         assert_eq!(bid["id"], json!("fictional-bid"));
-        assert_eq!(json["seatbid"][0]["seat"], json!("aps"));
+        assert_eq!(json["seatbid"][0]["seat"], json!("example"));
         assert_eq!(bid["adid"], json!("fictional-ad"));
         assert_eq!(bid["crid"], json!("fictional-creative"));
         assert_eq!(
             bid["ext"]["trusted_server"]["renderer"]["type"],
-            json!("aps")
+            json!("example")
         );
         assert_eq!(
             bid["ext"]["trusted_server"]["renderer"]["bidId"],

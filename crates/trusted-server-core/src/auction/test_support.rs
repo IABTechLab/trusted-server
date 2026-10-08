@@ -1,3 +1,6 @@
+//! Helpers for tests of the auction, in core and in an implementation's own
+//! crate.
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -17,7 +20,8 @@ use crate::settings::Settings;
 
 static TEST_SERVICES: LazyLock<RuntimeServices> = LazyLock::new(noop_services);
 
-pub(crate) fn create_test_auction_context<'a>(
+/// An auction context over services that do nothing.
+pub fn create_test_auction_context<'a>(
     settings: &'a Settings,
     request: &'a Request<EdgeBody>,
     timeout_ms: u32,
@@ -33,13 +37,13 @@ pub(crate) fn create_test_auction_context<'a>(
     }
 }
 
-/// Build canonical request facts shared by the PBS and APS Stage 1 wire goldens.
+/// Build canonical request facts shared by the implementations' wire goldens.
 ///
-/// The supported and unsupported formats deliberately exercise each profile's
-/// existing filtering and field-ownership policy. `trustedServer` bidder
-/// parameters are included to pin that PBS consumes them while APS ignores
-/// them.
-pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
+/// The supported and unsupported formats deliberately exercise each
+/// implementation's filtering and field-ownership policy. `trustedServer`
+/// bidder parameters are included to pin which implementation consumes them
+/// and which ignores them.
+pub fn canonical_parity_auction_request() -> AuctionRequest {
     AuctionRequest {
         id: "fictional-auction".to_string(),
         slots: vec![AdSlot {
@@ -120,24 +124,172 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
     }
 }
 
+/// The signing input the request goldens were captured with.
+pub fn golden_signing_params() -> crate::request_signing::SigningParams {
+    crate::request_signing::SigningParams {
+        request_id: "fictional-auction".to_string(),
+        request_host: "publisher.example".to_string(),
+        request_scheme: "https".to_string(),
+        timestamp: 1_706_900_000,
+    }
+}
+
+/// The one-source plan the request goldens were captured with: a source
+/// called `fictional_provider`, running `implementation` with `settings`.
+///
+/// The source takes every eligible slot when `all_eligible` is set. Otherwise
+/// the bidder `exampleBidder` is routed to it, which is how a source that
+/// takes only routed bidders is reached.
+pub fn golden_plan_config(
+    implementation: &str,
+    settings: serde_json::Value,
+    all_eligible: bool,
+    extra: &[crate::integrations::IntegrationBuilder],
+) -> crate::auction::plan::AuctionPlanConfig {
+    let mut table = demand_table(implementation, "https://exchange.example.test/openrtb");
+    table.insert("timeout_ms".to_string(), json!(321));
+    if all_eligible {
+        table.insert("routing".to_string(), json!("all_eligible"));
+    }
+    if let serde_json::Value::Object(settings) = settings {
+        table.extend(settings);
+    }
+    let mut config = plan_config_with(vec![("fictional_provider", table)], extra);
+    config.timeout_ms = 321;
+    if !all_eligible {
+        config.bidders.insert(
+            "exampleBidder".parse().expect("should parse bidder ID"),
+            crate::auction::plan::BidderRouteConfig {
+                module: "fictional_provider"
+                    .parse()
+                    .expect("should parse provider ID"),
+            },
+        );
+    }
+    config
+}
+
+/// The inbound request the request goldens were captured with.
+pub fn golden_inbound_request() -> Request<EdgeBody> {
+    Request::builder()
+        .uri("https://publisher.example/auction")
+        .header(
+            http::header::REFERER,
+            "https://referrer.example/story?fictional=1",
+        )
+        .header(http::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .header("dnt", "1")
+        .body(EdgeBody::empty())
+        .expect("should build inbound request")
+}
+
+/// A signer over one fixed key, so a signed golden is the same on every run.
+pub fn deterministic_signer() -> crate::request_signing::RequestSigner {
+    use base64::Engine as _;
+
+    use crate::platform::test_support::{
+        HashMapConfigStore, HashMapSecretStore, NoopHttpClient,
+        build_services_with_config_secret_and_http_client,
+    };
+
+    let config_data = HashMap::from([("current-kid".to_string(), "fictional-kid".to_string())]);
+    let secret_data = HashMap::from([(
+        "fictional-kid".to_string(),
+        base64::engine::general_purpose::STANDARD
+            .encode([7_u8; 32])
+            .into_bytes(),
+    )]);
+    let services = build_services_with_config_secret_and_http_client(
+        HashMapConfigStore::new(config_data),
+        HashMapSecretStore::new(secret_data),
+        std::sync::Arc::new(NoopHttpClient),
+    );
+    crate::request_signing::RequestSigner::from_services(&services)
+        .expect("should load deterministic signer")
+}
+
+/// Builds the request the driver would send to the first demand source of
+/// `plan` once `request` is routed to it, or `None` when the source keeps no
+/// impression.
+///
+/// A test in an implementation's own crate checks what its field policy and
+/// its extensions do to a request through this. The signature, when `signer`
+/// is given, is made over [`golden_signing_params`].
+///
+/// # Errors
+///
+/// Returns the error the request builder returns.
+pub fn build_for_first_source(
+    plan: &crate::auction::AuctionPlan,
+    request: AuctionRequest,
+    inbound: &Request<EdgeBody>,
+    transport_timeout_ms: u32,
+    signer: Option<&crate::request_signing::RequestSigner>,
+) -> Result<
+    Option<crate::openrtb::OpenRtbRequest>,
+    error_stack::Report<crate::error::TrustedServerError>,
+> {
+    use crate::auction::openrtb::{OpenRtbBuildOutcome, RequestFinalization, build_request};
+
+    let routed = crate::auction::routing::route_auction(request, inbound, plan, None);
+    let outcome = build_request(
+        &routed.inputs()[0],
+        &routed,
+        &plan.providers()[0],
+        transport_timeout_ms,
+        &RequestFinalization {
+            signer,
+            signing_params: golden_signing_params(),
+        },
+    )?;
+    Ok(match outcome {
+        OpenRtbBuildOutcome::Ready(request) => Some(request),
+        OpenRtbBuildOutcome::NoImpressions => None,
+    })
+}
+
+/// Reads `response` as the first demand source of `plan` would, once
+/// `request` is routed to it.
+///
+/// A test in an implementation's own crate checks how its implementation
+/// answers through this, with no upstream.
+///
+/// # Errors
+///
+/// Returns the error the source's own reading returns.
+pub async fn parse_as_first_source(
+    plan: &crate::auction::AuctionPlan,
+    request: AuctionRequest,
+    response: crate::platform::PlatformResponse,
+    response_time_ms: u64,
+) -> Result<
+    crate::auction::types::AuctionResponse,
+    error_stack::Report<crate::error::TrustedServerError>,
+> {
+    let inbound = Request::new(EdgeBody::empty());
+    let routed = crate::auction::routing::route_auction(request, &inbound, plan, None);
+    let provider =
+        crate::auction::provider::GenericOpenRtbProvider::new(plan.providers()[0].clone());
+    let state = provider.parse_state_for_test(routed.inputs()[0].clone());
+    provider
+        .parse_response_with_state(response, response_time_ms, Some(state.as_ref()))
+        .await
+}
+
 /// One `[demand.<name>]` table naming an implementation, for tests that need a
 /// compiled plan.
-pub(crate) fn demand_table(
+pub fn demand_table(
     implementation: &str,
     endpoint: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut table = serde_json::Map::from_iter([
+    serde_json::Map::from_iter([
         ("implementation".to_string(), json!(implementation)),
         ("endpoint".to_string(), json!(endpoint)),
-    ]);
-    if implementation == "auction.aps" {
-        table.insert("account_id".to_string(), json!("example-account"));
-    }
-    table
+    ])
 }
 
 /// An `[demand]` table selecting every name given, in the order given.
-pub(crate) fn demand_selection(
+pub fn demand_selection(
     tables: Vec<(&str, serde_json::Map<String, serde_json::Value>)>,
 ) -> crate::provider_table::ProviderList {
     let selected = tables
@@ -153,10 +305,21 @@ pub(crate) fn demand_selection(
 
 /// A plan configuration selecting the named demand tables, with every
 /// implementation the built-in builders register.
-pub(crate) fn plan_config(
+pub fn plan_config(
     tables: Vec<(&str, serde_json::Map<String, serde_json::Value>)>,
 ) -> crate::auction::plan::AuctionPlanConfig {
-    let builders = crate::integrations::all_builders(&[]).collect::<Vec<_>>();
+    plan_config_with(tables, &[])
+}
+
+/// A plan configuration selecting the named demand tables, with every
+/// implementation the built-in builders register followed by the ones
+/// `extra` registers, which is how a crate's own tests reach its
+/// implementation.
+pub fn plan_config_with(
+    tables: Vec<(&str, serde_json::Map<String, serde_json::Value>)>,
+    extra: &[crate::integrations::IntegrationBuilder],
+) -> crate::auction::plan::AuctionPlanConfig {
+    let builders = crate::integrations::all_builders(extra).collect::<Vec<_>>();
     crate::auction::plan::AuctionPlanConfig {
         timeout_ms: 1000,
         demand: demand_selection(tables),
@@ -174,7 +337,7 @@ pub(crate) fn plan_config(
 
 /// A `[demand]` selection of ordinary `OpenRTB` sources under the names given,
 /// each taking every eligible slot.
-pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderList {
+pub fn demand_named(names: &[&str]) -> crate::provider_table::ProviderList {
     demand_selection(
         names
             .iter()
@@ -195,6 +358,7 @@ pub(crate) fn demand_named(names: &[&str]) -> crate::provider_table::ProviderLis
 ///
 /// Production compiles its sources from the plan instead, so this exists only
 /// so the parity tests can drive the pre-plan orchestrator.
+#[cfg(test)]
 pub(crate) fn legacy_auction_config(settings: &Settings) -> crate::auction::AuctionConfig {
     let mut config = settings.auction.clone();
     config.provider_names = settings
@@ -213,6 +377,7 @@ pub(crate) fn legacy_auction_config(settings: &Settings) -> crate::auction::Auct
 /// `timeout_ms` from its table and refuses any other setting, as an
 /// implementation of a vendor's does. Its provider answers every request
 /// with no bid and calls nothing.
+#[cfg(test)]
 pub(crate) mod adserver_fixture {
     use std::sync::Arc;
 

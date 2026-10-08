@@ -750,27 +750,6 @@ formats = [{ width = 300, height = 250 }]
         }
     }
 
-    fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
-        let table = serde_json::Map::from_iter([
-            (
-                "implementation".to_string(),
-                serde_json::json!("auction.aps"),
-            ),
-            (
-                "endpoint".to_string(),
-                serde_json::json!("https://aps.example.com/e/pb/bid"),
-            ),
-            ("routing".to_string(), serde_json::json!("all_eligible")),
-            ("account_id".to_string(), serde_json::json!(account_id)),
-        ]);
-        settings.demand = crate::provider_table::ProviderList::new(
-            vec!["aps_main".to_string()],
-            std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
-        );
-    }
-
-    /// The `[tinybird]` block is top-level and validated at parse time, so
-    /// uncommenting it with the documented `api_host` must parse cleanly.
     #[test]
     fn documented_tinybird_block_validates_when_uncommented() {
         let toml = uncomment_block(&template_with_resolved_required_secrets(), "[tinybird]");
@@ -1353,31 +1332,6 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn deploy_validation_rejects_blank_aps_account_id() {
-        for (label, account_id) in [("empty", ""), ("whitespace-only", "   ")] {
-            let mut settings = valid_settings();
-            insert_aps_provider(&mut settings, account_id);
-
-            let err = validate_settings_for_deploy(&settings)
-                .expect_err("should reject blank APS account_id");
-
-            assert!(
-                format!("{err:?}").contains("account_id"),
-                "should mention the APS profile account_id for {label}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn deploy_validation_normalizes_padded_aps_account_id() {
-        let mut settings = valid_settings();
-        insert_aps_provider(&mut settings, "  example-account  ");
-
-        validate_settings_for_deploy(&settings)
-            .expect("should accept a padded APS profile account_id after trimming it");
-    }
-
-    #[test]
     fn deploy_validation_rejects_padded_request_signing_store_ids() {
         let mut settings = valid_settings();
         settings.request_signing = Some(crate::settings::RequestSigning {
@@ -1431,42 +1385,6 @@ password = "production-admin-password-32-bytes"
 
         validate_settings_for_deploy(&settings)
             .expect("deploy validation should leave unknown ids to the registry");
-    }
-
-    #[test]
-    fn deploy_validation_rejects_an_aps_demand_setting_it_does_not_know() {
-        let mut settings = valid_settings();
-        let table = serde_json::Map::from_iter([
-            (
-                "implementation".to_string(),
-                serde_json::json!("auction.aps"),
-            ),
-            (
-                "endpoint".to_string(),
-                serde_json::json!("https://aps.example.com/e/pb/bid"),
-            ),
-            (
-                "account_id".to_string(),
-                serde_json::json!("example-account"),
-            ),
-            ("enabled".to_string(), serde_json::json!(false)),
-        ]);
-        settings.demand = crate::provider_table::ProviderList::new(
-            vec!["aps_main".to_string()],
-            std::collections::BTreeMap::from([("aps_main".to_string(), table)]),
-        );
-
-        let error = validate_settings_for_deploy(&settings)
-            .expect_err("should reject a setting the APS implementation does not know");
-        let rendered = format!("{error:?}");
-        assert!(
-            rendered.contains("aps_main"),
-            "should identify the demand source: {rendered}"
-        );
-        assert!(
-            rendered.contains("enabled"),
-            "should identify the setting it does not know: {rendered}"
-        );
     }
 
     #[test]

@@ -23,8 +23,13 @@ pub mod plan;
 pub mod provider;
 pub(crate) mod routing;
 pub mod telemetry;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc,
+    reason = "test helpers, offered to other crates' tests under the test-utils feature"
+)]
+pub mod test_support;
 pub mod types;
 
 pub use config::AuctionConfig;
@@ -204,7 +209,7 @@ mod auction_token_tests {
 #[cfg(test)]
 mod plan_sharing_tests {
     use super::*;
-    use crate::auction::test_support::{demand_named, demand_selection, demand_table};
+    use crate::auction::test_support::demand_named;
     use crate::integrations::IntegrationRegistry;
     use crate::provider_table::ProviderChoice;
     use crate::test_support::tests::create_test_settings;
@@ -338,41 +343,5 @@ mod plan_sharing_tests {
                     .contains("does not support concurrent provider fanout")
             );
         }
-    }
-
-    #[test]
-    fn an_aps_demand_source_registers_the_renderer_with_no_integration_table() {
-        let mut settings = create_test_settings();
-        let mut table = demand_table("auction.aps", "https://aps.example/e/pb/bid");
-        table.insert("routing".to_string(), json!("all_eligible"));
-        settings.demand = demand_selection(vec![("aps_main", table)]);
-        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));
-        let registry = IntegrationRegistry::with_plan(&settings, plan)
-            .expect("should build APS renderer registry");
-
-        assert!(registry.has_route(&http::Method::GET, "/integrations/aps/renderer"));
-    }
-
-    #[test]
-    fn two_aps_sources_that_disagree_on_rendering_are_refused() {
-        let mut settings = create_test_settings();
-        let mut publisher_native = demand_table("auction.aps", "https://aps.example/e/pb/bid");
-        publisher_native.insert("rendering_mode".to_string(), json!("publisher_native"));
-        settings.demand = demand_selection(vec![
-            (
-                "aps_one",
-                demand_table("auction.aps", "https://aps.example/e/pb/bid"),
-            ),
-            ("aps_two", publisher_native),
-        ]);
-        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));
-        let error = match IntegrationRegistry::with_plan(&settings, plan) {
-            Ok(_) => panic!("should refuse two rendering modes"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("rendering_mode"),
-            "should name the setting that disagrees: {error:?}"
-        );
     }
 }

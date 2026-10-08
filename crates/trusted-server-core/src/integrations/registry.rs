@@ -4300,9 +4300,9 @@ mod tests {
         );
     }
 
-    /// Prebid and APS are not builders, because the auction plan registers
-    /// them, yet an outside builder claiming either id is still refused, naming
-    /// both sources, whether or not the plan-backed integration runs.
+    /// Prebid registers from the auction plan, and an outside builder claiming
+    /// its id is refused all the same, naming both sources, whether or not the
+    /// plan-backed integration runs.
     #[test]
     fn with_registrations_rejects_an_outside_builder_claiming_a_plan_backed_id() {
         fn register_nothing(
@@ -4312,29 +4312,25 @@ mod tests {
         }
 
         let settings = crate::test_support::tests::create_test_settings();
-        for id in [
-            crate::integrations::prebid::PREBID_INTEGRATION_ID,
-            crate::integrations::aps::APS_INTEGRATION_ID,
-        ] {
-            let extra = [crate::integrations::IntegrationBuilder::new(
-                id,
-                "seam-probe",
-                register_nothing,
-                validate_nothing,
-            )];
+        let id = crate::integrations::prebid::PREBID_INTEGRATION_ID;
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            id,
+            "seam-probe",
+            register_nothing,
+            validate_nothing,
+        )];
 
-            let Err(error) = IntegrationRegistry::with_registrations(&settings, &extra) else {
-                panic!("should refuse an outside builder claiming `{id}`");
-            };
+        let Err(error) = IntegrationRegistry::with_registrations(&settings, &extra) else {
+            panic!("should refuse an outside builder claiming `{id}`");
+        };
 
-            let message = error.to_string();
-            assert!(
-                message.contains(id)
-                    && message.contains("trusted-server-core")
-                    && message.contains("seam-probe"),
-                "error should name `{id}` and both sources: {message}"
-            );
-        }
+        let message = error.to_string();
+        assert!(
+            message.contains(id)
+                && message.contains("trusted-server-core")
+                && message.contains("seam-probe"),
+            "error should name `{id}` and both sources: {message}"
+        );
     }
 
     fn enable_prebid(settings: &mut Settings) {
@@ -4464,8 +4460,7 @@ mod tests {
     fn js_part_is_none_for_an_integration_registered_without_js() {
         // The carried lookup would answer `Some` on its own, so this proves the
         // without-JS check runs first. No built-in integration can stand in, because
-        // the only `without_js` built-in with a Rust registration, `aps`, has
-        // no compile-time module either.
+        // none registers without a browser script.
         let settings = settings_naming("probe");
         let extra = [crate::integrations::IntegrationBuilder::new(
             "probe",
@@ -5396,7 +5391,6 @@ mod tests {
     fn an_auction_implementation_named_in_a_section_is_refused() {
         for (section, name) in [
             ("auction", "prebid-server"),
-            ("auction", "aps"),
             ("auction", "ad-server.fixture"),
             ("auction-protocol", "openrtb"),
         ] {

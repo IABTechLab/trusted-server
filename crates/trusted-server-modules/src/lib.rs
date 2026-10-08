@@ -31,6 +31,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
+        trusted_server_auction_aps::builder(),
         trusted_server_ad_server_mock::builder(),
     ]
 }
@@ -95,6 +96,7 @@ mod tests {
                 "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
+                "auction.aps",
                 "ad-server.mock",
             ],
             "should offer the stock modules in the order their hooks run"

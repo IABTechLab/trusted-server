@@ -5531,6 +5531,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-auction-aps"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-audience-permutive"
 version = "0.1.0"
 dependencies = [
@@ -5831,6 +5850,7 @@ dependencies = [
  "tokio",
  "trusted-server-ad-server-mock",
  "trusted-server-ad-tag-google",
+ "trusted-server-auction-aps",
  "trusted-server-audience-permutive",
  "trusted-server-bot-protection-datadome",
  "trusted-server-cmp-didomi",

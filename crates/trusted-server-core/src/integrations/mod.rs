@@ -14,7 +14,6 @@ use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
-pub mod aps;
 pub mod js_asset_proxy;
 pub mod openrtb;
 pub mod prebid;
@@ -725,9 +724,6 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     IntegrationBuilder::implementations(openrtb::MODULE, CORE_SOURCE).with_demand(&openrtb::DEMAND),
     IntegrationBuilder::implementations(prebid_server::MODULE, CORE_SOURCE)
         .with_demand(&prebid_server::DEMAND),
-    IntegrationBuilder::implementations(aps::APS_INTEGRATION_ID, CORE_SOURCE)
-        .with_demand(&aps::DEMAND)
-        .with_plan_registration(aps::register_for_plan),
     // A stand-in ad server, which core's own tests select where they need
     // one.
     #[cfg(test)]

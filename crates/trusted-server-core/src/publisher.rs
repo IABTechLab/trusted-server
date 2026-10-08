@@ -3612,8 +3612,8 @@ pub(crate) fn prepend_auction_debug_comment(
     //      untyped provider diagnostics cannot cross that boundary and one
     //      large creative cannot dominate the payload. Bid-level fields
     //      (`Bid.metadata`, `nurl`, `burl`) are NOT yet allowlisted; they pass
-    //      through today because the only writer (`integrations/aps.rs`) emits
-    //      opaque targeting keys. Tightening this to a fail-closed bid allowlist
+    //      through today because the only writer, a demand implementation,
+    //      emits opaque targeting keys. Tightening this to a fail-closed bid allowlist
     //      is tracked in #925.
     //   2. `render_dump` below neutralises HTML comment terminators and caps the
     //      total serialized size.
@@ -22692,7 +22692,6 @@ mod tests {
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
         use crate::http_util::RequestInfo;
-        use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
         use crate::price_bucket::PriceGranularity;
         use crate::settings::Settings;
         use std::collections::HashMap;
@@ -23857,45 +23856,40 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_exposes_aps_renderer_and_selected_bid_id() {
+        fn bid_map_exposes_a_typed_renderer_and_the_bid_it_picks() {
             // Sanitization is opt-in, so enable it: the script-only creative
             // below is what drives this bid onto the renderer path. Left at the
             // default it would survive processing as an ordinary creative.
             let mut settings = test_settings();
             settings.auction.sanitize_creatives = true;
-            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "example", "fallback-ad", "", "");
             bid.bid_id = Some("selected-bid".to_string());
             bid.creative = Some("<script>reject()</script>".to_string());
             bid.nurl = None;
             bid.burl = None;
             bid.renderer = Some(
-                BidRenderer::from_typed(
-                    APS_RENDERER_TYPE,
-                    &ApsRendererV1 {
-                        version: 1,
-                        account_id: "example-account".to_string(),
-                        bid_id: "selected-bid".to_string(),
-                        creative_id: None,
-                        tag_type: ApsTagType::Iframe,
-                        creative_url: "https://creative.example/render".to_string(),
-                        aax_response: "fictional-base64</script>".to_string(),
-                        width: 300,
-                        height: 250,
-                    },
+                BidRenderer::new(
+                    "example",
+                    serde_json::json!({
+                        "version": 1,
+                        "bidId": "selected-bid",
+                        "creativeUrl": "https://creative.example/render",
+                        "envelope": "fictional-base64</script>",
+                    }),
                 )
-                .expect("should build APS renderer descriptor")
-                .picking_bid_by(crate::integrations::aps::APS_RENDERER_BID_ID_KEY),
+                .expect("should build the example renderer descriptor")
+                .picking_bid_by("bidId"),
             );
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
             let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let obj = map["atf_sidebar_ad"]
                 .as_object()
-                .expect("should include APS bid");
+                .expect("should include the renderer bid");
 
-            assert_eq!(obj["hb_bidder"], "aps");
+            assert_eq!(obj["hb_bidder"], "example");
             assert_eq!(obj["hb_adid"], "selected-bid");
-            assert_eq!(obj["renderer"]["type"], "aps");
+            assert_eq!(obj["renderer"]["type"], "example");
             assert_eq!(obj["renderer"]["bidId"], "selected-bid");
             assert!(obj.get("adm").is_none());
 
@@ -23912,34 +23906,29 @@ mod tests {
             // copy it.
             let mut settings = test_settings();
             settings.auction.sanitize_creatives = true;
-            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "ad-id-value", "", "");
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "example", "ad-id-value", "", "");
             bid.bid_id = Some("openrtb-bid-id".to_string());
             bid.cache_id = None;
             bid.creative = Some("<script>reject()</script>".to_string());
             bid.renderer = Some(
-                BidRenderer::from_typed(
-                    APS_RENDERER_TYPE,
-                    &ApsRendererV1 {
-                        version: 1,
-                        account_id: "example-account".to_string(),
-                        bid_id: "renderer-bid-id".to_string(),
-                        creative_id: None,
-                        tag_type: ApsTagType::Iframe,
-                        creative_url: "https://creative.example/render".to_string(),
-                        aax_response: "A".repeat(200 * 1024),
-                        width: 300,
-                        height: 250,
-                    },
+                BidRenderer::new(
+                    "example",
+                    serde_json::json!({
+                        "version": 1,
+                        "bidId": "renderer-bid-id",
+                        "creativeUrl": "https://creative.example/render",
+                        "envelope": "A".repeat(200 * 1024),
+                    }),
                 )
-                .expect("should build APS renderer descriptor")
-                .picking_bid_by(crate::integrations::aps::APS_RENDERER_BID_ID_KEY),
+                .expect("should build the example renderer descriptor")
+                .picking_bid_by("bidId"),
             );
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
             let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let obj = map["atf_sidebar_ad"]
                 .as_object()
-                .expect("should include APS bid");
+                .expect("should include the renderer bid");
 
             assert_eq!(
                 obj["hb_adid"], "renderer-bid-id",

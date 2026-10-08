@@ -764,7 +764,6 @@ fn compile_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::aps::ApsDemand;
     use crate::integrations::openrtb::OpenRtbDemand;
     use crate::integrations::prebid_server::PrebidServerDemand;
     use crate::provider_table::IMPLEMENTATION_KEY;
@@ -786,21 +785,13 @@ mod tests {
 
     /// One `[demand.<name>]` table naming an implementation.
     fn table(implementation: &str) -> Map<String, Value> {
-        let mut table = Map::from_iter([
+        Map::from_iter([
             (IMPLEMENTATION_KEY.to_string(), json!(implementation)),
             (
                 ENDPOINT_KEY.to_string(),
                 json!("https://bid.example/openrtb2/auction"),
             ),
-        ]);
-        if implementation == "auction.aps" {
-            table.insert(
-                ENDPOINT_KEY.to_string(),
-                json!("https://aps.example/e/pb/bid"),
-            );
-            table.insert("account_id".to_string(), json!("example-account"));
-        }
-        table
+        ])
     }
 
     /// A `[demand]` table selecting every name given, in order.
@@ -913,7 +904,6 @@ mod tests {
             "fictional_exchange",
             "auction-protocol.openrtb",
             "auction.prebid-server",
-            "auction.aps",
         ] {
             assert!(
                 message.contains(expected),
@@ -1113,7 +1103,6 @@ mod tests {
         let plan = AuctionPlan::compile(config(vec![
             ("openrtb_one", table("auction-protocol.openrtb")),
             ("pbs_one", table("auction.prebid-server")),
-            ("aps_one", table("auction.aps")),
             ("pbs_override", override_table),
         ]))
         .expect("should resolve timeouts");
@@ -1124,7 +1113,6 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(timeouts["openrtb_one"], 1500);
         assert_eq!(timeouts["pbs_one"], 1000);
-        assert_eq!(timeouts["aps_one"], 800);
         assert_eq!(timeouts["pbs_override"], 321);
     }
 
@@ -1132,19 +1120,18 @@ mod tests {
     fn the_plan_reports_which_implementations_it_selected() {
         let plan = AuctionPlan::compile(config(vec![("pbs", table("auction.prebid-server"))]))
             .expect("should compile without Settings or browser integration state");
-        assert!(!plan.has_implementation("auction.aps"));
+        assert!(!plan.has_implementation("auction-protocol.openrtb"));
         assert!(plan.has_implementation("auction.prebid-server"));
 
-        let plan = AuctionPlan::compile(config(vec![("aps_instance", table("auction.aps"))]))
-            .expect("should compile APS plan");
+        let plan = AuctionPlan::compile(one_source()).expect("should compile a plain source");
         assert!(
-            plan.has_implementation("auction.aps"),
-            "a validated plan should expose its APS renderer capability"
+            plan.has_implementation("auction-protocol.openrtb"),
+            "a validated plan should say which implementation it selected"
         );
         assert!(!plan.has_implementation("auction.prebid-server"));
         assert!(
-            plan.providers()[0].demand.as_any().is::<ApsDemand>(),
-            "the APS source should compile its own settings"
+            plan.providers()[0].demand.as_any().is::<OpenRtbDemand>(),
+            "the source should compile its own settings"
         );
     }
 
@@ -1191,15 +1178,6 @@ mod tests {
                 "should reject {endpoint}"
             );
         }
-        let mut aps = table("auction.aps");
-        aps.insert(
-            ENDPOINT_KEY.to_string(),
-            json!("https://aps.example/e/dtb/bid"),
-        );
-        assert!(
-            AuctionPlan::compile(config(vec![("aps", aps)])).is_err(),
-            "should refuse the legacy APS path"
-        );
     }
 
     #[test]
@@ -1278,13 +1256,6 @@ mod tests {
         assert_eq!(
             plan.providers()[0].endpoint.as_str(),
             "https://bid.example/"
-        );
-
-        let plan = AuctionPlan::compile(config(vec![("aps", table("auction.aps"))]))
-            .expect("should compile APS endpoint");
-        assert_eq!(
-            plan.providers()[0].endpoint.as_str(),
-            "https://aps.example/e/pb/bid"
         );
     }
 
@@ -1404,20 +1375,6 @@ mod tests {
         assert!(
             format!("{error:?}").contains("browser_only"),
             "should name the setting: {error:?}"
-        );
-
-        let mut aps = table("auction.aps");
-        aps.insert("inventory_domain".to_string(), json!("publisher.example"));
-        assert!(
-            AuctionPlan::compile(config(vec![("aps", aps)])).is_err(),
-            "should refuse an APS inventory domain without its page origin"
-        );
-
-        let mut without_account = table("auction.aps");
-        without_account.remove("account_id");
-        assert!(
-            AuctionPlan::compile(config(vec![("aps", without_account)])).is_err(),
-            "should refuse an APS source with no account"
         );
     }
 

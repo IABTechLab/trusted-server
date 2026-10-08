@@ -164,7 +164,7 @@ fn deterministic_signer() -> RequestSigner {
 }
 
 #[test]
-fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
+fn consent_matrix_preserves_pbs_and_standard_policies() {
     let cases = [
         ("empty", ConsentContext::default()),
         (
@@ -204,30 +204,18 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
         ),
     ];
     for (name, consent) in cases {
-        for implementation in [
-            "auction-protocol.openrtb",
-            "auction.prebid-server",
-            "auction.aps",
-        ] {
+        for implementation in ["auction-protocol.openrtb", "auction.prebid-server"] {
             let mut canonical = canonical_parity_auction_request();
             canonical.user.consent = Some(consent.clone());
-            let config = if implementation == "auction.aps" {
-                json!({"account_id": "example-account-id"})
-            } else {
-                json!({})
-            };
-            let value =
-                serde_json::to_value(build_with_request(implementation, config, canonical, None))
-                    .expect("should serialize request");
+            let value = serde_json::to_value(build_with_request(
+                implementation,
+                json!({}),
+                canonical,
+                None,
+            ))
+            .expect("should serialize request");
             let regs = value.get("regs");
-            if implementation == "auction.aps" {
-                let regs = regs.expect("APS should preserve empty admitted context");
-                assert_eq!(
-                    regs["gdpr"],
-                    json!(u8::from(consent.gdpr_applies)),
-                    "{name}"
-                );
-            } else if name == "empty" {
+            if name == "empty" {
                 assert!(regs.is_none(), "{implementation} should omit empty regs");
             } else {
                 let regs = regs.expect("should emit actionable regs");
@@ -296,17 +284,11 @@ fn language_limits_are_profile_specific() {
     let language = "abcdefghijk";
     for (implementation, expected) in [
         ("auction.prebid-server", Some(language)),
-        ("auction.aps", None),
         ("auction-protocol.openrtb", None),
     ] {
-        let config = if implementation == "auction.aps" {
-            json!({"account_id": "example-account-id"})
-        } else {
-            json!({})
-        };
         let request = build_with_request(
             implementation,
-            config,
+            json!({}),
             canonical_parity_auction_request(),
             Some(language),
         );
@@ -315,19 +297,10 @@ fn language_limits_are_profile_specific() {
             expected
         );
     }
-    for implementation in [
-        "auction.prebid-server",
-        "auction.aps",
-        "auction-protocol.openrtb",
-    ] {
-        let config = if implementation == "auction.aps" {
-            json!({"account_id": "example-account-id"})
-        } else {
-            json!({})
-        };
+    for implementation in ["auction.prebid-server", "auction-protocol.openrtb"] {
         let request = build_with_request(
             implementation,
-            config,
+            json!({}),
             canonical_parity_auction_request(),
             Some("en-US,en;q=0.9"),
         );
@@ -773,69 +746,6 @@ fn pbs_driver_exact_golden_preserves_profile_policy() {
 }
 
 #[test]
-fn aps_inventory_identity_and_page_fallback_preserve_legacy_policy() {
-    let mut request = canonical_parity_auction_request();
-    request.publisher.domain = "deployment.example".to_string();
-    request.publisher.page_url =
-        Some("https://deployment.example/news/story?edition=fictional#section".to_string());
-    let built = build_with_request(
-        "auction.aps",
-        json!({
-            "account_id": "example-account-id",
-            "inventory_domain": "publisher.example",
-            "inventory_page_origin": "https://www.publisher.example"
-        }),
-        request,
-        None,
-    );
-    let site = built.site.expect("should include APS site");
-    assert_eq!(site.domain.as_deref(), Some("publisher.example"));
-    assert_eq!(
-        site.page.as_deref(),
-        Some("https://www.publisher.example/news/story?edition=fictional")
-    );
-    assert_eq!(
-        site.publisher
-            .and_then(|publisher| publisher.domain)
-            .as_deref(),
-        Some("publisher.example")
-    );
-
-    for unsafe_page in [
-        "https://user:password@publisher.example/private",
-        "data:text/html,fictional",
-    ] {
-        let mut request = canonical_parity_auction_request();
-        request.publisher.page_url = Some(unsafe_page.to_string());
-        let built = build_with_request(
-            "auction.aps",
-            json!({"account_id":"example-account-id"}),
-            request,
-            None,
-        );
-        assert_eq!(
-            built.site.and_then(|site| site.page).as_deref(),
-            Some("https://publisher.example"),
-            "unsafe page should fall back to publisher domain"
-        );
-    }
-}
-
-#[test]
-fn aps_driver_exact_golden_preserves_profile_policy() {
-    let request = build(
-        "auction.aps",
-        json!({"account_id": "example-account-id"}),
-        None,
-    );
-    assert_eq!(
-        serde_json::to_string(&request).expect("should serialize APS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
-        "should preserve APS parity differences"
-    );
-}
-
-#[test]
 fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
     let signer = deterministic_signer();
     for (implementation, config) in [
@@ -844,7 +754,6 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
             json!({"request_ext": {"fictional": true}}),
         ),
         ("auction.prebid-server", json!({})),
-        ("auction.aps", json!({"account_id": "example-account-id"})),
     ] {
         let unsigned = serde_json::to_value(build(implementation, config.clone(), None))
             .expect("should serialize unsigned request");
@@ -898,11 +807,6 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
             "auction.prebid-server",
             json!({}),
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
-        ),
-        (
-            "auction.aps",
-            json!({"account_id": "example-account-id"}),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
     ];
     for (implementation, config, expected) in cases {

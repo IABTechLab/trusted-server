@@ -196,6 +196,82 @@ impl PlatformBackend for StubBackend {
 }
 
 // ---------------------------------------------------------------------------
+// NamingBackend
+// ---------------------------------------------------------------------------
+
+/// Test stub for [`PlatformBackend`] that names a backend the way the given
+/// policy does, so two demand sources get two names, and records what it was
+/// asked.
+pub struct NamingBackend {
+    pub policy: super::BackendNamingPolicy,
+    /// How many names were predicted.
+    pub predicted: std::sync::atomic::AtomicUsize,
+    /// How many backends were registered or refused.
+    pub ensured: std::sync::atomic::AtomicUsize,
+    /// The specification of every backend registered, in order.
+    pub specs: Mutex<Vec<PlatformBackendSpec>>,
+    /// The discriminators whose registration fails.
+    pub fail_ensure_for: Mutex<std::collections::HashSet<String>>,
+}
+
+impl NamingBackend {
+    pub fn new(policy: super::BackendNamingPolicy) -> Self {
+        Self {
+            policy,
+            predicted: std::sync::atomic::AtomicUsize::new(0),
+            ensured: std::sync::atomic::AtomicUsize::new(0),
+            specs: Mutex::new(Vec::new()),
+            fail_ensure_for: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Makes registration fail for the source `provider_id`.
+    pub fn fail_ensure_for(&self, provider_id: &str) {
+        self.fail_ensure_for
+            .lock()
+            .expect("should lock failing provider IDs")
+            .insert(provider_id.to_string());
+    }
+
+    fn name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.policy
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
+    }
+}
+
+impl PlatformBackend for NamingBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        self.policy
+    }
+
+    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.predicted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.name(spec)
+    }
+
+    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.ensured
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if spec.discriminator.as_deref().is_some_and(|provider_id| {
+            self.fail_ensure_for
+                .lock()
+                .expect("should lock failing provider IDs")
+                .contains(provider_id)
+        }) {
+            return Err(Report::new(PlatformError::Backend));
+        }
+        self.specs
+            .lock()
+            .expect("should lock planned backend specs")
+            .push(spec.clone());
+        self.name(spec)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StubHttpClient
 // ---------------------------------------------------------------------------
 

@@ -380,4 +380,4 @@ cd crates/trusted-server-js/lib
 npx vitest run test/integrations/aps/render.test.ts test/core/auction.test.ts
 ```
 
-See `crates/trusted-server-core/src/integrations/aps.rs` for the request/parser implementation and `crates/trusted-server-js/lib/src/integrations/aps/render.ts` for the browser renderer contract.
+See `crates/auction/aps/src/lib.rs` for the request/parser implementation and `crates/trusted-server-js/lib/src/integrations/aps/render.ts` for the browser renderer contract.

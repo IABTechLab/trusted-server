@@ -776,8 +776,11 @@ pub(crate) fn unused_bidder_params_count(
 }
 
 /// Count routed bidder params for a demand source known to ignore them.
+///
+/// Public so an implementation that takes no bidder parameters reports the
+/// ones it was routed the way core's own reader does.
 #[must_use]
-pub(crate) fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
+pub fn ignored_bidder_params_count(input: &ProviderAuctionInput) -> u32 {
     saturating_bidder_param_counts(input.slots().iter().map(|slot| slot.bidder_params().len()))
 }
 
@@ -814,13 +817,8 @@ mod routing_metadata_tests {
         for (implementation, expected) in [
             ("auction.prebid-server", 0),
             ("auction-protocol.openrtb", 1),
-            ("auction.aps", 1),
         ] {
-            let endpoint = if implementation == "auction.aps" {
-                "https://aps.example/e/pb/bid"
-            } else {
-                "https://provider.example/openrtb"
-            };
+            let endpoint = "https://provider.example/openrtb";
             let provider_id =
                 ProviderId::from_str("fictional_provider").expect("should parse provider ID");
             let mut config = plan_config(vec![(

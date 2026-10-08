@@ -559,7 +559,6 @@ impl AuctionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use serde_json::json;
 
     fn make_bid(bidder: &str) -> Bid {
@@ -750,181 +749,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn aps_renderer_serializes_to_versioned_camel_case_contract() {
-        let renderer = BidRenderer::from_typed(
-            APS_RENDERER_TYPE,
-            &ApsRendererV1 {
-                version: 1,
-                account_id: "example-account-id".to_string(),
-                bid_id: "fictional-bid-id".to_string(),
-                creative_id: Some("fictional-creative-id".to_string()),
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "base64-data".to_string(),
-                width: 300,
-                height: 250,
-            },
-        )
-        .expect("should build APS renderer descriptor");
-
-        let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
-
-        assert_eq!(
-            serialized,
-            json!({
-                "type": "aps",
-                "version": 1,
-                "accountId": "example-account-id",
-                "bidId": "fictional-bid-id",
-                "creativeId": "fictional-creative-id",
-                "tagType": "iframe",
-                "creativeUrl": "https://creative.example/render",
-                "aaxResponse": "base64-data",
-                "width": 300,
-                "height": 250
-            }),
-            "should match renderer wire contract"
-        );
+    /// A provider's own payload type, as an implementation in a crate of its
+    /// own defines one.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ExampleRenderer {
+        version: u8,
+        bid_id: String,
+        creative_url: String,
     }
 
-    #[test]
-    fn aps_renderer_omits_absent_creative_id() {
-        let renderer = BidRenderer::from_typed(
-            APS_RENDERER_TYPE,
-            &ApsRendererV1 {
-                version: 1,
-                account_id: "example-account-id".to_string(),
-                bid_id: "fictional-bid-id".to_string(),
-                creative_id: None,
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "base64-data".to_string(),
-                width: 300,
-                height: 250,
-            },
-        )
-        .expect("should build APS renderer descriptor");
+    const EXAMPLE_RENDERER_TYPE: &str = "example";
 
-        let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
-
-        assert!(
-            serialized.get("creativeId").is_none(),
-            "should omit absent creative ID"
-        );
-    }
-
-    /// Rewrites every object in `value` with its keys in sorted order, so
-    /// serializing the result gives one fixed key order.
-    ///
-    /// `serde_json::Map` is a `BTreeMap`, which serializes keys in sorted
-    /// order, only while the crate's `preserve_order` feature is off. With the
-    /// feature on it is an `IndexMap` and the order follows insertion instead.
-    /// Nothing in this crate asks for the feature, but Cargo unifies features
-    /// across everything built for one target, and `trusted-server-cli` pulls
-    /// it in through `edgezero-cli` and then `handlebars`. A maintainer
-    /// running `cargo test --workspace --target <host>` therefore builds this
-    /// crate with `preserve_order` on, and a test that pinned insertion order
-    /// would fail there for no reason. Sorting both sides removes the
-    /// dependence on which map `serde_json` was built with.
-    fn with_sorted_keys(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(map) => {
-                let mut keys = map.keys().collect::<Vec<_>>();
-                keys.sort_unstable();
-                let mut sorted = serde_json::Map::with_capacity(keys.len());
-                for key in keys {
-                    let child = map.get(key).expect("should find a key the map just listed");
-                    sorted.insert(key.clone(), with_sorted_keys(child));
-                }
-                serde_json::Value::Object(sorted)
-            }
-            serde_json::Value::Array(items) => {
-                serde_json::Value::Array(items.iter().map(with_sorted_keys).collect())
-            }
-            scalar => scalar.clone(),
+    fn example_descriptor() -> ExampleRenderer {
+        ExampleRenderer {
+            version: 1,
+            bid_id: "fictional-bid-id".to_string(),
+            creative_url: "https://creative.example/render".to_string(),
         }
     }
 
     #[test]
-    fn the_open_renderer_serializes_to_the_same_bytes_as_the_aps_variant_did() {
-        // Literal strings captured from the closed-enum form before this
-        // change, through the same `serde_json::to_value` path production
-        // uses: `BidExt::to_ext` for the OpenRTB response extension, and
-        // `build_bid_map` for `window.tsjs.bids`.
-        //
-        // Both sides go through `with_sorted_keys` first, because the key
-        // order `serde_json` emits is not ours to pin, and that function
-        // explains why. Sorting settles the order without weakening what is
-        // pinned, since two objects serialize to the same sorted bytes only
-        // when they carry exactly the same keys with exactly the same values.
-        let full = BidRenderer::from_typed(
-            APS_RENDERER_TYPE,
-            &ApsRendererV1 {
-                version: 1,
-                account_id: "example-account-id".to_string(),
-                bid_id: "fictional-bid-id".to_string(),
-                creative_id: Some("fictional-creative-id".to_string()),
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "base64-data".to_string(),
-                width: 300,
-                height: 250,
-            },
-        )
-        .expect("should build APS renderer descriptor");
-        let absent = BidRenderer::from_typed(
-            APS_RENDERER_TYPE,
-            &ApsRendererV1 {
-                version: 1,
-                account_id: "example-account-id".to_string(),
-                bid_id: "fictional-bid-id".to_string(),
-                creative_id: None,
-                tag_type: ApsTagType::Script,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "base64-data".to_string(),
-                width: 300,
-                height: 250,
-            },
-        )
-        .expect("should build APS renderer descriptor");
-
-        let full_bytes = serde_json::to_string(&with_sorted_keys(
-            &serde_json::to_value(&full).expect("should convert renderer to a JSON value"),
-        ))
-        .expect("should serialize renderer");
-        let absent_bytes = serde_json::to_string(&with_sorted_keys(
-            &serde_json::to_value(&absent).expect("should convert renderer to a JSON value"),
-        ))
-        .expect("should serialize renderer");
+    fn renderer_serializes_flat_under_its_type_tag() {
+        let renderer = BidRenderer::from_typed(EXAMPLE_RENDERER_TYPE, &example_descriptor())
+            .expect("should build renderer descriptor");
 
         assert_eq!(
-            full_bytes,
-            "{\"aaxResponse\":\"base64-data\",\"accountId\":\"example-account-id\",\"bidId\":\"fictional-bid-id\",\"creativeId\":\"fictional-creative-id\",\"creativeUrl\":\"https://creative.example/render\",\"height\":250,\"tagType\":\"iframe\",\"type\":\"aps\",\"version\":1,\"width\":300}",
-            "should serialize to the bytes the closed enum produced"
-        );
-        assert_eq!(
-            absent_bytes,
-            "{\"aaxResponse\":\"base64-data\",\"accountId\":\"example-account-id\",\"bidId\":\"fictional-bid-id\",\"creativeUrl\":\"https://creative.example/render\",\"height\":250,\"tagType\":\"script\",\"type\":\"aps\",\"version\":1,\"width\":300}",
-            "should serialize to the bytes the closed enum produced with no creative ID"
+            serde_json::to_value(&renderer).expect("should serialize renderer"),
+            json!({
+                "type": "example",
+                "version": 1,
+                "bidId": "fictional-bid-id",
+                "creativeUrl": "https://creative.example/render"
+            }),
+            "should carry the tag beside the payload's own keys"
         );
     }
 
     #[test]
     fn renderer_round_trips_through_its_wire_form() {
-        let descriptor = ApsRendererV1 {
-            version: 1,
-            account_id: "example-account-id".to_string(),
-            bid_id: "fictional-bid-id".to_string(),
-            creative_id: Some("fictional-creative-id".to_string()),
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "base64-data".to_string(),
-            width: 300,
-            height: 250,
-        };
-        let renderer = BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
-            .expect("should build APS renderer descriptor");
+        let descriptor = example_descriptor();
+        let renderer = BidRenderer::from_typed(EXAMPLE_RENDERER_TYPE, &descriptor)
+            .expect("should build renderer descriptor");
 
         let serialized = serde_json::to_string(&renderer).expect("should serialize renderer");
         let restored: BidRenderer =
@@ -932,13 +798,13 @@ mod tests {
 
         assert_eq!(
             restored.renderer_type(),
-            APS_RENDERER_TYPE,
+            EXAMPLE_RENDERER_TYPE,
             "should round-trip the renderer type tag"
         );
         assert_eq!(
             restored
-                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
-                .expect("should deserialize the APS payload"),
+                .payload_as::<ExampleRenderer>(EXAMPLE_RENDERER_TYPE)
+                .expect("should deserialize the payload"),
             descriptor,
             "should round-trip the provider payload"
         );
@@ -946,51 +812,41 @@ mod tests {
 
     #[test]
     fn renderer_payload_is_hidden_from_a_different_type_tag() {
-        let renderer = BidRenderer::new(APS_RENDERER_TYPE, json!({ "version": 1 }))
+        let renderer = BidRenderer::new(EXAMPLE_RENDERER_TYPE, json!({ "version": 1 }))
             .expect("should build renderer descriptor");
 
         assert!(
-            renderer.payload_as::<ApsRendererV1>("example").is_none(),
+            renderer.payload_as::<ExampleRenderer>("other").is_none(),
             "should refuse a payload requested under a different tag"
         );
     }
 
     #[test]
     fn renderer_payload_field_borrows_the_same_value_the_whole_descriptor_carries() {
-        let descriptor = ApsRendererV1 {
-            version: 1,
-            account_id: "example-account-id".to_string(),
-            bid_id: "fictional-bid-id".to_string(),
-            creative_id: Some("fictional-creative-id".to_string()),
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "base64-data".to_string(),
-            width: 300,
-            height: 250,
-        };
-        let renderer = BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
-            .expect("should build APS renderer descriptor");
+        let descriptor = example_descriptor();
+        let renderer = BidRenderer::from_typed(EXAMPLE_RENDERER_TYPE, &descriptor)
+            .expect("should build renderer descriptor");
 
         assert_eq!(
             renderer
-                .payload_field(APS_RENDERER_TYPE, "bidId")
+                .payload_field(EXAMPLE_RENDERER_TYPE, "bidId")
                 .and_then(serde_json::Value::as_str),
             Some(descriptor.bid_id.as_str()),
             "should read the same bid id the whole descriptor carries"
         );
         assert_eq!(
             renderer
-                .payload_field(APS_RENDERER_TYPE, "bidId")
+                .payload_field(EXAMPLE_RENDERER_TYPE, "bidId")
                 .and_then(serde_json::Value::as_str),
             renderer
-                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                .payload_as::<ExampleRenderer>(EXAMPLE_RENDERER_TYPE)
                 .as_ref()
                 .map(|full| full.bid_id.as_str()),
             "should agree with the field read through the whole descriptor"
         );
         assert!(
             renderer
-                .payload_field(APS_RENDERER_TYPE, "notAKey")
+                .payload_field(EXAMPLE_RENDERER_TYPE, "notAKey")
                 .is_none(),
             "should return nothing for a key the payload does not carry"
         );
@@ -998,19 +854,59 @@ mod tests {
 
     #[test]
     fn renderer_payload_field_is_hidden_from_a_different_type_tag() {
-        let renderer = BidRenderer::new(APS_RENDERER_TYPE, json!({ "bidId": "fictional-bid-id" }))
-            .expect("should build renderer descriptor");
+        let renderer = BidRenderer::new(
+            EXAMPLE_RENDERER_TYPE,
+            json!({ "bidId": "fictional-bid-id" }),
+        )
+        .expect("should build renderer descriptor");
 
         assert!(
-            renderer.payload_field("example", "bidId").is_none(),
+            renderer.payload_field("other", "bidId").is_none(),
             "should refuse a field requested under a different tag"
+        );
+    }
+
+    #[test]
+    fn renderer_names_the_bid_it_picks_only_when_its_builder_said_which_key_holds_it() {
+        let unstated = BidRenderer::from_typed(EXAMPLE_RENDERER_TYPE, &example_descriptor())
+            .expect("should build renderer descriptor");
+        assert_eq!(
+            unstated.bid_id(),
+            None,
+            "should name no bid for a descriptor whose builder made no statement"
+        );
+
+        let stated = unstated.clone().picking_bid_by("bidId");
+        assert_eq!(
+            stated.bid_id(),
+            Some("fictional-bid-id"),
+            "should read the key the builder stated"
+        );
+        assert_eq!(
+            stated.clone().bid_id(),
+            Some("fictional-bid-id"),
+            "should keep the statement when the descriptor is cloned"
+        );
+        assert_eq!(
+            serde_json::to_value(&stated).expect("should serialize renderer"),
+            serde_json::to_value(&unstated).expect("should serialize renderer"),
+            "should send the same bytes with or without the statement"
+        );
+
+        let absent = BidRenderer::new(EXAMPLE_RENDERER_TYPE, json!({ "version": 1 }))
+            .expect("should build renderer descriptor")
+            .picking_bid_by("bidId");
+        assert_eq!(
+            absent.bid_id(),
+            None,
+            "should name no bid when the payload does not carry the stated key"
         );
     }
 
     #[test]
     fn renderer_rejects_a_payload_that_is_not_an_object() {
         assert!(
-            BidRenderer::new(APS_RENDERER_TYPE, json!("not-an-object")).is_err(),
+            BidRenderer::new(EXAMPLE_RENDERER_TYPE, json!("not-an-object")).is_err(),
             "should reject a payload that is not a JSON object"
         );
     }
@@ -1018,7 +914,11 @@ mod tests {
     #[test]
     fn renderer_rejects_a_payload_carrying_its_own_type_key() {
         assert!(
-            BidRenderer::new(APS_RENDERER_TYPE, json!({ "type": "other", "version": 1 })).is_err(),
+            BidRenderer::new(
+                EXAMPLE_RENDERER_TYPE,
+                json!({ "type": "other", "version": 1 })
+            )
+            .is_err(),
             "should reject a payload that would collide with the type tag"
         );
     }
