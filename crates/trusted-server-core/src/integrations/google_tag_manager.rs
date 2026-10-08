@@ -12,7 +12,7 @@
 //! | `GET/POST` | `.../collect` | Proxies GA analytics beacons |
 //! | `GET/POST` | `.../g/collect` | Proxies GA4 analytics beacons |
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
+use crate::integrations::ScriptTextAccumulator;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
@@ -356,14 +357,6 @@ pub struct GoogleTagManagerIntegration {
     /// allowlist as "any host", so without this a 3xx from the upstream would
     /// let an arbitrary origin's body be re-served as first-party JavaScript.
     proxy_allowed_domains: Vec<String>,
-    /// Accumulates text fragments when `lol_html` splits a text node across
-    /// chunk boundaries. Drained on `is_last_in_text_node`.
-    ///
-    /// Uses `Mutex` to satisfy the `Sync` bound on `IntegrationScriptRewriter`.
-    /// The pipeline is single-threaded (`lol_html::HtmlRewriter` is `!Send`),
-    /// so the lock is uncontended. `lol_html` delivers text chunks sequentially
-    /// per element — the buffer is always empty when a new element's text begins.
-    accumulated_text: Mutex<String>,
 }
 
 impl GoogleTagManagerIntegration {
@@ -372,7 +365,6 @@ impl GoogleTagManagerIntegration {
         Arc::new(Self {
             config,
             proxy_allowed_domains,
-            accumulated_text: Mutex::new(String::new()),
         })
     }
 
@@ -1029,10 +1021,12 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
     }
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-        let mut buf = self
-            .accumulated_text
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Per document, never per registry: a registry-lifetime buffer would
+        // carry one document's partial script into the next.
+        let accumulator = ctx
+            .document_state
+            .get_or_insert_with(GTM_INTEGRATION_ID, ScriptTextAccumulator::default);
+        let mut buf = accumulator.buffer();
 
         // Cheap gate: only engage the accumulation path for scripts whose
         // running text could plausibly contain a GTM/GA domain. Unrelated
@@ -3463,6 +3457,76 @@ container_id = "GTM-DEFAULT"
             }
             other => panic!("expected Replace for fragmented GTM, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_interrupted_document_leaves_no_residue_for_the_next_document() {
+        // The registry holds one `Arc<dyn IntegrationScriptRewriter>` for the
+        // lifetime of the application, so both documents below go through the
+        // SAME rewriter instance. Only the document state differs. With the
+        // buffer owned by the rewriter this test fails: document two emits
+        // document one's secret.
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-LEAK01", &[]));
+
+        // Document one: a GTM snippet that is cut off before its final
+        // fragment ever arrives, as a client disconnect or truncated origin
+        // body would do.
+        let first_document = IntegrationDocumentState::default();
+        let interrupted = IntegrationScriptContext {
+            selector: "script",
+            request_host: "first.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: false,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
+            document_state: &first_document,
+        };
+        // Must end mid-domain: that is what makes the cheap prefix gate
+        // accumulate rather than pass the fragment through untouched.
+        let secret =
+            r#"(function(w,d,s,l,i){var token='SESSION-ONE-SECRET'; j.src='https://www.google"#;
+
+        let action = IntegrationScriptRewriter::rewrite(&*integration, secret, &interrupted);
+        assert_eq!(
+            action,
+            ScriptRewriteAction::RemoveNode,
+            "the partial fragment should be withheld, which is what strands it"
+        );
+
+        // Document two: a different request, a fresh document state, the same
+        // registry and the same rewriter.
+        let second_document = IntegrationDocumentState::default();
+        let fresh = IntegrationScriptContext {
+            selector: "script",
+            request_host: "second.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            is_last_in_text_node: true,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
+            document_state: &second_document,
+        };
+        let benign = r#"(function(w,d,s,l,i){j.src='https://www.googletagmanager.com/gtm.js?id='+i;})(window,document,'script','dataLayer','GTM-LEAK01');"#;
+
+        let action = IntegrationScriptRewriter::rewrite(&*integration, benign, &fresh);
+
+        let emitted = match action {
+            ScriptRewriteAction::Replace(rewritten) => rewritten,
+            ScriptRewriteAction::Keep => benign.to_owned(),
+            other => panic!("expected the second document to be emitted, got {other:?}"),
+        };
+
+        assert!(
+            !emitted.contains("SESSION-ONE-SECRET"),
+            "the interrupted document's content must not reach the next document, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("first.example.com"),
+            "no trace of the previous document should survive, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("/integrations/google_tag_manager/gtm.js"),
+            "the second document should still be rewritten correctly, got: {emitted}"
+        );
     }
 
     #[test]
