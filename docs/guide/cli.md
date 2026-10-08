@@ -44,7 +44,13 @@ commands are shown explicitly.
 | `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                            | `ts dev proxy ca uninstall`                                                                                    |
 | `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
 | `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                   | `ts prebid <COMMAND>`                                                                                          |
-| `ts prebid bundle`               | Linux + macOS | Generate a local external Prebid bundle and update config metadata                               | `ts prebid bundle [OPTIONS]`                                                                                   |
+| `ts prebid client`               | Linux + macOS | Generate a local external Prebid client bundle and update config metadata                        | `ts prebid client [OPTIONS]`                                                                                   |
+| `ts prebid server`               | Linux + macOS | Configure and operate a self-hosted Prebid Server deployment                                     | `ts prebid server [OPTIONS] <COMMAND>`                                                                         |
+| `ts prebid server inspect`       | Linux + macOS | Inspect local Trusted Server configuration without modifying it or contacting AWS                | `ts prebid server inspect [OPTIONS]`                                                                           |
+| `ts prebid server check`         | Linux + macOS | Validate declared PBS inputs and regional YAML merges locally, without AWS access                | `ts prebid server check [OPTIONS] --deployment <DEPLOYMENT>`                                                   |
+| `ts prebid server status`        | Linux + macOS | Read EC2 infrastructure status, not PBS health or the installed release                          | `ts prebid server status [OPTIONS] --deployment <DEPLOYMENT>`                                                  |
+| `ts prebid server secrets`       | Linux + macOS | Manage values for existing, explicitly declared Secrets Manager secrets                          | `ts prebid server secrets [OPTIONS] <COMMAND>`                                                                 |
+| `ts prebid server secrets set`   | Linux + macOS | Write a complete JSON credential payload; does not deploy or rotate partner credentials          | `ts prebid server secrets set [OPTIONS] --deployment <DEPLOYMENT> --region <REGION> <BIDDER>`                  |
 | `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                            | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
 | `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                    | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
 | `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
@@ -686,8 +692,12 @@ APIs.
 
 ## Generate an external Prebid bundle
 
-`ts prebid bundle` builds the local external Prebid browser bundle configured in
+`ts prebid client` builds the local external Prebid browser bundle configured in
 `trusted-server.toml`.
+
+> This command was previously `ts prebid bundle`. Update scripts and runbooks to
+> use `ts prebid client` with the same arguments. The old spelling is retired and
+> is not accepted as an alias.
 
 ```toml
 [integrations.prebid.bundle.modules]
@@ -706,7 +716,7 @@ Run the command after installing JS dependencies:
 ```bash
 cd crates/trusted-server-js/lib && npm ci
 cd ../../..
-ts prebid bundle
+ts prebid client
 ```
 
 By default, generated artifacts are written to `dist/prebid/`. The versioned
@@ -722,8 +732,122 @@ HTTPS asset URL, and include that host plus any redirect targets in
 Use custom paths when needed:
 
 ```bash
-ts prebid bundle --config publisher-a.toml --out build/prebid
+ts prebid client --config publisher-a.toml --out build/prebid
 ```
 
-`ts prebid bundle` is local-only. It has no `--adapter` option and does not
+`ts prebid client` is local-only. It has no `--adapter` option and does not
 upload, provision, deploy, or push config.
+
+## Operate a self-hosted Prebid Server
+
+The experimental `ts prebid server` namespace supports four bounded operations:
+
+- `inspect` reads selected local Trusted Server configuration.
+- `check` validates a deployment descriptor and regional configuration locally.
+- `secrets set` writes one approved value to an existing AWS Secrets Manager secret.
+- `status` reads declared EC2 infrastructure state, not PBS health or readiness.
+
+AWS operations require AWS CLI v2 on `PATH`; `inspect` and `check` do not contact
+AWS. Add `--json` anywhere under `ts prebid server` for machine-readable output.
+Failures use exit code 2, including incomplete `status` reports that still write
+partial JSON to stdout.
+
+### Deployment descriptor and bindings
+
+Pass an explicit `--deployment <file>`; there is no automatic discovery or
+production default. This fictional descriptor is suitable only for local checks:
+
+```yaml
+schema_version: 1
+environment: sandbox
+runtime: ec2-compose
+aws:
+  account_id: '123456789012'
+  profile: pbs-sandbox
+pbs:
+  config: pbs.yaml
+  image: registry.example.com/pbs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  bindings: bindings.json
+regions:
+  us-east-1:
+    instance_ids:
+      - i-0123456789abcdef0
+    overrides: east.yaml
+```
+
+Version 1 requires an explicit environment, `ec2-compose` runtime, 12-digit AWS
+account ID, AWS CLI profile, digest-pinned image, baseline YAML path, and nonempty
+region map. Environment and bidder identifiers use letters, digits, underscores,
+and hyphens; profile names may also contain periods. Instance IDs are optional,
+but `status` needs explicitly listed instances to report infrastructure health.
+Regional override paths and `pbs.bindings` are optional. Omit bindings when no
+host secrets are needed.
+
+Paths resolve relative to the descriptor. Unknown schema fields, duplicate YAML
+keys, tags, and implicit YAML merge keys are rejected. Regional mappings merge
+recursively over the baseline; sequences and scalars replace whole values. The
+CLI validates in memory and writes no rendered files.
+
+The binding file is a JSON or YAML mapping keyed by bidder identifier. Each
+entry requires:
+
+- `verified_image`, exactly matching the descriptor's image.
+- `source`, an HTTPS reference used by the operator to verify the mapping.
+- `secrets`, a complete Secrets Manager ARN for each descriptor region, matching
+  its account and region. Each secret must belong to only one bidder binding.
+- `keys`, mapping credential names to an environment variable `env`, a YAML path
+  array `pbs_path`, and optional `required`, which defaults to true.
+
+For example, a key mapping can be:
+
+```json
+{
+  "api_key": {
+    "env": "PBS_ADAPTERS_EXAMPLEBIDDER_API_KEY",
+    "pbs_path": ["adapters", "examplebidder", "api_key"],
+    "required": true
+  }
+}
+```
+
+Bindings support string-valued credentials. Environment variables and YAML
+destinations must not conflict across bindings or with values already present in
+the resolved YAML. These are operator-supplied mappings, not a verified adapter
+catalog. `check` does not validate the complete upstream PBS schema, verify
+bidder authorization, retrieve secrets, pull images, or prove application health.
+
+### Secret-write safeguards
+
+`secrets set` replaces the complete JSON value of an existing declared secret.
+It does not create secret metadata, deploy PBS, refresh a container, or rotate a
+bidder's credential. Use a trusted host and short-lived AWS credentials. Obtain
+separate approval for each target and value write.
+
+Before writing, the CLI verifies the account through STS, describes the declared
+secret, rejects replicas and secrets scheduled for deletion, and checks both the
+selected profile's and default AWS CLI history settings. History must be disabled
+or unset. Provider stderr is withheld and configured API endpoint overrides are
+disabled.
+
+Interactive use reads JSON in a hidden terminal prompt and requires typing
+`yes`. For approved automation, use `--file <path>` or `--stdin` with `--yes` and
+an explicit `--request-token <UUID>`. The payload must contain only declared keys,
+include required nonempty string values, and fit the Secrets Manager size limit.
+Duplicate keys and non-string values are rejected.
+
+Secret contents do not enter arguments or reports. The AWS request goes through a
+tool-owned temporary file, owner-only on Unix, removed on normal success and
+error paths. Abrupt termination can leave that file behind; Windows temporary-file
+ACLs have not been verified. Operator-provided input files are never deleted.
+Input-file errors print the full escaped path to stderr, including under `--json`.
+Keep sensitive directory and partner names out of public logs.
+
+A successful write reports its version identifier, not runtime readiness. A failed
+or unverifiable response means the outcome may be uncertain. Preserve the request
+UUID and input. Reuse that UUID only with the original identical payload; use a
+new UUID only for a separately intended update. Do not retry changed values under
+the same UUID. `--yes` authorizes only this write, not deployment or future writes.
+
+See the
+[experimental PBS command reference](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-cli/README.md)
+for complete binding fixtures, command examples, and remaining runtime limits.
