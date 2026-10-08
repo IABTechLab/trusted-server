@@ -800,7 +800,8 @@ The Trusted Server JavaScript (TSJS) library is automatically injected:
 
 ### Integration bundles
 
-The integration registry selects TSJS modules by enabled integration ID. A
+The integration registry selects TSJS modules by the integrations the
+settings select, each known to the browser by its integration ID. A
 registered ID with a compiled module is included in the immediate unified
 bundle unless its builder calls `.with_deferred_js()`; deferred modules are
 served separately as `/static/tsjs=tsjs-<id>.min.js`. Builders can call
@@ -819,7 +820,7 @@ Each integration is built as a separate IIFE at compile time (`crates/trusted-se
 - Prebid is built externally with `build-prebid-external.mjs` and served through `/integrations/prebid/bundle.js`
 - `tsjs-lockr.js`, `tsjs-permutive.js`, `tsjs-didomi.js`, `tsjs-datadome.js`, `tsjs-testlight.js` — Other integrations
 
-At runtime, the server concatenates `tsjs-core.js` + the modules for enabled integrations. The URL stays `/static/tsjs=tsjs-unified.min.js?v=<hash>` for backward compatibility.
+At runtime, the server concatenates `tsjs-core.js` + the modules for the integrations that run. The URL stays `/static/tsjs=tsjs-unified.min.js?v=<hash>` for backward compatibility.
 
 ## Performance Optimization
 

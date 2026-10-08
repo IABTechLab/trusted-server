@@ -13,14 +13,14 @@ fn make_config() -> HtmlProcessorConfig {
         request_scheme: "https".to_string(),
         integrations: IntegrationRegistry::default(),
         ad_slots_script: None,
+        permissions_script: None,
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,
-        gpt_diagnostics: None,
+        request_state: trusted_server_core::integrations::IntegrationRequestState::default(),
         // The benchmark measures URL rewriting, not ad injection, and
         // `ad_slots_script` is `None` here — matching the previous behaviour,
         // which inferred no body-close work from that.
         body_close: BodyCloseInjection::None,
-        suppress_datadome_client_side_tag: false,
     }
 }
 

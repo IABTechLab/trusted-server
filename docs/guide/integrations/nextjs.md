@@ -26,8 +26,10 @@ Next.js applications generate framework-specific JSON data (`__NEXT_DATA__`) and
 ## Configuration
 
 ```toml
-[integrations.nextjs]
-enabled = false
+[framework]
+module = "nextjs"
+
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url"]
 max_combined_payload_bytes = 10485760
 ```
@@ -36,7 +38,6 @@ max_combined_payload_bytes = 10485760
 
 | Field                        | Type    | Default                   | Description                                     |
 | ---------------------------- | ------- | ------------------------- | ----------------------------------------------- |
-| `enabled`                    | boolean | `false`                   | Enable Next.js integration                      |
 | `rewrite_attributes`         | array   | `["href", "link", "url"]` | Attributes to rewrite in Next.js data           |
 | `max_combined_payload_bytes` | integer | `10485760`                | Maximum bytes retained for one unresolved group |
 
@@ -93,9 +94,9 @@ Next.js Pages Router embeds data in `__NEXT_DATA__` script:
 
 The Next.js integration is implemented across multiple files:
 
-- [crates/trusted-server-core/src/integrations/nextjs/mod.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/mod.rs) - Main integration
-- [crates/trusted-server-core/src/integrations/nextjs/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/rsc.rs) - RSC parsing
-- [crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/nextjs/script_rewriter.rs) - Script rewriting
+- [crates/framework/nextjs/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/lib.rs) - Main integration
+- [crates/framework/nextjs/src/rsc.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/rsc.rs) - RSC parsing
+- [crates/framework/nextjs/src/script_rewriter.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/framework/nextjs/src/script_rewriter.rs) - Script rewriting
 
 ### Key Components
 
@@ -141,11 +142,11 @@ Combine Next.js SSR/SSG with Trusted Server edge logic.
 
 ### 1. Enable Only When Needed
 
-Only enable if you're using Next.js:
+Name it only if you're using Next.js:
 
 ```toml
-[integrations.nextjs]
-enabled = true  # Only if using Next.js
+[framework]
+module = "nextjs"
 ```
 
 ### 2. Configure Rewrite Attributes
@@ -153,7 +154,10 @@ enabled = true  # Only if using Next.js
 Add custom attributes if your Next.js app uses non-standard fields:
 
 ```toml
-[integrations.nextjs]
+[framework]
+module = "nextjs"
+
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url", "customImageUrl"]
 ```
 

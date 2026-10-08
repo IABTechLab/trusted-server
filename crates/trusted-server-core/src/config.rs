@@ -11,48 +11,16 @@ use std::borrow::Cow;
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
+use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
-use crate::integrations::{
-    adserver_mock::AdServerMockConfig,
-    aps::ApsConfig,
-    datadome::DataDomeConfig,
-    didomi::DidomiIntegrationConfig,
-    google_tag_manager::GoogleTagManagerConfig,
-    gpt::GptConfig,
-    gpt_diagnostics::GptDiagnosticsConfig,
-    js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
-    lockr::LockrConfig,
-    nextjs::NextJsIntegrationConfig,
-    osano::OsanoConfig,
-    permutive::PermutiveConfig,
-    prebid,
-    sourcepoint::SourcepointConfig,
-    testlight::TestlightConfig,
-};
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+
+use crate::integrations::IntegrationBuilder;
+use crate::settings::{AssetOriginAuth, Ec, MODULE_IMPLEMENTATION_KEY, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
-#[cfg(test)]
-const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
-    "prebid",
-    "aps",
-    "adserver_mock",
-    "testlight",
-    "nextjs",
-    "permutive",
-    "lockr",
-    "didomi",
-    "sourcepoint",
-    "osano",
-    "google_tag_manager",
-    "datadome",
-    "gpt",
-    "gpt_diagnostics",
-    JS_ASSET_PROXY_INTEGRATION_ID,
-];
 
 /// Typed app-config root used by the `ts` CLI.
 ///
@@ -114,10 +82,34 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
     }
 }
 
+/// The builders [`TrustedServerAppConfig`] validates against besides core's
+/// own, set once by the tool that validates.
+static DEPLOY_INTEGRATIONS: std::sync::OnceLock<Vec<IntegrationBuilder>> =
+    std::sync::OnceLock::new();
+
+/// Registers the integration builders [`TrustedServerAppConfig`] validates
+/// against besides core's own.
+///
+/// `EdgeZero` validates an app config through the [`Validate`] trait, which
+/// takes no arguments, so a tool that validates a deployment's settings
+/// registers that deployment's builders here before it validates anything.
+/// The first call wins and a later one changes nothing.
+pub fn register_deploy_integrations(builders: Vec<IntegrationBuilder>) {
+    let _ = DEPLOY_INTEGRATIONS.set(builders);
+}
+
+/// The builders a tool registered for deploy validation, or none.
+fn deploy_integrations() -> &'static [IntegrationBuilder] {
+    DEPLOY_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
+}
+
 impl Validate for TrustedServerAppConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = self.settings.validate().err().unwrap_or_default();
-        if let Err(report) = validate_settings_for_deploy(&self.settings) {
+        remove_labeled_module_secret_errors(&mut errors, &self.settings.ec);
+        if let Err(report) =
+            validate_settings_for_deploy_with(&self.settings, deploy_integrations())
+        {
             errors.add(
                 DEPLOY_VALIDATION_FIELD,
                 report_to_validation_error(&report, "trusted_server_deploy_validation"),
@@ -131,6 +123,101 @@ impl Validate for TrustedServerAppConfig {
     }
 }
 
+/// Removes the passphrase checks on Edge Cookie module blocks written under
+/// a label.
+///
+/// Push-time validation reads a configuration whose secret fields hold
+/// secret-store key names rather than the secrets themselves, so a value check
+/// such as the 32-byte passphrase minimum would be judging a key name.
+/// `EdgeZero`'s `validate_excluding_secrets` removes those checks for the
+/// leaves [`secret_fields`](edgezero_core::app_config::AppConfigMeta::secret_fields)
+/// lists, which covers the `[ec.hmac]` block. A block under a label of the
+/// operator's choosing has no fixed path that list can hold, so its check is
+/// removed here instead. The check itself is unchanged, and runs wherever
+/// settings are loaded with their secrets resolved.
+fn remove_labeled_module_secret_errors(errors: &mut ValidationErrors, ec: &Ec) {
+    let Some(ValidationErrorsKind::Struct(ec_errors)) = errors.errors_mut().get_mut("ec") else {
+        return;
+    };
+    let labeled = ec
+        .module_blocks
+        .hmac_blocks()
+        .map(|(name, _)| name)
+        .filter(|name| *name != HMAC_MODULE_KEY)
+        .chain(
+            ec.module_blocks
+                .host_signals_blocks()
+                .map(|(name, _)| name)
+                .filter(|name| *name != HOST_SIGNALS_MODULE_KEY),
+        );
+    for name in labeled {
+        let Some(ValidationErrorsKind::Struct(block_errors)) = ec_errors.errors_mut().get_mut(name)
+        else {
+            continue;
+        };
+        block_errors.errors_mut().remove("passphrase");
+        if block_errors.errors().is_empty() {
+            ec_errors.errors_mut().remove(name);
+        }
+    }
+    // An `ec` entry holding nothing would keep the whole result an error, the
+    // same reason `EdgeZero` prunes emptied containers after its own removals.
+    let ec_is_empty = ec_errors.errors().is_empty();
+    if ec_is_empty {
+        errors.errors_mut().remove("ec");
+    }
+}
+
+impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig {
+    /// The passphrase of every Edge Cookie module block that configures a
+    /// module built into core under a label.
+    ///
+    /// [`secret_fields`](edgezero_core::app_config::AppConfigMeta::secret_fields)
+    /// lists the passphrases of the `[ec.hmac]` and `[ec.host_signals]`
+    /// blocks, the one path each of those modules' blocks has when its name
+    /// is its implementation. The same module under a label of the
+    /// operator's choosing holds that secret at `ec.<label>.passphrase`, which
+    /// is only knowable from the configuration itself.
+    fn configured_secret_fields(data: &serde_json::Value) -> Vec<SecretField> {
+        labeled_module_block_names(data)
+            .map(|name| SecretField {
+                kind: SecretKind::KeyInDefault,
+                optional: true,
+                path: vec![
+                    SecretPathSegment::Field(Cow::Borrowed("ec")),
+                    SecretPathSegment::Field(Cow::Owned(name)),
+                    SecretPathSegment::Field(Cow::Borrowed("passphrase")),
+                ],
+            })
+            .collect()
+    }
+}
+
+/// The names of the `[ec.<name>]` blocks in a serialized configuration that
+/// configure a module built into core under a label.
+///
+/// A block named after either built-in implementation is a fixed path
+/// `secret_fields` already lists, whichever of the two it configures, so it is
+/// left out rather than listed twice. A block naming any other implementation
+/// holds that implementation's settings, which core does not read.
+fn labeled_module_block_names(data: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
+    data.get("ec")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(name, block)| {
+            let Some(implementation) = block
+                .get(MODULE_IMPLEMENTATION_KEY)
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let built_in = |key: &str| key == HMAC_MODULE_KEY || key == HOST_SIGNALS_MODULE_KEY;
+            built_in(implementation) && !built_in(name.as_str())
+        })
+        .map(|(name, _)| name.clone())
+}
+
 impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
     fn secret_fields() -> Vec<SecretField> {
         let field = |path: Vec<SecretPathSegment>, optional| SecretField {
@@ -142,9 +229,21 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
         let optional_object =
             |name: &'static str| SecretPathSegment::OptionalField(Cow::Borrowed(name));
 
-        vec![
+        let mut fields = vec![
             field(vec![object("publisher"), object("proxy_secret")], false),
-            field(vec![object("ec"), object("passphrase")], false),
+            field(vec![object("ec"), object("passphrase")], true),
+            field(
+                vec![object("ec"), optional_object("hmac"), object("passphrase")],
+                true,
+            ),
+            field(
+                vec![
+                    object("ec"),
+                    optional_object("host_signals"),
+                    object("passphrase"),
+                ],
+                true,
+            ),
             field(
                 vec![
                     object("ec"),
@@ -184,23 +283,6 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             ),
             field(
                 vec![
-                    optional_object("integrations"),
-                    optional_object("datadome"),
-                    object("server_side_key_secret_name"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("integrations"),
-                    optional_object("datadome"),
-                    optional_object("protection_test_bypass"),
-                    object("credential_secret_name"),
-                ],
-                true,
-            ),
-            field(
-                vec![
                     optional_object("proxy"),
                     optional_object("asset_routes"),
                     SecretPathSegment::ArrayEach,
@@ -229,11 +311,17 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 ],
                 true,
             ),
-        ]
+        ];
+        // The settings a module declares in its own table, for core's
+        // modules and the ones a tool registered for deploy validation.
+        let builders = crate::integrations::all_builders(deploy_integrations()).collect::<Vec<_>>();
+        fields.extend(crate::module_secrets::secret_fields(&builders));
+        fields
     }
 }
 
-/// Runs Trusted Server push-time validation for app config.
+/// Runs Trusted Server push-time validation for app config with the built-in
+/// integrations only.
 ///
 /// Secret fields contain secret-store key names at this stage, so this function
 /// deliberately excludes checks that require resolved values. The `EdgeZero` CLI
@@ -245,21 +333,51 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when non-secret configuration or a secret key
 /// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    validate_secret_key_references(settings)?;
+    validate_settings_for_deploy_with(settings, &[])
+}
+
+/// Runs push-time validation with the built-in integrations followed by the
+/// externally supplied builders an adapter registers. Every builder validates,
+/// enabled or not, so a typo in a disabled block is still caught.
+///
+/// As in [`validate_settings_for_deploy`], secret fields still hold key names
+/// here, so no check reads a resolved secret value.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when non-secret configuration or a secret key
+/// reference is invalid, or when a builder rejects its own configuration.
+pub fn validate_settings_for_deploy_with(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
+    // The selection is checked first, so a block nothing runs is reported as
+    // that rather than as whatever its unread settings fail next.
+    settings.validate_module_sections()?;
+    validate_secret_key_references(settings, extra_integrations)?;
     validate_non_secret_deploy_placeholders(settings)?;
-    validate_js_asset_proxy_config(settings)?;
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
     structural_settings.validate_admin_coverage()?;
 
-    let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_enabled_integrations(settings, &plan, false)?;
+    // The plan is compiled with the builders the blocks are validated
+    // against, so a `[demand]` or `[ad-server]` name one of them supplies
+    // compiles here.
+    let plan = crate::auction::compile_auction_plan_with(settings, extra_integrations)?;
+    validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    settings.ec.validate_resolve_allowed_origins()?;
     Ok(())
 }
 
-/// Runs Trusted Server runtime validation after secret references are resolved.
+/// Runs Trusted Server runtime validation after secret references are
+/// resolved, against the built-in integrations only.
+///
+/// A deployment whose `[demand]` or `[ad-server]` names an implementation a
+/// builder of its own supplies calls [`validate_settings_for_runtime_with`]
+/// with that builder, because this function cannot see it and refuses the
+/// name as one no builder registers.
 ///
 /// # Errors
 ///
@@ -268,89 +386,55 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    validate_settings_for_runtime_with(settings, &[])
+}
+
+/// Runs runtime validation with the built-in integrations followed by the
+/// builders a deployment supplies.
+///
+/// This runs while the settings load, before any application state is built,
+/// so a deployment that composes builders supplies them here as well as to
+/// the state build. Each builder also validates its own table.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when resolved secrets or runtime-only
+/// configuration checks are invalid, or when a builder rejects its own
+/// configuration.
+pub fn validate_settings_for_runtime_with(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    validate_js_asset_proxy_config(settings)?;
     settings.validate_admin_handler_passwords()?;
-    let plan = crate::auction::compile_auction_plan(settings)?;
-    validate_enabled_integrations(settings, &plan, true)?;
+    let plan = crate::auction::compile_auction_plan_with(settings, extra_integrations)?;
+    validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
 
-fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    let Some(raw_config) = settings.integrations.get(JS_ASSET_PROXY_INTEGRATION_ID) else {
-        return Ok(());
-    };
-
-    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: configuration could not be parsed: {error}"
-            ),
-        })
-    })?;
-    config.validate().map_err(|error| {
-        Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: {error}"
-            ),
-        })
-    })
-}
-
-fn validate_enabled_integrations(
+/// Validates every integration block, the built-in ones first and then
+/// `extra_integrations`.
+///
+/// Each builder validates its own block, and one with a rule that depends on
+/// what the auction plan selects then checks its block against the plan.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when any integration block fails its
+/// validation.
+fn validate_integration_blocks(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
-    resolved_secrets: bool,
+    extra_integrations: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
-    validate_prebid(settings, plan)?;
-    validate_integration::<ApsConfig>(settings, "aps")?;
-    validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
-    validate_integration::<TestlightConfig>(settings, "testlight")?;
-    validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
-    validate_integration::<PermutiveConfig>(settings, "permutive")?;
-    validate_integration::<LockrConfig>(settings, "lockr")?;
-    validate_integration::<DidomiIntegrationConfig>(settings, "didomi")?;
-    validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
-    validate_integration::<OsanoConfig>(settings, "osano")?;
-    validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
-    if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
-        if resolved_secrets {
-            crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(
-                config,
-            )?;
-        } else {
-            crate::integrations::datadome::DataDomeIntegration::validate_config_for_deploy(config)?;
+    for builder in crate::integrations::all_builders(extra_integrations) {
+        builder.validate(settings)?;
+        if let Some(validate) = builder.plan_validator() {
+            validate(settings, plan)?;
         }
     }
-    validate_integration::<GptConfig>(settings, "gpt")?;
-    validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
-
     Ok(())
-}
-
-fn validate_prebid(
-    settings: &Settings,
-    plan: &crate::auction::AuctionPlan,
-) -> Result<(), Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<prebid::PrebidIntegrationConfig>("prebid")?
-    else {
-        return Ok(());
-    };
-    prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
-    prebid::validate_browser_bidder_ownership(&config, plan)
-}
-
-fn validate_integration<T>(
-    settings: &Settings,
-    integration_id: &str,
-) -> Result<bool, Report<TrustedServerError>>
-where
-    T: IntegrationConfig,
-{
-    settings
-        .integration_config::<T>(integration_id)
-        .map(|config| config.is_some())
 }
 
 fn validate_non_secret_deploy_placeholders(
@@ -385,12 +469,26 @@ fn validate_non_secret_deploy_placeholders(
     }))
 }
 
-fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+fn validate_secret_key_references(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_reference(
         "publisher.proxy_secret",
         settings.publisher.proxy_secret.expose(),
     )?;
-    validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
+    if let Some(passphrase) = &settings.ec.passphrase {
+        validate_secret_key_reference("ec.passphrase", passphrase.expose())?;
+    }
+    for (name, hmac) in settings.ec.module_blocks.hmac_blocks() {
+        validate_secret_key_reference(&format!("ec.{name}.passphrase"), hmac.passphrase.expose())?;
+    }
+    for (name, host_signals) in settings.ec.module_blocks.host_signals_blocks() {
+        validate_secret_key_reference(
+            &format!("ec.{name}.passphrase"),
+            host_signals.passphrase.expose(),
+        )?;
+    }
 
     for (index, partner) in settings.ec.partners.iter().enumerate() {
         if let Some(token) = &partner.api_token {
@@ -430,35 +528,24 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
     }
 
-    if let Some(datadome) = settings.integration_config::<DataDomeConfig>("datadome")? {
-        if datadome.enable_protection {
-            let key = datadome
-                .server_side_key_secret_name
-                .as_ref()
-                .ok_or_else(|| {
-                    missing_secret_key_reference(
-                        "integrations.datadome.server_side_key_secret_name",
-                    )
-                })?;
-            validate_secret_key_reference(
-                "integrations.datadome.server_side_key_secret_name",
-                key.expose(),
-            )?;
-        }
-        if let Some(bypass) = datadome
-            .protection_test_bypass
-            .as_ref()
-            .filter(|bypass| bypass.enabled)
-        {
-            let credential = bypass.credential_secret_name.as_ref().ok_or_else(|| {
-                missing_secret_key_reference(
-                    "integrations.datadome.protection_test_bypass.credential_secret_name",
-                )
-            })?;
-            validate_secret_key_reference(
-                "integrations.datadome.protection_test_bypass.credential_secret_name",
-                credential.expose(),
-            )?;
+    // Each setting a selected module declares as naming a secret, where the
+    // module's table puts it to use.
+    for builder in crate::integrations::all_builders(extra_integrations) {
+        let secrets = builder.secret_settings();
+        let Some((section, written)) = builder
+            .module_name()
+            .filter(|_| !secrets.is_empty())
+            .and_then(|name| settings.module_selection(name))
+        else {
+            continue;
+        };
+        let table = settings.section_table(section, written);
+        for secret in secrets.iter().filter(|secret| (secret.in_use)(&table)) {
+            let path = format!("{section}.{written}.{}", secret.path.join("."));
+            let reference = crate::module_secrets::value_at(&table, secret.path)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| missing_secret_key_reference(&path))?;
+            validate_secret_key_reference(&path, reference)?;
         }
     }
 
@@ -512,15 +599,36 @@ fn report_to_validation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
+    use crate::integrations::IntegrationRegistration;
+    use crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID;
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::template::{template_with_resolved_required_secrets, uncomment_block};
+    use crate::test_support::tests::{
+        crate_test_settings_str, crate_test_settings_str_with_ec_section, select_hmac_module,
+    };
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
+
+    /// Message an external builder rejects with, so the test can prove the
+    /// rejection reached the caller intact.
+    const EXTERNAL_REJECTION_MESSAGE: &str = "seam probe refuses to deploy";
+
+    /// Stands in for a vendor integration builder that never registers.
+    fn build_nothing(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    fn reject_deploy(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Configuration {
+            message: EXTERNAL_REJECTION_MESSAGE.to_string(),
+        }))
+    }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -588,20 +696,21 @@ formats = [{ width = 300, height = 250 }]
         source["auction"]["allowed_context_keys"] = serde_json::json!([
             "zeta", "alpha", "gamma", "beta", "epsilon", "delta", "alpha"
         ]);
-        source["auction"]["providers"] = serde_json::json!({
+        source["demand"] = serde_json::json!({
+            "modules": ["secondary", "primary"],
             "secondary": {
-                "protocol": "openrtb-2.6", "endpoint": "https://secondary.example.com/auction",
-                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
-                "profile_config": {"second": 2, "first": 1}
+                "implementation": "auction.plain-fixture", "endpoint": "https://secondary.example.com/auction",
+                "routing": "all_eligible",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]}
             },
             "primary": {
-                "protocol": "openrtb-2.6", "endpoint": "https://primary.example.com/auction",
-                "notifications": {"suppress_seats": ["seat-b", "seat-a"]},
-                "profile_config": {"second": 2, "first": 1}
+                "implementation": "auction.plain-fixture", "endpoint": "https://primary.example.com/auction",
+                "routing": "all_eligible",
+                "notifications": {"suppress_seats": ["seat-b", "seat-a"]}
             }
         });
         source["auction"]["bidders"] = serde_json::json!({
-            "bidder-b": {"provider": "secondary"}, "bidder-a": {"provider": "primary"}
+            "bidder-b": {"module": "secondary"}, "bidder-a": {"module": "primary"}
         });
         source["creative_opportunities"] = serde_json::json!({
             "gam_network_id": "99999",
@@ -641,121 +750,6 @@ formats = [{ width = 300, height = 250 }]
         }
     }
 
-    fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
-        settings.auction.providers.insert(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example.com/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: RoutingMode::AllEligible,
-                notifications: NotificationConfig::default(),
-                profile_config: serde_json::json!({ "account_id": account_id }),
-            },
-        );
-    }
-
-    /// Source-controlled operator-facing config template.
-    const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../trusted-server.example.toml"
-    ));
-
-    /// Returns the template with required secret-store key references replaced
-    /// by resolved test values, so direct [`Settings`] parsing can exercise the
-    /// optional blocks this module uncomments.
-    fn template_with_resolved_required_secrets() -> String {
-        EXAMPLE_TEMPLATE
-            .replace(
-                "password = \"handler_password\"",
-                "password = \"unit-test-resolved-handler-password-0001\"",
-            )
-            .replace(
-                "proxy_secret = \"publisher_proxy_secret\"",
-                "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
-            )
-            .replace(
-                "passphrase = \"ec_passphrase\"",
-                "passphrase = \"unit-test-resolved-ec-passphrase-secret-0001\"",
-            )
-    }
-
-    /// Uncomments the contiguous `#`-prefixed block that begins at the line
-    /// `# {header}`, leaving the rest of the template untouched. Stops at the
-    /// first line that is not a comment (a blank line ends the block).
-    fn uncomment_block(template: &str, header: &str) -> String {
-        let header_line = format!("# {header}");
-        let mut out = Vec::new();
-        let mut uncommenting = false;
-
-        for line in template.lines() {
-            if line == header_line {
-                uncommenting = true;
-            } else if uncommenting && !line.trim_start().starts_with('#') {
-                uncommenting = false;
-            }
-
-            if uncommenting {
-                let bare = line
-                    .strip_prefix("# ")
-                    .or_else(|| line.strip_prefix('#'))
-                    .unwrap_or(line);
-                out.push(bare.to_owned());
-            } else {
-                out.push(line.to_owned());
-            }
-        }
-
-        out.join("\n")
-    }
-
-    /// Every documented block should be push-ready: uncommenting it and setting
-    /// the shown values must parse and pass field validation. Blocks that ship
-    /// a deliberately-invalid non-secret placeholder (GTM `container_id` and
-    /// `request_signing` store ids) are excluded.
-    #[test]
-    fn documented_integration_blocks_validate_when_uncommented() {
-        let base = template_with_resolved_required_secrets();
-
-        for (header, id) in [
-            ("[integrations.permutive]", "permutive"),
-            ("[integrations.lockr]", "lockr"),
-            ("[integrations.sourcepoint]", "sourcepoint"),
-        ] {
-            let toml = uncomment_block(&base, header);
-            let settings = Settings::from_toml(&toml)
-                .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
-
-            match id {
-                "permutive" => assert!(
-                    settings
-                        .integration_config::<PermutiveConfig>(id)
-                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                        .is_some(),
-                    "{header} should resolve to an enabled, valid config"
-                ),
-                "lockr" => assert!(
-                    settings
-                        .integration_config::<LockrConfig>(id)
-                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                        .is_some(),
-                    "{header} should resolve to an enabled, valid config"
-                ),
-                "sourcepoint" => assert!(
-                    settings
-                        .integration_config::<SourcepointConfig>(id)
-                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
-                        .is_some(),
-                    "{header} should resolve to an enabled, valid config"
-                ),
-                other => panic!("unhandled integration id {other}"),
-            }
-        }
-    }
-
-    /// The `[tinybird]` block is top-level and validated at parse time, so
-    /// uncommenting it with the documented `api_host` must parse cleanly.
     #[test]
     fn documented_tinybird_block_validates_when_uncommented() {
         let toml = uncomment_block(&template_with_resolved_required_secrets(), "[tinybird]");
@@ -800,7 +794,7 @@ formats = [{ width = 300, height = 250 }]
     fn push_validation_accepts_secret_key_names() {
         let mut settings = valid_settings();
         settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
-        settings.ec.passphrase = Redacted::new("ec_key".to_owned());
+        select_hmac_module(&mut settings.ec, HMAC_MODULE_KEY, "ec_key");
         settings.handlers[0].password = Redacted::new("handler_password".to_owned());
         settings.handlers[1].password = Redacted::new("admin_password".to_owned());
         let app_config = TrustedServerAppConfig::new(settings)
@@ -810,6 +804,142 @@ formats = [{ width = 300, height = 250 }]
             serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
         assert!(serialized.contains("publisher_proxy"));
         assert!(!serialized.contains("unit-test-proxy-secret"));
+    }
+
+    /// The crate test configuration selecting the built-in HMAC module
+    /// under the label `primary`, with `passphrase` as the block's passphrase.
+    fn labeled_hmac_settings_str(passphrase: &str) -> String {
+        crate_test_settings_str_with_ec_section(&format!(
+            "[ec]\nmodule = \"primary\"\n\n[ec.primary]\nimplementation = \"hmac\"\npassphrase = \"{passphrase}\"\n"
+        ))
+    }
+
+    #[test]
+    fn push_validation_accepts_a_key_name_in_a_labeled_hmac_block() {
+        // At push time a secret field holds the name of a secret-store key, so
+        // a value check such as the 32-byte passphrase minimum would be judging
+        // the key name. `ec_key` is far shorter than any passphrase.
+        let toml = labeled_hmac_settings_str("ec_key");
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize a labeled module block");
+        let mut settings = app_config.into_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the key name without judging it as a passphrase");
+
+        // The value check still exists. It runs where settings are loaded with
+        // their secrets resolved, which here reads `ec_key` as the passphrase.
+        let err = Settings::from_toml(&toml)
+            .expect_err("a short passphrase in a labeled block should be rejected on load");
+        assert!(
+            format!("{err:?}").contains("ec.primary.passphrase: short_passphrase"),
+            "should report the short passphrase at the labeled block's path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn configured_secret_fields_names_only_labeled_hmac_blocks() {
+        use crate::secret_resolution::ConfiguredSecretFields as _;
+
+        let data = serde_json::json!({
+            "ec": {
+                "module": "primary",
+                "ec_store": "ec_identity_store",
+                "hmac": { "passphrase": "ec_key" },
+                "primary": { "implementation": "hmac", "passphrase": "labeled_ec_key" },
+                "acme": { "implementation": "acme", "endpoint": "https://ec.acme.example.com" },
+            }
+        });
+
+        let paths = TrustedServerAppConfig::configured_secret_fields(&data)
+            .iter()
+            .map(SecretField::dotted_path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec!["ec.primary.passphrase".to_owned()],
+            "only a block naming the hmac implementation under a label needs a path the \
+             fixed list cannot hold"
+        );
+    }
+
+    #[test]
+    fn push_validation_keeps_the_sections_other_errors_for_a_labeled_block() {
+        // A block under a label has no fixed secret path, so push validation
+        // strips the error that judged its key name as a passphrase, and only
+        // that one: another error in the Edge Cookie section is still reported.
+        let toml = labeled_hmac_settings_str("ec_key");
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize a labeled module block");
+        let mut settings = app_config.into_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings.ec.partners = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "Example partner",
+                "source_domain": "https://partner.example",
+            }))
+            .expect("should deserialize a partner"),
+        ];
+
+        // Read from the section's own errors, because deploy validation
+        // reports a bad partner as well.
+        let errors = TrustedServerAppConfig { settings }
+            .validate()
+            .expect_err("an error beside the passphrase should still be reported");
+        let Some(ValidationErrorsKind::Struct(ec)) = errors.errors().get("ec") else {
+            panic!("the Edge Cookie section should keep its error: {errors}");
+        };
+        assert!(
+            ec.errors().contains_key("partners"),
+            "the partner error should be reported: {errors}"
+        );
+        assert!(
+            !ec.errors().contains_key("primary"),
+            "the key name should not be judged as a passphrase: {errors}"
+        );
+    }
+
+    #[test]
+    fn push_validation_rejects_an_empty_key_name_in_a_labeled_hmac_block() {
+        let toml = labeled_hmac_settings_str("");
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize a labeled module block");
+        let mut settings = app_config.into_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject an empty secret key reference in a labeled block");
+        assert!(
+            err.to_string().contains("ec.primary.passphrase"),
+            "error should identify the labeled block's empty reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn push_validation_accepts_a_host_signals_passphrase_key_name() {
+        // The block is named `host_signals` in the configuration and in the
+        // registered secret path, so push validation has to skip the passphrase
+        // check under that name.
+        let mut settings = valid_settings();
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
+            HOST_SIGNALS_MODULE_KEY,
+        ));
+        settings.ec.module_blocks.clear();
+        settings.ec.module_blocks.insert(
+            HOST_SIGNALS_MODULE_KEY.to_owned(),
+            crate::settings::EcModuleBlock::from(crate::settings::HostSignalsModuleConfig {
+                passphrase: Redacted::new("host_signals_key".to_owned()),
+            }),
+        );
+
+        let app_config = TrustedServerAppConfig::new(settings)
+            .expect("should validate the host_signals passphrase as a key name");
+
+        let serialized =
+            serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
+        assert!(serialized.contains("host_signals_key"));
     }
 
     #[test]
@@ -824,21 +954,14 @@ formats = [{ width = 300, height = 250 }]
             paths,
             vec![
                 ("publisher.proxy_secret".to_owned(), false),
-                ("ec.passphrase".to_owned(), false),
+                ("ec.passphrase".to_owned(), true),
+                ("ec.hmac.passphrase".to_owned(), true),
+                ("ec.host_signals.passphrase".to_owned(), true),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
-                (
-                    "integrations.datadome.server_side_key_secret_name".to_owned(),
-                    true,
-                ),
-                (
-                    "integrations.datadome.protection_test_bypass.credential_secret_name"
-                        .to_owned(),
-                    true,
-                ),
                 ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
                 (
                     "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
@@ -891,20 +1014,6 @@ formats = [{ width = 300, height = 250 }]
     fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
         let mut settings = valid_settings();
         settings.tinybird.secret_store = Some("legacy-tinybird-store".to_string());
-        settings
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enabled": true,
-                    "server_side_key_secret_store": "legacy-datadome-store",
-                    "protection_test_bypass": {
-                        "enabled": false,
-                        "credential_secret_store": "legacy-bypass-store",
-                    },
-                }),
-            )
-            .expect("should insert legacy DataDome selectors");
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -922,12 +1031,7 @@ formats = [{ width = 300, height = 250 }]
         settings.normalize_deserialized();
         let serialized = serde_json::to_string(&settings).expect("should serialize settings");
 
-        for legacy_store in [
-            "legacy-tinybird-store",
-            "legacy-datadome-store",
-            "legacy-bypass-store",
-            "legacy-s3-store",
-        ] {
+        for legacy_store in ["legacy-tinybird-store", "legacy-s3-store"] {
             assert!(
                 !serialized.contains(legacy_store),
                 "serialized config should omit deprecated selector {legacy_store}"
@@ -941,21 +1045,20 @@ formats = [{ width = 300, height = 250 }]
         settings.tinybird.auction_token_secret =
             Some(Redacted::new("resolved-tinybird-secret".to_string()));
         settings
-            .integrations
-            .insert_config(
-                "datadome",
+            .insert_module_config(
+                "testing",
+                "testing.example",
                 &serde_json::json!({
-                    "enabled": true,
-                    "server_side_key_secret_name": "resolved-datadome-secret",
+                    "key_name": "resolved-module-secret",
                 }),
             )
-            .expect("should insert resolved DataDome config");
+            .expect("should insert a module's table holding a resolved secret");
 
         let debug = format!("{settings:?}");
 
         assert!(!debug.contains("resolved-tinybird-secret"));
-        assert!(!debug.contains("resolved-datadome-secret"));
-        assert!(debug.contains("datadome"));
+        assert!(!debug.contains("resolved-module-secret"));
+        assert!(debug.contains("example"));
     }
 
     #[test]
@@ -979,8 +1082,9 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn wrapper_rejects_legacy_auction_provider_list_with_migration_guidance() {
         let toml = format!(
-            "{}\n[auction]\nproviders = [\"prebid\"]\n",
+            "{}\n",
             crate_test_settings_str()
+                .replace("[auction]\n", "[auction]\nproviders = [\"example\"]\n")
         );
 
         let error = toml::from_str::<TrustedServerAppConfig>(&toml)
@@ -991,8 +1095,8 @@ formats = [{ width = 300, height = 250 }]
             "should identify the removed field: {rendered}"
         );
         assert!(
-            rendered.contains("CHANGELOG.md"),
-            "should direct operators to migration guidance: {rendered}"
+            rendered.contains("[demand] modules"),
+            "should name where the setting moved to: {rendered}"
         );
     }
 
@@ -1081,6 +1185,20 @@ gam_network_id = "99999"
     }
 
     #[test]
+    fn app_config_new_rejects_a_resolve_allowed_origin_that_is_not_bare() {
+        let mut settings = valid_settings();
+        settings.ec.resolve_allowed_origins = vec!["https://www.example.com/".to_owned()];
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should refuse at push an entry the settings refuse at load");
+
+        assert!(
+            err.to_string().contains("`https://www.example.com/`"),
+            "error should name the entry: {err:?}"
+        );
+    }
+
+    #[test]
     fn app_config_new_rejects_invalid_non_secret_settings() {
         let mut settings = valid_settings();
         settings.publisher.domain = "invalid/domain".to_owned();
@@ -1104,7 +1222,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
 [[handlers]]
@@ -1208,31 +1332,6 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
-    fn deploy_validation_rejects_blank_aps_account_id() {
-        for (label, account_id) in [("empty", ""), ("whitespace-only", "   ")] {
-            let mut settings = valid_settings();
-            insert_aps_provider(&mut settings, account_id);
-
-            let err = validate_settings_for_deploy(&settings)
-                .expect_err("should reject blank APS account_id");
-
-            assert!(
-                format!("{err:?}").contains("account_id"),
-                "should mention the APS profile account_id for {label}: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn deploy_validation_normalizes_padded_aps_account_id() {
-        let mut settings = valid_settings();
-        insert_aps_provider(&mut settings, "  example-account  ");
-
-        validate_settings_for_deploy(&settings)
-            .expect("should accept a padded APS profile account_id after trimming it");
-    }
-
-    #[test]
     fn deploy_validation_rejects_padded_request_signing_store_ids() {
         let mut settings = valid_settings();
         settings.request_signing = Some(crate::settings::RequestSigning {
@@ -1252,258 +1351,405 @@ password = "production-admin-password-32-bytes"
         );
     }
 
-    /// Integrations that default to disabled do not validate inactive fields.
+    /// A table written for a module its section does not select is refused
+    /// when the settings load, so `ts config validate` reports it before the
+    /// configuration reaches a deployment.
     #[test]
-    fn deploy_validation_skips_field_validation_for_integrations_with_omitted_enabled() {
-        let mut settings = valid_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &serde_json::json!({ "endpoint": "not-a-valid-url" }),
-            )
-            .expect("should insert adserver_mock config");
+    fn a_table_for_a_module_its_section_does_not_select_is_refused() {
+        let mut value = serde_json::to_value(valid_settings()).expect("should serialize settings");
+        value
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "cmp".to_owned(),
+                serde_json::json!({ "modules": ["osano"], "didomi": { "api_key": "k" } }),
+            );
 
-        validate_settings_for_deploy(&settings).expect(
-            "should skip field validation for integrations that resolve to disabled via default",
-        );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_retired_aps_fields_when_explicitly_disabled() {
-        let mut settings = valid_settings();
-        settings
-            .integrations
-            .insert_config(
-                "aps",
-                &serde_json::json!({
-                    "enabled": false,
-                    "endpoint": "https://aps.example.com/e/pb/bid"
-                }),
-            )
-            .expect("should insert disabled APS config with a retired field");
-
-        let error = validate_settings_for_deploy(&settings)
-            .expect_err("should reject retired APS server fields when explicitly disabled");
+        let error =
+            Settings::from_json_value(value).expect_err("should reject a table nothing selects");
         let rendered = format!("{error:?}");
+
         assert!(
-            rendered.contains("Integration 'aps' configuration could not be parsed"),
-            "should identify the APS configuration: {rendered}"
-        );
-        assert!(
-            rendered.contains("endpoint"),
-            "should identify the retired APS field: {rendered}"
+            rendered.contains("[cmp.didomi] is configured") && rendered.contains("does not select"),
+            "should name the table and the selection it is missing from: {rendered}"
         );
     }
 
+    /// An id no builder in this deployment supplies is refused where the
+    /// registry is built, not here, because a vendor crate the CLI never links
+    /// may supply it.
     #[test]
-    fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
+    fn deploy_validation_accepts_an_id_it_does_not_know() {
         let mut settings = valid_settings();
-        settings.proxy.allowed_domains.clear();
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject external Prebid bundle without proxy allowlist");
-
-        assert!(
-            err.to_string().contains("proxy.allowed_domains"),
-            "error should mention proxy.allowed_domains: {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_invalid_enabled_js_asset_proxy_config() {
-        let mut settings = valid_settings();
-        settings.integrations.insert(
-            "js_asset_proxy".to_string(),
-            serde_json::json!({ "enabled": true }),
-        );
-
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject invalid JS asset proxy config");
-        let message = err.to_string();
-        assert!(
-            message.contains("js_asset_proxy"),
-            "error should mention JS asset proxy validation"
-        );
-        assert!(
-            message.contains("empty_assets") || message.contains("assets"),
-            "error should mention the missing assets"
-        );
-    }
-
-    #[test]
-    fn deploy_validation_requires_external_bundle_url_for_enabled_prebid() {
-        let mut settings = valid_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &serde_json::json!({
-                    "enabled": true,
-                    "bundle": {
-                        "modules": { "bidder": ["exampleBidderBidAdapter"] }
-                    }
-                }),
-            )
-            .expect("should insert enabled Prebid config");
-
-        let error = validate_settings_for_deploy(&settings)
-            .expect_err("should require enabled Prebid external bundle URL");
-        assert!(error.to_string().contains("external_bundle_url"));
-    }
-
-    #[test]
-    fn deploy_validation_rejects_conflicting_prebid_browser_bidder_ownership() {
-        let mut settings = valid_settings();
-        settings.auction.enabled = true;
-        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
-        settings.auction.bidders.insert(
-            "exampleBidder"
-                .parse()
-                .expect("should parse server-side bidder"),
-            crate::auction::BidderRouteConfig {
-                provider: "pbs".parse().expect("should parse provider"),
-            },
-        );
-        let mut prebid = settings
-            .integration_config::<prebid::PrebidIntegrationConfig>("prebid")
-            .expect("should parse Prebid config")
-            .expect("should have enabled Prebid config");
-        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
-        settings
-            .integrations
-            .insert_config("prebid", &prebid)
-            .expect("should replace Prebid config");
-
-        let error = validate_settings_for_deploy(&settings)
-            .expect_err("should reject conflicting browser bidder ownership");
-        assert!(error.to_string().contains("exampleBidder"));
-        assert!(
-            error
-                .to_string()
-                .contains("both client-side and server-side")
-        );
-    }
-
-    #[test]
-    fn deploy_validation_accepts_dormant_prebid_browser_bidder_overlap() {
-        let mut settings = valid_settings();
-        settings.auction.enabled = false;
-        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
-        settings.auction.bidders.insert(
-            "exampleBidder"
-                .parse()
-                .expect("should parse server-side bidder"),
-            crate::auction::BidderRouteConfig {
-                provider: "pbs".parse().expect("should parse provider"),
-            },
-        );
-        let mut prebid = settings
-            .integration_config::<prebid::PrebidIntegrationConfig>("prebid")
-            .expect("should parse Prebid config")
-            .expect("should have enabled Prebid config");
-        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
-        settings
-            .integrations
-            .insert_config("prebid", &prebid)
-            .expect("should replace Prebid config");
+        settings.select_module("testing", "testing.a_vendors_own_integration");
 
         validate_settings_for_deploy(&settings)
-            .expect("disabled plan overlap should remain deployable");
+            .expect("deploy validation should leave unknown ids to the registry");
     }
 
-    #[test]
-    fn deploy_validation_accepts_typed_prebid_bundle_build_table() {
-        let settings = valid_settings();
+    /// Counts calls to [`record_validate_call`]. A builder holds plain fn
+    /// pointers and cannot capture, so the recording has to go through a
+    /// static.
+    static RECORDED_VALIDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-        validate_settings_for_deploy(&settings)
-            .expect("test config with typed Prebid bundle build table should validate");
+    fn record_validate_call(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        RECORDED_VALIDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
     }
 
-    #[test]
-    fn deploy_validation_covers_registered_integration_builders() {
-        let validated_ids: HashSet<&'static str> =
-            DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
-        let missing_ids = crate::integrations::registered_builder_ids()
-            .filter(|id| !validated_ids.contains(id))
-            .collect::<Vec<_>>();
+    /// The ad server implementation a crate outside core supplies.
+    static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
+        crate::auction::demand::AdServerImplementation {
+            id: "ad-server.example",
+            build: build_external_adserver,
+        };
 
-        assert!(
-            missing_ids.is_empty(),
-            "deploy validation should cover all registered integration builders: {missing_ids:?}"
-        );
+    fn build_external_adserver(
+        name: &str,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<
+        std::sync::Arc<dyn crate::auction::provider::AuctionProvider>,
+        Report<TrustedServerError>,
+    > {
+        Ok(std::sync::Arc::new(
+            crate::auction::test_support::adserver_fixture::FixtureAdServer::new(name, 500),
+        ))
     }
 
-    #[test]
-    fn deploy_validation_rejects_invalid_osano_config() {
+    /// The builder of the crate that supplies [`EXTERNAL_ADSERVER`].
+    fn external_adserver_builders() -> [IntegrationBuilder; 1] {
+        [
+            IntegrationBuilder::implementations("example-adserver", "example-crate")
+                .with_adserver(&EXTERNAL_ADSERVER),
+        ]
+    }
+
+    /// Settings whose `[ad-server] module` names the external ad server.
+    fn settings_naming_the_external_adserver() -> Settings {
         let mut settings = valid_settings();
+        settings.adserver = crate::provider_table::ProviderChoice::new(
+            Some("example".to_string()),
+            std::collections::BTreeMap::from([("example".to_string(), serde_json::Map::new())]),
+        );
         settings
-            .integrations
-            .insert_config(
-                "osano",
-                &serde_json::json!({ "enabled": true, "typo": true }),
-            )
-            .expect("should insert Osano config");
+    }
 
-        let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject invalid Osano config during deploy validation");
-        let error_text = format!("{err:?}");
+    /// Deploy validation compiles the plan with the builders it validates the
+    /// blocks against, so it and the running service agree on which ad server
+    /// names are valid. Both halves are asserted, so the test fails if the
+    /// built-in path stops refusing the name or the external path stops
+    /// accepting it.
+    #[test]
+    fn deploy_validation_accepts_an_external_ad_server_only_when_given_its_builder() {
+        let settings = settings_naming_the_external_adserver();
 
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("built-ins alone should not know this ad server");
         assert!(
-            error_text.contains("osano") || error_text.contains("typo"),
-            "error should mention Osano or the invalid field: {err:?}"
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        validate_settings_for_deploy_with(&settings, &external_adserver_builders())
+            .expect("the external builder's ad server should pass deploy validation");
+    }
+
+    /// Runtime validation runs while the settings load, before any application
+    /// state exists, so a deployment that composes a builder supplies it here
+    /// too. Both halves are asserted, so the test fails if the built-in path
+    /// stops refusing the name or the external path stops accepting it.
+    #[test]
+    fn runtime_validation_accepts_an_external_ad_server_only_when_given_its_builder() {
+        let settings = settings_naming_the_external_adserver();
+
+        let error = validate_settings_for_runtime(&settings)
+            .expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        validate_settings_for_runtime_with(&settings, &external_adserver_builders())
+            .expect("the external builder's ad server should pass runtime validation");
+    }
+
+    /// Every builder handed to deploy validation has its `validate` run, and
+    /// reporting disabled does not excuse a builder from validating.
+    #[test]
+    fn deploy_validation_runs_every_builder_it_is_given() {
+        RECORDED_VALIDATE_CALLS.store(0, Ordering::SeqCst);
+        let extra_integrations = [IntegrationBuilder::new(
+            "seam-probe-integration",
+            "seam-probe-crate",
+            build_nothing,
+            record_validate_call,
+        )
+        .with_module_name("testing.seam-probe-integration")];
+        validate_settings_for_deploy_with(&valid_settings(), &extra_integrations)
+            .expect("should accept settings whose external builder reports disabled");
+
+        assert_eq!(
+            RECORDED_VALIDATE_CALLS.load(Ordering::SeqCst),
+            1,
+            "the external builder should validate even though it reports disabled"
         );
     }
 
+    /// Deploy validation reaches each built-in builder's own config type, one
+    /// id at a time, by planting a block no config type can deserialize. A
+    /// string where the block belongs fails for all of them, whatever settings
+    /// each one takes.
+    ///
+    /// This catches deploy validation ceasing to validate the built-ins. It
+    /// cannot catch a builder deleted from `BUILT_IN_BUILDERS`, because the
+    /// loop below reads the same constant the validation walks, and no independent
+    /// list of the built-ins exists in the crate.
     #[test]
-    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
-        for (enable_protection, name, expected_message) in [
-            (false, "datadome_test_bypass", "requires enable_protection"),
-            (true, "", "credential_secret_name"),
-        ] {
+    fn deploy_validation_reaches_every_built_in_builder() {
+        for builder in crate::integrations::builders()
+            .iter()
+            .filter(|builder| builder.supplies_integration())
+        {
+            let name = builder
+                .module_name()
+                .expect("every built-in page integration names its module");
+            let section = builder
+                .section()
+                .expect("every built-in page integration has a section");
             let mut settings = valid_settings();
             settings
-                .integrations
-                .insert_config(
-                    "datadome",
-                    &serde_json::json!({
-                        "enabled": true,
-                        "enable_protection": enable_protection,
-                        "server_side_key_secret_name": "datadome_server_side_key",
-                        "protection_test_bypass": {
-                            "enabled": true,
-                            "credential_secret_name": name,
-                        },
-                    }),
+                .insert_module_config(
+                    section,
+                    name,
+                    &serde_json::json!({ "no_such_setting": true }),
                 )
-                .expect("should insert DataDome config");
+                .expect("should insert the planted table");
 
-            let err = validate_settings_for_deploy(&settings)
-                .expect_err("should reject invalid DataDome test bypass");
             assert!(
-                format!("{err:?}").contains(expected_message),
-                "error should mention the invalid bypass setting: {err:?}"
+                validate_settings_for_deploy(&settings).is_err(),
+                "deploy validation should reach the `{name}` builder and reject its planted config"
+            );
+        }
+    }
+
+    /// Every built-in page integration refuses a setting it does not know, so
+    /// a misspelt key in its block fails deploy validation naming the
+    /// integration and the key, rather than being ignored.
+    #[test]
+    fn every_integration_rejects_a_setting_it_does_not_know() {
+        for builder in crate::integrations::builders()
+            .iter()
+            .filter(|builder| builder.supplies_integration())
+        {
+            let name = builder
+                .module_name()
+                .expect("every built-in page integration names its module");
+            let section = builder
+                .section()
+                .expect("every built-in page integration has a section");
+            let mut settings = valid_settings();
+            settings
+                .insert_module_config(
+                    section,
+                    name,
+                    &serde_json::json!({ "no_such_setting": true }),
+                )
+                .expect("should insert the planted table");
+
+            let error = match validate_settings_for_deploy(&settings) {
+                Ok(()) => panic!("`{name}` should refuse a setting it does not know"),
+                Err(error) => format!("{error:?}"),
+            };
+            let written = crate::module_name::short_form(section, name);
+            assert!(
+                error.contains(&format!("[{section}.{written}]"))
+                    && error.contains("no_such_setting"),
+                "`{name}` should name its table and the unknown setting: {error}"
             );
         }
     }
 
     #[test]
-    fn validate_rejects_invalid_disabled_js_asset_proxy_assets() {
-        let mut settings = valid_settings();
-        settings.integrations.insert(
-            JS_ASSET_PROXY_INTEGRATION_ID.to_string(),
-            serde_json::json!({
-                "enabled": false,
-                "assets": [{
-                    "path": "bad path",
-                    "origin_url": "not-a-url",
-                    "proxy": "disabled"
-                }]
-            }),
+    fn deploy_validation_surfaces_an_external_integration_builders_rejection() {
+        let extra = [IntegrationBuilder::new(
+            "seam-probe",
+            "seam-probe-crate",
+            build_nothing,
+            reject_deploy,
+        )
+        .with_module_name("testing.seam-probe")];
+
+        let err = validate_settings_for_deploy_with(&valid_settings(), &extra)
+            .expect_err("should surface the external integration builder's rejection");
+
+        assert!(
+            err.to_string().contains(EXTERNAL_REJECTION_MESSAGE),
+            "should keep the external builder's message intact: {err:?}"
         );
+    }
+
+    /// A builder's own rules run when the settings load with that builder, so
+    /// a deployment that composes it is held to them at startup.
+    #[test]
+    fn runtime_validation_surfaces_an_external_integration_builders_rejection() {
+        let extra = [IntegrationBuilder::new(
+            "seam-probe",
+            "seam-probe-crate",
+            build_nothing,
+            reject_deploy,
+        )
+        .with_module_name("testing.seam-probe")];
+
+        validate_settings_for_runtime(&valid_settings())
+            .expect("the settings should pass without the external builder");
+
+        let err = validate_settings_for_runtime_with(&valid_settings(), &extra)
+            .expect_err("should surface the external integration builder's rejection");
+
+        assert!(
+            err.to_string().contains(EXTERNAL_REJECTION_MESSAGE),
+            "should keep the external builder's message intact: {err:?}"
+        );
+    }
+
+    fn module_key_is_in_use(table: &serde_json::Map<String, serde_json::Value>) -> bool {
+        table.get("lock").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    const MODULE_SECRETS: &[crate::integrations::ModuleSecretSetting] =
+        &[crate::integrations::ModuleSecretSetting {
+            path: &["spare", "key_name"],
+            in_use: module_key_is_in_use,
+        }];
+
+    /// A builder a deployment added, whose module names a secret in its own
+    /// table.
+    fn module_with_a_secret() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_module_name("testing.probe")
+        .with_secret_settings(MODULE_SECRETS)
+    }
+
+    #[test]
+    fn deploy_validation_refuses_a_module_s_secret_setting_in_use_that_names_no_key() {
+        for (table, expected) in [
+            (
+                serde_json::json!({ "lock": true }),
+                Some("testing.probe.spare.key_name"),
+            ),
+            (
+                serde_json::json!({ "lock": true, "spare": { "key_name": "  " } }),
+                Some("testing.probe.spare.key_name"),
+            ),
+            (
+                serde_json::json!({ "lock": true, "spare": { "key_name": "module_key" } }),
+                None,
+            ),
+            // A setting the table does not put to use is not checked.
+            (serde_json::json!({ "lock": false }), None),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .insert_module_config("testing", "testing.probe", &table)
+                .expect("should insert the module's table");
+
+            let result = validate_settings_for_deploy_with(&settings, &[module_with_a_secret()]);
+
+            match expected {
+                Some(path) => {
+                    let error = result.expect_err("should refuse a setting that names no key");
+                    assert!(
+                        format!("{error:?}").contains(path),
+                        "should name the setting for {table}: {error:?}"
+                    );
+                }
+                None => result.unwrap_or_else(|error| {
+                    panic!("should accept {table}: {error:?}");
+                }),
+            }
+        }
+    }
+
+    const PLAN_RULE_MESSAGE: &str = "probe module refuses an enabled auction";
+
+    fn refuse_an_enabled_auction(
+        _settings: &Settings,
+        plan: &crate::auction::AuctionPlan,
+    ) -> Result<(), Report<TrustedServerError>> {
+        if plan.enabled() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: PLAN_RULE_MESSAGE.to_owned(),
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deploy_validation_runs_a_builder_s_check_against_the_auction_plan() {
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_module_name("testing.probe")
+        .with_plan_validator(refuse_an_enabled_auction)];
+        let mut settings = valid_settings();
+
+        settings.auction.enabled = false;
+        validate_settings_for_deploy_with(&settings, &extra)
+            .expect("should accept a plan the module's rule allows");
+
+        settings.auction.enabled = true;
+        let error = validate_settings_for_deploy_with(&settings, &extra)
+            .expect_err("should refuse a plan the module's rule does not allow");
+        assert!(
+            error.to_string().contains(PLAN_RULE_MESSAGE),
+            "should keep the module's message intact: {error:?}"
+        );
+        validate_settings_for_deploy(&settings)
+            .expect("should apply no such rule without the module's builder");
+    }
+
+    #[test]
+    fn deploy_validation_checks_no_secret_setting_without_the_module_s_builder() {
+        let mut settings = valid_settings();
+        settings
+            .insert_module_config(
+                "testing",
+                "testing.probe",
+                &serde_json::json!({ "lock": true }),
+            )
+            .expect("should insert the module's table");
+
+        validate_settings_for_deploy(&settings)
+            .expect("should check nothing for a module that declared nothing to this validation");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_js_asset_proxy_assets() {
+        let mut settings = valid_settings();
+        settings
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
+                &serde_json::json!({
+                    "assets": [{
+                        "path": "bad path",
+                        "origin_url": "not-a-url",
+                        "proxy": "disabled"
+                    }]
+                }),
+            )
+            .expect("should insert the asset inventory");
 
         let err = validate_settings_for_deploy(&settings)
-            .expect_err("should reject invalid disabled asset inventory");
+            .expect_err("should reject an invalid asset inventory");
         let message = err.to_string();
         assert!(
             message.contains(JS_ASSET_PROXY_INTEGRATION_ID),
@@ -1519,15 +1765,16 @@ password = "production-admin-password-32-bytes"
     fn validate_trait_reports_deploy_errors() {
         let mut settings = valid_settings();
         settings.auction.enabled = true;
-        settings.auction.providers =
-            crate::auction::AuctionConfig::legacy_provider_map(&["missing-provider"]);
-        settings
-            .auction
-            .providers
-            .values_mut()
-            .next()
-            .expect("should have provider")
-            .protocol = "unsupported".to_string();
+        settings.demand = crate::provider_table::ProviderList::new(
+            vec!["missing_provider".to_string()],
+            std::collections::BTreeMap::from([(
+                "missing_provider".to_string(),
+                serde_json::Map::from_iter([(
+                    "implementation".to_string(),
+                    serde_json::json!("no_such_implementation"),
+                )]),
+            )]),
+        );
         let app_config = TrustedServerAppConfig { settings };
 
         let err = app_config
@@ -1535,8 +1782,8 @@ password = "production-admin-password-32-bytes"
             .expect_err("should reject invalid auction provider");
 
         assert!(
-            err.to_string().contains("missing-provider"),
-            "validation error should mention invalid provider"
+            err.to_string().contains("no_such_implementation"),
+            "validation error should name the implementation this build does not have"
         );
     }
 }

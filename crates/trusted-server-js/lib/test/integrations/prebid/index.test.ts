@@ -7632,7 +7632,7 @@ describe('prebid/client-side bidders', () => {
     // not the internal build script.
     const pointsAtBundleConfig = errorCalls.some((args) =>
       args.some(
-        (a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle.modules].bidder')
+        (a) => typeof a === 'string' && a.includes('[auction.prebid.bundle.modules].bidder')
       )
     );
     expect(pointsAtBundleConfig).toBe(true);

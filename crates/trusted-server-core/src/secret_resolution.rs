@@ -1,8 +1,10 @@
 //! Runtime resolution of `EdgeZero` app-config secret references.
 //!
 //! Config blobs carry secret-store key names at rest. This module walks the
-//! public `EdgeZero` metadata contract and replaces those names only in the
-//! in-memory value used to build runtime [`crate::settings::Settings`].
+//! public `EdgeZero` metadata contract, together with the leaves
+//! [`ConfiguredSecretFields`] reads out of the configuration itself, and
+//! replaces those names only in the in-memory value used to build runtime
+//! [`crate::settings::Settings`].
 
 use edgezero_core::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
@@ -11,7 +13,26 @@ use serde_json::Value;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformSecretStore, StoreName};
 
+/// Secret leaves whose paths come from the configuration rather than the type.
+///
+/// [`AppConfigMeta::secret_fields`] is an associated function of the type, so
+/// every path it can return is fixed, and `EdgeZero`'s path segments have no
+/// way to say "whatever name the operator chose". A configuration can hold
+/// secrets under such a name, as an Edge Cookie module block under a label
+/// does, and an implementation of this trait finds those by reading the
+/// configuration being loaded.
+pub trait ConfiguredSecretFields: AppConfigMeta {
+    /// The secret leaves `data` holds under names the operator chose, each
+    /// with its full path from the configuration root.
+    fn configured_secret_fields(data: &Value) -> Vec<SecretField>;
+}
+
 /// Resolve all secret references in a serialized Trusted Server app config.
+///
+/// Both the fixed leaves [`AppConfigMeta::secret_fields`] lists and the ones
+/// [`ConfiguredSecretFields::configured_secret_fields`] reads out of `data`
+/// are resolved in one pass, so a failure in either leaves the configuration
+/// as it was.
 ///
 /// The input is mutated in memory; the verified envelope is never rewritten.
 /// Secret values are not included in structural or platform errors.
@@ -21,13 +42,40 @@ use crate::platform::{PlatformSecretStore, StoreName};
 /// Returns [`TrustedServerError::Configuration`] when a required path or key
 /// is malformed, a secret is unavailable, is not valid UTF-8, or resolves to an
 /// empty value.
-pub fn resolve_secret_references<C: AppConfigMeta>(
+pub fn resolve_secret_references<C: ConfiguredSecretFields>(
     data: &mut Value,
     secret_store: &dyn PlatformSecretStore,
     default_store_name: &StoreName,
 ) -> Result<(), Report<TrustedServerError>> {
+    resolve_secret_references_with::<C>(data, secret_store, default_store_name, Vec::new())
+}
+
+/// Resolve all secret references in a serialized Trusted Server app config,
+/// together with `extra`, the leaves known only where the configuration is
+/// loaded, such as the ones a deployment's modules declare in their own
+/// tables.
+///
+/// A leaf listed more than once is looked up once, because the second lookup
+/// would read the secret itself as the name of a key.
+///
+/// # Errors
+///
+/// As [`resolve_secret_references`].
+pub fn resolve_secret_references_with<C: ConfiguredSecretFields>(
+    data: &mut Value,
+    secret_store: &dyn PlatformSecretStore,
+    default_store_name: &StoreName,
+    extra: Vec<SecretField>,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut listed = std::collections::BTreeSet::new();
+    let fields = C::secret_fields()
+        .into_iter()
+        .chain(C::configured_secret_fields(data))
+        .chain(extra)
+        .filter(|field| listed.insert(field.dotted_path()))
+        .collect::<Vec<_>>();
     let mut resolved_data = data.clone();
-    for field in C::secret_fields() {
+    for field in fields {
         if matches!(field.kind, SecretKind::StoreRef) {
             continue;
         }
@@ -238,6 +286,28 @@ mod tests {
 
     struct Fixture;
 
+    impl ConfiguredSecretFields for Fixture {
+        /// Every key under `labeled` holds its secret at
+        /// `labeled.<name>.secret`, which is the shape a fixed path cannot
+        /// name.
+        fn configured_secret_fields(data: &Value) -> Vec<SecretField> {
+            data.get("labeled")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(name, _)| SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    optional: false,
+                    path: vec![
+                        SecretPathSegment::Field("labeled".into()),
+                        SecretPathSegment::Field(name.clone().into()),
+                        SecretPathSegment::Field("secret".into()),
+                    ],
+                })
+                .collect()
+        }
+    }
+
     impl AppConfigMeta for Fixture {
         fn secret_fields() -> Vec<SecretField> {
             vec![
@@ -299,6 +369,61 @@ mod tests {
     }
 
     #[test]
+    fn a_leaf_listed_twice_is_looked_up_once() {
+        // The second lookup would read the secret itself as the name of a
+        // key, which this store does not hold.
+        let mut data = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "feature": {"credential": "feature-key"}
+        });
+        let listed_again = vec![SecretField {
+            kind: SecretKind::KeyInDefault,
+            optional: true,
+            path: vec![
+                SecretPathSegment::OptionalField("feature".into()),
+                SecretPathSegment::Field("credential".into()),
+            ],
+        }];
+
+        resolve_secret_references_with::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+            listed_again,
+        )
+        .expect("should look a leaf up once however often it is listed");
+
+        assert_eq!(data["feature"]["credential"], "resolved-feature");
+    }
+
+    #[test]
+    fn resolves_a_leaf_only_the_caller_lists() {
+        let mut data = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "added": {"key_name": "token-b"}
+        });
+        let added = vec![SecretField {
+            kind: SecretKind::KeyInDefault,
+            optional: true,
+            path: vec![
+                SecretPathSegment::OptionalField("added".into()),
+                SecretPathSegment::Field("key_name".into()),
+            ],
+        }];
+
+        resolve_secret_references_with::<Fixture>(
+            &mut data,
+            &store(),
+            &StoreName::from("secrets"),
+            added,
+        )
+        .expect("should resolve the leaf the caller listed");
+
+        assert_eq!(data["added"]["key_name"], "resolved-b");
+        assert_eq!(data["outer"][0]["token"], "resolved-a");
+    }
+
+    #[test]
     fn resolves_present_and_skips_absent_optional_intermediate() {
         let mut absent = serde_json::json!({
             "outer": [{"token": "token-a"}]
@@ -314,6 +439,38 @@ mod tests {
             .expect("should resolve present optional intermediate");
 
         assert_eq!(present["feature"]["credential"], "resolved-feature");
+    }
+
+    #[test]
+    fn resolves_a_secret_under_a_name_only_the_configuration_holds() {
+        let mut data = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "labeled": {"chosen": {"secret": "feature-key"}},
+        });
+
+        resolve_secret_references::<Fixture>(&mut data, &store(), &StoreName::from("secrets"))
+            .expect("should resolve a secret the fixed paths cannot name");
+
+        assert_eq!(data["outer"][0]["token"], "resolved-a");
+        assert_eq!(data["labeled"]["chosen"]["secret"], "resolved-feature");
+    }
+
+    #[test]
+    fn a_failed_configured_field_leaves_the_fixed_ones_unresolved() {
+        // Fixed and configured leaves resolve in one pass, so a failure in
+        // either hands back the configuration exactly as it arrived.
+        let mut data = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "labeled": {"chosen": {"secret": "missing"}},
+        });
+        let original = data.clone();
+
+        let err =
+            resolve_secret_references::<Fixture>(&mut data, &store(), &StoreName::from("secrets"))
+                .expect_err("should reject a missing configured secret");
+
+        assert!(err.to_string().contains("labeled.chosen.secret"));
+        assert_eq!(data, original, "should preserve unresolved data on failure");
     }
 
     #[test]

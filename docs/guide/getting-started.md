@@ -174,18 +174,19 @@ only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- browser integrations under `[integrations.*]`;
-- server auction providers under map-shaped `[auction.providers.<id>]`;
-- server bidder routes under `[auction.bidders.<id>]`;
-- KV store mappings;
-- EC configuration;
-- consent settings (`[gdpr]`); and
-- stable key names for `trusted_server_secrets`.
+- the page modules that run, each selected in the section of its type (`[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]`, `[framework]`, and `[auction]` for Prebid), with their settings under `[<section>.<name>]`
+- the demand sources, in `[demand] modules`, each with its settings under `[demand.<name>]`
+- the ad server, if one runs, in `[ad-server] module`, with its settings under `[ad-server.<name>]`
+- server bidder routes under `[auction.bidders.<code>]`
+- KV store mappings
+- Edge Cookie configuration under `[ec]`
+- stable key names for `trusted_server_secrets`
 
 Do not put a Prebid Server URL or server bidder list under
-`[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
-`[integrations.aps]`. Those server values belong to auction provider common
-fields and `profile_config`.
+`[auction.prebid]`. Those server values belong to a `[demand.<name>]` table
+whose `implementation` is `auction.prebid-server`, and APS has no integration table at
+all, because it is selected in `[demand]` too. The rules every one of these
+tables follows are in [Configuration Rules](/guide/configuration-rules).
 
 Before the first push, provision the physical store mapped from logical
 `trusted_server_secrets` with the credential values referenced by the config.

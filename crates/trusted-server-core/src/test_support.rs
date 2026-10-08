@@ -1,6 +1,8 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod tests {
-    use crate::settings::Settings;
+    use crate::ec::module::{EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
+    use crate::redacted::Redacted;
+    use crate::settings::{Ec, EcModuleBlock, HmacModuleConfig, HostSignalsModuleConfig, Settings};
 
     #[must_use]
     pub fn crate_test_settings_str() -> String {
@@ -21,24 +23,65 @@ pub mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [integrations.prebid]
-            enabled = true
-            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+            [geo]
+            # A gdpr-eu country, where every permission requires a signal. This
+            # reproduces the prior no-default floor, so existing tests are
+            # unaffected by the now-required default.
+            # Tests run with no geo module, so single-jurisdiction operation
+            # is acknowledged the same way a deployment would.
+            assume_single_jurisdiction = true
 
-            [integrations.prebid.bundle.modules]
-            bidder = ["exampleBidderBidAdapter"]
-
-            [integrations.nextjs]
-            enabled = false
-            rewrite_attributes = ["href", "link", "url"]
+            [auction]
 
             [ec]
+            module = "hmac"
+
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
             "#
         .to_owned()
+    }
+
+    /// The shared fixture TOML with the module `name` selected in `section`
+    /// as well, written with the section's type folder left off, for a test
+    /// that appends that module's own table.
+    #[must_use]
+    pub fn crate_test_settings_str_running(section: &str, name: &str) -> String {
+        let written = crate::module_name::short_form(section, name);
+        if section == "auction" {
+            return crate_test_settings_str().replace(
+                "[auction]\n",
+                &format!("[auction]\nmodules = [\"{written}\"]\n"),
+            );
+        }
+        format!(
+            "{}\n[{section}]\nmodules = [\"{written}\"]\n",
+            crate_test_settings_str()
+        )
+    }
+
+    /// The crate test configuration with its whole `[ec]` section replaced by
+    /// `ec_section`, which carries its own `[ec]` header and any module
+    /// blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded TOML configuration no longer has an `[ec]`
+    /// section followed by a `[request_signing]` section.
+    #[must_use]
+    pub fn crate_test_settings_str_with_ec_section(ec_section: &str) -> String {
+        let base = crate_test_settings_str();
+        let (before, rest) = base
+            .split_once("[ec]")
+            .expect("should find the [ec] section in the test settings");
+        let (_, after) = rest
+            .split_once("[request_signing]")
+            .expect("should find the [request_signing] section in the test settings");
+        format!("{before}{ec_section}\n\n[request_signing]{after}")
     }
 
     #[must_use]
@@ -54,9 +97,129 @@ pub mod tests {
         settings
     }
 
+    /// Selects the built-in HMAC module under `name` with `passphrase`,
+    /// replacing whatever Edge Cookie module the settings carried.
+    ///
+    /// A `name` other than `hmac` is a label, so the block names the
+    /// implementation it configures.
+    pub fn select_hmac_module(ec: &mut Ec, name: &str, passphrase: &str) {
+        let mut block = EcModuleBlock::from(HmacModuleConfig {
+            passphrase: Redacted::new(passphrase.to_owned()),
+        });
+        if name != HMAC_MODULE_KEY {
+            block.implementation = Some(HMAC_MODULE_KEY.to_owned());
+        }
+        ec.module = Some(EcModuleSelection::from(name));
+        ec.module_blocks.clear();
+        ec.module_blocks.insert(name.to_owned(), block);
+    }
+
+    /// Selects the built-in host-signal module under its own name with
+    /// `passphrase`, replacing whatever Edge Cookie module the settings
+    /// carried.
+    pub fn select_host_signals_module(ec: &mut Ec, passphrase: &str) {
+        ec.module = Some(EcModuleSelection::from(HOST_SIGNALS_MODULE_KEY));
+        ec.module_blocks.clear();
+        ec.module_blocks.insert(
+            HOST_SIGNALS_MODULE_KEY.to_owned(),
+            EcModuleBlock::from(HostSignalsModuleConfig {
+                passphrase: Redacted::new(passphrase.to_owned()),
+            }),
+        );
+    }
+
+    /// The passphrase the block `name` holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` has no block, or if its block configures another
+    /// module.
+    #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "a fixture names the block it could not find, which `expect` cannot"
+    )]
+    pub fn hmac_passphrase<'a>(ec: &'a Ec, name: &str) -> &'a str {
+        ec.module_blocks
+            .get(name)
+            .and_then(EcModuleBlock::hmac_settings)
+            .unwrap_or_else(|| panic!("settings should configure the hmac module under `{name}`"))
+            .passphrase
+            .expose()
+    }
+
     /// A valid EC ID in `{64-hex}.{6-alnum}` format for use in tests.
     pub const VALID_SYNTHETIC_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
+}
+
+/// Page fixtures shared by core's tests and the tests of a module crate.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fixtures {
+    /// A publisher page carrying the tags of several vendors, as an origin
+    /// would serve it.
+    pub const PUBLISHER_PAGE_HTML: &str = include_str!("html_processor.test.html");
+}
+
+/// The operator-facing settings template, for tests that check what it
+/// documents.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod template {
+    /// The source-controlled template an operator starts from.
+    pub const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../trusted-server.example.toml"
+    ));
+
+    /// The template with its required secret-store key references replaced by
+    /// resolved test values, so parsing it as settings can exercise the
+    /// optional blocks a test uncomments.
+    #[must_use]
+    pub fn template_with_resolved_required_secrets() -> String {
+        EXAMPLE_TEMPLATE
+            .replace(
+                "password = \"handler_password\"",
+                "password = \"unit-test-resolved-handler-password-0001\"",
+            )
+            .replace(
+                "proxy_secret = \"publisher_proxy_secret\"",
+                "proxy_secret = \"unit-test-resolved-publisher-proxy-secret-0001\"",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"unit-test-resolved-ec-passphrase-secret-0001\"",
+            )
+    }
+
+    /// Uncomments the contiguous `#`-prefixed block that begins at the line
+    /// `# {header}`, leaving the rest of the template untouched. Stops at the
+    /// first line that is not a comment, so a blank line ends the block.
+    #[must_use]
+    pub fn uncomment_block(template: &str, header: &str) -> String {
+        let header_line = format!("# {header}");
+        let mut out = Vec::new();
+        let mut uncommenting = false;
+
+        for line in template.lines() {
+            if line == header_line {
+                uncommenting = true;
+            } else if uncommenting && !line.trim_start().starts_with('#') {
+                uncommenting = false;
+            }
+
+            if uncommenting {
+                let bare = line
+                    .strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line);
+                out.push(bare.to_owned());
+            } else {
+                out.push(line.to_owned());
+            }
+        }
+
+        out.join("\n")
+    }
 }
 
 /// Shared Next.js + auction origin fixture.
@@ -110,30 +273,47 @@ pub mod nextjs_auction {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            # The fixture supplies its own geo module through the runtime
+            # services, so it selects the host lookup to reach it. Without a
+            # selection the jurisdiction is unknown, and a server-side auction
+            # fails closed on an unknown jurisdiction.
+            [geo]
+            module = "platform"
             "#,
         )
         .expect("should parse Next.js auction fixture settings");
         settings
-            .integrations
-            .insert_config(
-                "nextjs",
+            .insert_module_config(
+                "framework",
+                "framework.nextjs",
                 &serde_json::json!({
-                    "enabled": true,
                     "rewrite_attributes": ["href", "link", "url"],
                 }),
             )
-            .expect("should enable the fixture Next.js integration");
+            .expect("should select the fixture Next.js integration");
         settings.auction.enabled = true;
-        settings.auction.mediator = None;
-        settings.auction.providers = serde_json::from_value(serde_json::json!({
-            "fixture": {
-                "protocol": "openrtb-2.6",
-                "endpoint": "https://auction.example.com/bid",
-                "routing": "all_eligible",
-                "timeout_ms": 5000
-            }
-        }))
-        .expect("should configure the fixture auction provider");
+        // One `[demand.fixture]` source, which is where an auction provider is
+        // configured. `implementation` states the wire format, so there is no
+        // separate `protocol`.
+        settings.demand = crate::provider_table::ProviderTable::new(
+            vec!["fixture".to_owned()],
+            std::collections::BTreeMap::from([(
+                "fixture".to_owned(),
+                serde_json::Map::from_iter([
+                    (
+                        "implementation".to_owned(),
+                        serde_json::json!("auction-protocol.openrtb"),
+                    ),
+                    (
+                        "endpoint".to_owned(),
+                        serde_json::json!("https://auction.example.com/bid"),
+                    ),
+                    ("routing".to_owned(), serde_json::json!("all_eligible")),
+                    ("timeout_ms".to_owned(), serde_json::json!(5000)),
+                ]),
+            )]),
+        );
         settings.creative_opportunities = Some(
             toml::from_str(
                 r#"
@@ -277,10 +457,12 @@ pub mod nextjs_auction {
 
     struct FixtureGeo;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformGeo for FixtureGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<IpAddr>,
+            _services: &RuntimeServices,
         ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
             Ok(Some(GeoInfo {
                 country: "AU".to_owned(),

@@ -11,13 +11,11 @@ use rand::rngs::OsRng;
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformImageOptimizerOptions, PlatformImageOptimizerParams, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName,
+    PlatformImageOptimizerOptions, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
-use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
-pub(crate) struct NoopConfigStore;
+pub struct NoopConfigStore;
 
 impl PlatformConfigStore for NoopConfigStore {
     fn get(&self, _store_name: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
@@ -38,7 +36,7 @@ impl PlatformConfigStore for NoopConfigStore {
     }
 }
 
-pub(crate) struct NoopSecretStore;
+pub struct NoopSecretStore;
 
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(
@@ -63,12 +61,12 @@ impl PlatformSecretStore for NoopSecretStore {
     }
 }
 
-pub(crate) struct HashMapConfigStore {
+pub struct HashMapConfigStore {
     data: HashMap<String, String>,
 }
 
 impl HashMapConfigStore {
-    pub(crate) fn new(data: HashMap<String, String>) -> Self {
+    pub fn new(data: HashMap<String, String>) -> Self {
         Self { data }
     }
 }
@@ -95,12 +93,12 @@ impl PlatformConfigStore for HashMapConfigStore {
     }
 }
 
-pub(crate) struct HashMapSecretStore {
+pub struct HashMapSecretStore {
     data: HashMap<String, Vec<u8>>,
 }
 
 impl HashMapSecretStore {
-    pub(crate) fn new(data: HashMap<String, Vec<u8>>) -> Self {
+    pub fn new(data: HashMap<String, Vec<u8>>) -> Self {
         Self { data }
     }
 }
@@ -131,7 +129,7 @@ impl PlatformSecretStore for HashMapSecretStore {
     }
 }
 
-pub(crate) struct NoopBackend;
+pub struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
     fn naming_policy(&self) -> super::BackendNamingPolicy {
@@ -147,7 +145,7 @@ impl PlatformBackend for NoopBackend {
     }
 }
 
-pub(crate) struct NoopHttpClient;
+pub struct NoopHttpClient;
 
 // ?Send matches PlatformHttpClient. Body wraps LocalBoxStream which is !Send
 // by design; see http.rs for the full rationale.
@@ -181,7 +179,7 @@ impl PlatformHttpClient for NoopHttpClient {
 
 /// Test stub for [`PlatformBackend`] that returns `"stub-backend"` for any
 /// spec, allowing callers to proceed past backend registration.
-pub(crate) struct StubBackend;
+pub struct StubBackend;
 
 impl PlatformBackend for StubBackend {
     fn naming_policy(&self) -> super::BackendNamingPolicy {
@@ -194,6 +192,82 @@ impl PlatformBackend for StubBackend {
 
     fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Ok("stub-backend".to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NamingBackend
+// ---------------------------------------------------------------------------
+
+/// Test stub for [`PlatformBackend`] that names a backend the way the given
+/// policy does, so two demand sources get two names, and records what it was
+/// asked.
+pub struct NamingBackend {
+    pub policy: super::BackendNamingPolicy,
+    /// How many names were predicted.
+    pub predicted: std::sync::atomic::AtomicUsize,
+    /// How many backends were registered or refused.
+    pub ensured: std::sync::atomic::AtomicUsize,
+    /// The specification of every backend registered, in order.
+    pub specs: Mutex<Vec<PlatformBackendSpec>>,
+    /// The discriminators whose registration fails.
+    pub fail_ensure_for: Mutex<std::collections::HashSet<String>>,
+}
+
+impl NamingBackend {
+    pub fn new(policy: super::BackendNamingPolicy) -> Self {
+        Self {
+            policy,
+            predicted: std::sync::atomic::AtomicUsize::new(0),
+            ensured: std::sync::atomic::AtomicUsize::new(0),
+            specs: Mutex::new(Vec::new()),
+            fail_ensure_for: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Makes registration fail for the source `provider_id`.
+    pub fn fail_ensure_for(&self, provider_id: &str) {
+        self.fail_ensure_for
+            .lock()
+            .expect("should lock failing provider IDs")
+            .insert(provider_id.to_string());
+    }
+
+    fn name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.policy
+            .predict(spec)
+            .map(|prediction| prediction.name)
+            .change_context(PlatformError::Backend)
+    }
+}
+
+impl PlatformBackend for NamingBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        self.policy
+    }
+
+    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.predicted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.name(spec)
+    }
+
+    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.ensured
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if spec.discriminator.as_deref().is_some_and(|provider_id| {
+            self.fail_ensure_for
+                .lock()
+                .expect("should lock failing provider IDs")
+                .contains(provider_id)
+        }) {
+            return Err(Report::new(PlatformError::Backend));
+        }
+        self.specs
+            .lock()
+            .expect("should lock planned backend specs")
+            .push(spec.clone());
+        self.name(spec)
     }
 }
 
@@ -226,7 +300,7 @@ struct StubPendingResponse {
 const MAX_RECORDED_BODY_BYTES: usize = 64 * 1024 * 1024;
 type RecordedHeaderBytes = Vec<Vec<(String, Vec<u8>)>>;
 
-pub(crate) struct StubHttpClient {
+pub struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
@@ -302,7 +376,7 @@ impl StubHttpClient {
     }
 
     /// Make `has_enforceable_total_request_deadline()` report the given value.
-    pub(crate) fn set_enforceable_total_request_deadline(&self, supported: bool) {
+    pub fn set_enforceable_total_request_deadline(&self, supported: bool) {
         self.enforceable_total_request_deadline
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
@@ -370,7 +444,7 @@ impl StubHttpClient {
     }
 
     /// Make the next `select()` complete successfully before a later queued error.
-    pub(crate) fn push_select_success(&self) {
+    pub fn push_select_success(&self) {
         self.select_errors
             .lock()
             .expect("should lock select_errors")
@@ -379,7 +453,7 @@ impl StubHttpClient {
 
     /// Override backend metadata on the next pending handle returned by
     /// [`Self::send_async`]. `None` removes the metadata entirely.
-    pub(crate) fn push_pending_backend_name_override(&self, backend_name: Option<&str>) {
+    pub fn push_pending_backend_name_override(&self, backend_name: Option<&str>) {
         self.pending_backend_name_overrides
             .lock()
             .expect("should lock pending backend name overrides")
@@ -391,7 +465,7 @@ impl StubHttpClient {
     /// This is test-only timing control for deadline behavior. It deliberately
     /// uses a caller-selected, generous contrast with the tested budget rather
     /// than relying on scheduler races.
-    pub(crate) fn push_select_delay(&self, delay: Duration) {
+    pub fn push_select_delay(&self, delay: Duration) {
         self.select_delays
             .lock()
             .expect("should lock select_delays")
@@ -399,7 +473,7 @@ impl StubHttpClient {
     }
 
     /// Queue a wall-clock delay before the next direct pending-request `wait()`.
-    pub(crate) fn push_wait_delay(&self, delay: Duration) {
+    pub fn push_wait_delay(&self, delay: Duration) {
         self.wait_delays
             .lock()
             .expect("should lock wait_delays")
@@ -432,7 +506,7 @@ impl StubHttpClient {
     /// Return raw request header values captured per request, in order.
     ///
     /// Unlike [`Self::recorded_request_headers`], this includes malformed bytes.
-    pub(crate) fn recorded_request_header_bytes(&self) -> Vec<Vec<(String, Vec<u8>)>> {
+    pub fn recorded_request_header_bytes(&self) -> Vec<Vec<(String, Vec<u8>)>> {
         self.request_header_bytes
             .lock()
             .expect("should lock request_header_bytes")
@@ -448,7 +522,7 @@ impl StubHttpClient {
     }
 
     /// Return the cache intent captured per `send` or `send_async` call, in order.
-    pub(crate) fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
+    pub fn recorded_cache_intents(&self) -> Vec<PlatformCacheIntent> {
         self.cache_intents
             .lock()
             .expect("should lock cache intents")
@@ -857,10 +931,15 @@ fn build_stub_pending_response(
     builder.body(body).change_context(PlatformError::HttpClient)
 }
 
-pub(crate) struct NoopGeo;
+pub struct NoopGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for NoopGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &crate::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -869,7 +948,7 @@ impl PlatformGeo for NoopGeo {
 ///
 /// Use this when a test exercises code that reads from config AND secret stores,
 /// such as `request_signing::signing` and `request_signing::rotation`.
-pub(crate) fn build_services_with_config_and_secret(
+pub fn build_services_with_config_and_secret(
     config_store: impl PlatformConfigStore + 'static,
     secret_store: impl PlatformSecretStore + 'static,
 ) -> RuntimeServices {
@@ -884,7 +963,7 @@ pub(crate) fn build_services_with_config_and_secret(
         .build()
 }
 
-pub(crate) fn build_services_with_config_and_secret_and_client_ip(
+pub fn build_services_with_config_and_secret_and_client_ip(
     config_store: impl PlatformConfigStore + 'static,
     secret_store: impl PlatformSecretStore + 'static,
     client_ip: IpAddr,
@@ -903,7 +982,7 @@ pub(crate) fn build_services_with_config_and_secret_and_client_ip(
         .build()
 }
 
-pub(crate) fn build_request_signing_services() -> RuntimeServices {
+pub fn build_request_signing_services() -> RuntimeServices {
     let signing_key = SigningKey::generate(&mut OsRng);
     let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
     let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
@@ -923,7 +1002,7 @@ pub(crate) fn build_request_signing_services() -> RuntimeServices {
     )
 }
 
-pub(crate) fn build_services_with_config(
+pub fn build_services_with_config(
     config_store: impl PlatformConfigStore + 'static,
 ) -> RuntimeServices {
     RuntimeServices::builder()
@@ -937,14 +1016,132 @@ pub(crate) fn build_services_with_config(
         .build()
 }
 
-pub(crate) fn noop_services() -> RuntimeServices {
+pub fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
+}
+
+/// Build a [`RuntimeServices`] with an injected geo module, so a test can
+/// drive a geo outcome through the [`PlatformGeo`] seam rather than
+/// constructing the resolved status by hand.
+///
+/// This is the only way to reach the lookup-failure path, because the seam is
+/// what turns an `Err` into the requires-signal floor.
+pub fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(geo)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
+/// Build a [`RuntimeServices`] carrying an Edge Cookie module, threaded the
+/// way a composition root threads the module it resolved, so a test can
+/// exercise the seam a vendor module reaches core through and check that the
+/// request path reuses that instance.
+pub fn noop_services_with_ec_module(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+) -> RuntimeServices {
+    // A fixed client IP, so a module that reads one (the built-in HMAC
+    // module does) can run.
+    noop_services_with_ec_module_and_ip(
+        ec_module,
+        Some("203.0.113.10".parse().expect("should parse test client IP")),
+    )
+}
+
+/// Build a [`RuntimeServices`] with an injected Edge Cookie module and no
+/// client IP, modeling a host that cannot determine one.
+///
+/// Whether that matters is the module's decision, so this exists to test
+/// both answers: a module reading other evidence still creates an
+/// identifier, and one that needs the IP refuses.
+/// A config store that answers one known key, so a test can prove a module
+/// reached the config store it was handed rather than a value it already held.
+#[derive(Debug)]
+pub struct FixedConfigStore {
+    pub store: &'static str,
+    pub key: &'static str,
+    pub value: &'static str,
+}
+
+impl PlatformConfigStore for FixedConfigStore {
+    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        if store_name.as_ref() == self.store && key == self.key {
+            Ok(self.value.to_owned())
+        } else {
+            Err(Report::new(PlatformError::ConfigStore))
+        }
+    }
+
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// Build a [`RuntimeServices`] carrying both an Edge Cookie module and a
+/// config store the module is expected to read through, so a test can prove
+/// the services reaching the module are the ones the caller supplied.
+pub fn services_with_ec_module_and_config_store(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+    config_store: Arc<dyn PlatformConfigStore>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(config_store)
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .resolved_ec_module(ec_module)
+        .build()
+}
+
+pub fn noop_services_with_ec_module_without_client_ip(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+) -> RuntimeServices {
+    noop_services_with_ec_module_and_ip(ec_module, None)
+}
+
+fn noop_services_with_ec_module_and_ip(
+    ec_module: Arc<dyn crate::ec::module::EdgeCookieModule>,
+    client_ip: Option<IpAddr>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        })
+        .resolved_ec_module(ec_module)
+        .build()
 }
 
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
 /// recording (or otherwise custom) sink, so tests can assert which terminal
 /// auction events were emitted.
-pub(crate) fn noop_services_with_telemetry_sink(
+pub fn noop_services_with_telemetry_sink(
     auction_telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
@@ -966,14 +1163,14 @@ pub(crate) fn noop_services_with_telemetry_sink(
 /// both make HTTP calls and resolve backends don't need two separate service
 /// setups.  If your test must verify that a missing backend returns an error,
 /// use [`noop_services`] directly.
-pub(crate) fn build_services_with_http_client(
+pub fn build_services_with_http_client(
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
     build_services_with_secret_and_http_client(NoopSecretStore, http_client)
 }
 
 /// Build test services that dispatch HTTP requests with an attested client IP.
-pub(crate) fn build_services_with_http_client_and_client_ip(
+pub fn build_services_with_http_client_and_client_ip(
     http_client: Arc<dyn PlatformHttpClient>,
     client_ip: IpAddr,
 ) -> RuntimeServices {
@@ -991,7 +1188,7 @@ pub(crate) fn build_services_with_http_client_and_client_ip(
         .build()
 }
 
-pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
+pub fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
@@ -1017,7 +1214,7 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
     dead_code,
     reason = "retained for target-specific transport-timeout tests"
 )]
-pub(crate) fn build_services_with_backend_and_http_client(
+pub fn build_services_with_backend_and_http_client(
     backend: Arc<dyn PlatformBackend>,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
@@ -1038,7 +1235,7 @@ pub(crate) fn build_services_with_backend_and_http_client(
 }
 
 /// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
-pub(crate) fn build_services_with_config_secret_and_http_client(
+pub fn build_services_with_config_secret_and_http_client(
     config_store: impl PlatformConfigStore + 'static,
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
@@ -1054,7 +1251,7 @@ pub(crate) fn build_services_with_config_secret_and_http_client(
         .build()
 }
 
-pub(crate) fn build_services_with_secret_http_client_and_client_ip(
+pub fn build_services_with_secret_http_client_and_client_ip(
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
     client_ip: Option<IpAddr>,
@@ -1076,7 +1273,7 @@ pub(crate) fn build_services_with_secret_http_client_and_client_ip(
 }
 
 /// Build test services with a custom secret store and the standard test config store.
-pub(crate) fn build_services_with_secret_and_http_client(
+pub fn build_services_with_secret_and_http_client(
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
@@ -1085,7 +1282,8 @@ pub(crate) fn build_services_with_secret_and_http_client(
 
 #[cfg(test)]
 mod tests {
-    use crate::platform::DEFAULT_FIRST_BYTE_TIMEOUT;
+    use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformImageOptimizerParams};
+    use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
 

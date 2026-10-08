@@ -5,7 +5,7 @@
  *
  * Unlike build-all.mjs, this script is intended to run outside the Cargo build.
  * It produces an immutable bundle and manifest that can be hosted on an asset
- * CDN, then referenced by integrations.prebid.external_bundle_url.
+ * CDN, then referenced by auction.prebid.external_bundle_url.
  */
 
 import crypto from 'node:crypto';
@@ -43,19 +43,19 @@ const MODULE_KIND_DEFINITIONS = Object.freeze([
   {
     requestKey: 'bidder',
     tomlKey: 'bidder',
-    fieldPath: 'integrations.prebid.bundle.modules.bidder',
+    fieldPath: 'auction.prebid.bundle.modules.bidder',
     metadataType: 'bidder',
   },
   {
     requestKey: 'userId',
     tomlKey: 'user_id',
-    fieldPath: 'integrations.prebid.bundle.modules.user_id',
+    fieldPath: 'auction.prebid.bundle.modules.user_id',
     metadataType: 'userId',
   },
   {
     requestKey: 'analytics',
     tomlKey: 'analytics',
-    fieldPath: 'integrations.prebid.bundle.modules.analytics',
+    fieldPath: 'auction.prebid.bundle.modules.analytics',
     metadataType: 'analytics',
   },
 ]);

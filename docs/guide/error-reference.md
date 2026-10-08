@@ -75,7 +75,7 @@ TOML file.
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `ec.passphrase`
+- `ec.hmac.passphrase` (when `ec.module = "hmac"`)
 
 ---
 
@@ -94,15 +94,13 @@ credentials or fragment:
 
 ```toml
 # ❌ Wrong
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand.pbs_main]
+implementation = "auction.prebid-server"
 endpoint = "prebid.example.com/openrtb2/auction"
 
 # ✅ Correct
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand.pbs_main]
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 ```
 
@@ -118,13 +116,12 @@ Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
 
 **Cause:** Environment variable format doesn't match expected type
 
-**Solution:** Override an existing scalar leaf with the expected type. Provider
-map keys preserve hyphens, so shell users must invoke the CLI through `env`:
+**Solution:** Override an existing scalar leaf with the expected type. Demand
+source names are snake_case, so each maps straight onto a path segment:
 
 ```bash
 env 'TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__TIMEOUT_MS=1000' \
   ts config validate
 ```
 
@@ -149,10 +146,13 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `passphrase` names a secret-store entry in `trusted-server.toml`:
+1. Ensure the `hmac` module is selected and its `passphrase` names a secret-store entry in `trusted-server.toml`:
 
 ```toml
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -160,7 +160,8 @@ passphrase = "ec_passphrase"
    passphrase value:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__MODULE=hmac
+TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 ```
 
 3. Provision a high-entropy value of at least 32 characters under
@@ -176,9 +177,9 @@ TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 Backend not found: prebid-server
 ```
 
-**Cause:** Dynamic backend creation for a configured provider endpoint failed.
-Provider backends are derived from `[auction.providers.<id>]`; they are not
-manually named static Fastly backends.
+**Cause:** Dynamic backend creation for a configured demand endpoint failed.
+Demand backends are derived from `[demand.<name>]`; they are not manually
+named static Fastly backends.
 
 **Solution:**
 
@@ -227,14 +228,14 @@ Upstream request timeout after 1000ms
 
 **Solution:**
 
-1. Increase the affected server provider timeout:
+1. Increase the affected demand source's timeout:
 
 ```toml
-[auction.providers.pbs-main]
+[demand.pbs_main]
 timeout_ms = 2000
 ```
 
-Browser `[integrations.prebid].timeout_ms` is independent and does not control
+Browser `[auction.prebid].timeout_ms` is independent and does not control
 Prebid Server transport.
 
 2. Verify upstream service is responsive:
@@ -289,14 +290,14 @@ Prebid Server returned 400: Invalid OpenRTB request
 
 **Solution:**
 
-1. Enable debug mode on the Prebid Server profile:
+1. Enable debug mode on the Prebid Server demand source:
 
 ```toml
-[auction.providers.pbs-main]
-profile_config = { debug = true }
+[demand.pbs_main]
+debug = true
 ```
 
-`[integrations.prebid].debug` controls browser Prebid.js only.
+`[auction.prebid].debug` controls browser Prebid.js only.
 
 2. Check logs for request/response details
 3. Verify bidders are supported by your Prebid Server
@@ -331,8 +332,10 @@ Next.js links still pointing to origin domain
 2. Update `rewrite_attributes` to match actual keys:
 
 ```toml
-[integrations.nextjs]
-enabled = true
+[framework]
+module = "nextjs"
+
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]  # Add keys you find
 ```
 
@@ -360,7 +363,10 @@ Failed to fetch Permutive SDK: 404 Not Found
 2. Update configuration:
 
 ```toml
-[integrations.permutive]
+[audience]
+module = "permutive"
+
+[audience.permutive]
 organization_id = "myorg"
 workspace_id = "workspace-123"
 ```
@@ -381,15 +387,15 @@ curl https://myorg.edge.permutive.app/workspace-123-web.js
 No route matched for /integrations/custom/endpoint
 ```
 
-**Cause:** Integration not enabled or route not registered
+**Cause:** No section selects the integration's module, or the route is not registered
 
 **Solution:**
 
-1. Enable integration:
+1. Select the module in the section of its type so it runs:
 
 ```toml
-[integrations.custom]
-enabled = true
+[testing]
+modules = ["custom"]
 ```
 
 2. Verify integration is compiled in (check build logs)
@@ -642,18 +648,21 @@ cargo install viceroy --version 0.17.0 --locked --force
 
 ### Enable Debug Logging
 
-Browser Prebid.js debug remains under `[integrations.prebid]`:
+Browser Prebid.js debug remains under `[auction.prebid]`:
 
 ```toml
-[integrations.prebid]
+[auction]
+modules = ["prebid"]
+
+[auction.prebid]
 debug = true
 ```
 
-For Prebid Server diagnostics, enable debug in that provider's profile:
+For Prebid Server diagnostics, enable debug on that demand source:
 
 ```toml
-[auction.providers.pbs-main]
-profile_config = { debug = true }
+[demand.pbs_main]
+debug = true
 ```
 
 **Check Fastly logs:**

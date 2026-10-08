@@ -6,7 +6,8 @@
 ///
 /// This is used by both HTML (`__next_f` payloads) and Flight (`text/x-component`) rewriting to
 /// avoid corrupting unrelated hostnames.
-pub(crate) fn rewrite_bare_host_at_boundaries(
+#[must_use]
+pub fn rewrite_bare_host_at_boundaries(
     text: &str,
     origin_host: &str,
     request_host: &str,

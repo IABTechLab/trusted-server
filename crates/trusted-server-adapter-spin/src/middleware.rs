@@ -236,7 +236,13 @@ mod tests {
                 proxy_secret = "unit-test-proxy-secret"
 
                 [ec]
+                module = "hmac"
+
+                [ec.hmac]
                 passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should load test settings");

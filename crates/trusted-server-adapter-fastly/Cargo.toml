@@ -35,6 +35,14 @@ log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-modules = { workspace = true }
+trusted-server-permission-signal-gpc = { workspace = true }
+trusted-server-permission-signal-gpp = { workspace = true }
+trusted-server-permission-signal-mtm = { workspace = true }
+trusted-server-permission-signal-tcf = { workspace = true }
+trusted-server-permission-signal-us-privacy = { workspace = true }
+trusted-server-device-fastly = { workspace = true }
+trusted-server-geo-fastly = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 
@@ -43,3 +51,6 @@ bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 toml = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
+# Test fixture only. It proves the integration seam on this adapter from
+# outside core and must never be a regular dependency.
+trusted-server-integration-seam-probe = { path = "../testing/seam-probe" }

@@ -112,24 +112,6 @@ pub struct RegsExt {
 impl ToExt for RegsExt {}
 
 #[derive(Debug, Serialize)]
-pub struct RequestExt {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prebid: Option<PrebidExt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trusted_server: Option<TrustedServerExt>,
-}
-
-#[derive(Debug, Serialize, serde::Deserialize)]
-pub struct PrebidExt {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub debug: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub returnallbidstatus: Option<bool>,
-}
-
-impl ToExt for RequestExt {}
-
-#[derive(Debug, Serialize)]
 pub struct TrustedServerExt {
     /// Version of the signing protocol (e.g., "1.1")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,30 +127,6 @@ pub struct TrustedServerExt {
     /// Unix timestamp in milliseconds for replay protection
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImpExt {
-    pub prebid: PrebidImpExt,
-}
-
-impl ToExt for ImpExt {}
-
-#[derive(Debug, Default, Serialize)]
-pub struct PrebidImpExt {
-    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub bidder: std::collections::HashMap<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub storedrequest: Option<ImpStoredRequest>,
-}
-
-/// PBS imp-level stored request reference.
-///
-/// PBS merges the stored imp JSON (keyed by `id`) into the outgoing request,
-/// populating bidder params that are not sent inline.
-#[derive(Debug, Serialize)]
-pub struct ImpStoredRequest {
-    pub id: String,
 }
 
 #[derive(Debug, Serialize)]

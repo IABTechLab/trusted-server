@@ -1,6 +1,33 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/device/fastly",
+    "crates/geo/fastly",
+    # Test fixture that proves the integration seam from outside core. A
+    # workspace member so it shares workspace settings and lints; no default
+    # member and no adapter build reaches it, and only the Axum and Fastly
+    # adapters' tests depend on it.
+    "crates/testing/seam-probe",
+    "crates/permission-signal/gpc",
+    "crates/permission-signal/gpp",
+    "crates/permission-signal/mtm",
+    "crates/permission-signal/tcf",
+    "crates/permission-signal/us-privacy",
+    "crates/cmp/osano",
+    "crates/identity/lockr",
+    "crates/audience/permutive",
+    "crates/cmp/sourcepoint",
+    "crates/cmp/didomi",
+    "crates/tag/google-tag-manager",
+    "crates/testing/testlight",
+    "crates/framework/nextjs",
+    "crates/ad-tag/google",
+    "crates/bot-protection/datadome",
+    "crates/ad-server/mock",
+    "crates/auction/aps",
+    "crates/auction/prebid",
+    "crates/auction/prebid-server",
+    "crates/auction-protocol/openrtb",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -9,6 +36,7 @@ members = [
     "crates/trusted-server-core",
     "crates/trusted-server-integration-tests",
     "crates/trusted-server-js",
+    "crates/trusted-server-modules",
     "crates/trusted-server-openrtb",
     # Manual protobuf codegen tool — a member so it shares workspace settings,
     # but no default member or alias builds it. Run it explicitly with `-p`.
@@ -120,7 +148,30 @@ toml_edit = "0.23.10"
 tower = "0.4"
 tracing = "0.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
+trusted-server-device-fastly = { path = "crates/device/fastly" }
+trusted-server-geo-fastly = { path = "crates/geo/fastly" }
+trusted-server-permission-signal-gpc = { path = "crates/permission-signal/gpc" }
+trusted-server-permission-signal-gpp = { path = "crates/permission-signal/gpp" }
+trusted-server-permission-signal-mtm = { path = "crates/permission-signal/mtm" }
+trusted-server-permission-signal-tcf = { path = "crates/permission-signal/tcf" }
+trusted-server-permission-signal-us-privacy = { path = "crates/permission-signal/us-privacy" }
+trusted-server-cmp-osano = { path = "crates/cmp/osano" }
+trusted-server-identity-lockr = { path = "crates/identity/lockr" }
+trusted-server-audience-permutive = { path = "crates/audience/permutive" }
+trusted-server-cmp-sourcepoint = { path = "crates/cmp/sourcepoint" }
+trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
+trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }
+trusted-server-testing-testlight = { path = "crates/testing/testlight" }
+trusted-server-framework-nextjs = { path = "crates/framework/nextjs" }
+trusted-server-ad-tag-google = { path = "crates/ad-tag/google" }
+trusted-server-bot-protection-datadome = { path = "crates/bot-protection/datadome" }
+trusted-server-ad-server-mock = { path = "crates/ad-server/mock" }
+trusted-server-auction-aps = { path = "crates/auction/aps" }
+trusted-server-auction-prebid = { path = "crates/auction/prebid" }
+trusted-server-auction-prebid-server = { path = "crates/auction/prebid-server" }
+trusted-server-auction-protocol-openrtb = { path = "crates/auction-protocol/openrtb" }
 trusted-server-js = { path = "crates/trusted-server-js" }
+trusted-server-modules = { path = "crates/trusted-server-modules" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"
 urlencoding = "2.1"

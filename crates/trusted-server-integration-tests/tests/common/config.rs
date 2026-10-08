@@ -17,6 +17,9 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
     })?;
     let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
+    // The fixture selects modules a stock build ships, so validation needs
+    // the stock list as the adapters and the `ts` tool have it.
+    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
     let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))

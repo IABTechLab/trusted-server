@@ -1,0 +1,1183 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use super::shared::RscUrlRewriter;
+
+/// T-chunk header pattern: `hex_id:Thex_length`,
+///
+/// This is a static code-defined literal rather than a config-derived pattern,
+/// so it intentionally stays outside startup preparation.
+static TCHUNK_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new("([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
+
+/// Marker used to track script boundaries when combining RSC content.
+pub(crate) const RSC_MARKER: &str = "\x00SPLIT\x00";
+
+/// Default maximum combined payload size for cross-script processing (10 MB).
+pub(crate) const DEFAULT_MAX_COMBINED_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum reasonable T-chunk length to prevent `DoS` from malformed input (100 MB).
+/// A `T-chunk` larger than this is almost certainly malformed and would cause excessive
+/// memory allocation or iteration.
+pub(super) const MAX_REASONABLE_TCHUNK_LENGTH: usize = 100 * 1024 * 1024;
+
+// =============================================================================
+// Escape Sequence Parsing
+// =============================================================================
+//
+// JS escape sequences are parsed by a shared iterator to avoid code duplication.
+// The iterator yields (source_len, unescaped_byte_count) for each logical unit.
+
+/// A single parsed element from a JS string.
+#[derive(Clone, Copy)]
+struct EscapeElement {
+    /// Number of unescaped bytes this represents.
+    byte_count: usize,
+}
+
+/// Iterator over escape sequences in a JS string.
+/// Yields the unescaped byte count for each element.
+struct EscapeSequenceIter<'a> {
+    bytes: &'a [u8],
+    str_ref: &'a str,
+    pos: usize,
+    skip_marker: Option<&'a [u8]>,
+}
+
+impl<'a> EscapeSequenceIter<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: 0,
+            skip_marker: None,
+        }
+    }
+
+    fn with_marker(s: &'a str, marker: &'a [u8]) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: 0,
+            skip_marker: Some(marker),
+        }
+    }
+
+    fn from_position(s: &'a str, start: usize) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: start,
+            skip_marker: None,
+        }
+    }
+
+    fn from_position_with_marker(s: &'a str, start: usize, marker: &'a [u8]) -> Self {
+        Self {
+            bytes: s.as_bytes(),
+            str_ref: s,
+            pos: start,
+            skip_marker: Some(marker),
+        }
+    }
+
+    /// Current position in the source string.
+    fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether appending bytes could change how the next escape is decoded.
+    fn has_partial_escape(&self) -> bool {
+        let remaining = &self.bytes[self.pos..];
+        if remaining.first() != Some(&b'\\') {
+            return false;
+        }
+        match remaining.get(1) {
+            None => true,
+            Some(b'x') => remaining.len() < 4,
+            Some(b'u') => {
+                if remaining.len() < 6 {
+                    return remaining[2..].iter().all(u8::is_ascii_hexdigit);
+                }
+                let Some(code_unit) = self
+                    .str_ref
+                    .get(self.pos + 2..self.pos + 6)
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                else {
+                    return false;
+                };
+                if !(0xD800..=0xDBFF).contains(&code_unit) || remaining.len() >= 12 {
+                    return false;
+                }
+                // A high surrogate can still join a low surrogate. Retain only
+                // prefixes that can grow into `\uDC00` through `\uDFFF`.
+                let tail = &remaining[6..];
+                tail.iter().enumerate().all(|(index, byte)| match index {
+                    0 => *byte == b'\\',
+                    1 => *byte == b'u',
+                    2 => matches!(byte, b'd' | b'D'),
+                    3 => matches!(byte, b'c'..=b'f' | b'C'..=b'F'),
+                    _ => byte.is_ascii_hexdigit(),
+                })
+            }
+            Some(_) => false,
+        }
+    }
+}
+
+impl Iterator for EscapeSequenceIter<'_> {
+    type Item = EscapeElement;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.bytes.len() {
+            return None;
+        }
+
+        if let Some(marker) = self.skip_marker
+            && self.pos + marker.len() <= self.bytes.len()
+            && &self.bytes[self.pos..self.pos + marker.len()] == marker
+        {
+            self.pos += marker.len();
+            return Some(EscapeElement { byte_count: 0 });
+        }
+
+        if self.bytes[self.pos] == b'\\' && self.pos + 1 < self.bytes.len() {
+            let esc = self.bytes[self.pos + 1];
+
+            if matches!(
+                esc,
+                b'n' | b'r' | b't' | b'b' | b'f' | b'v' | b'"' | b'\'' | b'\\' | b'/'
+            ) {
+                self.pos += 2;
+                return Some(EscapeElement { byte_count: 1 });
+            }
+
+            // Only the boundary is checked, not the hex digits: validating the
+            // digits would change the unescaped byte count of malformed but
+            // previously scannable input such as `\xZZ`, and that count drives
+            // T-chunk length recomputation. Inputs that are rejected here are
+            // exactly the ones that used to advance into a character and panic.
+            if esc == b'x'
+                && self.pos + 3 < self.bytes.len()
+                && self.str_ref.is_char_boundary(self.pos + 4)
+            {
+                self.pos += 4;
+                return Some(EscapeElement { byte_count: 1 });
+            }
+
+            // `str::get` yields `None` when the escape body straddles a character,
+            // which falls through to literal handling exactly as invalid hex does.
+            if esc == b'u'
+                && self.pos + 5 < self.bytes.len()
+                && let Some(hex) = self.str_ref.get(self.pos + 2..self.pos + 6)
+                && hex.chars().all(|c| c.is_ascii_hexdigit())
+                && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+            {
+                if (0xD800..=0xDBFF).contains(&code_unit)
+                    && self.pos + 11 < self.bytes.len()
+                    && self.bytes[self.pos + 6] == b'\\'
+                    && self.bytes[self.pos + 7] == b'u'
+                {
+                    let hex2 = self.str_ref.get(self.pos + 8..self.pos + 12);
+                    if let Some(hex2) = hex2
+                        && hex2.chars().all(|c| c.is_ascii_hexdigit())
+                        && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
+                        && (0xDC00..=0xDFFF).contains(&code_unit2)
+                    {
+                        self.pos += 12;
+                        return Some(EscapeElement { byte_count: 4 });
+                    }
+                }
+
+                let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
+                self.pos += 6;
+                return Some(EscapeElement {
+                    byte_count: c.len_utf8(),
+                });
+            }
+        }
+
+        if self.bytes[self.pos] < 0x80 {
+            self.pos += 1;
+            Some(EscapeElement { byte_count: 1 })
+        } else if let Some(c) = self
+            .str_ref
+            .get(self.pos..)
+            .and_then(|remainder| remainder.chars().next())
+        {
+            let len = c.len_utf8();
+            self.pos += len;
+            Some(EscapeElement { byte_count: len })
+        } else {
+            // Defensive: the escape guards above keep `pos` on a character
+            // boundary, so a continuation byte here is unreachable. Advance one
+            // byte rather than slicing so the iterator cannot panic or stall.
+            self.pos += 1;
+            Some(EscapeElement { byte_count: 1 })
+        }
+    }
+}
+
+/// Calculate the unescaped byte length of a JS string with escape sequences.
+fn calculate_unescaped_byte_length(s: &str) -> usize {
+    EscapeSequenceIter::new(s).map(|e| e.byte_count).sum()
+}
+
+/// Consume a specified number of unescaped bytes from a JS string, returning the end position.
+fn consume_unescaped_bytes(s: &str, start_pos: usize, byte_count: usize) -> (usize, usize) {
+    let mut iter = EscapeSequenceIter::from_position(s, start_pos);
+    let mut consumed = 0;
+
+    while consumed < byte_count {
+        match iter.next() {
+            Some(elem) => consumed += elem.byte_count,
+            None => break,
+        }
+    }
+
+    (iter.position(), consumed)
+}
+
+// =============================================================================
+// T-chunk discovery
+// =============================================================================
+
+/// Information about a T-chunk found in the combined RSC content.
+pub(super) struct TChunkInfo {
+    /// Position where the T-chunk header starts (e.g., position of "1a:T...").
+    pub(super) match_start: usize,
+    /// Position right after the chunk ID (position of ":T").
+    pub(super) id_end: usize,
+    /// Position right after the comma (where content begins).
+    pub(super) header_end: usize,
+    /// Position where the content ends.
+    pub(super) content_end: usize,
+}
+
+pub(super) enum TChunkScan {
+    Complete(Vec<TChunkInfo>),
+    NeedMore,
+    Invalid,
+}
+
+/// A T-chunk whose header has been parsed but whose content has not fully arrived.
+pub(super) struct PendingTChunk {
+    match_start: usize,
+    id_end: usize,
+    header_end: usize,
+    declared_length: usize,
+    consumed: usize,
+    pos: usize,
+}
+
+/// Outcome of advancing a T-chunk scan by one chunk.
+pub(super) enum TChunkStep {
+    /// A chunk's declared content is fully present.
+    Found(TChunkInfo),
+    /// The text ends inside this chunk's content; resume with more text.
+    Pending(PendingTChunk),
+    /// No further chunk header begins in the text.
+    Exhausted,
+    Invalid,
+}
+
+/// Advance a T-chunk scan by one chunk.
+///
+/// Passing the [`TChunkStep::Pending`] chunk back resumes content consumption
+/// where it stopped, so growing text is walked once rather than re-walked from
+/// the chunk header on every call.
+///
+/// `hold_back_partial_escape` stops the scan at a trailing backslash that could
+/// still grow into a longer escape sequence. A resumed scan would otherwise
+/// commit to reading that backslash as a literal byte.
+pub(super) fn next_tchunk(
+    content: &str,
+    search_pos: usize,
+    pending: Option<PendingTChunk>,
+    marker: Option<&[u8]>,
+    hold_back_partial_escape: bool,
+) -> TChunkStep {
+    let mut chunk = match pending {
+        Some(chunk) => chunk,
+        None => {
+            if search_pos >= content.len() {
+                return TChunkStep::Exhausted;
+            }
+            let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) else {
+                return TChunkStep::Exhausted;
+            };
+            let call = cap.get(0).expect("T-chunk match should exist");
+            let id_match = cap.get(1).expect("T-chunk id should exist");
+            let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
+            let Some(declared_length) = usize::from_str_radix(length_hex, 16)
+                .ok()
+                .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)
+            else {
+                return TChunkStep::Invalid;
+            };
+            let header_end = search_pos + call.end();
+            PendingTChunk {
+                match_start: search_pos + call.start(),
+                id_end: search_pos + id_match.end(),
+                header_end,
+                declared_length,
+                consumed: 0,
+                pos: header_end,
+            }
+        }
+    };
+
+    let mut iter = match marker {
+        Some(marker) => EscapeSequenceIter::from_position_with_marker(content, chunk.pos, marker),
+        None => EscapeSequenceIter::from_position(content, chunk.pos),
+    };
+    while chunk.consumed < chunk.declared_length {
+        if hold_back_partial_escape && iter.has_partial_escape() {
+            break;
+        }
+        match iter.next() {
+            Some(element) => chunk.consumed += element.byte_count,
+            None => break,
+        }
+    }
+    chunk.pos = iter.position();
+
+    if chunk.consumed > chunk.declared_length {
+        return TChunkStep::Invalid;
+    }
+    if chunk.consumed < chunk.declared_length {
+        return TChunkStep::Pending(chunk);
+    }
+    TChunkStep::Found(TChunkInfo {
+        match_start: chunk.match_start,
+        id_end: chunk.id_end,
+        header_end: chunk.header_end,
+        content_end: chunk.pos,
+    })
+}
+
+/// Find all T-chunks in content, optionally skipping markers.
+fn scan_tchunks_impl(content: &str, skip_markers: bool) -> TChunkScan {
+    let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
+    let mut chunks = Vec::new();
+    let mut search_pos = 0;
+
+    loop {
+        match next_tchunk(content, search_pos, None, marker, false) {
+            TChunkStep::Found(chunk) => {
+                search_pos = chunk.content_end;
+                chunks.push(chunk);
+            }
+            TChunkStep::Pending(_) => return TChunkScan::NeedMore,
+            TChunkStep::Exhausted => return TChunkScan::Complete(chunks),
+            TChunkStep::Invalid => return TChunkScan::Invalid,
+        }
+    }
+}
+
+pub(super) fn scan_tchunks(content: &str) -> TChunkScan {
+    scan_tchunks_impl(content, false)
+}
+
+fn find_tchunks(content: &str) -> Option<Vec<TChunkInfo>> {
+    match scan_tchunks(content) {
+        TChunkScan::Complete(chunks) => Some(chunks),
+        TChunkScan::NeedMore | TChunkScan::Invalid => None,
+    }
+}
+
+fn find_tchunks_with_markers(content: &str) -> Option<Vec<TChunkInfo>> {
+    match scan_tchunks_impl(content, true) {
+        TChunkScan::Complete(chunks) => Some(chunks),
+        TChunkScan::NeedMore | TChunkScan::Invalid => None,
+    }
+}
+
+// =============================================================================
+// Single-script T-chunk processing
+// =============================================================================
+
+pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
+    content: &str,
+    rewriter: &RscUrlRewriter,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+) -> String {
+    let Some(chunks) = find_tchunks(content) else {
+        log::warn!(
+            "RSC payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
+        );
+        return content.to_owned();
+    };
+
+    if chunks.is_empty() {
+        return rewriter.rewrite_to_string(content, origin_host, request_host, request_scheme);
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let mut last_end = 0;
+
+    for chunk in &chunks {
+        let before = &content[last_end..chunk.match_start];
+        result.push_str(
+            rewriter
+                .rewrite(before, origin_host, request_host, request_scheme)
+                .as_ref(),
+        );
+
+        let chunk_content = &content[chunk.header_end..chunk.content_end];
+        let rewritten_content =
+            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
+
+        let new_length = calculate_unescaped_byte_length(&rewritten_content);
+        let new_length_hex = format!("{new_length:x}");
+
+        result.push_str(&content[chunk.match_start..chunk.id_end]);
+        result.push_str(":T");
+        result.push_str(&new_length_hex);
+        result.push(',');
+        result.push_str(&rewritten_content);
+
+        last_end = chunk.content_end;
+    }
+
+    let remaining = &content[last_end..];
+    result.push_str(
+        rewriter
+            .rewrite(remaining, origin_host, request_host, request_scheme)
+            .as_ref(),
+    );
+
+    result
+}
+
+// =============================================================================
+// Cross-script RSC processing
+// =============================================================================
+
+fn calculate_unescaped_byte_length_skip_markers(s: &str) -> usize {
+    EscapeSequenceIter::with_marker(s, RSC_MARKER.as_bytes())
+        .map(|e| e.byte_count)
+        .sum()
+}
+
+/// Process multiple RSC script payloads together, handling cross-script T-chunks.
+#[must_use]
+pub fn rewrite_rsc_scripts_combined(
+    payloads: &[&str],
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+) -> Vec<String> {
+    let rewriter = RscUrlRewriter::new();
+
+    rewrite_rsc_scripts_combined_with_limit(
+        payloads,
+        &rewriter,
+        origin_host,
+        request_host,
+        request_scheme,
+        DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
+    )
+}
+
+fn payload_contains_incomplete_tchunk(payload: &str) -> bool {
+    let mut search_pos = 0;
+    while search_pos < payload.len() {
+        let Some(cap) = TCHUNK_PATTERN.captures(&payload[search_pos..]) else {
+            break;
+        };
+
+        let m = cap.get(0).expect("T-chunk match should exist");
+        let header_end = search_pos + m.end();
+
+        let length_hex = cap.get(2).expect("T-chunk length should exist").as_str();
+        let Some(declared_length) = usize::from_str_radix(length_hex, 16)
+            .ok()
+            .filter(|&len| len <= MAX_REASONABLE_TCHUNK_LENGTH)
+        else {
+            return true;
+        };
+
+        let (pos, consumed) = consume_unescaped_bytes(payload, header_end, declared_length);
+        if consumed < declared_length {
+            return true;
+        }
+
+        search_pos = pos;
+    }
+
+    false
+}
+
+pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
+    payloads: &[&str],
+    rewriter: &RscUrlRewriter,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+    max_combined_payload_bytes: usize,
+) -> Vec<String> {
+    let Some((_, preceding_payloads)) = payloads.split_last() else {
+        return Vec::new();
+    };
+
+    // Early exit if no payload contains the origin host - avoids regex compilation
+    if !payloads.iter().any(|p| p.contains(origin_host)) {
+        return payloads.iter().map(|p| (*p).to_owned()).collect();
+    }
+
+    if payloads.len() == 1 {
+        return vec![rewrite_rsc_tchunks_with_rewriter(
+            payloads[0],
+            rewriter,
+            origin_host,
+            request_host,
+            request_scheme,
+        )];
+    }
+
+    let max_combined_payload_bytes = if max_combined_payload_bytes == 0 {
+        DEFAULT_MAX_COMBINED_PAYLOAD_BYTES
+    } else {
+        max_combined_payload_bytes
+    };
+
+    // Check total size before allocating combined buffer
+    let total_size: usize = payloads.iter().map(|p| p.len()).sum::<usize>()
+        + preceding_payloads.len() * RSC_MARKER.len();
+
+    if total_size > max_combined_payload_bytes {
+        // Avoid allocating a large combined buffer. If the payloads contain cross-script T-chunks,
+        // per-script rewriting is unsafe because it may rewrite T-chunk content without updating
+        // the original header, breaking React hydration.
+        log::warn!(
+            "RSC combined payload size {total_size} exceeds limit {max_combined_payload_bytes}, skipping cross-script combining"
+        );
+
+        if payloads
+            .iter()
+            .any(|p| payload_contains_incomplete_tchunk(p))
+        {
+            log::warn!(
+                "RSC payloads contain cross-script T-chunks; skipping RSC URL rewriting to avoid breaking hydration (consider increasing framework.nextjs.max_combined_payload_bytes)"
+            );
+            return payloads.iter().map(|p| (*p).to_owned()).collect();
+        }
+
+        return payloads
+            .iter()
+            .map(|p| {
+                rewrite_rsc_tchunks_with_rewriter(
+                    p,
+                    rewriter,
+                    origin_host,
+                    request_host,
+                    request_scheme,
+                )
+            })
+            .collect();
+    }
+
+    // Markers preserve script boundaries, but inserting one inside an escape
+    // changes its decoded length. Preserve this group rather than emitting a
+    // header counted differently by the classifier and the marker-aware scan.
+    for payload in preceding_payloads {
+        let mut iter = EscapeSequenceIter::new(payload);
+        loop {
+            if iter.has_partial_escape() {
+                return payloads
+                    .iter()
+                    .map(|payload| (*payload).to_owned())
+                    .collect();
+            }
+            if iter.next().is_none() {
+                break;
+            }
+        }
+    }
+
+    let mut combined = String::with_capacity(total_size);
+    combined.push_str(payloads[0]);
+    for payload in &payloads[1..] {
+        combined.push_str(RSC_MARKER);
+        combined.push_str(payload);
+    }
+
+    let Some(chunks) = find_tchunks_with_markers(&combined) else {
+        log::warn!(
+            "RSC combined payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
+        );
+        return payloads.iter().map(|p| (*p).to_owned()).collect();
+    };
+    if chunks.is_empty() {
+        return payloads
+            .iter()
+            .map(|p| rewriter.rewrite_to_string(p, origin_host, request_host, request_scheme))
+            .collect();
+    }
+
+    let mut result = String::with_capacity(combined.len());
+    let mut last_end = 0;
+
+    for chunk in &chunks {
+        let before = &combined[last_end..chunk.match_start];
+        result.push_str(
+            rewriter
+                .rewrite(before, origin_host, request_host, request_scheme)
+                .as_ref(),
+        );
+
+        let chunk_content = &combined[chunk.header_end..chunk.content_end];
+        let rewritten_content =
+            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
+
+        let new_length = calculate_unescaped_byte_length_skip_markers(&rewritten_content);
+        let new_length_hex = format!("{new_length:x}");
+
+        result.push_str(&combined[chunk.match_start..chunk.id_end]);
+        result.push_str(":T");
+        result.push_str(&new_length_hex);
+        result.push(',');
+        result.push_str(&rewritten_content);
+
+        last_end = chunk.content_end;
+    }
+
+    let remaining = &combined[last_end..];
+    result.push_str(
+        rewriter
+            .rewrite(remaining, origin_host, request_host, request_scheme)
+            .as_ref(),
+    );
+
+    result.split(RSC_MARKER).map(String::from).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tchunk_boundary_preserves_partial_scheme_colon() {
+        let rewriter = RscUrlRewriter::new();
+        for slashes in ["//", r"\/\/"] {
+            let content = format!(r#"{{"u":"https:{slashes}origin.example.com/a"}}"#);
+            // Cover every boundary within the scheme, including the reported T7 case.
+            for length in 7..=12 {
+                let payload = format!("1:T{length:x},{content}");
+                for request_host in [
+                    "origin.example.com",
+                    "short.example.com",
+                    "longer.proxy.example.com",
+                ] {
+                    let expected = payload.replace("origin.example.com", request_host);
+                    for payloads in [vec![payload.as_str()], vec![payload.as_str(), "2:T4,done"]] {
+                        let result = rewrite_rsc_scripts_combined_with_limit(
+                            &payloads,
+                            &rewriter,
+                            "origin.example.com",
+                            request_host,
+                            "https",
+                            DEFAULT_MAX_COMBINED_PAYLOAD_BYTES,
+                        );
+
+                        assert_eq!(
+                            result[0], expected,
+                            "should preserve the URL and T-length for {payload}"
+                        );
+                        assert_eq!(
+                            result.len(),
+                            payloads.len(),
+                            "should preserve script boundaries"
+                        );
+                        if result.len() == 2 {
+                            assert_eq!(
+                                result[1], "2:T4,done",
+                                "should preserve the following T-chunk"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tchunk_length_recalculation() {
+        let content = r#"1a:T29,{"url":"https://origin.example.com/path"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert!(
+            result.contains("test.example.com"),
+            "URL should be rewritten"
+        );
+        assert!(
+            result.starts_with("1a:T27,"),
+            "T-chunk length should be updated from 29 (41) to 27 (39). Got: {result}"
+        );
+    }
+
+    #[test]
+    fn tchunk_length_recalculation_with_length_increase() {
+        let content = r#"1a:T1c,{"url":"https://short.io/x"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "short.io",
+            "test.example.com",
+            "https",
+        );
+
+        assert!(
+            result.contains("test.example.com"),
+            "URL should be rewritten"
+        );
+        assert!(
+            result.starts_with("1a:T24,"),
+            "T-chunk length should be updated from 1c (28) to 24 (36). Got: {result}"
+        );
+    }
+
+    #[test]
+    fn incremental_scan_waits_only_for_incomplete_escapes() {
+        for (escape, length) in [
+            (r"\n", 1),
+            (r#"\""#, 1),
+            (r"\\", 1),
+            (r"\x41", 1),
+            (r"\u0041", 1),
+            (r"\ud83d\ude00", 4),
+        ] {
+            let header = format!("1:T{length:x},");
+            for split in 0..escape.len() {
+                let incomplete = format!("{header}{}", &escape[..split]);
+                let TChunkStep::Pending(pending) = next_tchunk(&incomplete, 0, None, None, true)
+                else {
+                    panic!("should retain incomplete escape {escape} at byte {split}");
+                };
+                let complete = format!("{header}{escape}");
+                assert!(
+                    matches!(
+                        next_tchunk(&complete, 0, Some(pending), None, true),
+                        TChunkStep::Found(_)
+                    ),
+                    "should resume and release complete escape {escape} at byte {split}"
+                );
+            }
+        }
+        for content in [
+            r"1:T3,\ud83d!",
+            r"1:T3,\ud83d\u0041",
+            r"1:T6,\uZZZZ",
+            r"1:T2,\q",
+        ] {
+            assert!(
+                matches!(
+                    next_tchunk(content, 0, None, None, true),
+                    TChunkStep::Found(_)
+                ),
+                "should not hold a disproved escape or surrogate pair: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn escapes_split_between_scripts_preserve_the_group_unchanged() {
+        for escape in [r"\n", r"\x41", r"\u0041", r"\ud83d\ude00"] {
+            let length = calculate_unescaped_byte_length(escape);
+            for split in 1..escape.len() {
+                let first = format!("1:T{length:x},{}", &escape[..split]);
+                let second = format!("{}\nhttps://origin.example.com/path/", &escape[split..]);
+                let payloads = [first.as_str(), second.as_str()];
+                let rewritten = rewrite_rsc_scripts_combined(
+                    &payloads,
+                    "origin.example.com",
+                    "proxy.example.com",
+                    "https",
+                );
+                assert_eq!(
+                    rewritten, payloads,
+                    "should preserve the group when a marker would split {escape} at byte {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_payload_escape_splits_preserve_declared_lengths() {
+        for body in [
+            r"\x41\x42",
+            r"a\nb",
+            r#"{\"a\":\"b\"}"#,
+            r"\ud83d\ude00",
+            r"\\\x41",
+        ] {
+            let length = calculate_unescaped_byte_length(body);
+            let header = format!("1:T{length:x},");
+            let document = format!("{header}{body}\nhttps://origin.example.com/path/");
+            for split in header.len()..header.len() + body.len() {
+                let payloads = [&document[..split], &document[split..]];
+                let rewritten = rewrite_rsc_scripts_combined(
+                    &payloads,
+                    "origin.example.com",
+                    "origin.example.com",
+                    "https",
+                );
+                assert_eq!(
+                    rewritten.concat(),
+                    document,
+                    "should preserve lengths for an identity rewrite at split {split} of {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn calculate_unescaped_byte_length_handles_common_escapes() {
+        assert_eq!(calculate_unescaped_byte_length("hello"), 5);
+        assert_eq!(calculate_unescaped_byte_length(r"\n"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\r\n"), 2);
+        assert_eq!(calculate_unescaped_byte_length(r#"\""#), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\\"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\x41"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\u0041"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\u00e9"), 2);
+    }
+
+    #[test]
+    fn rejects_tchunk_lengths_that_split_a_decoded_character() {
+        for content in ["1:T1,€", r"1:T1,\ud83d\ude00"] {
+            assert!(
+                matches!(scan_tchunks(content), TChunkScan::Invalid),
+                "plain scanner should reject a split decoded character: {content}"
+            );
+            assert!(
+                matches!(scan_tchunks_impl(content, true), TChunkScan::Invalid),
+                "marker-aware scanner should reject a split decoded character: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_tchunks() {
+        let content = r#"1a:T1c,{"url":"https://short.io/x"}\n1b:T1c,{"url":"https://short.io/y"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "short.io",
+            "test.example.com",
+            "https",
+        );
+
+        assert!(
+            result.contains("test.example.com"),
+            "URLs should be rewritten"
+        );
+        let count = result.matches(":T24,").count();
+        assert_eq!(count, 2, "Both T-chunks should have updated lengths");
+    }
+
+    #[test]
+    fn cross_script_tchunk_rewriting() {
+        let script0 = r"other:data\n1a:T3e,partial content";
+        let script1 = " with https://origin.example.com/page goes here";
+
+        let combined_content = "partial content with https://origin.example.com/page goes here";
+        let combined_len = calculate_unescaped_byte_length(combined_content);
+        println!("Combined T-chunk content length: {combined_len} bytes = 0x{combined_len:x}");
+
+        let payloads: Vec<&str> = vec![script0, script1];
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(results.len(), 2, "Should return same number of scripts");
+        assert!(
+            results[1].contains("test.example.com"),
+            "URL in script 1 should be rewritten. Got: {}",
+            results[1]
+        );
+
+        let rewritten_content = "partial content with https://test.example.com/page goes here";
+        let rewritten_len = calculate_unescaped_byte_length(rewritten_content);
+        let expected_header = format!(":T{rewritten_len:x},");
+        assert!(
+            results[0].contains(&expected_header),
+            "T-chunk length in script 0 should be updated to {}. Got: {}",
+            expected_header,
+            results[0]
+        );
+    }
+
+    #[test]
+    fn cross_script_preserves_non_tchunk_content() {
+        let script0 = r#"{"url":"https://origin.example.com/first"}\n1a:T38,partial"#;
+        let script1 = " content with https://origin.example.com/page end";
+
+        let payloads: Vec<&str> = vec![script0, script1];
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert!(
+            results[0].contains("test.example.com/first"),
+            "URL outside T-chunk should be rewritten. Got: {}",
+            results[0]
+        );
+
+        assert!(
+            results[1].contains("test.example.com/page"),
+            "URL inside cross-script T-chunk should be rewritten. Got: {}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn preserves_protocol_relative_urls() {
+        let input = r#"{"url":"//origin.example.com/path"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let rewritten =
+            rewriter.rewrite_to_string(input, "origin.example.com", "proxy.example.com", "https");
+
+        assert!(
+            rewritten.contains(r#""url":"//proxy.example.com/path""#),
+            "Protocol-relative URL should remain protocol-relative. Got: {rewritten}",
+        );
+    }
+
+    #[test]
+    fn rewrites_bare_host_occurrences() {
+        let input = r#"{"siteProductionDomain":"origin.example.com"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let rewritten =
+            rewriter.rewrite_to_string(input, "origin.example.com", "proxy.example.com", "https");
+
+        assert!(
+            rewritten.contains(r#""siteProductionDomain":"proxy.example.com""#),
+            "Bare host should be rewritten inside RSC payload. Got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn bare_host_rewrite_respects_hostname_boundaries() {
+        let input = r#"{"sub":"cdn.origin.example.com","prefix":"notorigin.example.com","suffix":"origin.example.com.uk","path":"origin.example.com/news","exact":"origin.example.com"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let rewritten =
+            rewriter.rewrite_to_string(input, "origin.example.com", "proxy.example.com", "https");
+
+        assert!(
+            rewritten.contains(r#""sub":"cdn.origin.example.com""#),
+            "Subdomain should not be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""prefix":"notorigin.example.com""#),
+            "Prefix substring should not be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""suffix":"origin.example.com.uk""#),
+            "Suffix domain should not be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""path":"proxy.example.com/news""#),
+            "Bare host with path should be rewritten. Got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#""exact":"proxy.example.com""#),
+            "Exact bare host should be rewritten. Got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn single_payload_bypasses_combining() {
+        // When there's only one payload, we should process it directly without combining
+        // Content: {"url":"https://origin.example.com/x"} = 37 bytes = 0x25 hex
+        let payload = r#"1a:T25,{"url":"https://origin.example.com/x"}"#;
+        let payloads: Vec<&str> = vec![payload];
+
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].contains("test.example.com"),
+            "Single payload should be rewritten. Got: {}",
+            results[0]
+        );
+        // The length should be updated for the rewritten URL
+        // {"url":"https://test.example.com/x"} = 35 bytes = 0x23 hex
+        assert!(
+            results[0].contains(":T23,"),
+            "T-chunk length should be updated. Got: {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn empty_payloads_returns_empty() {
+        let payloads: Vec<&str> = vec![];
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn no_origin_in_payloads_returns_unchanged() {
+        let payloads: Vec<&str> = vec![r#"1a:T10,{"key":"value"}"#, r#"1b:T10,{"foo":"bar"}"#];
+
+        let results = rewrite_rsc_scripts_combined(
+            &payloads,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(results.len(), 2);
+        // Content should be identical - note that T-chunk lengths may be recalculated
+        // even if content is unchanged (due to how the algorithm works)
+        assert!(
+            !results[0].contains("origin.example.com") && !results[0].contains("test.example.com"),
+            "No host should be present in payload without URLs"
+        );
+        assert!(
+            !results[1].contains("origin.example.com") && !results[1].contains("test.example.com"),
+            "No host should be present in payload without URLs"
+        );
+        // The content after T-chunk header should be preserved
+        assert!(
+            results[0].contains(r#"{"key":"value"}"#),
+            "Content should be preserved. Got: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains(r#"{"foo":"bar"}"#),
+            "Content should be preserved. Got: {}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn size_limit_skips_rewrite_when_cross_script_tchunk_detected() {
+        let script0 = r"other:data\n1a:T40,partial content";
+        let script1 = " with https://origin.example.com/page goes here";
+
+        let payloads: Vec<&str> = vec![script0, script1];
+        let results = rewrite_rsc_scripts_combined_with_limit(
+            &payloads,
+            &RscUrlRewriter::new(),
+            "origin.example.com",
+            "test.example.com",
+            "https",
+            1,
+        );
+
+        assert_eq!(results.len(), 2, "Should return same number of scripts");
+        assert_eq!(
+            results[0], script0,
+            "Cross-script payload should remain unchanged when size limit is exceeded"
+        );
+        assert_eq!(
+            results[1], script1,
+            "Cross-script payload should remain unchanged when size limit is exceeded"
+        );
+    }
+
+    #[test]
+    fn size_limit_rewrites_individually_when_tchunks_are_complete() {
+        let script0 = r#"1a:T25,{"url":"https://origin.example.com/x"}"#;
+        let script1 = r#"1b:T25,{"url":"https://origin.example.com/y"}"#;
+
+        let payloads: Vec<&str> = vec![script0, script1];
+        let results = rewrite_rsc_scripts_combined_with_limit(
+            &payloads,
+            &RscUrlRewriter::new(),
+            "origin.example.com",
+            "test.example.com",
+            "https",
+            1,
+        );
+
+        assert_eq!(results.len(), 2, "Should return same number of scripts");
+        assert!(
+            results[0].contains("test.example.com"),
+            "First payload should be rewritten. Got: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains("test.example.com"),
+            "Second payload should be rewritten. Got: {}",
+            results[1]
+        );
+        assert!(
+            results[0].contains(":T23,"),
+            "First payload T-chunk length should be updated. Got: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains(":T23,"),
+            "Second payload T-chunk length should be updated. Got: {}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn invalid_or_unreasonable_tchunk_length_skips_rewriting() {
+        let content = r#"1a:T10000000,{"url":"https://origin.example.com/path"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(
+            result, content,
+            "Should skip rewriting when T-chunk length is unreasonable"
+        );
+    }
+
+    #[test]
+    fn incomplete_tchunk_skips_rewriting() {
+        let content = r#"1a:Tff,{"url":"https://origin.example.com/path"}"#;
+        let rewriter = RscUrlRewriter::new();
+        let result = rewrite_rsc_tchunks_with_rewriter(
+            content,
+            &rewriter,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        );
+
+        assert_eq!(
+            result, content,
+            "Should skip rewriting when T-chunk content is incomplete"
+        );
+    }
+}

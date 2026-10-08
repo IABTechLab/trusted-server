@@ -1,0 +1,1600 @@
+//! Google Publisher Tags (GPT) integration for first-party ad serving.
+//!
+//! This module provides transparent proxying for Google's entire GPT script
+//! chain, enabling first-party ad tag delivery.
+//! GPT loads scripts in a cascade:
+//!
+//! 1. `gpt.js` – the thin bootstrap loader
+//! 2. `pubads_impl.js` – the main GPT implementation (~640 KB)
+//! 3. `pubads_impl_*.js` – lazy-loaded sub-modules (page-level ads, side rails, …)
+//! 4. Auxiliary scripts – viewability, monitoring, error reporting
+//!
+//! All of these are served from `securepubads.g.doubleclick.net`. The
+//! integration proxies these scripts through the publisher's domain
+//! while a client-side shim intercepts dynamic script insertions and
+//! rewrites their URLs to the first-party proxy so that every
+//! subsequent fetch in the cascade routes back through the trusted
+//! server.
+//!
+//! ## How It Works
+//!
+//! 1. **HTML rewriting** – The [`IntegrationAttributeRewriter`] swaps `src`/`href`
+//!    attributes pointing at Google's GPT script with a first-party URL
+//!    (`/integrations/gpt/script`).
+//! 2. **Script proxy** – [`IntegrationProxy`] endpoints serve `gpt.js`
+//!    (`/integrations/gpt/script`) and all secondary scripts
+//!    (`/integrations/gpt/pagead/*`, `/integrations/gpt/tag/*`) through the
+//!    publisher's domain. Script bodies are served **verbatim** — no
+//!    server-side domain rewriting is performed.
+//! 3. **Client-side shim** – A TypeScript module (built into the unified TSJS
+//!    bundle) installs a script guard that intercepts dynamically inserted GPT
+//!    `<script>` elements and rewrites their URLs to the first-party proxy.
+//!    This is the sole mechanism that routes the GPT cascade through the proxy.
+//!    The shim also hooks into the `googletag` API for targeting injection.
+//!
+//! The crate holds a second module, [`diagnostics`], which a deployment
+//! selects on its own as `ad-tag.google.diagnostics`.
+
+#![cfg_attr(
+    test,
+    allow(
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::panic,
+        clippy::dbg_macro,
+        clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
+    )
+)]
+
+pub mod diagnostics;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::{Request, Response, header};
+use serde::{Deserialize, Serialize};
+use url::Url;
+use validator::Validate;
+
+use trusted_server_core::constants::{
+    HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE,
+};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::{
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration,
+};
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::proxy::{ProxyRequestConfig, proxy_request};
+use trusted_server_core::settings::{IntegrationConfig, Settings};
+
+const GPT_INTEGRATION_ID: &str = "gpt";
+
+/// The name this module is selected by, in `[ad-tag]`.
+pub const MODULE: &str = "ad-tag.google";
+
+/// The builder a deployment hands to an adapter, which the registry runs when
+/// a section selects [`MODULE`].
+#[must_use]
+pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
+    trusted_server_core::integrations::IntegrationBuilder::new(
+        GPT_INTEGRATION_ID,
+        env!("CARGO_PKG_NAME"),
+        register,
+        validate,
+    )
+    .with_module_name(MODULE)
+}
+
+/// Primary Google domain that serves GPT scripts.
+const SECUREPUBADS_HOST: &str = "securepubads.g.doubleclick.net";
+
+/// Integration route prefix for all GPT proxy endpoints.
+const ROUTE_PREFIX: &str = "/integrations/gpt";
+
+/// Configuration for the Google Publisher Tags integration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct GptConfig {
+    /// Enable page-level `ts=true` delivery attribution in GAM.
+    #[serde(default)]
+    pub gam_attribution_enabled: bool,
+
+    /// URL for the GPT bootstrap script (default: Google's CDN).
+    #[serde(default = "default_script_url")]
+    #[validate(url)]
+    pub script_url: String,
+
+    /// Cache TTL for proxied GPT scripts in seconds (default: 3600 = 1 hour).
+    #[serde(default = "default_cache_ttl")]
+    #[validate(range(min = 60, max = 86400))]
+    pub cache_ttl_seconds: u32,
+
+    /// Whether to rewrite GPT script URLs in publisher HTML.
+    #[serde(default = "default_rewrite_script")]
+    pub rewrite_script: bool,
+
+    /// URL for the slim-Prebid bundle loaded post-window.load.
+    ///
+    /// When set, `installSlimPrebidLoader()` in the GPT bundle will load this
+    /// script after `window.load`, enabling scroll/refresh client-side auctions
+    /// and userID module warm-up. Set to the publisher's tsjs-prebid bundle URL.
+    ///
+    /// Override via env var: `TRUSTED_SERVER__AD-TAG__GOOGLE__SLIM_PREBID_URL`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slim_prebid_url: Option<String>,
+}
+
+impl IntegrationConfig for GptConfig {}
+
+/// Google Publisher Tags integration implementation.
+///
+/// Proxies the full GPT script cascade through first-party endpoints.
+/// Script bodies are served verbatim; the client-side GPT shim handles
+/// URL rewriting so that every script in the cascade routes back through
+/// the trusted server.
+pub struct GptIntegration {
+    config: GptConfig,
+}
+
+impl GptIntegration {
+    fn new(config: GptConfig) -> Arc<Self> {
+        Arc::new(Self { config })
+    }
+
+    fn error(message: impl Into<String>) -> TrustedServerError {
+        TrustedServerError::Integration {
+            integration: GPT_INTEGRATION_ID.to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// Build the upstream URL for a proxied GPT request.
+    ///
+    /// Strips the integration prefix from the request path and constructs
+    /// a full URL on the GPT host, preserving the original path and query.
+    ///
+    /// Returns `None` if `request_path` does not start with [`ROUTE_PREFIX`].
+    fn build_upstream_url(request_path: &str, query: Option<&str>) -> Option<String> {
+        let upstream_path = request_path.strip_prefix(ROUTE_PREFIX)?;
+        let query_part = query.map(|q| format!("?{}", q)).unwrap_or_default();
+        Some(format!(
+            "https://{SECUREPUBADS_HOST}{upstream_path}{query_part}"
+        ))
+    }
+
+    fn build_proxy_config<'a>(
+        target_url: &'a str,
+        req: &Request<EdgeBody>,
+    ) -> ProxyRequestConfig<'a> {
+        let mut config = ProxyRequestConfig::new(target_url)
+            .with_streaming()
+            .without_forward_headers();
+        config.follow_redirects = false;
+        config.forward_ec_id = false;
+
+        Self::apply_request_header_allowlist(config, req)
+    }
+
+    fn apply_request_header_allowlist<'a>(
+        mut config: ProxyRequestConfig<'a>,
+        req: &Request<EdgeBody>,
+    ) -> ProxyRequestConfig<'a> {
+        for header_name in [
+            &HEADER_ACCEPT,
+            &HEADER_ACCEPT_LANGUAGE,
+            &HEADER_ACCEPT_ENCODING,
+        ] {
+            if let Some(value) = req.headers().get(header_name).cloned() {
+                config = config.with_header(header_name.clone(), value);
+            }
+        }
+
+        config.with_header(
+            header::USER_AGENT,
+            http::HeaderValue::from_static("TrustedServer/1.0"),
+        )
+    }
+
+    fn ensure_successful_gpt_asset_response(
+        response: &Response<EdgeBody>,
+        context: &str,
+    ) -> Result<(), Report<TrustedServerError>> {
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        log::error!(
+            "GPT proxy upstream returned status {} for {}",
+            status,
+            context
+        );
+        Err(Report::new(Self::error(format!(
+            "{context}: upstream returned {status}"
+        ))))
+    }
+
+    fn finalize_gpt_asset_response(&self, response: Response<EdgeBody>) -> Response<EdgeBody> {
+        let (parts, body) = response.into_parts();
+        let status = parts.status;
+        let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
+        let content_encoding = parts.headers.get(header::CONTENT_ENCODING).cloned();
+        let etag = parts.headers.get(header::ETAG).cloned();
+        let last_modified = parts.headers.get(header::LAST_MODIFIED).cloned();
+        let upstream_vary = parts
+            .headers
+            .get(header::VARY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let mut finalized = Response::new(body);
+        *finalized.status_mut() = status;
+        finalized
+            .headers_mut()
+            .insert("X-GPT-Proxy", http::HeaderValue::from_static("true"));
+
+        if let Some(content_type) = content_type {
+            finalized
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
+        }
+
+        if let Some(etag) = etag {
+            finalized.headers_mut().insert(header::ETAG, etag);
+        }
+
+        if let Some(last_modified) = last_modified {
+            finalized
+                .headers_mut()
+                .insert(header::LAST_MODIFIED, last_modified);
+        }
+
+        if let Some(content_encoding) = content_encoding {
+            finalized
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, content_encoding);
+            finalized.headers_mut().insert(
+                header::VARY,
+                http::HeaderValue::from_str(&Self::vary_with_accept_encoding(
+                    upstream_vary.as_deref(),
+                ))
+                .expect("should build GPT Vary header"),
+            );
+        }
+
+        if status.is_success() {
+            finalized.headers_mut().insert(
+                header::CACHE_CONTROL,
+                http::HeaderValue::from_str(&format!(
+                    "public, max-age={}",
+                    self.config.cache_ttl_seconds
+                ))
+                .expect("should build GPT Cache-Control header"),
+            );
+        }
+
+        finalized
+    }
+
+    fn vary_with_accept_encoding(upstream_vary: Option<&str>) -> String {
+        match upstream_vary.map(str::trim) {
+            Some("*") => "*".to_string(),
+            Some(vary) if !vary.is_empty() => {
+                if vary
+                    .split(',')
+                    .any(|header_name| header_name.trim().eq_ignore_ascii_case("accept-encoding"))
+                {
+                    vary.to_string()
+                } else {
+                    format!("{vary}, Accept-Encoding")
+                }
+            }
+            _ => "Accept-Encoding".to_string(),
+        }
+    }
+
+    async fn proxy_gpt_asset(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+        target_url: &str,
+        context: &str,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let config = Self::build_proxy_config(target_url, &req);
+        let response = proxy_request(settings, req, config, services)
+            .await
+            .change_context(Self::error(context))?;
+
+        Self::ensure_successful_gpt_asset_response(&response, context)?;
+        Ok(self.finalize_gpt_asset_response(response))
+    }
+
+    /// Check if a URL points at Google's GPT bootstrap script (`gpt.js`).
+    ///
+    /// Only matches the canonical host:
+    /// - `securepubads.g.doubleclick.net/tag/js/gpt.js`
+    ///
+    /// This matcher is intentionally strict and only controls HTML attribute
+    /// rewriting for the initial bootstrap tag. The `script_url` config option
+    /// still controls which upstream URL `/integrations/gpt/script` fetches.
+    fn is_gpt_script_url(url: &str) -> bool {
+        let parsed = Url::parse(url).or_else(|_| {
+            let stripped = url
+                .strip_prefix("//")
+                .ok_or(url::ParseError::RelativeUrlWithoutBase)?;
+            Url::parse(&format!("https://{stripped}"))
+        });
+
+        let Ok(parsed) = parsed else {
+            return false;
+        };
+
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+
+        host.eq_ignore_ascii_case(SECUREPUBADS_HOST)
+            && parsed.path().eq_ignore_ascii_case("/tag/js/gpt.js")
+    }
+
+    /// Fetch and serve the GPT bootstrap script (`gpt.js`).
+    ///
+    /// The script body is served verbatim — domain rewriting for the
+    /// cascade (`pubads_impl`, sub-modules, etc.) is handled client-side
+    /// by the GPT script guard shim.
+    async fn handle_script_serving(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let script_url = &self.config.script_url;
+        log::info!("Fetching GPT script from: {}", script_url);
+        self.proxy_gpt_asset(
+            settings,
+            services,
+            req,
+            script_url,
+            &format!("Failed to fetch GPT script from {script_url}"),
+        )
+        .await
+    }
+
+    /// Proxy a secondary GPT script (anything under `/pagead/*` or `/tag/*`).
+    ///
+    /// Requests to `/integrations/gpt/pagead/…` (or `/tag/…`) are forwarded
+    /// to `securepubads.g.doubleclick.net/…` and served verbatim. The
+    /// client-side GPT script guard handles URL rewriting for subsequent
+    /// cascade loads.
+    async fn handle_pagead_proxy(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let original_path = req.uri().path().to_string();
+        let query = req.uri().query();
+
+        let target_url = Self::build_upstream_url(&original_path, query)
+            .ok_or_else(|| Self::error(format!("Invalid GPT pagead path: {}", original_path)))?;
+
+        log::info!("GPT proxy: forwarding to {}", target_url);
+        self.proxy_gpt_asset(
+            settings,
+            services,
+            req,
+            &target_url,
+            &format!("Failed to fetch GPT resource from {target_url}"),
+        )
+        .await
+    }
+}
+
+fn build(settings: &Settings) -> Result<Option<Arc<GptIntegration>>, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<GptConfig>(MODULE)? else {
+        log::debug!("[gpt] Integration disabled or not configured");
+        return Ok(None);
+    };
+
+    Ok(Some(GptIntegration::new(config)))
+}
+
+/// Validates the GPT configuration for deployment and reports whether
+/// a section selects the integration's module.
+///
+/// # Errors
+///
+/// Returns an error when the GPT configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .module_config::<GptConfig>(MODULE)
+        .map(|config| config.is_some())
+}
+
+/// Register the GPT integration.
+///
+/// # Errors
+///
+/// Returns an error when the GPT integration runs with invalid
+/// configuration.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(integration) = build(settings)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        IntegrationRegistration::builder(GPT_INTEGRATION_ID)
+            .with_proxy(integration.clone())
+            .with_attribute_rewriter(integration.clone())
+            .with_head_injector(integration)
+            .build(),
+    ))
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for GptIntegration {
+    fn integration_name(&self) -> &'static str {
+        GPT_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![
+            self.get("/script"),
+            self.get("/pagead/*"),
+            self.get("/tag/*"),
+        ]
+    }
+
+    async fn handle(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+
+        if path == "/integrations/gpt/script" {
+            self.handle_script_serving(settings, services, req).await
+        } else if path.starts_with("/integrations/gpt/pagead/")
+            || path.starts_with("/integrations/gpt/tag/")
+        {
+            self.handle_pagead_proxy(settings, services, req).await
+        } else {
+            Err(Report::new(Self::error(format!(
+                "Unknown GPT route: {}",
+                path
+            ))))
+        }
+    }
+}
+
+impl IntegrationAttributeRewriter for GptIntegration {
+    fn integration_id(&self) -> &'static str {
+        GPT_INTEGRATION_ID
+    }
+
+    fn handles_attribute(&self, attribute: &str) -> bool {
+        self.config.rewrite_script && matches!(attribute, "src" | "href")
+    }
+
+    fn rewrite(
+        &self,
+        _attr_name: &str,
+        attr_value: &str,
+        _ctx: &IntegrationAttributeContext<'_>,
+    ) -> AttributeRewriteAction {
+        if !self.config.rewrite_script {
+            return AttributeRewriteAction::keep();
+        }
+
+        if Self::is_gpt_script_url(attr_value) {
+            // Root-relative so the browser resolves it against the page host.
+            // Note: a page-level `<base href>` participates in this resolution,
+            // so on pages that set an external base URL these resolve against
+            // that base rather than the address-bar origin — an accepted
+            // tradeoff, matching GTM/Didomi/Testlight which are also relative.
+            AttributeRewriteAction::replace("/integrations/gpt/script".to_string())
+        } else {
+            AttributeRewriteAction::keep()
+        }
+    }
+}
+
+impl IntegrationHeadInjector for GptIntegration {
+    fn integration_id(&self) -> &'static str {
+        GPT_INTEGRATION_ID
+    }
+
+    /// Injects the `tsjs.adInit` bootstrap script into `<head>`.
+    ///
+    /// ## Scroll / refresh handoff contract (Phase 1)
+    ///
+    /// `tsjs.adInit` handles **initial render only**: it wires server-side bid
+    /// targeting into GPT slots and refreshes them. Win/billing beacons fire
+    /// only from the TS render bridge in the JS bundle, where a matching
+    /// Prebid Universal Creative request proves the TS creative rendered.
+    /// It does **not** trigger refresh auctions or handle GPT slot refresh events.
+    ///
+    /// Post-`window.load`, slim-Prebid owns scroll and GPT refresh: it listens
+    /// for GPT refresh events, runs client-side auctions, and sets targeting for
+    /// subsequent impressions. SPA navigation is handled separately by
+    /// `installSpaAuctionHook()` in the GPT bundle, which re-runs the server-side
+    /// auction via `GET /_ts/page-bids` on pushState / replaceState / popstate
+    /// route changes (see `auction/endpoints.rs`).
+    /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        let gam_attribution_flag = if self.config.gam_attribution_enabled {
+            "window.__tsjs_gam_attribution_enabled=true;"
+        } else {
+            ""
+        };
+
+        let mut scripts = vec![
+            format!(
+                "<script>window.__tsjs_gpt_enabled=true;{gam_attribution_flag}\
+                 window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
+            ),
+            format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
+        ];
+
+        if let Some(ref url) = self.config.slim_prebid_url {
+            // JSON-encode the URL, then escape `</` so a configured value
+            // containing the literal `</script>` cannot close this inline tag and
+            // let trailing markup execute (standard JSON-in-HTML mitigation).
+            let encoded = serde_json::to_string(url)
+                .expect("should serialize string")
+                .replace("</", "<\\/");
+            scripts.push(format!(
+                "<script>window.__tsjs_slim_prebid_url={encoded};</script>"
+            ));
+        }
+
+        scripts
+    }
+
+    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        if self.config.gam_attribution_enabled {
+            vec![("data-ts-gam-attribution", "true")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Inline `window.tsjs.adInit` bootstrap injected at `<head>` so the bids
+/// script at `</body>` can call it before the TSJS bundle has loaded.
+///
+/// The bundle's idempotent implementation in
+/// `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` later overwrites this stub.
+/// Both implementations guard the one-time-per-page setup with
+/// `window.tsjs.servicesEnabled` so neither double-enables services if the
+/// publisher's own init code also calls `googletag.enableServices()`.
+const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
+
+// Default value functions
+
+fn default_script_url() -> String {
+    "https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()
+}
+
+fn default_cache_ttl() -> u32 {
+    3600
+}
+
+fn default_rewrite_script() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Method;
+    use trusted_server_core::constants::HEADER_X_FORWARDED_FOR;
+    use trusted_server_core::integrations::IntegrationDocumentState;
+    use trusted_server_core::test_support::tests::create_test_settings;
+
+    fn test_config() -> GptConfig {
+        GptConfig {
+            gam_attribution_enabled: false,
+            script_url: default_script_url(),
+            cache_ttl_seconds: 3600,
+            rewrite_script: true,
+            slim_prebid_url: None,
+        }
+    }
+
+    fn test_context() -> IntegrationAttributeContext<'static> {
+        IntegrationAttributeContext {
+            attribute_name: "src",
+            element_name: "script",
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+        }
+    }
+
+    fn build_http_request(method: Method, uri: &str) -> http::Request<EdgeBody> {
+        http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(EdgeBody::empty())
+            .expect("should build HTTP request")
+    }
+
+    #[test]
+    fn gam_attribution_defaults_to_disabled() {
+        let config: GptConfig =
+            serde_json::from_value(serde_json::json!({})).expect("should parse defaults");
+
+        assert!(!config.gam_attribution_enabled);
+    }
+
+    #[test]
+    fn gam_attribution_deserializes_explicit_values() {
+        let disabled: GptConfig = serde_json::from_value(serde_json::json!({
+            "gam_attribution_enabled": false
+        }))
+        .expect("should parse explicit false");
+        let enabled: GptConfig = serde_json::from_value(serde_json::json!({
+            "gam_attribution_enabled": true
+        }))
+        .expect("should parse explicit true");
+
+        assert!(!disabled.gam_attribution_enabled);
+        assert!(enabled.gam_attribution_enabled);
+    }
+
+    // -- URL detection --
+
+    #[test]
+    fn gpt_script_url_detection() {
+        assert!(
+            GptIntegration::is_gpt_script_url(
+                "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
+            ),
+            "should match the standard GPT CDN URL"
+        );
+
+        assert!(
+            GptIntegration::is_gpt_script_url("//securepubads.g.doubleclick.net/tag/js/gpt.js"),
+            "should match protocol-relative GPT CDN URLs"
+        );
+
+        assert!(
+            GptIntegration::is_gpt_script_url(
+                "https://SECUREPUBADS.G.DOUBLECLICK.NET/tag/js/gpt.js"
+            ),
+            "should match case-insensitively"
+        );
+
+        assert!(
+            !GptIntegration::is_gpt_script_url("https://example.com/script.js"),
+            "should not match unrelated URLs"
+        );
+
+        assert!(
+            !GptIntegration::is_gpt_script_url(
+                "https://securepubads.g.doubleclick.net/other/script.js"
+            ),
+            "should not match other doubleclick paths"
+        );
+
+        assert!(
+            !GptIntegration::is_gpt_script_url(
+                "https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js"
+            ),
+            "should not match when GPT host appears only in query text"
+        );
+
+        assert!(
+            !GptIntegration::is_gpt_script_url(
+                "https://cdn.example.com/assets/securepubads.g.doubleclick.net/tag/js/gpt.js"
+            ),
+            "should not match when GPT host appears only in path text"
+        );
+    }
+
+    // -- Attribute rewriter --
+
+    #[test]
+    fn attribute_rewriter_rewrites_gpt_urls() {
+        let integration = GptIntegration::new(test_config());
+        let ctx = test_context();
+
+        let result = integration.rewrite(
+            "src",
+            "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+            &ctx,
+        );
+
+        match result {
+            AttributeRewriteAction::Replace(url) => {
+                assert_eq!(
+                    url, "/integrations/gpt/script",
+                    "should rewrite to root-relative first-party script endpoint"
+                );
+            }
+            other => panic!("Expected Replace action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn attribute_rewriter_keeps_non_gpt_urls() {
+        let integration = GptIntegration::new(test_config());
+        let ctx = test_context();
+
+        let result = integration.rewrite("src", "https://cdn.example.com/analytics.js", &ctx);
+
+        assert_eq!(
+            result,
+            AttributeRewriteAction::Keep,
+            "should keep non-GPT URLs unchanged"
+        );
+    }
+
+    #[test]
+    fn attribute_rewriter_noop_when_disabled() {
+        let config = GptConfig {
+            rewrite_script: false,
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let ctx = test_context();
+
+        let result = integration.rewrite(
+            "src",
+            "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+            &ctx,
+        );
+
+        assert_eq!(
+            result,
+            AttributeRewriteAction::Keep,
+            "should keep GPT URLs when rewrite_script is disabled"
+        );
+    }
+
+    #[test]
+    fn handles_attribute_respects_config() {
+        let enabled = GptIntegration::new(test_config());
+        assert!(
+            enabled.handles_attribute("src"),
+            "should handle src when rewrite_script is true"
+        );
+        assert!(
+            enabled.handles_attribute("href"),
+            "should handle href when rewrite_script is true"
+        );
+        assert!(
+            !enabled.handles_attribute("action"),
+            "should not handle action attribute"
+        );
+
+        let disabled = GptIntegration::new(GptConfig {
+            rewrite_script: false,
+            ..test_config()
+        });
+        assert!(
+            !disabled.handles_attribute("src"),
+            "should not handle src when rewrite_script is false"
+        );
+    }
+
+    // -- GPT proxy configuration --
+
+    #[test]
+    fn build_proxy_config_uses_streaming_without_ec_forwarding_or_redirects() {
+        let req = build_http_request(
+            Method::GET,
+            "https://edge.example.com/integrations/gpt/script",
+        );
+        let config = GptIntegration::build_proxy_config(
+            "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+            &req,
+        );
+
+        assert!(
+            config.stream_passthrough,
+            "should stream GPT assets verbatim without rewrite processing"
+        );
+        assert!(
+            !config.forward_ec_id,
+            "should not append EC ID to GPT asset requests"
+        );
+        assert!(
+            !config.follow_redirects,
+            "should keep GPT asset proxying on the original single-hop trust boundary"
+        );
+    }
+
+    #[test]
+    fn build_proxy_config_forwards_only_required_headers() {
+        let mut req = build_http_request(
+            Method::GET,
+            "https://edge.example.com/integrations/gpt/script",
+        );
+        req.headers_mut().insert(
+            HEADER_ACCEPT,
+            http::HeaderValue::from_static("application/javascript"),
+        );
+        req.headers_mut().insert(
+            HEADER_ACCEPT_LANGUAGE,
+            http::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        req.headers_mut().insert(
+            HEADER_ACCEPT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+
+        let config = GptIntegration::build_proxy_config(
+            "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+            &req,
+        );
+
+        let accept = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_ACCEPT)
+            .and_then(|(_, value)| value.to_str().ok());
+        let accept_language = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_ACCEPT_LANGUAGE)
+            .and_then(|(_, value)| value.to_str().ok());
+        let user_agent = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == header::USER_AGENT)
+            .and_then(|(_, value)| value.to_str().ok());
+        let referer = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == header::REFERER)
+            .and_then(|(_, value)| value.to_str().ok());
+        let x_forwarded_for = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_X_FORWARDED_FOR)
+            .and_then(|(_, value)| value.to_str().ok());
+        let accept_encoding = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_ACCEPT_ENCODING)
+            .and_then(|(_, value)| value.to_str().ok());
+
+        assert_eq!(
+            accept,
+            Some("application/javascript"),
+            "should preserve Accept for upstream content negotiation"
+        );
+        assert_eq!(
+            accept_language,
+            Some("en-US,en;q=0.9"),
+            "should preserve Accept-Language for upstream locale negotiation"
+        );
+        assert_eq!(
+            user_agent,
+            Some("TrustedServer/1.0"),
+            "should use a stable user agent for GPT upstream requests"
+        );
+        assert_eq!(
+            referer, None,
+            "should not forward Referer when proxying GPT assets"
+        );
+        assert_eq!(
+            x_forwarded_for, None,
+            "should not forward X-Forwarded-For when proxying GPT assets"
+        );
+        assert_eq!(
+            accept_encoding,
+            Some("gzip"),
+            "should preserve the caller Accept-Encoding for streamed GPT assets"
+        );
+    }
+
+    #[test]
+    fn build_proxy_config_does_not_advertise_accept_encoding_when_client_omits_it() {
+        let req = build_http_request(
+            Method::GET,
+            "https://edge.example.com/integrations/gpt/script",
+        );
+        let config = GptIntegration::build_proxy_config(
+            "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+            &req,
+        );
+
+        let accept_encoding = config
+            .headers
+            .iter()
+            .find(|(name, _)| name == HEADER_ACCEPT_ENCODING)
+            .and_then(|(_, value)| value.to_str().ok());
+
+        assert_eq!(
+            accept_encoding, None,
+            "should avoid advertising encodings the client did not request"
+        );
+    }
+
+    #[test]
+    fn finalize_gpt_asset_response_rebuilds_successful_responses_with_safe_headers() {
+        let integration = GptIntegration::new(test_config());
+        let response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .header(header::ETAG, "\"gpt-etag\"")
+            .header(header::LAST_MODIFIED, "Thu, 13 Mar 2025 08:00:00 GMT")
+            .header(header::CONTENT_ENCODING, "br")
+            .header(header::VARY, "Origin")
+            .header(header::SET_COOKIE, "gpt=1; Secure")
+            .body(EdgeBody::empty())
+            .expect("should build GPT response");
+        let response = integration.finalize_gpt_asset_response(response);
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should preserve successful upstream statuses"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("X-GPT-Proxy")
+                .and_then(|value| value.to_str().ok()),
+            Some("true"),
+            "should tag proxied GPT responses"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript; charset=utf-8"),
+            "should preserve upstream content type for GPT assets"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"gpt-etag\""),
+            "should preserve upstream ETag validators for GPT assets"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok()),
+            Some("Thu, 13 Mar 2025 08:00:00 GMT"),
+            "should preserve upstream Last-Modified validators for GPT assets"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("br"),
+            "should preserve upstream content encoding for GPT assets"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some("Origin, Accept-Encoding"),
+            "should normalize Vary when returning encoded GPT assets"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=3600"),
+            "should add cache headers for successful GPT asset responses"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "should not project unrelated upstream headers to first-party clients"
+        );
+    }
+
+    #[test]
+    fn ensure_successful_gpt_asset_response_rejects_non_success_statuses() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .body(EdgeBody::empty())
+            .expect("should build service unavailable response");
+        let err = GptIntegration::ensure_successful_gpt_asset_response(
+            &response,
+            "Failed to fetch GPT script from https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+        )
+        .expect_err("should reject non-success GPT upstream responses");
+
+        match err.current_context() {
+            TrustedServerError::Integration {
+                integration,
+                message,
+            } => {
+                assert_eq!(
+                    integration, GPT_INTEGRATION_ID,
+                    "should classify GPT upstream failures as integration errors"
+                );
+                assert!(
+                    message.contains("upstream returned 503 Service Unavailable"),
+                    "should report the upstream failure status"
+                );
+            }
+            other => panic!("expected GPT integration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_preserves_wildcard() {
+        let vary = GptIntegration::vary_with_accept_encoding(Some("*"));
+
+        assert_eq!(vary, "*", "should preserve wildcard Vary values");
+    }
+
+    #[test]
+    fn vary_with_accept_encoding_adds_accept_encoding_when_missing() {
+        let vary = GptIntegration::vary_with_accept_encoding(Some("Origin"));
+
+        assert_eq!(
+            vary, "Origin, Accept-Encoding",
+            "should explicitly vary encoded GPT assets on Accept-Encoding"
+        );
+    }
+
+    // -- Route registration --
+
+    #[test]
+    fn routes_registered() {
+        let integration = GptIntegration::new(test_config());
+        let routes = integration.routes();
+
+        assert_eq!(routes.len(), 3, "should register three routes");
+
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/gpt/script" && r.method == Method::GET),
+            "should register the bootstrap script endpoint"
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/gpt/pagead/*" && r.method == Method::GET),
+            "should register the pagead wildcard proxy"
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/gpt/tag/*" && r.method == Method::GET),
+            "should register the tag wildcard proxy"
+        );
+    }
+
+    // -- Build / register --
+
+    #[test]
+    fn build_requires_config() {
+        let settings = create_test_settings();
+        assert!(
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_none(),
+            "should not build without integration config"
+        );
+    }
+
+    #[test]
+    fn build_with_valid_config() {
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config(
+                "ad-tag",
+                "ad-tag.google",
+                &serde_json::json!({
+                    "script_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                    "cache_ttl_seconds": 3600,
+                    "rewrite_script": true
+                }),
+            )
+            .expect("should insert GPT config");
+
+        assert!(
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_some(),
+            "should build with valid integration config"
+        );
+    }
+
+    #[test]
+    fn build_without_the_integration_named_returns_none() {
+        let settings = create_test_settings();
+
+        assert!(
+            build(&settings)
+                .expect("should evaluate integration build")
+                .is_none(),
+            "should not build an integration no section selects"
+        );
+    }
+
+    // -- Upstream URL building --
+
+    #[test]
+    fn build_upstream_url_strips_prefix_and_preserves_path() {
+        let url = GptIntegration::build_upstream_url(
+            "/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js",
+            None,
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js"
+            ),
+            "should strip the integration prefix and build the upstream URL"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_preserves_query_string() {
+        let url = GptIntegration::build_upstream_url(
+            "/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js",
+            Some("cb=123&foo=bar"),
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?cb=123&foo=bar"
+            ),
+            "should preserve the query string in the upstream URL"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_handles_tag_routes() {
+        let url =
+            GptIntegration::build_upstream_url("/integrations/gpt/tag/js/gpt.js", Some("v=2"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://securepubads.g.doubleclick.net/tag/js/gpt.js?v=2"),
+            "should handle /tag/* routes correctly"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_returns_none_for_invalid_prefix() {
+        let url = GptIntegration::build_upstream_url("/some/other/path", None);
+        assert!(
+            url.is_none(),
+            "should return None when path does not start with the integration prefix"
+        );
+    }
+
+    #[test]
+    fn build_upstream_url_handles_empty_path_after_prefix() {
+        let url = GptIntegration::build_upstream_url("/integrations/gpt", None);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://securepubads.g.doubleclick.net"),
+            "should handle path that is exactly the prefix"
+        );
+    }
+
+    // -- Head injector --
+
+    #[test]
+    fn head_injector_emits_enable_flag() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(inserts.len(), 2, "should emit exactly two head inserts");
+        assert_eq!(
+            inserts[0],
+            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>",
+            "should set the enable flag and call the GPT shim activation function"
+        );
+        assert!(
+            integration.tsjs_script_tag_attributes().is_empty(),
+            "should not authorize GAM attribution metadata by default"
+        );
+    }
+
+    #[test]
+    fn gam_attribution_true_adds_both_activation_signals_without_a_new_insert() {
+        let integration = GptIntegration::new(GptConfig {
+            gam_attribution_enabled: true,
+            ..test_config()
+        });
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&context);
+
+        assert_eq!(inserts.len(), 2, "should not add another head insert");
+        assert!(
+            inserts[0].contains("window.__tsjs_gam_attribution_enabled=true;"),
+            "should activate the early bootstrap marker"
+        );
+        assert_eq!(
+            integration.tsjs_script_tag_attributes(),
+            vec![("data-ts-gam-attribution", "true")],
+            "should authorize the bundle fallback on the publisher tag"
+        );
+    }
+
+    #[test]
+    fn head_inserts_includes_ts_ad_init_with_synchronous_bids_read() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+        let combined = inserts.join("");
+        assert!(combined.contains("ts.adInit"), "should define tsjs.adInit");
+        assert!(
+            combined.contains("ts.bids"),
+            "should read tsjs.bids synchronously"
+        );
+        assert!(
+            combined.contains("ts_initial"),
+            "should set ts_initial sentinel"
+        );
+        assert!(
+            combined.contains("addEventListener(\"slotRequested\""),
+            "should observe publisher GPT requests before delayed adInit"
+        );
+        assert!(
+            combined.contains("addEventListener(\"slotRenderEnded\""),
+            "should observe publisher GPT renders before delayed adInit"
+        );
+        assert!(
+            !combined.contains("sendBeacon"),
+            "inline bootstrap lifecycle ownership must not fire win/billing beacons"
+        );
+        assert!(
+            !combined.contains("getTargeting(\"hb_adid\")"),
+            "inline bootstrap must not treat GPT targeting as winner proof"
+        );
+        assert!(
+            !combined.contains("/ts-bids"),
+            "must NOT fetch /ts-bids — bids are inline on the page"
+        );
+        assert!(
+            !combined.contains("bidsPromise"),
+            "must NOT use bidsPromise — bids are synchronous"
+        );
+        assert!(
+            !combined.contains("__ts_request_id"),
+            "must NOT reference request_id — no longer used"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_installs_fallback_scheduler() {
+        // The `</body>` bids script hands its payload to
+        // `tsjs.scheduleInitialAdInit`. The bundle installs the real scheduler,
+        // but when the bundle fails to load this head bootstrap must provide
+        // the degradation path — otherwise a failed bundle request would leave
+        // initial server-side ads uninitialized. Executable coverage of the
+        // fallback lives in the Vitest suite (gpt_bootstrap.test.ts).
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("ts.scheduleInitialAdInit"),
+            "should install the fallback scheduler for bundle-load failures"
+        );
+        assert!(
+            combined.contains("navGeneration"),
+            "fallback scheduler should honor the navigation-generation guard"
+        );
+        assert!(
+            combined.contains("requestAnimationFrame"),
+            "fallback scheduler should defer past hydration frames"
+        );
+        assert!(
+            combined.contains("\"load\""),
+            "fallback scheduler should gate on window load"
+        );
+        // The no-retry-timer property is owned by the executable suite
+        // (gpt_bootstrap.test.ts asserts adInit runs exactly once); a
+        // `!contains("setTimeout")` over the whole joined head-insert output
+        // would misattribute any future unrelated timer to the scheduler.
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_uses_css_safe_div_prefix_lookup() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("querySelectorAll(\"[id]\")"),
+            "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
+        );
+        assert!(
+            combined.contains("candidate.id.startsWith(divId)"),
+            "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
+        );
+        assert!(
+            !combined.contains("[id^='\" + slot.div_id"),
+            "bootstrap must not build a CSS attribute selector from raw div_id"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_installs_inner_div_slot_handoff() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("gptSlotHandoffs"),
+            "bootstrap should keep late publisher slot handoff state on window.tsjs"
+        );
+        assert!(
+            combined.contains("__tsSlotHandoffPatched"),
+            "bootstrap should install idempotent GPT handoff wrappers"
+        );
+        assert!(
+            combined.contains("return googletag.defineSlot") && combined.contains("actualDivId"),
+            "bootstrap should define the TS fallback on the actual inner div"
+        );
+        assert!(
+            !combined.contains("actualDivId + \"-container\""),
+            "bootstrap must not define a competing outer-container GPT slot"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_guards_enable_services_with_idempotency_flag() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("ts.servicesEnabled"),
+            "should guard enableServices/enableSingleRequest with the tsjs.servicesEnabled flag"
+        );
+        assert!(combined.contains("ts.adInit"), "should install tsjs.adInit");
+        assert!(
+            !combined.contains("googletag.pubads().refresh()"),
+            "should never call unbounded refresh() — only refresh(newSlots)"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_refreshes_ts_slots_when_initial_load_disabled() {
+        // Mirrors the bundle: when the publisher disables initial load through
+        // setConfig() or the legacy disableInitialLoad() method, display() only
+        // registers a TS-defined slot, so the bootstrap must also refresh those
+        // slots or they render blank.
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("gpt.setConfig"),
+            "bootstrap should wrap googletag.setConfig() to detect the disabled state"
+        );
+        assert!(
+            combined.contains("gpt.getConfig"),
+            "bootstrap should read GPT's modern initial-load configuration"
+        );
+        assert!(
+            combined.contains("pubads.disableInitialLoad"),
+            "bootstrap should wrap legacy disableInitialLoad() calls"
+        );
+        assert!(
+            combined.contains("gptInitialLoadDisabled"),
+            "bootstrap should record the initial-load-disabled state on window.tsjs"
+        );
+        assert!(
+            combined.contains("slotsNeedingRefresh"),
+            "bootstrap should refresh TS-defined slots when initial load is disabled"
+        );
+    }
+
+    #[test]
+    fn head_inserts_queue_gam_attribution_before_guard_and_ad_requests() {
+        let targeting_index = GPT_BOOTSTRAP_JS
+            .find("gpt.setConfig({ targeting: { ts: \"true\" } })")
+            .expect("should apply the fixed page-level GAM targeting pair");
+        let guard_index = GPT_BOOTSTRAP_JS
+            .find("if (ts.adInit) return;")
+            .expect("should retain the preinstalled adInit guard");
+        let display_index = GPT_BOOTSTRAP_JS
+            .find("googletag.display(divId);")
+            .expect("should retain the executable GPT display call");
+        let refresh_index = GPT_BOOTSTRAP_JS
+            .find("googletag.pubads().refresh(slotsNeedingRefresh);")
+            .expect("should retain the bounded GPT refresh call");
+
+        assert!(
+            targeting_index < guard_index,
+            "should enqueue attribution before the preinstalled adInit guard"
+        );
+        assert!(
+            targeting_index < display_index,
+            "should enqueue attribution before the executable display call"
+        );
+        assert!(
+            targeting_index < refresh_index,
+            "should enqueue attribution before the executable refresh call"
+        );
+    }
+
+    #[test]
+    fn head_injector_integration_id() {
+        let integration = GptIntegration::new(test_config());
+        assert_eq!(
+            IntegrationHeadInjector::integration_id(integration.as_ref()),
+            "gpt"
+        );
+    }
+
+    #[test]
+    fn head_inserts_emits_slim_prebid_url_when_configured() {
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/tsjs-prebid.min.js".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            3,
+            "should emit three head inserts when slim_prebid_url is set"
+        );
+        assert_eq!(
+            inserts[2],
+            r#"<script>window.__tsjs_slim_prebid_url="https://cdn.example.com/tsjs-prebid.min.js";</script>"#,
+            "should emit the slim-Prebid URL as a JSON-encoded string assignment"
+        );
+    }
+
+    #[test]
+    fn head_inserts_escapes_script_terminator_in_slim_prebid_url() {
+        // A configured URL containing `</script>` must not close the inline tag.
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/x</script><img src=x>".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        // The injected `</script><img ...>` must be neutralised: the only
+        // `</script>` left is the tag's own legitimate closer.
+        assert!(
+            !inserts[2].contains("</script><img"),
+            "should escape the injected </script> terminator, got: {}",
+            inserts[2]
+        );
+        assert_eq!(
+            inserts[2].matches("</script>").count(),
+            1,
+            "only the tag's own closing </script> should remain, got: {}",
+            inserts[2]
+        );
+        assert!(
+            inserts[2].contains("<\\/script>"),
+            "should emit the escaped terminator, got: {}",
+            inserts[2]
+        );
+    }
+
+    #[test]
+    fn head_inserts_omits_slim_prebid_url_when_not_configured() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should emit exactly two head inserts when slim_prebid_url is absent"
+        );
+        assert!(
+            inserts
+                .iter()
+                .all(|s| !s.contains("__tsjs_slim_prebid_url")),
+            "should not emit slim-Prebid URL tag when not configured"
+        );
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+}

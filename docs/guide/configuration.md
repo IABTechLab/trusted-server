@@ -10,12 +10,25 @@ Trusted Server uses a flexible configuration system based on:
 2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **EdgeZero Stores** - Config and secret stores for the pushed blob and runtime secret values
 
+Everything the deployment can switch on is a module, selected the same way,
+with `module`, or `modules` where several run. Read
+[Configuration Rules](/guide/configuration-rules) first. It is short, and it
+is the pattern every section below follows:
+
+```toml
+[<type>]
+module = "<name>"            # modules = [...] where several run
+
+[<type>.<name>]                # only when the selected name has settings
+setting = "value"
+```
+
 ## Quick Start
 
 ### Minimal Configuration
 
 Create `trusted-server.toml` in your project root. Generate both secret values
-first with `openssl rand -base64 32`; the placeholders below are intentionally
+first with `openssl rand -base64 32`. The placeholders below are intentionally
 rejected until replaced.
 
 ```toml
@@ -26,6 +39,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "ec_passphrase"
 ```
 
@@ -39,9 +55,10 @@ read by the deployed application at request time.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-# Secret overrides, when needed, are key names—not secret values.
+# Secret overrides, when needed, are key names, not secret values.
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
-export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+export TRUSTED_SERVER__EC__MODULE=hmac
+export TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 
 # Replace the rejected placeholder values in trusted-server.toml, then validate.
 ts config validate
@@ -55,13 +72,14 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
-- `ec.passphrase`
+- `ec.hmac.passphrase`, when `[ec] module = "hmac"`
+- `ec.host_signals.passphrase`, when `[ec] module = "host_signals"`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
-- `integrations.datadome.server_side_key_secret_name`, when protection is enabled
-- `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
+- `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
+- `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
 
 Their values belong in the logical `trusted_server_secrets` store and are
@@ -91,26 +109,26 @@ diff; it does not move inline values to a secret store.
 The following table records the independent lifecycle, key-identity,
 serialization, runtime, and secret axes for every exceptional field:
 
-| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime              | Secret handling          |
-| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | -------------------- | ------------------------ |
-| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only | none                     |
-| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away      | accepted, then discarded |
-| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active               | store resolved           |
-| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away      | none                     |
-| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active               | deliberately inline      |
+| Path                                                         | Lifecycle  | Key identity                        | Serialization | Runtime                 | Secret handling          |
+| ------------------------------------------------------------ | ---------- | ----------------------------------- | ------------- | ----------------------- | ------------------------ |
+| `AssetOriginAuth.s3_sig_v4`                                  | deprecated | alias of `AssetOriginAuth.s3_sigv4` | skipped       | deserialization only    | none                     |
+| `DataDomeConfig.server_side_key_secret_name`                 | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `DataDomeConfig.server_side_key_secret_store`                | deprecated | canonical                           | serialized    | discarded by the module | none                     |
+| `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | serialized    | discarded by the module | none                     |
+| `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `Handler.password`                                           | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `Publisher.proxy_secret`                                     | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `S3SigV4AuthConfig.access_key_id`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `S3SigV4AuthConfig.secret_access_key`                        | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `S3SigV4AuthConfig.secret_store`                             | deprecated | canonical                           | skipped       | normalized away         | none                     |
+| `S3SigV4AuthConfig.session_token`                            | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `TinybirdSettings.access_token_secret`                       | deprecated | canonical                           | skipped       | normalized away         | accepted, then discarded |
+| `TinybirdSettings.auction_token_secret`                      | canonical  | canonical                           | serialized    | active                  | store resolved           |
+| `TinybirdSettings.secret_store`                              | deprecated | canonical                           | skipped       | normalized away         | none                     |
+| `TrustedClientIpConfig.shared_secret`                        | canonical  | canonical                           | serialized    | active                  | deliberately inline      |
 
 Prepare an initial reference-based deployment in this order:
 
@@ -132,8 +150,9 @@ Migrate an existing deployment in this order:
 4. Restart/redeploy instances as needed to load the new values. Rotation is
    startup-scoped; changing a store value does not alter already-built state.
 
-Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
-rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
+Keep `publisher.proxy_secret` and the selected Edge Cookie module's
+passphrase stable unless intentionally rotating signed URLs or EC identifiers.
+On Spin, the app-config blob is stored
 under the `trusted_server_config` key in Spin's built-in `default` key-value
 store. Set the corresponding CLI store mapping before pushing so the write
 matches the runtime lookup:
@@ -187,34 +206,45 @@ fail and the service will return its startup-error response.
 | File                  | Purpose                         |
 | --------------------- | ------------------------------- |
 | `trusted-server.toml` | Main application configuration  |
+| `permissions.yaml`    | Country/region permission rules |
 | `fastly.toml`         | Fastly Compute service settings |
 | `.env.dev`            | Local development overrides     |
 
 ## Key Sections
 
-| Section                    | Purpose                                                                 |
-| -------------------------- | ----------------------------------------------------------------------- |
-| `[auction]`                | Auction orchestration, provider instances, bidder routes, and mediation |
-| `[cache]`                  | Static and rehosted asset cache policy                                  |
-| `[consent]`                | Consent interpretation, forwarding, and conflict resolution             |
-| `[creative_opportunities]` | Server-side page ad opportunities and templates                         |
-| `[debug]`                  | Explicit non-production diagnostics                                     |
-| `[ec]`                     | Edge Cookie identity, persistence, and partner sync                     |
-| `[[handlers]]`             | Ordered HTTP Basic-auth rules                                           |
-| `[image_optimizer]`        | Reusable Fastly Image Optimizer profiles                                |
-| `[integrations.*]`         | Typed partner and browser integration settings                          |
-| `[proxy]`                  | Proxy allowlist, TLS policy, and asset routes                           |
-| `[publisher]`              | Publisher domain, origin, and proxy signing key                         |
-| `[request_signing]`        | Outbound Ed25519 request signing and management-store IDs               |
-| `[response_headers]`       | Headers added to Trusted Server responses                               |
-| `[rewrite]`                | First-party URL rewrite exclusions                                      |
-| `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
-| `[tinybird]`               | Direct Tinybird auction telemetry                                       |
-| `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
+7 of these sections select what runs, with `module` where one runs and
+`modules` where several run, and each gives every selected name its own
+`[<type>.<name>]` settings table, as
+[Configuration Rules](/guide/configuration-rules) describes.
+
+| Section                                                                                                           | Selects               | Purpose                                                                                     |
+| ----------------------------------------------------------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------- |
+| `[ad-server]`                                                                                                     | one module            | The ad server that picks the winner                                                         |
+| `[auction]`                                                                                                       | several modules       | Auction orchestration, bidder routes, and the modules the auction runs, `prebid` among them |
+| `[cache]`                                                                                                         | nothing               | Static and rehosted asset cache policy                                                      |
+| `[consent]`                                                                                                       | nothing               | Consent interpretation, forwarding, and conflict resolution                                 |
+| `[creative_opportunities]`                                                                                        | nothing               | Server-side page ad opportunities and templates                                             |
+| `[debug]`                                                                                                         | nothing               | Explicit non-production diagnostics                                                         |
+| `[demand]`                                                                                                        | several modules       | The auction's demand sources                                                                |
+| `[device]`                                                                                                        | one module            | Device classification                                                                       |
+| `[ec]`                                                                                                            | one module            | Edge Cookie identity, persistence, and partner sync                                         |
+| `[geo]`                                                                                                           | one module            | Which module resolves location, if any                                                      |
+| `[[handlers]]`                                                                                                    | nothing               | Ordered HTTP Basic-auth rules                                                               |
+| `[image_optimizer]`                                                                                               | nothing               | Reusable Fastly Image Optimizer profiles                                                    |
+| `[permission-signal]`                                                                                             | several modules       | Which permission signals are acted on, in order                                             |
+| `[proxy]`                                                                                                         | several modules       | Proxy allowlist, TLS policy, asset routes, and the first-party script proxy module          |
+| `[publisher]`                                                                                                     | nothing               | Publisher domain, origin, and proxy signing key                                             |
+| `[request_signing]`                                                                                               | nothing               | Outbound Ed25519 request signing and management-store IDs                                   |
+| `[response_headers]`                                                                                              | nothing               | Headers added to Trusted Server responses                                                   |
+| `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                          |
+| `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                            |
+| `[tinybird]`                                                                                                      | nothing               | Direct Tinybird auction telemetry                                                           |
+| `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                               |
+| `[<type>]`, such as `[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]` or `[framework]` | one module or several | The section of a module type, selecting the modules of that type that run                   |
 
 ## Example: Production Setup
 
-Generate and substitute every `replace-with-*` value before validation or
+Generate and substitute every placeholder value before validation or
 deployment.
 
 ```toml
@@ -225,6 +255,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "publisher_proxy_secret"
 
 [ec]
+module = "hmac"
+
+[ec.hmac]
 passphrase = "ec_passphrase"
 
 [request_signing]
@@ -232,8 +265,7 @@ enabled = true
 config_store_id = "01GXXX"
 secret_store_id = "01GYYY"
 
-[integrations.prebid]
-enabled = true
+[auction.prebid]
 client_side_bidders = ["example-browser-bidder"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 
@@ -241,21 +273,22 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 allowed_domains = ["assets.example.com"]
 
 [auction]
+modules = ["prebid"]
 enabled = true
 timeout_ms = 2000
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+modules = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1200
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 
 [auction.bidders.example-server-bidder]
-provider = "pbs-main"
+module = "pbs_main"
 ```
 
 ## Detailed Reference
@@ -288,20 +321,21 @@ TRUSTED_SERVER__SECTION__SUBSECTION__FIELD
 - Separator: `__` (double underscore)
 - Case: UPPERCASE
 - Sections: Match TOML hierarchy
-- Map keys: Preserve TOML punctuation. For example, provider key `pbs-main`
-  uses the `PBS-MAIN` segment, not `PBS_MAIN`.
+- Selected names are snake_case, so a settings table maps
+  straight onto a path segment. `[demand.pbs_main] debug` is
+  `TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG`.
 
-Shell assignment syntax cannot contain a hyphenated variable name. Use `env`
-to apply a provider override to a command:
+A setting in one of those tables overrides like any other scalar leaf:
 
 ```bash
-env 'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
-  ts config validate
+export TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true
+ts config validate
 ```
 
 This example changes an existing scalar leaf. Edit TOML and run `ts config
 validate` followed by `ts config push` when changing an array, table, map, or
-rule.
+rule. A `modules` list is an array, so it cannot be overridden
+this way.
 
 ## Publisher Configuration
 
@@ -440,7 +474,7 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 #### `max_buffered_body_bytes`
 
 **Purpose**: Upper bound on how much of a publisher origin body the rewrite
-pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
+pipeline holds in memory, being the post-rewrite output buffer on buffered adapters,
 and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 
 **Usage**:
@@ -464,7 +498,7 @@ and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 - On **buffered adapters** the response fails before any bytes are committed.
 - On the **streaming path** the response headers are already committed when
   either cap trips, so the body is **truncated mid-stream** and the error is
-  logged — the client receives a short (incomplete) body rather than a `5xx`.
+  logged, and the client receives a short (incomplete) body rather than a `5xx`.
   Size the cap above your largest expected decoded page so legitimate responses
   are never truncated.
 
@@ -635,17 +669,48 @@ Legacy consent-store records are not read or migrated into `ec.ec_store`. Their 
 
 ### `[ec]`
 
-`passphrase` is a key name in `trusted_server_secrets`; the resolved value must
-be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                                                                                       |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                  | String or null | No       | Name of the active Edge Cookie module: `"hmac"` (built-in), `"host_signals"` (opt-in), `"none"` (explicitly stateless), or the name of a module a crate outside core supplies. Omit to run statelessly with no Edge Cookie. The `"client_fixed"` demonstration module needs the `client-fixed-demo` build feature |
+| `resolve_allowed_origins` | Array          | No       | Extra exact origins allowed to POST the client resolve endpoint, beyond `https://{publisher.domain}`                                                                                                                                                                                                              |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                                                                                   |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                                                                                        |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                                                                                               |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting, because cluster rechecks no longer use timestamps                                                                                                                                                                                                                                   |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                                                                                   |
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+Each module that has settings is configured in its own `[ec.<name>]` table, and the `module` selector names which table is active. A table may set `implementation = "<id>"` to say which module it configures, which makes the table name a label of your choosing, so `module = "primary"` with `[ec.primary]` holding `implementation = "hmac"` configures the built-in module under a name that means something to your deployment. A module from a crate is named by its folder below `crates/`, so it may be written in full, as `edgecookie.<name>`, or with that type folder left off, and core's own modules such as `hmac` take bare names. A name is parts joined by `.`, each of lower case letters, digits, `_` or `-`.
+
+A module has a table only when it has settings of its own. Both modules that derive an identifier at the edge take a passphrase, so selecting `hmac` or `host_signals` without its table fails at startup, while the `client_fixed` demonstration module needs no table at all. A table the selector does not name also fails at startup, so a stale table cannot sit unnoticed.
+
+`ec_store`, `partners` and the cluster thresholds are settings of the job
+rather than of one module, so they sit directly in `[ec]` whichever module
+is selected.
+
+A crate outside core declares each module it supplies under a name, and
+`module` selects it by that name. The crate's own module has to be selected
+in the section of its type as well, because only a selected module runs. A
+name written in full has more than one part, so a module selected that way
+takes its settings under a label, as `[ec.primary]` with
+`implementation = "<name>"`.
+
+### `[ec.hmac]`
+
+The built-in HMAC-over-client-IP module, named `hmac`.
+
+`passphrase` is a key name in `trusted_server_secrets`, and the resolved value
+must be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
+
+| Field        | Type   | Required                    | Description                                                |
+| ------------ | ------ | --------------------------- | ---------------------------------------------------------- |
+| `passphrase` | String | Yes when `hmac` is selected | Secret-store key name whose resolved value is the HMAC key |
+
+### `[ec.host_signals]`
+
+The built-in module that derives the identifier from the host's TLS JA4 and
+HTTP/2 signals together with the client address, so it needs a host that
+supplies those signals. It takes a `passphrase` on the same terms as
+`[ec.hmac]`.
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -660,8 +725,11 @@ outbound pull sync, but cannot authenticate to those inbound APIs.
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
+module = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.hmac]
+passphrase = "ec_passphrase"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -674,25 +742,132 @@ bidstream_enabled = true
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
+TRUSTED_SERVER__EC__MODULE=hmac
+TRUSTED_SERVER__EC__HMAC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
+These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environment values into the published configuration (for example test harnesses building an app-config blob). The running server reads its settings from the platform config store, so module selection changes take effect when a new configuration is pushed, not per request.
+
 ### Field Details
 
-#### `passphrase`
+#### `module`
 
-**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation.
+**Purpose**: Names the active Edge Cookie module. Omit to run statelessly with no Edge Cookie.
+
+**Validation**: Application startup fails if the name is not a module name (parts joined by `.`, each of lower case letters, digits, `_` or `-`), if it names a key the `[ec]` section reads as its own setting, if the selected module has no `[ec.<name>]` table where it needs one, if it names a module this build does not have, or if a table the selector does not name is configured. `ts config validate` does not run these checks, so start an instance to confirm a change to `[ec]`.
+
+#### `hmac.passphrase`
+
+**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation, read when `module = "hmac"`.
 
 **Security**:
 
-- The key name is stored in app config; the value is stored in `trusted_server_secrets`
+- The key name is stored in app config, and the value is stored in `trusted_server_secrets`
 - Keep the value stable unless intentionally rotating EC identifiers
 - Do not place the value in environment overlays or the pushed blob
 
-**Validation**: Application startup fails if:
+**Validation**: Application startup fails if the resolved value is:
 
-- Empty string
+- Empty
+- Shorter than 32 characters
+
+## Device Configuration
+
+Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie module selection. These signals serve identifier gating and bot detection, not bid enrichment.
+
+### `[device]`
+
+| Field    | Type           | Required | Description                                                                                                                                                                                                                            |
+| -------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module` | String or null | No       | Name of the device-detection module: `builtin` (the default, User-Agent only, no host-specific call), `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers, or the name of a module a crate outside core supplies |
+
+The default `builtin` module classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Neither `builtin` nor `fastly` has settings, and `[device]` holds no module settings table. A module from a crate at `crates/device/<name>` is written `<name>` or `device.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the device modules it does run.
+
+**Example**:
+
+```toml
+[device]
+module = "builtin" # or "fastly" to add TLS and HTTP/2 evidence
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__DEVICE__MODULE=builtin
+```
+
+## Geo Configuration
+
+Selects how a client IP is resolved into geolocation (country, region, coordinates), mirroring the Edge Cookie module selection. The resolved country also feeds the [permission model](/guide/permission-model).
+
+### `[geo]`
+
+| Field                        | Type           | Required        | Description                                                                                                                                                                                                |
+| ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module`                     | String or null | No              | Name of the geo module: `platform` to use the host's own geo lookup, `none` (or omit it) to resolve no location and make no host geo call, or the name of a module a crate outside core supplies           |
+| `assume_single_jurisdiction` | Boolean        | See description | With no geo module, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie module without a geo module acknowledges that by setting this to `true`. |
+
+`assume_single_jurisdiction` is a setting of the job rather than of one
+module, so it sits directly in `[geo]`.
+
+No module is the default, so a default deployment is not tied to any host geo service. A module from a crate at `crates/geo/<name>` is written `<name>` or `geo.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the geo modules it does run. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+
+**Example**:
+
+```toml
+[geo]
+module = "platform"
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__GEO__MODULE=platform
+```
+
+## Permission Signal Configuration
+
+Which permission signals Trusted Server acts on, and in what order. Signals
+compose rather than select, because a request can carry a TCF string and a
+Global Privacy Control header at once and both have something to say, so this
+type takes a list. The order is the policy, because the last module with an
+opinion decides.
+
+### `[permission-signal]`
+
+| Field     | Type          | Required | Description                                                                                                |
+| --------- | ------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `modules` | Array[String] | No       | The modules to act on, in order. Omit it to act on every module this build links, in the order shown below |
+
+The modules that ship are `gpc` (the `Sec-GPC` request header),
+`gpp` (a GPP US sale opt-out), `us-privacy` (a US Privacy string
+sale opt-out) and `tcf` (TCF v2). Each is a crate under
+`crates/permission-signal`, outside the core.
+
+A module that is not on the list does not run, and there is no separate
+switch to turn one off. An empty list acts on nothing, leaving every
+permission at its country and region baseline. An unknown or repeated name
+refuses startup. None of the four has settings, so none needs a
+`[permission-signal.<name>]` table.
+
+**Example**:
+
+```toml
+[permission-signal]
+modules = ["gpc", "gpp", "us-privacy", "tcf"]
+```
+
+See [Permission Signals](/guide/permission-signals) for what each module
+reads and how to add a scheme.
+
+## Module Permissions
+
+A module advertises the technical permissions its data use requires, and Trusted Server runs the module only when every required permission is set. This separates legal policy from the core, so the deployer brings the policy that decides how permissions are established. See the [Permission Model](/guide/permission-model) for the concept, the permission vocabulary, and how a request resolves.
+
+### Country and region rules (`permissions.yaml`)
+
+The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/sample.yaml`, which is for testing and evaluation only and is neither a production policy nor legal advice. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
 
 ## Consent Configuration
 
@@ -922,7 +1097,7 @@ Startup fails when no handler covers an admin route. The dynamic
 `/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
 Basic Auth runs on the raw path before routing, so coverage cannot be inferred
 from ID-shaped samples: a pattern such as
-`^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
+`^/_ts/admin/ec/hmac~[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
 matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
 patterns).
 
@@ -931,7 +1106,7 @@ percent-encoded aliases before routing. For a whole-site staging gate, use
 `path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
 equivalent origin paths.
 
-Startup also fails when any handler — admin or not — uses a placeholder or
+Startup also fails when any handler, admin or not, uses a placeholder or
 well-known weak password (`changeme`, `password`, `admin`, or a
 `replace-with-…` template value). Handler selection is first-match-wins, so a
 narrow handler ahead of the admin pattern governs the paths it matches.
@@ -951,7 +1126,7 @@ browser-facing endpoints that anonymous visitors must be able to reach:
 | `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
 
 A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
-fetches never carry Basic credentials, so every visitor gets `401` — on
+fetches never carry Basic credentials, so every visitor gets `401`, on
 `/_ts/page-bids` that means no ads after any client-side navigation. Match the
 admin routes specifically (`^/_ts/admin`) instead.
 
@@ -1076,6 +1251,7 @@ Controls first-party proxy security settings and path-based asset routes.
 | `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
 | `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins         |
 | `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
+| `modules`           | Array[String] | No (default: `[]`)   | The proxy modules that run, such as `js_asset_proxy`        |
 
 **Example**:
 
@@ -1096,7 +1272,7 @@ EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
 
 #### `allowed_domains`
 
-**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `integrations.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
+**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `auction.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
 
 **Behavior**: Trusted Server checks the parsed host before signing a target, before fetching the initial proxy target, and before following each HTTP redirect (301/302/303/307/308). A host that does not match the list is blocked with a 403 error.
 
@@ -1109,8 +1285,8 @@ EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
 | `assets.example.com` | `assets.example.com`                                               | `sub.assets.example.com` |
 | `*.cdn.example.com`  | `cdn.example.com`, `static.cdn.example.com`, `a.b.cdn.example.com` | `evil-cdn.example.com`   |
 
-- `"example.com"` — exact match only.
-- `"*.example.com"` — matches the base domain and any subdomain at any depth.
+- `"example.com"` matches that host exactly and nothing else.
+- `"*.example.com"` matches the base domain and any subdomain at any depth.
 - Matching is case-insensitive; entries are normalized to lowercase at startup.
 - Blank entries are ignored.
 - The `*` wildcard requires a dot boundary: `*.example.com` does **not** match `evil-example.com`.
@@ -1446,75 +1622,72 @@ tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 
-Every deploy-validated integration ID is listed here. A section is optional
-unless its integration is enabled or a CLI workflow retains an explicit
-disabled stub.
+A page integration is a module, selected in the section of its type, and
+each one that has settings gets its own `[<section>.<name>]` table. A
+module's name is `<type>.<name>`, which is the path under `crates/` of the
+crate the module lives in. There is no `enabled` flag and no `[integration]`
+table, because a module no section selects does not run, and an `enabled`
+key left in a module's table refuses startup. The full rule set is in
+[Configuration Rules](/guide/configuration-rules). Every module that deploy
+validation knows is listed below.
 
-| Section                             | Reference                                                          |
-| ----------------------------------- | ------------------------------------------------------------------ |
-| `[integrations.adserver_mock]`      | [Ad Server Mock](/guide/integrations/adserver_mock)                |
-| `[integrations.aps]`                | [APS](/guide/integrations/aps)                                     |
-| `[integrations.datadome]`           | [DataDome](/guide/integrations/datadome)                           |
-| `[integrations.didomi]`             | [Didomi](/guide/integrations/didomi)                               |
-| `[integrations.google_tag_manager]` | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
-| `[integrations.gpt]`                | [GPT](/guide/integrations/gpt)                                     |
-| `[integrations.gpt_diagnostics]`    | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
-| `[integrations.js_asset_proxy]`     | [JS Asset Proxy](#js-asset-proxy-integration) (no dedicated guide) |
-| `[integrations.lockr]`              | [lockr](/guide/integrations/lockr)                                 |
-| `[integrations.nextjs]`             | [Next.js](/guide/integrations/nextjs)                              |
-| `[integrations.osano]`              | [Osano](/guide/integrations/osano)                                 |
-| `[integrations.permutive]`          | [Permutive](/guide/integrations/permutive)                         |
-| `[integrations.prebid]`             | [Prebid](/guide/integrations/prebid)                               |
-| `[integrations.sourcepoint]`        | [Sourcepoint](/guide/integrations/sourcepoint)                     |
-| `[integrations.testlight]`          | [Testlight](/guide/integrations/testlight)                         |
+| Section                       | Reference                                                          |
+| ----------------------------- | ------------------------------------------------------------------ |
+| `[bot-protection.datadome]`   | [DataDome](/guide/integrations/datadome)                           |
+| `[cmp.didomi]`                | [Didomi](/guide/integrations/didomi)                               |
+| `[tag.google-tag-manager]`    | [Google Tag Manager](/guide/integrations/google_tag_manager)       |
+| `[ad-tag.google]`             | [GPT](/guide/integrations/gpt)                                     |
+| `[ad-tag.google.diagnostics]` | [GPT diagnostics](/guide/integrations/gpt-diagnostics)             |
+| `[proxy.js_asset_proxy]`      | [JS Asset Proxy](#js-asset-proxy-integration) (no dedicated guide) |
+| `[identity.lockr]`            | [lockr](/guide/integrations/lockr)                                 |
+| `[framework.nextjs]`          | [Next.js](/guide/integrations/nextjs)                              |
+| `[cmp.osano]`                 | [Osano](/guide/integrations/osano)                                 |
+| `[audience.permutive]`        | [Permutive](/guide/integrations/permutive)                         |
+| `[auction.prebid]`            | [Prebid](/guide/integrations/prebid)                               |
+| `[cmp.sourcepoint]`           | [Sourcepoint](/guide/integrations/sourcepoint)                     |
+| `[auction.testing.testlight]` | [Testlight](/guide/integrations/testlight)                         |
 
-### Common Fields
+### Selecting the modules that run
 
-All integrations support an `enabled` flag. Defaults vary by integration and only
-apply when the integration section exists in `trusted-server.toml`.
+```toml
+[auction]
+modules = ["prebid"]
 
-| Field     | Type    | Description                    |
-| --------- | ------- | ------------------------------ |
-| `enabled` | Boolean | Enable/disable the integration |
+[ad-tag]
+modules = ["google"]
 
-### Ad Server Mock Integration
+[framework]
+module = "nextjs"
+```
 
-**Section**: `[integrations.adserver_mock]`
+The modules this repository ships, by section, are `[cmp]` `didomi`,
+`sourcepoint` and `osano`; `[tag]` `google-tag-manager`; `[ad-tag]` `google`
+and `google.diagnostics`; `[bot-protection]` `datadome`; `[identity]`
+`lockr`; `[audience]` `permutive`; `[framework]` `nextjs`; `[auction]`
+`prebid` and `testing.testlight`; and `[proxy]` `js_asset_proxy`. A name
+this build does not have refuses startup, and the message lists the ones it
+does. A `[<section>.<name>]` table for a module its section does not select
+refuses startup too, as does a section that selects nothing, so a table left
+behind after a module is switched off is caught rather than sitting unread.
 
-This integration is the optional auction mediator selected by
-`auction.mediator = "adserver_mock"`; it is not an OpenRTB provider.
+`auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and
+`ad-server.mock` supply demand and ad server implementations only. They are
+not page integrations, so a section that names one refuses startup like any
+name no module supplies. Their settings live in `[demand.<name>]` and
+`[ad-server.<name>]`.
 
-| Field                  | Type           | Default  | Contract                                          |
-| ---------------------- | -------------- | -------- | ------------------------------------------------- |
-| `enabled`              | Boolean        | `false`  | Enable mediator registration                      |
-| `endpoint`             | URL            | Required | Mediation service URL                             |
-| `timeout_ms`           | Integer        | `500`    | `1..=60000` milliseconds                          |
-| `price_floor`          | Number or null | `null`   | Optional minimum accepted CPM                     |
-| `context_query_params` | Object         | `{}`     | Maps admitted auction-context keys to query names |
-
-### APS Browser Integration
-
-**Section**: `[integrations.aps]`
-
-| Field            | Type    | Default            | Contract                               |
-| ---------------- | ------- | ------------------ | -------------------------------------- |
-| `enabled`        | Boolean | `false`            | Enable browser-side APS behavior       |
-| `rendering_mode` | String  | `"trusted_server"` | `trusted_server` or `publisher_native` |
-
-Server endpoint, timeout, account, inventory, and debug settings belong to an
-`aps` provider and its `profile_config`, not this browser section. See
-[APS](/guide/integrations/aps).
+The sections below give each module's settings, and the integration guides
+describe what each one does.
 
 ### DataDome Integration
 
-**Section**: `[integrations.datadome]`
+**Section**: `[bot-protection.datadome]`
 
 The [DataDome guide](/guide/integrations/datadome) explains request behavior
 and exclusion-rule syntax. This table covers every canonical top-level field:
 
 | Field                                  | Type           | Default                          | Contract                                                        |
 | -------------------------------------- | -------------- | -------------------------------- | --------------------------------------------------------------- |
-| `enabled`                              | Boolean        | `false`                          | Enable DataDome registration                                    |
 | `sdk_origin`                           | URL            | `https://js.datadome.co`         | Browser SDK origin                                              |
 | `api_origin`                           | URL            | `https://api-js.datadome.co`     | Browser signal API origin                                       |
 | `cache_ttl_seconds`                    | Integer        | `3600`                           | `60..=86400` seconds                                            |
@@ -1554,11 +1727,10 @@ to new configurations.
 
 ### Didomi Integration
 
-**Section**: `[integrations.didomi]`
+**Section**: `[cmp.didomi]`
 
 | Field        | Type           | Default                          | Contract                                                            |
 | ------------ | -------------- | -------------------------------- | ------------------------------------------------------------------- |
-| `enabled`    | Boolean        | `true`                           | Enable the reverse proxy when the section exists                    |
 | `proxy_path` | String or null | `/integrations/didomi/consent`   | No trailing slash, repeated slash, dot segment, or unsafe character |
 | `sdk_origin` | URL            | `https://sdk.privacy-center.org` | SDK upstream                                                        |
 | `api_origin` | URL            | `https://api.privacy-center.org` | API upstream                                                        |
@@ -1567,11 +1739,10 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 
 ### Google Tag Manager Integration
 
-**Section**: `[integrations.google_tag_manager]`
+**Section**: `[tag.google-tag-manager]`
 
 | Field                  | Type    | Default                            | Contract                                            |
 | ---------------------- | ------- | ---------------------------------- | --------------------------------------------------- |
-| `enabled`              | Boolean | `false`                            | Enable tag-gateway routes and rewriting             |
 | `container_id`         | String  | Required                           | `GTM-` followed by 4–20 uppercase letters or digits |
 | `upstream_url`         | URL     | `https://www.googletagmanager.com` | Script upstream                                     |
 | `cache_max_age`        | Integer | `900`                              | `60..=86400` seconds                                |
@@ -1581,11 +1752,10 @@ See [Google Tag Manager](/guide/integrations/google_tag_manager).
 
 ### GPT Integration
 
-**Section**: `[integrations.gpt]`
+**Section**: `[ad-tag.google]`
 
 | Field                     | Type           | Default                 | Contract                                               |
 | ------------------------- | -------------- | ----------------------- | ------------------------------------------------------ |
-| `enabled`                 | Boolean        | `true`                  | Enable GPT when the section exists                     |
 | `gam_attribution_enabled` | Boolean        | `false`                 | Add page-level `ts=true` targeting                     |
 | `script_url`              | URL            | Google's secure GPT URL | Bootstrap source                                       |
 | `cache_ttl_seconds`       | Integer        | `3600`                  | `60..=86400` seconds                                   |
@@ -1596,15 +1766,17 @@ See [GPT](/guide/integrations/gpt).
 
 ### GPT Diagnostics Integration
 
-**Section**: `[integrations.gpt_diagnostics]`
+**Section**: `[ad-tag.google.diagnostics]`
 
-The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
-the standalone diagnostics tag is available, but individual browser sessions
-still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+The module has nothing to set, so naming `google.diagnostics` in
+`[ad-tag] modules` is the whole configuration and it needs no table. Once it
+is selected the standalone diagnostics tag is available, but individual
+browser sessions still require the activation flow in
+[GPT diagnostics](/guide/integrations/gpt-diagnostics).
 
 ### JS Asset Proxy Integration
 
-**Section**: `[integrations.js_asset_proxy]`
+**Section**: `[proxy.js_asset_proxy]`
 
 Serves explicitly configured third-party JavaScript assets from first-party
 paths. Each asset maps one exact publisher-facing path to one exact HTTPS
@@ -1615,11 +1787,10 @@ guide; the registered routes appear in the
 
 | Field               | Type    | Default | Contract                                      |
 | ------------------- | ------- | ------- | --------------------------------------------- |
-| `enabled`           | Boolean | `false` | Enable asset proxying and HTML rewriting      |
 | `cache_ttl_seconds` | Integer | None    | Optional downstream cache TTL for every asset |
-| `assets`            | Array   | `[]`    | Asset mappings; required when enabled         |
+| `assets`            | Array   | `[]`    | Asset mappings; at least one is required      |
 
-Each `[[integrations.js_asset_proxy.assets]]` entry:
+Each `[[proxy.js_asset_proxy.assets]]` entry:
 
 | Field               | Type    | Default   | Contract                                                  |
 | ------------------- | ------- | --------- | --------------------------------------------------------- |
@@ -1630,37 +1801,36 @@ Each `[[integrations.js_asset_proxy.assets]]` entry:
 
 ### lockr Integration
 
-**Section**: `[integrations.lockr]`
+**Section**: `[identity.lockr]`
 
-| Field               | Type            | Default                                             | Contract                             |
-| ------------------- | --------------- | --------------------------------------------------- | ------------------------------------ |
-| `enabled`           | Boolean         | `true`                                              | Enable lockr when the section exists |
-| `app_id`            | String          | Required                                            | Nonempty lockr application ID        |
-| `api_endpoint`      | URL             | `https://identity.loc.kr`                           | API origin                           |
-| `sdk_url`           | URL             | `https://aim.loc.kr/identity-lockr-trust-server.js` | SDK source                           |
-| `cache_ttl_seconds` | Integer         | `3600`                                              | `60..=86400` seconds                 |
-| `rewrite_sdk`       | Boolean         | `true`                                              | Rewrite matching lockr SDK URLs      |
-| `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input       |
-| `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override  |
+| Field               | Type            | Default                                             | Contract                            |
+| ------------------- | --------------- | --------------------------------------------------- | ----------------------------------- |
+| `app_id`            | String          | Required                                            | Nonempty lockr application ID       |
+| `api_endpoint`      | URL             | `https://identity.loc.kr`                           | API origin                          |
+| `sdk_url`           | URL             | `https://aim.loc.kr/identity-lockr-trust-server.js` | SDK source                          |
+| `cache_ttl_seconds` | Integer         | `3600`                                              | `60..=86400` seconds                |
+| `rewrite_sdk`       | Boolean         | `true`                                              | Rewrite matching lockr SDK URLs     |
+| `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input      |
+| `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override |
 
 See [lockr](/guide/integrations/lockr).
 
 ### Prebid Integration
 
-`[integrations.prebid]` owns browser behavior only. Server endpoint, provider
-timeout, routing, profile debug/test controls, consent forwarding, bidder-param
-overrides, and notification suppression belong under `[auction]`.
+`[auction.prebid]` owns browser behavior only. The server endpoint, the
+demand source timeout, routing, debug and test controls, consent forwarding,
+bidder-param overrides, and notification suppression belong to a `[demand]`
+source with `implementation = "auction.prebid-server"`.
 
 | Browser field                        | Type          | Default                                                                | Description                                                                    |
 | ------------------------------------ | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `enabled`                            | Boolean       | `true`                                                                 | Enable browser bundle injection, interception, and the `trustedServer` adapter |
 | `account_id`                         | String        | `None`                                                                 | Optional account value injected into browser Prebid configuration              |
-| `timeout_ms`                         | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every server provider timeout        |
-| `debug`                              | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of server profile debug              |
+| `timeout_ms`                         | Integer       | `1000`                                                                 | Browser Prebid.js timeout; independent of every demand source timeout          |
+| `debug`                              | Boolean       | `false`                                                                | Browser Prebid.js debug flag; independent of a demand source's debug           |
 | `client_side_bidders`                | Array[String] | `[]`                                                                   | Bidders kept on native browser adapters                                        |
 | `excluded_gam_ad_unit_path_suffixes` | Array[String] | `[]`                                                                   | GAM suffixes excluded from Trusted Server refresh auctions                     |
 | `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
-| `external_bundle_url`                | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
+| `external_bundle_url`                | String        | Required                                                               | HTTPS publisher-specific Prebid.js bundle URL                                  |
 | `external_bundle_sha256` / `*_sri`   | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
 | `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid client`                           |
 | `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid client`                          |
@@ -1669,24 +1839,26 @@ overrides, and notification suppression belong under `[auction]`.
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
 routes and injected into the browser. There is no second server bidder list in
-`[integrations.prebid]`. A browser bidder stays client-side only when named in
+`[auction.prebid]`. A browser bidder stays client-side only when named in
 `client_side_bidders` and its adapter is present in the generated bundle.
 
 **Example**:
 
 ```toml
-[integrations.prebid]
-enabled = true
+[auction]
+modules = ["prebid"]
+
+[auction.prebid]
 timeout_ms = 1000
 debug = false
 client_side_bidders = ["rubicon"]
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 script_patterns = ["/prebid.js", "/prebid.min.js"]
 
-[[integrations.prebid.managed_user_ids]]
+[[auction.prebid.managed_user_ids]]
 name = "sharedId"
 
-[integrations.prebid.managed_user_ids.storage]
+[auction.prebid.managed_user_ids.storage]
 type = "cookie"
 name = "_sharedid"
 expires = 15
@@ -1695,52 +1867,51 @@ refresh_in_seconds = 1800
 [proxy]
 allowed_domains = ["assets.example.com"]
 
-[integrations.prebid.bundle.modules]
+[auction.prebid.bundle.modules]
 bidder = ["rubiconBidAdapter"]
 user_id = ["sharedIdSystem"]
 analytics = ["atsAnalyticsAdapter"]
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+modules = ["pbs_main"]
+
+[demand.pbs_main]
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = false
 consent_forwarding = "both"
 bid_param_overrides = { example-server = { placement = "example-placement" } }
 
-[[auction.providers.pbs-main.profile_config.bid_param_override_rules]]
+[[demand.pbs_main.bid_param_override_rules]]
 when.bidder = "example-server"
 when.zone = "header"
 set = { placement = "example-header-placement" }
 
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+module = "pbs_main"
 ```
 
 **Environment override**:
 
 ```bash
-env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
-  'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+env 'TRUSTED_SERVER__AUCTION__PREBID__TIMEOUT_MS=1000' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__DEBUG=true' \
   ts config validate
 ```
 
-Environment overlays only replace existing scalar leaves. Keep
-`client_side_bidders`, provider profile tables, bidder-parameter overrides, and
-rules in TOML, then validate and push the edited file.
+Environment overlays only replace existing scalar leaves. Keep the `modules`
+lists, `client_side_bidders`, bidder-parameter overrides and rules in TOML,
+then validate and push the edited file.
 
 **Managed User ID modules**:
 
-Each `[[integrations.prebid.managed_user_ids]]` entry names a Prebid
+Each `[[auction.prebid.managed_user_ids]]` entry names a Prebid
 `userSync.userIds` module that Trusted Server installs on the page and
 reinstates whenever publisher JavaScript replaces the User ID configuration.
 Trusted Server does not interpret module-specific fields; every registered
@@ -1757,7 +1928,7 @@ module uses the same vendor-neutral surface. The managed `name` must match a
 | `storage.refresh_in_seconds` | Integer | Prebid's own default           | Seconds before the module may refresh the stored value; must be at least 1           |
 
 The module must be present in the built bundle. Name it under
-`[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
+`[auction.prebid.bundle.modules].user_id`, or omit that list to take the
 generator's default preset. `ts prebid client` resolves each managed `name`
 through the checked-in `user_id_modules.json` registry, rejects unknown names,
 ambiguous names, and two names that resolve to the same module, and confirms the
@@ -1790,33 +1961,34 @@ See [Prebid Integration](/guide/integrations/prebid) for full details.
 
 **Server Bid Param Override Surfaces**:
 
-These fields belong under
-`[auction.providers.<id>.profile_config]` for a `prebid-server` provider:
+These fields belong in the `[demand.<name>]` table of a `auction.prebid-server`
+demand source:
 
 - `bid_param_overrides`: static per-bidder shallow-merge overrides;
 - `bid_param_zone_overrides`: per-bidder, per-zone shallow-merge overrides; and
 - `bid_param_override_rules`: canonical ordered rules with `when` matchers and
   `set` objects.
 
-Compatibility-shaped fields are normalized into the same profile-local runtime
-engine. Explicit rules run after compatibility-derived rules, so later rules
-win on conflicts.
+Compatibility-shaped fields are normalized into the same runtime engine.
+Explicit rules run after compatibility-derived rules, so later rules win on
+conflicts.
 
 ### Next.js Integration
 
-**Section**: `[integrations.nextjs]`
+**Section**: `[framework.nextjs]`
 
 | Field                        | Type          | Default                   | Contract                                           |
 | ---------------------------- | ------------- | ------------------------- | -------------------------------------------------- |
-| `enabled`                    | Boolean       | `false`                   | Enable Next.js integration                         |
 | `rewrite_attributes`         | Array[String] | `["href", "link", "url"]` | Nonempty set of structured payload keys to rewrite |
 | `max_combined_payload_bytes` | Integer       | `10485760`                | Maximum combined RSC payload size in bytes         |
 
 **Example**:
 
 ```toml
-[integrations.nextjs]
-enabled = true
+[framework]
+module = "nextjs"
+
+[framework.nextjs]
 rewrite_attributes = ["href", "link", "url", "src"]
 max_combined_payload_bytes = 10485760
 ```
@@ -1824,42 +1996,33 @@ max_combined_payload_bytes = 10485760
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
+TRUSTED_SERVER__FRAMEWORK__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
 
 Edit `rewrite_attributes` in TOML because the overlay cannot replace arrays.
 
 ### Osano Integration
 
-**Section**: `[integrations.osano]`
+**Section**: `[cmp.osano]`
 
-| Field     | Type    | Default | Description                             |
-| --------- | ------- | ------- | --------------------------------------- |
-| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+Osano has nothing to set, so `[cmp] module = "osano"` is the whole
+configuration and it needs no table.
 
 **Example**:
 
 ```toml
-[integrations.osano]
-enabled = true
-```
-
-**Environment Override**:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+[cmp]
+module = "osano"
 ```
 
 The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
 
 ### Permutive Integration
 
-**Section**: `[integrations.permutive]`
+**Section**: `[audience.permutive]`
 
 | Field                     | Type    | Default                                | Contract                                     |
 | ------------------------- | ------- | -------------------------------------- | -------------------------------------------- |
-| `enabled`                 | Boolean | `true`                                 | Enable Permutive integration                 |
 | `organization_id`         | String  | Required                               | Nonempty Permutive organization ID           |
 | `workspace_id`            | String  | Required                               | Nonempty Permutive workspace ID              |
 | `project_id`              | String  | `""`                                   | Optional project ID; reserved for future use |
@@ -1871,8 +2034,10 @@ The Osano mirror runs in the browser, so consent cookies it writes are available
 **Example**:
 
 ```toml
-[integrations.permutive]
-enabled = true
+[audience]
+module = "permutive"
+
+[audience.permutive]
 organization_id = "org-12345"
 workspace_id = "ws-67890"
 project_id = "proj-abcde"
@@ -1884,11 +2049,10 @@ rewrite_sdk = true
 
 ### Sourcepoint Integration
 
-**Section**: `[integrations.sourcepoint]`
+**Section**: `[cmp.sourcepoint]`
 
 | Field               | Type           | Default                        | Contract                                                          |
 | ------------------- | -------------- | ------------------------------ | ----------------------------------------------------------------- |
-| `enabled`           | Boolean        | `false`                        | Enable Sourcepoint proxying and rewriting                         |
 | `rewrite_sdk`       | Boolean        | `true`                         | Rewrite matching Sourcepoint URLs                                 |
 | `cdn_origin`        | URL            | `https://cdn.privacy-mgmt.com` | HTTP(S) URL whose host is exactly `cdn.privacy-mgmt.com`          |
 | `auth_cookie_name`  | String or null | `null`                         | 1–64 letters, digits, `_`, or `-`; built-in cookies need no entry |
@@ -1898,11 +2062,10 @@ See [Sourcepoint](/guide/integrations/sourcepoint).
 
 ### Testlight Integration
 
-**Section**: `[integrations.testlight]`
+**Section**: `[auction.testing.testlight]`
 
 | Field             | Type    | Default                            | Contract                            |
 | ----------------- | ------- | ---------------------------------- | ----------------------------------- |
-| `enabled`         | Boolean | `false`                            | Enable Testlight integration        |
 | `endpoint`        | URL     | Required                           | Testlight auction endpoint          |
 | `timeout_ms`      | Integer | `1000`                             | `10..=60000` milliseconds           |
 | `shim_src`        | String  | `/static/tsjs=tsjs-unified.min.js` | Nonempty script source for the shim |
@@ -1911,8 +2074,10 @@ See [Sourcepoint](/guide/integrations/sourcepoint).
 **Example**:
 
 ```toml
-[integrations.testlight]
-enabled = true
+[auction]
+modules = ["testing.testlight"]
+
+[auction.testing.testlight]
 endpoint = "https://testlight.example/openrtb2/auction"
 timeout_ms = 1500
 rewrite_scripts = true
@@ -1920,10 +2085,12 @@ rewrite_scripts = true
 
 ## Auction Configuration
 
-`[auction.providers.*]` is the only server-side provider inventory, and
-`[auction.bidders.*]` is the only client-visible bidder route map. The optional
-`[auction].mediator` remains a separate integration selection; it is not a
-provider or bidder route.
+An auction is configured by three tables. `[demand]` selects the demand sources
+and gives each its settings, `[ad-server]` selects the ad server that picks the
+winner, and `[auction]` holds the settings that belong to the auction itself,
+including `[auction.bidders.<code>]`, the only client-visible bidder route map.
+`[auction] modules` selects the page modules the auction runs, such as
+`prebid`, and never a demand source or the ad server.
 
 ### `[auction]`
 
@@ -1933,9 +2100,9 @@ provider or bidder route.
 | `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery |
 | `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
 | `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                     |
+| `creative_store`       | String  | `"creative_store"` | Deprecated, because creatives are delivered inline             |
 | `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                 |
+| `modules`              | Array   | `[]`               | The page modules the auction runs, such as `prebid`            |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -1957,7 +2124,7 @@ setting affects HTML or CSS fetched through `/first-party/proxy`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs, upgrade sequencing, and rollback
-Default values are omitted from stored JSON; non-default values
+Default values are omitted from stored JSON. Non-default values
 (`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
 older `AuctionConfig` schemas reject unknown fields.
 
@@ -1983,42 +2150,51 @@ leaves. Existing configs must add **both** leaves under `[auction]`
 missing leaf is silently ignored.
 :::
 
-### Provider map
+### Demand sources
 
-::: danger Breaking migration from the provider list
-The former `[auction].providers = ["prebid", ...]` list and server-owned fields
-under `[integrations.prebid]` and `[integrations.aps]` are no longer accepted,
-even when an integration is disabled. Replace them with provider instances and
-bidder routes before deployment.
+::: danger Breaking migration from `[auction.providers]`
+`[auction] providers` and `[auction.providers.<id>]` are gone, and a
+configuration still carrying either is refused with a message naming where the
+setting moved to. Server-owned fields under `[integrations.prebid]` and
+`[integrations.aps]` are gone with them.
 
-For Prebid Server, move `server_url` to provider `endpoint`, server timeout to
-provider `timeout_ms`, request controls and bidder-parameter overrides to the
-`prebid-server` `profile_config`, notification suppression to `notifications`,
-and each server bidder to `[auction.bidders.<id>]`. Origin-only legacy
-`server_url` values compile to `/openrtb2/auction`; query parameters survive,
-and configured non-root custom endpoint paths remain exact. Browser timeout,
-debug, bundle, script interception, refresh exclusions, and
-`client_side_bidders` remain under `[integrations.prebid]`. Configure timeout or
-debug under both owners when both browser and server behavior should retain the
-old value.
+Move each provider to a `[demand.<name>]` table. `protocol` disappears,
+because every implementation states its own wire format. `profile` becomes
+`implementation`, so `"standard"` becomes `"openrtb"`, `"prebid-server"`
+becomes `"prebid_server"`, and `"aps"` stays `"aps"`. Everything that was
+inside `profile_config` moves up into the table itself, flat beside
+`endpoint`, `timeout_ms`, `routing` and `notifications`. Demand source names
+that carried a hyphen, such as `pbs-main`, become snake_case, such as `pbs_main`,
+and so does every `[auction.bidders.<code>] module` value that points at
+one.
 
-For APS, move endpoint and timeout to the provider, then move account,
-inventory, debug, and creative controls to the `aps` `profile_config`.
+For Prebid Server, move `server_url` to `endpoint` and the server timeout to
+`timeout_ms`. Origin-only legacy `server_url` values compile to
+`/openrtb2/auction`, query parameters survive, and configured non-root custom
+endpoint paths remain exact. Browser timeout, debug, bundle, script
+interception, refresh exclusions and `client_side_bidders` stay under
+`[auction.prebid]`. Configure timeout or debug under both owners when both
+browser and server behavior should retain the old value.
+
+For APS, move the endpoint and timeout to the table, then move account,
+inventory, debug and creative controls up beside them. `rendering_mode` moves
+out of `[integrations.aps]` into the same table.
 
 Only bidder codes listed in `[auction.bidders]` are folded into Trusted Server
-requests. Unlisted publisher bids remain native browser demand. All provider
-endpoints must be absolute HTTPS URLs.
+requests. Unlisted publisher bids remain native browser demand.
 
 The old and new blobs are mutually incompatible. Activate the new binary and
-map-shaped config together. A binary-first or config-first rolling deployment
-will put one version on a schema it rejects. Roll back by restoring the old
-binary and old-schema blob together.
+the new-shape config together. A binary-first or config-first rolling
+deployment will put one version on a schema it rejects. Roll back by restoring
+the old binary and old-schema blob together.
 :::
 
-Each table name is the provider ID used for configuration, backend correlation,
-health, response metadata, and telemetry. Provider IDs must match
-`^[a-z][a-z0-9-]{0,62}$`. Multiple instances may select the same profile and
-endpoint because the provider ID remains their distinct runtime identity.
+`[demand] modules` lists the demand sources, in a list because several run.
+Each table name is the demand source's identity for configuration, backend
+correlation, health, response metadata and telemetry, and must be snake_case.
+Every demand table carries an `implementation` line naming the
+implementation by its module path, such as `auction.prebid-server`, which is
+how two Prebid Servers run side by side under names of their own.
 
 **Example**:
 
@@ -2028,108 +2204,134 @@ enabled = true
 sanitize_creatives = false
 rewrite_creatives = true
 timeout_ms = 2000
-mediator = "adserver_mock"
 
-[auction.providers.pbs-main]
-protocol = "openrtb-2.6"
-profile = "prebid-server"
+[demand]
+modules = ["pbs_main", "aps_main"]
+
+[demand.pbs_main]
+implementation = "auction.prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"
 routing = "explicit"
 timeout_ms = 1200
-
-[auction.providers.pbs-main.profile_config]
 debug = false
 test_mode = false
 consent_forwarding = "both"
 
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 
-[auction.providers.aps-main]
-protocol = "openrtb-2.6"
-profile = "aps"
+[demand.aps_main]
+implementation = "auction.aps"
 endpoint = "https://aps.example.com/e/pb/bid"
 routing = "all_eligible"
-
-[auction.providers.aps-main.profile_config]
 account_id = "example-aps-account"
 debug = false
 allow_script_creatives = false
 
 [auction.bidders.example-server]
-provider = "pbs-main"
+module = "pbs_main"
 
-[integrations.adserver_mock]
-enabled = true
-endpoint = "https://mediator.example.com/mediate"
+[ad-server]
+module = "mock"
+
+[ad-server.mock]
+endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
 
-| Provider field   | Required | Default         | Description                                                   |
-| ---------------- | -------- | --------------- | ------------------------------------------------------------- |
-| `protocol`       | Yes      | None            | Must be `openrtb-2.6`                                         |
-| `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                         |
-| `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment   |
-| `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap      |
-| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles            |
-| `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
-| `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
+Every `[demand.<name>]` table takes these four settings, whichever
+implementation it names:
 
-### Profile configuration
+| Setting         | Required | Default                | Description                                                                                                                     |
+| --------------- | -------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`      | Yes      | None                   | Absolute HTTPS URL with a host and no credentials or fragment. Plain HTTP is accepted only to `127.0.0.1`, `::1` or `localhost` |
+| `timeout_ms`    | No       | Implementation default | This source's logical budget before the remaining-auction cap                                                                   |
+| `routing`       | No       | `explicit`             | `explicit`, or `all_eligible` where the implementation allows it                                                                |
+| `notifications` | No       | No suppression         | Common `nurl`/`burl` suppression after response normalization                                                                   |
 
-The table reflects the typed profile schemas. `Required` refers to the selected
-profile's `profile_config` object, not to the provider wrapper.
+Every other key in the table belongs to the implementation, which rejects any
+key it does not know.
 
-| Profile         | Field                      | Required | Default | Provider timeout default | Constraints                                                                                                      |
-| --------------- | -------------------------- | -------- | ------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `aps`           | `account_id`               | Yes      | —       | `800 ms`                 | String or integer; trimmed, nonempty, at most 1024 bytes                                                         |
-| `aps`           | `allow_script_creatives`   | No       | `false` | `800 ms`                 | Script creatives are ineligible unless enabled                                                                   |
-| `aps`           | `debug`                    | No       | `false` | `800 ms`                 | May expose unredacted request and response data                                                                  |
-| `aps`           | `inventory_domain`         | No       | `None`  | `800 ms`                 | DNS name, at most 253 bytes; configure with inventory_page_origin                                                |
-| `aps`           | `inventory_page_origin`    | No       | `None`  | `800 ms`                 | HTTPS origin without credentials, port, path, query, or fragment; host must equal or be beneath inventory_domain |
-| `prebid-server` | `bid_param_override_rules` | No       | `[]`    | `1000 ms`                | Ordered exact-match rules; at least one matcher and a nonempty set object                                        |
-| `prebid-server` | `bid_param_overrides`      | No       | `{}`    | `1000 ms`                | Per-bidder nonempty shallow-merge objects                                                                        |
-| `prebid-server` | `bid_param_zone_overrides` | No       | `{}`    | `1000 ms`                | Per-bidder, per-zone nonempty shallow-merge objects                                                              |
-| `prebid-server` | `consent_forwarding`       | No       | `both`  | `1000 ms`                | `openrtb_only`, `cookies_only`, or `both`                                                                        |
-| `prebid-server` | `debug`                    | No       | `false` | `1000 ms`                | Includes upstream exchange diagnostics                                                                           |
-| `prebid-server` | `debug_query_params`       | No       | `None`  | `1000 ms`                | Optional legacy page-URL query fragment                                                                          |
-| `prebid-server` | `test_mode`                | No       | `false` | `1000 ms`                | Sets OpenRTB `test = 1`                                                                                          |
-| `standard`      | `imp_ext`                  | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object                                               |
-| `standard`      | `request_ext`              | No       | `{}`    | Auction timeout          | JSON object; at most 16384 bytes, depth 8, and 256 keys per object; `trusted_server` is reserved                 |
+| Implementation             | Default timeout    | `all_eligible` | Its own settings                                                                                                                                |
+| -------------------------- | ------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auction-protocol.openrtb` | the auction budget | yes            | `request_ext`, `imp_ext`                                                                                                                        |
+| `auction.prebid-server`    | 1000 ms            | no             | `debug`, `test_mode`, `debug_query_params`, `consent_forwarding`, `bid_param_overrides`, `bid_param_zone_overrides`, `bid_param_override_rules` |
+| `auction.aps`              | 800 ms             | yes            | `account_id` (required), `debug`, `allow_script_creatives`, `inventory_domain`, `inventory_page_origin`, `rendering_mode`                       |
 
-Timeout defaults are 1000 ms for `prebid-server`, 800 ms for `aps`, and the
-auction timeout for `standard`. An explicit provider timeout overrides the
-profile default. Runtime uses `min(provider timeout, auction time remaining)`
-for launch decisions and OpenRTB `tmax`.
+An explicit `timeout_ms` overrides the implementation default. Runtime uses
+`min(source timeout, auction time remaining)` for launch decisions and OpenRTB
+`tmax`.
 
 `routing = "explicit"` sends only slots carrying a bidder assigned to that
-provider, plus trusted stored-request routes. `routing = "all_eligible"` sends
-every banner-compatible slot to the provider, regardless of bidder routes. It
-does not disclose bidder parameters assigned to another provider. APS commonly
+source, plus trusted stored-request routes. `routing = "all_eligible"` sends
+every banner-compatible slot to the source, regardless of bidder routes. It
+does not disclose bidder parameters assigned to another source. APS commonly
 uses `all_eligible` to preserve its whole-inventory participation. The
-`prebid-server` profile rejects `all_eligible` because every PBS impression must
-carry routed bidder or stored-request demand.
+`auction.prebid-server` implementation rejects `all_eligible` because every PBS
+impression must carry routed bidder or stored-request demand.
+
+APS `rendering_mode` is `trusted_server` by default, which renders through
+Trusted Server's opaque static renderer route. Set `publisher_native` only for
+a controlled publisher-origin friendly-frame cohort.
+
+### Ad server
+
+`[ad-server] module` names the one ad server that picks the winner, as a
+string rather than a list, and `[ad-server.<name>]` holds its settings. With no
+ad server the orchestrator selects the highest decoded CPM per slot and
+applies floors locally. With one configured, normalized demand responses are
+sent to it, and Trusted Server falls back to local ranking when the ad server
+cannot run.
+
+The one implementation this repository ships is `ad-server.mock`, written
+`mock` in `[ad-server]`, for
+development and testing.
+
+| Setting                | Required | Default | Description                                                         |
+| ---------------------- | -------- | ------- | ------------------------------------------------------------------- |
+| `endpoint`             | Yes      | None    | Decision endpoint URL, on the same scheme rule as a demand endpoint |
+| `timeout_ms`           | No       | `500`   | Request timeout, 1 to 60000                                         |
+| `price_floor`          | No       | None    | Minimum acceptable CPM                                              |
+| `context_query_params` | No       | `{}`    | Maps auction context keys to decision-URL query parameters          |
+
+```toml
+[ad-server]
+module = "mock"
+
+[ad-server.mock]
+endpoint = "https://adserver.example.com/decide"
+timeout_ms = 500
+
+[ad-server.mock.context_query_params]
+example_segments = "segments"
+```
+
+The word mediator is gone. It is "ad server" in prose and `ad-server` in
+configuration, `[debug.auction_html_comment_options] include_mediator_response`
+is now `include_adserver_response`, and the auction response metadata that read
+`parallel_mediation` now reads `parallel_adserver`.
 
 ### Bidder routes and bounds
 
-Each `[auction.bidders.<bidder-id>]` maps one client-visible bidder ID to exactly
-one provider. Bidder IDs must be nonempty, no more than 128 UTF-8 bytes, contain
-no control characters or surrounding whitespace, and cannot be the reserved
-exact ID `trustedServer`. Browser `trustedServer.bidderParams` accepts at most
-128 bidder entries; its optional `zone` is at most 256 UTF-8 bytes.
+Each `[auction.bidders.<bidder-id>]` maps one client-visible bidder ID to
+exactly one demand source, named by its `[demand]` table name. A route naming
+a source `[demand] modules` does not select is refused. Bidder IDs must be
+nonempty, no more than 128 UTF-8 bytes, contain no control characters or
+surrounding whitespace, and cannot be the reserved exact ID `trustedServer`.
+Browser `trustedServer.bidderParams` accepts at most 128 bidder entries, and
+its optional `zone` is at most 256 UTF-8 bytes.
 
-For the `standard` profile, `profile_config.request_ext` and `imp_ext` must be
-JSON objects. Each object is limited to 16 KiB serialized, eight container
-levels, and 256 keys at any one object level. Within `request_ext`, the
-`trusted_server` member is reserved and cannot be overwritten. `imp_ext` has no
-reserved-member guard in the current implementation.
+For the `auction-protocol.openrtb` implementation, `request_ext` and `imp_ext` must be JSON
+objects. Each object is limited to 16 KiB serialized, eight container levels,
+and 256 keys at any one object level. Reserved driver, implementation and
+signing fields cannot be overwritten.
 
 Common notification suppression uses exact returned OpenRTB seat values, not
 bidder route IDs:
 
 ```toml
-[auction.providers.pbs-main.notifications]
+[demand.pbs_main.notifications]
 suppress_all = false
 suppress_seats = ["example-seat"]
 ```
@@ -2140,50 +2342,56 @@ UTF-8 bytes and without ASCII control characters.
 ### Validation timing and target limits
 
 `ts config validate` and ordinary deploy validation compile the complete
-target-independent plan: profiles and defaults, routes, endpoint ownership,
-extension bounds, notifications, signing structure, and mediator selection.
-Target-specific checks are deferred to adapter startup. Startup uses the same
-compiled plan and additionally validates backend-name prediction/collisions and
-provider fan-out capability.
+target-independent plan from `[demand]`, `[ad-server]` and `[auction.bidders]`.
+That covers unselected tables, names that are not snake_case, an
+implementation this build does not have, endpoint scheme and host, timeouts,
+routing modes, notification bounds, bidder route ownership, signing structure,
+and any setting the chosen implementation rejects. Target-specific checks are
+deferred to adapter startup. Startup uses the same compiled plan and
+additionally validates backend-name prediction and collisions, and demand
+fan-out capability.
 
-Fastly and Axum support multiple configured providers. Cloudflare and Spin
-currently reject an enabled auction with more than one provider because those
-adapters do not support concurrent provider fan-out. Disabled auctions may keep
-dormant multi-provider maps without target rejection.
+Fastly and Axum support several configured demand sources. Cloudflare and Spin
+currently reject an enabled auction with more than one, because those adapters
+do not support concurrent fan-out. A disabled auction may keep a dormant
+multi-source plan without target rejection.
 
 A target-aware pre-write `ts config push --adapter <target>` callback is **not
 available in this tree** because the required EdgeZero callback is not yet
 available. Until it lands, push performs target-independent validation and
 adapter startup is the mandatory target-aware gate. Do not treat a successful
-push as proof that a Cloudflare or Spin multi-provider plan can start.
+push as proof that a Cloudflare or Spin multi-source plan can start.
 
 ### Deadline behavior
 
 Configured timeouts are logical budgets, not hard wall-clock guarantees. No
-current adapter claims an abortable provider-wide total-request deadline.
-Already-launched work may complete after the logical budget and a completed late
-response can remain eligible. Once the logical auction budget is exhausted,
-Trusted Server starts no additional provider or mediator network work, then
-finishes local decision and delivery. An auction can therefore exceed its
-configured wall-clock timeout.
+current adapter claims an abortable total-request deadline across demand
+sources. Already-launched work may complete after the logical budget and a
+completed late response can remain eligible. Once the logical auction budget is
+exhausted, Trusted Server starts no additional demand or ad server network
+work, then finishes local decision and delivery. An auction can therefore
+exceed its configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
 markup before delivery. `rewrite_creatives = false` skips first-party URL
 rewriting and creative TSJS injection. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
-**Environment overrides** replace map leaves that already exist in TOML:
+**Environment overrides** replace scalar leaves that already exist in TOML:
 
 ```bash
 env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
   'TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false' \
   'TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true' \
   'TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction' \
-  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=900' \
-  'TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction' \
+  'TRUSTED_SERVER__DEMAND__PBS_MAIN__TIMEOUT_MS=900' \
   ts config validate
 ```
+
+A selector list is an array, so `[demand] modules` and a section's
+`modules` cannot be changed by an overlay. Edit the TOML, then
+validate and push.
 
 ## Creative Opportunities Configuration
 
@@ -2227,7 +2435,7 @@ enabled = true # set to false to disable server-side ad templates
 gam_network_id = "123456789"
 price_granularity = "dense"
 
-# Shared placeholder value for the site root ("/") — see {section} below.
+# Shared placeholder value for the site root ("/"). See {section} below.
 section_root = "home"
 # Which path segment names the section, 0-based. Default 0 (first segment).
 # Set to 1 for locale-prefixed URLs such as "/en/news/article".
@@ -2237,7 +2445,7 @@ section_root = "home"
 id = "ad-header"
 gam_unit_path = "/{network_id}/example/{section}"
 # List each section landing page as well as its subtree: `/news/*` matches
-# `/news/article` but NOT `/news` — the glob requires the trailing separator.
+# `/news/article` but NOT `/news`, because the glob requires the trailing separator.
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
@@ -2458,9 +2666,9 @@ fresh origin response; they do not fail the page. The corresponding
 
 `X-TS-Assembly` identifies how the private response was assembled:
 
-- `esi-parser` — authorized cold miss assembled by the repaired parser;
-- `byte-seam` — warm template-cache hit using the streaming byte seam;
-- `byte-seam-fallback` — cold response safely assembled by byte seam because
+- `esi-parser`, an authorized cold miss assembled by the repaired parser;
+- `byte-seam`, a warm template-cache hit using the streaming byte seam;
+- `byte-seam-fallback`, a cold response safely assembled by byte seam because
   the platform parser was unavailable or rejected the document.
 
 The two headers together are the reliable verification signal. Timing alone can
@@ -2706,12 +2914,12 @@ dynamic-only limit.
 - Casing is preserved. [Google documents GAM ad-unit codes as
   case-insensitive](https://support.google.com/admanager/answer/10477476?hl=en),
   so do not lowercase the value.
-- The path is used **raw — it is not percent-decoded**. So `/new%20s` →
+- The path is used **raw, and is not percent-decoded**. So `/new%20s` →
   `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
   `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
   same raw path.
-- When the path has no segment at that index — the site root (`/`, or repeated
-  slashes), or a path shorter than `section_segment` — `{section}` is
+- When the path has no segment at that index, being the site root (`/`, or
+  repeated slashes) or a path shorter than `section_segment`, `{section}` is
   `section_root`. So with `section_segment = 1`, the path `/en` renders the root
   section rather than reusing the locale.
 
@@ -2758,7 +2966,7 @@ The same config with `section_segment = 1` and locale-prefixed patterns
 | `/en/news`         | `/123456789/example/news` |
 | `/en/news/article` | `/123456789/example/news` |
 
-An **unmatched route** — a path matched by no slot's `page_patterns` — produces
+An **unmatched route**, a path matched by no slot's `page_patterns`, produces
 no slot at all, so no template is rendered for it.
 
 Startup validation rejects a malformed template: an unknown placeholder (e.g.
@@ -2777,7 +2985,7 @@ auction, TLS, or creative data and are for controlled non-production use only.
 | `auction_html_comment`                                    | Boolean       | `false`                                | Insert an auction diagnostic comment before `</body>`            |
 | `inject_adm_for_testing`                                  | Boolean       | `false`                                | Enable the direct GAM-replace test path and raw `debug_bid` data |
 | `auction_html_comment_options.include_provider_responses` | Boolean       | `true`                                 | Include provider response summaries                              |
-| `auction_html_comment_options.include_mediator_response`  | Boolean       | `true`                                 | Include mediator response summaries                              |
+| `auction_html_comment_options.include_adserver_response`  | Boolean       | `true`                                 | Include the ad server's response summary                         |
 | `auction_html_comment_options.include_bids`               | Boolean       | `true`                                 | Include provider bid arrays                                      |
 | `auction_html_comment_options.metadata_keys`              | Array[String] | `error_type`, `http_status`, `message` | Must be a subset of this fixed allowlist                         |
 | `auction_html_comment_options.verbosity`                  | String        | `"redacted"`                           | `redacted`, `upstream`, or `full`                                |
@@ -2931,46 +3139,70 @@ version if that is required.
 
 ## Validation
 
-### Automatic Validation
+Configuration is checked at two gates.
+[Configuration Rules](/guide/configuration-rules#what-is-checked-before-a-request-is-served)
+sets out which rule is caught where. In short, `ts config validate`,
+`ts config diff` and `ts config push` check everything that can be decided
+from the file, and startup checks the rest and runs the first set again.
 
-Configuration is validated at startup:
+### Checked when the configuration is validated or pushed
 
-**Publisher Validation**:
+**Publisher**:
 
 - All fields non-empty
-- `origin_url` is valid URL
+- `origin_url` is a valid URL
 
 **EC Validation**:
 
-- The `passphrase` key name is non-empty at push time
-- The resolved passphrase is at least 32 bytes at runtime
-- Known placeholder values are rejected after resolution
+- `module`, when set, is a module name and has the `[ec.<name>]` table its
+  implementation needs, and no unselected table is left configured, or startup
+  fails
+- The `hmac.passphrase` key name is non-empty at push time, the resolved
+  passphrase is at least 32 bytes at runtime, and a known placeholder value is
+  rejected after resolution
+- The complete auction plan compiles from `[demand]`, `[ad-server]` and
+  `[auction.bidders]`, so an unselected table, a name that is not a module name,
+  an implementation this build does not have, a bad endpoint, an out-of-range
+  timeout, an unsupported routing mode, a route naming an unselected demand
+  source, or a setting the implementation rejects, all fail here
 
-**Handler Validation**:
+**Secrets**:
 
-- `path` is valid regex
+- Every secret setting holds a key name and no secret value
+
+**Handlers**:
+
+- `path` is a valid regex
 - `username` is ordinary configuration and non-empty
-- The resolved `password` is non-empty and is checked for placeholders at runtime
+- At least one handler covers the `/_ts/admin` namespace
 
-**Integration Validation**:
+**Integrations**:
 
-- Each integration implements `Validate` trait
-- Custom rules per integration
+- Each integration validates its own block, selected or not, so a typo in a
+  block that is switched off is still caught
+
+### Checked when the service starts
+
+Everything above runs again on the loaded configuration, and these join it:
+
+- The `[ec]`, `[geo]`, `[device]` and `[permission-signal]` selections. A name
+  this build does not have, a missing settings table, or a table the selector
+  does not name, stops the service on its next start. A passing
+  `ts config validate` is not proof that a change to those four will start
+- Resolved secret values, so a passphrase shorter than 32 bytes, a placeholder
+  or a weak handler password fails here
+- The compiled `permissions.yaml` policy, and the `assume_single_jurisdiction`
+  acknowledgment an Edge Cookie module needs when no geo module is selected
+- The checks only the host can make, being backend name prediction and
+  collisions, and whether the adapter can call more than one demand source at
+  once
 
 ### Validation Errors
-
-**Startup Failure** if:
-
-- Required fields missing
-- Invalid data types
-- Regex compilation fails
-- Secret key is default value
-- Integration config fails validation
 
 **Error Format**:
 
 ```
-Configuration error: provider `pbs-main` endpoint must be an absolute HTTPS URL
+Configuration error: [demand.pbs_main] endpoint must be HTTPS, or HTTP to 127.0.0.1, ::1 or localhost, with a host and no credentials or fragment
 ```
 
 ## Best Practices

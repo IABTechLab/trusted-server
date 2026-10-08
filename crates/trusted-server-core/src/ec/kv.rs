@@ -1502,6 +1502,13 @@ impl KvIdentityGraph {
         }
 
         // Compute cluster size via prefix list.
+        //
+        // `ec_hash` takes everything before the first `.`, so a coded
+        // identifier yields `hmac~<hash>` and a bare one yields `<hash>`.
+        // Prefix matching is anchored at the start of the key, so bare and
+        // `hmac~` rows for one client IP are counted separately and
+        // `cluster_size` can under-report. The count is reported in identify
+        // responses and gates nothing, and it must not gate a decision.
         let hash_prefix = ec_hash(ec_id);
         let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
 

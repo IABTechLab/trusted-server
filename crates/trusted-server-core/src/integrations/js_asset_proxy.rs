@@ -30,6 +30,20 @@ use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 
 pub(crate) const JS_ASSET_PROXY_INTEGRATION_ID: &str = "js_asset_proxy";
+
+/// The name this module is selected by, in `[proxy]`.
+pub const MODULE: &str = "js_asset_proxy";
+
+/// The builder the registry runs when a section selects [`MODULE`].
+pub(crate) const BUILDER: crate::integrations::IntegrationBuilder =
+    crate::integrations::IntegrationBuilder::new(
+        JS_ASSET_PROXY_INTEGRATION_ID,
+        crate::integrations::CORE_SOURCE,
+        register,
+        validate,
+    )
+    .with_module_name(MODULE)
+    .selected_in("proxy");
 const JS_ASSET_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const X_CONTENT_TYPE_OPTIONS_NOSNIFF: &str = "nosniff";
 const ERROR_ORIGIN_UNREACHABLE: &str = "js-asset-origin-unreachable";
@@ -37,10 +51,8 @@ const ERROR_ORIGIN_STATUS: &str = "js-asset-origin-status";
 
 /// Configuration for the JavaScript asset proxy integration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsAssetProxyConfig {
-    /// Enables or disables the integration.
-    #[serde(default)]
-    pub enabled: bool,
     /// Optional downstream cache TTL override for every asset.
     #[serde(default)]
     pub cache_ttl_seconds: Option<u32>,
@@ -88,18 +100,16 @@ impl JsAssetProxyConfig {
     }
 }
 
-impl IntegrationConfig for JsAssetProxyConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
+impl IntegrationConfig for JsAssetProxyConfig {}
 
 impl Validate for JsAssetProxyConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = ValidationErrors::new();
         errors.merge_self("assets", self.assets.validate());
 
-        if self.enabled && self.assets.is_empty() {
+        // A selected integration with nothing to serve is a configuration
+        // mistake, so the block has to list at least one asset.
+        if self.assets.is_empty() {
             errors.add("assets", ValidationError::new("empty_assets"));
         }
 
@@ -446,9 +456,7 @@ impl JsAssetProxyIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<JsAssetProxyIntegration>>, Report<TrustedServerError>> {
-    let Some(mut config) =
-        settings.integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)?
-    else {
+    let Some(mut config) = settings.module_config::<JsAssetProxyConfig>(MODULE)? else {
         return Ok(None);
     };
     config.normalize_origin_urls();
@@ -456,11 +464,24 @@ fn build(
     Ok(Some(JsAssetProxyIntegration::new(config)))
 }
 
+/// Validates the JavaScript asset proxy configuration for deployment and
+/// reports whether a section selects the integration's module.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .module_config::<JsAssetProxyConfig>(MODULE)
+        .map(|config| config.is_some())
+}
+
 /// Register the JavaScript asset proxy integration.
 ///
 /// # Errors
 ///
-/// Returns an error when the integration is enabled with invalid configuration.
+/// Returns an error when the integration runs with invalid configuration.
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -600,7 +621,6 @@ mod tests {
 
     fn config_with_assets(assets: Vec<JsAssetProxyAsset>) -> JsAssetProxyConfig {
         JsAssetProxyConfig {
-            enabled: true,
             cache_ttl_seconds: None,
             assets,
         }
@@ -638,8 +658,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
-            gpt_diagnostics: None,
-            suppress_datadome_client_side_tag: false,
+            request_state: crate::integrations::IntegrationRequestState::default(),
+            permissions_script: None,
         });
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -656,34 +676,20 @@ mod tests {
     }
 
     #[test]
-    fn disabled_config_does_not_register_routes() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
-                &json!({
-                    "enabled": false,
-                    "assets": [{
-                        "path": "/assets/vendor.js",
-                        "origin_url": "https://cdn.example.com/vendor.js"
-                    }]
-                }),
-            )
-            .expect("should insert integration config");
+    fn an_integration_that_is_not_named_registers_no_routes() {
+        let settings = create_test_settings();
 
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
 
         assert!(
             !registry.has_route(&Method::GET, "/assets/vendor.js"),
-            "disabled integration should not register asset route"
+            "an integration that is not named should register no asset route"
         );
     }
 
     #[test]
     fn enabled_config_requires_at_least_one_asset() {
         let config = JsAssetProxyConfig {
-            enabled: true,
             cache_ttl_seconds: None,
             assets: Vec::new(),
         };
@@ -845,104 +851,117 @@ mod tests {
     #[test]
     fn js_asset_proxy_rewriter_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::tag_fixture::MODULE,
+        );
         settings
-            .integrations
-            .insert_config("gpt", &json!({ "enabled": true }))
-            .expect("should insert GPT config");
-        settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
-                    "enabled": true,
                     "assets": [{
-                        "path": "/assets/gpt.js",
-                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "path": "/assets/sdk.js",
+                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
                         "proxy": "enabled"
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></body></html>"#;
+        let html = format!(
+            r#"<html><body><script src="{}"></script></body></html>"#,
+            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+        );
 
-        let processed = process_html_with_registry(html, registry);
+        let processed = process_html_with_registry(&html, registry);
 
         assert!(
-            processed.contains(r#"<script src="/assets/gpt.js"></script>"#),
-            "JS asset proxy should rewrite before GPT native rewriter: {processed}"
+            processed.contains(r#"<script src="/assets/sdk.js"></script>"#),
+            "JS asset proxy should rewrite before the integration's own rewriter: {processed}"
         );
         assert!(
-            !processed.contains("/integrations/gpt/script"),
-            "GPT native rewrite should not override JS asset proxy"
+            !processed.contains(
+                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+            ),
+            "the integration's own rewrite should not override JS asset proxy"
         );
     }
 
     #[test]
     fn js_asset_proxy_blocking_takes_precedence_over_native_rewriters() {
         let mut settings = create_test_settings();
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::tag_fixture::MODULE,
+        );
         settings
-            .integrations
-            .insert_config("gpt", &json!({ "enabled": true }))
-            .expect("should insert GPT config");
-        settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
-                    "enabled": true,
                     "assets": [{
-                        "path": "/assets/gpt.js",
-                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "path": "/assets/sdk.js",
+                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
                         "proxy": "blocked"
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js">googletag.cmd.push(() => {});</script></body></html>"#;
+        let html = format!(
+            r#"<html><body><script src="{}">vendor.cmd.push(() => {{}});</script></body></html>"#,
+            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+        );
 
-        let processed = process_html_with_registry(html, registry);
+        let processed = process_html_with_registry(&html, registry);
 
         assert!(
-            !processed.contains("googletag.cmd"),
-            "blocked JS asset should remove the script element before GPT can rewrite it"
+            !processed.contains("vendor.cmd"),
+            "blocked JS asset should remove the script element before the integration can rewrite it"
         );
         assert!(
-            !processed.contains("/integrations/gpt/script"),
-            "GPT native rewrite should not keep a blocked script"
+            !processed.contains(
+                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+            ),
+            "the integration's own rewrite should not keep a blocked script"
         );
     }
 
     #[test]
     fn disabled_js_asset_proxy_candidate_allows_native_rewriters() {
         let mut settings = create_test_settings();
+        settings.select_module(
+            "testing",
+            crate::integrations::registry_test_support::tag_fixture::MODULE,
+        );
         settings
-            .integrations
-            .insert_config("gpt", &json!({ "enabled": true }))
-            .expect("should insert GPT config");
-        settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
-                    "enabled": true,
                     "assets": [{
-                        "path": "/assets/gpt.js",
-                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "path": "/assets/sdk.js",
+                        "origin_url": crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL,
                         "proxy": "disabled"
                     }]
                 }),
             )
             .expect("should insert JS asset proxy config");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
-        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></body></html>"#;
+        let html = format!(
+            r#"<html><body><script src="{}"></script></body></html>"#,
+            crate::integrations::registry_test_support::tag_fixture::SCRIPT_URL
+        );
 
-        let processed = process_html_with_registry(html, registry);
+        let processed = process_html_with_registry(&html, registry);
 
         assert!(
-            processed.contains(r#"<script src="/integrations/gpt/script"></script>"#),
-            "disabled JS asset proxy entries should not suppress native integration rewrites"
+            processed.contains(&format!(
+                r#"<script src="{}"></script>"#,
+                crate::integrations::registry_test_support::tag_fixture::FIRST_PARTY_SCRIPT
+            )),
+            "disabled JS asset proxy entries should not suppress an integration's own rewrite"
         );
     }
 
@@ -1051,14 +1070,17 @@ mod tests {
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
 
-            [integrations.js_asset_proxy]
-            enabled = true
+            [proxy]
+            modules = ["js_asset_proxy"]
 
-            [[integrations.js_asset_proxy.assets]]
+            [[proxy.js_asset_proxy.assets]]
             path = "/assets/vendor.js"
             origin_url = "https://cdn.example.com/vendor.js"
             proxy = "passthrough"
@@ -1067,7 +1089,7 @@ mod tests {
 
         assert!(
             settings
-                .integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)
+                .module_config::<JsAssetProxyConfig>(MODULE)
                 .is_err(),
             "unknown proxy mode should fail deserialization"
         );
@@ -1077,11 +1099,10 @@ mod tests {
     fn exact_configured_routes_are_registered() {
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
-                    "enabled": true,
                     "assets": [
                         {
                             "path": "/assets/vendor.js",
@@ -1278,11 +1299,10 @@ mod tests {
     fn configured_origin_urls_are_canonicalized_for_matching_and_duplicates() {
         let mut settings = create_test_settings();
         settings
-            .integrations
-            .insert_config(
-                JS_ASSET_PROXY_INTEGRATION_ID,
+            .insert_module_config(
+                "proxy",
+                "js_asset_proxy",
                 &json!({
-                    "enabled": true,
                     "assets": [{
                         "path": "/assets/vendor.js",
                         "origin_url": "HTTPS://CDN.EXAMPLE.COM:443/vendor.js"

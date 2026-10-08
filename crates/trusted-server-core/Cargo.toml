@@ -41,6 +41,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 toml = { workspace = true }
@@ -63,10 +64,16 @@ uuid = { workspace = true, features = ["js"] }
 edgezero-core = { workspace = true }
 
 [features]
+# Compiles in the `client_fixed` demonstration Edge Cookie module. Off by
+# default so production builds cannot select a fixed shared word as identity.
+client-fixed-demo = []
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
-# so downstream crates can build registries with stub integrations in their tests.
-test-utils = []
+# and the platform test doubles, so downstream crates can build registries with
+# stub integrations and run against stub services in their tests. The doubles
+# are built on the platform library's own, which its feature of the same name
+# offers.
+test-utils = ["edgezero-core/test-utils"]
 
 [dev-dependencies]
 config = { workspace = true }
