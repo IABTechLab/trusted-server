@@ -847,9 +847,9 @@ page or auction. When available, the opaque value follows the standard path:
 2. The current `/auction` request includes that entry.
 3. Trusted Server merges and consent-gates it, then forwards it to Prebid
    Server as `user.ext.eids`.
-4. The browser persists the same opaque value in the bounded `ts-eids` cookie.
-5. A later request can ingest it into an EC/KV partner configured with
-   `source_domain = "liveramp.com"`.
+4. Response finalization conservatively stores the body UID on an existing,
+   consenting EC row for a partner configured with `source_domain = "liveramp.com"`.
+5. Later auctions resolve the stored ID from KV. No EID cookie is used.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -917,8 +917,8 @@ domain, booleans, source names, counts, and status codes:
    recording its value.
 5. Confirm a controlled Prebid Server request contains that source in
    `user.ext.eids`.
-6. Confirm a later request ingests the source into the configured
-   `liveramp.com` EC partner.
+6. Confirm the body submission persists the source into the existing
+   `liveramp.com` EC partner, then confirm a later auction resolves it from KV.
 7. Repeat with denied consent and confirm the envelope endpoint is not called,
    `idl_env` is not written, and no LiveRamp EID is forwarded.
 8. Repeat on an unapproved origin and confirm identity resolution degrades
@@ -929,38 +929,56 @@ path. LiveRamp ATS Direct audience segments, including `_lr_atsDirect` storage
 and GAM or Prebid segment activation, require a separate integration and are
 not passed by this implementation.
 
-## Identity Forwarding
+## Identity forwarding
 
-Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
+Prebid.js sends current EIDs from `pbjs.getUserIdsAsEids()` in the `/auction`
+body. Trusted Server merges them with usable registered IDs from the current
+EC/KV row, applies consent gating, and forwards `user.ext.eids` to Prebid Server.
 
-1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
-2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
-3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
-4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
-5. The `ts-eids` cookie is still ingested after the response so later requests can reuse the IDs even when the current auction does not provide them again.
+Registered body sources are staged before provider dispatch. Response finalization
+combines them with the separate `sharedId` cookie in one conservative mutation,
+using the auction's KV snapshot. No bid and handled provider-error responses still
+finalize these updates. Browser input fills absent sources only. It cannot replace
+stored IDs, forge lifecycle metadata, create a root, recover a missing root, or
+revive a withdrawal tombstone. Unknown sources remain current-request-only.
 
-This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
+This persistence requires EC KV support. Fastly supports it; adapters without an
+EC identity graph can forward permitted body EIDs but do not persist them.
+Publisher and SPA page-bid auctions use KV IDs only. An ID arriving late needs
+another `/auction` body submission; there is no page-exit beacon or cookie repair.
 
 ### Identity flow
 
 ```mermaid
-sequenceDiagram
-    participant B as Browser / Prebid.js
-    participant T as Trusted Server /auction
-    participant K as EC + KV identity graph
-    participant P as Prebid Server
-
-    B->>B: User ID modules resolve EIDs
-    B->>T: POST /auction\n(adUnits + current-request eids)
-    T->>K: Resolve EC-backed source-domain IDs
-    K-->>T: KV-derived EIDs
-    T->>T: Merge + dedupe client + KV EIDs
-    T->>T: Apply consent gating
-    T->>P: OpenRTB request\nuser.ext.eids = merged set
-    P-->>T: OpenRTB bid response
-    T-->>B: Auction response
-    T->>K: Ingest ts-eids cookie for future requests
+flowchart TD
+    A[Prebid User ID modules resolve EIDs] --> B[POST auction with current body EIDs]
+    B --> C[Stage registered UID-only updates on EC context]
+    C --> D[Read current EC row and merge usable KV EIDs]
+    D --> E[Consent-gated OpenRTB request to Prebid Server]
+    E --> F[Bid, no-bid, or handled error response]
+    F --> G[Finalize body plus sharedId on existing consenting root]
+    G --> H[Send response]
+    G --> I[Later auctions read stored IDs from KV]
 ```
+
+### Cookie and diagnostic retirement
+
+New servers ignore `ts-eids`, including writes by cached older bundles. No TS EID
+cookie replaces it. The transition JS bundle expires the old host-only `Path=/`
+cookie once installed. Remove that cleanup only after writing bundles have aged
+past both the old cookie's one-day max-age and the deployment cache lifetime.
+The server does not emit unconditional cleanup `Set-Cookie` headers.
+
+`x-ts-eids` and `x-ts-eids-truncated` are no longer emitted and remain stripped
+from inbound requests. Check external diagnostic consumers before rollout.
+`/_ts/admin/eids` remains authenticated and returns a local `410 Gone` with
+`Cache-Control: no-store`, never publisher fallback. Use `/_ts/admin/ec` to inspect
+persisted state on adapters with EC KV support. EC and consent headers remain.
+
+Deploy metadata-preserving readers and writers everywhere and drain old invocations
+before activating body writer/revision metadata. Old binaries can erase metadata
+or ignore expiry; rolling back to them after activation is unsafe. A passing test
+on a new binary is not deployment-drain evidence.
 
 ### Merge and deduplication rules
 
@@ -968,7 +986,11 @@ sequenceDiagram
 - UIDs are deduplicated by `source + id`
 - If the same UID appears in both places, it is sent only once downstream
 - Distinct UIDs under the same source are preserved
-- Consent gating is applied to the **merged** set before forwarding
+- Supplied `inserter`, `matcher`, and integer `mm` remain current-request provenance,
+  including empty `matcher` and zero `mm`; they are not stored in KV
+- UID `ext` remains current-request-only; existing UID merge precedence is unchanged
+- Known-expired KV IDs are omitted, including an identical body UID for that source
+- Consent gating is applied to the merged set before forwarding
 
 ### What reaches Prebid Server
 
@@ -981,7 +1003,7 @@ The downstream Prebid Server request includes:
 In practice, this gives operators both:
 
 - **same-request identity transparency** for Prebid User ID Module output, and
-- **future-request continuity** through cookie ingestion and KV-backed partner resolution.
+- future-request continuity through body persistence and KV-backed partner resolution.
 
 ## Endpoints
 

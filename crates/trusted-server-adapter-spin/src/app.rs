@@ -21,10 +21,9 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported, admin_eids_lookup_retired,
+    deny_admin_diagnostic_fallback,
 };
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -645,18 +644,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
         };
 
-        // Admin EIDs echo: pure request inspection (no KV), so this adapter
-        // serves the real handler.
-        let s = Arc::clone(&state);
-        let admin_eids_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let req = ctx.into_request();
-                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
-                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
+        // Retain authenticated local denial, never publisher fallback.
+        let admin_eids_handler =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(admin_eids_lookup_retired()) };
 
         // /auction
         let s = Arc::clone(&state);

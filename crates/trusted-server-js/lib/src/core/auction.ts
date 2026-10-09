@@ -30,6 +30,9 @@ export interface AuctionUid {
 /** An auction-level EID entry forwarded to the server. */
 export interface AuctionEid {
   source: string;
+  inserter?: string;
+  matcher?: string;
+  mm?: number;
   uids: AuctionUid[];
 }
 

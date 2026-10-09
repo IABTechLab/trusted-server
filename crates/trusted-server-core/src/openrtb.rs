@@ -65,11 +65,20 @@ pub struct ConsentedProvidersSettings {
 }
 
 /// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
+    /// Entity that inserted this EID into the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inserter: Option<String>,
+    /// Entity that matched this EID. An empty supplied string is preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// `OpenRTB` match method. Zero is a supplied value, not absence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mm: Option<i32>,
     /// One or more user IDs from this provider.
     pub uids: Vec<Uid>,
 }
@@ -394,6 +403,9 @@ mod tests {
     #[test]
     fn eid_serializes_correctly() {
         let eid = Eid {
+            inserter: None,
+            matcher: None,
+            mm: None,
             source: "id5-sync.com".to_owned(),
             uids: vec![Uid {
                 id: "ID5-abc123".to_owned(),
@@ -418,6 +430,9 @@ mod tests {
     #[test]
     fn eid_serializes_vendor_specific_atype() {
         let eid = Eid {
+            inserter: None,
+            matcher: None,
+            mm: None,
             source: "google.com".to_owned(),
             uids: vec![Uid {
                 id: "pair-id".to_owned(),

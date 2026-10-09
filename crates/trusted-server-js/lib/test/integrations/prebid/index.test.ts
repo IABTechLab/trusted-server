@@ -2543,9 +2543,9 @@ describe('prebid/installPrebidNpm', () => {
       expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
     });
 
-    it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
-      const spec = getAdapterSpec();
+    it('installation expires the retired ts-eids cookie when EIDs are absent', () => {
       document.cookie = 'ts-eids=stale-value';
+      const spec = getAdapterSpec();
       mockGetUserIdsAsEids.mockReturnValue([]);
 
       spec.buildRequests([
@@ -2613,6 +2613,45 @@ describe('prebid/installPrebidNpm', () => {
           ],
         },
       ]);
+    });
+
+    it('buildRequests preserves supplied EID provenance including empty matcher and zero mm', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'id5-sync.com',
+          inserter: 'Lockr-For-Publishers',
+          matcher: '',
+          mm: 0,
+          uids: [{ id: 'opaque-id', atype: 1, ext: { linkType: 1 } }],
+        },
+        {
+          source: 'other.example',
+          inserter: 1,
+          matcher: null,
+          mm: 1.5,
+          uids: [{ id: 'other-id' }],
+        },
+      ]);
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'slot',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+      expect(JSON.parse(result.data).eids).toEqual([
+        {
+          source: 'id5-sync.com',
+          inserter: 'Lockr-For-Publishers',
+          matcher: '',
+          mm: 0,
+          uids: [{ id: 'opaque-id', atype: 1, ext: { linkType: 1 } }],
+        },
+        { source: 'other.example', uids: [{ id: 'other-id' }] },
+      ]);
+      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
     });
 
     it('buildRequests uses custom endpoint when configured', () => {
@@ -3157,7 +3196,7 @@ describe('prebid/installPrebidNpm', () => {
       expect(hasTsBidder).toBe(true);
     });
 
-    it('syncs a structured ts-eids cookie after bidsBackHandler', () => {
+    it('never writes a ts-eids cookie after bidsBackHandler', () => {
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
@@ -3176,20 +3215,10 @@ describe('prebid/installPrebidNpm', () => {
         adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
       } as unknown as RequestBidsArg);
 
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      expect(JSON.parse(atob(cookieValue!))).toEqual([
-        {
-          source: 'sharedid.org',
-          uids: [
-            { id: 'shared_123', atype: 3 },
-            { id: 'shared_456', ext: { provider: 'example' } },
-          ],
-        },
-      ]);
+      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
     });
 
-    it('preserves an opaque LiveRamp envelope in the ts-eids cookie', () => {
+    it('does not persist an opaque LiveRamp envelope in a cookie', () => {
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
@@ -3205,17 +3234,10 @@ describe('prebid/installPrebidNpm', () => {
         adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
       } as unknown as RequestBidsArg);
 
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      expect(JSON.parse(atob(cookieValue!))).toEqual([
-        {
-          source: 'liveramp.com',
-          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
-        },
-      ]);
+      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
     });
 
-    it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
+    it('expires the retired cookie on installation before any auction', () => {
       document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
