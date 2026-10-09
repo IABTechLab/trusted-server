@@ -356,7 +356,7 @@ actual token bytes from the local file, excluding its line terminator. The publi
 cover every mapped browser hostname. Omitting the section keeps the server's
 default transport-origin behavior.
 
-Generate a local token file, provision its token in the server secret store,
+Generate a cryptographically random local token file, provision its token in the server secret store,
 and pass only the file path to the proxy:
 
 ```bash
@@ -364,7 +364,7 @@ umask 077
 openssl rand -hex 32 > ./forwarder-token.txt
 
 ts dev proxy \
-  --map www.example-publisher.com=trusted-server-example.edgecompute.app \
+  --map www.publisher.example.com=trusted-server.example.com \
   --rewrite-host \
   --forwarder-secret-file ./forwarder-token.txt \
   --launch chrome

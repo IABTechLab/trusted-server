@@ -80,3 +80,5 @@ Both branch trees passed all required CI gates, target-matched adapter builds, F
 The real operator `ts config validate` command accepted the optional forwarder section with a secret-store key reference. A shared-target artifact interruption in the server CLI documentation run cleared on a sequential full-suite rerun. Independent reviews approved every implementation and corrective pass, including the runtime-origin fallback, streaming trailer removal, identify CORS and joint listener fixture.
 
 GitHub CI and the existing deployed/mobile release acceptance are tracked in the PR descriptions; local wire tests do not replace physical mobile, browser session restoration or operator staging acceptance.
+
+The new CodeQL password-hashing alert #204 was independently reviewed and classified as a false positive: SHA-256 normalizes temporary bearer-token digests for comparison; no verifier digest is stored or exposed. The operator guide explicitly requires random-token generation and distinguishes length from entropy.
