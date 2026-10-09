@@ -323,7 +323,7 @@ IntegrationRegistration::builder(ID)
 ## JS Build Pipeline
 
 - `build-all.mjs` discovers `src/integrations/*/index.ts` and builds each as a separate IIFE.
-- Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js`.
+- Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js` from `npm run build`. `build.rs` passes `--out-dir` to build the same files into a private `OUT_DIR/tsjs-dist`, validates the set, and never reads `dist/`.
 - `build.rs` auto-generates `tsjs_modules.rs` with `include_str!()` for each discovered file.
 - `bundle.rs` provides `concatenate_modules(ids)` and `concatenated_hash(ids)` APIs.
 - Runtime: Rust server concatenates core + enabled integration JS files at request time.
@@ -453,7 +453,7 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
-| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/build.rs`                       | Builds into `OUT_DIR`, generates `tsjs_modules.rs`   |
 | `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---

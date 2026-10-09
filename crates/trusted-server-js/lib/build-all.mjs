@@ -41,9 +41,14 @@ function resolveOutDir(args) {
   return path.resolve(value);
 }
 
-// Clean the output directory
-fs.rmSync(distDir, { recursive: true, force: true });
+// Remove only the bundles this script writes, so a wrong --out-dir cannot
+// delete unrelated files.
 fs.mkdirSync(distDir, { recursive: true });
+for (const name of fs.readdirSync(distDir)) {
+  if (name.startsWith('tsjs-') && name.endsWith('.js')) {
+    fs.rmSync(path.join(distDir, name));
+  }
+}
 
 // Discover integration modules: directories in src/integrations/ with index.ts
 const integrationModules = fs.existsSync(integrationsDir)

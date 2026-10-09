@@ -616,7 +616,7 @@ npm run lint
 
 ```bash
 cd crates/trusted-server-js/lib && npm run build && cd -
-TSJS_PREBUILT_DIR="$PWD/crates/trusted-server-js/dist" cargo build
+TSJS_PREBUILT_DIR="$PWD/crates/trusted-server-js/dist" cargo build-fastly
 ```
 
 `TSJS_PREBUILT_DIR` is checked the same way as a normal build: every expected
@@ -634,7 +634,8 @@ writes.
 | Error message contains                                           | Cause and fix                                                                                                                                                                                                                      |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tsjs: npm not found on PATH`                                    | Node.js is not installed or not on `PATH`. Install Node.js, or set `TSJS_PREBUILT_DIR` as shown above.                                                                                                                             |
-| `tsjs: TSJS_SKIP_BUILD is no longer supported`                   | Unset `TSJS_SKIP_BUILD` and use `TSJS_PREBUILT_DIR` instead.                                                                                                                                                                       |
+| `tsjs: TSJS_PREBUILT_DIR must be an absolute path`               | Cargo runs build scripts from `crates/trusted-server-js`, so a relative path would resolve there. Pass an absolute path, for example `"$PWD/crates/trusted-server-js/dist"`.                                                       |
+| `tsjs: TSJS_SKIP_BUILD is no longer supported`                   | `TSJS_SKIP_BUILD=1` no longer skips the build. Unset it and use `TSJS_PREBUILT_DIR` instead.                                                                                                                                       |
 | `tsjs: node_modules is out of date with package-lock.json`       | Dependencies changed, for example after switching branches. Run `npm ci` in `crates/trusted-server-js/lib`. The check compares file times, so a checkout that rewrites an unchanged lockfile also triggers it; `npm ci` clears it. |
 | `tsjs: npm ci failed`                                            | `node_modules` was missing and the automatic install failed. Run `npm ci` in `crates/trusted-server-js/lib` to see the error.                                                                                                      |
 | `tsjs: invalid bundle set ... missing bundles` / `empty bundles` | The Node build or the `TSJS_PREBUILT_DIR` directory did not produce one `tsjs-<id>.js` per `core` and `lib/src/integrations/<id>/index.ts`.                                                                                        |

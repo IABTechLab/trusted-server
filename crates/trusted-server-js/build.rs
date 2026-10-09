@@ -49,6 +49,12 @@ fn main() {
         .unwrap_or_else(|err| panic!("tsjs: failed to discover modules: {err}"));
 
     if let Some(prebuilt_dir) = env::var_os(PREBUILT_DIR_VAR).map(PathBuf::from) {
+        assert!(
+            prebuilt_dir.is_absolute(),
+            "tsjs: {PREBUILT_DIR_VAR} must be an absolute path because Cargo runs build \
+             scripts from {}; got {prebuilt_dir:?}",
+            crate_dir.display()
+        );
         println!("cargo:rerun-if-changed={}", prebuilt_dir.display());
         info!(
             "tsjs: Using prebuilt bundles from {}",
@@ -79,7 +85,7 @@ fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {
     );
 
     assert!(
-        env::var_os(SKIP_BUILD_VAR).is_none(),
+        !env::var(SKIP_BUILD_VAR).is_ok_and(|value| value == "1"),
         "tsjs: {SKIP_BUILD_VAR} is no longer supported because it embedded whatever \
          dist/ held. {how_to_prebuild}"
     );
