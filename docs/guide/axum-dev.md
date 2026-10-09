@@ -54,8 +54,11 @@ Unrecognized values, including per-module filters such as
 `trusted_server=debug`, fall back to `info` and print a warning to standard
 error at startup.
 
-The `trace` level includes full OpenRTB bid request bodies and TCF consent
-strings, so enable it only for short local debugging sessions.
+The `trace` level can log auction payloads and TCF consent strings, for example
+the `adserver_mock` mediation request, and the full Prebid Server response
+(including its `ext.debug` echo of the resolved request) when a provider sets
+`profile_config.debug = true`. Enable it only for short local debugging
+sessions.
 
 ## Runtime boundaries
 

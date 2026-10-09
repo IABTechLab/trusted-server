@@ -11,14 +11,17 @@ const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 
 #[allow(clippy::print_stderr)]
 fn main() {
-    let configured_level = std::env::var(LOG_LEVEL_ENV).ok();
-    if let Some(value) = unrecognized_log_level(configured_level.as_deref()) {
+    // `var_os` keeps a set but non-UTF-8 value visible, so it is rejected
+    // with a warning instead of silently falling back.
+    let configured_level =
+        std::env::var_os(LOG_LEVEL_ENV).map(|value| value.to_string_lossy().into_owned());
+    let level = parse_log_level(configured_level.as_deref()).unwrap_or_else(|value| {
         eprintln!(
             "warning: {LOG_LEVEL_ENV}={value:?} is not a single log level; using {}",
             DEFAULT_LOG_LEVEL.as_str().to_ascii_lowercase()
         );
-    }
-    let level = resolve_max_level(configured_level.as_deref());
+        DEFAULT_LOG_LEVEL
+    });
     if let Err(e) = simple_logger::SimpleLogger::new().with_level(level).init() {
         eprintln!("warning: logger init failed: {e}");
     }
@@ -42,28 +45,24 @@ fn main() {
     }
 }
 
-/// Resolves the logger's maximum level from an optional `RUST_LOG` value.
+/// Parses an optional `RUST_LOG` value into the logger's maximum level.
 ///
-/// Falls back to `Info` when the value is absent or is not a single level
-/// name (such as `trace`, `debug`, `info`, `warn`, `error`, or `off`). The
-/// quiet default keeps trace-level payload and consent-string logging out of
+/// Absent and blank values resolve to [`DEFAULT_LOG_LEVEL`]. Any other value
+/// must be a single level name (`trace`, `debug`, `info`, `warn`, `error`, or
+/// `off`), matched case-insensitively after trimming whitespace. The quiet
+/// default keeps trace-level payload and consent-string logging out of
 /// standard output unless an operator explicitly asks for it.
-fn resolve_max_level(configured: Option<&str>) -> LevelFilter {
-    configured
-        .and_then(|value| value.trim().parse::<LevelFilter>().ok())
-        .unwrap_or(DEFAULT_LOG_LEVEL)
-}
-
-/// Returns the configured `RUST_LOG` value when it is set but ignored.
 ///
-/// A value is ignored when it is non-blank and does not parse as a single
-/// level name, such as the per-module filter `trusted_server=trace`. Blank
-/// values are treated as unset and return `None`.
-fn unrecognized_log_level(configured: Option<&str>) -> Option<&str> {
-    configured.filter(|value| {
-        let trimmed = value.trim();
-        !trimmed.is_empty() && trimmed.parse::<LevelFilter>().is_err()
-    })
+/// # Errors
+///
+/// Returns the trimmed value when it is not a single level name, such as the
+/// per-module filter `trusted_server=trace`, so the caller can warn before
+/// falling back to [`DEFAULT_LOG_LEVEL`].
+fn parse_log_level(configured: Option<&str>) -> Result<LevelFilter, &str> {
+    match configured.map(str::trim) {
+        None | Some("") => Ok(DEFAULT_LOG_LEVEL),
+        Some(trimmed) => trimmed.parse().map_err(|_| trimmed),
+    }
 }
 
 /// Read a port number from the `PORT` environment variable.
@@ -91,82 +90,59 @@ mod tests {
     fn crate_compiles() {}
 
     #[test]
-    fn resolve_max_level_defaults_to_info_when_unset() {
+    fn parse_log_level_defaults_to_info_when_unset_or_blank() {
         assert_eq!(
-            resolve_max_level(None),
-            LevelFilter::Info,
+            parse_log_level(None),
+            Ok(LevelFilter::Info),
             "should default to info when RUST_LOG is unset"
+        );
+        assert_eq!(
+            parse_log_level(Some("")),
+            Ok(LevelFilter::Info),
+            "should treat an empty value as unset"
+        );
+        assert_eq!(
+            parse_log_level(Some("  ")),
+            Ok(LevelFilter::Info),
+            "should treat a whitespace-only value as unset"
         );
     }
 
     #[test]
-    fn resolve_max_level_honors_explicit_levels() {
+    fn parse_log_level_honors_explicit_levels() {
         assert_eq!(
-            resolve_max_level(Some("info")),
-            LevelFilter::Info,
+            parse_log_level(Some("info")),
+            Ok(LevelFilter::Info),
             "should suppress trace when RUST_LOG is info"
         );
         assert_eq!(
-            resolve_max_level(Some("trace")),
-            LevelFilter::Trace,
+            parse_log_level(Some("trace")),
+            Ok(LevelFilter::Trace),
             "should enable trace when RUST_LOG is trace"
         );
         assert_eq!(
-            resolve_max_level(Some(" DEBUG ")),
-            LevelFilter::Debug,
+            parse_log_level(Some(" DEBUG ")),
+            Ok(LevelFilter::Debug),
             "should accept case-insensitive levels with surrounding whitespace"
         );
         assert_eq!(
-            resolve_max_level(Some("off")),
-            LevelFilter::Off,
+            parse_log_level(Some("off")),
+            Ok(LevelFilter::Off),
             "should allow disabling logging"
         );
     }
 
     #[test]
-    fn resolve_max_level_falls_back_to_info_for_unrecognized_values() {
+    fn parse_log_level_rejects_unrecognized_values() {
         assert_eq!(
-            resolve_max_level(Some("trusted_server=trace")),
-            LevelFilter::Info,
-            "should fall back to info for module-filter syntax it does not support"
+            parse_log_level(Some("trace,hyper=info")),
+            Err("trace,hyper=info"),
+            "should reject module-filter syntax it does not support"
         );
         assert_eq!(
-            resolve_max_level(Some("")),
-            LevelFilter::Info,
-            "should fall back to info for an empty value"
-        );
-    }
-
-    #[test]
-    fn unrecognized_log_level_reports_ignored_values() {
-        assert_eq!(
-            unrecognized_log_level(Some("trace,hyper=info")),
-            Some("trace,hyper=info"),
-            "should report a module-filter value that falls back to the default"
-        );
-        assert_eq!(
-            unrecognized_log_level(Some("verbose")),
-            Some("verbose"),
-            "should report an unknown level name"
-        );
-    }
-
-    #[test]
-    fn unrecognized_log_level_ignores_unset_blank_and_valid_values() {
-        assert_eq!(
-            unrecognized_log_level(None),
-            None,
-            "should not report an unset value"
-        );
-        assert_eq!(
-            unrecognized_log_level(Some("  ")),
-            None,
-            "should treat a blank value as unset"
-        );
-        assert_eq!(
-            unrecognized_log_level(Some(" Debug ")),
-            None,
-            "should not report a valid level"
+            parse_log_level(Some(" verbose ")),
+            Err("verbose"),
+            "should reject an unknown level name and return it trimmed"
         );
     }
 }
