@@ -46,6 +46,15 @@ pub enum ConfigError {
          can reach the proxy. Bind a loopback address, or drop --basic-auth."
     )]
     BasicAuthNonLoopback { value: String },
+    /// The forwarding token file could not be read.
+    #[display("cannot read --forwarder-secret-file")]
+    ForwarderSecretFile,
+    /// The forwarding token was invalid.
+    #[display("--forwarder-secret-file must contain at least 32 ASCII graphic bytes on one line")]
+    ForwarderSecret,
+    /// Credential injection requires a loopback listener.
+    #[display("--forwarder-secret-file requires a loopback --listen address")]
+    ForwarderSecretNonLoopback,
     /// An unknown or unsupported browser was passed to `--launch`.
     #[display("unsupported browser `{value}` (use chrome|firefox|all, plus safari on macOS)")]
     Browser { value: String },
@@ -88,6 +97,41 @@ impl BasicAuth {
 impl core::fmt::Debug for BasicAuth {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("BasicAuth([REDACTED])")
+    }
+}
+
+/// Authentication header shared with Trusted Server's trusted-forwarder configuration.
+pub const FORWARDER_AUTH_HEADER: &str = "x-ts-forwarder-auth";
+
+/// A validated forwarding token whose debug representation is redacted.
+#[derive(Clone)]
+pub struct ForwarderSecret(HeaderValue);
+
+impl ForwarderSecret {
+    fn parse(raw: &[u8]) -> Result<Self, ConfigError> {
+        let token = raw
+            .strip_suffix(b"\r\n")
+            .or_else(|| raw.strip_suffix(b"\n"))
+            .unwrap_or(raw);
+        if token.len() < 32 || !token.iter().all(u8::is_ascii_graphic) {
+            return Err(ConfigError::ForwarderSecret);
+        }
+        let mut header =
+            HeaderValue::from_bytes(token).map_err(|_| ConfigError::ForwarderSecret)?;
+        header.set_sensitive(true);
+        Ok(Self(header))
+    }
+
+    /// The prevalidated sensitive authentication header value.
+    #[must_use]
+    pub fn header_value(&self) -> &HeaderValue {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for ForwarderSecret {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ForwarderSecret([REDACTED])")
     }
 }
 
@@ -143,6 +187,8 @@ pub struct ResolvedConfig {
     pub launch: Vec<Browser>,
     pub insecure: bool,
     pub basic_auth: Option<BasicAuth>,
+    /// Optional credential for authenticating browser-facing forwarding metadata.
+    pub forwarder_secret: Option<ForwarderSecret>,
     pub ca_dir: PathBuf,
     /// DNS pins from `--resolve`: lowercase hostname → connection address. When
     /// an upstream host is present here, the proxy dials this IP instead of
@@ -309,6 +355,18 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
             value: args.listen.clone(),
         }));
     }
+    if !is_loopback && args.forwarder_secret_file.is_some() {
+        return Err(Report::new(ConfigError::ForwarderSecretNonLoopback));
+    }
+    let forwarder_secret = args
+        .forwarder_secret_file
+        .as_ref()
+        .map(|path| {
+            let raw = std::fs::read(path).map_err(|_| ConfigError::ForwarderSecretFile)?;
+            ForwarderSecret::parse(&raw)
+        })
+        .transpose()
+        .map_err(Report::from)?;
     let ca_dir = ca_dir(args);
     let resolve = build_resolve(args).map_err(Report::from)?;
 
@@ -336,6 +394,7 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
         launch,
         insecure: args.insecure,
         basic_auth,
+        forwarder_secret,
         ca_dir,
         resolve,
         connect_timeout: std::time::Duration::from_secs(args.connect_timeout),
@@ -382,6 +441,141 @@ mod tests {
             a: crate::commands::dev::proxy::ProxyArgs,
         }
         W::try_parse_from(argv).map(|w| w.a)
+    }
+
+    #[test]
+    fn forwarder_secret_file_is_accepted_by_cli() {
+        let dir = tempfile::tempdir().expect("should create temporary directory");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "example-forwarder-token-0123456789\n").expect("should write token");
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.example.com",
+            "--forwarder-secret-file",
+            path.to_str().expect("should encode path"),
+        ]);
+        assert!(
+            resolve(&args).is_ok(),
+            "should load a valid forwarder secret"
+        );
+    }
+
+    #[test]
+    fn forwarder_secret_files_reject_invalid_contents_without_disclosure() {
+        let dir = tempfile::tempdir().expect("should create temporary directory");
+        let path = dir.path().join("token");
+        for raw in [
+            "",
+            "short",
+            "1234567890123456789012345678901",
+            "example-forwarder-token-0123456789 ",
+            " example-forwarder-token-0123456789",
+            "example-forwarder-token-0123456789\n\n",
+            "example-forwarder-token-0123456789\r",
+            "example-forwarder-token-0123456789\nsecond",
+            "example-forwarder-token-0123456789é",
+        ] {
+            std::fs::write(&path, raw).expect("should write invalid token");
+            let args = parse_args(&[
+                "ts",
+                "--map",
+                "a.example.com=b.example.com",
+                "--forwarder-secret-file",
+                path.to_str().expect("should encode path"),
+            ]);
+            let error = resolve(&args).expect_err("should reject invalid token");
+            if !raw.is_empty() {
+                assert!(
+                    !format!("{error:?}").contains(raw),
+                    "should redact invalid token"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_loopback_rejects_forwarder_secret_file() {
+        let dir = tempfile::tempdir().expect("should create temporary directory");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "example-forwarder-token-0123456789").expect("should write token");
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.example.com",
+            "--forwarder-secret-file",
+            path.to_str().expect("should encode path"),
+            "--listen",
+            "0.0.0.0:18080",
+            "--allow-non-loopback",
+        ]);
+        let error = resolve(&args).expect_err("should reject credential injection off loopback");
+        assert!(
+            matches!(
+                error.current_context(),
+                ConfigError::ForwarderSecretNonLoopback
+            ),
+            "should reject credential injection before reading the file"
+        );
+    }
+
+    #[test]
+    fn forwarder_credentials_are_optional_and_accept_exactly_32_bytes() {
+        let args = parse_args(&["ts", "--map", "a.example.com=b.example.com"]);
+        assert!(
+            resolve(&args)
+                .expect("should resolve default config")
+                .forwarder_secret
+                .is_none(),
+            "should leave forwarding authentication disabled by default"
+        );
+        assert!(
+            ForwarderSecret::parse(b"12345678901234567890123456789012").is_ok(),
+            "should accept the minimum token length"
+        );
+    }
+
+    #[test]
+    fn forwarding_token_is_sensitive_and_debug_redacted() {
+        for ending in ["", "\n", "\r\n"] {
+            let raw = format!("example-forwarder-token-0123456789{ending}");
+            let secret = ForwarderSecret::parse(raw.as_bytes()).expect("should accept token");
+            assert!(
+                secret.header_value().is_sensitive(),
+                "should mark credential sensitive"
+            );
+            assert_eq!(
+                secret.header_value(),
+                "example-forwarder-token-0123456789",
+                "should remove only line terminator"
+            );
+            assert!(
+                !format!("{secret:?}").contains("example-forwarder"),
+                "should redact wrapper Debug"
+            );
+            assert!(
+                !format!("{:?}", secret.header_value()).contains("example-forwarder"),
+                "should redact header Debug"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarder_secret_file_read_failure_is_redacted() {
+        let dir = tempfile::tempdir().expect("should create temporary directory");
+        let path = dir.path().join("missing");
+        let args = parse_args(&[
+            "ts",
+            "--map",
+            "a.example.com=b.example.com",
+            "--forwarder-secret-file",
+            path.to_str().expect("should encode path"),
+        ]);
+        let error = resolve(&args).expect_err("should reject missing token file");
+        assert!(
+            matches!(error.current_context(), ConfigError::ForwarderSecretFile),
+            "should report file error"
+        );
     }
 
     #[test]

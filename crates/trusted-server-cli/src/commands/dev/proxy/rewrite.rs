@@ -190,21 +190,11 @@ impl Rule {
             VerifyMode::Secure
         };
         let origin_key = OriginKey::new(transport, reference, to.port, verify, address_policy);
-        let upstream_origin = if rewrite_host {
-            let scheme = if plaintext { "http" } else { "https" };
-            let text = format!("{scheme}://{}", to.host_with_port());
-            Some(HeaderValue::from_str(&text).map_err(|_| RuleError::Header {
-                value: text.clone(),
-            })?)
-        } else {
-            None
-        };
         let outcome = RewriteOutcome {
             sni,
             host_header,
             orig_host,
             scheme_is_tls: !plaintext,
-            upstream_origin,
         };
         Ok(Self {
             from,
@@ -252,11 +242,6 @@ pub struct RewriteOutcome {
     pub orig_host: HeaderValue,
     /// Whether the upstream leg is TLS (`!plaintext`).
     pub scheme_is_tls: bool,
-    /// With `--rewrite-host`, the `TO` origin that replaces the browser's
-    /// same-origin `Origin` on the trace Enable/End requests, so `Origin` and `Host`
-    /// name the same authority. `None` without `--rewrite-host`, where `Host`
-    /// stays `FROM`.
-    pub upstream_origin: Option<HeaderValue>,
 }
 
 /// Computes the rewrite outcome for a matched rule (spec §8.3).
@@ -458,43 +443,6 @@ mod tests {
         assert!(
             !out.scheme_is_tls,
             "plaintext rule yields a non-TLS outcome"
-        );
-    }
-
-    #[test]
-    fn rewrite_host_derives_upstream_origin_from_to_scheme_and_port() {
-        let plaintext = rule("www.example-publisher.com", "127.0.0.1:7676", true, true);
-        let tls = rule(
-            "www.example-publisher.com",
-            "ts.example-publisher.com",
-            true,
-            false,
-        );
-
-        assert_eq!(
-            rewrite_for(&plaintext).upstream_origin,
-            Some(HeaderValue::from_static("http://127.0.0.1:7676")),
-            "should use the plaintext scheme and non-default port"
-        );
-        assert_eq!(
-            rewrite_for(&tls).upstream_origin,
-            Some(HeaderValue::from_static("https://ts.example-publisher.com")),
-            "should omit the default TLS port"
-        );
-    }
-
-    #[test]
-    fn default_host_keeps_no_upstream_origin() {
-        let r = rule(
-            "www.example-publisher.com",
-            "to.edgecompute.app",
-            false,
-            false,
-        );
-        assert_eq!(
-            rewrite_for(&r).upstream_origin,
-            None,
-            "should leave Origin alone when Host stays FROM"
         );
     }
 

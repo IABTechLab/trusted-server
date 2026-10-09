@@ -132,6 +132,10 @@ pub struct ProxyArgs {
     #[arg(long, value_name = "PATH")]
     pub basic_auth_file: Option<String>,
 
+    /// Read the Trusted Server forwarding token from a file (loopback only).
+    #[arg(long, value_name = "PATH")]
+    pub forwarder_secret_file: Option<String>,
+
     /// Skip upstream certificate verification.
     #[arg(long)]
     pub insecure: bool,

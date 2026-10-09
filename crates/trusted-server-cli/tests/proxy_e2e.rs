@@ -89,8 +89,8 @@ async fn rewrite_host_keeps_forwarded_host_on_from() {
         upstream.addr.to_string(),
         "--rewrite-host sends Host: TO"
     );
-    // The point: TS anchors URL rewriting to X-Forwarded-Host, so it stays FROM
-    // even though Host is TO — keeping emitted first-party URLs on the prod host.
+    // Authenticated forwarding lets the server use browser authority independently
+    // of the upstream routing Host. This fixture verifies the proxy wire values.
     assert_eq!(
         response.seen_forwarded_host,
         support::FROM_HOST,
@@ -99,7 +99,7 @@ async fn rewrite_host_keeps_forwarded_host_on_from() {
 }
 
 #[tokio::test]
-async fn rewrite_host_presents_same_origin_origin_as_the_upstream_origin() {
+async fn rewrite_host_preserves_browser_origin_on_trace_actions() {
     let upstream = support::start_echo_upstream().await;
     let cfg = support::test_config_rewrite_host(&upstream.addr);
     let ca = Arc::new(support::dev_ca());
@@ -115,8 +115,8 @@ async fn rewrite_host_presents_same_origin_origin_as_the_upstream_origin() {
     assert_eq!(response.status, 200, "response streamed back");
     assert_eq!(
         response.seen_origin,
-        format!("https://{}", upstream.addr),
-        "--rewrite-host should name the TO authority in Origin on trace actions"
+        format!("https://{}", support::FROM_HOST),
+        "should preserve browser Origin on trace actions"
     );
 }
 
@@ -772,4 +772,208 @@ async fn mitm_connect_overread_preserves_tls_client_hello() {
 
     assert_eq!(response.status, 200);
     assert_eq!(response.path, "/mitm-overread");
+}
+
+#[tokio::test]
+async fn mapped_requests_strip_unconfigured_forwarder_auth_and_keep_browser_port() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_rewrite_host(&upstream.addr);
+    let proxy = support::spawn_proxy(cfg, Arc::new(support::dev_ca())).await;
+    let authority = format!("{}:8443", support::FROM_HOST);
+    let responses = support::drive_raw_mapped_requests(proxy, &[format!(
+        "POST /_ts/trace/end HTTP/1.1\r\nHost: {authority}\r\nOrigin: https://{authority}\r\nX-Ts-Forwarder-Auth: hostile\r\nContent-Length: 0\r\n\r\n"
+    )]).await;
+    assert_eq!(
+        responses[0].seen_forwarded_host, authority,
+        "should preserve browser port"
+    );
+    assert_eq!(
+        responses[0].seen_forwarder_auth, "",
+        "should remove inbound credential even when unset"
+    );
+    assert_eq!(
+        responses[0].seen_origin,
+        format!("https://{authority}"),
+        "should preserve Origin"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_forwarding_preserves_browser_contract_across_transports_and_host_modes() {
+    for plaintext in [false, true] {
+        for rewrite_host in [false, true] {
+            let upstream = if plaintext {
+                support::start_plaintext_echo_upstream().await
+            } else {
+                support::start_echo_upstream().await
+            };
+            let cfg = support::test_config_authenticated(&upstream.addr, plaintext, rewrite_host);
+            let proxy = support::spawn_proxy(cfg, Arc::new(support::dev_ca())).await;
+            let authority = format!("{}:8443", support::FROM_HOST);
+            let requests: Vec<_> = ["/_ts/trace/enable?source=test", "/_ts/trace/end", "/_ts/consent/api/events",
+                "/_ts/trace/enable/", "/checkout"].iter().map(|path| format!(
+                "POST {path} HTTP/1.1\r\nHost: {authority}\r\nOrigin: https://{authority}\r\nOrigin: https://foreign.example.com\r\nX-Ts-Forwarder-Auth: hostile\r\nX-Ts-Forwarder-Auth: second\r\nX-Forwarded-Host: foreign.example.com\r\nX-Forwarded-Proto: http\r\nConnection: x-ts-forwarder-auth, x-forwarded-host, x-forwarded-proto, Origin\r\nContent-Length: 0\r\n\r\n"
+            )).collect();
+            let responses = support::drive_raw_mapped_requests(proxy, &requests).await;
+            for response in responses {
+                assert_eq!(response.status, 200, "should forward mapped request");
+                assert_eq!(
+                    response.seen_host,
+                    if rewrite_host {
+                        upstream.addr.to_string()
+                    } else {
+                        support::FROM_HOST.to_string()
+                    },
+                    "should apply configured Host mode"
+                );
+                assert_eq!(
+                    response.seen_forwarded_host, authority,
+                    "should authenticate actual browser authority"
+                );
+                assert_eq!(
+                    response.seen_forwarded_proto, "https",
+                    "should authenticate browser TLS scheme"
+                );
+                assert_eq!(
+                    response.seen_forwarder_auth,
+                    support::FORWARDER_TOKEN,
+                    "should overwrite inbound credentials after sanitation"
+                );
+                assert_eq!(
+                    response.seen_origin,
+                    format!("https://{authority}|https://foreign.example.com"),
+                    "should preserve every browser Origin on all routes"
+                );
+            }
+            assert_eq!(
+                upstream.snapshot().accepted_connections,
+                1,
+                "should reuse authenticated upstream connection"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn authenticated_forwarding_rejects_guessed_or_ambiguous_authorities() {
+    let upstream = support::start_echo_upstream().await;
+    for request in [
+        "GET / HTTP/1.0\r\n\r\n".to_string(),
+        format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nHost: {}\r\n\r\n",
+            support::FROM_HOST,
+            support::FROM_HOST
+        ),
+        format!("GET / HTTP/1.1\r\nHost: {}:bad\r\n\r\n", support::FROM_HOST),
+        format!(
+            "GET https://foreign.example.com/ HTTP/1.1\r\nHost: {}\r\n\r\n",
+            support::FROM_HOST
+        ),
+    ] {
+        let cfg = support::test_config_authenticated(&upstream.addr, false, true);
+        let proxy = support::spawn_proxy(cfg, Arc::new(support::dev_ca())).await;
+        let responses = support::drive_raw_mapped_requests(proxy, &[request]).await;
+        assert_eq!(
+            responses[0].status, 400,
+            "should reject ambiguous authority without forwarding"
+        );
+    }
+    assert_eq!(
+        upstream.snapshot().requests,
+        0,
+        "should never send credentials for rejected authority"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_forwarding_routes_by_request_host_instead_of_connect_host() {
+    let upstream = support::start_echo_upstream().await;
+    let mut cfg = support::test_config_shared_to(&upstream.addr);
+    cfg.forwarder_secret =
+        support::test_config_authenticated(&upstream.addr, false, true).forwarder_secret;
+    let proxy = support::spawn_proxy(cfg, Arc::new(support::dev_ca())).await;
+    let authority = format!("{}:8443", support::ALT_FROM_HOST);
+    let responses = support::drive_raw_mapped_requests(
+        proxy,
+        &[format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n")],
+    )
+    .await;
+    assert_eq!(
+        responses[0].status, 200,
+        "should accept the request's matched rule"
+    );
+    assert_eq!(
+        responses[0].seen_forwarded_host, authority,
+        "should stamp per-request authority"
+    );
+    assert_eq!(
+        responses[0].seen_forwarder_auth,
+        support::FORWARDER_TOKEN,
+        "should authenticate matched request"
+    );
+}
+
+#[tokio::test]
+async fn configured_forwarder_token_does_not_change_blind_or_plain_http_traffic() {
+    let raw = support::start_raw_echo_upstream().await;
+    let cfg = support::test_config_authenticated(&raw.addr, false, true);
+    let proxy = support::spawn_proxy(cfg, Arc::new(support::dev_ca())).await;
+    let payload = b"X-Ts-Forwarder-Auth: original\r\nopaque bytes";
+    let mut tunnel = support::open_blind_tunnel(proxy, &raw.addr.to_string(), payload).await;
+    let mut echoed = vec![0; payload.len()];
+    tunnel
+        .read_exact(&mut echoed)
+        .await
+        .expect("should read unchanged blind payload");
+    assert_eq!(echoed, payload, "should leave blind tunnel bytes unchanged");
+    let (mut plain, expected) = support::open_plain_forward(proxy, raw.addr, payload).await;
+    let mut echoed = vec![0; expected.len()];
+    plain
+        .read_exact(&mut echoed)
+        .await
+        .expect("should read unchanged plain HTTP payload");
+    assert_eq!(
+        echoed, expected,
+        "should leave plain HTTP forwarding unchanged"
+    );
+    assert!(
+        !String::from_utf8_lossy(&echoed).contains(support::FORWARDER_TOKEN),
+        "should never inject forwarding token into plain traffic"
+    );
+}
+
+async fn assert_forwarder_trailer_contract(authenticated: bool) {
+    let expected_auth = if authenticated {
+        support::FORWARDER_TOKEN
+    } else {
+        ""
+    };
+    let upstream = support::start_forwarder_trailer_upstream(expected_auth).await;
+    let cfg = if authenticated {
+        support::test_config_authenticated(&upstream.addr, false, true)
+    } else {
+        support::test_config_rewrite_host(&upstream.addr)
+    };
+    let proxy = support::spawn_proxy(cfg, Arc::new(support::dev_ca())).await;
+    let (body, trailers) = support::drive_forwarder_auth_trailers(proxy).await;
+    assert_eq!(
+        body, b"accepted",
+        "should strip auth declarations and frames, preserve checksum and initial configured auth (authenticated={authenticated})"
+    );
+    assert!(
+        trailers
+            .to_ascii_lowercase()
+            .contains("x-response-accepted: yes"),
+        "should preserve benign response trailers"
+    );
+}
+
+#[tokio::test]
+async fn mapped_authentication_is_removed_from_trailer_declarations_and_frames_when_unset() {
+    assert_forwarder_trailer_contract(false).await;
+}
+
+#[tokio::test]
+async fn mapped_authentication_is_removed_from_trailer_declarations_and_frames_when_set() {
+    assert_forwarder_trailer_contract(true).await;
 }
