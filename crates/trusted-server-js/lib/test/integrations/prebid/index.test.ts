@@ -213,6 +213,11 @@ type RequestBidsArg = Parameters<ReturnType<typeof installPrebidNpm>['requestBid
 
 /** The bid adapter spec object registered via `pbjs.registerBidAdapter`. */
 interface TestAdapterSpec {
+  onTimeout?: (bids: Array<Record<string, unknown>>) => void;
+  onBidderError?: (value: {
+    error: unknown;
+    bidderRequest: { bids: Array<Record<string, unknown>> };
+  }) => void;
   code: string;
   supportedMediaTypes: string[];
   isBidRequestValid: (bid: Record<string, unknown>) => boolean;
@@ -364,6 +369,9 @@ import type { TsjsApi } from '../../../src/core/types';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 import envelope from '../../fixtures/aps-renderer-v1.json';
+import { installTraceRuntime } from '../../../src/trace/runtime';
+import { gptTransport } from '../../trace/gpt-fixtures';
+import { SLOT_TOKEN } from '../../trace/fixtures';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module
 // self-init above already set it), so every test starts from a clean page.
@@ -7965,4 +7973,363 @@ describe('prebid self-init user ID module timing', () => {
     window.dispatchEvent(new Event('load'));
     expect(userSyncCallCount()).toBe(1);
   });
+});
+
+describe('Prebid registered trace transport hooks', () => {
+  function setup(...flags: unknown[]) {
+    const flag = flags.length ? flags[0] : true;
+    window.tsjs = {} as TsjsApi;
+    window.__tsjs_trace_active = flag as boolean;
+    if (flag === true) installTraceRuntime(window.tsjs);
+    installPrebidNpm();
+    return mockRegisterBidAdapter.mock.calls[
+      mockRegisterBidAdapter.mock.calls.length - 1
+    ]![2] as TestAdapterSpec;
+  }
+  function original(id: string, code = 'example-unit', bidderRequestId = 'example-request') {
+    return {
+      bidId: id,
+      bidderRequestId,
+      adUnitCode: code,
+      bidder: 'trustedServer',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+      params: {},
+    };
+  }
+  function result() {
+    return {
+      body: {
+        ext: {
+          trusted_server: {
+            trace_auction: {
+              ...gptTransport(),
+              evidence: { ...gptTransport().evidence!, source: 'auction_api' },
+            },
+          },
+        },
+      },
+    };
+  }
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockRegisterBidAdapter.mockClear();
+    mockGetConfig.mockReturnValue(3000);
+    vi.spyOn(window.crypto, 'randomUUID').mockReturnValue('12345678-1234-4abc-8def-123456789abc');
+  });
+  afterEach(() => {
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    delete window.tsjs;
+    delete window.__tsjs_trace_active;
+  });
+  it.each([undefined, false, 'true', 1])(
+    'adds no hooks, listeners, tokens or timers for gate %s',
+    (flag) => {
+      const listen = vi.spyOn(window, 'addEventListener');
+      const uuid = window.crypto.randomUUID;
+      const spec = setup(flag);
+      expect(spec).not.toHaveProperty('onTimeout');
+      expect(spec).not.toHaveProperty('onBidderError');
+      const request = spec.buildRequests([original('first')]);
+      expect(JSON.parse(request.data as unknown as string).adUnits[0]).not.toHaveProperty('ext');
+      expect(uuid).not.toHaveBeenCalled();
+      expect(listen.mock.calls.filter(([name]) => name === 'pagehide')).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
+  it('uses final grouped units and consumes API transport before ordinary bid parsing exactly once', () => {
+    const spec = setup();
+    const input = [original('first'), original('second')];
+    const request = spec.buildRequests(input);
+    const payload = JSON.parse(request.data as unknown as string);
+    expect(payload.adUnits).toHaveLength(1);
+    expect(payload.adUnits[0].ext.trusted_server.trace_slot_ref).toBe(SLOT_TOKEN);
+    expect(input[0]).not.toHaveProperty('ext');
+    const received = result();
+    Object.defineProperty(received.body, 'seatbid', {
+      get() {
+        expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('complete');
+        return [];
+      },
+    });
+    expect(spec.interpretResponse(received, request)).toEqual([]);
+    spec.interpretResponse(received, request);
+    spec.onTimeout!([original('first')]);
+    spec.onBidderError!({ error: new Error('private'), bidderRequest: { bids: input } });
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.serverAuctions).toHaveLength(1);
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.slotCorrelations).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('isolates concurrent request IDs and consumes timeout/error only once before callbacks', () => {
+    const spec = setup();
+    const first = spec.buildRequests([original('first')]);
+    const second = spec.buildRequests([original('second')]);
+    const collector = window.tsjs!.traceEvidence!;
+    expect(first).toBeDefined();
+    spec.onTimeout!([original('first')]);
+    spec.onBidderError!({
+      error: {
+        get message() {
+          throw Error('private');
+        },
+      },
+      bidderRequest: { bids: [original('first')] },
+    });
+    spec.interpretResponse(result(), second);
+    expect(collector.captureStatus()).toBe('partial');
+    expect(collector.snapshot().value?.serverAuctions).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('retains ordinary payload on throwing token generator and still observes independent evidence', () => {
+    const spec = setup();
+    vi.mocked(window.crypto.randomUUID).mockImplementation(() => {
+      throw Error('private');
+    });
+    const request = spec.buildRequests([original('first')]);
+    expect(JSON.parse(request.data as unknown as string).adUnits[0]).not.toHaveProperty('ext');
+    spec.interpretResponse(result(), request);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('complete');
+  });
+  it('keeps missing optional evidence unobserved and malformed evidence bounded without changing bids', () => {
+    const spec = setup();
+    const absent = spec.buildRequests([original('first')]);
+    expect(spec.interpretResponse({ body: {} }, absent)).toEqual([]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+    const malformed = spec.buildRequests([original('second')]);
+    expect(
+      spec.interpretResponse(
+        { body: { ext: { trusted_server: { trace_auction: null } } } },
+        malformed
+      )
+    ).toEqual([]);
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.issues).toEqual([
+      'evidence_validation_failed',
+    ]);
+  });
+  it('clears BFCache markers, permits resumed requests, and destroys nonpersisted page timers', () => {
+    const spec = setup();
+    spec.buildRequests([original('first')]);
+    expect(vi.getTimerCount()).toBe(1);
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+    expect(vi.getTimerCount()).toBe(0);
+    spec.onTimeout!([original('first')]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+    const resumed = spec.buildRequests([original('second')]);
+    expect(vi.getTimerCount()).toBe(1);
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
+    expect(vi.getTimerCount()).toBe(0);
+    spec.interpretResponse(result(), resumed);
+    spec.buildRequests([original('third')]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+  });
+  it('uses distinct final unit refs while retaining all original bid IDs for one request', () => {
+    const spec = setup();
+    vi.mocked(window.crypto.randomUUID)
+      .mockReturnValueOnce('12345678-1234-4abc-8def-123456789abc')
+      .mockReturnValueOnce('22345678-1234-4abc-8def-123456789abc');
+    const request = spec.buildRequests([
+      original('first', 'unit-a'),
+      original('second', 'unit-a'),
+      original('third', 'unit-b'),
+    ]);
+    const payload = JSON.parse(request.data as unknown as string);
+    expect(
+      payload.adUnits.map(
+        (unit: { ext: { trusted_server: { trace_slot_ref: string } } }) =>
+          unit.ext.trusted_server.trace_slot_ref
+      )
+    ).toEqual([SLOT_TOKEN, 'ts-slot-22345678-1234-4abc-8def-123456789abc']);
+    spec.onTimeout!([original('second')]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('unavailable');
+    spec.interpretResponse(result(), request);
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('swallows throwing diagnostic callbacks while returning ordinary auction bids unchanged', () => {
+    window.tsjs = {} as TsjsApi;
+    window.__tsjs_trace_active = true;
+    const collector = installTraceRuntime(window.tsjs)!;
+    window.tsjs.traceEvidence = {
+      ...collector,
+      recordTransport: () => {
+        throw Error('private-transport');
+      },
+      recordTransportFailure: () => {
+        throw Error('private-failure');
+      },
+    };
+    installPrebidNpm();
+    const spec = mockRegisterBidAdapter.mock.calls[
+      mockRegisterBidAdapter.mock.calls.length - 1
+    ]![2] as TestAdapterSpec;
+    const request = spec.buildRequests([original('first')]);
+    const received = result();
+    Object.assign(received.body, {
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [
+            { impid: 'example-unit', adm: '<div>Example creative</div>', price: 1, w: 300, h: 250 },
+          ],
+        },
+      ],
+    });
+    expect(spec.interpretResponse(received, request)).toHaveLength(1);
+    spec.buildRequests([original('second')]);
+    expect(() => spec.onTimeout!([original('second')])).not.toThrow();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('retires colliding live IDs while ordinary bid delivery and earlier capture remain intact', () => {
+    const spec = setup();
+    const collector = window.tsjs!.traceEvidence!;
+    collector.recordTransport(result().body.ext.trusted_server.trace_auction);
+    const first = spec.buildRequests([original('shared')]);
+    const collision = spec.buildRequests([original('shared')]);
+    expect(vi.getTimerCount()).toBe(2);
+    spec.onTimeout!([original('shared')]);
+    spec.onBidderError!({ error: Error('private'), bidderRequest: { bids: [original('shared')] } });
+    const received = result();
+    Object.assign(received.body, {
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [{ impid: 'example-unit', adm: '<div>Example</div>', price: 1, w: 300, h: 250 }],
+        },
+      ],
+    });
+    expect(spec.interpretResponse(received, first)).toHaveLength(1);
+    expect(spec.interpretResponse(received, collision)).toHaveLength(1);
+    expect(collector.captureStatus()).toBe('complete');
+    expect(collector.snapshot().value?.serverAuctions).toHaveLength(3);
+  });
+  it('keeps ordinary bid parsing when the optional request trace handle getter throws', () => {
+    const spec = setup();
+    const request = spec.buildRequests([original('first')]);
+    Object.defineProperty(request, 'tracePending', {
+      get: () => {
+        throw Error('private-handle');
+      },
+    });
+    const received = result();
+    Object.assign(received.body, {
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [{ impid: 'example-unit', adm: '<div>Example</div>', price: 1, w: 300, h: 250 }],
+        },
+      ],
+    });
+    expect(() => spec.interpretResponse(received, request)).not.toThrow();
+    expect(spec.interpretResponse(received, request)).toHaveLength(1);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+  });
+  it('declines trace setup if its lifecycle listener cannot install while registering the ordinary adapter', () => {
+    const listen = window.addEventListener.bind(window);
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
+      if (type === 'pagehide') throw Error('private-listener');
+      listen(type, listener, options);
+    });
+    let spec!: TestAdapterSpec;
+    expect(() => {
+      spec = setup();
+    }).not.toThrow();
+    expect(spec).not.toHaveProperty('onTimeout');
+    expect(spec).not.toHaveProperty('onBidderError');
+    const request = spec.buildRequests([original('first')]);
+    expect(JSON.parse(request.data as unknown as string).adUnits[0]).not.toHaveProperty('ext');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('retains valid capped server evidence from a 65-unit request without changing ordinary bids', () => {
+    const spec = setup();
+    let generated = 0;
+    vi.mocked(window.crypto.randomUUID).mockImplementation(
+      () =>
+        `${(++generated).toString(16).padStart(8, '0')}-1234-4abc-8def-123456789abc` as ReturnType<
+          Crypto['randomUUID']
+        >
+    );
+    const requests = Array.from({ length: 65 }, (_, index) =>
+      original(`bid-${index}`, `unit-${index}`)
+    );
+    const request = spec.buildRequests(requests);
+    const payload = JSON.parse(request.data as unknown as string);
+    const envelope = gptTransport();
+    envelope.evidence.source = 'auction_api';
+    envelope.evidence.truncation.omitted_slots = 1;
+    envelope.evidence.slots = payload.adUnits
+      .slice(0, 64)
+      .map((unit: { ext: { trusted_server: { trace_slot_ref: string } } }, index: number) => ({
+        ...envelope.evidence.slots[0]!,
+        slot_number: index + 1,
+        slot_ref: unit.ext.trusted_server.trace_slot_ref,
+      }));
+    const received = {
+      body: {
+        ext: { trusted_server: { trace_auction: envelope } },
+        seatbid: [
+          {
+            seat: 'example-bidder',
+            bid: [{ impid: 'unit-64', adm: '<div>Example</div>', price: 1, w: 300, h: 250 }],
+          },
+        ],
+      },
+    };
+    expect(payload.adUnits).toHaveLength(65);
+    expect(spec.interpretResponse(received, request)).toHaveLength(1);
+    const capture = window.tsjs!.traceEvidence!.snapshot().value!;
+    expect(capture.serverAuctions).toHaveLength(1);
+    expect(capture.serverAuctions[0]!.slots).toHaveLength(64);
+    expect(capture.serverAuctions[0]!.truncation.omitted_slots).toBe(1);
+    expect(capture.slotCorrelations).toEqual([]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('complete');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('keeps over-cap exact response capture and never attributes unseen colliding timeout IDs', () => {
+    const spec = setup();
+    const first = spec.buildRequests([original('bid-2048')]);
+    const large = spec.buildRequests(
+      Array.from({ length: 2049 }, (_, index) => original(`bid-${index}`))
+    );
+    const later = spec.buildRequests([original('bid-2047')]);
+    spec.onTimeout!([original('bid-2048'), original('bid-2047')]);
+    spec.onBidderError!({
+      error: Error('private'),
+      bidderRequest: { bids: [original('bid-2048')] },
+    });
+    const collector = window.tsjs!.traceEvidence!;
+    expect(collector.captureStatus()).toBe('not_observed');
+    expect(collector.snapshot().value?.issues).toEqual(['correlation_unavailable']);
+    for (const request of [first, large, later])
+      expect(spec.interpretResponse(result(), request)).toEqual([]);
+    expect(collector.captureStatus()).toBe('complete');
+    expect(collector.snapshot().value?.serverAuctions).toHaveLength(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('does not add a second lifecycle listener on repeated shim installation', () => {
+    const listen = vi.spyOn(window, 'addEventListener');
+    setup();
+    installPrebidNpm();
+    expect(listen.mock.calls.filter(([name]) => name === 'pagehide')).toHaveLength(1);
+  });
+  it.each(['timeout', 'error'])(
+    'ignores a retired %s hook when a newer request reuses the original bid ID',
+    (mode) => {
+      const spec = setup();
+      const old = original('reused', 'example-unit', 'request-old');
+      const first = spec.buildRequests([old]);
+      spec.interpretResponse(result(), first);
+      const next = spec.buildRequests([original('reused', 'example-unit', 'request-new')]);
+      if (mode === 'timeout') spec.onTimeout!([old]);
+      else spec.onBidderError!({ error: Error('private'), bidderRequest: { bids: [old] } });
+      expect(vi.getTimerCount()).toBe(1);
+      expect(window.tsjs!.traceEvidence!.snapshot().value?.issues).toEqual([
+        'correlation_unavailable',
+      ]);
+      spec.interpretResponse(result(), next);
+      expect(window.tsjs!.traceEvidence!.snapshot().value?.serverAuctions).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
 });

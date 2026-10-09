@@ -10,6 +10,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::request::{InboundOrigin, OriginSource};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -26,9 +27,9 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::http_util::sanitize_forwarded_headers;
+use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{ClientInfo, RuntimeServices};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
@@ -46,6 +47,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
+use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{
     AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
@@ -282,8 +284,8 @@ fn parse_client_addr(raw: &str) -> Option<IpAddr> {
 // A client can spoof `Forwarded`/`X-Forwarded-*` to hijack the host and scheme
 // that publisher HTML rewriting, integration URL rewriting, and request-signing
 // context consume. Stripping them first (mirroring the Fastly/Axum edge
-// sanitization) means the value `detect_request_scheme`/`extract_request_host`
-// read originates from the trusted runtime URL rather than the client.
+// sanitization) means the typed origin used by `RequestInfo` originates from
+// the trusted runtime URL rather than the client.
 //
 // Spin builds the core request URI from `IncomingRequest::path_with_query()`, so
 // it is path-only (e.g. "/first-party/proxy?..."). The shared first-party
@@ -355,6 +357,11 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     else {
         return;
     };
+    let Ok(origin) = InboundOrigin::parse(&scheme, &host, OriginSource::RuntimeUri) else {
+        return;
+    };
+    req.extensions_mut()
+        .insert(RuntimeRequestOrigin::new(origin));
 
     // Always set Host from the trusted spin-full-url rather than preserving any
     // incoming value. Spin's WASI HTTP bridge does not normally surface the
@@ -367,12 +374,6 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // Overriding from the single trusted authority keeps both consistent.
     if let Ok(hval) = HeaderValue::from_str(&host) {
         req.headers_mut().insert(header::HOST, hval);
-    }
-
-    // Without a trusted scheme signal, detect_request_scheme defaults to http and
-    // rewrites HTTPS URLs as http.
-    if let Ok(pval) = HeaderValue::from_str(&scheme) {
-        req.headers_mut().insert("x-forwarded-proto", pval);
     }
 
     // Promote the path-only URI to an absolute one so the shared first-party
@@ -880,7 +881,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let legacy_admin_deny =
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
 
+        let trace_state = Arc::clone(&state);
         let mut builder = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+                Arc::clone(&state.settings),
+                Arc::new(move |request| trace_metadata(&trace_state, request)),
+            )))
             // Outermost middleware: strips the configured trusted-client-IP
             // headers before anything else sees the request. Must stay first —
             // any middleware registered ahead of it would observe the
@@ -970,6 +976,33 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
 
         builder.build()
+    }
+}
+
+fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+    if let Some(services) = &state.services {
+        let client_info = services.client_info().clone();
+        let geo = client_info.client_ip.and_then(|client_ip| {
+            services.geo().lookup(Some(client_ip)).unwrap_or_else(|_| {
+                log::warn!("trace_geo_unavailable");
+                None
+            })
+        });
+        return TraceMetadata { client_info, geo };
+    }
+    let client_ip = request
+        .headers()
+        .get_all("spin-client-addr")
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_client_addr);
+    TraceMetadata {
+        client_info: ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        },
+        geo: None,
     }
 }
 
@@ -1120,6 +1153,132 @@ mod tests {
     }
 
     #[test]
+    fn normalize_spin_request_rejects_invalid_last_runtime_origin() {
+        for value in [
+            "ftp://publisher.example.com/article",
+            "https://publisher.example.com:invalid/article",
+        ] {
+            let mut req = request_with(&[
+                (
+                    "spin-full-url",
+                    "https://client-supplied.example.com/article",
+                ),
+                ("spin-full-url", value),
+            ]);
+
+            normalize_spin_request(&mut req);
+
+            assert!(
+                req.extensions().get::<RuntimeRequestOrigin>().is_none(),
+                "should not recover origin from a client field when trusted last URL is invalid"
+            );
+            assert_eq!(
+                req.uri().to_string(),
+                "/",
+                "should retain original path when runtime origin is invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn normalized_runtime_origin_does_not_authorize_trace_without_ingress() {
+        let mut settings = multi_provider_settings();
+        settings.auction.enabled = false;
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &std::collections::BTreeMap::from([
+                    ("enabled", true),
+                    ("trace_page_enabled", true),
+                ]),
+            )
+            .expect("should enable trace actions");
+        let router =
+            TrustedServerApp::routes_with_settings(settings).expect("should build trace router");
+        let mut req = request_with(&[
+            (
+                "spin-full-url",
+                "https://publisher.example.com:8443/_ts/trace/enable",
+            ),
+            ("origin", "https://publisher.example.com:8443"),
+            ("sec-fetch-site", "same-origin"),
+            ("x-ts-trace-action", "enable"),
+        ]);
+        *req.method_mut() = Method::POST;
+        *req.uri_mut() = "/_ts/trace/enable".parse().expect("should set action path");
+        normalize_spin_request(&mut req);
+
+        let response = RouterService::oneshot(&router, req)
+            .await
+            .expect("should reject unbound trace action");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should require immutable ingress even with typed runtime origin"
+        );
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should not mutate trace cookies without ingress origin"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_preserves_https_request_info_without_ingress_origin() {
+        let mut req = request_with(&[
+            (
+                "spin-full-url",
+                "https://publisher.example.com:8443/article",
+            ),
+            ("host", "client-supplied.example.com"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        req.extensions_mut().insert(
+            edgezero_core::request::RequestIngress::new(
+                edgezero_core::request::CapturedTarget::Unavailable(
+                    edgezero_core::request::TargetUnavailable::NotExposed,
+                ),
+                None,
+                edgezero_core::request::HeaderFidelity::default(),
+                Vec::new(),
+            )
+            .expect("should freeze path-only runtime ingress"),
+        );
+
+        normalize_spin_request(&mut req);
+        trusted_server_core::forwarder::prepare_trusted_forwarder(
+            &mut req,
+            &multi_provider_settings(),
+        );
+
+        let info = trusted_server_core::http_util::RequestInfo::from_request(
+            &req,
+            &trusted_server_core::platform::ClientInfo::default(),
+        );
+        assert_eq!(
+            info.scheme, "https",
+            "should retain trusted Spin HTTPS scheme after forwarding sanitation"
+        );
+        assert_eq!(
+            info.host, "publisher.example.com:8443",
+            "should retain trusted runtime authority and port"
+        );
+        assert!(
+            req.extensions()
+                .get::<edgezero_core::request::RequestIngress>()
+                .expect("should retain original ingress")
+                .origin()
+                .is_none(),
+            "should not grant immutable ingress origin from normalized URL"
+        );
+        assert!(
+            !req.headers().contains_key("x-forwarded-proto"),
+            "should not require a synthetic forwarding header"
+        );
+    }
+
+    #[test]
     fn normalize_spin_request_strips_spoofed_headers_and_uses_runtime_url() {
         // Client sends an HTTPS spin-full-url but tries to spoof a downgraded
         // http scheme and an attacker-controlled host via forwarded headers.
@@ -1159,13 +1318,9 @@ mod tests {
             Some("www.publisher.example"),
             "should set trusted Host from spin-full-url"
         );
-        // The only surviving x-forwarded-proto is the trusted scheme we injected.
-        assert_eq!(
-            req.headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok()),
-            Some("https"),
-            "should override spoofed scheme with the trusted https scheme"
+        assert!(
+            !req.headers().contains_key("x-forwarded-proto"),
+            "should use typed runtime origin instead of a forwarding header"
         );
         // The path-only request URI is promoted to an absolute URI using the
         // trusted scheme+host so the first-party proxy/click/sign handlers can
@@ -1202,11 +1357,12 @@ mod tests {
             "should rebuild the absolute URI with the same trusted authority"
         );
         assert_eq!(
-            req.headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok()),
-            Some("https"),
-            "should still inject the trusted scheme"
+            trusted_server_core::http_util::RequestInfo::from_request(
+                &req,
+                &ClientInfo::default(),
+            ).scheme,
+            "https",
+            "should retain trusted runtime scheme"
         );
     }
 
@@ -1398,6 +1554,159 @@ mod tests {
             &body[..],
             b"ok",
             "startup-fallback health body should be `ok`"
+        );
+    }
+}
+#[cfg(test)]
+mod trace_dispatch_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use trusted_server_core::trace::TraceTerminalResponse;
+
+    fn router(enabled: bool) -> RouterService {
+        let settings = Settings::from_toml(&format!(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "example-user"
+            password = "example-password"
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret"
+            [ec]
+            passphrase = "fictional-passphrase-at-least-32-bytes"
+            [request_signing]
+            enabled = false
+            config_store_id = "fictional-config"
+            secret_store_id = "fictional-secrets"
+            [integrations.gpt_diagnostics]
+            enabled = true
+            trace_page_enabled = {enabled}
+        "#
+        ))
+        .expect("should parse trace settings");
+        TrustedServerApp::routes_with_settings(settings).expect("should build adapter routes")
+    }
+
+    #[test]
+    fn trace_dispatch_reserves_all_methods_before_ordinary_lifecycle() {
+        let router = router(true);
+        for (method, path, status) in [
+            (Method::GET, "/_ts/trace/state", StatusCode::OK),
+            (Method::HEAD, "/_ts/trace", StatusCode::OK),
+            (Method::GET, "/_ts/trace/assets/v1.js", StatusCode::OK),
+            (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
+            (
+                Method::PATCH,
+                "/_ts/trace/state",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::from_bytes(b"EXAMPLE-METHOD").expect("should parse extension method"),
+                "/_ts/trace",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (Method::GET, "/_ts/trace/extra", StatusCode::NOT_FOUND),
+            (Method::GET, "/%5Fts/trace", StatusCode::BAD_REQUEST),
+        ] {
+            let head = method == Method::HEAD;
+            let request = edgezero_core::http::request_builder()
+                .method(method)
+                .uri(format!("https://publisher.example.com{path}"))
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build trace request");
+            let response =
+                block_on(router.oneshot(request)).expect("should return local trace policy");
+            assert_eq!(response.status(), status, "should bypass ordinary dispatch");
+            assert!(
+                response
+                    .extensions()
+                    .get::<TraceTerminalResponse>()
+                    .is_some(),
+                "should mark terminal trace responses"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should never manufacture a mutation"
+            );
+            if head {
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer HEAD")
+                        .len(),
+                    0,
+                    "should remove HEAD bodies"
+                );
+            }
+        }
+        let response = block_on(
+            self::router(false).oneshot(
+                edgezero_core::http::request_builder()
+                    .uri("/_ts/trace/state")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build disabled request"),
+            ),
+        )
+        .expect("should reserve disabled namespace");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should hide disabled feature"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_some(),
+            "should harden disabled feature"
+        );
+    }
+
+    #[test]
+    fn trace_dispatch_setup_uses_last_runtime_client_addr_without_normalizing_request() {
+        let router = router(true);
+        let mut request = edgezero_core::http::request_builder()
+            .uri("/_ts/trace")
+            .header("spin-client-addr", "203.0.113.22:1234")
+            .header("spin-full-url", "https://untrusted.example.com/other")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build Spin setup");
+        request.headers_mut().append(
+            "spin-client-addr",
+            HeaderValue::from_static("192.0.2.99:4321"),
+        );
+        SpinRequestContext::insert(
+            &mut request,
+            SpinRequestContext {
+                client_addr: Some(
+                    "203.0.113.22"
+                        .parse()
+                        .expect("should parse spoofed example IP"),
+                ),
+                full_url: Some("https://untrusted.example.com/other".to_owned()),
+            },
+        );
+        let response = block_on(router.oneshot(request)).expect("should render setup locally");
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should buffer setup");
+        let html = String::from_utf8(bytes.to_vec()).expect("should render UTF8 setup");
+        assert!(
+            html.contains("192.0.2.0/24"),
+            "should project the trusted last synthetic address"
+        );
+        assert!(
+            !html.contains("203.0.113."),
+            "should not use the spoofed first SDK-context address"
+        );
+        assert!(
+            !html.contains("untrusted.example.com"),
+            "should never project or trust spin-full-url"
         );
     }
 }

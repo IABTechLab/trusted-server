@@ -1,0 +1,456 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --line: #d1d9e0;
+  --soft: #f6f8fa;
+  --accent: #0969da;
+  --accent-fg: #ffffff;
+  --ok-bg: #dafbe1;
+  --ok-fg: #116329;
+  --bad-bg: #ffebe9;
+  --bad-fg: #a40e26;
+  --unknown-bg: #eff2f5;
+  --unknown-fg: #424a53;
+  --attention-bg: #fff8c5;
+  --attention-line: #d4a72c;
+  --clear-bg: #dafbe1;
+  --clear-line: #4ac26b;
+  --segment-response: #0969da;
+  --segment-render: #8250df;
+  --segment-after: #1a7f37;
+  --focus: #ca6800;
+  font:
+    1rem/1.5 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --line: #3d444d;
+    --soft: #151b23;
+    --accent: #4493f8;
+    --accent-fg: #0d1117;
+    --ok-bg: #12261e;
+    --ok-fg: #57ab5a;
+    --bad-bg: #2d1214;
+    --bad-fg: #f47067;
+    --unknown-bg: #212830;
+    --unknown-fg: #9198a1;
+    --attention-bg: #2e2610;
+    --attention-line: #9e6a03;
+    --clear-bg: #12261e;
+    --clear-line: #2b6a30;
+    --segment-response: #4493f8;
+    --segment-render: #ab7df8;
+    --segment-after: #3fb950;
+    --focus: #f0883e;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
+    max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+  overflow-wrap: anywhere;
+  background: var(--bg);
+}
+
+main {
+  max-width: 48rem;
+  margin: auto;
+}
+h1 {
+  font-size: 1.6rem;
+  line-height: 1.25;
+  margin: 0.25rem 0;
+}
+h2 {
+  font-size: 1.15rem;
+  margin: 0 0 0.5rem;
+}
+h3 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+section {
+  margin-block: 1.5rem;
+}
+dl {
+  margin: 0.25rem 0;
+}
+dt {
+  font-weight: 650;
+  margin-top: 0.75rem;
+  color: var(--muted);
+}
+dd {
+  margin-inline: 0;
+}
+a {
+  color: var(--accent);
+}
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+button,
+.button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0.75rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  background: var(--bg);
+  border: 2px solid currentColor;
+  border-radius: 0.6rem;
+  cursor: pointer;
+  white-space: normal;
+}
+
+.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+[role='status'] {
+  min-height: 3rem;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+th,
+td {
+  padding: 0.5rem;
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+[hidden] {
+  display: none;
+}
+summary {
+  min-height: 44px;
+  padding-block: 0.6rem;
+  cursor: pointer;
+}
+
+/* Report header */
+.trace-report-header {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem;
+}
+.trace-notice {
+  display: inline-block;
+  margin: 0;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.trace-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* What happened */
+.trace-verdict {
+  border: 1px solid var(--attention-line);
+  background: var(--attention-bg);
+  border-radius: 1rem;
+  padding: 1rem;
+}
+.trace-verdict.is-clear {
+  border-color: var(--clear-line);
+  background: var(--clear-bg);
+}
+.trace-verdict p {
+  margin: 0.25rem 0;
+}
+.trace-verdict .trace-headline {
+  font-size: 1.2rem;
+  font-weight: 700;
+  line-height: 1.3;
+  margin-bottom: 0.5rem;
+}
+.trace-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.trace-stats li {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.6rem;
+}
+.trace-stat-value {
+  display: block;
+  font-size: 1.4rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.trace-stat-label {
+  display: block;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+.trace-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.trace-chip {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.15rem 0.65rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.trace-chip-filled {
+  background: var(--ok-bg);
+  color: var(--ok-fg);
+}
+.trace-chip-empty {
+  background: var(--bad-bg);
+  color: var(--bad-fg);
+}
+.trace-chip-unknown {
+  background: var(--unknown-bg);
+  color: var(--unknown-fg);
+}
+
+/* Needs attention */
+.trace-attention {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+.trace-attention li {
+  margin-block: 0.35rem;
+}
+
+/* Ad slot cards */
+.trace-slot {
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  padding: 0.75rem 1rem;
+  margin-block: 0.75rem;
+  background: var(--bg);
+  scroll-margin-top: 1rem;
+}
+.trace-slot:target {
+  outline: 3px solid var(--focus);
+}
+.trace-slot > header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+.trace-slot p {
+  margin: 0.35rem 0;
+}
+.trace-timing {
+  display: flex;
+  height: 0.6rem;
+  margin-top: 0.75rem;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--unknown-bg);
+}
+.trace-segment {
+  min-width: 3px;
+}
+.trace-segment-response {
+  background: var(--segment-response);
+}
+.trace-segment-render {
+  background: var(--segment-render);
+}
+.trace-segment-load,
+.trace-segment-viewable {
+  background: var(--segment-after);
+}
+.trace-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+.trace-legend li::before {
+  content: '';
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  margin-right: 0.35rem;
+  border-radius: 2px;
+  vertical-align: baseline;
+}
+.trace-legend-response::before {
+  background: var(--segment-response);
+}
+.trace-legend-render::before {
+  background: var(--segment-render);
+}
+.trace-legend-load::before,
+.trace-legend-viewable::before {
+  background: var(--segment-after);
+}
+.trace-link {
+  font-size: 0.9rem;
+  color: var(--accent);
+}
+.trace-link.is-unlinked {
+  color: var(--muted);
+}
+.trace-slot-details > summary,
+.trace-request > summary,
+.trace-auction > summary {
+  color: var(--accent);
+  font-weight: 600;
+}
+.trace-request,
+.trace-auction,
+.trace-server-slot {
+  border-top: 1px solid var(--line);
+  margin-top: 0.5rem;
+}
+.trace-server-slot {
+  padding-top: 0.5rem;
+}
+.trace-unavailable > summary {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* Collapsed detail sections */
+.trace-more {
+  margin-top: 2rem;
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.trace-section {
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  padding: 0 1rem;
+  margin-block: 0.5rem;
+}
+.trace-section > summary h2 {
+  display: inline;
+  font-size: 1.05rem;
+  margin: 0;
+}
+.trace-section[open] {
+  padding-bottom: 0.75rem;
+}
+
+/* Timing bar weights: relative flex shares, never inline styles (CSP style-src 'self'). */
+.trace-weight-1 {
+  flex: 1;
+}
+.trace-weight-2 {
+  flex: 2;
+}
+.trace-weight-3 {
+  flex: 3;
+}
+.trace-weight-4 {
+  flex: 4;
+}
+.trace-weight-5 {
+  flex: 5;
+}
+.trace-weight-6 {
+  flex: 6;
+}
+.trace-weight-7 {
+  flex: 7;
+}
+.trace-weight-8 {
+  flex: 8;
+}
+.trace-weight-9 {
+  flex: 9;
+}
+.trace-weight-10 {
+  flex: 10;
+}
+.trace-weight-11 {
+  flex: 11;
+}
+.trace-weight-12 {
+  flex: 12;
+}
+.trace-weight-13 {
+  flex: 13;
+}
+.trace-weight-14 {
+  flex: 14;
+}
+.trace-weight-15 {
+  flex: 15;
+}
+.trace-weight-16 {
+  flex: 16;
+}
+.trace-weight-17 {
+  flex: 17;
+}
+.trace-weight-18 {
+  flex: 18;
+}
+.trace-weight-19 {
+  flex: 19;
+}
+.trace-weight-20 {
+  flex: 20;
+}
+
+/* Setup controls move below the report when a report is shown. */
+#trace-viewer-setup {
+  border-top: 1px solid var(--line);
+  margin-top: 1.5rem;
+}

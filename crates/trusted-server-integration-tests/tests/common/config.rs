@@ -9,6 +9,18 @@ const GENERATED_AT: &str = "2026-06-23T00:00:00Z";
 const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.integration.toml");
 
 pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
+    integration_app_config_envelope_with_trace(origin_port, false)
+}
+
+/// Generate an isolated runtime fixture with an explicit trace feature setting.
+///
+/// # Errors
+///
+/// Returns a bounded fixture-generation error when configuration validation fails.
+pub fn integration_app_config_envelope_with_trace(
+    origin_port: u16,
+    trace: bool,
+) -> TestResult<String> {
     let origin_url = format!("http://127.0.0.1:{origin_port}");
     let app_config: TrustedServerAppConfig = toml::from_str(APP_CONFIG).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
@@ -17,6 +29,18 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
     })?;
     let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
+    if trace {
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .map_err(|report| {
+                Report::new(TestError::ConfigGeneration)
+                    .attach(format!("invalid trace fixture config: {report:?}"))
+            })?;
+    }
     let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))
@@ -45,6 +69,51 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_browser_fixture_keeps_auctions_and_shared_assembly_disabled() {
+        let envelope: serde_json::Value = serde_json::from_str(
+            &integration_app_config_envelope_with_trace(8888, true)
+                .expect("should generate normal-browser trace fixture"),
+        )
+        .expect("should parse trace browser envelope");
+        assert_eq!(
+            envelope["data"]["auction"]["enabled"], false,
+            "should keep the normal browser workflow independent of bidder transport"
+        );
+        assert!(
+            envelope["data"]
+                .get("creative_opportunities")
+                .is_none_or(serde_json::Value::is_null),
+            "should keep shared assembly and configured server slots out of this fixture"
+        );
+        assert_eq!(
+            envelope["data"]["integrations"]["gpt_diagnostics"]["trace_page_enabled"], true,
+            "should activate trace only through the explicit isolated configuration"
+        );
+    }
+
+    #[test]
+    fn trace_runtime_boundary_config_enables_only_explicit_fixture() {
+        let baseline: serde_json::Value = serde_json::from_str(
+            &integration_app_config_envelope(8888).expect("should generate baseline envelope"),
+        )
+        .expect("should parse baseline envelope");
+        assert_ne!(
+            baseline["data"]["integrations"]["gpt_diagnostics"]["trace_page_enabled"], true,
+            "should keep the trace feature disabled in the ordinary baseline"
+        );
+        let enabled: serde_json::Value = serde_json::from_str(
+            &integration_app_config_envelope_with_trace(8888, true)
+                .expect("should generate trace fixture envelope"),
+        )
+        .expect("should parse trace envelope");
+        assert_eq!(
+            enabled["data"]["integrations"]["gpt_diagnostics"]["trace_page_enabled"], true,
+            "should explicitly enable isolated trace fixture"
+        );
+    }
     const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
     const VICEROY_TEMPLATE: &str = include_str!("../../fixtures/configs/viceroy-template.toml");
     const VICEROY_SECRET_STORE_MAPPING_KEY: &str =

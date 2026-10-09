@@ -22,6 +22,8 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
+use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
+use crate::integrations::datadome::HEADER_DATADOME_TEST_BYPASS;
 use crate::platform::PlatformImageOptimizerRegion;
 use crate::redacted::Redacted;
 
@@ -2867,8 +2869,123 @@ fn validate_trusted_client_ip_shared_secret(
     Ok(())
 }
 
+/// Authenticated forwarding configuration for the public request host and scheme.
+///
+/// The upstream proxy must replace client-supplied authentication and forwarding
+/// headers before forwarding a request to Trusted Server.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trusted_forwarder, skip_on_field_errors = false))]
+pub struct TrustedForwarderConfig {
+    /// Explicit authentication header name, normally `x-ts-forwarder-auth`.
+    pub auth_header: String,
+    /// Shared secret required before accepting forwarded host and scheme values.
+    #[validate(custom(function = validate_trusted_forwarder_shared_secret))]
+    pub shared_secret: Redacted<String>,
+}
+
+impl TrustedForwarderConfig {
+    /// Placeholder shared secrets shipped in example configuration and docs.
+    pub const SHARED_SECRET_PLACEHOLDERS: &[&str] = &["replace-with-a-random-shared-secret"];
+
+    /// Returns whether the shared secret is a known placeholder, ignoring case.
+    #[must_use]
+    pub fn is_placeholder_shared_secret(shared_secret: &str) -> bool {
+        Self::SHARED_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| placeholder.eq_ignore_ascii_case(shared_secret))
+    }
+
+    /// Returns whether `candidate` exactly matches the configured shared secret.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::redacted::Redacted;
+    /// use trusted_server_core::settings::TrustedForwarderConfig;
+    ///
+    /// let config = TrustedForwarderConfig {
+    ///     auth_header: "x-ts-forwarder-auth".to_owned(),
+    ///     shared_secret: Redacted::new("fictional-forwarder-secret-0123456789".to_owned()),
+    /// };
+    /// assert!(config.authenticates("fictional-forwarder-secret-0123456789"));
+    /// assert!(!config.authenticates("fictional-wrong-secret"));
+    /// ```
+    #[must_use]
+    pub fn authenticates(&self, candidate: &str) -> bool {
+        let configured_digest = Sha256::digest(self.shared_secret.expose().as_bytes());
+        let candidate_digest = Sha256::digest(candidate.as_bytes());
+        configured_digest.ct_eq(&candidate_digest).into()
+    }
+}
+
+fn validate_trusted_forwarder(config: &TrustedForwarderConfig) -> Result<(), ValidationError> {
+    let auth_header = http::HeaderName::from_bytes(config.auth_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_forwarder_auth_header"))?;
+    let name = auth_header.as_str();
+    if !name.starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_forwarder_auth_header"));
+    }
+    if SPOOFABLE_FORWARDED_HEADERS.contains(&name)
+        || INTERNAL_HEADERS.contains(&name)
+        || name == HEADER_DATADOME_TEST_BYPASS
+        || matches!(name, "x-ts-trace-action" | "x-ts-original-scheme")
+        || name.starts_with("x-ts-tls-")
+    {
+        return Err(ValidationError::new(
+            "reserved_trusted_forwarder_auth_header",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trusted_forwarder_shared_secret(
+    shared_secret: &Redacted<String>,
+) -> Result<(), ValidationError> {
+    let shared_secret = shared_secret.expose();
+    if shared_secret.len() < Ec::MIN_PASSPHRASE_LENGTH {
+        return Err(ValidationError::new(
+            "short_trusted_forwarder_shared_secret",
+        ));
+    }
+    if !shared_secret
+        .bytes()
+        .all(|byte| matches!(byte, b'!'..=b'~'))
+    {
+        return Err(ValidationError::new(
+            "invalid_trusted_forwarder_shared_secret",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trust_header_collisions(settings: &Settings) -> Result<(), ValidationError> {
+    let (Some(forwarder), Some(client_ip)) =
+        (&settings.trusted_forwarder, &settings.trusted_client_ip)
+    else {
+        return Ok(());
+    };
+    for header in [&client_ip.ip_header, &client_ip.auth_header] {
+        if forwarder.auth_header.eq_ignore_ascii_case(header) {
+            return Err(ValidationError::new(
+                "colliding_trusted_forwarder_client_ip_header",
+            ));
+        }
+        if ["forwarded", "x-forwarded-host", "x-forwarded-proto"]
+            .iter()
+            .any(|forwarded| forwarded.eq_ignore_ascii_case(header))
+        {
+            return Err(ValidationError::new(
+                "colliding_trusted_client_ip_forwarded_header",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trust_header_collisions, skip_on_field_errors = false))]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -2885,6 +3002,12 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub trusted_client_ip: Option<TrustedClientIpConfig>,
+    /// Optional authenticated forwarding of the public request host and scheme.
+    ///
+    /// Omitted when unset to preserve config compatibility with older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub trusted_forwarder: Option<TrustedForwarderConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -3108,6 +3231,13 @@ impl Settings {
             )
         {
             insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
+        }
+        if let Some(trusted_forwarder) = &self.trusted_forwarder
+            && TrustedForwarderConfig::is_placeholder_shared_secret(
+                trusted_forwarder.shared_secret.expose(),
+            )
+        {
+            insecure_fields.push("trusted_forwarder.shared_secret".to_owned());
         }
         for partner in &self.ec.partners {
             if partner
@@ -3783,6 +3913,226 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
+    fn trusted_forwarder_json(auth_header: &str, shared_secret: &str) -> JsonValue {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let mut value = serde_json::to_value(settings).expect("should serialize test settings");
+        value["trusted_forwarder"] = json!({
+            "auth_header": auth_header,
+            "shared_secret": shared_secret,
+        });
+        value
+    }
+
+    #[test]
+    fn trusted_forwarder_accepts_valid_configuration_and_redacts_debug_output() {
+        let secret = "fictional-shared-secret-01234567";
+        let settings =
+            Settings::from_json_value(trusted_forwarder_json("x-ts-forwarder-auth", secret))
+                .expect("should accept trusted forwarder configuration");
+        let config = settings
+            .trusted_forwarder
+            .as_ref()
+            .expect("should retain the forwarder configuration");
+        assert!(
+            config.authenticates(secret),
+            "should authenticate the exact shared secret"
+        );
+        for candidate in [
+            secret.to_uppercase(),
+            format!(" {secret}"),
+            format!("{secret} "),
+            secret[..secret.len() - 1].to_owned(),
+            format!("{secret}extra"),
+            String::new(),
+        ] {
+            assert!(
+                !config.authenticates(&candidate),
+                "should reject altered authentication values"
+            );
+        }
+        let debug = format!("{settings:?}");
+        assert!(
+            !debug.contains(secret),
+            "should redact the forwarder shared secret"
+        );
+        let value = serde_json::to_value(settings).expect("should serialize configured settings");
+        assert_eq!(
+            value["trusted_forwarder"]["auth_header"], "x-ts-forwarder-auth",
+            "should retain the configured authentication header"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_invalid_shared_secrets_without_exposing_them() {
+        for secret in [
+            "fictional-shared-secret-0123456",
+            "fictional-secret-with space-012345",
+            "fictional-secret-withé-0123456789",
+            "fictional-secret-with\t-0123456789",
+            "fictional-secret-with\u{007f}-0123456789",
+        ] {
+            let error =
+                Settings::from_json_value(trusted_forwarder_json("x-ts-forwarder-auth", secret))
+                    .expect_err("should reject an invalid forwarder shared secret");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains("trusted_forwarder_shared_secret"),
+                "should identify shared-secret validation: {message}"
+            );
+            assert!(
+                !message.contains(secret),
+                "should not expose the shared secret: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_placeholder_shared_secret() {
+        let settings = Settings::from_json_value(trusted_forwarder_json(
+            "x-ts-forwarder-auth",
+            "REPLACE-WITH-A-RANDOM-SHARED-SECRET",
+        ))
+        .expect("should parse the placeholder before rejecting insecure defaults");
+        let error = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject a forwarder placeholder");
+        assert!(
+            format!("{error:?}").contains("trusted_forwarder.shared_secret"),
+            "should identify the placeholder field"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_requires_explicit_fields_and_rejects_unknown_fields() {
+        for section in [
+            json!({"shared_secret": "fictional-forwarder-secret-0123456789"}),
+            json!({"auth_header": "x-ts-forwarder-auth"}),
+            json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": "fictional-forwarder-secret-0123456789", "enabled": true}),
+        ] {
+            let mut value = trusted_forwarder_json(
+                "x-ts-forwarder-auth",
+                "fictional-forwarder-secret-0123456789",
+            );
+            value["trusted_forwarder"] = section;
+            let _ = Settings::from_json_value(value)
+                .expect_err("should reject incomplete or unknown forwarder fields");
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_unsafe_authentication_header() {
+        for header in [
+            "authorization",
+            "host",
+            "Forwarded",
+            "Fastly-SSL",
+            "Fastly-Client-IP",
+            "",
+            "x-invalid header",
+            "x-invalid\r\nheader",
+        ] {
+            let error = Settings::from_json_value(trusted_forwarder_json(
+                header,
+                "fictional-forwarder-secret-0123456789",
+            ))
+            .expect_err("should reject unsafe authentication headers");
+            assert!(
+                format!("{error:?}").contains("trusted_forwarder_auth_header"),
+                "should identify authentication-header validation"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_reserved_header_collisions_case_insensitively() {
+        for header in [
+            "X-Forwarded-Host",
+            "X-Forwarded-Proto",
+            "X-Forwarded-For",
+            "X-TS-Trace-Action",
+            "X-TS-DataDome-Bypass",
+            "X-TS-Original-Scheme",
+            "X-TS-TLS-Protocol",
+            "X-TS-TLS-Cipher",
+            "X-TS-TLS-Future",
+            "X-TS-EC",
+            "X-Request-ID",
+        ] {
+            let error = Settings::from_json_value(trusted_forwarder_json(
+                header,
+                "fictional-forwarder-secret-0123456789",
+            ))
+            .expect_err("should reject reserved forwarder authentication headers");
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_forwarder_auth_header"),
+                "should identify the reserved header collision"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_client_ip_header_collisions_case_insensitively() {
+        for header in ["X-TS-Client-IP", "X-TS-Client-IP-Auth"] {
+            let mut value = trusted_forwarder_json(header, "fictional-forwarder-secret-0123456789");
+            value["trusted_client_ip"] = json!({"ip_header": "x-ts-client-ip", "auth_header": "x-ts-client-ip-auth", "shared_secret": "fictional-client-ip-secret-0123456789"});
+            let error = Settings::from_json_value(value)
+                .expect_err("should reject overlapping trust headers");
+            assert!(
+                format!("{error:?}").contains("colliding_trusted_forwarder_client_ip_header"),
+                "should identify colliding trust headers"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_rejects_client_ip_overlap_with_forwarded_metadata() {
+        for (ip_header, auth_header) in [
+            ("Forwarded", "x-ts-client-ip-auth"),
+            ("x-ts-client-ip", "FORWARDED"),
+            ("X-Forwarded-Host", "x-ts-client-ip-auth"),
+            ("X-Forwarded-Proto", "x-ts-client-ip-auth"),
+            ("x-ts-client-ip", "X-Forwarded-Host"),
+            ("x-ts-client-ip", "X-Forwarded-Proto"),
+        ] {
+            let mut value = trusted_forwarder_json(
+                "x-ts-forwarder-auth",
+                "fictional-forwarder-secret-0123456789",
+            );
+            value["trusted_client_ip"] = json!({"ip_header": ip_header, "auth_header": auth_header, "shared_secret": "fictional-client-ip-secret-0123456789"});
+            let error = Settings::from_json_value(value)
+                .expect_err("should reject client IP headers that overlap forwarded metadata");
+            assert!(
+                format!("{error:?}").contains("colliding_trusted_client_ip_forwarded_header"),
+                "should identify forwarded metadata collisions"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_allows_distinct_client_ip_configuration() {
+        let mut value = trusted_forwarder_json(
+            "x-ts-forwarder-auth",
+            "fictional-forwarder-secret-0123456789",
+        );
+        value["trusted_client_ip"] = json!({"ip_header": "fastly-client-ip", "auth_header": "x-ts-client-ip-auth", "shared_secret": "fictional-client-ip-secret-0123456789"});
+        Settings::from_json_value(value)
+            .expect("should accept distinct forwarder and client IP trust headers");
+    }
+
+    #[test]
+    fn trusted_forwarder_is_omitted_when_unconfigured() {
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse settings");
+        let value = serde_json::to_value(settings).expect("should serialize settings");
+        assert!(
+            value.get("trusted_forwarder").is_none(),
+            "should omit an unconfigured forwarder"
+        );
+        serde_json::from_value::<BaseRevisionSettings>(value)
+            .expect("should preserve backward compatibility without forwarder configuration");
+    }
+
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
@@ -3921,6 +4271,8 @@ mod tests {
         const CANARY_EC_PARTNER_TS_PULL_TOKEN: &str = "CANARY-EC-PARTNER-TS-PULL-TOKEN-0123456789";
         const CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET: &str =
             "CANARY-TRUSTED-CLIENT-IP-SHARED-SECRET-0123456789";
+        const CANARY_TRUSTED_FORWARDER_SHARED_SECRET: &str =
+            "CANARY-TRUSTED-FORWARDER-SHARED-SECRET-0123456789";
         const CANARY_S3_ACCESS_KEY_ID: &str = "CANARY-S3-ACCESS-KEY-ID-0123456789";
         const CANARY_S3_SECRET_ACCESS_KEY: &str = "CANARY-S3-SECRET-ACCESS-KEY-0123456789";
         const CANARY_S3_SESSION_TOKEN: &str = "CANARY-S3-SESSION-TOKEN-0123456789";
@@ -3959,6 +4311,10 @@ mod tests {
             ip_header: "fastly-client-ip".to_string(),
             auth_header: "x-trusted-client-auth".to_string(),
             shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
+        });
+        settings.trusted_forwarder = Some(TrustedForwarderConfig {
+            auth_header: "x-ts-forwarder-auth".to_owned(),
+            shared_secret: Redacted::new(CANARY_TRUSTED_FORWARDER_SHARED_SECRET.to_string()),
         });
 
         let mut asset_route = ProxyAssetRoute::new("/s3-assets/", "https://s3.canary.example");
@@ -4024,6 +4380,10 @@ mod tests {
             (
                 "trusted_client_ip.shared_secret",
                 CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET,
+            ),
+            (
+                "trusted_forwarder.shared_secret",
+                CANARY_TRUSTED_FORWARDER_SHARED_SECRET,
             ),
             (
                 "proxy.asset_routes[].auth.access_key_id",

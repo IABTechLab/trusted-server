@@ -45,8 +45,8 @@ and non-storeable.
 
 ### Auction correlation token
 
-Enabling the integration has one further server-side effect, beyond module
-availability, that does not depend on browser activation. For each server-side auction
+The existing `hb_auction_id` publication has one further server-side effect, beyond module
+availability, that does not depend on browser activation. With mobile tracing inactive, for each server-side auction
 that produced winning bids, Trusted Server mints a fresh correlation token and publishes
 it as `hb_auction_id` on each winning bid in `window.tsjs.bids`:
 
@@ -66,6 +66,11 @@ ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
 - It is published on every document whose auction produced winning bids, including
   documents with no active console session, because the console reads it from the same
   page bid state the GPT integration already consumes.
+
+Active mobile tracing instead mints its opaque identity before dispatch and reuses
+that token in deliverable auction evidence and GPT opportunity markers. Zero-bid,
+skipped and failed auctions can carry evidence independently of winning bids.
+Disabling mobile tracing retains the existing console-only publication behavior.
 
 ## Activate or Deactivate a Browser Session
 
@@ -94,13 +99,189 @@ An exact directive establishes or clears the host-only, `Secure`, `HttpOnly`,
 `SameSite=Lax` `__Host-ts-console` session cookie. The server removes every reserved
 `ts_console` pair before origin, cookie, or auction handling, and the response removes
 the directive from the visible URL while preserving the path, unrelated query pairs,
-and fragment. Activation applies to the same origin across tabs until the browser
-session ends or an exact deactivation directive clears it.
+and fragment. Explicit activation lasts 30 minutes; ordinary requests do not
+extend that lifetime. The host-only cookie is shared across tabs on that hostname
+and does not isolate different ports. An exact deactivation directive clears it.
 
 Duplicate directives, unrecognized values, and duplicate activation cookies fail
 closed for the current response. Active and directive-bearing HTML responses use
 `Cache-Control: private, no-store` and omit surrogate cache headers. The cookie is
 never forwarded to the publisher origin and is unrelated to `ts-tester`.
+
+## Mobile Trace Page
+
+The mobile report is a separate opt-in surface. Its deployment option defaults
+to `false` and requires the diagnostics integration:
+
+```toml
+[integrations.gpt_diagnostics]
+enabled = true
+trace_page_enabled = true
+```
+
+Before enabling it, the operator must accept that same-origin scripts can read
+the projected health of four owned cookies, opaque auction outcomes, a masked
+network identifier and available coarse network metadata. A masked identifier
+can still identify a network. The `HttpOnly` cookie value remains inaccessible
+to scripts; the report deliberately exposes only validated shape and observation
+categories. No cookie values, exact publisher path, provider identity, creative
+markup, bid price or external user identifier belongs in a trace report.
+
+Open `/_ts/trace` on the exact publisher hostname and in the same browser tab.
+The initial visit is read-only and describes its own **Setup request**, not an
+earlier ad failure. Tap **Enable tracing**. A successful POST requests the cookie
+change; a separate state request must observe a valid session before the page
+says tracing is on. Return to the affected page, explicitly reload it once,
+reproduce the issue, then tap **View trace results** in the TS Console. A history
+Back or restored page alone does not prove a new capture. If history is not useful,
+reopen the article on that same hostname in that tab and reload once.
+
+The publisher action validates one combined report and saves it before navigating
+in the same tab. If storage alone fails, it stays on the publisher page and offers
+an explicit download of that same valid report. A failed capture does not offer a
+GPT-only export as an equivalent fallback. The viewer keeps traced-document facts
+separate from its setup request. Server-auction and browser/GPT clocks remain
+separate; candidate selection or a filled slot does not establish an auction winner.
+
+Slot returned-bid counts include records returned by bidder and mediator calls,
+including mediator echoes. They are observations across stages, not unique bids;
+do not sum slot counts to infer a unique bid total.
+
+### Storage, export and cleanup
+
+One versioned `sessionStorage` key holds at most 512 KiB of compact UTF-8 data.
+A new explicit capture replaces it. Reports expire after 15 minutes, but tabs with
+an opener and browser session restoration may copy or retain the entry. Same-origin
+scripts and service workers can read or replace it. The viewer labels it
+**Browser-carried, unverified diagnostic data**; it is troubleshooting information,
+not cryptographic proof, identity evidence or security evidence.
+
+**Copy**, **Download** and file **Share** use the same validated public report JSON.
+The selected share app receives that file. The viewer does not upload a report or
+substitute URL sharing when file sharing is unavailable. Native download or share
+initiation does not prove that a recipient saved the file.
+
+**Delete local report** removes only this tab's owned report key. After confirmation,
+**Clear report and end tracing** attempts local deletion, the end POST and a separate
+state check independently. Offline requests cannot prevent local deletion. A failed
+deletion retains its own retry; unconfirmed server end retains a separate retry and
+may leave tracing active. An inactive state means no valid session was observed in
+that request; it does not prove that every cookie is absent. Exported files and
+copies in other tabs or apps are not removed by local cleanup.
+
+### Deployment and runtime boundary
+
+Use a suitable same-origin deployment where the browser accepts the unchanged
+`Secure`, `HttpOnly`, host-only `SameSite=Lax` cookie. Its explicit activation lifetime
+is 1800 seconds; ordinary requests do not refresh it. Do not weaken cookie attributes
+or infer HTTPS from an untrusted forwarding header to make a test pass.
+
+On deployed Fastly, Cloudflare and Spin staging services, verify HTTPS Enable returns a
+successful response, a separate state request observes the session, publisher
+reload captures evidence, and End followed by another state request observes
+inactivity. Local plain-HTTP runtime tests do not establish this HTTPS behavior.
+
+Enable and End require the browser's canonical Origin to agree with the
+effective public origin. By default that origin comes from the runtime's
+trusted transport metadata. A TLS-terminating proxy that forwards HTTPS as
+HTTP, or replaces the public authority with an internal host, can therefore
+cause an intentional `403`, including on Spin and Axum.
+
+For that arrangement, explicitly configure an
+[authenticated forwarder](../configuration.md#trusted-forwarder) and provision
+its shared secret in the secret store. The proxy must supply one authenticated
+`X-Forwarded-Host` and `X-Forwarded-Proto` pair bounded to the configured publisher
+domain or a subdomain. This supports an HTTPS browser using Axum's plain-HTTP
+listener without changing the received transport evidence. The request URI and
+Host must still agree with that evidence; forwarding cannot upgrade cookie or
+header fidelity. Unauthenticated `Forwarded` or `X-Forwarded-*` fields do not
+grant trust. Verify Enable, state and End through the actual proxy with the
+unchanged Secure cookie attributes before accepting the deployment.
+
+Publisher activation and context use injected inline scripts without an attached
+CSP nonce. A publisher nonce/hash policy that does not authorize those scripts
+can prevent diagnostics activation and capture. Check the literal activation gate
+and actual capture under the deployed publisher CSP; do not weaken that policy
+or the trace viewer's separate CSP to make the check pass.
+
+A pre-existing session cookie cannot be retroactively assigned this lifetime by
+the server. End tracing and explicitly enable it again to adopt the bounded cookie.
+Expiry or disabling the deployment flag does not unload an already-running page;
+reload documents after rollback. Subsequent gated server requests stop producing
+new evidence immediately when the deployment option is disabled.
+
+Ordered Basic-auth handlers remain first-match-wins. They match the literal path
+visible after runtime conversion, before trace feature flags or method checks.
+Protect the shell and its fixed assets consistently if operator authentication is
+required. Without a matching handler, this opt-in surface is available to users of
+that publisher deployment. The script and stylesheet are fixed same-origin versioned
+assets. Dynamic endpoints and evidence-bearing responses are `private, no-store`;
+successful assets are publicly immutable only when unprotected.
+
+The boundary distinguishes runtime rejection before invocation, adapter
+bootstrap/conversion failure, and successfully converted application-visible
+handling. Fastly, Cloudflare or Spin can normalize a path or change visible header
+representation before Trusted Server sees it. A path normalized outside the trace
+namespace follows ordinary health/routing behavior. A path normalized into a literal
+trace path receives full trace authentication and handling. Aliases still visible
+encoded after conversion are reserved and rejected under authentication for their literal visible path; decoding does not
+grant different authentication coverage. Original wire-target reconstruction is not
+a release prerequisite or a source of authentication decisions.
+
+The visible Cookie header is capped at 16384 bytes. Invalid visible text or size
+prevents health inspection. When runtime fidelity cannot guarantee preservation,
+replacement characters, or commas that border a Trusted Server cookie name and
+could be folded field boundaries, conservatively make all four cookie rows
+unavailable and suppress capture. Commas inside unrelated cookie values, such as
+JSON-valued sign-in or consent cookies, do not block tracing; marker-free headers
+with unknown fidelity can still activate tracing. This can produce false negatives rather than
+guessing a session. End remains available for ambiguous cookie observations.
+
+Locally handled authentication, routing and control failures use bounded
+400/401/403/404/405/413 responses. A runtime rejection has no fabricated local trace
+response. Adapters may buffer a request body before the hook runs; the hook supplies
+no wall-clock timeout, memory-allocation guarantee or earlier raw-header access.
+Unsupported metadata and request-relative server milestones display **Unavailable**.
+There is no historical recovery or server-side report store.
+
+### Release acceptance
+
+Keep `trace_page_enabled` off until the required automated checks in the
+[implementation plan](https://github.com/IABTechLab/trusted-server/blob/750ba8dc470aa37f3eb62512cc2b5a025bab8f9d/docs/superpowers/plans/2026-10-05-mobile-ad-render-trace-implementation-plan.md)
+pass. The browser checks must exercise the complete setup, real cookie observation,
+publisher reload, capture, viewer, export and end flow on each supported adapter.
+Real bidder transport and creative rendering require their separate live checks;
+an auction-disabled browser fixture does not establish those behaviors.
+
+Before production rollout, also complete the following checks on real iOS Safari
+and Android Chrome. Desktop Chromium emulation does not establish native mobile
+behavior:
+
+- Reproduce from the same hostname and tab using the displayed return/reload
+  instructions. Verify browser Back alone is not described as a fresh capture.
+- Check 320 CSS px layout, text zoom, safe-area placement, readable status messages
+  and usable primary controls without horizontal page scrolling.
+- Download and share the JSON through the native browser/app picker. Compare the
+  saved file with the copied report, and verify cancellation or rejection retains
+  the visible report and its other export actions.
+- Verify local deletion independently of an offline or failed end request, then
+  reconnect and use the separate end/state retry.
+- Check viewer reload, tab/opener copies, expiry and any browser session restoration
+  behavior being supported. Record session-restoration checks separately from
+  automated storage fixtures.
+
+The linked plan is the immutable implementation baseline. Record device/browser
+versions and new acceptance results in the current rollout evidence, referencing
+that baseline and the exact deployed revision.
+Until these checks are complete, physical mobile acceptance remains pending.
+
+### Maintaining versioned assets
+
+The committed trace asset manifest covers source, compiler dependency locks and
+build options. After changing those inputs, rebuild and review the JS/CSS and
+refresh the source digest. Unchanged bytes keep their existing asset URL and
+digest. Once an asset set is published, changed bytes require a new versioned
+URL; the current feature's v1 set remains unpublished until release acceptance.
 
 ## What the Console Shows
 
@@ -410,9 +591,9 @@ unsubscribe()
 | `hide()`              | Dismisses presentation without stopping capture                                                      |
 | `show()`              | Clears dismissal and remounts presentation without resetting data                                    |
 
-## V1 Export, Storage, and Privacy
+## GPT-only V1 Export, Observation Memory, and Privacy
 
-The allowlisted export contains:
+The existing GPT-only `snapshot()` and `export()` model contains:
 
 - `version: 1` and an ISO `capturedAt` timestamp.
 - Current page origin and pathname, excluding query parameters and fragments.
@@ -441,11 +622,15 @@ identifier, and never repeated across auctions, so it cannot be joined back to a
 visitor. Diagnostics retain it only after trimming to a non-empty value of at most
 256 UTF-8 bytes.
 
-Captured records are memory-only. Diagnostics do not add an upload, diagnostics
+The GPT-only observation store remains memory-only. Its capture and `export()` do not add an upload, diagnostics
 network request, `localStorage`, `sessionStorage`, IndexedDB, or other persistence.
 `export()` creates only the user-requested local JSON download; it sends nothing to a
 server. The `__Host-ts-console` session cookie contains only the activation bit and is
 inaccessible to JavaScript.
+
+The explicit mobile handoff separately writes the bounded combined trace report
+to `sessionStorage`. Its stricter GPT projection excludes the exact pathname,
+GAM identifiers and `previousCreativeId`, as described under [Mobile Trace Page](#mobile-trace-page).
 
 ## Timing and Retention Bounds
 
