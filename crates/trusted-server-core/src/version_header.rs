@@ -15,12 +15,12 @@ pub fn git_version_header_value() -> Option<HeaderValue> {
 /// Converts `version` to a header value, logging and returning `None` when it
 /// is not a valid header value.
 #[must_use]
-pub fn header_value_from(version: Option<&str>) -> Option<HeaderValue> {
+fn header_value_from(version: Option<&str>) -> Option<HeaderValue> {
     let version = version?;
     match HeaderValue::from_str(version) {
         Ok(value) => Some(value),
         Err(_) => {
-            log::warn!("Skipping invalid TS_GIT_VERSION response header value");
+            log::warn!("Skipping invalid TRUSTED_SERVER__GIT_VERSION response header value");
             None
         }
     }
@@ -33,7 +33,7 @@ pub fn apply_git_version_header(response: &mut Response) {
 
 /// Sets `x-ts-version` to `version`, or removes it when `version` is unknown
 /// or invalid, so an origin's `x-ts-version` is never reported as ours.
-pub fn apply_git_version_header_from(version: Option<&str>, response: &mut Response) {
+fn apply_git_version_header_from(version: Option<&str>, response: &mut Response) {
     if let Some(value) = header_value_from(version) {
         response.headers_mut().insert(HEADER_X_TS_VERSION, value);
     } else {

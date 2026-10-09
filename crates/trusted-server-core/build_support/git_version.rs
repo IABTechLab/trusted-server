@@ -5,7 +5,7 @@
 
 /// Raw candidates for the deployed git version, in priority order.
 pub struct Candidates<'a> {
-    /// `TRUSTED_SERVER_GIT_VERSION`, supplied by the deploy pipeline.
+    /// `TRUSTED_SERVER__GIT_VERSION`, supplied by the deploy pipeline.
     pub override_value: Option<&'a str>,
     /// `git describe --tags --exact-match`.
     pub exact_tag: Option<&'a str>,

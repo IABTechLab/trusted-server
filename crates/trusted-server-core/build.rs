@@ -1,4 +1,5 @@
-//! Compiles the deployed git version into `trusted-server-core` as `TS_GIT_VERSION`.
+//! Compiles the deployed git version into `trusted-server-core` as
+//! `TRUSTED_SERVER__GIT_VERSION`.
 
 #[path = "build_support/git_version.rs"]
 mod git_version;
@@ -8,9 +9,12 @@ use std::process::Command;
 
 use git_version::{Candidates, is_usable, resolve_git_version};
 
-/// Set by the deploy pipeline. Its CI checkout is shallow and detached, so local git
-/// cannot see the tag or branch there.
-const OVERRIDE_ENV: &str = "TRUSTED_SERVER_GIT_VERSION";
+/// Set by the deploy pipeline, which knows the deployed ref even when its checkout
+/// cannot name it: a detached SHA or pull-request checkout has no tag or branch.
+///
+/// The resolved value is re-emitted under the same name, so `option_env!` reads
+/// the validated value rather than the raw pipeline input.
+const OVERRIDE_ENV: &str = "TRUSTED_SERVER__GIT_VERSION";
 
 /// Runs `git` in the crate directory; `None` if git is missing or fails.
 fn git(args: &[&str]) -> Option<String> {
@@ -108,7 +112,10 @@ fn main() {
         None => resolve_from_local_git(),
     };
 
-    if let Some(version) = resolved {
-        println!("cargo:rustc-env=TS_GIT_VERSION={version}");
-    }
+    // Always emitted, even when empty, so the raw pipeline value never reaches
+    // `option_env!` unvalidated: `rustc-env` shadows the inherited environment.
+    println!(
+        "cargo:rustc-env={OVERRIDE_ENV}={}",
+        resolved.unwrap_or_default()
+    );
 }

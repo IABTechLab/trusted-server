@@ -37,8 +37,11 @@ pub const HEADER_X_TS_FASTLY_VERSION: HeaderName = HeaderName::from_static("x-ts
 pub const HEADER_X_TS_ENV: HeaderName = HeaderName::from_static("x-ts-env");
 
 /// Deployed git version compiled in by `build.rs`, from the deploy pipeline's
-/// `TRUSTED_SERVER_GIT_VERSION` or local git. `None` when unknown.
-pub const TS_GIT_VERSION: Option<&str> = option_env!("TS_GIT_VERSION");
+/// `TRUSTED_SERVER__GIT_VERSION` or local git. `None` when unknown.
+pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_VERSION") {
+    Some(version) if !version.is_empty() => Some(version),
+    _ => None,
+};
 
 // Fastly environment variables
 pub const ENV_FASTLY_SERVICE_VERSION: &str = "FASTLY_SERVICE_VERSION";

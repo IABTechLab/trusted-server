@@ -50,8 +50,9 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 ///
 /// Headers are written in this order (last write wins):
 /// 1. Geo headers (or `X-Geo-Info-Available: false` when geo is unavailable)
-/// 2. `X-TS-Version` from the compiled-in git version (`TS_GIT_VERSION`), and
-///    `X-TS-Fastly-Version` from the `FASTLY_SERVICE_VERSION` env var
+/// 2. `X-TS-Version` from the compiled-in git version
+///    (`TRUSTED_SERVER__GIT_VERSION`), and `X-TS-Fastly-Version` from the
+///    `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Operator-configured `settings.response_headers` (can override any managed header)
 pub struct FinalizeResponseMiddleware {
@@ -189,8 +190,9 @@ where
 ///
 /// Header write order (last write wins):
 /// 1. Geo headers (`x-geo-*`) — or `X-Geo-Info-Available: false` when absent
-/// 2. `X-TS-Version` from the compiled-in git version (`TS_GIT_VERSION`), and
-///    `X-TS-Fastly-Version` from the `FASTLY_SERVICE_VERSION` env var
+/// 2. `X-TS-Version` from the compiled-in git version
+///    (`TRUSTED_SERVER__GIT_VERSION`), and `X-TS-Fastly-Version` from the
+///    `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Set-Cookie cache privacy — strip surrogate cache headers and downgrade
 ///    `Cache-Control` to `private, max-age=0` on cookie-bearing responses
@@ -213,13 +215,22 @@ pub(crate) fn apply_finalize_headers(
 
     apply_git_version_header(response);
 
-    if let Ok(v) = std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        if let Ok(value) = HeaderValue::from_str(&v) {
-            response
-                .headers_mut()
-                .insert(HEADER_X_TS_FASTLY_VERSION, value);
-        } else {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+    // Remove an inherited origin value when the version is unknown so it is
+    // never reported as ours.
+    match std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        Ok(v) => match HeaderValue::from_str(&v) {
+            Ok(value) => {
+                response
+                    .headers_mut()
+                    .insert(HEADER_X_TS_FASTLY_VERSION, value);
+            }
+            Err(_) => {
+                log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+                response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
+            }
+        },
+        Err(_) => {
+            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
         }
     }
 
@@ -825,6 +836,10 @@ mod tests {
     fn version_headers_split_git_and_fastly_versions() {
         let settings = settings_with_response_headers(vec![]);
         let mut response = empty_response();
+        response.headers_mut().insert(
+            HEADER_X_TS_FASTLY_VERSION,
+            HeaderValue::from_static("origin-value"),
+        );
 
         apply_finalize_headers(&settings, None, &mut response);
 

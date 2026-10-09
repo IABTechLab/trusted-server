@@ -1,12 +1,12 @@
 # Deployed git version in `x-ts-version`
 
-**Issues:** not filed yet
+**Issues:** #1212
 
 **Date:** 2026-09-25
 
 **Plan:** [../plans/2026-09-25-git-version-header.md](../plans/2026-09-25-git-version-header.md)
 
-**Status:** Pending maintainer review
+**Status:** Implemented
 
 ## Problem
 
@@ -56,7 +56,7 @@ identifiable too.
   minimal and only gains the compiled-in `x-ts-version`.
 - Do not implement a production release gate or the pipeline-side version
   resolution here. Those belong to the deploy pipeline; this repository only
-  defines the `TRUSTED_SERVER_GIT_VERSION` build input.
+  defines the `TRUSTED_SERVER__GIT_VERSION` build input.
 
 ## Current behavior
 
@@ -107,16 +107,20 @@ including after a rollback.
 ### 2. Resolution order
 
 `crates/trusted-server-core/build.rs` resolves the version once per build and
-emits it as the rustc env `TS_GIT_VERSION`:
+re-emits it as the rustc env of the same name, `TRUSTED_SERVER__GIT_VERSION`:
 
-1. `TRUSTED_SERVER_GIT_VERSION` from the build environment, if it is usable
+1. `TRUSTED_SERVER__GIT_VERSION` from the build environment, if it is usable
    (see below). The deploy pipeline sets this.
 2. Otherwise the exact tag at `HEAD`, from `git describe --tags --exact-match`.
 3. Otherwise the current branch, from `git symbolic-ref --short -q HEAD`.
 4. Otherwise the first 6 characters of `git rev-parse HEAD`. Take exactly 6
    characters. Do not use `--short`, which may lengthen the hash to keep it
    unique.
-5. Otherwise leave it unset.
+5. Otherwise emit it empty.
+
+The variable is always emitted, even when empty. Cargo's `rustc-env` shadows the
+inherited environment, so `option_env!` only ever sees the validated value, and
+a raw pipeline value that §2 rejects never reaches the compile.
 
 A candidate is **usable** when, after trimming surrounding whitespace, it is
 non-empty and consists only of visible ASCII (bytes `0x21`–`0x7E`). An
@@ -126,17 +130,17 @@ This is stricter than git. `git check-ref-format` forbids control characters,
 space, and `~^:?*[\`, but it allows non-ASCII UTF-8, so a tag such as `v1-été`
 is a valid ref, and a pipeline may pass such a ref through. Under this rule it
 is skipped: `build.rs` prints a `cargo:warning` naming
-`TRUSTED_SERVER_GIT_VERSION`, and resolution falls back to local git. In a CI
+`TRUSTED_SERVER__GIT_VERSION`, and resolution falls back to local git. In a CI
 checkout that yields the 6-char hash, which still identifies the code. Falling
 back was preferred over omitting the header, because a missing header is harder
 to diagnose. The visible-ASCII rule keeps every compiled-in value a valid
 `HeaderValue` whose `to_str()` succeeds, so consumers never see opaque bytes.
 
-The deploy pipeline must supply the value because CI checkouts are shallow and
-detached (`actions/checkout`, `fetch-depth: 1`, no tags). In such a checkout
-steps 2 and 3 always fail, and only the hash is available. The pipeline knows
-the ref the operator asked for and can resolve the tag or branch against
-`origin` before the build.
+The deploy pipeline supplies the value because it knows the ref the operator
+deployed, even when its checkout cannot name it. `actions/checkout` puts branch
+builds on a local branch and fetches the tag ref for tag builds, so local git
+can name those. A detached SHA or pull-request checkout has no tag or branch,
+so steps 2 and 3 fail there and only the hash is available.
 
 The choice between these candidates is a pure function in
 `crates/trusted-server-core/build_support/git_version.rs`. `build.rs` and an
@@ -145,7 +149,7 @@ without running a build script.
 
 ### 3. Build caching
 
-`build.rs` prints `cargo:rerun-if-env-changed=TRUSTED_SERVER_GIT_VERSION`.
+`build.rs` prints `cargo:rerun-if-env-changed=TRUSTED_SERVER__GIT_VERSION`.
 CI deploys commonly restore a cached `target/` (EdgeZero's `deploy-fastly`
 action does). Without this line a warm cache could keep the previous deploy's
 version.
@@ -187,7 +191,8 @@ Constants in `trusted-server-core::constants`:
 - `HEADER_X_TS_VERSION` keeps the name `x-ts-version`, which now means the git
   version.
 - Add `HEADER_X_TS_FASTLY_VERSION`, named `x-ts-fastly-version`.
-- Add `TS_GIT_VERSION: Option<&str> = option_env!("TS_GIT_VERSION")`.
+- Add `TS_GIT_VERSION: Option<&str>`, read from
+  `option_env!("TRUSTED_SERVER__GIT_VERSION")`, with an empty value as `None`.
 
 A new module, `trusted-server-core::version_header`, owns the value and the
 write:
@@ -198,7 +203,8 @@ write:
   unreachable for values from `build.rs`, but the check stays as a backstop.
 - `apply_git_version_header(response)` inserts `x-ts-version` from
   `git_version_header_value()`.
-- Testable variants take the version as an argument.
+- Private testable variants take the version as an argument, so the colocated
+  unit tests cover every case without a rebuild.
 
 Keeping this in core means all four adapters, and the Fastly health fast path,
 use the same rule.
@@ -209,6 +215,10 @@ Axum, Cloudflare, and Spin `apply_finalize_headers` call
 `apply_git_version_header` right after the geo-availability header. In every
 adapter the call runs before `apply_response_headers_with_cache_privacy`, so the
 existing order is kept: operator headers still apply last.
+
+When the Fastly entry point cannot reload settings to finalize a response (for
+example a binary that cannot parse its config blob), it still calls
+`apply_git_version_header`, because the version needs no settings.
 
 Fastly `health_response` sets `x-ts-version` from `git_version_header_value()`.
 The `fastly` crate's `set_header` accepts the `http` 1.x `HeaderValue` that
@@ -240,7 +250,8 @@ x-ts-version: v1.3.0
 
 `build.rs` never fails the build over version metadata. If git is missing, the
 directory is not a repository (for example an exported source tree), or git
-fails, the build leaves `TS_GIT_VERSION` unset and `x-ts-version` is omitted.
+fails, the build emits an empty `TRUSTED_SERVER__GIT_VERSION`, `TS_GIT_VERSION`
+is `None`, and `x-ts-version` is omitted.
 The same applies when git's top level (`git rev-parse --show-toplevel`) is not
 the workspace root: git searches parent directories, so an exported tree nested
 in an unrelated repository would otherwise report that repository's tag or
@@ -249,7 +260,7 @@ branch. When the version is unknown, an `x-ts-version` already on the response
 Sending a placeholder such as `unknown` was rejected: a missing header is easier
 to tell apart from a real ref.
 
-An unusable `TRUSTED_SERVER_GIT_VERSION` (§2) produces a `cargo:warning` and
+An unusable `TRUSTED_SERVER__GIT_VERSION` (§2) produces a `cargo:warning` and
 falls back to local git. It does not fail the build.
 
 No new public error type is introduced.
@@ -262,7 +273,7 @@ Fastly version number. Dashboards, monitors, and scripts must switch to
 
 The rollout does not depend on the deploy pipeline:
 
-- A pipeline that does not set `TRUSTED_SERVER_GIT_VERSION`: CI deploys report
+- A pipeline that does not set `TRUSTED_SERVER__GIT_VERSION`: CI deploys report
   the 6-char hash from the local fallback. This is still correct, just less
   readable.
 - A pipeline that sets it before this change ships: the variable is in the
@@ -279,9 +290,9 @@ version's compiled-in value.
 - **Operator `[response_headers]` in the pushed config blob.** Rejected. Config
   push is versionless and not reverted by rollback, and it depends on every
   operator keeping it in sync.
-- **Local git only, in `build.rs`.** Rejected as the only source. CI checkouts
-  are shallow and detached, so it would always produce the hash and never the
-  tag or branch. It stays as the fallback.
+- **Local git only, in `build.rs`.** Rejected as the only source. A detached
+  SHA or pull-request checkout has no tag or branch, so there it would produce
+  only the hash. It stays as the fallback.
 - **A new header, keeping `x-ts-version` as the Fastly version.** Rejected. The
   existing name is the one people expect to carry the Trusted Server version,
   and keeping it wrong would keep misleading them.
@@ -314,7 +325,7 @@ Unit and integration tests follow red-green-refactor and cover:
 
 End-to-end, offline, with Viceroy and no live Fastly service:
 
-1. Build the release Wasm with `TRUSTED_SERVER_GIT_VERSION=v9.9.9-test`, run it
+1. Build the release Wasm with `TRUSTED_SERVER__GIT_VERSION=v9.9.9-test`, run it
    under `fastly compute serve --file <wasm>`, and `curl -sI` both `GET /health`
    and a route that passes through `FinalizeResponseMiddleware`, with a local
    `trusted_server_config` pushed as `scripts/smoke-fastly.sh` does so the route
@@ -348,7 +359,7 @@ handoff reports the commands run and their observed results.
 
 ## Acceptance Criteria
 
-- A Fastly deploy built with `TRUSTED_SERVER_GIT_VERSION=v1.3.0` returns
+- A Fastly deploy built with `TRUSTED_SERVER__GIT_VERSION=v1.3.0` returns
   `x-ts-version: v1.3.0` and `x-ts-fastly-version: <service version>` on
   finalized responses, and `x-ts-version: v1.3.0` on `GET /health`.
 - A staging deploy of branch `feature/x` returns `x-ts-version: feature/x`. A
@@ -359,7 +370,7 @@ handoff reports the commands run and their observed results.
   succeeds.
 - An override that is not visible ASCII produces a `cargo:warning` and the
   local git fallback.
-- Changing `TRUSTED_SERVER_GIT_VERSION` between builds changes the header even
+- Changing `TRUSTED_SERVER__GIT_VERSION` between builds changes the header even
   with a warm `target/` cache.
 - Axum, Cloudflare, and Spin responses carry `x-ts-version`.
 - No response carries the Fastly service version as `x-ts-version`.

@@ -1,4 +1,4 @@
-//! The version-resolution rule `build.rs` uses for `TS_GIT_VERSION`.
+//! The version-resolution rule `build.rs` uses for `TRUSTED_SERVER__GIT_VERSION`.
 
 #[path = "../build_support/git_version.rs"]
 mod git_version;
@@ -25,7 +25,7 @@ fn override_wins_over_local_git() {
     assert_eq!(
         resolve_git_version(&candidates).as_deref(),
         Some("v1.2.3"),
-        "should prefer the pipeline-supplied TRUSTED_SERVER_GIT_VERSION"
+        "should prefer the pipeline-supplied TRUSTED_SERVER__GIT_VERSION"
     );
 }
 

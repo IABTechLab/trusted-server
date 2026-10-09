@@ -6,8 +6,9 @@
 6-char commit hash. The Fastly service version moves to `x-ts-fastly-version`.
 
 **Architecture:** `trusted-server-core/build.rs` compiles the version in as
-`TS_GIT_VERSION`. It takes the value from the build-time env
-`TRUSTED_SERVER_GIT_VERSION` (set by the deploy pipeline), or falls back to local `git`.
+`TRUSTED_SERVER__GIT_VERSION`, read through `constants::TS_GIT_VERSION`. It takes
+the value from the build-time env `TRUSTED_SERVER__GIT_VERSION` (set by the
+deploy pipeline), or falls back to local `git`.
 The choice itself is a pure function in `build_support/git_version.rs`, shared by
 `build.rs` and an integration test through `#[path]`. A core module
 `version_header` owns the header value and the write. Every adapter's
@@ -20,12 +21,12 @@ applied, and the Fastly `/health` fast path sets it directly.
 
 ## Global Constraints
 
-- Build env var: exactly `TRUSTED_SERVER_GIT_VERSION`. Compiled-in rustc env: exactly `TS_GIT_VERSION`.
+- Build env var and compiled-in rustc env: exactly `TRUSTED_SERVER__GIT_VERSION`. `build.rs` always re-emits the validated value (empty when unknown), so the raw input never reaches `option_env!`.
 - Resolution order: usable env override → exact tag → branch → first **6** chars of the commit → none.
 - Usable = trimmed, non-empty, and only bytes `0x21`–`0x7E`. An unusable override prints a `cargo:warning` and falls back to local git.
 - No version known: **omit** `x-ts-version`. Never emit `unknown`.
 - `build.rs` must never fail the build over version metadata.
-- `build.rs` must print `cargo:rerun-if-env-changed=TRUSTED_SERVER_GIT_VERSION`, and `rerun-if-changed` only for git paths that exist (`<git-dir>/HEAD`, the current branch's ref file under `<common-dir>`, `<common-dir>/refs/tags`, `<common-dir>/packed-refs`).
+- `build.rs` must print `cargo:rerun-if-env-changed=TRUSTED_SERVER__GIT_VERSION`, and `rerun-if-changed` only for git paths that exist (`<git-dir>/HEAD`, the current branch's ref file under `<common-dir>`, `<common-dir>/refs/tags`, `<common-dir>/packed-refs`).
 - Header names: `x-ts-version` (git), `x-ts-fastly-version` (the `FASTLY_SERVICE_VERSION` value). Fastly `/health` gets `x-ts-version` only.
 - Operator `settings.response_headers` still apply last.
 - Test messages use the repo's `"should …"` style. Run the relevant `cargo test-*` / `cargo clippy-*` alias per task.
@@ -46,14 +47,14 @@ applied, and the Fastly `/health` fast path sets it directly.
 - Produces: `git_version::is_usable(value: &str) -> bool` and
   `git_version::resolve_git_version(candidates: &Candidates<'_>) -> Option<String>`,
   where `Candidates { override_value, exact_tag, branch, commit }` are all `Option<&str>`.
-- Produces: the compile-time env `TS_GIT_VERSION`, set only when a version is known.
+- Produces: the compile-time env `TRUSTED_SERVER__GIT_VERSION`, always set; empty when no version is known.
 
 - [ ] **Step 1: Write the failing test**
 
 `crates/trusted-server-core/tests/git_version_resolve.rs`:
 
 ```rust
-//! The version-resolution rule `build.rs` uses for `TS_GIT_VERSION`.
+//! The version-resolution rule `build.rs` uses for `TRUSTED_SERVER__GIT_VERSION`.
 
 #[path = "../build_support/git_version.rs"]
 mod git_version;
@@ -80,7 +81,7 @@ fn override_wins_over_local_git() {
     assert_eq!(
         resolve_git_version(&candidates).as_deref(),
         Some("v1.2.3"),
-        "should prefer the pipeline-supplied TRUSTED_SERVER_GIT_VERSION"
+        "should prefer the pipeline-supplied TRUSTED_SERVER__GIT_VERSION"
     );
 }
 
@@ -207,7 +208,7 @@ Expected: FAIL to compile, with `couldn't read …/build_support/git_version.rs`
 
 /// Raw candidates for the deployed git version, in priority order.
 pub struct Candidates<'a> {
-    /// `TRUSTED_SERVER_GIT_VERSION`, supplied by the deploy pipeline.
+    /// `TRUSTED_SERVER__GIT_VERSION`, supplied by the deploy pipeline.
     pub override_value: Option<&'a str>,
     /// `git describe --tags --exact-match`.
     pub exact_tag: Option<&'a str>,
@@ -249,7 +250,8 @@ Expected: 10 passed.
 Replace `crates/trusted-server-core/build.rs` with:
 
 ```rust
-//! Compiles the deployed git version into `trusted-server-core` as `TS_GIT_VERSION`.
+//! Compiles the deployed git version into `trusted-server-core` as
+//! `TRUSTED_SERVER__GIT_VERSION`.
 
 #[path = "build_support/git_version.rs"]
 mod git_version;
@@ -259,9 +261,12 @@ use std::process::Command;
 
 use git_version::{Candidates, is_usable, resolve_git_version};
 
-/// Set by the deploy pipeline. Its CI checkout is shallow and detached, so local git
-/// cannot see the tag or branch there.
-const OVERRIDE_ENV: &str = "TRUSTED_SERVER_GIT_VERSION";
+/// Set by the deploy pipeline, which knows the deployed ref even when its checkout
+/// cannot name it: a detached SHA or pull-request checkout has no tag or branch.
+///
+/// The resolved value is re-emitted under the same name, so `option_env!` reads
+/// the validated value rather than the raw pipeline input.
+const OVERRIDE_ENV: &str = "TRUSTED_SERVER__GIT_VERSION";
 
 /// Runs `git` in the crate directory; `None` if git is missing or fails.
 fn git(args: &[&str]) -> Option<String> {
@@ -334,17 +339,20 @@ fn main() {
         None => resolve_from_local_git(),
     };
 
-    if let Some(version) = resolved {
-        println!("cargo:rustc-env=TS_GIT_VERSION={version}");
-    }
+    // Always emitted, even when empty, so the raw pipeline value never reaches
+    // `option_env!` unvalidated: `rustc-env` shadows the inherited environment.
+    println!(
+        "cargo:rustc-env={OVERRIDE_ENV}={}",
+        resolved.unwrap_or_default()
+    );
 }
 ```
 
 - [ ] **Step 6: Verify the override reaches the compile and re-runs on change**
 
 Run:
-`TRUSTED_SERVER_GIT_VERSION=v0.0.0-check cargo build -p trusted-server-core --target wasm32-wasip1 -vv 2>&1 | grep -F 'TS_GIT_VERSION=v0.0.0-check'`
-Expected: one matching `cargo:rustc-env=TS_GIT_VERSION=v0.0.0-check` line.
+`TRUSTED_SERVER__GIT_VERSION=v0.0.0-check cargo build -p trusted-server-core --target wasm32-wasip1 -vv 2>&1 | grep -F 'rustc-env=TRUSTED_SERVER__GIT_VERSION=v0.0.0-check'`
+Expected: one matching `cargo:rustc-env=TRUSTED_SERVER__GIT_VERSION=v0.0.0-check` line.
 
 Run the same command again with `v0.0.0-check2`. Expected: the build script
 re-runs and prints `…check2`.
@@ -375,7 +383,7 @@ git commit --signoff -S -m "Compile deployed git version into trusted-server-cor
 
 **Interfaces:**
 
-- Consumes: `TS_GIT_VERSION` compile-time env (Task 1).
+- Consumes: `TRUSTED_SERVER__GIT_VERSION` compile-time env (Task 1).
 - Produces: `constants::HEADER_X_TS_FASTLY_VERSION: HeaderName`, `constants::TS_GIT_VERSION: Option<&'static str>`.
 - Produces: `version_header::git_version_header_value() -> Option<HeaderValue>`,
   `version_header::header_value_from(version: Option<&str>) -> Option<HeaderValue>`,
@@ -396,8 +404,11 @@ pub const HEADER_X_TS_FASTLY_VERSION: HeaderName = HeaderName::from_static("x-ts
 pub const HEADER_X_TS_ENV: HeaderName = HeaderName::from_static("x-ts-env");
 
 /// Deployed git version compiled in by `build.rs`, from the deploy pipeline's
-/// `TRUSTED_SERVER_GIT_VERSION` or local git. `None` when unknown.
-pub const TS_GIT_VERSION: Option<&str> = option_env!("TS_GIT_VERSION");
+/// `TRUSTED_SERVER__GIT_VERSION` or local git. `None` when unknown.
+pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_VERSION") {
+    Some(version) if !version.is_empty() => Some(version),
+    _ => None,
+};
 ```
 
 Create `crates/trusted-server-core/src/version_header.rs`:
@@ -535,7 +546,7 @@ pub fn header_value_from(version: Option<&str>) -> Option<HeaderValue> {
     match HeaderValue::from_str(version) {
         Ok(value) => Some(value),
         Err(_) => {
-            log::warn!("Skipping invalid TS_GIT_VERSION response header value");
+            log::warn!("Skipping invalid TRUSTED_SERVER__GIT_VERSION response header value");
             None
         }
     }
@@ -869,7 +880,7 @@ X-Debug-Build = "canary"
 Add as the first bullet under `## [Unreleased]` → `### Changed`:
 
 ```markdown
-- **Breaking:** `x-ts-version` now reports the deployed git version — the release tag, else the branch, else the first 6 characters of the commit — compiled in from the build-time `TRUSTED_SERVER_GIT_VERSION` (set by the deploy pipeline) or local git, and is sent by every adapter, including on the Fastly `GET /health` probe. The Fastly service version it previously carried is now `x-ts-fastly-version`; update dashboards, monitors, and scripts that read `x-ts-version` as the Fastly version number. Builds with neither the override nor git omit the header.
+- **Breaking:** `x-ts-version` now reports the deployed git version — the release tag, else the branch, else the first 6 characters of the commit — compiled in from the build-time `TRUSTED_SERVER__GIT_VERSION` (set by the deploy pipeline) or local git, and is sent by every adapter, including on the Fastly `GET /health` probe. The Fastly service version it previously carried is now `x-ts-fastly-version`; update dashboards, monitors, and scripts that read `x-ts-version` as the Fastly version number. Builds with neither the override nor git omit the header.
 ```
 
 - [ ] **Step 3: Format checks**
@@ -894,7 +905,7 @@ PR test plan. Work in the scratchpad directory (`$SCRATCH` below).
 - [ ] **Step 1: Override build, served under Viceroy**
 
 ```bash
-TRUSTED_SERVER_GIT_VERSION=v9.9.9-test cargo build --release -p trusted-server-adapter-fastly --target wasm32-wasip1
+TRUSTED_SERVER__GIT_VERSION=v9.9.9-test cargo build --release -p trusted-server-adapter-fastly --target wasm32-wasip1
 ```
 
 Serve it with a pushed local config, reusing the setup in
@@ -916,15 +927,15 @@ Viceroy's `FASTLY_SERVICE_VERSION`. No `x-ts-version` is numeric.
 - [ ] **Step 2: Warm-cache rebuild with a changed value**
 
 ```bash
-TRUSTED_SERVER_GIT_VERSION=v9.9.9-test2 cargo build --release -p trusted-server-adapter-fastly --target wasm32-wasip1 -vv 2>&1 | grep -F 'TS_GIT_VERSION='
+TRUSTED_SERVER__GIT_VERSION=v9.9.9-test2 cargo build --release -p trusted-server-adapter-fastly --target wasm32-wasip1 -vv 2>&1 | grep -F 'rustc-env=TRUSTED_SERVER__GIT_VERSION='
 ```
 
-Expected: `cargo:rustc-env=TS_GIT_VERSION=v9.9.9-test2`. Re-serve and curl
+Expected: `cargo:rustc-env=TRUSTED_SERVER__GIT_VERSION=v9.9.9-test2`. Re-serve and curl
 `/health`: `x-ts-version: v9.9.9-test2`.
 
 - [ ] **Step 3: No-env fallback**
 
-Rebuild with `TRUSTED_SERVER_GIT_VERSION` unset on branch
+Rebuild with `TRUSTED_SERVER__GIT_VERSION` unset on branch
 `feat/git-version-header`: `/health` shows `x-ts-version: feat/git-version-header`.
 Then `git switch --detach` and rebuild: `x-ts-version` is the first 6 chars of
 `git rev-parse HEAD`. Switch back to the branch afterwards.
@@ -933,7 +944,7 @@ Then `git switch --detach` and rebuild: `x-ts-version` is the first 6 chars of
 
 ```bash
 git archive --format=tar HEAD | (mkdir -p "$SCRATCH/nogit" && tar -x -C "$SCRATCH/nogit")
-cd "$SCRATCH/nogit" && env -u TRUSTED_SERVER_GIT_VERSION cargo build --release -p trusted-server-adapter-fastly --target wasm32-wasip1
+cd "$SCRATCH/nogit" && env -u TRUSTED_SERVER__GIT_VERSION cargo build --release -p trusted-server-adapter-fastly --target wasm32-wasip1
 ```
 
 Confirm `$SCRATCH` is not inside a git repository first

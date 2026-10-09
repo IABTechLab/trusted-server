@@ -29,7 +29,7 @@ use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
-use trusted_server_core::version_header::git_version_header_value;
+use trusted_server_core::version_header::{apply_git_version_header, git_version_header_value};
 
 mod app;
 mod backend;
@@ -214,6 +214,9 @@ fn edgezero_main(mut req: FastlyRequest) {
                 }
                 Err(e) => {
                     log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
+                    // The compiled-in version needs no settings, so a deploy that cannot
+                    // load its config still reports which build is serving.
+                    apply_git_version_header(&mut response);
                 }
             }
         }
