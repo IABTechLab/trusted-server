@@ -29,6 +29,7 @@ ids = ["trusted_server_secrets"]
 "#;
 const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
+const CLICKS_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CLICKS";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED";
 const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
 const PROVIDER_ENDPOINT_ENV: &str = "TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT";
@@ -80,6 +81,76 @@ fn validate_with_overlay(project: &MigratedProject, raw_value: &str) -> Output {
         .env(REWRITE_ENV, raw_value)
         .output()
         .expect("should run ts config validate")
+}
+
+fn pushed_auction_with_env(
+    project: &MigratedProject,
+    key: &str,
+    raw_value: &str,
+) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args(["config", "push", "--adapter", "axum", "--manifest"])
+        .arg(&project.manifest_path)
+        .arg("--app-config")
+        .arg(&project.config_path)
+        .args(["--yes", "--no-diff"])
+        .current_dir(project.directory.path())
+        .env(key, raw_value)
+        .output()
+        .expect("should run ts config push");
+    assert!(
+        output.status.success(),
+        "config push should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let local_store_path = project
+        .directory
+        .path()
+        .join(".edgezero/local-config-trusted_server_config.json");
+    let local_store: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(local_store_path).expect("should read pushed local config"),
+    )
+    .expect("should parse local config store");
+    let envelope_json = local_store
+        .as_object()
+        .and_then(|entries| entries.values().next())
+        .and_then(serde_json::Value::as_str)
+        .expect("should contain a blob envelope");
+    let envelope: serde_json::Value =
+        serde_json::from_str(envelope_json).expect("should parse blob envelope");
+    envelope["data"]["auction"].clone()
+}
+
+#[test]
+fn rewrite_clicks_environment_override_applies_when_leaf_present() {
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read migrated config")
+        .parse::<DocumentMut>()
+        .expect("should parse migrated config");
+    document["auction"]["rewrite_clicks"] = value(true);
+    fs::write(&project.config_path, document.to_string()).expect("should write config");
+
+    let auction = pushed_auction_with_env(&project, CLICKS_ENV, "false");
+
+    assert_eq!(
+        auction["rewrite_clicks"],
+        serde_json::Value::Bool(false),
+        "pushed config should contain the rewrite_clicks environment override"
+    );
+}
+
+#[test]
+fn rewrite_clicks_environment_override_is_ignored_without_leaf() {
+    let project = migrated_project();
+
+    let auction = pushed_auction_with_env(&project, CLICKS_ENV, "false");
+
+    assert!(
+        auction.get("rewrite_clicks").is_none(),
+        "an override for a missing leaf should be ignored and the unset default omitted"
+    );
 }
 
 #[test]

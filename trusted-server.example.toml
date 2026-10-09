@@ -125,8 +125,13 @@ pull_sync_concurrency = 3
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]
-# Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
+# Hosts never rewritten: assets stay direct and click-through links are not
+# wrapped. Supports "*.example.com" wildcards (matches the apex too).
 # exclude_domains = ["*.cdn.example.com"]
+# When non-empty, only asset URLs on these hosts are proxied; other assets load
+# directly. Click-through links are not affected. Set this in TOML; environment
+# overrides cannot replace arrays.
+# include_domains = ["assets.example.com", "*.img.example.com"]
 
 # Trust a fronting CDN's reader IP only when the same request also supplies
 # the matching shared secret. The front door must set both headers on requests
@@ -261,18 +266,29 @@ proxy = "enabled"
 # Keep disabled until provider endpoints, routes, and profile values below are
 # replaced with deployment-specific settings.
 enabled = false
-# Rewrite winning-bid creative HTML to first-party endpoints (default true). Set
-# false to skip proxy/click-URL conversion and creative TSJS injection.
-# Sanitization is controlled separately by `sanitize_creatives` below. Restore
-# true before rolling back to an older binary that rejects unknown fields.
+# Rewrite winning-bid creative asset URLs (images, scripts, styles, media,
+# iframes, CSS url()) to first-party /first-party/proxy endpoints (default
+# true). Set false to leave asset URLs direct. Bidder <base> removal and
+# creative TSJS injection run when this or rewrite_clicks is on. Sanitization
+# is controlled separately by `sanitize_creatives` below. Restore true before
+# rolling back to an older binary that rejects unknown fields.
 rewrite_creatives = true
+# Wrap creative click-through links (<a href>, <area href>) in signed
+# /first-party/click redirects. Unset (the default) follows rewrite_creatives
+# for auction creatives and keeps wrapping links in HTML fetched through
+# /first-party/proxy; a set value applies to both. Leave it commented out to
+# keep that behavior: any explicit value is stored in the pushed config, and
+# binaries older than this setting reject it. Uncomment it before relying on
+# TRUSTED_SERVER__AUCTION__REWRITE_CLICKS, which cannot create a missing leaf.
+# rewrite_clicks = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content. Defaults to false
-# (executable markup preserved). Note that with `rewrite_creatives = true` the
-# adm is still not untouched: eligible URLs are rewritten, bidder `<base>`
-# elements are removed, and the creative TSJS runtime is injected. Enable it
-# whenever creatives can render in a context that shares the publisher origin
-# (its primary defence there); leave it off when creatives render in a
+# (executable markup preserved). Note that with `rewrite_creatives` or
+# `rewrite_clicks` on, the adm is still not untouched: eligible asset URLs
+# and/or links are rewritten, bidder `<base>` elements are removed, and the
+# creative TSJS runtime is injected. Enable it whenever creatives can render
+# in a context that shares the publisher origin (its primary defence there);
+# leave it off when creatives render in a
 # foreign-origin frame (e.g. the Prebid Universal Creative inside the ad
 # server's iframe), since it removes script-based creatives entirely and would
 # blank slots on a script-heavy demand stack.

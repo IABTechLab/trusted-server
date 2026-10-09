@@ -1225,7 +1225,7 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+pub(crate) fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1670,37 +1670,33 @@ pub async fn handle_first_party_proxy_sign(
     };
 
     let trimmed = payload.url.trim();
-    let abs = if trimmed.starts_with("//") {
-        format!("{}:{}", request_scheme, trimmed)
+    let protocol_relative;
+    // A protocol-relative target inherits the signing request's scheme before
+    // normalization, so `//` and absolute input reach the same policy check.
+    let candidate = if trimmed.starts_with("//") {
+        protocol_relative = format!("{request_scheme}:{trimmed}");
+        protocol_relative.as_str()
     } else {
-        crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
-            Report::new(TrustedServerError::Proxy {
-                message: "unsupported url".to_string(),
-            })
-        })?
+        trimmed
     };
-
-    if settings.rewrite.is_excluded(&abs) {
-        return Err(Report::new(TrustedServerError::Proxy {
+    let target = crate::creative::normalize_creative_url(candidate).ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
             message: "unsupported url".to_string(),
-        }));
-    }
-
-    let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
-        message: "invalid url".to_string(),
+        })
     })?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "unsupported scheme".to_string(),
-        }));
-    }
-
-    let host = parsed.host_str().ok_or_else(|| {
+    let host = target.host_str().ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
             message: "missing host".to_string(),
         })
     })?;
+    if !settings.rewrite.should_proxy_asset(host) {
+        log::debug!(
+            "sign request for `{host}` declined: host excluded or not in rewrite.include_domains"
+        );
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported url".to_string(),
+        }));
+    }
     if !is_host_permitted(&settings.proxy.allowed_domains, host) {
         log::warn!(
             "sign request for `{}` blocked: host not in proxy.allowed_domains",
@@ -1720,10 +1716,10 @@ pub async fn handle_first_party_proxy_sign(
         .to_string();
     let extras = vec![(String::from("tsexp"), tsexp)];
 
-    let mut base = parsed.clone();
+    let mut base = target.clone();
     base.set_query(None);
     base.set_fragment(None);
-    let proxied = crate::creative::build_proxy_url_with_extras(settings, &abs, &extras);
+    let proxied = crate::creative::build_proxy_url_with_extras(settings, target.as_str(), &extras);
 
     let resp = ProxySignResp {
         href: proxied,
@@ -2695,20 +2691,171 @@ mod tests {
             let mut settings = create_test_settings();
             settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
 
-            for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
-                let body = serde_json::json!({ "url": url });
-                let req =
-                    build_http_post_json_request("https://edge.example/first-party/sign", &body);
-                let err: Report<TrustedServerError> =
-                    handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                        .await
-                        .expect_err("should reject excluded URL");
+            for method in [&Method::GET, &Method::POST] {
+                for url in [
+                    "https://cdn.example/asset.js",
+                    "//cdn.example/asset.js",
+                    "https://CDN.Example/asset.js",
+                ] {
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example/first-party/sign",
+                        url,
+                    );
+                    let err: Report<TrustedServerError> =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                            .await
+                            .expect_err("should reject excluded URL");
 
-                assert_eq!(
-                    err.current_context().status_code(),
-                    StatusCode::BAD_GATEWAY,
-                    "should reject excluded URL `{url}` as unsupported"
-                );
+                    assert_eq!(
+                        err.current_context().status_code(),
+                        StatusCode::BAD_GATEWAY,
+                        "{} should reject excluded URL `{url}` as unsupported",
+                        method.as_str()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_rejects_excluded_urls_case_insensitively() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["CDN.Example".to_owned()];
+
+            for method in [&Method::GET, &Method::POST] {
+                for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example/first-party/sign",
+                        url,
+                    );
+                    let err: Report<TrustedServerError> =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                            .await
+                            .expect_err("should reject a host excluded by a mixed-case entry");
+
+                    assert_eq!(
+                        err.current_context().status_code(),
+                        StatusCode::BAD_GATEWAY,
+                        "{} should reject `{url}` excluded by a mixed-case entry as unsupported",
+                        method.as_str()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_sign_applies_rewrite_include_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            include_domains: &'static [&'static str],
+            exclude_domains: &'static [&'static str],
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            expected: StatusCode,
+        }
+
+        let cases = [
+            Case {
+                name: "listed absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "listed protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.com/a.png",
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "off-list absolute",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off-list protocol-relative",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "//img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "host in both lists",
+                include_domains: &["*.example.com"],
+                exclude_domains: &["img.example.com"],
+                allowed_domains: &[],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "off include list and off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.net/a.png",
+                expected: StatusCode::BAD_GATEWAY,
+            },
+            Case {
+                name: "listed but off proxy allowlist",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &["*.example.org"],
+                target: "https://img.example.com/a.png",
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "mixed-case host",
+                include_domains: &["*.example.com"],
+                exclude_domains: &[],
+                allowed_domains: &[],
+                target: "https://IMG.Example.COM/a.png",
+                expected: StatusCode::OK,
+            },
+        ];
+
+        let to_owned = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+
+        futures::executor::block_on(async {
+            for case in &cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.rewrite.include_domains = to_owned(case.include_domains);
+                    settings.rewrite.exclude_domains = to_owned(case.exclude_domains);
+                    settings.proxy.allowed_domains = to_owned(case.allowed_domains);
+                    let req = build_proxy_sign_request(
+                        method,
+                        "https://edge.example.com/first-party/sign",
+                        case.target,
+                    );
+
+                    let status =
+                        match handle_first_party_proxy_sign(&settings, &noop_services(), req).await
+                        {
+                            Ok(response) => response.status(),
+                            Err(error) => error.current_context().status_code(),
+                        };
+
+                    assert_eq!(
+                        status, case.expected,
+                        "{label} should return {}",
+                        case.expected
+                    );
+                }
             }
         });
     }
@@ -3621,6 +3768,84 @@ mod tests {
             css_body.contains("/first-party/proxy?tsurl="),
             "should keep rewriting proxied CSS when auction rewriting is disabled: {css_body}"
         );
+    }
+
+    #[test]
+    fn proxied_html_click_wrapping_follows_explicit_rewrite_clicks() {
+        let html = r#"<html><head><base href="https://base.example.com/"></head><body><a href="https://landing.example.com/page"><img src="https://cdn.example.com/ad.png"></a><a href="https://excluded.example.com/page">Excluded</a></body></html>"#;
+        // (rewrite_creatives, rewrite_clicks, expect wrapped clicks)
+        let cases = [
+            (true, None, true),
+            (false, None, true),
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (false, Some(false), false),
+            (false, Some(true), true),
+        ];
+
+        for (rewrite_creatives, rewrite_clicks, expect_clicks) in cases {
+            let mut settings = create_test_settings();
+            settings.auction.rewrite_creatives = rewrite_creatives;
+            settings.auction.rewrite_clicks = rewrite_clicks;
+            settings.rewrite.exclude_domains = vec!["excluded.example.com".to_owned()];
+            let label =
+                format!("rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}");
+            let req = build_http_request(Method::GET, "https://edge.example.com/first-party/proxy");
+            let mut response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+
+            let body = response_body_string(
+                finalize(
+                    &settings,
+                    &req,
+                    "https://cdn.example.com/creative.html",
+                    response,
+                )
+                .expect("should finalize proxied HTML"),
+            );
+
+            assert!(
+                body.contains("/first-party/proxy?tsurl="),
+                "{label}: proxied HTML always proxies assets: {body}"
+            );
+            // A wrapped landing link carries the click URL in href and data-tsclick.
+            assert_eq!(
+                body.matches("/first-party/click?tsurl=").count(),
+                if expect_clicks { 2 } else { 0 },
+                "{label}: click wrapping in proxied HTML: {body}"
+            );
+            assert_eq!(
+                body.matches("data-tsclick").count(),
+                usize::from(expect_clicks),
+                "{label}: data-tsclick in proxied HTML: {body}"
+            );
+            if !expect_clicks {
+                let landing_href = body
+                    .split("<a href=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next());
+                assert_eq!(
+                    landing_href,
+                    Some("https://landing.example.com/page"),
+                    "{label}: landing link keeps its raw href: {body}"
+                );
+            }
+            assert!(
+                body.contains(r#"<a href="https://excluded.example.com/page">Excluded</a>"#),
+                "{label}: excluded link always stays raw: {body}"
+            );
+            assert!(
+                !body.contains("<base"),
+                "{label}: proxied HTML always removes <base>: {body}"
+            );
+            assert!(
+                body.contains("/static/tsjs="),
+                "{label}: proxied HTML always receives the runtime: {body}"
+            );
+        }
     }
 
     #[test]

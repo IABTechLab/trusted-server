@@ -4696,6 +4696,7 @@ mod tests {
                 enabled: true,
                 sanitize_creatives: true,
                 rewrite_creatives: true,
+                rewrite_clicks: None,
                 providers: AuctionConfig::legacy_provider_map(&[]),
                 bidders: Default::default(),
                 mediator: None,
