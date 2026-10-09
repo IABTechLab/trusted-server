@@ -2295,6 +2295,59 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_forwarder_preserves_configured_identify_cors_policy() {
+        let mut settings = test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.publisher.cookie_domain = ".publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(trusted_server_core::settings::TrustedForwarderConfig {
+            auth_header: "x-ts-forwarder-auth".to_owned(),
+            shared_secret: trusted_server_core::redacted::Redacted::new(
+                "fictional-forwarder-secret-0123456789".to_owned(),
+            ),
+        });
+        let state = build_state_from_settings(settings).expect("should build forwarder state");
+        let router = TrustedServerApp::routes_for_state(&state);
+        for (origin, allowed) in [
+            ("https://publisher.example.com", true),
+            ("https://other.publisher.example.com:9443", true),
+            ("https://foreign.example.com", false),
+            ("http://publisher.example.com", false),
+        ] {
+            let request = request_builder()
+                .method(Method::OPTIONS)
+                .uri("http://internal.example.com/_ts/api/v1/identify")
+                .header(header::HOST, "internal.example.com")
+                .header(header::ORIGIN, origin)
+                .header("x-forwarded-host", "shop.publisher.example.com:8443")
+                .header("x-forwarded-proto", "https")
+                .header(
+                    "x-ts-forwarder-auth",
+                    "fictional-forwarder-secret-0123456789",
+                )
+                .body(Body::empty())
+                .expect("should build forwarded identify preflight");
+            let response = route(&router, request);
+            assert_eq!(
+                response.status(),
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "should retain configured identify origin policy for {origin}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()),
+                allowed.then_some(origin),
+                "should echo only an allowed browser Origin"
+            );
+        }
+    }
+
+    #[test]
     fn dispatch_identify_options_routes_to_cors_preflight() {
         // Parity guard: OPTIONS /_ts/api/v1/identify must reach
         // cors_preflight_identify (200 for a request without an Origin

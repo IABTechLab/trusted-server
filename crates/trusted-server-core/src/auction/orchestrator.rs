@@ -321,6 +321,24 @@ fn snapshot_context_request(request: &Request<EdgeBody>) -> Request<EdgeBody> {
     *snapshot.uri_mut() = request.uri().clone();
     *snapshot.version_mut() = request.version();
     *snapshot.headers_mut() = request.headers().clone();
+    if let Some(prepared) = request
+        .extensions()
+        .get::<crate::forwarder::ForwarderPreparation>()
+    {
+        snapshot.extensions_mut().insert(prepared.clone());
+    }
+    if let Some(origin) = request
+        .extensions()
+        .get::<crate::http_util::RuntimeRequestOrigin>()
+    {
+        snapshot.extensions_mut().insert(origin.clone());
+    }
+    if let Some(ingress) = request
+        .extensions()
+        .get::<edgezero_core::request::RequestIngress>()
+    {
+        snapshot.extensions_mut().insert(ingress.clone());
+    }
     snapshot
 }
 
@@ -5096,6 +5114,161 @@ mod tests {
             assert!(result.provider_responses.iter().any(|response| {
                 response.provider == "pending" && response.status == BidStatus::Success
             }));
+        }
+    }
+
+    #[test]
+    fn runtime_origin_snapshot_preserves_https_fallback() {
+        let mut request = http::Request::builder()
+            .uri("/article")
+            .header(http::header::HOST, "client-supplied.example.com")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should construct normalized runtime request");
+        request
+            .extensions_mut()
+            .insert(crate::http_util::RuntimeRequestOrigin::new(
+                edgezero_core::request::InboundOrigin::parse(
+                    "https",
+                    "publisher.example.com:8443",
+                    edgezero_core::request::OriginSource::RuntimeUri,
+                )
+                .expect("should validate runtime origin"),
+            ));
+
+        let snapshot = super::snapshot_context_request(&request);
+        let info = crate::http_util::RequestInfo::from_request(
+            &snapshot,
+            &crate::platform::ClientInfo::default(),
+        );
+
+        assert_eq!(
+            info.scheme, "https",
+            "should preserve runtime HTTPS scheme in auction snapshot"
+        );
+        assert_eq!(
+            info.host, "publisher.example.com:8443",
+            "should preserve runtime authority in auction snapshot"
+        );
+    }
+
+    #[test]
+    fn public_origin_snapshot_preserves_accepted_and_frozen_rejected_decisions() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+            auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: crate::redacted::Redacted::new(
+                "fictional-forwarder-secret-0123456789".to_owned(),
+            ),
+        });
+        for accepted in [true, false] {
+            let mut request = http::Request::builder()
+                .uri("http://internal.example.com/article?x=1")
+                .header(http::header::HOST, "internal.example.com")
+                .header(
+                    crate::forwarder::FORWARDER_AUTH_HEADER,
+                    "fictional-forwarder-secret-0123456789",
+                )
+                .header("x-forwarded-host", "publisher.example.com:8443")
+                .header("x-forwarded-proto", "https")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should construct request");
+            if !accepted {
+                request
+                    .headers_mut()
+                    .remove(crate::forwarder::FORWARDER_AUTH_HEADER);
+            }
+            let ingress = edgezero_core::request::RequestIngress::new(
+                edgezero_core::request::CapturedTarget::Unavailable(
+                    edgezero_core::request::TargetUnavailable::NotExposed,
+                ),
+                Some(
+                    edgezero_core::request::InboundOrigin::parse(
+                        "http",
+                        "internal.example.com",
+                        edgezero_core::request::OriginSource::RuntimeUri,
+                    )
+                    .expect("should construct transport origin"),
+                ),
+                edgezero_core::request::HeaderFidelity::default(),
+                vec![],
+            )
+            .expect("should construct ingress");
+            request.extensions_mut().insert(ingress);
+            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            let mut snapshot = super::snapshot_context_request(&request);
+            assert!(
+                snapshot
+                    .extensions()
+                    .get::<crate::forwarder::ForwarderPreparation>()
+                    .is_some(),
+                "should preserve frozen forwarding decision"
+            );
+            let retained = snapshot
+                .extensions()
+                .get::<edgezero_core::request::RequestIngress>()
+                .expect("should preserve immutable ingress");
+            let original = request
+                .extensions()
+                .get::<edgezero_core::request::RequestIngress>()
+                .expect("should retain ingress on source request");
+            assert_eq!(
+                retained.origin().map(|origin| (
+                    origin.scheme(),
+                    origin.authority(),
+                    origin.source()
+                )),
+                original.origin().map(|origin| (
+                    origin.scheme(),
+                    origin.authority(),
+                    origin.source()
+                )),
+                "should preserve actual transport origin"
+            );
+            assert!(
+                matches!(
+                    retained.target(),
+                    edgezero_core::request::CapturedTarget::Unavailable(
+                        edgezero_core::request::TargetUnavailable::NotExposed
+                    )
+                ),
+                "should preserve unavailable target evidence"
+            );
+            assert_eq!(
+                retained.header_fidelity(&http::header::COOKIE),
+                original.header_fidelity(&http::header::COOKIE),
+                "should preserve cookie fidelity"
+            );
+            snapshot.headers_mut().insert(
+                crate::forwarder::FORWARDER_AUTH_HEADER,
+                http::HeaderValue::from_static("fictional-forwarder-secret-0123456789"),
+            );
+            snapshot.headers_mut().insert(
+                "x-forwarded-host",
+                http::HeaderValue::from_static("publisher.example.com:8443"),
+            );
+            snapshot
+                .headers_mut()
+                .insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
+            crate::forwarder::prepare_trusted_forwarder(&mut snapshot, &settings);
+            let info = crate::http_util::RequestInfo::from_request(
+                &snapshot,
+                &crate::platform::ClientInfo::default(),
+            );
+            assert_eq!(
+                info.host,
+                if accepted {
+                    "publisher.example.com:8443"
+                } else {
+                    "internal.example.com"
+                },
+                "should retain initial trust decision"
+            );
+            assert_eq!(
+                info.scheme,
+                if accepted { "https" } else { "http" },
+                "should retain initial public or ingress scheme"
+            );
         }
     }
 

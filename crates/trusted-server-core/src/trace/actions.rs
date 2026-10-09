@@ -6,6 +6,7 @@ use futures::StreamExt as _;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header};
 use url::Url;
 
+use crate::forwarder::{PublicOrigin, public_origin};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsCookieAction;
 
 use super::routes::TraceRoute;
@@ -91,7 +92,11 @@ fn matches_trusted_origin(request: &Request<EdgeBody>) -> bool {
     else {
         return false;
     };
-    if origin != expected
+    let public_expected =
+        public_origin(request).map_or_else(|| expected.clone(), PublicOrigin::serialized);
+    // Public origin authorizes the browser. The received URI and Host must
+    // still agree with immutable transport ingress below.
+    if origin != public_expected
         || request
             .uri()
             .scheme_str()
@@ -366,6 +371,104 @@ mod tests {
             json!({"mutation_requested":true}),
             "should claim only the requested mutation"
         );
+    }
+
+    fn forwarded_settings() -> Settings {
+        let mut value =
+            serde_json::to_value(settings(true, false)).expect("should serialize trace settings");
+        value["publisher"]["domain"] = json!("publisher.example");
+        value["trusted_forwarder"] = json!({
+            "auth_header": "x-ts-forwarder-auth",
+            "shared_secret": "fictional-forwarder-secret-0123456789",
+        });
+        Settings::from_json_value(value).expect("should parse authenticated trace settings")
+    }
+
+    fn forwarded_request(action: &str, scheme: &str, authority: &str) -> Request<EdgeBody> {
+        let mut request = request(action);
+        *request.uri_mut() = format!("{scheme}://{authority}/_ts/trace/{action}")
+            .parse()
+            .expect("should construct a transport request URI");
+        request.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_str(authority).expect("should construct transport Host"),
+        );
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://publisher.example:8443"),
+        );
+        request.headers_mut().insert(
+            "x-ts-forwarder-auth",
+            HeaderValue::from_static("fictional-forwarder-secret-0123456789"),
+        );
+        request.headers_mut().insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("publisher.example:8443"),
+        );
+        request
+            .headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        request.extensions_mut().insert(metadata(scheme, authority));
+        request
+    }
+
+    #[test]
+    fn trace_actions_accept_authenticated_public_origin_across_transports() {
+        let settings = forwarded_settings();
+        for action in ["enable", "end"] {
+            for scheme in ["http", "https"] {
+                for authority in ["publisher.example", "upstream.example.com:7676"] {
+                    let mut request = forwarded_request(action, scheme, authority);
+                    let cookies_before = inspect_cookies(
+                        request.headers(),
+                        request.extensions().get::<RequestIngress>(),
+                    );
+                    crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+                    assert_eq!(
+                        inspect_cookies(
+                            request.headers(),
+                            request.extensions().get::<RequestIngress>()
+                        ),
+                        cookies_before,
+                        "should retain transport cookie health after forwarding"
+                    );
+                    assert_mutation(respond(&settings, request), action);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trace_forwarding_keeps_transport_and_browser_controls_independent() {
+        let settings = forwarded_settings();
+        for (name, value) in [
+            ("origin", "https://other.example.com"),
+            ("origin", "null"),
+            ("host", "other.example.com"),
+            ("x-ts-forwarder-auth", "fictional-wrong-secret-0123456789"),
+            ("sec-fetch-site", "cross-site"),
+            ("x-ts-trace-action", "end"),
+        ] {
+            let mut request = forwarded_request("enable", "http", "upstream.example.com:7676");
+            request.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("should validate field name"),
+                HeaderValue::from_static(value),
+            );
+            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            private_error(respond(&settings, request), StatusCode::FORBIDDEN);
+        }
+        for target in [
+            "https://upstream.example.com:7676/_ts/trace/enable",
+            "http://other.example.com/_ts/trace/enable",
+            "http://upstream.example.com:7676/_ts/trace/enable?",
+        ] {
+            let mut request = forwarded_request("enable", "http", "upstream.example.com:7676");
+            *request.uri_mut() = target
+                .parse()
+                .expect("should construct conflicting transport target");
+            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            private_error(respond(&settings, request), StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]

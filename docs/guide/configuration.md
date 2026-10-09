@@ -55,6 +55,7 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
+- `trusted_forwarder.shared_secret`, when public-origin forwarding is configured
 - `ec.passphrase`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
@@ -69,10 +70,8 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
-Two accepted secret-shaped fields are deliberately different:
+One accepted secret-shaped field is deliberately different:
 
-- `trusted_client_ip.shared_secret` is an inline value in the app-config blob;
-  it is redacted by debug formatting but is not resolved from a secret store.
 - `tinybird.access_token_secret` is deprecated input. It is accepted for
   migration, then discarded and omitted from serialized config; use
   `tinybird.auction_token_secret` as the store key name instead.
@@ -210,6 +209,7 @@ fail and the service will return its startup-error response.
 | `[rewrite]`                | First-party URL rewrite exclusions                                      |
 | `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
 | `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[trusted_forwarder]`      | Authenticated browser-facing host and scheme forwarding                 |
 | `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
 ## Example: Production Setup
@@ -488,6 +488,48 @@ Fastly service running Trusted Server. It lets Trusted Server use the reader's
 address instead of the immediate fronting edge node's address. Only the Fastly
 adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
 it but keep using their own runtime client address.
+
+### `[trusted_forwarder]`
+
+Trusted Server can accept the browser-facing authority and scheme from an
+explicitly authenticated forwarder. This is useful for `ts dev proxy` when the
+upstream leg uses plain HTTP or sends a different Host. Leave the section absent
+for direct traffic. Unauthenticated forwarding headers never establish a public
+origin.
+
+```toml
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+shared_secret = "trusted_forwarder_shared_secret"
+```
+
+Both fields are required. `shared_secret` names a key in the logical
+`trusted_server_secrets` store; the stored value must contain at least 32 ASCII
+graphic bytes. The credential is redacted in diagnostics and compared in
+constant time. Configure the same actual value in the development proxy's
+`--forwarder-secret-file`; use `auth_header = "x-ts-forwarder-auth"` with that CLI.
+
+The forwarder must replace client-supplied `X-Forwarded-Host` and
+`X-Forwarded-Proto` with the actual browser-facing authority and HTTP/HTTPS
+scheme. The authority includes a non-default browser port. Exactly one field of
+each kind and one matching authentication field are required. Lists, ambiguous
+or malformed values, and hosts outside `publisher.domain` or its subdomains
+cannot establish trust. Missing or invalid authentication falls back to the
+runtime transport origin. Hostname case and default ports canonicalize for
+comparison.
+
+The validated public origin supplies URL rewriting and trace Origin checks.
+The actual ingress URI, Host, TLS metadata, target provenance and cookie-header
+fidelity remain transport facts. Trace actions still require an exact browser
+Origin, same-origin Fetch Metadata, the action control, no query and an empty
+body; forwarding does not expand identify CORS or relax cookie policy.
+
+Forwarding credentials and raw forwarding fields are removed before routing,
+including trace preflight returns. Authentication names cannot overlap
+forwarding sources, internal controls or configured trusted-client-IP fields.
+Omitted configuration stays omitted from serialized blobs. Deploy a compatible
+server before enabling this section, and remove it before rolling back to an
+older server.
 
 ### `[trusted_client_ip]`
 

@@ -182,18 +182,21 @@ reload captures evidence, and End followed by another state request observes
 inactivity. Local plain-HTTP runtime tests do not establish this HTTPS behavior.
 
 Enable and End require the browser's canonical Origin to agree with the
-runtime-provided origin and request authority. A TLS-terminating proxy that
-forwards HTTPS traffic as HTTP, or replaces the public authority with an internal
-host, can therefore cause an intentional `403`, including on Spin and Axum.
-Use a deployment that preserves the public origin in the runtime's trusted
-request metadata and verify both actions through the actual proxy. Untrusted
-`Forwarded` or `X-Forwarded-*` headers cannot repair that mismatch.
+effective public origin. By default that origin comes from the runtime's
+trusted transport metadata. A TLS-terminating proxy that forwards HTTPS as
+HTTP, or replaces the public authority with an internal host, can therefore
+cause an intentional `403`, including on Spin and Axum.
 
-The current Axum entry point supplies trusted origin metadata only for its
-plain-HTTP listener. TLS offload does not supply a trusted HTTPS origin, so an
-HTTPS browser session cannot pass Enable/End through that arrangement. Axum
-HTTPS support needs a suitable trusted transport binding before it can meet
-the deployed HTTPS acceptance gate.
+For that arrangement, explicitly configure an
+[authenticated forwarder](../configuration.md#trusted-forwarder) and provision
+its shared secret in the secret store. The proxy must supply one authenticated
+`X-Forwarded-Host` and `X-Forwarded-Proto` pair bounded to the configured publisher
+domain or a subdomain. This supports an HTTPS browser using Axum's plain-HTTP
+listener without changing the received transport evidence. The request URI and
+Host must still agree with that evidence; forwarding cannot upgrade cookie or
+header fidelity. Unauthenticated `Forwarded` or `X-Forwarded-*` fields do not
+grant trust. Verify Enable, state and End through the actual proxy with the
+unchanged Secure cookie attributes before accepting the deployment.
 
 Publisher activation and context use injected inline scripts without an attached
 CSP nonce. A publisher nonce/hash policy that does not authorize those scripts

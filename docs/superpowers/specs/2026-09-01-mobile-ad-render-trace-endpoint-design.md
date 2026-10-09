@@ -513,7 +513,11 @@ unavailable. Recovery is not a v1 prerequisite. `RequestIngress.target()` is
 optional capability evidence, never a second route/auth interpretation; a
 missing snapshot or whole-target capture cap does not invalidate an inspectable
 pathname. Trusted canonical origin for actions still comes from the adapter's
-validated `RequestIngress.origin()`, never from forwarded-header fallbacks.
+validated `RequestIngress.origin()`, unless an explicitly configured authenticated
+forwarder supplies a validated publisher-bounded public origin. Raw forwarding
+headers never grant origin trust. Keep `RequestIngress` unchanged: received URI
+and Host still validate against transport origin, and forwarding cannot upgrade
+target provenance or header fidelity.
 
 Add an explicit default-off option to the existing integration:
 
@@ -606,7 +610,10 @@ Rules (route responses below apply after configured authentication):
   mutation. This deliberately targets current supported mobile browsers rather
   than weakening the check for legacy clients.
 - The canonical request origin comes from adapter-owned inbound URL/scheme and
-  validated authority data, never an arbitrary forwarded header. Both it and
+  validated authority data, or the separate public-origin decision from an
+  explicitly authenticated forwarder. Resolve that decision before trace
+  pre-dispatch and remove the credential before any early return. Never trust
+  arbitrary forwarded headers. Both the public origin and
   the single parsed `Origin` header are serialized with lowercase host and
   default ports removed before exact comparison. Invalid or multi-valued host,
   authority, scheme, or origin input fails closed.

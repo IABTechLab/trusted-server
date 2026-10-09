@@ -3121,6 +3121,24 @@ fn request_head_snapshot(req: &Request<EdgeBody>) -> Request<EdgeBody> {
     *snapshot.uri_mut() = req.uri().clone();
     *snapshot.version_mut() = req.version();
     *snapshot.headers_mut() = req.headers().clone();
+    if let Some(prepared) = req
+        .extensions()
+        .get::<crate::forwarder::ForwarderPreparation>()
+    {
+        snapshot.extensions_mut().insert(prepared.clone());
+    }
+    if let Some(origin) = req
+        .extensions()
+        .get::<crate::http_util::RuntimeRequestOrigin>()
+    {
+        snapshot.extensions_mut().insert(origin.clone());
+    }
+    if let Some(ingress) = req
+        .extensions()
+        .get::<edgezero_core::request::RequestIngress>()
+    {
+        snapshot.extensions_mut().insert(ingress.clone());
+    }
     snapshot
 }
 
@@ -7630,6 +7648,158 @@ mod tests {
     }
 
     #[test]
+    fn runtime_origin_snapshot_preserves_https_fallback() {
+        let mut request = Request::builder()
+            .uri("/article")
+            .header(header::HOST, "client-supplied.example.com")
+            .body(EdgeBody::empty())
+            .expect("should construct normalized runtime request");
+        request
+            .extensions_mut()
+            .insert(crate::http_util::RuntimeRequestOrigin::new(
+                edgezero_core::request::InboundOrigin::parse(
+                    "https",
+                    "publisher.example.com:8443",
+                    edgezero_core::request::OriginSource::RuntimeUri,
+                )
+                .expect("should validate runtime origin"),
+            ));
+
+        let snapshot = request_head_snapshot(&request);
+        let info = RequestInfo::from_request(&snapshot, &crate::platform::ClientInfo::default());
+
+        assert_eq!(
+            info.scheme, "https",
+            "should preserve runtime HTTPS scheme in publisher snapshot"
+        );
+        assert_eq!(
+            info.host, "publisher.example.com:8443",
+            "should preserve runtime authority in publisher snapshot"
+        );
+    }
+
+    #[test]
+    fn public_origin_snapshot_preserves_accepted_and_frozen_rejected_decisions() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+            auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: crate::redacted::Redacted::new(
+                "fictional-forwarder-secret-0123456789".to_owned(),
+            ),
+        });
+        for accepted in [true, false] {
+            let mut request = http::Request::builder()
+                .uri("http://internal.example.com/article?x=1")
+                .header(header::HOST, "internal.example.com")
+                .header(
+                    crate::forwarder::FORWARDER_AUTH_HEADER,
+                    "fictional-forwarder-secret-0123456789",
+                )
+                .header("x-forwarded-host", "publisher.example.com:8443")
+                .header("x-forwarded-proto", "https")
+                .body(EdgeBody::empty())
+                .expect("should construct request");
+            if !accepted {
+                request
+                    .headers_mut()
+                    .remove(crate::forwarder::FORWARDER_AUTH_HEADER);
+            }
+            let ingress = edgezero_core::request::RequestIngress::new(
+                edgezero_core::request::CapturedTarget::Unavailable(
+                    edgezero_core::request::TargetUnavailable::NotExposed,
+                ),
+                Some(
+                    edgezero_core::request::InboundOrigin::parse(
+                        "http",
+                        "internal.example.com",
+                        edgezero_core::request::OriginSource::RuntimeUri,
+                    )
+                    .expect("should construct transport origin"),
+                ),
+                edgezero_core::request::HeaderFidelity::default(),
+                vec![],
+            )
+            .expect("should construct ingress");
+            request.extensions_mut().insert(ingress);
+            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+            let mut snapshot = request_head_snapshot(&request);
+            assert!(
+                snapshot
+                    .extensions()
+                    .get::<crate::forwarder::ForwarderPreparation>()
+                    .is_some(),
+                "should preserve frozen forwarding decision"
+            );
+            let retained = snapshot
+                .extensions()
+                .get::<edgezero_core::request::RequestIngress>()
+                .expect("should preserve immutable ingress");
+            let original = request
+                .extensions()
+                .get::<edgezero_core::request::RequestIngress>()
+                .expect("should retain ingress on source request");
+            assert_eq!(
+                retained.origin().map(|origin| (
+                    origin.scheme(),
+                    origin.authority(),
+                    origin.source()
+                )),
+                original.origin().map(|origin| (
+                    origin.scheme(),
+                    origin.authority(),
+                    origin.source()
+                )),
+                "should preserve actual transport origin"
+            );
+            assert!(
+                matches!(
+                    retained.target(),
+                    edgezero_core::request::CapturedTarget::Unavailable(
+                        edgezero_core::request::TargetUnavailable::NotExposed
+                    )
+                ),
+                "should preserve unavailable target evidence"
+            );
+            assert_eq!(
+                retained.header_fidelity(&http::header::COOKIE),
+                original.header_fidelity(&http::header::COOKIE),
+                "should preserve cookie fidelity"
+            );
+            snapshot.headers_mut().insert(
+                crate::forwarder::FORWARDER_AUTH_HEADER,
+                http::HeaderValue::from_static("fictional-forwarder-secret-0123456789"),
+            );
+            snapshot.headers_mut().insert(
+                "x-forwarded-host",
+                http::HeaderValue::from_static("publisher.example.com:8443"),
+            );
+            snapshot
+                .headers_mut()
+                .insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
+            crate::forwarder::prepare_trusted_forwarder(&mut snapshot, &settings);
+            let info = crate::http_util::RequestInfo::from_request(
+                &snapshot,
+                &crate::platform::ClientInfo::default(),
+            );
+            assert_eq!(
+                info.host,
+                if accepted {
+                    "publisher.example.com:8443"
+                } else {
+                    "internal.example.com"
+                },
+                "should retain initial trust decision"
+            );
+            assert_eq!(
+                info.scheme,
+                if accepted { "https" } else { "http" },
+                "should retain initial public or ingress scheme"
+            );
+        }
+    }
+
+    #[test]
     fn template_eligibility_implies_origin_shareability() {
         for bits in 0u16..256 {
             let inputs = SharedRequestInputs {
@@ -10820,6 +10990,10 @@ mod tests {
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend, StubHttpClient,
         };
         use crate::test_support::tests::crate_test_settings_str;
+        use edgezero_core::request::{
+            CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+            TargetUnavailable,
+        };
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -11790,9 +11964,17 @@ mod tests {
                 let settings = Arc::new(settings_with_readthrough_enabled("inline"));
                 queue_shareable_html(&stub);
                 let mut request = navigation_request();
-                request
-                    .headers_mut()
-                    .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+                let ingress = RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    Some(
+                        InboundOrigin::parse("https", "ts.example.com", OriginSource::RuntimeUri)
+                            .expect("should capture the reader transport origin"),
+                    ),
+                    HeaderFidelity::default(),
+                    vec![],
+                )
+                .expect("should construct the reader ingress");
+                request.extensions_mut().insert(ingress);
                 *request.uri_mut() = "https://ts.example.com/article?b=2&a=1"
                     .parse()
                     .expect("should parse reader URI");
@@ -12076,6 +12258,109 @@ mod tests {
                         .origin_cache_shareable,
                     Some(0),
                     "should exclude non-document requests from the gate's potential reach"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn public_origin_publisher_rewrites_html_and_partitions_template_cache() {
+            let mut settings = settings_with_mode("esi");
+            settings.publisher.domain = "publisher.example.com".to_owned();
+            settings.publisher.origin_url = "http://origin.example.com".to_owned();
+            settings.publisher.origin_host_header_override = Some("backend.example.com".to_owned());
+            settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+                auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+                shared_secret: crate::redacted::Redacted::new(
+                    "fictional-forwarder-secret-0123456789".to_owned(),
+                ),
+            });
+            let settings = Arc::new(settings);
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for _ in 0..2 {
+                stub.push_response_with_headers(200,
+                    b"<html><head></head><body><a href=\"http://origin.example.com/next\">next</a></body></html>".to_vec(),
+                    vec![("content-type", "text/html; charset=utf-8"), ("cache-control", "public, max-age=300")]);
+            }
+            for (authority, expected_fetches) in [
+                ("publisher.example.com:8443", 1),
+                ("publisher.example.com:8443", 1),
+                ("publisher.example.com:9443", 2),
+            ] {
+                let mut request = navigation_request();
+                *request.uri_mut() = "http://internal.example.com/article"
+                    .parse()
+                    .expect("should parse transport URI");
+                request.headers_mut().insert(
+                    header::HOST,
+                    HeaderValue::from_static("internal.example.com"),
+                );
+                request.headers_mut().insert(
+                    crate::forwarder::FORWARDER_AUTH_HEADER,
+                    HeaderValue::from_static("fictional-forwarder-secret-0123456789"),
+                );
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-host", HeaderValue::from_static(authority));
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+                crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+                let response = run(&settings, &services, request).await;
+                let body = String::from_utf8(body_of(response).await).expect("should decode HTML");
+                assert!(
+                    body.contains(&format!("https://{authority}/next")),
+                    "should rewrite publisher links to public origin: {body}"
+                );
+                assert!(
+                    !body.contains("internal.example.com"),
+                    "should not expose transport authority in HTML"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    expected_fetches,
+                    "should hit cache only for the same public authority"
+                );
+            }
+            for key in cache
+                .lookups
+                .lock()
+                .expect("should lock cache lookups")
+                .iter()
+            {
+                assert_eq!(
+                    key.request_scheme, "https",
+                    "should partition templates by public scheme"
+                );
+                assert!(
+                    matches!(
+                        key.request_host.as_str(),
+                        "publisher.example.com:8443" | "publisher.example.com:9443"
+                    ),
+                    "should partition templates by public authority"
+                );
+            }
+            for uri in stub.recorded_request_uris() {
+                assert_eq!(
+                    uri, "http://origin.example.com/article",
+                    "should connect only to configured publisher origin"
+                );
+            }
+            for fields in stub.recorded_request_headers() {
+                assert!(
+                    fields
+                        .iter()
+                        .any(|(name, value)| name.eq_ignore_ascii_case("host")
+                            && value == "backend.example.com"),
+                    "should retain configured backend Host"
+                );
+                assert!(
+                    !fields.iter().any(|(name, _)| matches!(
+                        name.as_str(),
+                        "x-ts-forwarder-auth" | "x-forwarded-host" | "x-forwarded-proto"
+                    )),
+                    "should not forward public-origin inputs"
                 );
             }
         }
@@ -25383,6 +25668,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
         struct AuctionIdTestProvider {
             captured_request: Arc<Mutex<Option<AuctionRequest>>>,
             winning_bid: bool,
+            creative: Option<String>,
         }
 
         #[async_trait::async_trait(?Send)]
@@ -25429,7 +25715,7 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
                         slot_id: "atf".to_string(),
                         price: Some(1.50),
                         currency: "USD".to_string(),
-                        creative: None,
+                        creative: self.creative.clone(),
                         adomain: None,
                         bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
                         returned_seat: None,
@@ -25874,8 +26160,112 @@ for (const mode of ['ready', 'queued', 'stale', 'inactive', 'throws']) {
             orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
                 captured_request,
                 winning_bid,
+                creative: None,
             }));
             orchestrator
+        }
+
+        #[tokio::test]
+        async fn public_origin_spa_creatives_use_public_port_and_preserve_publisher_identity() {
+            let mut settings = settings_with_co();
+            settings.publisher.domain = "publisher.example.com".to_owned();
+            settings.proxy.allowed_domains = vec!["*.example.com".to_owned()];
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
+            settings.auction.rewrite_creatives = true;
+            settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+                auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+                shared_secret: crate::redacted::Redacted::new(
+                    "fictional-forwarder-secret-0123456789".to_owned(),
+                ),
+            });
+            for endpoint in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
+                let captured = Arc::new(Mutex::new(None));
+                let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
+                    captured_request: Arc::clone(&captured), winning_bid: true,
+                    creative: Some("<a href=\"https://ads.example.com/click\"><img src=\"https://ads.example.com/banner.png\"></a>".to_owned()),
+                }));
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, b"winner".to_vec());
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let mut request = Request::builder()
+                    .uri(format!(
+                        "http://internal.example.com{endpoint}?path=/2024/article"
+                    ))
+                    .header(header::HOST, "internal.example.com")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(
+                        crate::forwarder::FORWARDER_AUTH_HEADER,
+                        "fictional-forwarder-secret-0123456789",
+                    )
+                    .header("x-forwarded-host", "reader.publisher.example.com:8443")
+                    .header("x-forwarded-proto", "https")
+                    .body(EdgeBody::empty())
+                    .expect("should construct SPA request");
+                crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+                let mut ec_context = EcContext::new_for_test(
+                    None,
+                    crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                        ..Default::default()
+                    },
+                );
+                let response = handle_page_bids(
+                    &settings,
+                    &services,
+                    None,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &article_slot(),
+                        registry: None,
+                    },
+                    &mut ec_context,
+                    request,
+                )
+                .await
+                .expect("should serve SPA bids");
+                let json: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should read SPA bids"),
+                )
+                .expect("should decode SPA bids JSON");
+                let creative = json["bids"]["atf"]["adm"]
+                    .as_str()
+                    .expect("should return rewritten winning creative");
+                assert!(
+                    creative
+                        .contains("https://reader.publisher.example.com:8443/first-party/proxy?"),
+                    "should proxy assets through authenticated public authority: {creative}"
+                );
+                assert!(
+                    creative
+                        .contains("https://reader.publisher.example.com:8443/first-party/click?"),
+                    "should proxy clicks through authenticated public authority: {creative}"
+                );
+                assert!(
+                    !creative.contains("internal.example.com"),
+                    "should not leak transport authority into SPA creative"
+                );
+                let auction = captured
+                    .lock()
+                    .expect("should lock captured request")
+                    .clone()
+                    .expect("should dispatch SPA auction");
+                assert_eq!(
+                    auction.publisher.domain, "publisher.example.com",
+                    "should retain configured publisher identity"
+                );
+                assert_eq!(
+                    auction.publisher.page_url.as_deref(),
+                    Some("https://publisher.example.com/2024/article"),
+                    "should use public scheme with configured publisher page identity"
+                );
+            }
         }
 
         #[tokio::test]

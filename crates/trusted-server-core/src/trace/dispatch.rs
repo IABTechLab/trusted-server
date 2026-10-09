@@ -13,6 +13,7 @@ use super::actions::action_response;
 use super::routes::{TraceRoute, state_response};
 use super::shell::render_setup_shell;
 use super::{TraceCookies, TracePreflight, inspect_cookies, preflight, project_request_context};
+use crate::forwarder::prepare_trusted_forwarder;
 use crate::integrations::gpt_diagnostics::{
     GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig, GptDiagnosticsRequestDecision,
 };
@@ -104,6 +105,7 @@ impl PreDispatchHook for TracePreDispatchHook {
         &self,
         request: &mut Request<Body>,
     ) -> Result<Option<Response<Body>>, EdgeError> {
+        prepare_trusted_forwarder(request, &self.settings);
         let dispatch = match preflight(&self.settings, request) {
             TracePreflight::NotTrace => {
                 let enabled = self
@@ -208,6 +210,33 @@ mod tests {
                 }
             }),
         )
+    }
+
+    #[test]
+    fn forwarding_credentials_are_removed_before_every_preflight_outcome() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = hook(false, calls);
+        for path in [
+            "/_ts/trace/enable",
+            "/_ts/trace/trace.js",
+            "/publisher",
+            "/_ts/trace/missing",
+        ] {
+            let mut request = Request::builder()
+                .uri(path)
+                .header(
+                    "x-ts-forwarder-auth",
+                    "fictional-forwarder-secret-0123456789",
+                )
+                .body(Body::empty())
+                .expect("should construct a preflight request");
+            let _response =
+                block_on(hook.handle(&mut request)).expect("should complete local preflight");
+            assert!(
+                !request.headers().contains_key("x-ts-forwarder-auth"),
+                "should sanitize credentials before any preflight return"
+            );
+        }
     }
 
     #[test]

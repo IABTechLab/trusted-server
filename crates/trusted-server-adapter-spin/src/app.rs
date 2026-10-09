@@ -10,6 +10,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::request::{InboundOrigin, OriginSource};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -26,7 +27,7 @@ use trusted_server_core::ec::admin::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::http_util::sanitize_forwarded_headers;
+use trusted_server_core::http_util::{RuntimeRequestOrigin, sanitize_forwarded_headers};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, RuntimeServices};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -283,8 +284,8 @@ fn parse_client_addr(raw: &str) -> Option<IpAddr> {
 // A client can spoof `Forwarded`/`X-Forwarded-*` to hijack the host and scheme
 // that publisher HTML rewriting, integration URL rewriting, and request-signing
 // context consume. Stripping them first (mirroring the Fastly/Axum edge
-// sanitization) means the value `detect_request_scheme`/`extract_request_host`
-// read originates from the trusted runtime URL rather than the client.
+// sanitization) means the typed origin used by `RequestInfo` originates from
+// the trusted runtime URL rather than the client.
 //
 // Spin builds the core request URI from `IncomingRequest::path_with_query()`, so
 // it is path-only (e.g. "/first-party/proxy?..."). The shared first-party
@@ -356,6 +357,11 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     else {
         return;
     };
+    let Ok(origin) = InboundOrigin::parse(&scheme, &host, OriginSource::RuntimeUri) else {
+        return;
+    };
+    req.extensions_mut()
+        .insert(RuntimeRequestOrigin::new(origin));
 
     // Always set Host from the trusted spin-full-url rather than preserving any
     // incoming value. Spin's WASI HTTP bridge does not normally surface the
@@ -368,12 +374,6 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // Overriding from the single trusted authority keeps both consistent.
     if let Ok(hval) = HeaderValue::from_str(&host) {
         req.headers_mut().insert(header::HOST, hval);
-    }
-
-    // Without a trusted scheme signal, detect_request_scheme defaults to http and
-    // rewrites HTTPS URLs as http.
-    if let Ok(pval) = HeaderValue::from_str(&scheme) {
-        req.headers_mut().insert("x-forwarded-proto", pval);
     }
 
     // Promote the path-only URI to an absolute one so the shared first-party
@@ -1153,6 +1153,132 @@ mod tests {
     }
 
     #[test]
+    fn normalize_spin_request_rejects_invalid_last_runtime_origin() {
+        for value in [
+            "ftp://publisher.example.com/article",
+            "https://publisher.example.com:invalid/article",
+        ] {
+            let mut req = request_with(&[
+                (
+                    "spin-full-url",
+                    "https://client-supplied.example.com/article",
+                ),
+                ("spin-full-url", value),
+            ]);
+
+            normalize_spin_request(&mut req);
+
+            assert!(
+                req.extensions().get::<RuntimeRequestOrigin>().is_none(),
+                "should not recover origin from a client field when trusted last URL is invalid"
+            );
+            assert_eq!(
+                req.uri().to_string(),
+                "/",
+                "should retain original path when runtime origin is invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn normalized_runtime_origin_does_not_authorize_trace_without_ingress() {
+        let mut settings = multi_provider_settings();
+        settings.auction.enabled = false;
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &std::collections::BTreeMap::from([
+                    ("enabled", true),
+                    ("trace_page_enabled", true),
+                ]),
+            )
+            .expect("should enable trace actions");
+        let router =
+            TrustedServerApp::routes_with_settings(settings).expect("should build trace router");
+        let mut req = request_with(&[
+            (
+                "spin-full-url",
+                "https://publisher.example.com:8443/_ts/trace/enable",
+            ),
+            ("origin", "https://publisher.example.com:8443"),
+            ("sec-fetch-site", "same-origin"),
+            ("x-ts-trace-action", "enable"),
+        ]);
+        *req.method_mut() = Method::POST;
+        *req.uri_mut() = "/_ts/trace/enable".parse().expect("should set action path");
+        normalize_spin_request(&mut req);
+
+        let response = RouterService::oneshot(&router, req)
+            .await
+            .expect("should reject unbound trace action");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should require immutable ingress even with typed runtime origin"
+        );
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should not mutate trace cookies without ingress origin"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_preserves_https_request_info_without_ingress_origin() {
+        let mut req = request_with(&[
+            (
+                "spin-full-url",
+                "https://publisher.example.com:8443/article",
+            ),
+            ("host", "client-supplied.example.com"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        req.extensions_mut().insert(
+            edgezero_core::request::RequestIngress::new(
+                edgezero_core::request::CapturedTarget::Unavailable(
+                    edgezero_core::request::TargetUnavailable::NotExposed,
+                ),
+                None,
+                edgezero_core::request::HeaderFidelity::default(),
+                Vec::new(),
+            )
+            .expect("should freeze path-only runtime ingress"),
+        );
+
+        normalize_spin_request(&mut req);
+        trusted_server_core::forwarder::prepare_trusted_forwarder(
+            &mut req,
+            &multi_provider_settings(),
+        );
+
+        let info = trusted_server_core::http_util::RequestInfo::from_request(
+            &req,
+            &trusted_server_core::platform::ClientInfo::default(),
+        );
+        assert_eq!(
+            info.scheme, "https",
+            "should retain trusted Spin HTTPS scheme after forwarding sanitation"
+        );
+        assert_eq!(
+            info.host, "publisher.example.com:8443",
+            "should retain trusted runtime authority and port"
+        );
+        assert!(
+            req.extensions()
+                .get::<edgezero_core::request::RequestIngress>()
+                .expect("should retain original ingress")
+                .origin()
+                .is_none(),
+            "should not grant immutable ingress origin from normalized URL"
+        );
+        assert!(
+            !req.headers().contains_key("x-forwarded-proto"),
+            "should not require a synthetic forwarding header"
+        );
+    }
+
+    #[test]
     fn normalize_spin_request_strips_spoofed_headers_and_uses_runtime_url() {
         // Client sends an HTTPS spin-full-url but tries to spoof a downgraded
         // http scheme and an attacker-controlled host via forwarded headers.
@@ -1192,13 +1318,9 @@ mod tests {
             Some("www.publisher.example"),
             "should set trusted Host from spin-full-url"
         );
-        // The only surviving x-forwarded-proto is the trusted scheme we injected.
-        assert_eq!(
-            req.headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok()),
-            Some("https"),
-            "should override spoofed scheme with the trusted https scheme"
+        assert!(
+            !req.headers().contains_key("x-forwarded-proto"),
+            "should use typed runtime origin instead of a forwarding header"
         );
         // The path-only request URI is promoted to an absolute URI using the
         // trusted scheme+host so the first-party proxy/click/sign handlers can
@@ -1235,11 +1357,12 @@ mod tests {
             "should rebuild the absolute URI with the same trusted authority"
         );
         assert_eq!(
-            req.headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok()),
-            Some("https"),
-            "should still inject the trusted scheme"
+            trusted_server_core::http_util::RequestInfo::from_request(
+                &req,
+                &ClientInfo::default(),
+            ).scheme,
+            "https",
+            "should retain trusted runtime scheme"
         );
     }
 

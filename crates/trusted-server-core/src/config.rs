@@ -179,6 +179,13 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 false,
             ),
             field(
+                vec![
+                    optional_object("trusted_forwarder"),
+                    object("shared_secret"),
+                ],
+                false,
+            ),
+            field(
                 vec![optional_object("tinybird"), object("auction_token_secret")],
                 true,
             ),
@@ -442,6 +449,13 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         validate_secret_key_reference(
             "trusted_client_ip.shared_secret",
             trusted_client_ip.shared_secret.expose(),
+        )?;
+    }
+
+    if let Some(trusted_forwarder) = &settings.trusted_forwarder {
+        validate_secret_key_reference(
+            "trusted_forwarder.shared_secret",
+            trusted_forwarder.shared_secret.expose(),
         )?;
     }
 
@@ -853,6 +867,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
+                ("trusted_forwarder.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 (
                     "integrations.datadome.server_side_key_secret_name".to_owned(),
@@ -1074,6 +1089,67 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the empty secret reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_accepts_short_secret_key_reference() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": "forwarder_key"});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize secret key references");
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the key name rather than a resolved value");
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_reserved_auth_header_with_short_secret_reference() {
+        for auth_header in ["X-Forwarded-Host", "X-TS-DataDome-Bypass"] {
+            let mut value =
+                serde_json::to_value(valid_settings()).expect("should serialize test settings");
+            value["trusted_forwarder"] =
+                serde_json::json!({"auth_header": auth_header, "shared_secret": "forwarder_key"});
+            let settings =
+                serde_json::from_value(value).expect("should deserialize secret key references");
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should validate headers even with unresolved short secret references");
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_forwarder_auth_header"),
+                "should reject the reserved authentication header"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_client_ip_collision_with_short_secret_references() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "X-TS-Client-IP-Auth", "shared_secret": "forwarder_key"});
+        value["trusted_client_ip"] = serde_json::json!({"ip_header": "x-ts-client-ip", "auth_header": "x-ts-client-ip-auth", "shared_secret": "client_ip_key"});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize secret key references");
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should validate collisions even with unresolved short secret references");
+        assert!(
+            format!("{error:?}").contains("colliding_trusted_forwarder_client_ip_header"),
+            "should reject colliding authentication headers"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_empty_secret_key_reference() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] =
+            serde_json::json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": " "});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize secret key references");
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject an empty forwarder key reference");
+        assert!(
+            format!("{error:?}").contains("trusted_forwarder.shared_secret"),
+            "should name the invalid key reference field"
         );
     }
 

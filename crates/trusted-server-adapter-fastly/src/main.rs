@@ -426,6 +426,12 @@ fn edgezero_main(
         .as_deref()
         .and_then(|settings| settings.trusted_client_ip.as_ref());
 
+    // Preserve the public origin before native sanitation removes its source
+    // fields. The frozen decision carries no authentication material.
+    let forwarder = settings_snapshot
+        .as_deref()
+        .map(|settings| compat::capture_fastly_forwarder(&mut req, settings));
+
     // Resolve the trusted client IP, then strip client-spoofable forwarded
     // headers before dispatch. One call keeps resolution ahead of the
     // sanitization that removes the headers it reads.
@@ -475,6 +481,9 @@ fn edgezero_main(
     // as multiple Set-Cookie headers.
     let mut response = match into_core_request_with_ingress(req, ingress) {
         Ok(mut core_req) => {
+            if let Some(forwarder) = forwarder {
+                core_req.extensions_mut().insert(forwarder);
+            }
             core_req.extensions_mut().insert(config_store);
             if let Some(device_signals) = device_signals {
                 core_req.extensions_mut().insert(device_signals);
