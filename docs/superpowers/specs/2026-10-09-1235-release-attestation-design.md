@@ -30,7 +30,7 @@ This design establishes a canonical release artifact per version, target, and ap
 6. Provide exact online and offline verification procedures with a constrained signer, source ref, and source revision.
 7. Make immutable build facts available to future #161 work, while keeping the final binary digest external.
 8. Keep artifact identity, publisher identity, configuration identity, deployment observations, and runtime evidence distinct.
-9. Preserve existing logical-store mapping, staged configuration isolation, health checks, and rollback behavior.
+9. Preserve existing logical-store mapping and staged configuration isolation, with exact deployment outcomes usable by the separate health-check and rollback lifecycle commands.
 
 ## Non-goals
 
@@ -99,6 +99,10 @@ A publisher can run altered code that reports an official artifact digest and si
 
 Consumers continue to trust the reviewed source, the chosen build workflow, GitHub's identity assertions, and the applicable Sigstore trust roots. Provenance does not establish absence of vulnerabilities or correctness of an SBOM. Release integrity does not prevent an authorized future release from containing different software.
 
+The release evidence uses established supply-chain standards: SLSA build provenance through GitHub/Sigstore and SPDX 2.3 for the SBOM. The release index, build-composition adapter, CLI policy, and local deployment receipt are project-specific contracts. Their use does not establish certification or a standardized publisher-attestation protocol. SLSA Build Level 2 is an implementation target to validate against the platform and producer requirements, not a rating achieved by this document.
+
+The separation of evidence, authority, verification policy, and a consumer's authorization decision is also consistent with the IETF RATS architecture. RATS is an architectural reference for future runtime work; this design implements neither a RATS protocol nor hardware-backed remote attestation.
+
 ```mermaid
 flowchart LR
     source[Reviewed tag and locked inputs] --> build[Release build]
@@ -156,7 +160,9 @@ Every release records the following input classes in build evidence. New inputs 
 
 The CLI currently embeds `CARGO_MANIFEST_DIR` as a resource-discovery fallback, and debug metadata can contain paths. These are recorded build inputs. This first release makes no byte-identical-rebuild claim. Removing path-dependent data, normalizing debug information, stabilizing native SDK inputs, and testing independent rebuilds belong to later reproducibility work.
 
-The release environment removes operator `TRUSTED_SERVER__*` and `EDGEZERO__*` values, `TSJS_SKIP_BUILD`, unapproved `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`, npm configuration overrides, and Vite environment overrides. Vite release execution explicitly disables environment-file loading and uses the approved production mode. Release scripts validate permitted native compiler settings rather than inheriting operator values. Platform authentication is unavailable to build jobs.
+Release preflight rejects any presence of `TSJS_SKIP_BUILD` before environment sanitization; silently removing it would hide a prohibited release request. The build script independently enforces the same rule. Reject other prohibited operator build inputs, then construct the permitted build environment rather than inheriting arbitrary compiler/tool overrides. Remove operator `TRUSTED_SERVER__*` and `EDGEZERO__*` values from the actual build environment.
+
+The recipe sets or rejects compiler/tool overrides including `RUSTC`, `RUSTDOC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, target-specific Cargo rustflags/linkers, Cargo profile overrides, `NODE_OPTIONS`, and npm/Vite configuration overrides. The only compiler wrapper is the reviewed composition recorder. Control Cargo home/configuration layers and prohibit unreviewed command-line configuration overrides; record the approved settings. Vite release execution explicitly disables environment-file loading and uses the approved production mode. Release scripts validate permitted native compiler settings rather than inheriting operator values. Platform authentication is unavailable to build jobs. This is a controlled release recipe, not a claim of a fully hermetic build.
 
 No wall-clock build timestamp, workflow run ID, publisher identity, or final artifact checksum is embedded. Operational timestamps and run identifiers remain external evidence. `SOURCE_DATE_EPOCH`, if used by a component, is derived from the source commit and recorded.
 
@@ -169,7 +175,7 @@ No wall-clock build timestamp, workflow run ID, publisher identity, or final art
 | `ts-aarch64-apple-darwin`     | `trusted-server-cli`, `aarch64-apple-darwin`     | `macos-15`       | macOS 15 ARM64; explicit deployment target 15.0                                  |
 | `ts-x86_64-apple-darwin`      | `trusted-server-cli`, `x86_64-apple-darwin`      | `macos-15-intel` | macOS 15 Intel; explicit deployment target 15.0                                  |
 
-Runner labels fix an OS generation, not an immutable VM image. Capture the actual image/toolchain versions and perform executable startup checks on each selected runner. Changes to compatibility require a reviewed recipe change. Linux portability to older glibc, ARM Linux, and older macOS is not implied.
+Runner labels fix an OS generation, not an immutable VM image. Capture the actual image/toolchain versions and perform executable startup checks on each selected runner. Inspect native linkage and loader paths on Linux/macOS. Validate the Linux CLI's version/help/config-init commands outside a checkout in a clean Ubuntu 24.04 runtime with only its documented runtime dependencies installed; a provisioned build runner alone does not establish that compatibility. Reject dependencies on absolute runner-only paths or undeclared libraries. Changes to compatibility require a reviewed recipe change. Linux portability to older glibc, ARM Linux, and older macOS is not implied.
 
 Use explicit Cargo packages/targets with `--release --locked`. Fastly does not enable `reusable-sandbox`; production build commands do not use `--all-features`. CLI uses its existing default feature graph, including EdgeZero's default adapter registrations. Do not remove dependencies merely because they appear unrelated at the workspace level.
 
@@ -207,7 +213,9 @@ Strict mode:
 7. Checks the exit status of explicitly requested JS tests. Release validation also runs JS tests as an independent blocking step.
 8. Tracks the strict flag, skip/test flags, selected tools, recipe inputs, and relevant environment changes so an incremental local invocation cannot silently keep a previous permissive result.
 
-Release jobs have fresh checkouts and isolated Cargo target directories. Do not restore compiled Cargo output, `dist`, `OUT_DIR`, or `node_modules` from caches. Verified Cargo/npm download caches may be used. No parallel Cargo process mutates a shared crate `dist` directory; each matrix job owns its checkout.
+Release jobs have fresh checkouts and isolated Cargo target directories. Do not restore compiled Cargo output, `dist`, `OUT_DIR`, or `node_modules` from caches. Verified Cargo/npm download caches may be used only with archive bytes revalidated against locked checksums/integrity before fresh extraction; restored extracted source trees are not assumed to match a lockfile. Pinned git dependencies are freshly checked out and matched to their locked revisions. No parallel Cargo process mutates a shared crate `dist` directory; each matrix job owns its checkout.
+
+Record npm lifecycle execution and generated native/tool inputs separately from the package archive integrity. `npm ci` authenticates selected archive content under the lockfile, but permitted install scripts execute code and may generate or modify installed files; it does not make every resulting file byte-identical to the archive. Review and record the required lifecycle behavior, including esbuild's native tool setup, rather than disabling all scripts and silently breaking the selected bundler.
 
 Capture expected source identities before building and ensure tracked inputs have not changed afterward. Generated output belongs in dedicated output paths. Release scripts are responsible for validating source-only directories, not just checking that `git status` reports no tracked modifications.
 
@@ -283,7 +291,7 @@ Administrative prerequisites are part of rollout: immutable releases enabled; ac
 
 The trusted source repository is `IABTechLab/trusted-server`. The signer is `IABTechLab/trusted-server/.github/workflows/release-build.yml`, because the reusable workflow contains the attestation action. The source ref is the exact selected `refs/tags/<tag>` and the source digest is its reviewed peeled commit. The expected GitHub OIDC issuer is `https://token.actions.githubusercontent.com`.
 
-The CLI's release policy fixes repository, signer, issuer, supported targets/variants, predicate types, and hosted-runner requirement. Operator configuration cannot weaken those values. A future reviewed builder revision policy may additionally pin `--signer-digest`; it must distinguish the reusable workflow revision from the application source revision.
+The CLI's release policy fixes GitHub host `github.com`, repository, signer, issuer, supported targets/variants, predicate types, and hosted-runner requirement. Operator configuration cannot weaken those values. The checked subprocess uses explicit host/repository selection, fixed verifier arguments, and an approved GitHub CLI executable/version; it clears unapproved host/configuration overrides and accepts no forwarded verifier arguments. A future reviewed builder revision policy may additionally pin `--signer-digest`; it must distinguish the reusable workflow revision from the application source revision.
 
 The release index is authenticated before its target/variant/digest fields are trusted. Online consumers validate immutable release membership, expected tag/source identity, index provenance, artifact provenance, and the artifact's SPDX attestation. `SHA256SUMS` is a convenience check only until authenticated through the release or independently signed evidence.
 
@@ -294,17 +302,18 @@ RELEASE_TAG=v1.2.0
 REVIEWED_COMMIT='<reviewed-40-character-commit>'
 
 gh release download "$RELEASE_TAG" \
-  -R IABTechLab/trusted-server \
+  -R github.com/IABTechLab/trusted-server \
   --pattern 'trusted-server-fastly.wasm*' \
   --pattern 'release-index*' \
   --pattern SHA256SUMS
 
-gh release verify "$RELEASE_TAG" -R IABTechLab/trusted-server
+gh release verify "$RELEASE_TAG" -R github.com/IABTechLab/trusted-server
 gh release verify-asset "$RELEASE_TAG" release-index.json \
-  -R IABTechLab/trusted-server
+  -R github.com/IABTechLab/trusted-server
 
 gh attestation verify release-index.json \
   -R IABTechLab/trusted-server \
+  --hostname github.com \
   --signer-workflow IABTechLab/trusted-server/.github/workflows/release-build.yml \
   --source-ref "refs/tags/$RELEASE_TAG" \
   --source-digest "$REVIEWED_COMMIT" \
@@ -312,6 +321,7 @@ gh attestation verify release-index.json \
 
 gh attestation verify trusted-server-fastly.wasm \
   -R IABTechLab/trusted-server \
+  --hostname github.com \
   --signer-workflow IABTechLab/trusted-server/.github/workflows/release-build.yml \
   --source-ref "refs/tags/$RELEASE_TAG" \
   --source-digest "$REVIEWED_COMMIT" \
@@ -319,6 +329,7 @@ gh attestation verify trusted-server-fastly.wasm \
 
 gh attestation verify trusted-server-fastly.wasm \
   -R IABTechLab/trusted-server \
+  --hostname github.com \
   --signer-workflow IABTechLab/trusted-server/.github/workflows/release-build.yml \
   --source-ref "refs/tags/$RELEASE_TAG" \
   --source-digest "$REVIEWED_COMMIT" \
@@ -326,9 +337,9 @@ gh attestation verify trusted-server-fastly.wasm \
   --predicate-type https://spdx.dev/Document/v2.3 # allow-domain: spdx.dev
 
 gh release verify-asset "$RELEASE_TAG" trusted-server-fastly.wasm \
-  -R IABTechLab/trusted-server
+  -R github.com/IABTechLab/trusted-server
 gh release verify-asset "$RELEASE_TAG" trusted-server-fastly.wasm.spdx.json \
-  -R IABTechLab/trusted-server
+  -R github.com/IABTechLab/trusted-server
 ```
 
 The same checks apply to each named CLI executable before installing or executing it. The integrated verifier also checks index fields and verifies every referenced companion before consuming it. A successful command checking one predicate is not treated as successful verification of all required evidence.
@@ -341,10 +352,21 @@ The implementation pins a supported GitHub CLI version in the release tools mani
 
 An online preparation step saves the release assets, their bundles, and a trusted-root snapshot acquired through GitHub CLI's trusted-root mechanism. Trust roots and the consumer's approved release tag/commit policy must be transported securely; roots included by an arbitrary artifact supplier are not authoritative.
 
-For example:
+Provide a read-only `ts release verify <tag> --asset <supported-asset> --output-evidence <directory>` export using the same fixed verification library as deployment. It performs the complete online policy without provider credentials or writes. Only after every check succeeds does it save the verified assets/bundles, roots and version-1 `verified-publication.json`, and report that record's SHA-256 plus the verified source commit. Its record fields are the publication bindings listed below; it is a consumer observation rather than another release asset or publisher claim. Partial exports cannot be mistaken for successful verification. The consumer approves and transfers the resulting record pin and roots through its trusted channel.
+
+For the proposed export interface:
 
 ```sh
-gh attestation trusted-root > trusted_root.jsonl
+ts release verify v1.2.0 --asset trusted-server-fastly.wasm \
+  --output-evidence ./release-evidence
+```
+
+This export command is new work, not available at the baseline. Its output enables the offline deployment example below without requiring operators to hand-author a record asserting that checks passed.
+
+The native GitHub CLI can also prepare a trusted-root snapshot:
+
+```sh
+gh attestation trusted-root --hostname github.com > trusted_root.jsonl
 ```
 
 The published bundles avoid dependence on the GitHub attestation API during offline verification. `gh attestation download` is an alternative online export, not an offline retrieval step.
@@ -355,6 +377,7 @@ REVIEWED_COMMIT='<reviewed-40-character-commit>'
 
 gh attestation verify release-index.json \
   -R IABTechLab/trusted-server \
+  --hostname github.com \
   --bundle release-index.provenance.sigstore.json \
   --custom-trusted-root trusted_root.jsonl \
   --signer-workflow IABTechLab/trusted-server/.github/workflows/release-build.yml \
@@ -364,6 +387,7 @@ gh attestation verify release-index.json \
 
 gh attestation verify trusted-server-fastly.wasm \
   -R IABTechLab/trusted-server \
+  --hostname github.com \
   --bundle trusted-server-fastly.wasm.provenance.sigstore.json \
   --custom-trusted-root trusted_root.jsonl \
   --signer-workflow IABTechLab/trusted-server/.github/workflows/release-build.yml \
@@ -373,6 +397,7 @@ gh attestation verify trusted-server-fastly.wasm \
 
 gh attestation verify trusted-server-fastly.wasm \
   -R IABTechLab/trusted-server \
+  --hostname github.com \
   --bundle trusted-server-fastly.wasm.sbom.sigstore.json \
   --custom-trusted-root trusted_root.jsonl \
   --signer-workflow IABTechLab/trusted-server/.github/workflows/release-build.yml \
@@ -382,7 +407,9 @@ gh attestation verify trusted-server-fastly.wasm \
   --predicate-type https://spdx.dev/Document/v2.3 # allow-domain: spdx.dev
 ```
 
-Offline index verification and digest checks bind the artifact/companions to the signed distribution index. The offline profile does not claim a fresh GitHub release-state lookup or fresh revocation information. Online `gh release verify-asset` has no assumed offline replacement in this design. Consumers requiring immutable-release membership while disconnected retain an independently verified release record through their evidence-transfer process; the signed index alone is identified as build/distribution evidence.
+Offline index verification and digest checks bind the artifact/companions to the signed distribution index. A signed build index can also exist before publication, so it alone does not establish official release membership. Official offline `ts deploy --release` additionally requires a securely transferred record of previously successful online immutable-release and asset verification. That record binds the repository, tag, peeled source commit, release-index digest, selected artifact and companion digests, verification policy, and observation time. It is an explicit trust input from the consumer's approved online preparation process, protected by that process's authenticated evidence-transfer channel. Store its bytes as `verified-publication.json` in the evidence directory and require `--publication-record-sha256` supplied independently through that approved channel; the verifier matches the record's exact bytes to this pin before trusting its fields. A checksum copied from the supplied evidence directory is insufficient. Do not describe this consumer-approved record as an offline-verifiable GitHub release attestation unless a supported verifier actually verifies that evidence.
+
+The offline profile does not claim a fresh GitHub release-state lookup or fresh revocation information. Online `gh release verify-asset` has no assumed offline replacement in this design. Standalone bundle verification without the transferred publication record remains useful build/distribution verification, but cannot produce an official-release `VerifiedArtifact` for deployment. The consumer's policy determines how old a transferred record may be; securely supplied approval and roots remain required.
 
 Offline artifact verification also does not make platform deployment offline: uploading still requires provider access. The automated offline verifier is tested with network access denied to establish that no hidden attestation/root lookup is required.
 
@@ -403,12 +430,13 @@ ts deploy --adapter fastly --service-id '<service-id>' \
   --release v1.2.0 --artifact ./trusted-server-fastly.wasm \
   --offline --evidence-dir ./release-evidence \
   --expected-source-commit '<reviewed-40-character-commit>' \
+  --publication-record-sha256 '<approved-publication-record-sha256>' \
   --trusted-root ./trusted_root.jsonl --receipt deployment-receipt.json
 ```
 
 These are new interfaces to implement, not commands available at the baseline.
 
-`--release` enables the fixed official-release policy. `--artifact` chooses local bytes but requires that policy and the selected release. `--offline` requires the local artifact, evidence directory, securely supplied root, and approved source commit. `--evidence-dir` contains the authenticated index and all required companions. Online deployment resolves and verifies the immutable release record; automation may also supply `--expected-source-commit` to pin its approved revision.
+`--release` enables the fixed official-release policy. `--artifact` chooses local bytes but requires that policy and the selected release. `--offline` requires the local artifact, evidence directory, securely supplied root, approved source commit, and the trusted previously verified publication record described above with an independently approved `--publication-record-sha256` pin. `--evidence-dir` contains the authenticated index, all required companions, and that record when offline. The offline record and its approved pin must arrive through the consumer's approved evidence-transfer process. Online deployment resolves and verifies the immutable release record; automation may also supply `--expected-source-commit` to pin its approved revision.
 
 Reject unsupported adapters, missing evidence, unsupported targets/variants, conflicting deployment inputs, and artifact-related flags without `--release`. Arbitrary passthrough flags that override package, directory, source-build behavior, verification, service/version selection, or provider safety are forbidden on this route. Artifact deployment bypasses manifest build/deploy overrides; it does not run `fastly compute publish` or an operator-supplied shell command.
 
@@ -418,7 +446,11 @@ Existing source-build commands remain available for development and custom distr
 
 Trusted Server owns official release acquisition/verification and the `VerifiedArtifact` value. Its fields are private; callers cannot construct one by supplying a path and an asserted checksum. It owns retained bytes, SHA-256, validated release/source identity, target/variant, verification policy version, and evidence references. Provider code cannot replace its bytes through passthrough arguments.
 
-EdgeZero owns an additive typed artifact deployment request/result and platform lifecycle. Its request accepts an explicitly prepared package and expected digest with adapter/service/staging parameters; its result reports exact observed service/version and activation state. This is additive to source deployment, not a rewrite of all `AdapterAction` execution. EdgeZero treats the Trusted Server verifier as its trusted caller; it is not assigned responsibility for recognizing IAB release policy. Official release flags, evidence acquisition and signer constraints remain in Trusted Server's argument wrapper, not in generic EdgeZero `DeployArgs`.
+EdgeZero owns an additive typed artifact deployment request/result and platform lifecycle. Its request accepts an explicitly prepared package and expected digest with adapter/service/staging parameters and validated deployment context: selected platform manifest, declared logical config-store IDs, physical resource mappings, and any allowed version comment. Trusted Server checks that the context includes the configuration logical ID expected by the canonical artifact before mutation. An absent config declaration must not take EdgeZero's generic no-config staging branch and silently retain the production selector. The package and lifecycle use the same resolved context; manifest shell overrides cannot replace it.
+
+Its result reports exact observed service/version and activation or staging state. Its structured failure reports whether a provider mutation was attempted, any known service/version, the last confirmed phase, and an explicit unknown outcome when a timeout or unparseable response prevents confirmation. An error never implies that no deployment occurred. Uncertain uploads or activation require reconciliation before retry, rather than guessing a version or repeating the write.
+
+This is additive to source deployment, not a rewrite of all `AdapterAction` execution. EdgeZero treats the Trusted Server verifier as its trusted caller; it is not assigned responsibility for recognizing IAB release policy. Official release flags, evidence acquisition and signer constraints remain in Trusted Server's argument wrapper, not in generic EdgeZero `DeployArgs`.
 
 The implementation first lands the upstream capability and pins a reviewed EdgeZero revision. It must not duplicate staging cloning/selector logic in Trusted Server to work around an unconditional upstream build. If upstream support is delayed, the documented native route below permits use of released bytes, but integrated `ts deploy --release` acceptance remains incomplete.
 
@@ -432,12 +464,14 @@ The implementation first lands the upstream capability and pins a reviewed EdgeZ
 6. Inspect the completed archive safely and require exactly one expected regular `bin/main.wasm` member with the verified digest. Reject symlinks, traversal, duplicate members, unexpected executable payloads, and manifest/package mismatches.
 7. Hash the complete selected archive, retain it privately, and recheck it immediately before provider upload.
 8. Only now perform provider writes using the explicit package. Capture the exact provider service/version result.
-9. For staging, preserve current version comments and isolated config selectors before staging/health checks. For production, retain the existing activation and health-check policy.
-10. Return a structured outcome and write the requested receipt atomically. Rollback uses the previously observed version, not a guessed current active version.
+9. For staging, preserve current version comments and isolated config selectors before marking the exact version staged, without activating production. For production, activate the exact uploaded version according to the existing deployment behavior.
+10. Return a structured outcome and write the requested receipt atomically. Health checks and rollback remain explicit lifecycle commands or orchestration follow-ups; `ts deploy` does not automatically perform them at the baseline. A production rollback uses a version captured before deployment, never a guessed current active version.
 
 No build, wasm annotation, stripping, signing, or post-build hook runs between artifact verification and upload. A Fastly provider package hash is not assumed to equal raw wasm SHA-256. Packaging verification establishes which module was submitted; it does not establish execution at every edge node.
 
 Failure before step 8 makes no provider writes, configuration pushes, selector changes, or service provisioning. Failure after provider mutation reports the exact known outcome and preserves enough evidence for recovery; receipt-writing failure must not be presented as proof that no deployment occurred.
+
+Operators/orchestrators serialize mutating deployment and rollback operations per service, including staging. EdgeZero's staging selector twin is mutable and shared by staged versions of one service; concurrent reconciliation can race, and a selector link is not an immutable configuration snapshot. Production rollback's active-version guard is not an atomic provider precondition. Preserve the current guards and documented serialization requirement; this change does not add a distributed lock or solve external actors bypassing that serialization.
 
 #### Native Fastly route during rollout
 
@@ -471,7 +505,8 @@ A requested receipt is a versioned local JSON observation record, not a publishe
 - Verification policy version, online/offline profile, and evidence bundle digests.
 - Package SHA-256 and the observed package member digest.
 - CLI and platform tool versions.
-- Adapter, observed service/version, staging/production mode, activation/health outcome, and observation timestamp.
+- Adapter, observed service/version, staging/production mode, activation/staging outcome, and observation timestamp.
+- Health status `not_performed` for a deployment-only operation; a later explicit check can produce its own observed result. Unknown provider state remains unknown, never inferred from command failure.
 - Previous deployment version when actually captured.
 
 It contains no tokens, resolved secrets, complete publisher manifest, configuration document, or claimed publisher authorization. It does not assert a config digest unless the deployment operation actually observed and verified one; config push is a separate operation. Exact service/version comes from deployment responses, not a racy post-deploy lookup of whatever version is now active.
@@ -505,6 +540,20 @@ The integration registry can provide an enabled capability inventory. It is not 
 
 No generic attestation framework, arbitrary predicate registry, publisher endpoint, or empty publisher implementation is added for these future requirements. The release/deployment interfaces above provide the useful groundwork without committing to those protocols.
 
+#### Assumptions and decisions deferred to publisher work
+
+| Foundation selected now                                  | Consequence for future claims                                                                   | Decision still open                                                                        |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Artifact identity is external SHA-256 of final bytes     | A publisher claim can reference an independently verified release subject                       | How a provider or other authority establishes that those bytes execute remotely            |
+| Publisher authorization is separate from release signing | A valid build signature does not authorize a publisher/domain                                   | Enrollment, ownership verification, delegation, trust roots, key rotation and revocation   |
+| Configuration is loaded at runtime                       | Claims must bind the snapshot actually used, including explicit policy/secret-version treatment | Public projection, canonicalization, config authorization, freshness and rollback policy   |
+| Deployment receipts are local observations               | Later signing must preserve their limited assurance and known/unknown states                    | Which authority signs, what it independently observes, and which consumers trust it        |
+| Claim types may evolve independently                     | Release index/build facts do not become a universal publisher schema                            | Transport, DSSE/JWT/EAT or another format, discovery, versioning and purpose-specific keys |
+| Runtime state and request context can change             | Static artifact identity cannot imply a fresh request/config claim                              | Nonces/timestamps, replay windows, request/body binding and verifier appraisal policy      |
+| Vendor approval names its own scope                      | An enabled integration is not evidence of endorsement                                           | Code/config/policy scope, vendor signing authority and permission enforcement              |
+
+Future designs may revise these integration seams through reviewed versions. No assumption here requires a central publisher registry, reuse of deployment request-signing keys, a particular hosting provider, or a hardware attestation mechanism.
+
 ### 12. Other adapter and asset boundaries
 
 | Surface            | Follow-up artifact definition                                                                                                |
@@ -527,6 +576,7 @@ Each future artifact gets its own digest, target/variant recipe, SBOM and byte-p
 - Missing core/integration output, empty or unexpected output, and bundle/evidence digest mismatches reject release generation.
 - Changing strict-mode environment after a permissive build cannot reuse the permissive Cargo result.
 - Operator configuration presence/content and physical resource mappings do not change canonical bytes under the same controlled recipe; prohibited operator build variables reject release preflight.
+- Workflow preflight rejects skip-flag presence before sanitization; unreviewed compiler wrappers, Cargo configuration layers and tool startup overrides cannot replace the selected recipe.
 - Editing repository `edgezero.toml` changes the recorded input/template digest and is rejected when it conflicts with the selected source snapshot.
 - Build metadata rejects malformed/missing release facts and distinguishes local builds, package version, release version, and service version.
 - First-artifact feature selection matches current production defaults and does not enable reusable sandbox or test utilities.
@@ -550,6 +600,9 @@ Each future artifact gets its own digest, target/variant recipe, SBOM and byte-p
 - A provenance-only, SBOM-only, or checksum-only result cannot produce a `VerifiedArtifact`.
 - Exercise missing/incompatible GitHub CLI, network failure, malformed JSON and partially successful command sequences.
 - Verify saved bundles/roots with networking disabled; untrusted or absent roots fail.
+- Read-only online export applies the complete deployment verification policy, rejects unsupported assets, performs no provider writes, and emits no successful publication record after a partial failure.
+- Official offline deployment rejects absent/untrusted publication records, missing or mismatched independently approved record pins, and records inconsistent with tag/source/index/artifact identities, even when all build bundles verify. A signed index from an unpublished build is insufficient.
+- Inherited GitHub host/configuration overrides cannot redirect the official verifier's authority or weaken fixed signer/issuer policy.
 - Validate index schema/paths, duplicate assets, expected matrix completeness, and companion provenance subjects.
 - Fail CI eligibility when successful checks are absent for the exact source commit, not merely for current `main`.
 - Exercise failed matrix jobs, partial draft recovery, conflicting drafts, concurrent runs, already published tags, and uncertain publication responses.
@@ -563,9 +616,12 @@ Each future artifact gets its own digest, target/variant recipe, SBOM and byte-p
 - Replacing the original operator artifact path after verification cannot substitute upload bytes; changing retained/package bytes is detected before upload.
 - Production and staging submit the explicitly verified package and return exact service/version results.
 - Staged config selectors and physical resource mappings keep current isolation behavior.
-- Health-check failure, partial activation, rollback and receipt-write failure report observed state accurately.
+- Missing/incompatible manifest or config logical-ID context rejects Trusted Server staging before mutation; the prepared package and lifecycle share the same validated context.
+- Partial upload/stage/activation, uncertain responses and receipt-write failure preserve known/unknown outcomes and require reconciliation before retry. Deployment-only receipts report no health check performed.
+- Separate health-check and rollback commands can consume the exact returned version; orchestration captures production's previous version before mutation and serializes lifecycle writes per service.
 - Readiness of `/health` or a reported version is never asserted to be cryptographic artifact verification.
 - Native CLI startup/help/config-init work outside the source tree; repository-dependent commands retain explicit prerequisites.
+- Native linkage inspection and clean Ubuntu 24.04 runtime smoke establish the advertised Linux baseline independently of build-runner provisioning.
 
 ### Required repository checks
 
@@ -590,14 +646,17 @@ Published immutable releases are never repaired by overwriting assets or moving 
 
 ## Alternatives considered
 
-| Approach                                                        | Benefit                                                         | Reason for the selected order                                                                                                  |
-| --------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Verify and deploy release bytes                                 | Direct connection between attested subject and submitted module | Selected first; avoids independent-build determinism as an adoption prerequisite                                               |
-| Require local reproducible rebuilds                             | Operators can independently rebuild and compare                 | Valuable follow-up; native paths/SDKs, JS/environment and transformations need additional controlled experiments               |
-| Publish evidence but keep unconditional local deployment builds | Small CI-only change                                            | Rejected: operators do not necessarily submit the attested subject                                                             |
-| Attest the Fastly package instead of wasm                       | Identifies one complete provider archive                        | Rejected for the canonical artifact: publisher manifests/resource identities vary; retain a separate deployment package digest |
-| SBOM from whole dependency graph or bare wasm scan              | Simple existing tool invocation                                 | Rejected as sufficient composition evidence: target/dev/build roles and embedded JS are misrepresented or missed               |
-| Implement publisher/runtime attestation now                     | Delivers more claim types at once                               | Deferred: identity authority, schema, snapshot/freshness and independent execution assurance need #161's reviewed threat model |
+| Approach                                                        | Benefit                                                         | Reason for the selected order                                                                                                                                                                                                              |
+| --------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Verify and deploy release bytes                                 | Direct connection between attested subject and submitted module | Selected first; avoids independent-build determinism as an adoption prerequisite                                                                                                                                                           |
+| Require local reproducible rebuilds                             | Operators can independently rebuild and compare                 | Valuable follow-up; native paths/SDKs, JS/environment and transformations need additional controlled experiments                                                                                                                           |
+| Publish evidence but keep unconditional local deployment builds | Small CI-only change                                            | Rejected: operators do not necessarily submit the attested subject                                                                                                                                                                         |
+| Attest the Fastly package instead of wasm                       | Identifies one complete provider archive                        | Rejected for the canonical artifact: publisher manifests/resource identities vary; retain a separate deployment package digest                                                                                                             |
+| SBOM from whole dependency graph or bare wasm scan              | Simple existing tool invocation                                 | Rejected as sufficient composition evidence: target/dev/build roles and embedded JS are misrepresented or missed                                                                                                                           |
+| Rust-native SBOM tooling or `cargo-auditable`                   | Reduces custom Rust dependency tooling                          | Cargo's precise SBOM precursor is currently unstable; stable cargo-auditable uses metadata fallback, modifies executable bytes and does not replace JS/native composition. Revisit when a maintained pipeline proves the selected contract |
+| Implement publisher/runtime attestation now                     | Delivers more claim types at once                               | Deferred: identity authority, schema, snapshot/freshness and independent execution assurance need #161's reviewed threat model                                                                                                             |
+
+The composition adapter and provider lifecycle interface are the largest implementation costs. Keep the adapter limited to observed selection, metadata joins, relationships and validation; reuse Syft and maintained parsers rather than writing a new package scanner. The fixture proof precedes production workflow work so feasibility failures can change the approved contract early. Publishing verified bytes first remains the chosen order; independent reproducibility and stronger builder isolation add distinct assurance later.
 
 ## Acceptance criteria
 
@@ -608,7 +667,7 @@ Published immutable releases are never repaired by overwriting assets or moving 
 - [ ] Strict JS release builds reject missing tools, installation failure, skip flags and stale/incomplete output.
 - [ ] SBOM fixtures prove target/build-host selection and embedded JS scope, including the external Prebid exclusion.
 - [ ] Both production and staging artifact deployment preserve verified wasm bytes and perform no provider writes on verification failure.
-- [ ] Offline evidence verification works without network access and documents its release-state/freshness limits.
+- [ ] Read-only online export produces verified offline evidence; official offline deployment requires the previously verified publication record and its independently approved digest pin, works without verification network access, and documents its freshness limits.
 - [ ] Build facts distinguish release/package/source/target/variant from service version and final binary checksum.
 - [ ] Deployment observations preserve exact known results without claiming publisher authorization or remote execution proof.
 - [ ] Immutable-release settings, active tag rules and release authority are verified and documented.
@@ -628,6 +687,11 @@ Authoritative implementation references:
 - [Immutable-release settings API](https://docs.github.com/en/rest/repos/repos#check-if-immutable-releases-are-enabled-for-a-repository).
 - [GitHub CLI attestation verification](https://cli.github.com/manual/gh_attestation_verify), [bundle download](https://cli.github.com/manual/gh_attestation_download), and [trusted roots](https://cli.github.com/manual/gh_attestation_trusted-root). <!-- allow-domain: cli.github.com -->
 - [Attestation action modes and outputs](https://github.com/actions/attest).
+- [SLSA build requirements](https://slsa.dev/spec/v1.2/build-requirements). <!-- allow-domain: slsa.dev -->
+- [SPDX relationships](https://spdx.github.io/spdx-spec/v2.3.1/relationships-between-SPDX-elements/). <!-- allow-domain: spdx.github.io -->
+- [IETF RATS architecture](https://www.rfc-editor.org/rfc/rfc9334.html). <!-- allow-domain: www.rfc-editor.org -->
+- [Reproducible build definition](https://reproducible-builds.org/docs/definition/). <!-- allow-domain: reproducible-builds.org -->
+- [Cargo SBOM precursor](https://doc.rust-lang.org/cargo/reference/unstable.html#sbom) and [cargo-auditable's metadata/precursor selection](https://github.com/rust-secure-code/cargo-auditable/blob/master/cargo-auditable/src/collect_audit_data.rs).
 - [Syft package catalogers](https://oss.anchore.com/docs/guides/sbom/catalogers/) and [Rust capabilities](https://oss.anchore.com/docs/capabilities/rust/). <!-- allow-domain: oss.anchore.com -->
 - [Rollup output hooks](https://rollupjs.org/plugin-development/). <!-- allow-domain: rollupjs.org -->
 - [Cargo build messages](https://doc.rust-lang.org/cargo/reference/external-tools.html) and [metadata](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html).
