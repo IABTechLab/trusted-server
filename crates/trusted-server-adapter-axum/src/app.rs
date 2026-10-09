@@ -16,9 +16,8 @@ use trusted_server_core::auction::{
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+    admin_ec_lookup_not_supported, admin_eids_lookup_retired, deny_admin_diagnostic_fallback,
 };
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
@@ -495,11 +494,9 @@ fn named_route_handler(
                         // dev server has no store to read.
                         Ok(admin_ec_lookup_not_supported())
                     }
-                    NamedRouteHandler::AdminEidsLookup => {
-                        let partner_registry =
-                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
-                        handle_admin_eids_lookup(&partner_registry, &req)
-                    }
+                    // Keep the authenticated route local. Removing it would
+                    // risk forwarding admin credentials to publisher fallback.
+                    NamedRouteHandler::AdminEidsLookup => Ok(admin_eids_lookup_retired()),
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent

@@ -15,9 +15,8 @@ use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
-use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
+use crate::constants::HEADER_X_TS_EC_CONSENT;
 use crate::creative;
-use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{
@@ -533,21 +532,6 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             .insert(HEADER_X_TS_EC_CONSENT, HeaderValue::from_static("ok"));
     }
 
-    // Attach EID response headers when consent-gated EIDs are available.
-    if let Some(ref eids) = auction_request.user.eids {
-        let (encoded, truncated) = encode_eids_header(eids)?;
-        let header_val =
-            HeaderValue::from_str(&encoded).change_context(TrustedServerError::Auction {
-                message: "Failed to encode EIDs header value".to_string(),
-            })?;
-        response.headers_mut().insert(HEADER_X_TS_EIDS, header_val);
-        if truncated {
-            response
-                .headers_mut()
-                .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
-        }
-    }
-
     Ok(OpenRtbResponseConversion { response, delivery })
 }
 
@@ -561,6 +545,7 @@ mod tests {
     use crate::auction::types::{
         ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
     };
+    use crate::constants::{HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -811,9 +796,12 @@ mod tests {
     }
 
     #[test]
-    fn response_includes_eid_headers_when_eids_present() {
+    fn response_keeps_eid_diagnostics_retired_when_eids_present() {
         let mut request = make_auction_request();
         request.user.eids = Some(vec![Eid {
+            inserter: None,
+            matcher: None,
+            mm: None,
             source: "ssp.com".to_owned(),
             uids: vec![Uid {
                 id: "uid-1".to_owned(),
@@ -829,8 +817,8 @@ mod tests {
             .expect("should build response");
 
         assert!(
-            response.headers().get(&HEADER_X_TS_EIDS).is_some(),
-            "should include x-ts-eids header when EIDs are present"
+            response.headers().get(&HEADER_X_TS_EIDS).is_none(),
+            "EID diagnostic headers stay retired even when EIDs are present"
         );
         assert_eq!(
             response
@@ -845,7 +833,7 @@ mod tests {
                 .headers()
                 .get(&HEADER_X_TS_EIDS_TRUNCATED)
                 .is_none(),
-            "should not include truncated header for small payload"
+            "should never emit the retired truncation header"
         );
     }
 

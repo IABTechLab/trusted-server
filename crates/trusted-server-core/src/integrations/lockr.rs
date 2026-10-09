@@ -10,12 +10,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use serde::Deserialize;
+use serde_json::Value;
 use validator::Validate;
+
+use crate::ec::identity::{IdentityConsentSignals, IdentityObservation, IdentityOutcome};
+use crate::integrations::identity::{IdentityCapture, IdentityCaptureInput, IdentityRequestBody};
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
@@ -29,6 +34,15 @@ use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
+const ID5_SOURCE: &str = "id5-sync.com";
+const LOCKR_API_PREFIX: &str = "/integrations/lockr/api";
+const LOCKR_TOKEN_PATHS: [&str; 4] = [
+    "/publisher/app/v2/identityLockr/page-view",
+    "/publisher/app/v2/identityLockr/generate-tokens",
+    "/publisher/app/v2/identityLockr/refresh-tokens",
+    "/publisher/app/v2/identityLockr/sync-no-hem-ids",
+];
+const LOCKR_REVOKE_PATH: &str = "/publisher/app/v2/identityLockr/revoke-consent";
 
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]
@@ -36,6 +50,14 @@ pub struct LockrConfig {
     /// Enable/disable the integration
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Kill switch for token observation; does not remove the source claim.
+    #[serde(default = "default_enabled")]
+    pub capture_identity: bool,
+
+    /// Separately approved global EC withdrawal from successful revoke responses.
+    #[serde(default)]
+    pub capture_global_withdrawal: bool,
 
     /// Lockr app ID (from meta tag lockr-signin-app_id)
     #[validate(length(min = 1))]
@@ -111,7 +133,7 @@ impl LockrIntegration {
         services: &RuntimeServices,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let sdk_url = &self.config.sdk_url;
-        log::info!("Fetching Lockr SDK from {}", sdk_url);
+        log::info!("Fetching Lockr SDK");
 
         // TODO: Check KV store cache first (future enhancement)
 
@@ -121,19 +143,16 @@ impl LockrIntegration {
             .header(header::USER_AGENT, "TrustedServer/1.0")
             .header(header::ACCEPT, "application/javascript, */*")
             .body(EdgeBody::empty())
-            .change_context(Self::error("Failed to build Lockr SDK request"))?;
+            .map_err(|_| Report::new(Self::error("Failed to build Lockr SDK request")))?;
 
         let backend_name = Self::backend_name_for_url(services, sdk_url)
-            .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
+            .map_err(|_| Report::new(Self::error("Failed to determine backend for SDK fetch")))?;
 
         let lockr_response = services
             .http_client()
             .send(PlatformHttpRequest::new(lockr_req, backend_name))
             .await
-            .change_context(Self::error(format!(
-                "Failed to fetch Lockr SDK from {}",
-                sdk_url
-            )))?
+            .map_err(|_| Report::new(Self::error("Failed to fetch Lockr SDK")))?
             .response;
 
         if !lockr_response.status().is_success() {
@@ -170,7 +189,6 @@ impl LockrIntegration {
             )
             .header("X-Lockr-SDK-Proxy", "true")
             .header("X-Lockr-SDK-Mode", "trust-server")
-            .header("X-SDK-Source", sdk_url)
             .body(EdgeBody::from(sdk_body))
             .change_context(Self::error("Failed to build Lockr SDK response"))
     }
@@ -186,13 +204,13 @@ impl LockrIntegration {
         let original_path = parts.uri.path().to_string();
         let method = parts.method.clone();
 
-        log::info!("Proxying Lockr API request: {} {}", method, original_path);
+        log::info!("Proxying Lockr API request: {}", method);
 
         // Extract path after /integrations/lockr/api and pass through directly.
         // This allows the Lockr SDK to use any API endpoint without hardcoded mappings.
         let target_path = original_path
             .strip_prefix("/integrations/lockr/api")
-            .ok_or_else(|| Self::error(format!("Invalid Lockr API path: {}", original_path)))?;
+            .ok_or_else(|| Self::error("Invalid Lockr API path"))?;
 
         let query = parts
             .uri
@@ -201,39 +219,43 @@ impl LockrIntegration {
             .unwrap_or_default();
         let target_url = format!("{}{}{}", self.config.api_endpoint, target_path, query);
 
-        log::info!("Forwarding to Lockr API: {}", target_url);
-
-        let request_body = if method == Method::POST {
-            let bytes =
+        let capture_selected = self.matches(&method, &original_path);
+        // The same allocation backs the forwarded POST and request-local capture signals.
+        // Never read the browser request a second time for capture.
+        let (request_body, capture_body) = if method == Method::POST {
+            let bytes = Bytes::from(
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, LOCKR_INTEGRATION_ID)
-                    .await?;
-            EdgeBody::from(bytes)
+                    .await?,
+            );
+            let capture_body = capture_selected.then(|| IdentityRequestBody(bytes.clone()));
+            (EdgeBody::from_bytes(bytes), capture_body)
         } else {
-            EdgeBody::empty()
+            (EdgeBody::empty(), None)
         };
 
         let mut target_req = http::Request::builder()
             .method(method.clone())
             .uri(&target_url)
             .body(request_body)
-            .change_context(Self::error("Failed to build Lockr API proxy request"))?;
+            .map_err(|_| Report::new(Self::error("Failed to build Lockr API proxy request")))?;
         self.copy_request_headers(&parts.headers, target_req.headers_mut())?;
 
         let backend_name = Self::backend_name_for_url(services, &self.config.api_endpoint)
-            .change_context(Self::error("Failed to determine backend for API proxy"))?;
+            .map_err(|_| Report::new(Self::error("Failed to determine backend for API proxy")))?;
 
         let response = services
             .http_client()
             .send(PlatformHttpRequest::new(target_req, backend_name))
             .await
-            .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
-            )))?
+            .map_err(|_| Report::new(Self::error("Failed to forward Lockr API request")))?
             .response;
 
         log::info!("Lockr API responded with status {}", response.status());
 
+        let mut response = response;
+        if let Some(body) = capture_body {
+            response.extensions_mut().insert(body);
+        }
         Ok(response)
     }
 
@@ -280,8 +302,8 @@ impl LockrIntegration {
                 Ok(value) => {
                     to.insert(header::ORIGIN, value);
                 }
-                Err(error) => {
-                    log::warn!("Skipping invalid Lockr origin header value '{origin}': {error}");
+                Err(_) => {
+                    log::warn!("Skipping invalid Lockr origin header");
                 }
             }
         }
@@ -302,6 +324,95 @@ impl LockrIntegration {
     ) -> Result<String, Report<TrustedServerError>> {
         ensure_integration_backend(services, target_url, LOCKR_INTEGRATION_ID, None)
     }
+}
+
+// Only the confirmed ID5 token schema is recognized. Unknown keys do not become
+// source claims, even when an EID in the same response names a registered source.
+fn id5_token(token: &Value, ids: Option<&Value>, now: Option<u64>) -> Option<IdentityOutcome> {
+    if token.get("key_name")?.as_str()? != "id5id" {
+        return None;
+    }
+    let encoded = token.get("advertising_token")?.as_str()?;
+    // A malformed percent escape must not silently become a different UID.
+    let bytes = encoded.as_bytes();
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (!bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                || !bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
+        {
+            return None;
+        }
+    }
+    let decoded = urlencoding::decode(encoded).ok()?;
+    let uid = serde_json::from_str::<Value>(&decoded)
+        .ok()?
+        .get("universal_uid")?
+        .as_str()?
+        .to_string();
+    if uid.is_empty() || uid.len() > 512 {
+        return None;
+    }
+
+    // An associated EID is corroboration, not a source of new authority.
+    if let Some(ids) = ids {
+        let eid = ids.as_object()?.get("id5id");
+        if let Some(eid) = eid {
+            if eid.get("source")?.as_str()? != ID5_SOURCE {
+                return None;
+            }
+            let uids = eid.get("uids")?.as_array()?;
+            if uids.len() != 1
+                || uids[0].get("id")?.as_str()? != uid
+                || uids[0].get("atype")?.as_u64()? != 1
+            {
+                return None;
+            }
+        }
+    }
+
+    let expires_at = match token.get("identity_expires") {
+        None => None,
+        Some(value) => {
+            let millis = value.as_u64()?;
+            let seconds = millis / 1000;
+            // Without a working clock we cannot prove that a dated token is live.
+            if seconds <= now? {
+                return None;
+            }
+            Some(seconds)
+        }
+    };
+    Some(IdentityOutcome::Issued {
+        source: ID5_SOURCE.to_string(),
+        uid,
+        expires_at,
+    })
+}
+
+fn request_consent(body: &[u8]) -> IdentityConsentSignals {
+    let mut signals = IdentityConsentSignals::default();
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        signals.malformed = true;
+        return signals;
+    };
+    let Some(object) = value.as_object() else {
+        signals.malformed = true;
+        return signals;
+    };
+    for (field, target) in [
+        ("consentString", &mut signals.tcf),
+        ("gppString", &mut signals.gpp),
+        ("ccpaString", &mut signals.usp),
+    ] {
+        if let Some(value) = object.get(field) {
+            match value.as_str() {
+                Some("") => {}
+                Some(text) => *target = Some(text.to_string()),
+                None => signals.malformed = true,
+            }
+        }
+    }
+    signals
 }
 
 fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<TrustedServerError>> {
@@ -339,6 +450,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(LOCKR_INTEGRATION_ID)
             .with_proxy(integration.clone())
+            .with_identity_capture(integration.clone())
             .with_attribute_rewriter(integration)
             .build(),
     ))
@@ -367,11 +479,86 @@ impl IntegrationProxy for LockrIntegration {
         } else if path.starts_with("/integrations/lockr/api/") {
             self.handle_api_proxy(settings, services, req).await
         } else {
-            Err(Report::new(Self::error(format!(
-                "Unknown Lockr route: {}",
-                path
-            ))))
+            Err(Report::new(Self::error("Unknown Lockr route")))
         }
+    }
+}
+
+impl IdentityCapture for LockrIntegration {
+    fn sources(&self) -> &'static [&'static str] {
+        &[ID5_SOURCE]
+    }
+
+    // The trait's enabled switch controls capture, not the entire integration proxy.
+    #[allow(clippy::misnamed_getters)]
+    fn enabled(&self) -> bool {
+        self.config.capture_identity
+    }
+
+    fn matches(&self, method: &Method, path: &str) -> bool {
+        if *method != Method::POST || !self.enabled() {
+            return false;
+        }
+        let Some(path) = path.strip_prefix(LOCKR_API_PREFIX) else {
+            return false;
+        };
+        LOCKR_TOKEN_PATHS.contains(&path)
+            || (self.config.capture_global_withdrawal && path == LOCKR_REVOKE_PATH)
+    }
+
+    fn observe(&self, input: IdentityCaptureInput<'_>) -> Option<IdentityObservation> {
+        if !self.config.capture_identity || !input.status.is_success() {
+            return None;
+        }
+        let response: Value = serde_json::from_slice(input.decoded_body).ok()?;
+        if !response.get("success")?.as_bool()? {
+            return None;
+        }
+        let path = input.path.strip_prefix(LOCKR_API_PREFIX)?;
+        if path == LOCKR_REVOKE_PATH {
+            return self
+                .config
+                .capture_global_withdrawal
+                .then(|| IdentityObservation {
+                    outcomes: vec![IdentityOutcome::ConsentWithdrawn],
+                    consent: IdentityConsentSignals::default(),
+                });
+        }
+        if !LOCKR_TOKEN_PATHS.contains(&path) {
+            return None;
+        }
+        let tokens = match response.get("aimTokens") {
+            None => &[][..],
+            Some(tokens) => tokens.as_array()?.as_slice(),
+        };
+        let ids = response.get("ids");
+        if ids.is_some_and(|value| !value.is_object()) {
+            return None;
+        }
+        let now = crate::ec::checked_current_timestamp();
+        let outcomes = tokens
+            .iter()
+            .filter_map(|token| id5_token(token, ids, now))
+            .collect::<Vec<_>>();
+        // The provider has not defined ordering between overlapping tokens.
+        // Never choose an arbitrary winner for this one-source mapping.
+        if outcomes.len() > 1 {
+            return None;
+        }
+        let consent = request_consent(input.request_body);
+        // Bad request JSON or signal shapes may not acquire an ID, even if the
+        // upstream returned one. Revocation above is deliberately independent.
+        if consent.malformed {
+            return None;
+        }
+        Some(IdentityObservation {
+            outcomes: if outcomes.is_empty() {
+                vec![IdentityOutcome::NoChange]
+            } else {
+                outcomes
+            },
+            consent,
+        })
     }
 }
 
@@ -443,6 +630,8 @@ mod tests {
     fn test_config() -> LockrConfig {
         LockrConfig {
             enabled: true,
+            capture_identity: true,
+            capture_global_withdrawal: false,
             app_id: "test-app-id".to_string(),
             api_endpoint: default_api_endpoint(),
             sdk_url: default_sdk_url(),
@@ -609,6 +798,7 @@ mod tests {
         let response = futures::executor::block_on(integration.handle(&settings, &services, req))
             .expect("should proxy request");
         assert_eq!(response.status(), http::StatusCode::OK, "should return OK");
+        assert!(response.extensions().get::<IdentityRequestBody>().is_none());
 
         let bodies = stub.recorded_request_bodies();
         assert_eq!(
@@ -697,6 +887,288 @@ mod tests {
                 .any(|r| r.path == "/integrations/lockr/api/*" && r.method == Method::GET),
             "should register API GET route"
         );
+    }
+
+    const TOKEN_PATH: &str = "/integrations/lockr/api/publisher/app/v2/identityLockr/page-view";
+    const REVOKE_PATH: &str =
+        "/integrations/lockr/api/publisher/app/v2/identityLockr/revoke-consent";
+
+    fn sample_token() -> Value {
+        json!({
+            "success": true,
+            "aimTokens": [{
+                "key_name": "id5id",
+                "advertising_token": "%7B%22universal_uid%22%3A%22ID5*synthetic%22%7D",
+                "identity_expires": 4102444800000_u64
+            }]
+        })
+    }
+
+    fn observed(
+        integration: &LockrIntegration,
+        path: &str,
+        response: &Value,
+        request: &[u8],
+    ) -> Option<IdentityObservation> {
+        let decoded = serde_json::to_vec(response).expect("should serialize fixture");
+        integration.observe(IdentityCaptureInput {
+            path,
+            request_body: request,
+            status: StatusCode::OK,
+            decoded_body: &decoded,
+        })
+    }
+
+    #[test]
+    fn capture_route_and_kill_switch() {
+        let integration = LockrIntegration::new(test_config());
+        for route in LOCKR_TOKEN_PATHS {
+            let path = format!("{LOCKR_API_PREFIX}{route}");
+            assert!(integration.matches(&Method::POST, &path));
+            assert!(!integration.matches(&Method::GET, &path));
+            assert!(!integration.matches(&Method::POST, &format!("{path}/extra")));
+        }
+        assert!(!integration.matches(&Method::POST, REVOKE_PATH));
+        assert!(!integration.matches(&Method::POST, "/integrations/lockr/sdk"));
+        assert!(!integration.matches(
+            &Method::POST,
+            "/integrations/lockr/api/publisher/app/v2/identityLockr/settings"
+        ));
+        let killed = LockrIntegration::new(LockrConfig {
+            capture_identity: false,
+            ..test_config()
+        });
+        assert_eq!(killed.sources(), &[ID5_SOURCE]);
+        assert!(!killed.enabled());
+        assert!(!killed.matches(&Method::POST, TOKEN_PATH));
+    }
+
+    #[test]
+    fn id5_capture_validates_associated_eid_expiry_and_uid() {
+        let integration = LockrIntegration::new(test_config());
+        let request = br#"{"consentString":"","gppString":"","ccpaString":""}"#;
+        let result = observed(&integration, TOKEN_PATH, &sample_token(), request)
+            .expect("should capture synthetic ID5 token");
+        assert!(
+            matches!(&result.outcomes[..], [IdentityOutcome::Issued { source, uid, expires_at: Some(4102444800) }] if source == ID5_SOURCE && uid == "ID5*synthetic")
+        );
+        assert!(result.consent.tcf.is_none());
+        let mut with_eid = sample_token();
+        with_eid["ids"] = json!({"id5id":{"eid":{"source":"id5-sync.com","uids":[{"id":"ID5*synthetic","atype":1}]}}});
+        assert_eq!(
+            observed(&integration, TOKEN_PATH, &with_eid, request)
+                .expect("should capture matching EID")
+                .outcomes
+                .len(),
+            1
+        );
+        with_eid["ids"]["id5id"]["eid"]["uids"][0]["id"] = json!("different");
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &with_eid, request)
+                .expect("should treat mismatched EID as no change")
+                .outcomes[..],
+            [IdentityOutcome::NoChange]
+        ));
+        let mut changed_expiry = sample_token();
+        changed_expiry["aimTokens"][0]["identity_expires"] = json!(4102444801000_u64);
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &changed_expiry, request)
+                .expect("should observe extended expiry")
+                .outcomes[..],
+            [IdentityOutcome::Issued { uid, expires_at: Some(4102444801), .. }] if uid == "ID5*synthetic"
+        ));
+        let mut mismatch = sample_token();
+        mismatch["ids"] = json!({"id5id":{"eid":{"source":"other.example","uids":[{"id":"ID5*synthetic","atype":1}]}}});
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &mismatch, request)
+                .expect("should reject mismatched source")
+                .outcomes[..],
+            [IdentityOutcome::NoChange]
+        ));
+        let mut expired = sample_token();
+        expired["aimTokens"][0]["identity_expires"] = json!(1000);
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &expired, request)
+                .expect("should reject expired token")
+                .outcomes[..],
+            [IdentityOutcome::NoChange]
+        ));
+        let mut missing = sample_token();
+        missing["aimTokens"][0]
+            .as_object_mut()
+            .expect("should access fixture token")
+            .remove("identity_expires");
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &missing, request)
+                .expect("should capture token without expiry")
+                .outcomes[..],
+            [IdentityOutcome::Issued {
+                expires_at: None,
+                ..
+            }]
+        ));
+        let mut unknown = sample_token();
+        unknown["aimTokens"][0]["key_name"] = json!("liveramp");
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &unknown, request)
+                .expect("should ignore unknown provider key")
+                .outcomes[..],
+            [IdentityOutcome::NoChange]
+        ));
+        let mut huge = sample_token();
+        huge["aimTokens"][0]["advertising_token"] = json!(
+            urlencoding::encode(&json!({"universal_uid":"x".repeat(513)}).to_string()).to_string()
+        );
+        assert!(matches!(
+            &observed(&integration, TOKEN_PATH, &huge, request)
+                .expect("should reject oversized UID")
+                .outcomes[..],
+            [IdentityOutcome::NoChange]
+        ));
+    }
+
+    #[test]
+    fn acquisition_requires_valid_request_json_and_signal_shapes() {
+        let integration = LockrIntegration::new(test_config());
+        assert!(observed(&integration, TOKEN_PATH, &sample_token(), b"{").is_none());
+        assert!(
+            observed(
+                &integration,
+                TOKEN_PATH,
+                &sample_token(),
+                br#"{"gppString":4}"#
+            )
+            .is_none()
+        );
+        let signals = observed(
+            &integration,
+            TOKEN_PATH,
+            &sample_token(),
+            br#"{"consentString":"opt-out","gppString":"gpp","ccpaString":"usp"}"#,
+        )
+        .expect("should parse populated consent signals")
+        .consent;
+        assert_eq!(signals.tcf.as_deref(), Some("opt-out"));
+        assert_eq!(signals.gpp.as_deref(), Some("gpp"));
+        assert_eq!(signals.usp.as_deref(), Some("usp"));
+        assert!(
+            observed(
+                &integration,
+                TOKEN_PATH,
+                &json!({"success":true,"aimTokens":[]}),
+                b"{}"
+            )
+            .is_some()
+        );
+        assert!(
+            observed(
+                &integration,
+                TOKEN_PATH,
+                &json!({"success":false,"aimTokens":[]}),
+                b"{}"
+            )
+            .is_none()
+        );
+        assert!(
+            observed(
+                &integration,
+                TOKEN_PATH,
+                &json!({"success":true,"aimTokens":{}}),
+                b"{}"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn revoke_needs_explicit_global_approval_and_application_success() {
+        let integration = LockrIntegration::new(LockrConfig {
+            capture_global_withdrawal: true,
+            ..test_config()
+        });
+        assert!(integration.matches(&Method::POST, REVOKE_PATH));
+        assert!(matches!(
+            &observed(&integration, REVOKE_PATH, &json!({"success":true}), b"{")
+                .expect("should observe approved explicit withdrawal")
+                .outcomes[..],
+            [IdentityOutcome::ConsentWithdrawn]
+        ));
+        assert!(observed(&integration, REVOKE_PATH, &json!({"success":false}), b"{}").is_none());
+        let default = LockrIntegration::new(test_config());
+        assert!(observed(&default, REVOKE_PATH, &json!({"success":true}), b"{}").is_none());
+    }
+
+    #[test]
+    fn selected_proxy_reuses_forwarded_body_and_preserves_response() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"synthetic upstream".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let integration = LockrIntegration::new(test_config());
+        let payload = br#"{"consentString":"synthetic"}"#;
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri(format!("https://publisher.example{TOKEN_PATH}?id=private"))
+            .header(header::COOKIE, "session=private")
+            .header(header::AUTHORIZATION, "Bearer private")
+            .body(EdgeBody::from(payload.to_vec()))
+            .expect("should build selected proxy request");
+        let response = futures::executor::block_on(integration.handle(
+            &create_test_settings(),
+            &services,
+            req,
+        ))
+        .expect("should forward selected proxy request");
+        assert_eq!(stub.recorded_request_bodies(), vec![payload.to_vec()]);
+        let headers = stub.recorded_request_headers();
+        assert!(
+            !headers[0]
+                .iter()
+                .any(|(key, _)| key == "cookie" || key == "authorization")
+        );
+        assert_eq!(
+            response
+                .extensions()
+                .get::<IdentityRequestBody>()
+                .expect("should attach shared forwarding bytes")
+                .0
+                .as_ref(),
+            payload
+        );
+        assert!(
+            matches!(response.into_body(), EdgeBody::Once(bytes) if bytes.as_ref() == b"synthetic upstream")
+        );
+    }
+
+    #[test]
+    fn malformed_or_failed_upstream_does_not_acquire_or_revoke() {
+        let integration = LockrIntegration::new(LockrConfig {
+            capture_global_withdrawal: true,
+            ..test_config()
+        });
+        for path in [TOKEN_PATH, REVOKE_PATH] {
+            assert!(
+                integration
+                    .observe(IdentityCaptureInput {
+                        path,
+                        request_body: b"{}",
+                        status: StatusCode::BAD_REQUEST,
+                        decoded_body: br#"{"success":true}"#,
+                    })
+                    .is_none()
+            );
+            assert!(
+                integration
+                    .observe(IdentityCaptureInput {
+                        path,
+                        request_body: b"{}",
+                        status: StatusCode::OK,
+                        decoded_body: b"{",
+                    })
+                    .is_none()
+            );
+        }
     }
 
     #[test]

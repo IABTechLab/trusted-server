@@ -302,9 +302,10 @@ pub(crate) fn entry_is_pull_complete(entry: &KvEntry, registry: &PartnerRegistry
 }
 
 fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>) -> bool {
-    kv_entry
-        .and_then(|entry| entry.ids.get(&partner.source_domain))
-        .is_none()
+    partner.identity_owner.is_none()
+        && kv_entry
+            .and_then(|entry| entry.ids.get(&partner.source_domain))
+            .is_none()
 }
 
 fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
@@ -550,6 +551,7 @@ mod tests {
             pull_sync_allowed_domains: vec!["sync.partner.test".to_owned()],
             pull_sync_ttl_sec: ttl_sec,
             pull_sync_rate_limit: 20,
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new("token".to_owned())),
         }
     }
@@ -620,6 +622,7 @@ mod tests {
                 "ssp.example.com".to_owned(),
                 crate::ec::kv_types::KvPartnerId {
                     uid: "uid".to_owned(),
+                    ..Default::default()
                 },
             );
         }
@@ -653,6 +656,26 @@ mod tests {
     }
 
     #[test]
+    fn expired_identity_does_not_trigger_legacy_pull_refresh() {
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+        let mut entry = KvEntry::minimal("ssp.example.com", "expired-uid", 1_000);
+        entry
+            .ids
+            .get_mut("ssp.example.com")
+            .expect("should contain record")
+            .expires_at = Some(1);
+        assert!(
+            entry_is_pull_complete(&entry, &registry),
+            "legacy completeness tracks stored presence, not auction usability"
+        );
+        assert!(
+            !is_partner_pull_eligible(&pull_partner(3_600), Some(&entry)),
+            "expiry must not introduce an unapproved generic refresh"
+        );
+    }
+
+    #[test]
     fn completeness_requires_all_pull_partner_ids() {
         let registry = PartnerRegistry::from_config(&[
             pull_enabled_ec_partner("a.example.com"),
@@ -670,6 +693,7 @@ mod tests {
             "b.example.com".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "uid-b".to_owned(),
+                ..Default::default()
             },
         );
 
@@ -894,6 +918,7 @@ mod tests {
             pull_sync_allowed_domains: vec![source_domain.to_owned()],
             pull_sync_ttl_sec: 3600,
             pull_sync_rate_limit: 100,
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new("outbound-token".to_owned())),
         }
     }
@@ -1181,6 +1206,7 @@ mod tests {
             "alpha.example.com".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "already-known".to_owned(),
+                ..Default::default()
             },
         );
         graph

@@ -400,6 +400,12 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
+    /// Integration selected as the authoritative identity writer for this source.
+    ///
+    /// An owned source retains token-authenticated read access, rejects legacy
+    /// batch writes and cannot enable legacy pull acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_owner: Option<String>,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
     /// When present, the token is hashed at startup for auth lookups. Omitting
@@ -3952,6 +3958,7 @@ mod tests {
             pull_sync_allowed_domains: Vec::new(),
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
         }];
 
@@ -5705,6 +5712,7 @@ source_domain = "partner.example.com"
             pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
         }
     }

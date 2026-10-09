@@ -350,6 +350,7 @@ mod tests {
             pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new("pull-token".to_owned())),
         }
     }
@@ -377,6 +378,7 @@ mod tests {
                 (*domain).to_owned(),
                 crate::ec::kv_types::KvPartnerId {
                     uid: format!("uid-{domain}"),
+                    ..Default::default()
                 },
             );
         }
@@ -512,6 +514,7 @@ mod tests {
             "a.example.com".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "stale".to_owned(),
+                ..Default::default()
             },
         );
         let snapshots = [
@@ -689,5 +692,65 @@ mod tests {
             "ts-ec-pull-complete=value; Path=/; Secure; SameSite=Lax; Max-Age=3600; HttpOnly"
         );
         assert!(!cookie.contains("Domain="), "marker should be host-only");
+    }
+
+    #[test]
+    fn ownership_change_updates_effective_pull_fingerprint() {
+        let (settings, _) = settings_and_registry(&[]);
+        let unowned = PartnerRegistry::from_config(&[
+            pull_partner("owned-source.example.com"),
+            pull_partner("legacy-source.example.com"),
+        ])
+        .expect("should build unowned pull registry");
+        let mut owned_source = pull_partner("owned-source.example.com");
+        owned_source.identity_owner = Some("identity_module".to_owned());
+        let owned = PartnerRegistry::from_config(&[
+            owned_source,
+            pull_partner("legacy-source.example.com"),
+        ])
+        .expect("should build registry with one owned source");
+
+        let before = partner_set_fingerprint(&unowned);
+        let after = partner_set_fingerprint(&owned);
+        assert_ne!(
+            before, after,
+            "moving a source to an owner should change the effective pull fingerprint"
+        );
+        let marker = create_marker(&settings, &unowned, EC_ID, 4_600)
+            .expect("should create marker for the original effective pull set");
+        assert!(
+            validate_marker(&marker, &settings, &owned, EC_ID, 1_000).is_none(),
+            "ownership change should invalidate a marker signed for the old pull set"
+        );
+    }
+
+    #[test]
+    fn owned_missing_source_is_skipped_and_expired_unowned_presence_is_complete() {
+        let mut owned_source = pull_partner("owned-source.example.com");
+        owned_source.identity_owner = Some("identity_module".to_owned());
+        let legacy_source = pull_partner("legacy-source.example.com");
+        let registry = PartnerRegistry::from_config(&[owned_source, legacy_source])
+            .expect("should build mixed owned and legacy pull registry");
+
+        let mut entry = KvEntry::tombstone(1_000);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "legacy-source.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "expired-legacy-uid".to_owned(),
+                expires_at: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(
+            entry_is_pull_complete(&entry, &registry),
+            "owned absence should not make legacy acquisition incomplete, and expired unowned presence remains fill-missing complete"
+        );
+
+        entry.ids.remove("legacy-source.example.com");
+        assert!(
+            !entry_is_pull_complete(&entry, &registry),
+            "a missing unowned source should still make legacy acquisition incomplete"
+        );
     }
 }

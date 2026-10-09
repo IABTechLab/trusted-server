@@ -6864,6 +6864,9 @@ external_bundle_sri = "sha384-AAAA"
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
             crate::openrtb::Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "liveramp.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
@@ -6872,6 +6875,9 @@ external_bundle_sri = "sha384-AAAA"
                 }],
             },
             crate::openrtb::Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "id5-sync.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
@@ -6880,6 +6886,9 @@ external_bundle_sri = "sha384-AAAA"
                 }],
             },
             crate::openrtb::Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "google.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),

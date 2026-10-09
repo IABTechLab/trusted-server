@@ -27,7 +27,6 @@ use std::time::{Duration, Instant, SystemTime};
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
-use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
@@ -36,9 +35,7 @@ use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use sha2::Digest as _;
 
-use crate::auction::endpoints::{
-    merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
-};
+use crate::auction::endpoints::resolve_and_merge_auction_eids;
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, ERROR_TYPE_ALL,
@@ -56,7 +53,7 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -4812,7 +4809,7 @@ pub async fn handle_publisher_request(
     let mut origin_request = Some(req);
     let eid_cookie_may_need_persistence = cookie_jar
         .as_ref()
-        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+        .is_some_and(|jar| jar.get(COOKIE_SHAREDID).is_some());
     // This decision also gates the concurrent origin send below. A marker skip
     // cannot currently delay the origin behind an auction because marker
     // validation requires a non-empty registry, and every such auction sets
@@ -4932,8 +4929,6 @@ pub async fn handle_publisher_request(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
-                    ec_id,
                     kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
                     ec_context,
@@ -5511,8 +5506,6 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
 /// helper within the project's 7-argument cap.
 struct AuctionEidTargeting<'a> {
-    cookie_jar: Option<&'a CookieJar>,
-    ec_id: Option<&'a str>,
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
@@ -5532,21 +5525,12 @@ fn apply_auction_eids_and_device(
     auction_request: &mut AuctionRequest,
     targeting: &AuctionEidTargeting<'_>,
 ) {
-    let ts_eids_value = targeting
-        .cookie_jar
-        .and_then(|j| j.get(COOKIE_TS_EIDS))
-        .map(|c| c.value().to_owned());
-    let client_eids = if targeting.ec_id.is_some() {
-        resolve_client_auction_eids(None, ts_eids_value.as_deref())
-    } else {
-        None
-    };
-    let kv_eids = resolve_auction_eids(
+    let merged_eids = resolve_and_merge_auction_eids(
+        None,
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
     );
-    let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -6877,8 +6861,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// `kv` enriches the bid request with server-side EIDs from the EC identity
 /// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
-/// and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
-/// on every adapter, so no adapter forwards unconsented EIDs.
+/// and Spin pass `None` and cannot resolve server-side EIDs. Retired EID cookies
+/// are ignored on every adapter.
 ///
 /// # Errors
 ///
@@ -6998,7 +6982,6 @@ pub async fn handle_page_bids(
         .map(str::to_owned);
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
-    let cookie_jar = handle_request_cookies(&req)?;
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
     // uses — relies on the adapter's geo-aware EC context.
@@ -7072,7 +7055,7 @@ pub async fn handle_page_bids(
             };
             // Hand the loaded row to the request context so response
             // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests `ts-eids`/`sharedId` updates
+            // after this handler returns — ingests sharedId updates
             // from this read instead of paying for a second lookup.
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
@@ -7088,8 +7071,6 @@ pub async fn handle_page_bids(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
-                    ec_id: ec_id.as_deref(),
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
@@ -7260,6 +7241,7 @@ mod tests {
 
     use brotli::Decompressor;
     use brotli::enc::writer::CompressorWriter;
+    use cookie::CookieJar;
     use flate2::read::GzDecoder;
     use flate2::write::GzEncoder;
 
@@ -7867,6 +7849,7 @@ mod tests {
 
     fn marker_partner(source_domain: &str) -> crate::settings::EcPartner {
         crate::settings::EcPartner {
+            identity_owner: None,
             name: format!("Marker partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
@@ -7979,6 +7962,90 @@ mod tests {
         lookups.load(Ordering::SeqCst)
     }
 
+    #[test]
+    fn publisher_and_page_bids_ignore_retired_cookie_ids() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let context = EcContext::new_for_test(
+            Some(ec_id.clone()),
+            crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            },
+        );
+        let mut entry =
+            crate::ec::kv_types::KvEntry::minimal("ids.example.com", "expired-uid", 1_000);
+        entry
+            .ids
+            .get_mut("ids.example.com")
+            .expect("should contain record")
+            .expires_at = Some(1);
+        let snapshot = crate::ec::EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry.clone()),
+            generation: Some(1),
+        };
+        let registry = PartnerRegistry::from_config(&[marker_partner("ids.example.com")])
+            .expect("should build registry");
+        let services = crate::platform::test_support::noop_services();
+        for path_label in ["Server-side", "Page-bids"] {
+            for uid in ["expired-uid", "different-uid"] {
+                let encoded = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_vec(
+                        &serde_json::json!([{"source": "ids.example.com", "uids": [{"id": uid}]}]),
+                    )
+                    .expect("should encode cookie EIDs"),
+                );
+                let mut jar = CookieJar::new();
+                jar.add(cookie::Cookie::new("ts-eids", encoded));
+                let mut request = AuctionRequest {
+                    id: "example-auction".to_owned(),
+                    slots: Vec::new(),
+                    publisher: crate::auction::types::PublisherInfo {
+                        domain: "publisher.example.com".to_owned(),
+                        page_url: None,
+                    },
+                    user: crate::auction::types::UserInfo {
+                        id: Some(ec_id.clone()),
+                        consent: Some(context.consent().clone()),
+                        eids: None,
+                    },
+                    device: None,
+                    site: None,
+                    context: Default::default(),
+                };
+                apply_auction_eids_and_device(
+                    &mut request,
+                    &AuctionEidTargeting {
+                        kv_snapshot: &snapshot,
+                        partner_registry: Some(&registry),
+                        ec_context: &context,
+                        services: &services,
+                        geo: None,
+                        path_label,
+                    },
+                );
+                let uids: Vec<&str> = request
+                    .user
+                    .eids
+                    .iter()
+                    .flatten()
+                    .flat_map(|eid| &eid.uids)
+                    .map(|uid| uid.id.as_str())
+                    .collect();
+                assert!(
+                    uids.is_empty(),
+                    "publisher and SPA must not consume retired EID cookies"
+                );
+                assert_eq!(
+                    snapshot.entry_for(&ec_id),
+                    Some(&entry),
+                    "should not mutate retained lifecycle state"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn valid_completeness_marker_skips_pull_only_snapshot_lookup() {
         assert_eq!(
@@ -8004,10 +8071,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_marker_does_not_skip_eid_cookie_persistence_lookup() {
+    async fn valid_marker_ignores_retired_eid_cookie() {
         assert_eq!(
             run_marker_lookup_probe(MarkerProbe::Valid, true, false).await,
-            1
+            0
         );
     }
 
@@ -14122,7 +14189,6 @@ mod tests {
                         &mut ec_context,
                         Some(&graph),
                         &partners,
-                        None,
                         None,
                         &mut response,
                     );

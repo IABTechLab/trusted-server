@@ -131,6 +131,14 @@ fn handle_batch_sync_with_writer(
         return Ok(error_response(StatusCode::UNAUTHORIZED, "invalid_token"));
     };
 
+    // Managed ownership keeps this token read-only for identify.
+    if partner.identity_owner.is_some() {
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "identity_source_owned",
+        ));
+    }
+
     // 2. Rate limit (per-partner, per-minute via batch_rate_limit)
     let rate_key = format!("batch:{}", partner.source_domain);
     if rate_limiter.exceeded_per_minute(&rate_key, partner.batch_rate_limit)? {
@@ -306,11 +314,16 @@ fn error_response(status: StatusCode, reason: &str) -> Response<EdgeBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::VecDeque;
 
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::kv_types::KvEntry;
     use crate::error::TrustedServerError;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
+    use crate::test_support::tests::create_test_settings;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -408,6 +421,7 @@ mod tests {
             pull_sync_allowed_domains: vec![],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: None,
         }
     }
@@ -1073,5 +1087,100 @@ mod tests {
             ],
             "should stop after the failing group and accept A's later duplicate"
         );
+    }
+
+    #[test]
+    fn owned_partner_token_is_read_only_for_batch_sync_but_still_authenticates_identify() {
+        struct CountingRateLimiter(Cell<usize>);
+
+        impl RateLimiter for CountingRateLimiter {
+            fn exceeded(
+                &self,
+                _key: &str,
+                _hourly_limit: u32,
+            ) -> Result<bool, Report<TrustedServerError>> {
+                self.0.set(self.0.get() + 1);
+                Ok(false)
+            }
+
+            fn exceeded_per_minute(
+                &self,
+                _key: &str,
+                _per_minute_limit: u32,
+            ) -> Result<bool, Report<TrustedServerError>> {
+                self.0.set(self.0.get() + 1);
+                Ok(false)
+            }
+        }
+
+        const TOKEN: &str = "test-token-32-bytes-minimum-value";
+        let source = "owned-source.identity.test";
+        let mut partner = make_test_partner(source, TOKEN);
+        partner.identity_owner = Some("lockr".to_owned());
+        let registry = PartnerRegistry::from_config(&[partner])
+            .expect("should retain an owned partner with an API token");
+
+        let writer = MockWriter::new(vec![]);
+        let limiter = CountingRateLimiter(Cell::new(0));
+        let response = handle_batch_sync_with_writer(
+            &writer,
+            &registry,
+            &limiter,
+            authorized_batch_request("not-json"),
+        )
+        .expect("should return the owned-source denial");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an owned source token must not write through batch-sync"
+        );
+        assert_eq!(
+            limiter.0.get(),
+            0,
+            "ownership should reject before consuming rate-limit budget"
+        );
+        assert!(
+            writer.calls().is_empty(),
+            "ownership should reject before KV work"
+        );
+
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("owned-identify-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let entry = KvEntry::minimal(source, "owned-source-uid", 1_000);
+        graph.create(&ec_id, &entry).expect("should seed owned UID");
+        let identify_request = Request::builder()
+            .method("GET")
+            .uri("https://publisher.example.com/_ts/api/v1/identify")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build identify request");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        let ec_context = crate::ec::EcContext::new_for_test(Some(ec_id), consent);
+
+        let identify_response = crate::ec::identify::handle_identify(
+            &settings,
+            &graph,
+            &registry,
+            &identify_request,
+            &ec_context,
+        )
+        .expect("should allow identify through the same owned partner token");
+        assert_eq!(
+            identify_response.status(),
+            StatusCode::OK,
+            "ownership should preserve read-only identify authentication"
+        );
+        let body = identify_response
+            .into_body()
+            .into_bytes()
+            .expect("should read identify response");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("should decode identify response");
+        assert_eq!(json["uid"], "owned-source-uid");
     }
 }

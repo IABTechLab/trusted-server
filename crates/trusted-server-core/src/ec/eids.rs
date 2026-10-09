@@ -1,24 +1,16 @@
 //! Shared EID resolution and formatting helpers.
 //!
 //! Used by both `/_ts/api/v1/identify` and `/auction` to resolve source-domain
-//! keyed IDs from KV entries, convert them to `OpenRTB` EID structures, and
-//! build base64-encoded response headers.
+//! keyed IDs from KV entries and convert them to `OpenRTB` EID structures.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use error_stack::{Report, ResultExt as _};
-
-use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
 use super::kv_types::KvEntry;
 use super::registry::PartnerRegistry;
 
-/// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
-pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
-
 /// A source-domain keyed ID resolved from a KV entry against the partner registry.
 ///
-/// Only includes partners with `bidstream_enabled = true` and a non-empty UID.
+/// Only includes usable records from live entries and bidstream-enabled partners.
 pub struct ResolvedPartnerId {
     /// The partner's identity source domain and EC KV `ids` key.
     pub source_domain: String,
@@ -30,14 +22,21 @@ pub struct ResolvedPartnerId {
 
 /// Resolves source-domain keyed IDs from a KV entry against the partner registry.
 ///
-/// Filters to partners with `bidstream_enabled = true` and non-empty UIDs,
-/// sorted deterministically by source domain.
+/// Filters to live, consented, bidstream-enabled records with a usable UID at
+/// the supplied checked time, sorted deterministically by source domain.
 #[must_use]
-pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<ResolvedPartnerId> {
+pub fn resolve_partner_ids(
+    registry: &PartnerRegistry,
+    entry: &KvEntry,
+    now: Option<u64>,
+) -> Vec<ResolvedPartnerId> {
     let mut resolved = Vec::new();
+    if !entry.consent.ok {
+        return resolved;
+    }
 
     for (source_domain, partner_uid) in &entry.ids {
-        if partner_uid.uid.is_empty() {
+        if !partner_uid.is_usable(now) {
             continue;
         }
 
@@ -65,6 +64,9 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
         .map(|item| Eid {
+            inserter: None,
+            matcher: None,
+            mm: None,
             source: item.source_domain.clone(),
             uids: vec![Uid {
                 id: item.uid.clone(),
@@ -75,73 +77,6 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
         .collect()
 }
 
-/// Builds a base64-encoded EID header value, truncating if needed.
-///
-/// Returns `(encoded_value, was_truncated)`. If the full set of EIDs exceeds
-/// [`MAX_EIDS_HEADER_BYTES`] after base64 encoding, partners are removed
-/// from the end of the deterministic partner ordering until it fits.
-///
-/// # Errors
-///
-/// Returns an error if JSON serialization fails.
-pub fn build_eids_header(
-    resolved: &[ResolvedPartnerId],
-) -> Result<(String, bool), Report<TrustedServerError>> {
-    let eids = to_eids(resolved);
-    encode_eids_header(&eids)
-}
-
-/// Encodes a pre-built EID slice into a base64 header value with truncation.
-///
-/// Like [`build_eids_header`] but operates on already-constructed `Eid` values
-/// (e.g., from `UserInfo.eids` in the auction response path).
-///
-/// Returns `(encoded_value, was_truncated)`.
-///
-/// # Errors
-///
-/// Returns an error if JSON serialization fails.
-pub fn encode_eids_header(eids: &[Eid]) -> Result<(String, bool), Report<TrustedServerError>> {
-    let try_encode = |size: usize| -> Result<String, Report<TrustedServerError>> {
-        let json = serde_json::to_vec(&eids[..size]).change_context(
-            TrustedServerError::Configuration {
-                message: "Failed to serialize eids header payload".to_owned(),
-            },
-        )?;
-        Ok(BASE64.encode(json))
-    };
-
-    // Fast path: try the full slice first (common case — no truncation).
-    let encoded = try_encode(eids.len())?;
-    if encoded.len() <= MAX_EIDS_HEADER_BYTES {
-        return Ok((encoded, false));
-    }
-
-    // Binary search for the largest count that fits within the limit.
-    // Invariant: lo always fits, hi never fits.
-    let mut lo: usize = 0;
-    let mut hi: usize = eids.len();
-
-    while lo + 1 < hi {
-        let mid = lo + (hi - lo) / 2;
-        let encoded = try_encode(mid)?;
-        if encoded.len() <= MAX_EIDS_HEADER_BYTES {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-
-    // `lo` is the largest size that fits. Re-encode it for the final value.
-    if lo == 0 && !eids.is_empty() {
-        log::warn!(
-            "encode_eids_header: no EIDs fit within {MAX_EIDS_HEADER_BYTES}B; emitting empty truncated header"
-        );
-    }
-    let encoded = try_encode(lo)?;
-    Ok((encoded, true))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +85,7 @@ mod tests {
 
     fn make_test_partner(source_domain: &str) -> EcPartner {
         EcPartner {
+            identity_owner: None,
             name: format!("Partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
@@ -168,6 +104,63 @@ mod tests {
     }
 
     #[test]
+    fn resolve_partner_ids_omits_expired_identity() {
+        let registry = PartnerRegistry::from_config(&[make_test_partner("ids.example.com")])
+            .expect("should build registry");
+        let mut entry = KvEntry::minimal("ids.example.com", "expired-uid", 1_000);
+        entry
+            .ids
+            .get_mut("ids.example.com")
+            .expect("should contain record")
+            .expires_at = Some(1);
+
+        assert!(
+            resolve_partner_ids(&registry, &entry, Some(2)).is_empty(),
+            "should omit a known-expired identity without deleting its record"
+        );
+    }
+
+    #[test]
+    fn resolve_partner_ids_checks_clock_boundaries_and_retains_legacy_compatibility() {
+        let registry = PartnerRegistry::from_config(&[make_test_partner("ids.example.com")])
+            .expect("should build registry");
+        let mut entry = KvEntry::minimal("ids.example.com", "example-uid", 1_000);
+        entry
+            .ids
+            .get_mut("ids.example.com")
+            .expect("should contain record")
+            .expires_at = Some(2_000);
+        assert_eq!(
+            resolve_partner_ids(&registry, &entry, Some(1_999)).len(),
+            1,
+            "should resolve before expiry"
+        );
+        assert!(
+            resolve_partner_ids(&registry, &entry, Some(2_000)).is_empty(),
+            "should omit at expiry"
+        );
+        assert!(
+            resolve_partner_ids(&registry, &entry, None).is_empty(),
+            "should fail closed for known expiry when time is unavailable"
+        );
+        entry
+            .ids
+            .get_mut("ids.example.com")
+            .expect("should contain record")
+            .expires_at = None;
+        assert_eq!(
+            resolve_partner_ids(&registry, &entry, None).len(),
+            1,
+            "should retain unknown-expiry compatibility"
+        );
+        entry.consent.ok = false;
+        assert!(
+            resolve_partner_ids(&registry, &entry, Some(1_000)).is_empty(),
+            "should never deliver a withdrawn row's records"
+        );
+    }
+
+    #[test]
     fn resolve_partner_ids_sorts_by_source_domain() {
         let partners = vec![
             make_test_partner("zeta.example.com"),
@@ -181,16 +174,18 @@ mod tests {
             "zeta.example.com".to_owned(),
             super::super::kv_types::KvPartnerId {
                 uid: "uid-z".to_owned(),
+                ..Default::default()
             },
         );
         entry.ids.insert(
             "alpha.example.com".to_owned(),
             super::super::kv_types::KvPartnerId {
                 uid: "uid-a".to_owned(),
+                ..Default::default()
             },
         );
 
-        let resolved = resolve_partner_ids(&registry, &entry);
+        let resolved = resolve_partner_ids(&registry, &entry, Some(1_000));
         let source_domains: Vec<&str> = resolved
             .iter()
             .map(|item| item.source_domain.as_str())
@@ -239,41 +234,5 @@ mod tests {
             Some(571187),
             "should preserve PAIR vendor-specific atype"
         );
-    }
-
-    #[test]
-    fn build_eids_header_truncates_when_too_large() {
-        let mut resolved = Vec::new();
-        for idx in 0..64 {
-            resolved.push(ResolvedPartnerId {
-                uid: format!("uid_{}", "x".repeat(100)),
-                source_domain: format!("partner-{idx}.example.com"),
-                openrtb_atype: 3,
-            });
-        }
-
-        let (encoded, truncated) =
-            build_eids_header(&resolved).expect("should build truncated header");
-
-        assert!(truncated, "should report truncation for large payload");
-        assert!(
-            encoded.len() <= MAX_EIDS_HEADER_BYTES,
-            "should cap encoded header bytes"
-        );
-    }
-
-    #[test]
-    fn build_eids_header_fits_without_truncation() {
-        let resolved = vec![ResolvedPartnerId {
-            uid: "u1".to_owned(),
-            source_domain: "ssp.com".to_owned(),
-            openrtb_atype: 3,
-        }];
-
-        let (encoded, truncated) =
-            build_eids_header(&resolved).expect("should build header without truncation");
-
-        assert!(!truncated, "should not truncate small payload");
-        assert!(!encoded.is_empty(), "should produce non-empty value");
     }
 }

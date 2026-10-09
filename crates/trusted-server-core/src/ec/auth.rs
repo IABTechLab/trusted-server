@@ -59,6 +59,7 @@ mod tests {
             pull_sync_allowed_domains: vec![],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: None,
         }
     }

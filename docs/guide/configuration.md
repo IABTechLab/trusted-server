@@ -656,6 +656,25 @@ the partner calls the inbound identify or batch-sync APIs. A partner without
 `api_token` remains available for source-domain lookup, bidstream EIDs, and
 outbound pull sync, but cannot authenticate to those inbound APIs.
 
+Optional `identity_owner` selects one registered integration whose capture
+capability claims the source. Deploy validation, config push and startup reject
+missing or non-claiming owners and owned sources with legacy pull enabled.
+For owned sources, `api_token` still permits read-only `identify`; `batch-sync`
+returns 403 before accessing storage. Ownership also excludes the source from
+legacy pull dispatch, completeness and marker fingerprints. Disable capture
+without removing ownership when stopping acquisition. Changing owners requires
+an operator migration and old-invocation drain, not automatic fallback.
+
+Provider expiry, writer and opaque revision are optional schema-v1 KV fields.
+Known-expired IDs are omitted from auctions and `identify` without cleanup
+writes. Unowned legacy pull remains fill-missing-only even for expired records.
+Drain metadata-unaware readers and writers before enabling managed capture.
+`/auction` body EIDs enrich existing consenting rows conservatively; the retired
+`ts-eids` cookie and EID diagnostic response headers are no longer identity
+transport. Inbound diagnostic headers remain stripped. See the
+[Prebid transport migration](./integrations/prebid.md) and
+[Lockr capture gates](./integrations/lockr.md).
+
 **Example**:
 
 ```toml
