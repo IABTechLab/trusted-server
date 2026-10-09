@@ -18,6 +18,7 @@ pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
+pub mod identity;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;

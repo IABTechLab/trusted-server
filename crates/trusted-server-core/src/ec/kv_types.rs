@@ -34,10 +34,13 @@ pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 /// validation.
 pub const MAX_UID_LENGTH: usize = 512;
 
+/// Maximum byte length for a stored writer label or opaque record revision.
+pub const MAX_LIFECYCLE_LABEL_BYTES: usize = 128;
+
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
-/// **KV value:** JSON-serialized `KvEntry` (max ~5KB).
+/// **KV value:** JSON-serialized `KvEntry`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {
     /// Schema version — always [`SCHEMA_VERSION`].
@@ -97,11 +100,34 @@ pub struct KvGeo {
     pub dma: Option<i64>,
 }
 
-/// A partner user ID within a KV entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A partner user ID and its optional lifecycle metadata within a KV entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvPartnerId {
     /// The partner's user identifier.
     pub uid: String,
+    /// Provider expiry in Unix seconds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    /// Framework-assigned writer identity, not `OpenRTB` provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
+    /// Opaque version of a material record change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl KvPartnerId {
+    /// Returns whether this record can be delivered at the supplied checked time.
+    ///
+    /// Unknown-expiry records retain legacy behavior. A known expiry requires
+    /// usable time and is exclusive: the record is unusable at its expiry.
+    #[must_use]
+    pub fn is_usable(&self, now: Option<u64>) -> bool {
+        !self.uid.is_empty()
+            && self
+                .expires_at
+                .is_none_or(|expiry| now.is_some_and(|now| now < expiry))
+    }
 }
 
 /// Publisher property metadata captured when an EC entry is created.
@@ -307,6 +333,7 @@ impl KvEntry {
             partner_id.to_owned(),
             KvPartnerId {
                 uid: uid.to_owned(),
+                ..Default::default()
             },
         );
         Self {
@@ -381,6 +408,18 @@ impl KvEntry {
         }
 
         for (partner_id, partner_uid) in &self.ids {
+            for (field, label) in [
+                ("writer", partner_uid.writer.as_deref()),
+                ("revision", partner_uid.revision.as_deref()),
+            ] {
+                if let Some(label) = label
+                    && (label.trim().is_empty() || label.len() > MAX_LIFECYCLE_LABEL_BYTES)
+                {
+                    return Err(format!(
+                        "partner ID '{partner_id}' has invalid {field} metadata"
+                    ));
+                }
+            }
             if partner_uid.uid.len() > MAX_UID_LENGTH {
                 return Err(format!(
                     "partner ID '{partner_id}' exceeds MAX_UID_LENGTH ({})",
@@ -486,6 +525,149 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_labels_are_bounded_without_logging_their_values() {
+        for label in [
+            String::new(),
+            " ".to_owned(),
+            "x".repeat(MAX_LIFECYCLE_LABEL_BYTES + 1),
+        ] {
+            for field in ["writer", "revision"] {
+                let mut entry = KvEntry::minimal("ids.example.com", "example-uid", 1_000);
+                let record = entry
+                    .ids
+                    .get_mut("ids.example.com")
+                    .expect("should contain record");
+                if field == "writer" {
+                    record.writer = Some(label.clone());
+                } else {
+                    record.revision = Some(label.clone());
+                }
+                let error = entry
+                    .validate()
+                    .expect_err("should reject invalid lifecycle labels");
+                assert_eq!(
+                    error,
+                    format!("partner ID 'ids.example.com' has invalid {field} metadata"),
+                    "should report only the field, not its value"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partner_usability_respects_expiry_boundaries_and_clock_failure() {
+        let mut record = KvPartnerId {
+            uid: "example-uid".to_owned(),
+            expires_at: Some(2_000),
+            ..Default::default()
+        };
+        assert!(
+            record.is_usable(Some(1_999)),
+            "should allow a record before expiry"
+        );
+        assert!(
+            !record.is_usable(Some(2_000)),
+            "should omit a record at expiry"
+        );
+        assert!(
+            !record.is_usable(Some(2_001)),
+            "should omit a record after expiry"
+        );
+        assert!(
+            !record.is_usable(None),
+            "should not prove known expiry usable without a clock"
+        );
+        record.expires_at = None;
+        assert!(
+            record.is_usable(None),
+            "should retain unknown-expiry legacy behavior"
+        );
+        record.uid.clear();
+        assert!(!record.is_usable(Some(1_999)), "should omit an empty UID");
+    }
+
+    #[test]
+    fn legacy_partner_records_keep_their_uid_only_shape() {
+        let record = serde_json::json!({ "uid": "example-uid" });
+        let partner: KvPartnerId =
+            serde_json::from_value(record.clone()).expect("should decode a legacy partner record");
+
+        assert_eq!(partner.expires_at, None, "should retain unknown expiry");
+        assert_eq!(
+            partner.writer, None,
+            "should not invent a historical writer"
+        );
+        assert_eq!(
+            partner.revision, None,
+            "should not invent a historical revision"
+        );
+        assert_eq!(
+            serde_json::to_value(partner).expect("should serialize a legacy partner record"),
+            record,
+            "should omit absent lifecycle fields"
+        );
+    }
+
+    #[test]
+    fn partner_record_equality_includes_lifecycle_metadata() {
+        let original = KvPartnerId {
+            uid: "example-uid".to_owned(),
+            expires_at: Some(2_000),
+            writer: Some("example_identity".to_owned()),
+            revision: Some("example-revision".to_owned()),
+        };
+        let mut changed = original.clone();
+        changed.expires_at = Some(3_000);
+        assert_ne!(
+            original, changed,
+            "should distinguish same-UID expiry changes"
+        );
+        changed = original.clone();
+        changed.writer = Some("legacy".to_owned());
+        assert_ne!(original, changed, "should distinguish writer changes");
+        changed = original.clone();
+        changed.revision = Some("next-revision".to_owned());
+        assert_ne!(original, changed, "should distinguish revision changes");
+        assert_eq!(
+            original,
+            original.clone(),
+            "should match unchanged metadata"
+        );
+    }
+
+    #[test]
+    fn malformed_partner_expiry_fails_deserialization() {
+        for expiry in [serde_json::json!(-1), serde_json::json!("invalid")] {
+            assert!(
+                serde_json::from_value::<KvPartnerId>(serde_json::json!({
+                    "uid": "example-uid",
+                    "expires_at": expiry
+                }))
+                .is_err(),
+                "should not downgrade malformed known expiry to unknown expiry"
+            );
+        }
+    }
+
+    #[test]
+    fn partner_lifecycle_metadata_round_trips() {
+        let record = serde_json::json!({
+            "uid": "example-uid",
+            "expires_at": 2_000,
+            "writer": "example_identity",
+            "revision": "example-revision"
+        });
+        let partner: KvPartnerId = serde_json::from_value(record.clone())
+            .expect("should deserialize partner lifecycle metadata");
+
+        assert_eq!(
+            serde_json::to_value(partner).expect("should serialize partner lifecycle metadata"),
+            record,
+            "should preserve lifecycle metadata instead of silently dropping it"
+        );
+    }
+
+    #[test]
     fn entry_serialization_roundtrip() {
         let geo = sample_geo_info();
         let consent = sample_consent_context();
@@ -494,6 +676,7 @@ mod tests {
             "liveramp".to_owned(),
             KvPartnerId {
                 uid: "LR_xyz".to_owned(),
+                ..Default::default()
             },
         );
 
@@ -739,6 +922,7 @@ mod tests {
             "ssp_x".to_owned(),
             KvPartnerId {
                 uid: "x".repeat(MAX_UID_LENGTH + 1),
+                ..Default::default()
             },
         );
 

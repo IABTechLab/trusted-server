@@ -370,9 +370,8 @@ async fn admin_ec_route_without_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_admin_eids_route_returns_200() {
-    // The EIDs echo is pure request inspection (no KV), so this adapter
-    // serves the real handler.
+async fn authenticated_admin_eids_route_returns_local_retirement() {
+    // Retired diagnostics must not forward authenticated requests to origin.
     let req = request_builder()
         .method("GET")
         .uri("/_ts/admin/eids")
@@ -383,9 +382,11 @@ async fn authenticated_admin_eids_route_returns_200() {
 
     assert_eq!(
         resp.status().as_u16(),
-        200,
-        "/_ts/admin/eids should serve the real EIDs echo handler"
+        410,
+        "should deny the retired EID diagnostic locally"
     );
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

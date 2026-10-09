@@ -8,10 +8,16 @@ use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
 
+use super::identity::{
+    IdentityCapture, IdentityCaptureInput, IdentityRequestBody, inspect_response,
+};
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
+use crate::ec::identity::stage_capture;
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::partner::normalize_partner_source_domain;
+use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
@@ -629,6 +635,8 @@ pub struct IntegrationRegistration {
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// Capture capability and finite ownership descriptor, including when disabled.
+    pub identity_capture: Option<Arc<dyn IdentityCapture>>,
 }
 
 impl IntegrationRegistration {
@@ -655,6 +663,7 @@ impl IntegrationRegistrationBuilder {
                 html_stream_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                identity_capture: None,
             },
         }
     }
@@ -662,6 +671,13 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_proxy(mut self, proxy: Arc<dyn IntegrationProxy>) -> Self {
         self.registration.proxies.push(proxy);
+        self
+    }
+
+    /// Registers capture and ownership claims in the existing integration registry.
+    #[must_use]
+    pub fn with_identity_capture(mut self, capture: Arc<dyn IdentityCapture>) -> Self {
+        self.registration.identity_capture = Some(capture);
         self
     }
 
@@ -745,6 +761,7 @@ struct IntegrationRegistryInner {
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    identity_captures: BTreeMap<&'static str, Arc<dyn IdentityCapture>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -766,6 +783,7 @@ impl Default for IntegrationRegistryInner {
             html_stream_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            identity_captures: BTreeMap::new(),
         }
     }
 }
@@ -863,6 +881,11 @@ impl IntegrationRegistry {
         }
 
         for registration in registrations {
+            if let Some(capture) = registration.identity_capture {
+                inner
+                    .identity_captures
+                    .insert(registration.integration_id, capture);
+            }
             inner
                 .enabled_integration_ids
                 .push(registration.integration_id);
@@ -931,10 +954,69 @@ impl IntegrationRegistry {
             }
         }
 
+        Self::check_identity_owners(settings, &inner.identity_captures)?;
         Ok(Self {
             inner: Arc::new(inner),
             plan: Some(plan),
         })
+    }
+
+    /// Validates source ownership through existing builders, including disabled capture.
+    ///
+    /// Only selected owner builders are constructed, so deploy validation does
+    /// not accidentally run startup checks on unrelated unresolved secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for an unavailable or non-claiming owner.
+    pub fn validate_identity_owners(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+        let mut captures = BTreeMap::new();
+        for partner in &settings.ec.partners {
+            let Some(owner) = partner.identity_owner.as_deref() else {
+                continue;
+            };
+            if captures.contains_key(owner) {
+                continue;
+            }
+            if let Some(builder) = crate::integrations::builders()
+                .iter()
+                .find(|builder| builder.id == owner)
+                && let Some(registration) = (builder.build)(settings)?
+                && let Some(capture) = registration.identity_capture
+            {
+                captures.insert(registration.integration_id, capture);
+            }
+        }
+        Self::check_identity_owners(settings, &captures)
+    }
+
+    fn check_identity_owners(
+        settings: &Settings,
+        captures: &BTreeMap<&'static str, Arc<dyn IdentityCapture>>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        for partner in &settings.ec.partners {
+            let Some(owner) = partner.identity_owner.as_deref() else {
+                continue;
+            };
+            let source = normalize_partner_source_domain(&partner.source_domain).map_err(|_| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "identity source is invalid".to_owned(),
+                })
+            })?;
+            let claims_source = captures.get(owner).is_some_and(|capture| {
+                capture.sources().iter().any(|claim| {
+                    normalize_partner_source_domain(claim).ok().as_deref() == Some(source.as_str())
+                })
+            });
+            if !claims_source || partner.pull_sync_enabled {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "identity owner for '{source}' must be a registered claiming integration with legacy pull disabled"
+                    ),
+                }));
+            }
+        }
+        Ok(())
     }
 
     /// Return whether this registry and another consumer share the same plan allocation.
@@ -1041,7 +1123,7 @@ impl IntegrationRegistry {
             services,
             mut req,
         } = input;
-        if let Some((proxy, _)) = self.find_route(method, path) {
+        if let Some((proxy, integration_id)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
@@ -1058,7 +1140,38 @@ impl IntegrationRegistry {
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
-            Some(proxy.handle(settings, services, req).await)
+            let result = proxy.handle(settings, services, req).await;
+            let Ok(mut response) = result else {
+                return Some(result);
+            };
+            let request_body = response.extensions_mut().remove::<IdentityRequestBody>();
+            if let Some(capture) = self.inner.identity_captures.get(integration_id)
+                && capture.enabled()
+                && capture.matches(method, path)
+            {
+                let (original, decoded) = inspect_response(response).await;
+                response = original;
+                if let Some(decoded) = decoded
+                    && let Some(observation) = capture.observe(IdentityCaptureInput {
+                        path,
+                        request_body: request_body.as_ref().map_or(&[], |body| body.0.as_ref()),
+                        status: response.status(),
+                        decoded_body: &decoded,
+                    })
+                    && let Ok(partners) = PartnerRegistry::from_config(&settings.ec.partners)
+                    && let Some(effects) = stage_capture(
+                        integration_id,
+                        capture.sources(),
+                        observation,
+                        ec_context,
+                        &partners,
+                        settings,
+                    )
+                {
+                    response.extensions_mut().insert(effects);
+                }
+            }
+            Some(Ok(response))
         } else {
             None
         }
@@ -1270,6 +1383,7 @@ impl IntegrationRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner {
+                identity_captures: BTreeMap::new(),
                 get_router: Router::new(),
                 post_router: Router::new(),
                 put_router: Router::new(),
@@ -1300,6 +1414,7 @@ impl IntegrationRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner {
+                identity_captures: BTreeMap::new(),
                 get_router: Router::new(),
                 post_router: Router::new(),
                 put_router: Router::new(),
@@ -1326,6 +1441,7 @@ impl IntegrationRegistry {
     pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner {
+                identity_captures: BTreeMap::new(),
                 get_router: Router::new(),
                 post_router: Router::new(),
                 put_router: Router::new(),
@@ -1392,6 +1508,7 @@ impl IntegrationRegistry {
 
         Self {
             inner: Arc::new(IntegrationRegistryInner {
+                identity_captures: BTreeMap::new(),
                 get_router,
                 post_router,
                 put_router,

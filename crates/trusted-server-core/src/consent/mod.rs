@@ -404,6 +404,90 @@ pub fn is_consent_expired(tcf: &types::TcfConsent, max_age_days: u32) -> bool {
     now_deciseconds().saturating_sub(tcf.last_updated_ds) > max_age_ds
 }
 
+/// Checks restrictive capture signals with the shared decoders and expiry policy.
+///
+/// Populated malformed signals never become permission through a permissive
+/// jurisdiction or proxy mode. Body signals may only restrict request consent.
+pub(crate) fn identity_capture_consent_allowed(
+    request: &ConsentContext,
+    body: &RawConsentSignals,
+    config: &ConsentConfig,
+) -> bool {
+    if request.gpc || request.expired || !allows_ec_creation(request) {
+        return false;
+    }
+    let request_signals = RawConsentSignals {
+        raw_tc_string: request.raw_tc_string.clone(),
+        raw_gpp_string: request.raw_gpp_string.clone(),
+        raw_us_privacy: request.raw_us_privacy.clone(),
+        ..Default::default()
+    };
+    restrictive_identity_signals_allow(&request_signals, config)
+        && restrictive_identity_signals_allow(body, config)
+        && effective_tcf(request).is_none_or(allows_eid_transmission)
+        && request.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) != Some(true)
+        && !request
+            .us_privacy
+            .as_ref()
+            .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+}
+
+fn restrictive_identity_signals_allow(signals: &RawConsentSignals, config: &ConsentConfig) -> bool {
+    let tcf_allowed = |tcf: &TcfConsent| {
+        if !allows_eid_transmission(tcf) {
+            return false;
+        }
+        if !config.check_expiration {
+            return true;
+        }
+        let Some(now) = crate::ec::checked_current_timestamp() else {
+            return false;
+        };
+        now.saturating_mul(10).saturating_sub(tcf.last_updated_ds)
+            <= u64::from(config.max_consent_age_days) * DECISECONDS_PER_DAY
+    };
+    if let Some(raw) = signals
+        .raw_tc_string
+        .as_deref()
+        .filter(|raw| !raw.is_empty())
+    {
+        let Ok(tcf) = tcf::decode_tc_string(raw) else {
+            return false;
+        };
+        if !tcf_allowed(&tcf) {
+            return false;
+        }
+    }
+    if let Some(raw) = signals
+        .raw_gpp_string
+        .as_deref()
+        .filter(|raw| !raw.is_empty())
+    {
+        let Ok(gpp) = gpp::decode_gpp_string(raw) else {
+            return false;
+        };
+        if gpp.us_sale_opt_out == Some(true)
+            || gpp.eu_tcf.as_ref().is_some_and(|tcf| !tcf_allowed(tcf))
+            || (gpp.us_sale_opt_out.is_none() && gpp.eu_tcf.is_none())
+        {
+            return false;
+        }
+    }
+    if let Some(raw) = signals
+        .raw_us_privacy
+        .as_deref()
+        .filter(|raw| !raw.is_empty())
+    {
+        let Ok(usp) = us_privacy::decode_us_privacy(raw) else {
+            return false;
+        };
+        if usp.opt_out_sale == PrivacyFlag::Yes {
+            return false;
+        }
+    }
+    !signals.gpc
+}
+
 /// Constructs a US Privacy string from `Sec-GPC` and publisher config defaults.
 ///
 /// Called when `gpc = true` but no explicit `us_privacy` cookie exists and the

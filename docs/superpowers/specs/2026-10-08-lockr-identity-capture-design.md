@@ -1,57 +1,66 @@
 # Proxy-side identity capture for lockr-issued IDs
 
-Status: Design proposed, awaiting engineering review.
+Status: ID5-only capture implemented in the draft change, awaiting code review.
+Provider fixtures, consent approval, revocation semantics and live acceptance
+remain gated; rollout configuration explicitly disables capture. Depends on the
+[server-side identity foundation](2026-10-09-server-side-identity-foundation-design.md).
+See the [implementation plan and verification](../plans/2026-10-09-server-side-identity-foundation-and-lockr.md).
 
 Issue: [#1246](https://github.com/IABTechLab/trusted-server/issues/1246).
 
-Related: [2026-07-10 KV EID request snapshot and EC recovery](2026-07-10-kv-eid-request-snapshot-ec-recovery-design.md)
-defines the snapshot and post-send primitives this design reuses.
+The foundation owns capability registration, common identity outcomes, source
+ownership, lifecycle records, consent/mutation policy and adapter execution.
+It also owns auction-body ingestion and retirement of `ts-eids` and the EID
+diagnostic headers. This spec defines Lockr's capture behavior using those
+contracts; it does not introduce a separate identity service or KV writer.
 
-## 1. Purpose
+Related: [KV EID request snapshot and EC recovery](2026-07-10-kv-eid-request-snapshot-ec-recovery-design.md)
+defines existing snapshot and root safety rules retained by the foundation.
 
-The lockr SDK obtains partner IDs (ID5 today; RampID, UID2, EUID, FirstID,
-Yahoo ConnectID, PanoramaID, Criteo and Epsilon by configuration) and hands
-them to Prebid through `pbjs.setConfig({ortb2: {user: {ext: {eids}}}})`.
-Trusted Server collects auction EIDs from `pbjs.getUserIdsAsEids()`, which only
-reports the Prebid User ID module. The lockr IDs therefore reach client-side
-bidders and never reach the server-side auction, the `ts-eids` cookie, or the
-EC identity graph. This was measured on the production publisher route on
-2026-10-06 (Safari) and reconfirmed on 2026-10-08 (Chrome, direct versus TS
-matched arm): six captured `/auction` payloads contained no `id5-sync.com`
-entry while the same page carried the ID in `ortb2.user.ext.eids`.
+## 1. Purpose and agreed direction
 
-The fix proposed in the issue thread (merge configured `ortb2` EIDs into the
-JavaScript collector) corrects the symptom but keeps three dependencies this
-design removes:
+The lockr SDK obtains partner IDs, ID5 today and other providers by
+configuration, and hands them to Prebid through
+`pbjs.setConfig({ortb2: {user: {ext: {eids}}}})`. Trusted Server collects auction
+EIDs from `pbjs.getUserIdsAsEids()`, which only reports the Prebid User ID
+module. The lockr IDs therefore reach client-side bidders but do not reach the
+server-side auction or the EC identity graph. This was measured on the
+production publisher route on 2026-10-06 in Safari and reconfirmed on
+2026-10-08 in Chrome, direct versus TS matched arm. Six captured `/auction`
+payloads contained no `id5-sync.com` entry while the same page carried the ID
+in `ortb2.user.ext.eids`.
 
-1. The ID still travels through Prebid configuration.
-2. The ID still depends on the tsjs prebid module running in the page.
-3. The `ts-eids` cookie is written in `bidsBackHandler`, after the first
-   auction request has left, and KV ingestion happens on a later eligible
-   navigation.
+Capture those IDs in the first-party proxy response from lockr's API. Submit
+common identity outcomes to the shared service, which persists them under the
+visitor's existing EC ID after sending the response on Fastly.
 
-This design captures the IDs where Trusted Server already sees them, in the
-first-party proxy response from lockr's API, and writes them to a server-owned
-first-party cookie immediately and to KV after the response has been sent.
+The lockr SDK still runs in the browser. Capture does not depend on Prebid
+configuration or the TS JavaScript EID collector. There is no `ts-eids-s` or
+replacement EID cookie. `ts-ec` remains the browser's identity pointer.
+
+Delayed availability is accepted: a later auction sees an ID only after the
+deferred write completes and its KV read can see the record. The first auction
+may miss it. There is no cookie fallback or durable capture retry queue.
 
 ## 2. Observed lockr flow
 
-All lockr traffic on a TS page goes through `/integrations/lockr/api/*`, proxied
-by `handle_api_proxy` in `crates/trusted-server-core/src/integrations/lockr.rs`
-to `https://identity.loc.kr`. The trust-server SDK build hard-codes
+All lockr API traffic on a TS page goes through `/integrations/lockr/api/*`,
+proxied by `handle_api_proxy` in
+`crates/trusted-server-core/src/integrations/lockr.rs` to
+`https://identity.loc.kr`. The trust-server SDK build hard-codes
 `host: "/integrations/lockr/api"`, so no client shim is involved in routing.
 
 Measured call sequence after the publisher's consent gate opens:
 
-| Order | Request                                                                 | Carries                                                                                                                                                             |
-| ----- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | `GET /integrations/lockr/sdk`                                           | SDK body, 118,542 bytes                                                                                                                                             |
-| 2     | `POST .../publisher/app/v2/identityLockr/settings`                      | Request body `{appID}`. Response: publisher flags, `rampJSClientId`, client IP and geo, `hashedUserAgent`, `vvFlag`                                                 |
-| 3     | `POST .../publisher/app/v2/identityLockr/page-view`                     | Request body: `LTID`, existing `tokens` keyed by provider, `noGenerate`, consent strings, URL, referrer. Response on first issue: `aimTokens[]` and `ids.<key>.eid` |
-| 4     | `POST .../refresh-tokens`, `.../generate-tokens`, `.../sync-no-hem-ids` | Later token updates, same shapes                                                                                                                                    |
-| 5     | `POST .../revoke-consent`                                               | `LTID` and `optOutReason`                                                                                                                                           |
+| Order | Request                                                                 | Carries                                                                                                                            |
+| ----- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `GET /integrations/lockr/sdk`                                           | SDK body, 118,542 bytes                                                                                                            |
+| 2     | `POST .../publisher/app/v2/identityLockr/settings`                      | Request `{appID}`; response publisher settings                                                                                     |
+| 3     | `POST .../publisher/app/v2/identityLockr/page-view`                     | Request `LTID`, existing provider tokens, consent strings and page context; first-issue response `aimTokens[]` and `ids.<key>.eid` |
+| 4     | `POST .../refresh-tokens`, `.../generate-tokens`, `.../sync-no-hem-ids` | Later token updates                                                                                                                |
+| 5     | `POST .../revoke-consent`                                               | `LTID` and `optOutReason`                                                                                                          |
 
-Measured `page-view` response on first issue (identifier values elided):
+Measured `page-view` response on first issue, with identifier values elided:
 
 ```json
 {
@@ -83,298 +92,209 @@ Measured `page-view` response on first issue (identifier values elided):
 }
 ```
 
-The response is 603 bytes. The SDK then writes cookie and localStorage `id5id`,
-and exposes the EID to Prebid with `inserter: "Lockr-For-Publishers"`,
-`matcher: ""`, `mm: 2`.
+The response is 603 bytes. The SDK writes provider cookie and localStorage
+`id5id`, and exposes the EID to Prebid with `inserter: "Lockr-For-Publishers"`,
+`matcher: ""`, `mm: 2`. Those provider-owned browser stores are not removed.
 
-The request arrives at the proxy as a same-origin XHR, so it carries the
-`ts-ec`, `__gpp`, `__gpp_sid` and `us_privacy` cookies, and its body carries
-lockr's own `gppString`, `consentString` and `ccpaString`. The integration route
-already builds an `EcContext` from the request and attaches `EcFinalizeState`
-to the response (`dispatch_fallback` in
-`crates/trusted-server-adapter-fastly/src/app.rs`). The Fastly entry point
-already runs post-send work after `send_edgezero_response` (pull sync in
-`crates/trusted-server-adapter-fastly/src/main.rs`).
+The integration XHR carries `ts-ec` and publisher consent cookies to TS. The
+proxy does not forward publisher cookies or authorization to lockr. Its body
+carries lockr's own consent strings. The route already builds an `EcContext`
+and attaches `EcFinalizeState`; Fastly already has post-send execution.
 
-Nothing reads the proxied response body today. `handle_api_proxy` returns the
-upstream response as-is.
+Today the upstream response body is not inspected. `/auction` body EIDs are
+used for that auction, while cookie EIDs are persisted by finalization. The
+foundation changes the latter contract to direct auction-body ingestion before
+retiring the cookie path.
 
-## 3. Requirements
+## 3. Requirements and non-goals
 
-1. Lockr-issued IDs reach the server-side auction without the Prebid User ID
-   module and without any client-side JavaScript module.
-2. The IDs are written to a first-party cookie by the server on the same
-   response that delivered them, and to the EC identity graph without a KV
-   write before response bytes are sent.
-3. The IDs are available to the next auction on the same page load through the
-   cookie, and to later navigations through KV, with the cookie as fallback.
-4. Token refresh and consent revocation from lockr are reflected without a new
-   mechanism.
-5. OpenRTB 2.6 EID provenance (`inserter`, `matcher`, `mm`) survives into the
-   auction payload.
-6. Existing consent gating, size caps and fail-closed KV behavior are
-   unchanged.
+1. Capture lockr-issued IDs without requiring the Prebid User ID module or
+   a TS browser capture module.
+2. Implement the foundation's optional capture capability only. Lockr has no
+   active server-side resolver in this delivery.
+3. Return original proxy responses intact, with no added EID cookie and no
+   Fastly KV enrichment write before send.
+4. Submit authoritative `Issued` outcomes for owned, registered sources;
+   subsequent SDK token responses use the same path.
+5. Preserve known provider expiry through the foundation's lifecycle record.
+   Suppress expired IDs on later auctions without a hot-path cleanup write.
+6. Translate explicit consent revocation separately from token acquisition,
+   including when current request consent no longer allows identity use.
+7. Retain consent, size, UID, root and tombstone safety requirements from the
+   foundation. A failed capture must not break the SDK call.
 
-Out of scope: changing the JavaScript EID collector, server-to-server calls to
-lockr, direct proxies for ID5 or LiveRamp, and storing provenance metadata in
-KV.
+Out of scope: server-to-server calls to lockr, identifier intake, cross-browser
+linking, changing Prebid provider discovery, direct ID5 or LiveRamp proxies,
+OpenRTB provenance/provider `ext` storage, and client-side delivery of KV IDs.
 
-## 4. Design
+## 4. Capture implementation
 
-### 4.1 Capture hook on the integration proxy
+### 4.1 Registration and response handling
 
-Add an optional trait to the integration registry:
+Register `LockrIntegration` through `.with_identity_capture()` alongside its
+existing proxy and attribute rewriter. Its identity descriptor claims the
+confirmed source mappings in section 4.2. It registers no resolver capability.
+`capture_identity = false` disables observation while preserving the descriptor
+needed to validate configured source ownership.
 
-```rust
-/// Identity tokens an integration proxy observed in an upstream response.
-pub struct CapturedEid {
-    /// OpenRTB `source` domain, for example `id5-sync.com`.
-    pub source: String,
-    pub uid: String,
-    pub atype: Option<i32>,
-    /// Unix seconds; absent when the provider gave no expiry.
-    pub expires_at: Option<u64>,
-    pub inserter: Option<String>,
-    pub matcher: Option<String>,
-    pub mm: Option<i32>,
-}
+The capture paths are exact POST paths relative to `/integrations/lockr/api`:
 
-/// Outcome of inspecting one proxied response.
-pub enum IdentityCapture {
-    None,
-    Tokens(Vec<CapturedEid>),
-    ConsentRevoked,
-}
+- `/publisher/app/v2/identityLockr/page-view`
+- `/publisher/app/v2/identityLockr/generate-tokens`
+- `/publisher/app/v2/identityLockr/refresh-tokens`
+- `/publisher/app/v2/identityLockr/sync-no-hem-ids`
+- `/publisher/app/v2/identityLockr/revoke-consent`
 
-pub trait IntegrationIdentityCapture {
-    /// Paths (relative to the integration's `/api` prefix) whose responses
-    /// should be buffered and inspected.
-    fn capture_paths(&self) -> &'static [&'static str];
+The foundation handles bounded inspection and response preservation. Apply its
+independent 64 KiB original-body and 64 KiB decoded-JSON limits. Compressed
+responses must be decoded incrementally; overflow, unsupported encoding or
+decode failure skips capture and forwards original bytes and headers unchanged.
+The SDK and unlisted API paths retain existing handling.
 
-    /// Parses a buffered upstream response body.
-    fn capture(&self, path: &str, status: StatusCode, body: &[u8]) -> IdentityCapture;
-}
+Extract request-body consent signals from the POST bytes already buffered for
+forwarding. Supply them to the shared service without consuming the request
+again or modifying the forwarded payload. The integration does not write KV,
+set identity cookies or run its own background dispatch.
+
+### 4.2 Token normalization
+
+For token endpoints, read `aimTokens[]` and associated
+`ids.<key_name>.eid`. Prefer the EID's source and UID, validating the source
+against the mapping for that known key. When only `aimTokens[]` is present,
+map `key_name` using the SDK's `tokenMappings` and `tokenSourceMappings`:
+
+| `key_name`                 | `source`                    | Expected `atype` |
+| -------------------------- | --------------------------- | ---------------- |
+| `id5id`                    | `id5-sync.com`              | 1                |
+| `_lr_env`                  | `liveramp.com`              | 3                |
+| `__uid2_advertising_token` | `uidapi.com`                | 3                |
+| `__euid_advertising_token` | `euid.eu`                   | 3                |
+| `firstid`                  | `first-id.fr`               | 1                |
+| `connectId`                | `yahooinc.com`              | 3                |
+| `panoramaId`               | `panorama.com`, unconfirmed | 1                |
+| `cto_bidid`                | `criteo.com`                | 3                |
+| `_publink`                 | `epsilon.com`               | 3                |
+
+Do not enable the unconfirmed Panorama mapping until lockr confirms the source
+and type. Unknown keys and mismatched sources are dropped with redacted debug
+logging. An arbitrary EID source cannot expand Lockr's registered claims.
+
+For ID5, decode the URL-encoded JSON `advertising_token` and extract
+`universal_uid`. Submit one valid UID per source using the existing non-empty,
+512-byte UID limit. Source and aggregate caps are enforced by the foundation.
+Decode all supported provider token shapes using sanitized SDK/response
+fixtures before enabling their mappings; the ID5 shape alone is not evidence
+that every provider uses the same token encoding.
+
+Convert associated `identity_expires` from milliseconds to Unix seconds and
+include it in `Issued`. Drop a token already expired at capture time. The
+foundation stores known expiry and filters expired values on every later
+auction path. Missing expiry remains unknown; it does not erase a known expiry
+for the same UID.
+
+Unlike the earlier standalone draft, expiry is not discarded after parsing.
+This depends on the foundation's metadata-compatible storage rollout, not a
+Lockr-specific KV schema or timer. Lockr does not actively refresh records:
+new expiry or replacement tokens arrive through later SDK responses.
+
+A response with valid tokens produces `Issued`; a valid response with no new
+tokens produces `NoChange`. Non-2xx or malformed token responses skip capture.
+Neither an empty token response nor a fetch failure invalidates stored IDs.
+
+### 4.3 Consent and ownership
+
+The shared service requires allowed EC consent, a valid existing `ts-ec`,
+a registered source owned by `lockr`, and a live consenting root at mutation.
+Integration XHRs never generate or recover an identity.
+
+Lockr supplies its request-body `gppString`, `consentString` and `ccpaString`
+when populated. Empty optional fields are absent signals, not positive consent.
+Malformed non-empty signals fail closed; valid opt-outs cannot be overridden
+by allowed cookie consent. The shared consent layer interprets these signals,
+not a second Lockr-specific consent engine. Confirm any additional broker or
+provider-purpose requirements before enabling the relevant mappings.
+
+Failed token gating leaves the response intact and queues no enrichment.
+Browser submissions of the same source remain conservative foundation inputs;
+they cannot choose the `lockr` writer identity or replace a stored owned record.
+
+### 4.4 Explicit withdrawal
+
+The current provider contract assumes a successful 2xx `revoke-consent` response
+means explicit publisher-level identity withdrawal. Translate it into the
+foundation's `ConsentWithdrawn` outcome with global EC scope. Confirm both the
+application-success semantics and the scope with lockr before rollout; a
+provider-specific opt-out must not be widened into a global withdrawal.
+
+This outcome does not pass through token-consent eligibility: revocation must
+still work after consent becomes denied. The shared finalizer expires `ts-ec`
+and the service applies the existing-key-only tombstone path. Normal request
+withdrawal takes precedence and suppresses duplicate work. Lockr never clears
+or recreates a root independently.
+
+### 4.5 Shared persistence and auction delivery
+
+The shared service stages trusted capture effects with the full EC ID and
+snapshot. Fastly extracts them before response conversion, sends the response,
+then applies them before legacy pull sync. Lockr has no private
+`DeferredIdentityUpdates` type, adapter branch or mutation function.
+
+The service applies authoritative replacement for the configured owner,
+preserving unrelated sources and rejecting withdrawn roots. Same UID and same
+lifecycle metadata skip writes; a changed known expiry can require a write even
+if the UID is unchanged. Pass the resulting persisted snapshot to later work.
+
+Integration requests can carry a `NotRead` snapshot. The first required lookup
+then happens after send; generation refresh or CAS conflict can add reads.
+Persistence is best-effort and costs execution time without holding Fastly
+response bytes. Other adapters follow the foundation's supported timing and
+KV capability rules.
+
+Auctions resolve usable registered records from KV, deriving `atype` from the
+source registry. Set the registry type to the confirmed mapping. Do not stamp
+`Lockr-For-Publishers` onto every KV ID for a source: another input may have
+populated it. Provider `ext`, extra UIDs and OpenRTB provenance remain absent
+from later KV-only auctions, as defined by the foundation.
+
+## 5. Data flow and freshness
+
+```mermaid
+flowchart TD
+    A[Lockr SDK calls TS first-party proxy] --> B[Lockr API returns tokens]
+    B --> C[Lockr capture module normalizes IDs and expiry]
+    C --> D[Shared identity service validates consent and ownership]
+    D --> E[Original response sent without an EID cookie]
+    E --> F[Shared service applies authoritative updates after send]
+    F --> G[EC identity graph stores IDs and lifecycle metadata]
+    G --> H[Later auctions read visible unexpired IDs]
 ```
 
-`IntegrationRegistration::builder` gains `.with_identity_capture()`. The
-registry's `handle_proxy` checks whether the matched proxy implements the trait
-and whether the request path is in `capture_paths()`. If so it buffers the
-upstream response with `collect_response_bounded` at a new
-`IDENTITY_CAPTURE_MAX_RESPONSE_BYTES` of 64 KiB, calls `capture`, then rebuilds
-the response from the buffered bytes. Every other path streams through
-unchanged. Buffering is limited to the listed JSON endpoints; the SDK body and
-unlisted paths are never buffered by this hook.
+| Event                           | Persistence                                       | Auction availability                                                           |
+| ------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------ |
+| First issue                     | Authoritative update after send                   | Once a later KV read sees the record                                           |
+| SDK refresh                     | Replacement or expiry update after send           | Once new state is visible                                                      |
+| Provider expiry                 | Stored record becomes unusable; no timer required | Omitted when request time reaches known expiry                                 |
+| Explicit global revoke          | EC cookie expired; existing-key-only tombstone    | Later requests stop using the identity; dispatched auctions cannot be recalled |
+| Returning visitor, no new token | No capture mutation                               | Existing usable KV state only                                                  |
 
-### 4.2 Lockr implementation
+Inspection can retain 64 KiB of original bytes and 64 KiB of decoded JSON, plus
+bounded stream/decoder overhead. There are no additional TS EID cookie bytes
+on later requests.
 
-`LockrIntegration` implements the trait for `page-view`, `generate-tokens`,
-`refresh-tokens`, `sync-no-hem-ids` and `revoke-consent`.
-
-For token endpoints the parser reads `aimTokens[]` and, when present,
-`ids.<key_name>.eid`. The `eid` object is preferred because it already carries
-`source`, `atype` and provenance. When only `aimTokens[]` is present the
-`key_name` is mapped to a source domain with a static table taken from the
-SDK's own `tokenMappings` and `tokenSourceMappings`:
-
-| `key_name`                 | `source`                           | `atype` |
-| -------------------------- | ---------------------------------- | ------- |
-| `id5id`                    | `id5-sync.com`                     | 1       |
-| `_lr_env`                  | `liveramp.com`                     | 3       |
-| `__uid2_advertising_token` | `uidapi.com`                       | 3       |
-| `__euid_advertising_token` | `euid.eu`                          | 3       |
-| `firstid`                  | `first-id.fr`                      | 1       |
-| `connectId`                | `yahooinc.com`                     | 3       |
-| `panoramaId`               | `panorama.com` (verify with lockr) | 1       |
-| `cto_bidid`                | `criteo.com`                       | 3       |
-| `_publink`                 | `epsilon.com`                      | 3       |
-
-Unknown `key_name` values are logged at debug level and dropped. The ID5
-`advertising_token` is URL-encoded JSON `{"universal_uid": "..."}`; the parser
-extracts `universal_uid`. Tokens are validated with the existing
-`is_valid_eid_uid` rule (non-empty, at most `MAX_UID_LENGTH` of 512 bytes).
-`identity_expires` is milliseconds and is converted to seconds.
-
-`revoke-consent` with a 2xx upstream status yields `ConsentRevoked`.
-
-Non-2xx upstream responses and unparseable bodies yield `None` and are passed
-through to the browser unchanged.
-
-### 4.3 Consent gate
-
-Capture runs only when all of the following hold:
-
-1. `ec_context.consent()` passes `ec_consent_granted`, evaluated from the
-   request's consent cookies exactly as on publisher navigations.
-2. The request carries a valid `ts-ec` cookie, so there is an EC ID to attach
-   the IDs to. Integration XHRs never generate a new EC ID; that rule is
-   unchanged.
-3. The lockr request body's `gppString` or `consentString`, when present, does
-   not indicate an opt-out. The body is already buffered for POST forwarding by
-   `collect_body_bounded`; this adds a parse, not a read.
-
-When the gate fails the response is passed through and nothing is written.
-
-### 4.4 Server-owned first-party cookie
-
-A new cookie, `ts-eids-s`, is set on the proxy response that delivered the
-tokens:
-
-- Value: base64 of the structured JSON array already accepted by
-  `parse_prebid_eids_cookie`, holding `source` and one `id` per source and
-  nothing else. No `atype`, no `ext`, no provenance. Those are re-attached on
-  the server from a static per-source table when the auction payload is built
-  (section 4.6). Example before encoding:
-
-  ```json
-  [{ "source": "id5-sync.com", "uids": [{ "id": "ID5*..." }] }]
-  ```
-
-  The cookie rides on every same-origin request, not only auctions, so it is
-  kept as small as the ID itself. One ID5 token encodes to 184 bytes
-  (measured). All nine lockr-issued sources with representative token lengths
-  encode to 1,716 bytes (modeled with the measured ID5, RampID, UID2 and
-  Criteo values); UID2 and Criteo tokens account for most of that.
-
-- Attributes: `Path=/; Secure; HttpOnly; SameSite=Lax`, `Domain` as configured
-  for `ts-ec`, `Max-Age` = the smallest `expires_at` minus now, capped at 30
-  days, defaulting to 30 days when no expiry was given.
-- Merge policy: the new value is the union of the existing `ts-eids-s` cookie
-  on the request and the captured EIDs, keyed by `source`; captured values
-  replace existing values for the same source. Sources whose stored expiry has
-  passed are dropped at merge time.
-- Size: encoded value capped at 2,048 bytes. When the merged value exceeds
-  the cap, sources are dropped oldest-expiry first until it fits; dropping is
-  logged. The cap is below the 3,072-byte `ts-eids` cap because this cookie
-  carries one ID per source and nothing else, and above the modeled full set
-  so no lockr-issued source is dropped in practice.
-- `ConsentRevoked` sets `ts-eids-s` with `Max-Age=0`.
-
-The cookie is separate from `ts-eids` for two reasons. The tsjs prebid module
-rewrites `ts-eids` on every auction from `getUserIdsAsEids()`, so a server
-value stored there would be overwritten within seconds. And a server-set
-`HttpOnly` cookie is not subject to the script-written cookie lifetime cap in
-WebKit, and cannot be edited by page scripts.
-
-`enforce_set_cookie_cache_privacy` in the Fastly middleware already marks any
-response carrying `Set-Cookie` as private and uncacheable, so no cache change
-is needed.
-
-### 4.5 Readers of the new cookie
-
-Two readers change:
-
-- `resolve_client_auction_eids` in `crates/trusted-server-core/src/auction/endpoints.rs`
-  currently prefers the request body and falls back to `ts-eids`. It will
-  parse `ts-eids-s` and merge it with whichever of body or `ts-eids` applied,
-  through `merge_auction_eids`. Before merging, each `ts-eids-s` entry is
-  expanded with `atype` and provenance from the static table in section 4.6.
-  For the same `source`, the `ts-eids-s` entry is ordered first so its values
-  win under the existing "first value wins, fill missing fields" merge rule.
-- `collect_eid_cookie_updates` in `crates/trusted-server-core/src/ec/prebid_eids.rs`
-  takes a third optional cookie value and feeds it through
-  `collect_prebid_eid_updates_from_eids`. `EcFinalizeState` and
-  `EcRequestState` carry the extra cookie value. Existing partner-registry
-  gating applies: a source without an `[[ec.partners]]` entry still reaches the
-  auction body but is not written to KV.
-
-The JavaScript collector is not changed by this design. Its `ts-eids` output
-continues to cover User ID module providers.
-
-The `x-ts-eids` response header on `/auction` is unchanged. It is emitted
-after the merge and consent gating from the final `user.eids`, is on the
-`INTERNAL_HEADERS` strip list for inbound requests, and is read by nothing on
-the server. It remains the diagnostic view of what was sent to bidders.
-
-### 4.6 EID provenance
-
-`Eid` in `crates/trusted-server-core/src/openrtb.rs` gains three optional
-fields with `skip_serializing_if = "Option::is_none"`: `inserter: Option<String>`,
-`matcher: Option<String>`, `mm: Option<i32>`. `deny_unknown_fields` stays.
-`StructuredCookieEid` and `structured_cookie_eids_to_openrtb` carry the same
-three fields. `parse_client_auction_eids` and `merge_auction_eids` preserve
-them, with the conflict rule "first non-empty value wins", matching how `atype`
-and `ext` are merged today.
-
-Provenance is not stored in the cookie or in KV. A static table in the lockr
-integration, keyed by `source`, supplies `atype`, `inserter`
-(`Lockr-For-Publishers`), `matcher` (empty) and `mm` (2) when a `ts-eids-s`
-entry is expanded for the auction, matching what the SDK sets on
-`ortb2.user.ext.eids`. The `atype` column is the one from the mapping table in
-section 4.2. Provider `ext` payloads such as ID5's `pba` are not carried; they
-are not stored today either and bidders that need them read the provider
-cookie directly.
-
-Legacy flattened cookies decode as before. KV entries are unchanged: the
-identity graph still stores one UID per partner source and no provenance.
-
-### 4.7 KV write after send
-
-Capture never writes KV before the response is sent. Instead the proxy handler
-attaches a response extension:
-
-```rust
-pub struct DeferredIdentityUpdates {
-    pub updates: Vec<PartnerIdUpdate>,
-    pub revoke: bool,
-}
-```
-
-`PartnerIdUpdate` values are built with the existing partner-registry lookup,
-so only configured sources are included. In the Fastly entry point, after
-`send_edgezero_response` returns and before pull sync, a new
-`run_identity_updates_after_send` applies them:
-
-- `updates` go through `KvIdentityGraph::upsert_partner_ids_from_snapshot`
-  with the request's `EcKvSnapshot`, which already skips unchanged UIDs, fails
-  closed on a missing or unreadable root row, and refuses to write when the
-  stored `consent.ok` is false.
-- `revoke` calls `write_withdrawal_tombstone`, the same path the CMP
-  withdrawal flow uses.
-
-Both are best-effort and log on failure. The Wasm instance stays alive until
-the handler returns, so this work costs nothing on the response path. On a
-`page-view` that carries no new token (the common returning-visitor case) the
-extension is absent and no KV operation runs.
-
-The Axum, Cloudflare and Spin adapters apply the same extension in their own
-post-send positions where one exists; where an adapter has no post-send hook
-the updates are applied before send, matching how those adapters already
-handle pull sync. The hot-path constraint is a Fastly production constraint.
-
-### 4.8 Data flow summary
-
-```
-browser -> POST /integrations/lockr/api/.../page-view (ts-ec, consent cookies, body)
-   TS proxy -> identity.loc.kr -> 200 {aimTokens, ids}
-   TS: consent gate -> capture -> Set-Cookie ts-eids-s (HttpOnly)
-   TS: attach DeferredIdentityUpdates -> send response to browser
-   TS: after send -> KV upsert (CAS, skip-unchanged) or tombstone
-
-next /auction on this page -> reads ts-eids-s -> user.eids includes id5-sync.com
-next navigation           -> KV snapshot (hot-path read already present)
-                             -> ts-eids-s fallback when the row is missing
-```
-
-## 5. Freshness
-
-| Event                                      | Cookie                                 | KV                                    | Auction sees it             |
-| ------------------------------------------ | -------------------------------------- | ------------------------------------- | --------------------------- |
-| First issue (`page-view` with `aimTokens`) | Same response                          | After that response is sent           | Next `/auction` on the page |
-| Lockr refresh (`refresh-tokens`)           | Same response, new value and `Max-Age` | After send, only when the UID changed | Next `/auction`             |
-| Lockr revoke (`revoke-consent`)            | Cleared on that response               | Tombstone after send                  | Next request                |
-| Returning visitor, no new token            | Untouched                              | No operation                          | From KV snapshot            |
-
-Modeled cost per captured response: one JSON parse of at most 64 KiB and one
-`Set-Cookie` of at most 2,048 bytes. Modeled cost on every later same-origin
-request: the cookie bytes, 184 for ID5 alone and up to 1,716 for all nine
-lockr-issued sources. No additional KV read is added; the deferred upsert reuses the
-request snapshot and performs its own refresh read only on a CAS retry, as it
-does today for `ts-eids` ingestion.
+There is no cookie-based repair of a failed capture write. A later token-bearing
+SDK response, browser-body submission or separately authorized partner path can
+attempt persistence again under the foundation's writer rules. A returning
+`page-view` with no token does not repair a missed capture. Expiry-aware omission
+also does not initiate a Lockr fetch. These limits and delayed KV visibility are
+accepted for this draft.
 
 ## 6. Configuration
 
-No new lockr options. KV persistence for a lockr-issued source requires the
-existing partner registry entry, for example:
+Add `capture_identity` under `[integrations.lockr]`, default `true`, as the
+publisher capture kill switch. It does not disable browser-body ingestion,
+expiry-aware reads or normal EC consent withdrawal.
+
+Capturing a source requires its foundation source policy, for example:
 
 ```toml
 [[ec.partners]]
@@ -382,80 +302,105 @@ name = "ID5"
 source_domain = "id5-sync.com"
 openrtb_atype = 1
 bidstream_enabled = true
+identity_owner = "lockr"
 ```
 
-Without this entry the ID still reaches the auction body through the cookie
-and is never written to KV, matching current `ts-eids` behavior. The deployed
-registry for the affected publisher should be checked for this entry as part of
-rollout.
+`identity_owner` is a proposed foundation field, not an existing runtime option.
+Check the publisher registry and disable conflicting legacy authoritative paths
+before enabling the owner. Missing registration or another selected owner means
+Lockr does not persist the source. There is no cookie to forward an unregistered
+captured ID. Valid browser-body EIDs can still reach their current auction under
+the foundation's existing forwarding rules.
 
 ## 7. Error handling
 
-- Upstream non-2xx or malformed JSON: pass-through, no cookie, no KV, debug log.
-- Response larger than 64 KiB on a capture path: pass-through with a warning;
-  the limit is an order of magnitude above the measured 603-byte response.
-- Consent gate failure: pass-through, nothing written.
-- Cookie over 2,048 bytes after merge: drop oldest-expiry sources, log.
-- KV upsert failure after send: logged, cookie already delivered, next
-  navigation retries through normal cookie ingestion.
-- Missing `ts-ec`: pass-through, nothing written; the SDK call still succeeds.
+Use the foundation's redaction, bounds and root safety policy:
 
-## 8. Testing
+- Non-2xx, malformed JSON, unknown key, mismatched source or invalid token:
+  preserve the response, drop the affected acquisition, no raw-token log.
+- Original or decoded size overflow, unsupported encoding or decode failure:
+  skip capture and replay the original response unchanged.
+- Denied token consent, missing EC, missing registration or owner mismatch:
+  no enrichment; the SDK call still succeeds independently.
+- Missing, unreadable or withdrawn root: no creation or resurrection.
+- Post-send persistence failure: redacted log; no immediate retry, durable
+  queue or change to the already-sent response.
+- No tokens: `NoChange`, not invalidation or consent withdrawal.
 
-Rust, alongside the code:
+## 8. Verification
 
-- `integrations/lockr.rs`: parser tests for `aimTokens` only, `ids.*.eid`
-  present, URL-encoded ID5 JSON, unknown `key_name`, oversized UID, non-2xx,
-  malformed body, `revoke-consent`.
-- `integrations/registry.rs`: capture path buffering versus pass-through
-  streaming for unlisted paths; response bytes identical after buffering.
-- `auction/endpoints.rs`: `ts-eids-s` merged with body, with `ts-eids`, alone;
-  expansion from the static table; provenance precedence; caps.
-- `ec/prebid_eids.rs`: structured cookie with and without provenance fields;
-  legacy cookie unchanged; third cookie input.
-- `ec/finalize.rs` and adapter entry point: deferred updates applied after send;
-  absent when no tokens; tombstone on revoke; skip-unchanged.
-- Consent-denied regression coverage retained for every new path.
+Foundation tests own shared registration, browser migration, metadata
+compatibility, buffering limits, mutation rules and adapter timing. Lockr tests
+prove that this consumer reaches those paths correctly:
 
-JavaScript: no changes, existing suites must still pass.
+- Exact POST path selection; SDK, settings and unlisted paths unchanged.
+- `aimTokens` only, associated `ids.*.eid`, URL-encoded ID5 JSON, each enabled
+  provider token shape, unknown keys, mismatched sources and oversized UIDs.
+- Millisecond expiry conversion, already-expired rejection, missing expiry and
+  same-UID expiry extension; known expiry survives the persisted record.
+- Original and decoded cap overflow, including compressed expansion, skips
+  Lockr effects while retaining response bytes and encoding headers.
+- No-token response produces no token mutation; non-2xx/malformed token
+  response cannot invalidate existing records.
+- Populated body opt-outs, malformed signals, empty optional fields and cookie
+  consent conflicts exercise shared consent policy without modifying forwarding.
+- Explicit revoke works with denied consent, chooses the confirmed withdrawal
+  scope and does not duplicate request-finalization tombstones.
+- Owned/registered sources persist; unregistered or differently owned sources
+  do not; browser input cannot impersonate Lockr authority.
+- Capture effects execute after Fastly send through the foundation, not a
+  separate Lockr adapter implementation; persisted snapshot handoff is retained.
+- No newly emitted TS EID cookie or diagnostic EID header; provider browser
+  stores and existing publisher credential stripping remain unchanged.
 
-Live acceptance on the TS matched arm:
+Live acceptance on an approved publisher test route:
 
-1. Fresh profile, accept consent, wait for the `page-view` response.
-2. The `page-view` response carries `Set-Cookie: ts-eids-s=...; HttpOnly`,
-   and the decoded value holds only `source` and `id`.
-3. The next `/auction` request body decodes with `id5-sync.com` in
-   `user.eids`, with `inserter` and `mm` present.
-4. `GET /_ts/admin/ec` for the session's EC ID shows the ID5 UID under
-   `ids["id5-sync.com"]` after one further eligible request.
-5. Reload: same UID, no new KV write (admin generation unchanged).
-6. Trigger `revoke-consent` from the lockr SDK: cookie cleared, tombstone
-   present.
+1. Fresh profile, grant consent and wait for `page-view`.
+2. Confirm original response bytes and no TS EID cookie from capture.
+3. Allow for post-send work and KV visibility. Inspect the session's admin EC
+   record for the registered source and lifecycle metadata, without exporting IDs.
+4. Trigger a later auction and inspect bidder-facing payload evidence. Do not
+   require the browser body to contain a server-added ID or rely on `x-ts-eids`.
+5. Reload with no new tokens: unchanged UID and expiry do not cause a write.
+6. Trigger SDK refresh: confirm changed UID or expiry persists after visibility.
+7. Exercise known expiry in a controlled fixture and confirm omission, including
+   a stale matching UID resubmitted in a browser auction body.
+8. Trigger confirmed global revoke: EC cookie expires, tombstone exists and
+   later enrichment cannot revive it.
+
+No live identifiers, placement settings or credentials belong in fixtures or
+committed validation notes. Keep sanitized status/source/count evidence only.
 
 ## 9. Rollout
 
-1. Land the `Eid` provenance fields and cookie parser changes first; they are
-   additive and safe on their own.
-2. Land the capture hook with lockr behind a `capture_identity` boolean on
-   `[integrations.lockr]`, default `true`, so a publisher can switch it off
-   without a deploy.
-3. Add the `id5-sync.com` partner entry on the affected publisher.
-4. Verify with the live acceptance steps above.
+1. Deliver the foundation, including metadata-preserving writers/readers,
+   source ownership, browser-body migration and EID cookie/header retirement.
+2. Confirm Lockr path, provider token shapes, consent and revoke contracts using
+   sanitized fixtures; leave unconfirmed source mappings disabled.
+3. Register the capture consumer and its `capture_identity` kill switch.
+4. Configure the affected registered sources with `identity_owner = "lockr"`
+   and their confirmed `atype`, after resolving conflicting authoritative paths.
+5. Complete the foundation's deployment compatibility gate before activation.
+6. Enable capture on an approved test route and run live acceptance, including
+   visibility delay, expiry extension and withdrawal.
 
-## 10. Open questions
+Disabling capture stops new observations; it does not make already stored
+expiry metadata safe for an older UID-only binary. Follow the foundation's
+rollback contract. No `ts-eids-s` is introduced at any stage.
 
-1. Should `ts-eids-s` also be exposed to client-side auctions, for example
-   through `/identify` or a response header, or is the server-side auction the
-   only consumer? This design assumes server-side only.
-2. The `panoramaId` source domain and `atype` should be confirmed with lockr
-   before the mapping table ships.
-3. Whether a captured `expires_at` should also bound the KV entry. The identity
-   graph has no per-partner expiry today, and this design leaves that as is.
+## 10. Open questions and future work
 
-## 11. Future-state options
+1. Confirm the Panorama source/type and all enabled provider token shapes with
+   lockr. Do not infer them solely from the measured ID5 example.
+2. Confirm request-body consent details and any additional broker/provider
+   permission requirements.
+3. Confirm successful revoke response semantics and whether withdrawal is
+   global or source-specific before enabling that outcome.
+4. Confirm token ordering when SDK requests overlap. The foundation does not
+   infer provider issuance order from edge wall clocks.
 
-- Register lockr as a pull-sync partner and resolve tokens server-to-server
-  from the `ltid` value, removing the SDK from the identity path entirely.
-  Requires an S2S contract with lockr that does not exist today.
-- Apply the same capture hook to direct ID5 and LiveRamp proxies once those
-  endpoints are proxied first-party.
+Known expiry persistence is now a proposed foundation decision rather than an
+unimplemented Lockr-local open question. OpenRTB provenance storage remains
+outside this delivery. Active Lockr resolution from `ltid`, direct provider
+capture and client-side consumers require separate follow-up specs; no current
+S2S contract is assumed.

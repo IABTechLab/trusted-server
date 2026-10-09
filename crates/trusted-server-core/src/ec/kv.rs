@@ -159,6 +159,7 @@ fn apply_cookie_partner_id_updates(
             partner_id.to_owned(),
             super::kv_types::KvPartnerId {
                 uid: uid.to_owned(),
+                ..Default::default()
             },
         );
         changed = true;
@@ -187,6 +188,30 @@ fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> boo
     })
 }
 
+/// Applies a UID-only legacy update without retaining another UID's lifecycle metadata.
+fn apply_legacy_partner_id_update(entry: &mut KvEntry, partner_id: &str, uid: &str) -> bool {
+    let previous = entry.ids.get(partner_id);
+    if previous.is_some_and(|record| record.uid == uid) {
+        return false;
+    }
+    let had_metadata = previous.is_some_and(|record| {
+        record.expires_at.is_some() || record.writer.is_some() || record.revision.is_some()
+    });
+    let mut replacement = super::kv_types::KvPartnerId {
+        uid: uid.to_owned(),
+        ..Default::default()
+    };
+    // Keep legacy-only rows UID-only during the reader/writer rollout. Once a
+    // record has lifecycle metadata, replacement must change its version and
+    // writer without applying the old token's expiry to the replacement UID.
+    if had_metadata {
+        replacement.writer = Some("legacy".to_owned());
+        replacement.revision = Some(uuid::Uuid::new_v4().to_string());
+    }
+    entry.ids.insert(partner_id.to_owned(), replacement);
+    true
+}
+
 pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
@@ -195,21 +220,7 @@ pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerId
 
     let mut changed = false;
     for (partner_id, uid) in latest_updates {
-        if entry
-            .ids
-            .get(partner_id)
-            .is_some_and(|existing| existing.uid == uid)
-        {
-            continue;
-        }
-
-        entry.ids.insert(
-            partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
-        );
-        changed = true;
+        changed |= apply_legacy_partner_id_update(entry, partner_id, uid);
     }
 
     changed
@@ -837,6 +848,124 @@ impl KvIdentityGraph {
         }
     }
 
+    /// Applies validated owned capture records using bounded existing-root CAS.
+    ///
+    /// Missing and failed snapshots are never promoted to existence proof.
+    /// Ownership, root consent and effective expiry are rechecked at mutation.
+    pub(crate) fn upsert_managed_ids_from_snapshot(
+        &self,
+        ec_id: &str,
+        module: &str,
+        partners: &super::registry::PartnerRegistry,
+        updates: &[super::identity::ManagedPartnerIdUpdate],
+        snapshot: EcKvSnapshot,
+    ) -> EcKvSnapshot {
+        if updates.is_empty() {
+            return snapshot;
+        }
+        let mut current = match snapshot {
+            EcKvSnapshot::NotRead => self.load_snapshot(ec_id),
+            EcKvSnapshot::Present {
+                ec_id: ref id,
+                generation: None,
+                ..
+            } if id == ec_id => self.load_snapshot(ec_id),
+            state if state.belongs_to(ec_id) => state,
+            _ => {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            }
+        };
+        for _ in 0..MAX_CAS_RETRIES {
+            let EcKvSnapshot::Present {
+                ec_id: ref id,
+                ref entry,
+                generation: Some(generation),
+            } = current
+            else {
+                return current;
+            };
+            if id != ec_id || !entry.consent.ok {
+                return current;
+            }
+            let now = checked_current_timestamp();
+            let mut candidate = entry.as_ref().clone();
+            let mut changed = false;
+            for update in updates {
+                if partners
+                    .get(&update.source)
+                    .and_then(|partner| partner.identity_owner.as_deref())
+                    != Some(module)
+                {
+                    continue;
+                }
+                let previous = candidate.ids.get(&update.source);
+                let same_uid = previous.is_some_and(|record| record.uid == update.uid);
+                let expiry = update.expires_at.or_else(|| {
+                    if same_uid {
+                        previous.and_then(|record| record.expires_at)
+                    } else {
+                        None
+                    }
+                });
+                if expiry.is_some_and(|expiry| now.is_none_or(|now| now >= expiry)) {
+                    continue;
+                }
+                if previous.is_some_and(|record| {
+                    same_uid
+                        && record.expires_at == expiry
+                        && record.writer.as_deref() == Some(module)
+                        && record.revision.is_some()
+                }) {
+                    continue;
+                }
+                candidate.ids.insert(
+                    update.source.clone(),
+                    super::kv_types::KvPartnerId {
+                        uid: update.uid.clone(),
+                        expires_at: expiry,
+                        writer: Some(module.to_owned()),
+                        revision: Some(uuid::Uuid::new_v4().to_string()),
+                    },
+                );
+                changed = true;
+            }
+            if !changed {
+                return current;
+            }
+            let Ok((body, metadata)) = Self::serialize_entry(&candidate, self.store_name()) else {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &metadata,
+                ENTRY_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => {
+                    return EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(candidate),
+                        generation: None,
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => current = self.load_snapshot(ec_id),
+                Err(_) => {
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            }
+        }
+        EcKvSnapshot::Failed {
+            ec_id: ec_id.to_owned(),
+        }
+    }
+
     /// Returns `proven` instead of a read outcome that cannot disprove it.
     ///
     /// Partner-ID enrichment is best effort. When the caller already held proof
@@ -910,20 +1039,9 @@ impl KvIdentityGraph {
                 )));
             }
 
-            if entry
-                .ids
-                .get(partner_id)
-                .is_some_and(|existing| existing.uid == uid)
-            {
+            if !apply_legacy_partner_id_update(&mut entry, partner_id, uid) {
                 return Ok(());
             }
-
-            entry.ids.insert(
-                partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
-            );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
 
@@ -982,20 +1100,9 @@ impl KvIdentityGraph {
                 return Ok(UpsertResult::ConsentWithdrawn);
             }
 
-            if entry
-                .ids
-                .get(partner_id)
-                .is_some_and(|existing| existing.uid == uid)
-            {
+            if !apply_legacy_partner_id_update(&mut entry, partner_id, uid) {
                 return Ok(UpsertResult::Unchanged);
             }
-
-            entry.ids.insert(
-                partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
-            );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
 
@@ -1739,6 +1846,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+                ..Default::default()
             },
         );
         let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
@@ -1774,6 +1882,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+                ..Default::default()
             },
         );
 
@@ -1792,12 +1901,251 @@ mod tests {
         entry
     }
 
+    fn lifecycle_entry() -> KvEntry {
+        let mut entry = live_entry();
+        for source in ["ids.example.com", "other.example.com"] {
+            entry.ids.insert(
+                source.to_owned(),
+                super::super::kv_types::KvPartnerId {
+                    uid: format!("uid-{source}"),
+                    expires_at: Some(2_000),
+                    writer: Some("example_identity".to_owned()),
+                    revision: Some(format!("revision-{source}")),
+                },
+            );
+        }
+        entry
+    }
+
+    #[test]
+    fn lifecycle_metadata_survives_all_existing_enrichment_writers() {
+        for mode in ["browser", "bulk", "single", "batch", "cluster"] {
+            let graph = KvIdentityGraph::in_memory("lifecycle-store");
+            let ec_id = snapshot_ec_id();
+            let entry = lifecycle_entry();
+            assert_eq!(
+                graph
+                    .create_if_absent(&ec_id, &entry)
+                    .expect("should create identity"),
+                CreateIfAbsentOutcome::Written
+            );
+            match mode {
+                "browser" => {
+                    let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+                        &ec_id,
+                        &[
+                            PartnerIdUpdate::new("ids.example.com", "different-browser-uid"),
+                            PartnerIdUpdate::new("new.example.com", "new-uid"),
+                        ],
+                        graph.load_snapshot(&ec_id),
+                    );
+                    assert_eq!(outcome, EidCookieSyncOutcome::WrittenWithDeferredFreshness);
+                    assert!(
+                        snapshot.entry_for(&ec_id).is_some(),
+                        "should return the persisted snapshot"
+                    );
+                }
+                "bulk" => {
+                    let snapshot = graph.upsert_partner_ids_from_snapshot(
+                        &ec_id,
+                        &[PartnerIdUpdate::new("new.example.com", "new-uid")],
+                        graph.load_snapshot(&ec_id),
+                    );
+                    assert!(
+                        snapshot.entry_for(&ec_id).is_some(),
+                        "should return the persisted snapshot"
+                    );
+                }
+                "single" => graph
+                    .upsert_partner_id(&ec_id, "new.example.com", "new-uid")
+                    .expect("should update legacy source"),
+                "batch" => assert_eq!(
+                    graph
+                        .upsert_partner_id_if_exists(&ec_id, "new.example.com", "new-uid")
+                        .expect("should update legacy source"),
+                    UpsertResult::Written
+                ),
+                "cluster" => {
+                    let (stored, generation) = graph
+                        .get(&ec_id)
+                        .expect("should read identity")
+                        .expect("should find identity");
+                    graph
+                        .evaluate_cluster(&ec_id, &stored, generation)
+                        .expect("should update network metadata");
+                }
+                _ => unreachable!("should use a listed writer"),
+            }
+            let (retained, _) = graph
+                .get(&ec_id)
+                .expect("should read stored state")
+                .expect("should retain identity");
+            for source in entry.ids.keys() {
+                assert_eq!(
+                    retained.ids.get(source),
+                    entry.ids.get(source),
+                    "should preserve unrelated lifecycle state through {mode}"
+                );
+            }
+            if mode != "cluster" {
+                assert_eq!(
+                    retained.ids["new.example.com"].uid, "new-uid",
+                    "should actually persist the additional source"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_legacy_same_uid_is_a_noop_for_every_update_path() {
+        for mode in ["browser", "bulk", "single", "batch"] {
+            let graph = KvIdentityGraph::in_memory("lifecycle-store");
+            let ec_id = snapshot_ec_id();
+            let entry = lifecycle_entry();
+            graph.create(&ec_id, &entry).expect("should seed identity");
+            let (_, before) = graph
+                .get(&ec_id)
+                .expect("should read identity")
+                .expect("should find identity");
+            let uid = &entry.ids["ids.example.com"].uid;
+            match mode {
+                "browser" => {
+                    let (_, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
+                        &ec_id,
+                        &[PartnerIdUpdate::new("ids.example.com", uid)],
+                        graph.load_snapshot(&ec_id),
+                    );
+                    assert_eq!(outcome, EidCookieSyncOutcome::AlreadyMatched);
+                }
+                "bulk" => {
+                    graph.upsert_partner_ids_from_snapshot(
+                        &ec_id,
+                        &[PartnerIdUpdate::new("ids.example.com", uid)],
+                        graph.load_snapshot(&ec_id),
+                    );
+                }
+                "single" => graph
+                    .upsert_partner_id(&ec_id, "ids.example.com", uid)
+                    .expect("should accept unchanged UID"),
+                "batch" => assert_eq!(
+                    graph
+                        .upsert_partner_id_if_exists(&ec_id, "ids.example.com", uid)
+                        .expect("should accept unchanged UID"),
+                    UpsertResult::Unchanged
+                ),
+                _ => unreachable!("should use a listed writer"),
+            }
+            let (retained, after) = graph
+                .get(&ec_id)
+                .expect("should read retained identity")
+                .expect("should retain identity");
+            assert_eq!(
+                retained, entry,
+                "should retain metadata omitted by UID-only input"
+            );
+            assert_eq!(
+                after, before,
+                "should not write merely to observe the same UID"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_legacy_replacement_resets_expiry_and_never_reuses_revision() {
+        for mode in ["bulk", "single", "batch"] {
+            let graph = KvIdentityGraph::in_memory("lifecycle-store");
+            let ec_id = snapshot_ec_id();
+            let entry = lifecycle_entry();
+            graph.create(&ec_id, &entry).expect("should seed identity");
+            let mut previous_revision = entry.ids["ids.example.com"].revision.clone();
+            for uid in ["replacement-uid", entry.ids["ids.example.com"].uid.as_str()] {
+                match mode {
+                    "bulk" => {
+                        graph.upsert_partner_ids_from_snapshot(
+                            &ec_id,
+                            &[PartnerIdUpdate::new("ids.example.com", uid)],
+                            graph.load_snapshot(&ec_id),
+                        );
+                    }
+                    "single" => graph
+                        .upsert_partner_id(&ec_id, "ids.example.com", uid)
+                        .expect("should replace legacy UID"),
+                    "batch" => assert_eq!(
+                        graph
+                            .upsert_partner_id_if_exists(&ec_id, "ids.example.com", uid)
+                            .expect("should replace legacy UID"),
+                        UpsertResult::Written
+                    ),
+                    _ => unreachable!("should use a listed writer"),
+                }
+                let (retained, _) = graph
+                    .get(&ec_id)
+                    .expect("should read retained identity")
+                    .expect("should retain identity");
+                let record = &retained.ids["ids.example.com"];
+                assert_eq!(record.uid, uid, "should persist replacement UID");
+                assert_eq!(
+                    record.expires_at, None,
+                    "should not apply another token's expiry to the replacement"
+                );
+                assert_eq!(
+                    record.writer.as_deref(),
+                    Some("legacy"),
+                    "should not retain another writer's provenance"
+                );
+                assert!(
+                    record.revision.is_some(),
+                    "should version the lifecycle change"
+                );
+                assert_ne!(
+                    record.revision, previous_revision,
+                    "should not reuse the previous revision"
+                );
+                assert_ne!(
+                    record.revision, entry.ids["ids.example.com"].revision,
+                    "should not restore a historical revision when restoring a UID"
+                );
+                assert_eq!(
+                    retained.ids["other.example.com"], entry.ids["other.example.com"],
+                    "should preserve unrelated sources"
+                );
+                previous_revision.clone_from(&record.revision);
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_withdrawal_removes_all_identity_payload() {
+        let graph = KvIdentityGraph::in_memory("lifecycle-store");
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &lifecycle_entry())
+            .expect("should seed identity");
+        let snapshot = graph.tombstone_existing_from_snapshot(&ec_id, graph.load_snapshot(&ec_id));
+        assert!(
+            snapshot
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should return the persisted tombstone"
+        );
+        let (retained, _) = graph
+            .get(&ec_id)
+            .expect("should read tombstone")
+            .expect("should retain tombstone");
+        assert!(!retained.consent.ok, "should preserve withdrawal authority");
+        assert!(
+            retained.ids.is_empty(),
+            "should remove UIDs and all lifecycle metadata"
+        );
+    }
+
     fn concurrent_live_entry() -> KvEntry {
         let mut entry = live_entry();
         entry.ids.insert(
             "concurrent.example.com".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "concurrent-uid".to_owned(),
+                ..Default::default()
             },
         );
         entry
@@ -2133,6 +2481,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "uid-1".to_owned(),
+                ..Default::default()
             },
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "uid-1")];
@@ -2161,6 +2510,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "old-uid".to_owned(),
+                ..Default::default()
             },
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "new-uid")];
@@ -2193,6 +2543,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "original".to_owned(),
+                ..Default::default()
             },
         );
         let updates = vec![
@@ -2217,6 +2568,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "desired-uid".to_owned(),
+                ..Default::default()
             },
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2335,6 +2687,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "latest-uid".to_owned(),
+                ..Default::default()
             },
         );
         let updates = [
@@ -2356,6 +2709,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "concurrent-uid".to_owned(),
+                ..Default::default()
             },
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2441,6 +2795,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "protected-uid".to_owned(),
+                ..Default::default()
             },
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
@@ -2468,6 +2823,7 @@ mod tests {
             "ssp_x".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "protected-uid".to_owned(),
+                ..Default::default()
             },
         );
         graph.create(&ec_id, &entry).expect("should seed entry");

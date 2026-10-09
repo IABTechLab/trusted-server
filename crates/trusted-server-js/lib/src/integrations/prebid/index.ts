@@ -1011,6 +1011,9 @@ type TrustedServerRequest = {
 
 type PrebidUserIdEid = {
   source?: unknown;
+  inserter?: unknown;
+  matcher?: unknown;
+  mm?: unknown;
   uids?: Array<{ id?: unknown; atype?: unknown; ext?: unknown }>;
 };
 
@@ -1907,7 +1910,18 @@ function collectAuctionEids(): AuctionEid[] | undefined {
       continue;
     }
 
-    eids.push({ source: eid.source, uids });
+    const sanitized: AuctionEid = { source: eid.source, uids };
+    if (typeof eid.inserter === 'string') sanitized.inserter = eid.inserter;
+    if (typeof eid.matcher === 'string') sanitized.matcher = eid.matcher;
+    if (
+      typeof eid.mm === 'number' &&
+      Number.isInteger(eid.mm) &&
+      eid.mm >= -2147483648 &&
+      eid.mm <= 2147483647
+    ) {
+      sanitized.mm = eid.mm;
+    }
+    eids.push(sanitized);
   }
 
   return eids.length > 0 ? eids : undefined;
@@ -1987,6 +2001,7 @@ function installApsBidResponseRegistry(): void {
 }
 
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
+  expireRetiredPrebidEidsCookie();
   // The prebid integration requires the external Prebid.js bundle
   // (integrations.prebid.external_bundle_url). When it failed to load (network
   // error, SRI mismatch) window.pbjs is still the head-injected stub with no
@@ -2357,11 +2372,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
-      const hasUserIdApi = typeof pbjs.getUserIdsAsEids === 'function';
       const auctionEids = collectAuctionEids();
-      if (hasUserIdApi && !auctionEids) {
-        clearPrebidEidsCookie();
-      }
       const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
       return {
         method: 'POST',
@@ -2538,7 +2549,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     // and persist them as a cookie for backend sync.
     const originalBidsBack = opts.bidsBackHandler;
     opts.bidsBackHandler = function (...args: unknown[]) {
-      syncPrebidEidsCookie();
       const registrationId = isSyntheticRefresh
         ? undefined
         : registerPendingPublisherBids(publisherAdUnitCodes, args[0], firstImpressionTokens);
@@ -2897,114 +2907,14 @@ export function installUserIdModules(): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Prebid EID cookie sync
-// ---------------------------------------------------------------------------
-
-/** Maximum cookie payload size in bytes (leave room for other cookies). */
-const MAX_EID_COOKIE_BYTES = 3072;
-
-/** Cookie name for persisted Prebid EIDs. */
-const EID_COOKIE_NAME = 'ts-eids';
-
-/** Cookie max-age in seconds (1 day). */
-const EID_COOKIE_MAX_AGE = 86400;
-
-/** Clears any previously persisted Prebid EIDs cookie. */
-function clearPrebidEidsCookie(): void {
-  document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
-}
-
 /**
- * Trims an EID payload so its base64-encoded cookie fits `MAX_EID_COOKIE_BYTES`,
- * dropping UIDs then whole sources from the tail. `/auction` requests still
- * forward the untrimmed set in the request body (see `buildAdRequest`); this
- * cap only bounds what the `ts-eids` cookie carries for routes without a body
- * (e.g. `GET /_ts/page-bids`) and for backend ingestion at response finalize.
+ * Transition-only cleanup for the retired host-only Path=/ EID cookie.
+ * Remove once bundles that write it have aged past both their deployment cache
+ * lifetime and the old cookie's one-day max-age. New servers ignore those writes.
  */
-function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
-  const payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
-  const droppedSources = new Set<string>();
-  const trimmedSources = new Set<string>();
-
-  while (payload.length > 0) {
-    const encoded = btoa(JSON.stringify(payload));
-    if (encoded.length <= MAX_EID_COOKIE_BYTES) {
-      logTrimmedEidSources(droppedSources, trimmedSources);
-      return payload;
-    }
-
-    const last = payload[payload.length - 1];
-    if (last && last.uids.length > 1) {
-      last.uids = last.uids.slice(0, last.uids.length - 1);
-      trimmedSources.add(last.source);
-      continue;
-    }
-
-    const dropped = payload.pop();
-    if (dropped) {
-      droppedSources.add(dropped.source);
-      // A source trimmed and then dropped is reported once, as dropped.
-      trimmedSources.delete(dropped.source);
-    }
-  }
-
-  logTrimmedEidSources(droppedSources, trimmedSources);
-  return undefined;
-}
-
-/**
- * Logs which EID sources `fitAuctionEidsToCookie` had to drop or trim UIDs
- * from, if any. Debug level: `/auction` sends the untrimmed set in the request
- * body, so a trimmed cookie is expected steady state rather than a warning.
- */
-function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<string>): void {
-  if (droppedSources.size === 0 && trimmedSources.size === 0) {
-    return;
-  }
-  const parts: string[] = [];
-  if (droppedSources.size > 0) {
-    parts.push(`dropped sources: ${[...droppedSources].join(', ')}`);
-  }
-  if (trimmedSources.size > 0) {
-    parts.push(`trimmed uids from sources: ${[...trimmedSources].join(', ')}`);
-  }
-  log.debug(
-    `[tsjs-prebid] ts-eids cookie exceeded ${MAX_EID_COOKIE_BYTES} bytes; ${parts.join('; ')}`
-  );
-}
-
-/**
- * Collects EIDs from Prebid's User ID Module and writes them as a
- * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
- * and auction fallback on later requests.
- */
-function syncPrebidEidsCookie(): void {
-  try {
-    if (typeof pbjs.getUserIdsAsEids !== 'function') {
-      // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
-      clearPrebidEidsCookie();
-      return;
-    }
-
-    const eids = collectAuctionEids();
-    if (!eids) {
-      clearPrebidEidsCookie();
-      return;
-    }
-
-    const payload = fitAuctionEidsToCookie(eids);
-    if (!payload) {
-      clearPrebidEidsCookie();
-      return;
-    }
-
-    const encoded = btoa(JSON.stringify(payload));
-    document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
-
-    log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
-  } catch (err) {
-    log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
+function expireRetiredPrebidEidsCookie(): void {
+  if (typeof document !== 'undefined') {
+    document.cookie = 'ts-eids=; Path=/; Secure; SameSite=Lax; Max-Age=0';
   }
 }
 

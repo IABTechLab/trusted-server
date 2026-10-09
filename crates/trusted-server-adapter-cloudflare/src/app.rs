@@ -19,10 +19,9 @@ use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
-    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
-    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported, admin_eids_lookup_retired,
+    deny_admin_diagnostic_fallback,
 };
-use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
@@ -643,13 +642,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
+            // Keep the retired diagnostic local and behind existing authentication.
             .get(
                 "/_ts/admin/eids",
-                make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(admin_eids_lookup_retired())
                 }),
             )
             .post(

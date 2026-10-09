@@ -256,6 +256,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    crate::integrations::IntegrationRegistry::validate_identity_owners(settings)?;
     Ok(())
 }
 
@@ -274,6 +275,7 @@ pub fn validate_settings_for_runtime(
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    crate::integrations::IntegrationRegistry::validate_identity_owners(settings)?;
     Ok(())
 }
 
@@ -512,10 +514,11 @@ fn report_to_validation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
+    use crate::platform::{StoreName, test_support::HashMapSecretStore};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
     use crate::test_support::tests::crate_test_settings_str;
@@ -1537,6 +1540,222 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("missing-provider"),
             "validation error should mention invalid provider"
+        );
+    }
+
+    fn lockr_identity_owner_settings() -> (Settings, String) {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "lockr",
+                &serde_json::json!({
+                    "enabled": true,
+                    "capture_identity": false,
+                    "app_id": "synthetic-lockr-app",
+                }),
+            )
+            .expect("should insert disabled-capture Lockr config");
+        let registration = crate::integrations::lockr::register(&settings)
+            .expect("should build Lockr registration")
+            .expect("Lockr config should register");
+        let capture = registration
+            .identity_capture
+            .expect("Lockr registration should retain its capture descriptor");
+        assert!(
+            !capture.enabled(),
+            "fixture should exercise the capture kill switch"
+        );
+        let source = capture
+            .sources()
+            .first()
+            .expect("Lockr should declare at least one source")
+            .to_string();
+
+        settings.ec.partners.push(crate::settings::EcPartner {
+            name: "Owned identity source".to_owned(),
+            source_domain: source.clone(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Some(Redacted::new(
+                "owned-api-token-key-reference-32-bytes".to_owned(),
+            )),
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: Some("lockr".to_owned()),
+            ts_pull_token: None,
+        });
+        (settings, source)
+    }
+
+    #[test]
+    fn owner_validation_accepts_disabled_capture_and_unresolved_deploy_secret_refs() {
+        let (settings, source) = lockr_identity_owner_settings();
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy validation should accept a disabled capture descriptor");
+        let partner = settings
+            .ec
+            .partners
+            .last()
+            .expect("should retain the configured owner partner");
+        assert_eq!(partner.source_domain, source);
+        assert_eq!(
+            partner
+                .api_token
+                .as_ref()
+                .expect("should retain the API token reference")
+                .expose(),
+            "owned-api-token-key-reference-32-bytes",
+            "deploy validation should keep the unresolved secret reference"
+        );
+    }
+
+    #[test]
+    fn owner_validation_rejects_unknown_and_nonclaiming_owners_in_deploy_and_runtime() {
+        for (owner, source_override) in [
+            ("missing_identity_module", None),
+            ("lockr", Some("unclaimed.identity.test")),
+        ] {
+            let (mut settings, _) = lockr_identity_owner_settings();
+            {
+                let partner = settings
+                    .ec
+                    .partners
+                    .last_mut()
+                    .expect("should retain the configured owner partner");
+                partner.identity_owner = Some(owner.to_owned());
+                if let Some(source) = source_override {
+                    partner.source_domain = source.to_owned();
+                }
+            }
+            let deploy_error = validate_settings_for_deploy(&settings)
+                .expect_err("deploy validation should reject an invalid owner claim");
+            assert!(
+                deploy_error.to_string().contains("identity owner"),
+                "deploy error should identify the owner claim: {deploy_error:?}"
+            );
+            let runtime_error = validate_settings_for_runtime(&settings)
+                .expect_err("runtime validation should reject an invalid owner claim");
+            assert!(
+                runtime_error.to_string().contains("identity owner"),
+                "runtime error should identify the owner claim: {runtime_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_validation_rejects_enabled_legacy_pull_in_deploy_and_runtime() {
+        let (mut settings, _) = lockr_identity_owner_settings();
+        let partner = settings
+            .ec
+            .partners
+            .last_mut()
+            .expect("should retain the configured owner partner");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://pull.identity.test/v1".to_owned());
+        partner.pull_sync_allowed_domains = vec!["pull.identity.test".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new(
+            "owned-pull-token-key-reference-32-bytes".to_owned(),
+        ));
+
+        let deploy_error = validate_settings_for_deploy(&settings)
+            .expect_err("deploy validation should reject legacy pull on an owned source");
+        assert!(
+            deploy_error.to_string().contains("legacy pull disabled"),
+            "deploy error should identify the owned-source pull conflict: {deploy_error:?}"
+        );
+        let runtime_error = validate_settings_for_runtime(&settings)
+            .expect_err("runtime validation should reject legacy pull on an owned source");
+        assert!(
+            runtime_error.to_string().contains("legacy pull disabled"),
+            "runtime error should identify the owned-source pull conflict: {runtime_error:?}"
+        );
+    }
+
+    #[test]
+    fn startup_blob_validation_keeps_disabled_owner_descriptor_and_resolves_partner_token() {
+        let (mut settings, source) = lockr_identity_owner_settings();
+        settings.publisher.proxy_secret = Redacted::new("owner-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("owner-ec-passphrase".to_owned());
+        for (index, handler) in settings.handlers.iter_mut().enumerate() {
+            handler.password = Redacted::new(format!("owner-handler-password-{index}"));
+        }
+        settings
+            .ec
+            .partners
+            .last_mut()
+            .expect("should retain the configured owner partner")
+            .api_token = Some(Redacted::new("owner-partner-api-token".to_owned()));
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy should accept unresolved references before startup resolves them");
+
+        let mut secrets = HashMap::new();
+        for (key, value) in [
+            (
+                "owner-proxy-secret",
+                "resolved-proxy-secret-not-placeholder",
+            ),
+            (
+                "owner-ec-passphrase",
+                "resolved-ec-passphrase-32-bytes-valid",
+            ),
+            (
+                "owner-handler-password-0",
+                "resolved-handler-password-0-32-bytes",
+            ),
+            (
+                "owner-handler-password-1",
+                "resolved-handler-password-1-32-bytes",
+            ),
+            (
+                "owner-partner-api-token",
+                "resolved-owned-api-token-32-bytes-minimum",
+            ),
+        ] {
+            secrets.insert(key.to_owned(), value.as_bytes().to_vec());
+        }
+        let store = HashMapSecretStore::new(secrets);
+        let envelope = BlobEnvelope::new(
+            serde_json::to_value(&settings).expect("should serialize settings"),
+            "2026-10-09T00:00:00Z".to_owned(),
+        );
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let started = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &store,
+            &StoreName::from("identity-owner-test-secrets"),
+        )
+        .expect("startup should resolve secrets and validate the disabled owner descriptor");
+
+        let started_partner = started
+            .ec
+            .partners
+            .last()
+            .expect("startup should retain the configured owner partner");
+        assert_eq!(started_partner.identity_owner.as_deref(), Some("lockr"));
+        assert_eq!(started_partner.source_domain, source);
+        assert_eq!(
+            started_partner
+                .api_token
+                .as_ref()
+                .expect("startup should retain the identify token")
+                .expose(),
+            "resolved-owned-api-token-32-bytes-minimum",
+            "startup should resolve the identify token for the owned source"
+        );
+        let registration = crate::integrations::lockr::register(&started)
+            .expect("should build Lockr registration after startup")
+            .expect("Lockr should remain registered while capture is disabled");
+        assert!(
+            registration.identity_capture.is_some(),
+            "the disabled capture descriptor should remain discoverable"
         );
     }
 }
