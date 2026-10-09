@@ -62,11 +62,10 @@ ts dev proxy \
 
 `--rewrite-host` sends the upstream `Host: <TO>` so upstreams that reject the
 default `Host: <FROM>` — most dev and staging services, which aren't configured
-for the production hostname — still serve a page. Trade-off: against a real
-Trusted Server adapter, first-party URLs then render on the upstream host, not the
-production domain. To keep them on the production domain, point at an upstream that
-accepts `Host: <FROM>` and omit `--rewrite-host` — see
-[Host header behavior](#host-header-behavior).
+for the production hostname — still serve a page. To keep first-party URLs and
+trace authorization on the browser's production origin, configure authenticated
+forwarding on the Trusted Server upstream and supply `--forwarder-secret-file`.
+See [authenticated forwarding](#authenticated-forwarding).
 
 Run `ts dev proxy --help` to list every flag.
 
@@ -85,7 +84,7 @@ invocation with explicit options but no complete rewrite rule fails with a
 `no rewrite rule` error before touching system proxy state.
 
 Connection options — `--rewrite-host`, `--basic-auth`/`--basic-auth-file`,
-`--insecure`, and `--upstream-plaintext` — apply to every mapping, not per-rule.
+`--forwarder-secret-file`, `--insecure`, and `--upstream-plaintext` — apply to every mapping, not per-rule.
 
 ### Explicit rule and browser launch
 
@@ -286,13 +285,11 @@ certificate is imported until the subject check succeeds.
 
 ## Host header behavior
 
-The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) — the
-standard "original host" header for a forward proxy. Trusted Server core anchors
-all HTML/URL rewriting to it (it prefers `X-Forwarded-Host`, then `Host`), so
-**first-party URLs stay on the production domain regardless of the `Host` header —
-as long as the upstream preserves `X-Forwarded-Host`**. That decouples routing
-(`Host`) from the first-party host. (Real Trusted Server adapters strip inbound
-`X-Forwarded-Host`; the caveat below covers what that means with `--rewrite-host`.)
+The proxy sends the validated inbound browser authority as `X-Forwarded-Host`,
+including any explicit browser port, and `X-Forwarded-Proto: https` because the
+browser leg uses TLS. With authenticated forwarding enabled on both proxy and
+server, Trusted Server uses those values for public URLs and trace Origin checks.
+The upstream routing `Host` remains a separate choice.
 
 By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
 through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
@@ -312,8 +309,8 @@ ts dev proxy \
 ```
 
 The proxy dials `192.0.2.10` while the SNI stays `ts.example-publisher.com` and
-`X-Forwarded-Host` stays `www.example-publisher.com` — so TS rewrites first-party
-URLs onto the production domain. This keeps the tool self-contained — no
+`X-Forwarded-Host` stays `www.example-publisher.com`. With authenticated
+forwarding configured, TS rewrites first-party URLs onto the production domain. This keeps the tool self-contained — no
 `/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
 which sends no SNI extension at all, so a host-routed endpoint serves its default
 vhost.) Add `--insecure` if the endpoint serves a certificate that doesn't match
@@ -321,30 +318,76 @@ the hostname.
 
 **Sending `Host: TO`.** If your upstream routes or validates on its _own_
 hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pass
-`--rewrite-host` to send `Host: <TO>`. The proxy still stamps
-`X-Forwarded-Host: <FROM>`, so first-party URL rewriting stays anchored to `FROM`
-**as long as the upstream preserves that header**.
-
-> **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
-> request paths strip inbound `X-Forwarded-Host` before routing, so with
-> `--rewrite-host` a real Trusted Server upstream falls back to `Host` (`TO`) and
-> emits first-party URLs on `TO`, not `FROM`. Even so, `--rewrite-host` is the
-> right choice for most upstreams — dev and staging services rarely have the
-> production hostname configured and would reject the plain `Host: <FROM>`. Drop
-> it only when the upstream is configured to accept `Host: <FROM>` and you
-> specifically need first-party URLs anchored to `FROM` — the `--resolve` example
-> above is exactly that case.
+`--rewrite-host` to send `Host: <TO>`. The proxy preserves every browser `Origin`
+value on all routes, including trace Enable/End, publisher requests, and vendor
+integration requests. Trusted Server validates the browser Origin against the
+authenticated public origin when forwarding is configured.
 
 The TLS SNI is always the `TO` host either way:
 
-| Form             | `Host` header | `X-Forwarded-Host` | TLS SNI   |
-| ---------------- | ------------- | ------------------ | --------- |
-| _(omitted)_      | `FROM`        | `FROM`             | `TO` host |
-| `--rewrite-host` | `TO` host     | `FROM`             | `TO` host |
+| Form             | `Host` header | `X-Forwarded-Host`               | TLS SNI   |
+| ---------------- | ------------- | -------------------------------- | --------- |
+| _(omitted)_      | `FROM`        | Browser authority, port included | `TO` host |
+| `--rewrite-host` | `TO` host     | Browser authority, port included | `TO` host |
 
 **Port handling:** with `--rewrite-host` and a non-default `TO` port (e.g.
 `localhost:3000`), the port is included in the `Host` header but never in the SNI
 (a bare hostname; a port in SNI is invalid).
+
+## Authenticated forwarding
+
+This feature requires a Trusted Server upstream with authenticated forwarder
+support enabled. Provision the same secret in the server's trusted-forwarder
+configuration and in a local file, using the authentication header
+`x-ts-forwarder-auth`. The publisher hostname must be allowed by the server's
+publisher domain configuration. The server consumes the credential before
+routing or forwarding to publishers and vendors.
+
+Configure the upstream application with this optional section:
+
+```toml
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+shared_secret = "trusted_forwarder_shared_secret"
+```
+
+`shared_secret` names a server secret-store key; provision that key with the
+actual token bytes from the local file, excluding its line terminator. The publisher domain or its subdomains must
+cover every mapped browser hostname. Omitting the section keeps the server's
+default transport-origin behavior.
+
+Generate a cryptographically random local token file, provision its token in the server secret store,
+and pass only the file path to the proxy:
+
+```bash
+umask 077
+openssl rand -hex 32 > ./forwarder-token.txt
+
+ts dev proxy \
+  --map www.publisher.example.com=trusted-server.example.com \
+  --rewrite-host \
+  --forwarder-secret-file ./forwarder-token.txt \
+  --launch chrome
+```
+
+The file must contain at least 32 ASCII graphic bytes on one line, with an
+optional single LF or CRLF terminator. Spaces, blank or extra lines, and non-ASCII
+bytes are rejected. It is read once at startup. The token is redacted in debug
+output and marked sensitive in the HTTP header value.
+
+The proxy removes incoming `x-ts-forwarder-auth` fields on mapped MITM requests,
+including trailer declarations and streamed trailer fields, even when no
+credential is configured. With the option enabled it stamps the
+validated token after hop-by-hop sanitation, alongside the actual browser
+`X-Forwarded-Host` and `X-Forwarded-Proto: https`. A missing, duplicate, malformed,
+or conflicting Host/absolute-URI authority receives `400`; the proxy never
+signs a guessed CONNECT host. Each request must match its own mapping.
+Unmatched blind tunnels and plain HTTP forwarding keep their existing behavior.
+
+Without the server opt-in, forwarded metadata does not establish a trusted
+public origin. In particular, rewriting Host can change the origin Trusted Server
+uses for public URLs and can make browser trace actions fail Origin validation.
+Keep the credential file outside version control.
 
 ## Non-loopback listen
 
@@ -360,7 +403,8 @@ ts dev proxy \
 
 Even with `--allow-non-loopback`, unmatched `CONNECT` authorities are refused
 (`403`) rather than blind-tunneled, so the proxy cannot act as an open CONNECT
-proxy on the LAN.
+proxy on the LAN. Injected forwarding credentials and Basic auth require a
+loopback listener, even with `--allow-non-loopback`.
 
 ## All options
 

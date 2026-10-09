@@ -479,7 +479,8 @@ async fn mitm(
 /// rerouted through the CONNECT-authority rule — it is refused with `421`
 /// (Misdirected Request), so a client cannot `CONNECT mapped.example` then send
 /// `Host: other.example` to smuggle traffic through a rule it never matched. The
-/// CONNECT authority is consulted only when the request carries no `Host` at all.
+/// Without a forwarding credential, CONNECT remains a fallback for missing Host.
+/// Authenticated forwarding requires a validated request authority.
 ///
 /// This is infallible at the hyper layer — upstream errors become a `502` so
 /// the keep-alive tunnel survives a single bad request (spec §11).
@@ -493,17 +494,25 @@ async fn forward_request(
         return Ok(status_response(StatusCode::NOT_IMPLEMENTED));
     }
 
-    // Route by the request's own Host when present (spec §8.2). A Host that
-    // matches no rule is refused (421) rather than rerouted through the CONNECT
-    // authority. Only a request with no Host falls back to the CONNECT authority.
-    let rule = match request_host(&req) {
+    let authority = match browser_authority(&req) {
+        Ok(Some(authority)) => Some(authority),
+        Ok(None) | Err(()) if state.config.forwarder_secret.is_some() => {
+            return Ok(status_response(StatusCode::BAD_REQUEST));
+        }
+        Ok(None) | Err(()) => None,
+    };
+    let inbound_host = authority
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| request_host(&req));
+    let rule = match inbound_host {
         Some(host) => match state.config.rules.first_match(&host) {
             Some(rule) => rule,
             None => return Ok(status_response(StatusCode::MISDIRECTED_REQUEST)),
         },
         None => match state.config.rules.first_match(connect_host) {
             Some(rule) => rule,
-            // Should not happen: MITM is only entered on a CONNECT-authority match.
             None => return Ok(status_response(StatusCode::BAD_GATEWAY)),
         },
     };
@@ -517,6 +526,10 @@ async fn forward_request(
         state.config.basic_auth.as_ref(),
         rule,
         &state.upstream,
+        ForwardingHeaders {
+            authority: authority.as_ref(),
+            secret: state.config.forwarder_secret.as_ref(),
+        },
     )
     .await
     {
@@ -545,12 +558,85 @@ fn request_host(req: &Request<Incoming>) -> Option<String> {
     req.uri().host().map(str::to_string)
 }
 
+/// Metadata derived from the request before its headers are sanitized.
+#[derive(Clone, Copy, Default)]
+struct ForwardingHeaders<'a> {
+    authority: Option<&'a HeaderValue>,
+    secret: Option<&'a super::config::ForwarderSecret>,
+}
+
+/// Requires a single valid browser authority, with URI/Host agreement.
+fn browser_authority<B>(req: &Request<B>) -> Result<Option<HeaderValue>, ()> {
+    let host = if req.headers().contains_key(hyper::header::HOST) {
+        Some(single_header(req.headers(), &hyper::header::HOST).ok_or(())?)
+    } else {
+        None
+    };
+    let host_authority = host
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ())
+                .and_then(parse_browser_authority)
+        })
+        .transpose()?;
+    let uri_authority = req
+        .uri()
+        .authority()
+        .map(|authority| parse_browser_authority(authority.as_str()))
+        .transpose()?;
+    if let (Some(host), Some(uri)) = (&host_authority, &uri_authority)
+        && host != uri
+    {
+        return Err(());
+    }
+    match (host, req.uri().authority()) {
+        (Some(host), _) => Ok(Some(host.clone())),
+        (None, Some(authority)) => HeaderValue::from_str(authority.as_str())
+            .map(Some)
+            .map_err(|_| ()),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_browser_authority(raw: &str) -> Result<(String, u16), ()> {
+    let (host, port) = match raw.split_once(':') {
+        Some((host, port)) => {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let port = port.parse::<u16>().map_err(|_| ())?;
+            if port == 0 {
+                return Err(());
+            }
+            (host, port)
+        }
+        None => (raw, 443),
+    };
+    if host.is_empty()
+        || host.len() > 253
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(());
+    }
+    Ok((host.to_ascii_lowercase(), port))
+}
+
 async fn proxy_to_upstream(
     mut req: Request<Incoming>,
     outcome: &super::rewrite::RewriteOutcome,
     basic_auth: Option<&super::config::BasicAuth>,
     rule: &super::rewrite::Rule,
     upstream: &super::upstream::UpstreamClient,
+    forwarding: ForwardingHeaders<'_>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Report<ProxyError>> {
     let upstream_host = rule.to.host();
     let upstream_port = rule.to.port;
@@ -571,7 +657,7 @@ async fn proxy_to_upstream(
     );
 
     let metadata = super::upstream::RequestMetadata::capture(&req);
-    rewrite_headers(req.headers_mut(), outcome, basic_auth);
+    rewrite_headers(req.headers_mut(), outcome, basic_auth, forwarding);
 
     let mut response = upstream.send(req, metadata, rule, outcome).await?;
 
@@ -674,58 +760,62 @@ impl UpstreamTrailerMetadata {
 }
 
 fn is_safe_trailer_field(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str(),
-        "authorization"
-            | "cache-control"
-            | "connection"
-            | "content-encoding"
-            | "content-length"
-            | "content-range"
-            | "content-type"
-            | "host"
-            | "keep-alive"
-            | "max-forwards"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "set-cookie"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+    name.as_str() != super::config::FORWARDER_AUTH_HEADER
+        && !matches!(
+            name.as_str(),
+            "authorization"
+                | "cache-control"
+                | "connection"
+                | "content-encoding"
+                | "content-length"
+                | "content-range"
+                | "content-type"
+                | "host"
+                | "keep-alive"
+                | "max-forwards"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "set-cookie"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
 }
 
-/// Applies the rewrite outcome: strips inbound hop-by-hop headers, then sets
-/// upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host` (both `FROM`, after
-/// stripping any higher-priority inbound `Forwarded`), an authoritative
-/// `X-Forwarded-Proto: https` (the browser leg is always TLS), and (only when
-/// absent) the injected `Authorization`. The request URI is left origin-form,
-/// which is what an HTTP/1.1 upstream expects.
+/// Sanitizes mapped request headers, then stamps browser-facing authority,
+/// scheme and optional credentials. Origin fields retain their original values.
 fn rewrite_headers(
     headers: &mut hyper::HeaderMap,
     outcome: &super::rewrite::RewriteOutcome,
     basic_auth: Option<&super::config::BasicAuth>,
+    forwarding: ForwardingHeaders<'_>,
 ) {
     let trailer_metadata = UpstreamTrailerMetadata::capture(headers);
     // Strip hop-by-hop headers first, so a client cannot flag the authoritative
     // headers we stamp below as connection-specific and have them dropped.
+    let origins: Vec<_> = headers
+        .get_all(hyper::header::ORIGIN)
+        .iter()
+        .cloned()
+        .collect();
     strip_hop_by_hop(headers);
+    headers.remove(hyper::header::ORIGIN);
+    for origin in origins {
+        headers.append(hyper::header::ORIGIN, origin);
+    }
+    headers.remove(super::config::FORWARDER_AUTH_HEADER);
+    if let Some(secret) = forwarding.secret {
+        headers.insert(
+            super::config::FORWARDER_AUTH_HEADER,
+            secret.header_value().clone(),
+        );
+    }
     headers.insert(hyper::header::HOST, outcome.host_header.clone());
-    // Tell the upstream the original first-party host (always `FROM`). Trusted
-    // Server resolves the request host from `Forwarded` → `X-Forwarded-Host` →
-    // `Host`, so a client-supplied `Forwarded` would outrank the value we inject.
-    // Remove it first so the `X-Forwarded-Host` we stamp is the one core reads,
-    // aiming to keep emitted first-party URLs on the production host even when
-    // `--rewrite-host` sends `Host: TO` for routing/validation (spec §8.3). NOTE:
-    // this only holds if the upstream preserves `X-Forwarded-Host` — the real
-    // Fastly/Spin adapter paths strip it before routing, in which case core falls
-    // back to `Host` (`TO`). See the `--rewrite-host` caveat in the user guide.
-    // The `insert`s below already overwrite any inbound `X-Forwarded-Host`/`X-Orig-Host`.
     headers.remove("forwarded");
     headers.insert(
         HeaderName::from_static(X_FORWARDED_HOST),
-        outcome.orig_host.clone(),
+        forwarding.authority.unwrap_or(&outcome.orig_host).clone(),
     );
     headers.insert(
         HeaderName::from_static(X_ORIG_HOST),
@@ -747,6 +837,13 @@ fn rewrite_headers(
         headers.insert(hyper::header::AUTHORIZATION, auth.header_value().clone());
     }
     trailer_metadata.regenerate(headers);
+}
+
+/// Returns the value of `name` only when exactly one such field is present.
+fn single_header<'a>(headers: &'a hyper::HeaderMap, name: &HeaderName) -> Option<&'a HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -794,6 +891,23 @@ mod tests {
         }
     }
 
+    fn browser_headers(host: &'static str, origins: &[&'static str]) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::HOST, HeaderValue::from_static(host));
+        for origin in origins {
+            headers.append(hyper::header::ORIGIN, HeaderValue::from_static(origin));
+        }
+        headers
+    }
+
+    fn origins(headers: &hyper::HeaderMap) -> Vec<&str> {
+        headers
+            .get_all(hyper::header::ORIGIN)
+            .iter()
+            .map(|value| value.to_str().expect("should encode origin"))
+            .collect()
+    }
+
     fn head(method: &str, target: &str) -> RequestHead {
         RequestHead {
             method: method.to_string(),
@@ -802,6 +916,106 @@ mod tests {
             complete: true,
             prefix: Vec::new(),
         }
+    }
+
+    #[test]
+    fn authority_validation_rejects_ambiguous_or_malformed_hosts() {
+        for host in [
+            "",
+            "a.example.com,b.example.com",
+            "a.example.com/path",
+            "user@a.example.com",
+            "a.example.com:0",
+            "a.example.com:65536",
+            "a.example.com:",
+            "a.example.com:abc",
+            "a.example.com ",
+            "a..example.com",
+            "-a.example.com",
+            "a.example.com?x=1",
+        ] {
+            let mut req = Request::new(());
+            req.headers_mut().insert(
+                hyper::header::HOST,
+                HeaderValue::from_str(host).expect("should encode header"),
+            );
+            assert!(
+                browser_authority(&req).is_err(),
+                "should reject invalid authority {host}"
+            );
+        }
+        let mut req = Request::new(());
+        req.headers_mut().append(
+            hyper::header::HOST,
+            HeaderValue::from_static("a.example.com"),
+        );
+        req.headers_mut().append(
+            hyper::header::HOST,
+            HeaderValue::from_static("a.example.com"),
+        );
+        assert!(
+            browser_authority(&req).is_err(),
+            "should reject duplicate Host fields"
+        );
+    }
+
+    #[test]
+    fn authority_validation_preserves_ports_and_requires_uri_agreement() {
+        let mut req = Request::builder()
+            .uri("https://A.example.com:8443/path")
+            .header(hyper::header::HOST, "a.example.com:8443")
+            .body(())
+            .expect("should build request");
+        assert_eq!(
+            browser_authority(&req).expect("should validate authority"),
+            Some(HeaderValue::from_static("a.example.com:8443")),
+            "should retain browser port"
+        );
+        req.headers_mut().insert(
+            hyper::header::HOST,
+            HeaderValue::from_static("b.example.com:8443"),
+        );
+        assert!(
+            browser_authority(&req).is_err(),
+            "should reject URI/Host disagreement"
+        );
+        req.headers_mut().remove(hyper::header::HOST);
+        assert_eq!(
+            browser_authority(&req).expect("should accept unambiguous URI authority"),
+            Some(HeaderValue::from_static("A.example.com:8443")),
+            "should retain URI authority"
+        );
+        let req = Request::new(());
+        assert_eq!(
+            browser_authority(&req),
+            Ok(None),
+            "should never guess CONNECT authority"
+        );
+    }
+
+    #[test]
+    fn header_sanitation_preserves_every_origin_field() {
+        let expected = [
+            "https://www.example-publisher.com:8443",
+            "null",
+            "https://foreign.example.com",
+        ];
+        let mut headers = browser_headers("www.example-publisher.com:8443", &expected);
+        headers.insert(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("Origin"),
+        );
+        rewrite_headers(
+            &mut headers,
+            &rewrite_outcome("to.example.com"),
+            None,
+            ForwardingHeaders::default(),
+        );
+        assert_eq!(
+            origins(&headers),
+            expected,
+            "should preserve all Origin values unchanged"
+        );
     }
 
     #[test]
@@ -866,7 +1080,7 @@ mod tests {
             HeaderName::from_static("proxy-connection"),
             HeaderValue::from_static("keep-alive"),
         );
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_headers(&mut headers, &outcome, None, ForwardingHeaders::default());
         assert!(
             !headers.contains_key("proxy-connection"),
             "Proxy-Connection is a hop-by-hop header and must be removed"
@@ -916,6 +1130,7 @@ mod tests {
             request.headers_mut(),
             &rewrite_outcome("to.edgecompute.app"),
             None,
+            ForwardingHeaders::default(),
         );
 
         assert!(
@@ -955,7 +1170,7 @@ mod tests {
             HeaderValue::from_static("keep-alive, TE"),
         );
 
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_headers(&mut headers, &outcome, None, ForwardingHeaders::default());
 
         let declarations: Vec<_> = headers
             .get_all(hyper::header::TRAILER)
@@ -986,7 +1201,7 @@ mod tests {
             HeaderName::from_static("forwarded"),
             HeaderValue::from_static("host=evil.example.com"),
         );
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_headers(&mut headers, &outcome, None, ForwardingHeaders::default());
         assert!(
             !headers.contains_key("forwarded"),
             "inbound Forwarded must be stripped so it cannot outrank X-Forwarded-Host"
@@ -1012,7 +1227,7 @@ mod tests {
             HeaderName::from_static("fastly-ssl"),
             HeaderValue::from_static("0"),
         );
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_headers(&mut headers, &outcome, None, ForwardingHeaders::default());
         assert_eq!(
             headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()),
             Some("https"),
@@ -1043,7 +1258,7 @@ mod tests {
             HeaderName::from_static("keep-alive"),
             HeaderValue::from_static("timeout=5"),
         );
-        rewrite_headers(&mut headers, &outcome, None);
+        rewrite_headers(&mut headers, &outcome, None, ForwardingHeaders::default());
         assert!(
             !headers.contains_key(hyper::header::CONNECTION),
             "inbound Connection is stripped"
