@@ -25,9 +25,10 @@ if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 # A closed or merged proposal is a maintainer decision; never reopen or
-# recreate it on a retry.
-existing="$(gh pr list --head "$branch" --state all --json number,state,body \
-  --jq '.[0] | select(.) | "\(.number) \(.state) \([.body | match("<!-- docs-proposal-base: ([0-9a-f]{40}) -->").captures[0].string] | first // "")"')"
+# recreate it on a retry. The head filter matches branch names only, so skip
+# pull requests from forks that reuse the predictable proposal branch name.
+existing="$(gh pr list --head "$branch" --state all --json number,state,body,isCrossRepository \
+  --jq '[.[] | select(.isCrossRepository | not)] | .[0] | select(.) | "\(.number) \(.state) \([.body | match("<!-- docs-proposal-base: ([0-9a-f]{40}) -->").captures[0].string] | first // "")"')"
 read -r pr_number pr_state pr_base <<< "$existing" || true
 if [ -n "$existing" ] && [ "$pr_state" != "OPEN" ]; then
   printf 'Proposal #%s for %s is %s; not reopening it.\n' "$pr_number" "$sha" "$pr_state"
@@ -69,8 +70,10 @@ if [ ! -s "$work_dir/proposal.patch" ]; then
     if [ -n "$remote_head" ]; then
       git push --quiet --force-with-lease="refs/heads/$branch:$remote_head" origin --delete "$branch"
     fi
-    gh pr close "$pr_number" \
-      --comment "A rerun for $sha proposed no documentation changes."
+    # Deleting the head branch already closes the pull request, and
+    # gh pr close skips --comment on a closed one, so comment separately.
+    gh pr comment "$pr_number" --body "A rerun for $sha proposed no documentation changes."
+    gh pr close "$pr_number"
   fi
   exit 0
 fi

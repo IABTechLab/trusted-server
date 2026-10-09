@@ -27,6 +27,8 @@ if [ -z "$base" ] || [ "$base" = "$sha" ] || ! git merge-base --is-ancestor "$ba
   fi
   base="$(git rev-parse "$sha^1")"
 fi
+# A manual base such as `main` resolves here, so publish.sh gets a full SHA.
+base="$(git rev-parse --verify "$base^{commit}")"
 mkdir -p "$2"
 work_dir="$(cd "$2" && pwd)"
 # publish.sh records the base so a retry over a different range is refused.
@@ -34,11 +36,17 @@ printf '%s\n' "$base" > "$work_dir/base"
 relative_dir="${work_dir#"$root"/}"
 
 # Prints a prompt template with each `<work-dir>` replaced by the work
-# directory, relative to the repository root.
+# directory, relative to the repository root. Splits on the placeholder
+# instead of using ${text//pattern/replacement}: bash 3.2 keeps quotes in the
+# replacement literally, and bash 5.2 expands an unquoted & in it.
 render_prompt() {
-  local text
-  text="$(cat "$1")"
-  printf '%s\n' "${text//<work-dir>/"$relative_dir"}"
+  local rest rendered=""
+  rest="$(cat "$1")"
+  while [[ "$rest" == *"<work-dir>"* ]]; do
+    rendered+="${rest%%<work-dir>*}$relative_dir"
+    rest="${rest#*<work-dir>}"
+  done
+  printf '%s\n' "$rendered$rest"
 }
 
 # Reads are always permitted; writes are allowed so Copilot can edit pages,
@@ -81,7 +89,11 @@ fi
   git diff --cached --no-renames "$sha" -- docs | node "$here/hunks.mjs" list
   printf '```\n'
 } > "$work_dir/evidence-prompt.md"
-run_copilot evidence-prompt.md
+# Evidence is advisory: hunks without it are posted as "none cited", so a
+# failed evidence run must not discard the proposal.
+if ! run_copilot evidence-prompt.md; then
+  printf '::warning::Copilot evidence run failed; hunks will be posted without cited sources.\n'
+fi
 if [ ! -f "$work_dir/evidence.json" ]; then
   printf '{}\n' > "$work_dir/evidence.json"
 fi

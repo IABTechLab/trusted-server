@@ -47,7 +47,8 @@ assert_contains "$body" "<!-- docs-proposal-base: $base_sha -->" "should embed t
 assert_contains "$body" "inspected fedcba987654..0123456789ab" "should show the inspected range"
 assert_contains "$body" "merged change $sha (#42): Add example flag" "should link the merge and its PR"
 assert_contains "$body" "documents the new flag" "should include the rationale"
-assert_contains "$body" $'@\u200bexample-org/maintainers' "should neutralize mentions in the rationale"
+assert_contains "$body" $'## Rationale\n\n```text\n- docs/guide/cli.md' "should render the rationale as an inert text block"
+assert_contains "$body" "$(printf '@\342\200\213example-org/maintainers')" "should neutralize mentions in the rationale"
 : > "$rationale"
 body="$(docs_proposal_pr_body "$sha" "$base_sha" "Add example flag" "" "$rationale")"
 assert_contains "$body" "merged change $sha: Add example flag" "should omit a missing origin PR"
@@ -72,7 +73,16 @@ cat > "$tmp/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_LOG"
 case "$1 $2" in
-  "pr list") printf '%s' "${STUB_PR:-}" ;;
+  "pr list")
+    # STUB_PR_JSON is filtered through the real --jq expression; STUB_PR is
+    # printed as the already-filtered result.
+    if [ -n "${STUB_PR_JSON:-}" ]; then
+      while [ "$#" -gt 0 ] && [ "$1" != --jq ]; do shift; done
+      jq -r "$2" <<< "$STUB_PR_JSON"
+    else
+      printf '%s' "${STUB_PR:-}"
+    fi
+    ;;
   "pr create") printf 'https://github.com/example/repo/pull/7\n' ;;
   "api repos/{owner}/{repo}/commits/"*) printf '%s' "${STUB_ORIGIN_PR:-}" ;;
   "api --paginate") printf '%s' "${STUB_REVIEWS:-}" ;;
@@ -92,6 +102,13 @@ STUB
 cat > "$tmp/bin/copilot" <<'STUB'
 #!/usr/bin/env bash
 printf 'copilot %s\n' "$*" >> "$STUB_LOG"
+# The proposal run edits a page when asked, so the evidence half runs too.
+if [ -n "${STUB_COPILOT_EDIT:-}" ] && [[ "$2" == *"/prompt.md "* ]]; then
+  printf 'proposed\n' >> "$STUB_COPILOT_EDIT"
+fi
+if [ -n "${STUB_COPILOT_FAIL_EVIDENCE:-}" ] && [[ "$2" == *"/evidence-prompt.md "* ]]; then
+  exit 1
+fi
 STUB
 # Wraps git so a test can fail the proposal branch fetch, or land a
 # maintainer push right after publish.sh inspects the branch head.
@@ -174,6 +191,22 @@ make_patch docs/superpowers/notes.md
 assert_eq "$(run_validate)" 1 "should reject a disallowed path before the docs gates"
 assert_eq "$(grep -c 'npm' "$STUB_LOG" || true)" 0 "should not build a disallowed proposal"
 
+# A symlink under docs/guide passes the path check but would publish its
+# target, so both validation and publication refuse it.
+make_symlink_patch() {
+  make_patch ""
+  ln -s ../superpowers/notes.md docs/guide/link.md
+  git add -A && git diff --cached --binary "$merge_sha" > "$tmp/proposal/proposal.patch"
+  git reset -q --hard "$merge_sha" && git clean -qfd
+}
+make_symlink_patch
+assert_eq "$(run_validate)" 1 "should reject a symlink under docs/guide"
+assert_eq "$(grep -c 'npm' "$STUB_LOG" || true)" 0 "should not build a symlinked proposal"
+assert_contains "$(cat "$tmp/out.log")" "not regular files" "should explain why a symlink is rejected"
+make_symlink_patch
+assert_eq "$(STUB_PR="" run_publish)" 1 "should refuse to publish a symlink"
+assert_eq "$(remote_has_branch)" no "should not push a symlinked proposal"
+
 make_patch docs/guide/cli.md
 assert_eq "$(run_validate)" 0 "should validate an allowed proposal"
 assert_contains "$(cat "$STUB_LOG")" "npm run build" "should run the docs build"
@@ -202,6 +235,17 @@ published_head="$(remote_head)"
 assert_eq "$(STUB_PR="7 OPEN $base_sha" STUB_REVIEWS=101 run_publish)" 0 "should succeed on an unchanged retry"
 assert_eq "$(remote_head)" "$published_head" "should not push an unchanged proposal"
 assert_eq "$(grep -c 'pr create\|--method POST' "$STUB_LOG" || true)" 0 "should not re-post an unchanged proposal"
+
+# A fork can open a pull request from a branch with the predictable proposal
+# name; only the same-repository proposal counts.
+marker="<!-- docs-proposal-base: $base_sha -->"
+fork_and_own="[{\"number\":9,\"state\":\"CLOSED\",\"body\":\"$marker\",\"isCrossRepository\":true},{\"number\":7,\"state\":\"OPEN\",\"body\":\"$marker\",\"isCrossRepository\":false}]"
+assert_eq "$(STUB_PR_JSON="$fork_and_own" STUB_REVIEWS=101 run_publish)" 0 "should skip a newer fork PR with the proposal branch name"
+assert_contains "$(cat "$STUB_LOG")" "pr edit 7" "should update the same-repository proposal"
+assert_eq "$(grep -c 'pr edit 9' "$STUB_LOG" || true)" 0 "should never edit a fork PR"
+only_fork="[{\"number\":9,\"state\":\"OPEN\",\"body\":\"$marker\",\"isCrossRepository\":true}]"
+assert_eq "$(STUB_PR_JSON="$only_fork" STUB_REVIEWS=101 run_publish)" 0 "should ignore a fork PR when no proposal exists"
+assert_contains "$(cat "$STUB_LOG")" "pr create --base main --head $branch" "should open the proposal despite a fork PR"
 
 narrow_base=0000000000000000000000000000000000000001
 make_patch "" "$narrow_base"
@@ -281,7 +325,8 @@ git push -q --force origin "$pushed_head:refs/heads/$branch"
 make_patch ""
 assert_eq "$(STUB_PR="7 OPEN $base_sha" run_publish)" 0 "should succeed when an empty rerun deletes the proposal"
 assert_eq "$(remote_has_branch)" no "should delete an unmaintained proposal branch"
-assert_contains "$(cat "$STUB_LOG")" "pr close 7 --comment" "should close the proposal after deleting its branch"
+assert_contains "$(cat "$STUB_LOG")" "pr comment 7 --body" "should explain why the proposal closed"
+assert_contains "$(cat "$STUB_LOG")" "pr close 7" "should close the proposal after deleting its branch"
 assert_eq "$(grep -c 'delete-branch' "$STUB_LOG" || true)" 0 "should not let gh delete the branch"
 
 # A push that added two commits is inspected from the previous main head; a
@@ -313,10 +358,10 @@ assert_contains "$(cat "$STUB_LOG")" "copilot -p" "should run Copilot"
 assert_contains "$(cat .docs-proposal/prompt.md)" ".docs-proposal/rationale.md" "should name the work dir in the prompt"
 assert_eq "$(grep -c '<work-dir>' .docs-proposal/prompt.md || true)" 0 "should fill every work dir placeholder"
 
-rm -rf proposal-out
-"$here/propose.sh" "$second_sha" proposal-out "" > "$tmp/out.log" 2>&1
-assert_contains "$(cat proposal-out/prompt.md)" "proposal-out/rationale.md" "should name a custom work dir in the prompt"
-rm -rf proposal-out
+rm -rf 'proposal&out'
+"$here/propose.sh" "$second_sha" 'proposal&out' "" > "$tmp/out.log" 2>&1
+assert_contains "$(cat 'proposal&out/prompt.md')" "proposal&out/rationale.md" "should name a custom work dir in the prompt"
+rm -rf 'proposal&out'
 
 assert_eq "$(run_propose "")" 0 "should propose without a base"
 assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should default the base to the first parent"
@@ -328,6 +373,20 @@ assert_eq "$(grep -c '::warning::' "$tmp/out.log" || true)" 0 "should not warn a
 assert_eq "$(run_propose "$published_head")" 0 "should propose with an unrelated base"
 assert_eq "$(cat .docs-proposal/base)" "$first_sha" "should replace an unrelated base with the first parent"
 assert_contains "$(cat "$tmp/out.log")" "is not an ancestor" "should warn about an unrelated base"
+
+assert_eq "$(run_propose "$second_sha~2")" 0 "should propose with a revision expression as the base"
+assert_eq "$(cat .docs-proposal/base)" "$merge_sha" "should record the base as a full SHA"
+
+assert_eq "$(STUB_COPILOT_EDIT=docs/guide/cli.md run_propose "$merge_sha")" 0 "should propose an edited page"
+assert_contains "$(cat .docs-proposal/proposal.patch)" "+proposed" "should write the edit to the patch"
+assert_contains "$(cat .docs-proposal/evidence-prompt.md)" '"path": "docs/guide/cli.md"' "should list the edited hunk for evidence"
+assert_eq "$(grep -c '^copilot' "$STUB_LOG")" 2 "should run Copilot again for evidence"
+
+git reset -q --hard "$second_sha"
+assert_eq "$(STUB_COPILOT_EDIT=docs/guide/cli.md STUB_COPILOT_FAIL_EVIDENCE=1 run_propose "$merge_sha")" 0 "should keep the proposal when the evidence run fails"
+assert_contains "$(cat .docs-proposal/proposal.patch)" "+proposed" "should keep the patch when the evidence run fails"
+assert_eq "$(cat .docs-proposal/evidence.json)" "{}" "should fall back to no evidence"
+assert_contains "$(cat "$tmp/out.log")" "evidence run failed" "should warn that the evidence run failed"
 
 cd "$here"
 

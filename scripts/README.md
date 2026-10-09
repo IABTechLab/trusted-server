@@ -21,7 +21,7 @@ their documented orchestration handles a probe deliberately.
 | `docs-proposal/propose.sh`                | Merge SHA on `main`, work dir, optional base SHA; Copilot CLI, Node, `npm` | Runs Copilot CLI to edit `docs/guide/**` or `docs/index.md`, formats docs, and writes a patch, rationale, evidence, and base into the work dir. Leaves the edits staged.                                                                                                                           |
 | `docs-proposal/validate.sh`               | Merge SHA, work dir from `propose.sh`; Node, `npm`; no write credentials   | Applies the patch, rejects paths outside the allowlist, and runs the docs gates. Leaves the edits staged.                                                                                                                                                                                          |
 | `docs-proposal/publish.sh`                | Merge SHA, work dir from `propose.sh`; `gh` with write `GH_TOKEN`          | Re-checks the allowlist without building, pushes `docs/auto/<sha12>` unless a maintainer added to it, opens or edits its PR, and reviews each new commit per hunk. An empty rerun deletes the branch under a lease, then closes the PR; a failed branch lookup stops the run. Never writes `main`. |
-| `docs-proposal/test.sh`                   | Git and Node                                                               | Tests the helpers and the propose, validate, and publish flows against a temporary repository with stubbed `copilot`, `gh`, and `npm`; removes it on exit.                                                                                                                                         |
+| `docs-proposal/test.sh`                   | Git, Node, and `jq`                                                        | Tests the helpers and the propose, validate, and publish flows against a temporary repository with stubbed `copilot`, `gh`, and `npm`; removes it on exit.                                                                                                                                         |
 
 The four adapter smoke contracts are documented in the
 [deployment guides](../docs/guide/integrations-overview.md#adapter-support).
@@ -34,8 +34,9 @@ workflow itself, fails unless the organization Copilot policy "Allow use of
 Copilot CLI billed to the organization" and the repository setting "Allow GitHub
 Actions to create and approve pull requests" are already enabled. Pull requests
 opened with `GITHUB_TOKEN` do not trigger other workflows, so the workflow's
-validate job runs the docs gates itself, without write credentials; push to the
-proposal branch to run regular CI. Retry a merge from the workflow's manual
+validate job runs the docs gates itself, without write credentials. The checks
+`main` requires never start on a proposal, so close and reopen it, or push to
+its branch, before merging. Retry a merge from the workflow's manual
 dispatch with its full commit SHA; the scripts always run from the workflow's
 revision, so any merge on `main` can be retried. When the original push added
 several commits, as a rebase merge does, also pass its `base`: the `main` head

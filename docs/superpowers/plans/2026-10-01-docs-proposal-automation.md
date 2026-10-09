@@ -1,5 +1,11 @@
 # Documentation Proposal Automation Implementation Plan
 
+> **Status: Superseded.** This is the original two-job plan, kept for history.
+> Review moved the docs gates into the read-only `validate` job, replaced
+> `--force` pushes and `gh pr close --delete-branch` with leased pushes, dropped
+> `shell(git grep:*)` and the npm cache, and added base tracking. Do not execute
+> it; the design spec and `scripts/docs-proposal/` are the source of truth.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** After a code merge to `main`, run GitHub Copilot CLI to propose

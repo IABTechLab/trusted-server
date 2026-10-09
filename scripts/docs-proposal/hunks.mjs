@@ -180,7 +180,7 @@ export function indexEvidence(raw) {
   return evidence;
 }
 
-// A suggestion fence must be longer than any backtick run in its body.
+// A fence must be longer than any backtick run in its body.
 function fenceFor(body) {
   let longestRun = 0;
   for (const text of body) {
@@ -191,15 +191,33 @@ function fenceFor(body) {
   return "`".repeat(Math.max(3, longestRun + 1));
 }
 
+// The rationale is model output, so render it as a plain text block: links,
+// images, HTML, issue references, and closing keywords in it stay inert.
+export function inertBlock(text) {
+  const body = neutralizeMentions(text).replace(/\n+$/, "");
+  const fence = fenceFor(body.split("\n"));
+  return `${fence}text\n${body}\n${fence}\n`;
+}
+
+// A null body marks a hunk that creates its file: an empty suggestion would
+// leave an empty page that VitePress still builds, so ask for a deletion.
 function commentBody(cited, body) {
   const source = cited?.source
     ? `\`${cited.source}\``
     : "none cited — verify this hunk against the merged code.";
   const reason = cited?.reason ? ` — ${cited.reason}` : "";
+  const heading = `**Source:** ${source}${reason}`;
+  if (body === null) {
+    return [
+      heading,
+      "",
+      "This hunk creates the file. Delete the file to revert it.",
+    ].join("\n");
+  }
   const fence = fenceFor(body);
   const content = body.length > 0 ? `${body.join("\n")}\n` : "";
   return [
-    `**Source:** ${source}${reason}`,
+    heading,
     "",
     "Apply this suggestion to revert the hunk.",
     "",
@@ -232,7 +250,10 @@ export function buildReview(files, evidence, commitId) {
       path,
       line: suggestion.line,
       side: "RIGHT",
-      body: commentBody(evidence.get(id), suggestion.body),
+      body: commentBody(
+        evidence.get(id),
+        status === "added" ? null : suggestion.body,
+      ),
     };
     if (suggestion.startLine !== suggestion.line) {
       comment.start_line = suggestion.startLine;
@@ -260,8 +281,8 @@ function readEvidence(path) {
 
 function main([command, evidencePath, commitId]) {
   const input = readFileSync(0, "utf8");
-  if (command === "sanitize") {
-    process.stdout.write(neutralizeMentions(input));
+  if (command === "rationale") {
+    process.stdout.write(inertBlock(input));
     return;
   }
   const files = parseDiff(input);
@@ -275,7 +296,7 @@ function main([command, evidencePath, commitId]) {
     return;
   }
   process.stderr.write(
-    "usage: hunks.mjs list | review <evidence.json> <commit-sha> | sanitize\n",
+    "usage: hunks.mjs list | review <evidence.json> <commit-sha> | rationale\n",
   );
   process.exitCode = 2;
 }

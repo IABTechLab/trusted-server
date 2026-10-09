@@ -32,12 +32,12 @@ jobs:
         id: node-version
         run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
 
+      # No dependency cache: the docs-proposal workflow runs generated content
+      # on the main ref, where it could save a poisoned entry under this key.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
-          cache-dependency-path: docs/package-lock.json
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

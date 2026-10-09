@@ -5,6 +5,7 @@ import {
   buildReview,
   collectHunks,
   indexEvidence,
+  inertBlock,
   listHunks,
   neutralizeMentions,
   parseDiff,
@@ -208,6 +209,24 @@ test("neutralizeMentions keeps text but breaks every mention", () => {
   );
 });
 
+test("inertBlock fences the rationale beyond any backtick run", () => {
+  assert.equal(
+    inertBlock("Closes #12, see [x](https://example.com) and `a` ```b```\n\n"),
+    [
+      "````text",
+      "Closes #12, see [x](https://example.com) and `a` ```b```",
+      "````",
+      "",
+    ].join("\n"),
+    "should wrap the text in a longer fence and drop trailing newlines",
+  );
+  assert.equal(
+    inertBlock("ask @team\n"),
+    "```text\nask @\u200bteam\n```\n",
+    "should still neutralize mentions",
+  );
+});
+
 test("buildReview cites evidence and suggests reverts", () => {
   const files = parseDiff(
     [
@@ -293,6 +312,41 @@ test("buildReview lists binary and unanchored changes in the body", () => {
     review.body,
     /`docs\/guide\/logo\.png`: binary change/,
     "should note the binary file",
+  );
+});
+
+test("buildReview asks to delete a new file instead of emptying it", () => {
+  const files = parseDiff(
+    [
+      "diff --git a/docs/guide/new.md b/docs/guide/new.md",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/docs/guide/new.md",
+      "@@ -0,0 +1,2 @@",
+      "+# New",
+      "+page",
+      "",
+    ].join("\n"),
+  );
+  const [entry] = collectHunks(files);
+  const evidence = indexEvidence({
+    hunks: [{ id: entry.id, source: "crates/a.rs:1", reason: "New page." }],
+  });
+  const [comment] = buildReview(files, evidence, "abc123").comments;
+  assert.equal(
+    comment.path,
+    "docs/guide/new.md",
+    "should anchor on the new file",
+  );
+  assert.equal(comment.line, 2, "should end at the last new line");
+  assert.equal(
+    comment.body,
+    [
+      "**Source:** `crates/a.rs:1` — New page.",
+      "",
+      "This hunk creates the file. Delete the file to revert it.",
+    ].join("\n"),
+    "should keep the evidence and offer no empty suggestion",
   );
 });
 

@@ -47,9 +47,9 @@ the current scripts rather than historical ones.
 - `push` to `main`, filtered to the source paths above. `docs/**` and
   `scripts/docs-proposal/**` are not included, so a merged documentation
   proposal or a change to this tooling never retriggers the workflow.
-- `workflow_dispatch` with a required `sha` input, for retries and for the
-  first end-to-end validation. Both scripts require a full 40-character SHA
-  reachable from `origin/main`.
+- `workflow_dispatch` with a required `sha` input and an optional `base`
+  input, for retries and for the first end-to-end validation. All three
+  scripts require a full 40-character SHA reachable from `origin/main`.
 - `concurrency` with `group: docs-proposal`, `cancel-in-progress: false`, and
   `queue: max` so sequential merges are processed one at a time, in order.
   The default queue keeps one pending run and cancels the rest, which would
@@ -83,7 +83,8 @@ Permissions: `contents: read`, `copilot-requests: write`.
       A hunk id is the changed path plus a short hash of the hunk's removed
       and added lines, so it is stable across reruns. A second Copilot run
       writes `evidence.json`: for each hunk id, the merged source `path:line`
-      that justifies it and a one-sentence reason.
+      that justifies it and a one-sentence reason. Evidence is advisory, so a
+      failed evidence run only logs a warning and keeps the proposal.
 4. Upload the `.docs-proposal/` directory as an artifact.
 
 ### Job `validate`
@@ -96,7 +97,9 @@ only here.
 
 1. Empty diff: exit successfully.
 2. Apply `proposal.patch` to the merge commit and reject the proposal if any
-   changed path is outside `docs/guide/**` or `docs/index.md`.
+   changed path is outside `docs/guide/**` or `docs/index.md`, or any changed
+   entry is not a regular file. A symlink would otherwise pass the path check
+   and publish its target.
 3. In `docs/`: `npm ci`, `npm run lint`, `npm run format`, `npm run build`.
    Any failure fails the workflow; no pull request is offered.
 
@@ -109,7 +112,8 @@ and nothing installs, builds, or executes proposal content.
 
 1. If a closed or merged pull request already exists for
    `docs/auto/<short-sha>`, leave it alone and exit successfully: a
-   maintainer's decision is never reopened or recreated.
+   maintainer's decision is never reopened or recreated. Pull requests from
+   forks that reuse the branch name are ignored.
 2. If an open pull request records a different base in its body, fail: the
    retry inspected another range, such as a manual dispatch without the base
    of a multi-commit push, and must not narrow or close the proposal. The
@@ -123,12 +127,14 @@ and nothing installs, builds, or executes proposal content.
    without pushing, closing, or deleting anything.
 4. Empty diff: if a pull request is open, delete its branch with
    `git push --force-with-lease=refs/heads/<branch>:<inspected head> --delete`,
-   so a maintainer push after the inspection makes the deletion fail, and
-   close the pull request with a comment only after the deletion succeeds.
+   so a maintainer push after the inspection makes the deletion fail. Only
+   after the deletion succeeds, comment on the pull request and then close
+   it; the deletion may already have closed it, and `gh pr close` skips its
+   `--comment` on a closed pull request.
    Then exit successfully. Otherwise apply `proposal.patch` to a fresh
    checkout of the merge commit.
 5. Reject the proposal again if any changed path is outside `docs/guide/**` or
-   `docs/index.md`.
+   `docs/index.md`, or any changed entry is not a regular file.
 6. Commit as `github-actions[bot]` on `docs/auto/<short-sha>`. If the remote
    branch already exists and its tree equals the new tree, reuse the remote
    commit and skip the push, so a retry resumes any later step that failed.
@@ -136,9 +142,10 @@ and nothing installs, builds, or executes proposal content.
 7. Find the originating pull request with
    `gh api repos/{owner}/{repo}/commits/<sha>/pulls`. Create the pull request,
    or edit the existing one, with a body that links the merge commit and the
-   originating pull request, records the inspected base, includes `rationale.md` with its `@` mentions
-   neutralized, and states that a human must verify the prose against the
-   code before merging.
+   originating pull request, records the inspected base, includes `rationale.md` as a
+   fenced `text` block with its `@` mentions neutralized, so links, HTML,
+   issue references, and closing keywords in it stay inert, and states that
+   a human must verify the prose against the code before merging.
 8. If `github-actions[bot]` already reviewed the pushed commit, stop: nothing
    is re-posted. Otherwise `node scripts/docs-proposal/hunks.mjs review`
    builds review comments and posts one `COMMENT` review through `gh api`
@@ -156,6 +163,7 @@ so the revert is exact:
 | ------------------------- | --------------------------------------- | ---------------------------------------- |
 | Changed or inserted lines | The new lines (right side)              | The original lines (empty for insertion) |
 | Pure deletion             | Adjacent context line (prefer previous) | That context line plus deleted lines     |
+| New file                  | The new lines (right side)              | None; the comment asks to delete it      |
 | Deleted file or binary    | Listed in the review body               | None                                     |
 
 Hunks without evidence still receive a revert suggestion, marked "none
@@ -174,8 +182,9 @@ Documented in `scripts/README.md`:
 - Repository setting "Allow GitHub Actions to create and approve pull
   requests" is enabled.
 - Pull requests opened with `GITHUB_TOKEN` do not trigger other workflows.
-  The `validate` job runs the docs gates itself; maintainers re-run regular CI
-  by pushing to the branch if needed.
+  The `validate` job runs the docs gates itself. The checks `main` requires
+  never start on a proposal, so maintainers close and reopen it, or push to
+  its branch, before merging.
 
 ## Security
 
@@ -187,6 +196,10 @@ Documented in `scripts/README.md`:
   is treated as able to run arbitrary code. Its token is read-only, neither it
   nor `validate` restores or saves a dependency cache, and its artifact is
   re-checked by `validate.sh` and `publish.sh`.
+- Both jobs run on the `main` ref, and code running in a job can save cache
+  entries scoped to `main` without declaring a cache. `deploy-docs.yml`, the
+  only privileged workflow that restored a cache, therefore installs docs
+  dependencies without one.
 - Input is code already merged to `main`, so no untrusted fork content reaches
   the agent.
 - The path allowlist is enforced by `validate.sh` and again by `publish.sh`,
@@ -201,15 +214,17 @@ Documented in `scripts/README.md`:
 - `node --test scripts/docs-proposal/hunks.test.mjs` covers hunk listing,
   every row of the per-hunk table, unknown evidence ids, and the review payload.
 - `scripts/docs-proposal/test.sh` stubs `gh` and `npm` and pushes to a
-  temporary bare repository to cover validation of empty, disallowed, and
-  allowed proposals, the empty diff, closing a stale proposal, a disallowed
+  temporary bare repository to cover validation of empty, disallowed, symlinked,
+  and allowed proposals, the empty diff, fork pull requests that reuse the
+  proposal branch name, closing a stale proposal, a disallowed
   path, first publish without a build, an unchanged retry, an updated proposal
   whose review fails and is resumed without a second push, a retry or empty
   rerun that leaves maintainer commits in place, an empty rerun that races a
   maintainer push, a failed branch fetch on both the empty and push paths,
   deleting an unmaintained branch before closing its proposal, retries over a different or
   unrecorded range, a closed proposal, PR body rendering, and how
-  `propose.sh` resolves the base of a multi-commit push.
+  `propose.sh` resolves the base of a multi-commit push, renders the work
+  dir into prompts, and runs, or survives a failure of, the evidence half.
 - `shellcheck` passes for every script.
 - The `docs-proposal-scripts` job in `format.yml` runs all three on every
   pull request.
