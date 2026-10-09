@@ -348,7 +348,7 @@ Every PR must pass:
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm && cargo clippy-cli && cargo clippy-codegen`
-   Also `scripts/lint-wasm-clock.sh` (core must use `web_time`, not `std::time::{Instant,SystemTime}::now`, which panic on Cloudflare).
+   Also `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there).
 3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)

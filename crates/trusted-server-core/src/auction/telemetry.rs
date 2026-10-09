@@ -211,6 +211,11 @@ impl AuctionObservationContext {
     }
 
     /// Return elapsed milliseconds since the observation was created.
+    ///
+    /// On Cloudflare Workers, [`Instant`] reads `performance.now()`, which only
+    /// advances after I/O. There this counts time spent waiting on I/O and
+    /// reads 0 for CPU-only spans, so it is not comparable with the wall-clock
+    /// value other adapters report.
     #[must_use]
     pub fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)

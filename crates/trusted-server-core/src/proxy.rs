@@ -907,16 +907,8 @@ fn apply_asset_origin_auth(
                 &config.region,
                 &credentials,
                 // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
-                // only accepts `std::time::SystemTime`. `std::time::SystemTime::now()`
-                // panics on `wasm32-unknown-unknown` (Cloudflare Workers), so derive an
-                // equivalent `std::time::SystemTime` from the wasm-safe `web_time` clock:
-                // `UNIX_EPOCH + elapsed` is pure arithmetic and never calls the panicking
-                // `now()`. On Fastly (wasm32-wasip1) and native, `web_time` delegates to
-                // the std clock, so behavior is unchanged there.
-                std::time::UNIX_EPOCH
-                    + web_time::SystemTime::now()
-                        .duration_since(web_time::UNIX_EPOCH)
-                        .unwrap_or_default(),
+                // only accepts `std::time::SystemTime`.
+                crate::ec::std_system_time_now(),
             )
         }
     }

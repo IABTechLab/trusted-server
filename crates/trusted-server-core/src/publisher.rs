@@ -6463,15 +6463,9 @@ fn origin_shared_ttl(
     headers: &edgezero_core::http::HeaderMap,
     max_age: Duration,
 ) -> Result<Duration, TemplateCacheBypassReason> {
-    // `httpdate` parses `Date`/`Expires` into `std::time::SystemTime`, but
-    // `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown`
-    // (Cloudflare Workers). Build the equivalent `std` value from the wasm-safe
-    // `web_time` clock: `UNIX_EPOCH + elapsed` never calls the panicking `now()`.
-    let now = SystemTime::UNIX_EPOCH
-        + web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .unwrap_or_default();
-    origin_shared_ttl_at(headers, now, max_age)
+    // `httpdate` parses `Date`/`Expires` into `std::time::SystemTime`, so take
+    // the wasm-safe std value rather than calling `SystemTime::now()`.
+    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_age)
 }
 
 fn origin_shared_ttl_at(

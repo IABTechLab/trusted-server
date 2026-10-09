@@ -723,6 +723,21 @@ pub(crate) fn checked_current_timestamp() -> Option<u64> {
         .ok()
 }
 
+/// Returns the current time as a [`std::time::SystemTime`] without calling
+/// `std::time::SystemTime::now()`, which panics on `wasm32-unknown-unknown`.
+///
+/// Use this for APIs that only accept the std type, such as `httpdate` or
+/// chrono's `DateTime::from`. It reads the wasm-safe [`web_time::SystemTime`]
+/// clock and adds the elapsed time to [`std::time::UNIX_EPOCH`], which is pure
+/// arithmetic. On native and `wasm32-wasip1`, [`web_time`] delegates to the
+/// std clock, so this equals `std::time::SystemTime::now()` there.
+pub(crate) fn std_system_time_now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH
+        + web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,6 +1138,19 @@ mod tests {
             ec.existing_cookie_ec_id(),
             Some(cookie_ec2.as_str()),
             "should return cookie value for revocation even when header is present"
+        );
+    }
+
+    #[test]
+    fn std_system_time_now_tracks_std_clock() {
+        let before = std::time::SystemTime::now();
+
+        let now = std_system_time_now();
+
+        let after = std::time::SystemTime::now();
+        assert!(
+            before <= now && now <= after,
+            "should fall between std clock reads taken before and after"
         );
     }
 }
