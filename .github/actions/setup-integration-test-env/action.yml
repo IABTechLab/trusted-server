@@ -96,8 +96,11 @@ runs:
     - name: Build WordPress test container
       if: ${{ inputs.build-test-images == 'true' }}
       shell: bash
+      # Docker's official ECR mirror avoids Docker Hub anonymous pull limits.
       run: |
-        docker build -t test-wordpress:latest \
+        docker build \
+          --build-arg DOCKER_LIBRARY=public.ecr.aws/docker/library \
+          -t test-wordpress:latest \
           crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 
     - name: Build Next.js test container
@@ -106,6 +109,7 @@ runs:
       run: |
         docker build \
           --build-arg NODE_VERSION=${{ steps.node-version.outputs.node-version }} \
+          --build-arg DOCKER_LIBRARY=public.ecr.aws/docker/library \
           -t test-nextjs:latest \
           crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 
