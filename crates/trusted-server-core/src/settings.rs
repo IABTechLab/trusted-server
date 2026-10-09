@@ -1023,7 +1023,7 @@ pub struct ImageOptimizerSettings {
 }
 
 impl ImageOptimizerSettings {
-    /// Normalize image configuration without losing conflicting original keys.
+    /// Trim image configuration keys and values, rejecting keys that collide after trimming.
     ///
     /// # Errors
     ///
@@ -1034,11 +1034,13 @@ impl ImageOptimizerSettings {
             self.profile_sets.keys(),
             "image_optimizer.profile_sets",
         )?;
-        for (name, profile_set) in &self.profile_sets {
+        let mut profile_sets: Vec<_> = self.profile_sets.iter().collect();
+        profile_sets.sort_unstable_by_key(|(name, _)| *name);
+        for (name, profile_set) in profile_sets {
             if !name.trim().is_empty() {
                 validate_trimmed_image_optimizer_keys(
                     profile_set.profiles.keys(),
-                    &format!("image_optimizer.profile_sets {name:?}.profiles"),
+                    &format!("image_optimizer.profile_sets.{name:?}.profiles"),
                 )?;
             }
         }
@@ -7086,6 +7088,29 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn image_optimizer_reports_first_profile_key_collision_in_stable_set_order() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." alpha_images ".profiles]
+            medium = "width=100"
+            " medium" = "width=200"
+
+            [image_optimizer.profile_sets.zeta_images.profiles]
+            medium = "width=300"
+            " medium" = "width=400"
+            "#;
+
+        for _ in 0..32 {
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    r#"image_optimizer.profile_sets." alpha_images ".profiles keys " medium" and "medium" collide after trimming to "medium""#,
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn image_optimizer_normalization_preserves_non_colliding_configuration() {
         let toml = crate_test_settings_str()
             + r#"
@@ -7135,16 +7160,45 @@ source_domain = "partner.example.com"
 
         for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
             let settings = result.expect("should accept non-colliding keys");
-            assert_eq!(settings.image_optimizer.profile_sets.len(), 2);
+            assert_eq!(
+                settings.image_optimizer.profile_sets.len(),
+                2,
+                "should discard empty profile-set names"
+            );
             let profile_set = &settings.image_optimizer.profile_sets["default_images"];
-            assert_eq!(profile_set.base_params, "quality=70");
-            assert_eq!(profile_set.default_profile, "medium");
-            assert_eq!(profile_set.profile_param, "profile");
-            assert_eq!(profile_set.aspect_ratio_param, "ratio");
-            assert_eq!(profile_set.debug_param, "debug");
-            assert_eq!(profile_set.profiles.len(), 2);
-            assert_eq!(profile_set.profiles["medium"], "width=100");
-            assert_eq!(profile_set.profiles["large"], "width=200");
+            assert_eq!(
+                profile_set.base_params, "quality=70",
+                "should trim base parameters"
+            );
+            assert_eq!(
+                profile_set.default_profile, "medium",
+                "should trim the default profile reference"
+            );
+            assert_eq!(
+                profile_set.profile_param, "profile",
+                "should trim the profile query parameter name"
+            );
+            assert_eq!(
+                profile_set.aspect_ratio_param, "ratio",
+                "should trim the aspect ratio query parameter name"
+            );
+            assert_eq!(
+                profile_set.debug_param, "debug",
+                "should trim the debug query parameter name"
+            );
+            assert_eq!(
+                profile_set.profiles.len(),
+                2,
+                "should discard empty profile names"
+            );
+            assert_eq!(
+                profile_set.profiles["medium"], "width=100",
+                "should trim profile keys and values"
+            );
+            assert_eq!(
+                profile_set.profiles["large"], "width=200",
+                "should preserve unpadded profile keys and values"
+            );
             assert_eq!(
                 settings.image_optimizer.profile_sets["other_images"].profiles["medium"],
                 "width=300",
@@ -7154,21 +7208,45 @@ source_domain = "partner.example.com"
                 .aspect_ratios
                 .as_ref()
                 .expect("should retain ratios");
-            assert_eq!(ratios.allowed, ["1-1"]);
-            assert_eq!(ratios.profiles, ["medium"]);
+            assert_eq!(
+                ratios.allowed,
+                ["1-1"],
+                "should trim allowed aspect ratios and discard empty entries"
+            );
+            assert_eq!(
+                ratios.profiles,
+                ["medium"],
+                "should trim aspect ratio profile references and discard empty entries"
+            );
             let offsets = profile_set
                 .crop_offsets
                 .as_ref()
                 .expect("should retain offsets");
-            assert_eq!(offsets.x_param, "x");
-            assert_eq!(offsets.y_param, "y");
-            assert_eq!(offsets.buckets, [10, 90]);
+            assert_eq!(
+                offsets.x_param, "x",
+                "should trim the horizontal crop offset parameter name"
+            );
+            assert_eq!(
+                offsets.y_param, "y",
+                "should trim the vertical crop offset parameter name"
+            );
+            assert_eq!(
+                offsets.buckets,
+                [10, 90],
+                "should sort and deduplicate crop offset buckets"
+            );
             let route = settings.proxy.asset_routes[0]
                 .image_optimizer
                 .as_ref()
                 .expect("should retain the route's image optimizer");
-            assert_eq!(route.region, "us_east");
-            assert_eq!(route.profile_set, "default_images");
+            assert_eq!(
+                route.region, "us_east",
+                "should trim the image optimizer region"
+            );
+            assert_eq!(
+                route.profile_set, "default_images",
+                "should trim the route's profile-set reference"
+            );
         }
     }
 

@@ -861,8 +861,14 @@ formats = [{ width = 300, height = 250 }]
         let app_config: TrustedServerAppConfig =
             toml::from_str(&toml).expect("should deserialize non-colliding app config");
         let profile_set = &app_config.settings().image_optimizer.profile_sets["default_images"];
-        assert_eq!(profile_set.default_profile, "medium");
-        assert_eq!(profile_set.profiles["medium"], "width=100");
+        assert_eq!(
+            profile_set.default_profile, "medium",
+            "should trim the default profile reference"
+        );
+        assert_eq!(
+            profile_set.profiles["medium"], "width=100",
+            "should trim profile keys and values"
+        );
     }
 
     #[test]
