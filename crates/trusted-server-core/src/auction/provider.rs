@@ -29,6 +29,10 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
 const MAX_PLANNED_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Evidence attached when bookkeeping fails after the platform started a request.
+#[derive(Debug)]
+pub(crate) struct ProviderRequestStarted;
+
 fn attach_provider_routing_metadata(
     response: &mut AuctionResponse,
     profile: &CompiledOpenRtbProfile,
@@ -392,7 +396,8 @@ impl GenericOpenRtbProvider {
                     "Provider {} pending request backend did not match registered backend",
                     self.provider_name()
                 ),
-            }));
+            })
+            .attach_opaque(ProviderRequestStarted));
         }
         let parse_state = match &self.plan.profile {
             CompiledOpenRtbProfile::Standard(_) => GenericOpenRtbParseState::Standard {

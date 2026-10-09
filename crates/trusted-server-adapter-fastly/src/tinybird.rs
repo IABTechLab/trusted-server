@@ -76,8 +76,8 @@ impl TinybirdEventsTarget {
 
     /// Builds the Events API target for the access-log datasource.
     ///
-    /// Shares [`from_config`](Self::from_config)'s host/secret-store/
-    /// body-size-limit derivation, but points at `access_dataset` and
+    /// Shares [`from_config`](Self::from_config)'s host and body-size-limit
+    /// derivation, but points at `access_dataset` and
     /// `access_token_secret` instead of the auction pair, so access-log
     /// emission never shares a datasource or token with auction telemetry
     /// even though both configs come from the same [`TinybirdSettings`].
@@ -310,7 +310,7 @@ pub(crate) async fn emit_access_event(
         })?;
     let request = build_access_events_request(target, row, auth_header)?;
 
-    log::info!(
+    log::debug!(
         "sending access telemetry to Tinybird dataset={} host={} backend={}",
         target.dataset,
         target.api_host,

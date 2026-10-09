@@ -22,7 +22,8 @@ use std::borrow::Cow;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
+use web_time::Instant;
 
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
@@ -34,6 +35,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
+use sha2::Digest as _;
 
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
@@ -42,7 +44,7 @@ use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, ERROR_TYPE_ALL,
     ERROR_TYPE_HTTP_STATUS, ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_PARSE_RESPONSE,
-    ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT,
+    ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT, OrchestrationResult,
 };
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
@@ -90,6 +92,8 @@ use crate::streaming_processor::{
     STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
 };
 use crate::streaming_replacer::create_url_replacer;
+
+include!(concat!(env!("OUT_DIR"), "/template_build_digest.rs"));
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2093,22 +2097,27 @@ fn assemble_if_shared(
     Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
-/// Fingerprint of every configuration input plus the compiled browser bundle.
+/// Fingerprint of settings, browser bundles, and the core implementation.
 ///
 /// This intentionally over-invalidates. Trying to maintain a hand-written list already
 /// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
 /// the complete typed settings cannot expose secret values and makes future config fields
 /// safe by default: a change misses until someone proves it irrelevant, never cross-serves
-/// an old template under new behavior.
+/// an old template under new behavior. The build digest additionally covers core source
+/// files (including embedded head scripts), build logic, manifests, and the workspace
+/// lockfile when present, so implementation edits automatically invalidate templates.
 ///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
 fn template_fingerprint(settings: &Settings) -> String {
-    use sha2::Digest as _;
+    template_fingerprint_with_build_digest(settings, TEMPLATE_BUILD_DIGEST)
+}
 
+fn template_fingerprint_with_build_digest(settings: &Settings, build_digest: &str) -> String {
     let mut hasher = sha2::Sha256::new();
+    hasher.update(build_digest.as_bytes());
     hasher.update(
         trusted_server_js::concatenated_hash(trusted_server_js::all_module_ids()).as_bytes(),
     );
@@ -3335,6 +3344,8 @@ pub(crate) struct AdBidsState {
     auction_diagnostics: Arc<Mutex<Option<BrowserAuctionDiagnostics>>>,
     /// Whether this request activated the private diagnostics module.
     diagnostics_active: bool,
+    /// Whether the request arrived with an adapter-owned timing collector.
+    request_timing_collector_attached: bool,
 }
 
 #[cfg(test)]
@@ -3349,9 +3360,10 @@ impl AdBidsState {
 }
 
 impl AdBidsState {
-    fn with_diagnostics(diagnostics_active: bool) -> Self {
+    fn with_diagnostics(diagnostics_active: bool, request_timing_collector_attached: bool) -> Self {
         Self {
             diagnostics_active,
+            request_timing_collector_attached,
             ..Self::default()
         }
     }
@@ -3380,7 +3392,7 @@ impl AdBidsState {
     /// This rebuilds the script cell, so callers must run it before
     /// [`Self::prepend_to_script`] to preserve an existing debug prefix.
     fn set_auction_diagnostics(&self, timings: &RequestTimings) {
-        if !self.diagnostics_active {
+        if !self.diagnostics_active || !self.request_timing_collector_attached {
             return;
         }
         let Some(diagnostics) = BrowserAuctionDiagnostics::from_request_timings(timings) else {
@@ -4331,15 +4343,13 @@ async fn collect_non_html_auction(
     settings: &Settings,
     placement: AuctionWaitPlacement,
 ) {
-    let auction_id = telemetry
+    let diagnostics_request_id = telemetry
         .auction_request
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
+    let provider_launched = dispatched.has_provider_launch();
     let placeholder = mediator_placeholder_request();
-    // Qualified: `std::time::Instant::now()` panics on Cloudflare's
-    // `wasm32-unknown-unknown` target; this module's `Instant` import stays
-    // std for the pre-existing template-cache sites.
-    let wait_started = web_time::Instant::now();
+    let wait_started = Instant::now();
     let result = orchestrator
         .collect_dispatched_auction(
             dispatched,
@@ -4350,8 +4360,10 @@ async fn collect_non_html_auction(
     params
         .timings
         .record_auction_wait(placement, wait_started.elapsed());
-    // T0-anchored timeline mark (spec section 18): final bid or timeout.
-    params.timings.mark_auction_resolved();
+    // Collection is a resolution milestone only when dispatch reached a provider.
+    if provider_launched {
+        params.timings.mark_auction_resolved();
+    }
     let delivered_winner_slots = write_bids_to_state(
         &result.winning_bids,
         params.price_granularity,
@@ -4359,11 +4371,13 @@ async fn collect_non_html_auction(
         settings,
         &request_origin(&params.request_scheme, &params.request_host),
         settings.debug.inject_adm_for_testing,
-        auction_id.as_deref(),
+        diagnostics_request_id.as_deref(),
     );
     // T0-anchored timeline mark (spec section 18): winning bids are in page
     // state, available to the response pipeline.
-    params.timings.mark_auction_committed();
+    if provider_launched {
+        params.timings.mark_auction_committed();
+    }
     params
         .ad_bids_state
         .set_auction_diagnostics(&params.timings);
@@ -4402,23 +4416,23 @@ async fn collect_stream_auction(
         timings,
         placement,
     } = deps;
-    let auction_id = telemetry
+    let diagnostics_request_id = telemetry
         .auction_request
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
-    // Qualified: `std::time::Instant::now()` panics on Cloudflare's
-    // `wasm32-unknown-unknown` target; this module's `Instant` import stays
-    // std for the pre-existing template-cache sites.
-    let wait_started = web_time::Instant::now();
+    let provider_launched = dispatched.has_provider_launch();
+    let wait_started = Instant::now();
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
     timings.record_auction_wait(*placement, wait_started.elapsed());
-    // T0-anchored timeline mark (spec section 18): final bid or timeout.
-    timings.mark_auction_resolved();
+    // Collection is a resolution milestone only when dispatch reached a provider.
+    if provider_launched {
+        timings.mark_auction_resolved();
+    }
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
         result.winning_bids.len()
@@ -4430,11 +4444,13 @@ async fn collect_stream_auction(
         settings,
         request_origin,
         settings.debug.inject_adm_for_testing,
-        auction_id.as_deref(),
+        diagnostics_request_id.as_deref(),
     );
     // T0-anchored timeline mark (spec section 18): winning bids are in page
     // state, available to the response pipeline.
-    timings.mark_auction_committed();
+    if provider_launched {
+        timings.mark_auction_committed();
+    }
     ad_bids_state.set_auction_diagnostics(timings);
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
@@ -4601,7 +4617,9 @@ pub async fn handle_publisher_request(
 
     // A defaulted handle records into nothing that ever renders, so tests
     // that don't populate the request extension are unaffected.
-    let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_default();
+    let request_timings = RequestTimings::from_extensions(req.extensions());
+    let request_timing_collector_attached = request_timings.is_some();
+    let timings = request_timings.unwrap_or_default();
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
     // idempotent call as a direct-handler safety net and for focused tests.
@@ -4761,7 +4779,8 @@ pub async fn handle_publisher_request(
         .and_then(|co| co.auction_timeout_ms)
         .unwrap_or(settings.auction.timeout_ms);
 
-    let ad_bids_state = AdBidsState::with_diagnostics(gpt_diagnostics.active());
+    let ad_bids_state =
+        AdBidsState::with_diagnostics(gpt_diagnostics.active(), request_timing_collector_attached);
 
     let price_granularity = settings
         .creative_opportunities
@@ -5126,22 +5145,26 @@ pub async fn handle_publisher_request(
                 .await
             {
                 DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    // Bid requests have left the edge. A skipped auction or a
-                    // failed dispatch never reaches this arm, so a null
-                    // dispatch offset next to a non-null `auction_id` reads as
-                    // "attempted, nothing sent".
-                    timings.mark_auction_dispatched();
+                    // The outcome can also carry skipped-provider diagnostics;
+                    // only a real provider result/request establishes dispatch.
+                    if dispatched.has_provider_launch() {
+                        timings.mark_auction_dispatched();
+                    }
                     auction_request_for_telemetry = Some(auction_request);
                     auction_observation = Some(observation);
                     Some(dispatched)
                 }
                 DispatchAuctionOutcome::DispatchFailed {
+                    provider_launched,
                     request,
                     provider_responses,
                     fatal_admission_error,
                     metadata,
                     elapsed_ms,
                 } => {
+                    if provider_launched {
+                        timings.mark_auction_dispatched();
+                    }
                     if let Some(error) = fatal_admission_error {
                         log::warn!(
                             "Auction admission failed before publisher dispatch; continuing without bids: {error:?}"
@@ -5254,8 +5277,8 @@ pub async fn handle_publisher_request(
                 // failure could only truncate the response mid-body. Failing here falls
                 // back to the origin instead, which is a slower correct page.
                 //
-                // `schema_version` should make either failure unreachable, so reaching
-                // it means the transform changed without the version moving.
+                // The build fingerprint and schema version isolate incompatible
+                // templates. Keep this check as a defense against unusable entries.
                 //
                 // Asked of the mode, not of every template. The key covers
                 // `assembly_mode`, so a hit was stored by this same mode.
@@ -5265,7 +5288,7 @@ pub async fn handle_publisher_request(
                 if let Some(err) = seam_check {
                     log::error!(
                         "template_cache hit is unusable ({err}); treating as a miss. \
-                         The transform changed without TEMPLATE_SCHEMA_VERSION moving."
+                         The cached template violates the assembly marker contract."
                     );
                     if let Err(purge_err) = services.template_cache().purge_url(key).await {
                         log::warn!(
@@ -7374,18 +7397,67 @@ pub async fn handle_page_bids(
                 provider_responses: None,
                 services,
             };
-            timings.mark_auction_dispatched();
-            let result = auction
+            let mut dispatch_failure_responses = Vec::new();
+            let result = match auction
                 .orchestrator
-                .run_auction(&auction_request, &auction_context)
-                .await;
-            timings.mark_auction_resolved();
+                .dispatch_auction(&auction_request, &auction_context)
+                .await
+            {
+                DispatchAuctionOutcome::Dispatched(dispatched) => {
+                    let provider_launched = dispatched.has_provider_launch();
+                    if provider_launched {
+                        timings.mark_auction_dispatched();
+                    }
+                    let result = auction
+                        .orchestrator
+                        .collect_dispatched_auction(dispatched, services, &auction_context)
+                        .await;
+                    if provider_launched {
+                        timings.mark_auction_resolved();
+                    }
+                    Ok(result)
+                }
+                DispatchAuctionOutcome::DispatchFailed {
+                    provider_launched,
+                    provider_responses,
+                    fatal_admission_error,
+                    ..
+                } => {
+                    if provider_launched {
+                        timings.mark_auction_dispatched();
+                    }
+                    dispatch_failure_responses = provider_responses;
+                    Err(fatal_admission_error.unwrap_or_else(|| {
+                        Report::new(TrustedServerError::Auction {
+                            message: "All eligible provider requests failed to dispatch"
+                                .to_string(),
+                        })
+                    }))
+                }
+                DispatchAuctionOutcome::NotStarted if settings.auction.providers.is_empty() => {
+                    Ok(OrchestrationResult {
+                        provider_responses: Vec::new(),
+                        mediator_response: None,
+                        winning_bids: Default::default(),
+                        total_time_ms: 0,
+                        metadata: Default::default(),
+                    })
+                }
+                DispatchAuctionOutcome::NotStarted => {
+                    Err(Report::new(TrustedServerError::Auction {
+                        message: "No planned provider request was started".to_string(),
+                    }))
+                }
+            };
             match result {
                 Ok(result) => {
                     // A successful result proves at least one pending or immediate
                     // provider outcome. Failures can occur before any request leaves
                     // the edge, so they must not fabricate dispatch timing evidence.
-                    if gpt_diagnostics.browser_session_active() && has_request_timings {
+                    if gpt_diagnostics.browser_session_active()
+                        && has_request_timings
+                        && timings.snapshot().auction_dispatched_ms.is_some()
+                    {
                         let timing_snapshot = timings.snapshot();
                         auction_diagnostics = Some(BrowserAuctionDiagnostics {
                             auction_dispatched_ms: timing_snapshot.auction_dispatched_ms,
@@ -7401,17 +7473,19 @@ pub async fn handle_page_bids(
                         });
                     }
                     let winning_bids = result.winning_bids.clone();
-                    let auction_id = diagnostics_auction_id(settings);
+                    let diagnostics_request_id = diagnostics_auction_id(settings);
                     let bid_map = build_bid_map_with_auction_id(
                         &winning_bids,
                         co_config.price_granularity,
                         settings,
                         &page_bids_request_origin,
                         settings.debug.inject_adm_for_testing,
-                        auction_id.as_deref(),
+                        diagnostics_request_id.as_deref(),
                     );
                     // Targeting is available to the response pipeline.
-                    timings.mark_auction_committed();
+                    if timings.snapshot().auction_dispatched_ms.is_some() {
+                        timings.mark_auction_committed();
+                    }
                     if let Some(diagnostics) = auction_diagnostics.as_mut() {
                         diagnostics.auction_committed_ms = timings.snapshot().auction_committed_ms;
                     }
@@ -7437,7 +7511,7 @@ pub async fn handle_page_bids(
                             observation,
                             AuctionTerminalOutcome::ExecutionFailed {
                                 request: Some(&auction_request),
-                                provider_responses: &[],
+                                provider_responses: &dispatch_failure_responses,
                                 reason: "execution_failed",
                                 elapsed_ms,
                             },
@@ -9693,10 +9767,9 @@ mod tests {
             assert_eq!(
                 (crate::platform::TEMPLATE_SCHEMA_VERSION, AD_ASSEMBLY_SEAM,),
                 (5, "<!--ts-ad-seam-->"),
-                "changing the seam must bump the cache schema, or a deploy assembles \
-                 against a marker that moved. The converse does not hold — the schema \
-                 also moves when the cache key's shape changes, as it did for v5 — so \
-                 updating this pin with an unchanged seam is legitimate."
+                "the core build digest in the template fingerprint isolates seam changes, \
+                 so updating the seam needs no schema bump; the schema moves only for \
+                 compatibility changes outside that digest (see TEMPLATE_SCHEMA_VERSION)"
             );
             assert_eq!(
                 body_close_injection(AssemblyMode::Esi, false),
@@ -9806,6 +9879,43 @@ mod tests {
                 }),
             );
             settings
+        }
+
+        #[test]
+        fn production_fingerprint_uses_the_generated_build_digest() {
+            let settings = settings_with_prebid(true, 1000);
+            assert_eq!(
+                TEMPLATE_BUILD_DIGEST.len(),
+                64,
+                "should generate a SHA-256 digest"
+            );
+            assert!(
+                TEMPLATE_BUILD_DIGEST
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+                "should encode the build digest as hexadecimal"
+            );
+            assert_eq!(
+                template_fingerprint(&settings),
+                template_fingerprint_with_build_digest(&settings, TEMPLATE_BUILD_DIGEST),
+                "should use the generated digest in production"
+            );
+            assert_ne!(
+                template_fingerprint(&settings),
+                template_fingerprint_with_build_digest(&settings, ""),
+                "should not omit the build digest in production"
+            );
+        }
+
+        #[test]
+        fn changing_only_the_build_digest_changes_the_fingerprint() {
+            let settings = settings_with_prebid(true, 1000);
+
+            assert_ne!(
+                template_fingerprint_with_build_digest(&settings, "build-before-head-edit"),
+                template_fingerprint_with_build_digest(&settings, "build-after-head-edit"),
+                "should select a new template when only compiled head code changes"
+            );
         }
 
         #[test]
@@ -12680,8 +12790,10 @@ mod tests {
         async fn a_template_written_under_the_previous_schema_version_is_never_read() {
             // v1 put an executable ESI include at the seam. v2 puts an inert comment
             // there and hands slots to the scheduler, so a v1 entry has no marker this
-            // binary can find. `schema_version` is the only thing keeping the two apart
-            // — nothing purges template cache on deploy.
+            // binary can find. A real v1 entry also carries an older build digest, but
+            // this fixture reuses the current fingerprint, so here `schema_version` is
+            // the only thing keeping the two apart. Nothing purges template cache on
+            // deploy.
             assert_ne!(
                 crate::platform::TEMPLATE_SCHEMA_VERSION,
                 ESI_INCLUDE_SCHEMA_VERSION,
@@ -21879,7 +21991,7 @@ mod tests {
 
         let mut params = make_stream_params(&settings, "");
         params.content_type = "text/html; charset=utf-8".to_string();
-        params.dispatched_auction = Some(DispatchedAuction::empty_for_test(
+        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
             test_auction_request(),
             500,
         ));
@@ -21965,7 +22077,7 @@ mod tests {
 
         let mut params = make_stream_params(&settings, "");
         params.content_type = "text/html; charset=utf-8".to_string();
-        params.dispatched_auction = Some(DispatchedAuction::empty_for_test(
+        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
             test_auction_request(),
             500,
         ));
@@ -23876,7 +23988,7 @@ mod tests {
             timings.record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(12));
             timings.mark_auction_resolved();
             timings.mark_auction_committed();
-            let state = AdBidsState::with_diagnostics(true);
+            let state = AdBidsState::with_diagnostics(true, true);
             state.set(serde_json::Map::new());
 
             state.set_auction_diagnostics(&timings);
@@ -23893,6 +24005,26 @@ mod tests {
             assert!(script.contains("auctionCommittedMs"));
             assert!(script.contains("auctionWaitMs"));
             assert!(script.contains("in_stream"));
+        }
+
+        #[test]
+        fn active_diagnostics_without_attached_collector_omits_auction_timing() {
+            let timings = RequestTimings::new();
+            timings.mark_auction_dispatched();
+            timings.mark_auction_resolved();
+            let state = AdBidsState::with_diagnostics(true, false);
+            state.set(serde_json::Map::new());
+
+            state.set_auction_diagnostics(&timings);
+
+            let script = state
+                .script_cell()
+                .lock()
+                .expect("should lock bid script")
+                .clone()
+                .expect("should render bid script");
+            assert!(!script.contains("auctionDispatchedMs"));
+            assert!(!script.contains("auctionResolvedMs"));
         }
 
         #[test]
@@ -24519,6 +24651,164 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn active_page_bids_zero_provider_path_leaves_handler_collector_unresolved() {
+            let mut settings = settings_with_co();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let orchestrator = AuctionOrchestrator::from_plan(
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile empty planned auction"),
+                ),
+                None,
+            );
+            let slots = article_slot();
+            let mut req = make_active_page_bids_request("/2024/01/my-article/");
+            let timings = RequestTimings::new();
+            req.extensions_mut().insert(timings.handle().clone());
+            let mut ec_context = consent_allowing_ec_context();
+
+            let response = handle_page_bids(
+                &settings,
+                &noop_services(),
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should produce a no-bid response without providers");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let snapshot = timings.snapshot();
+            assert!(snapshot.auction_dispatched_ms.is_none());
+            assert!(snapshot.auction_resolved_ms.is_none());
+            assert!(snapshot.auction_committed_ms.is_none());
+        }
+
+        #[tokio::test]
+        async fn planned_page_bids_keeps_installed_collector_after_launch_and_transport_failure() {
+            for (transport_failure, metadata_missing) in
+                [(false, false), (true, false), (false, true)]
+            {
+                let mut settings = settings_with_co();
+                settings.auction = toml::from_str(
+                    r#"
+                    enabled = true
+                    [providers.example]
+                    protocol = "openrtb-2.6"
+                    profile = "standard"
+                    endpoint = "https://bidder.example.com/auction"
+                    routing = "all_eligible"
+                "#,
+                )
+                .expect("should parse a production provider plan");
+                settings
+                    .integrations
+                    .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                    .expect("should enable diagnostics");
+                let orchestrator = AuctionOrchestrator::from_plan(
+                    Arc::new(
+                        crate::auction::compile_auction_plan(&settings)
+                            .expect("should compile page-bids provider plan"),
+                    ),
+                    None,
+                );
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(204, Vec::new());
+                if transport_failure {
+                    stub.push_select_error();
+                }
+                if metadata_missing {
+                    stub.push_pending_backend_name_override(None);
+                }
+                let services = build_services_with_http_client(stub.clone());
+                let slots = article_slot();
+                let mut req = make_active_page_bids_request("/2024/01/my-article/");
+                let timings = RequestTimings::new();
+                req.extensions_mut().insert(timings.handle().clone());
+                let mut ec_context = consent_allowing_ec_context();
+
+                let response = handle_page_bids(
+                    &settings,
+                    &services,
+                    None,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &slots,
+                        registry: None,
+                    },
+                    &mut ec_context,
+                    req,
+                )
+                .await
+                .expect("should complete page-bids after a real launch");
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "should retain a no-bid response after transport failure"
+                );
+                assert_eq!(
+                    stub.recorded_backend_names().len(),
+                    1,
+                    "should launch the planned provider"
+                );
+                let snapshot = timings.snapshot();
+                assert!(
+                    snapshot.auction_id.is_some(),
+                    "should stamp the observation UUID in the original handle"
+                );
+                let dispatched = snapshot
+                    .auction_dispatched_ms
+                    .expect("should mark dispatch");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should read page-bids response body"),
+                )
+                .expect("should parse page-bids response");
+                if metadata_missing {
+                    assert!(
+                        snapshot.auction_resolved_ms.is_none(),
+                        "should not fabricate collection after losing the pending handle"
+                    );
+                    assert!(
+                        snapshot.auction_committed_ms.is_none(),
+                        "should not commit a failed dispatch"
+                    );
+                    assert!(
+                        body.get("auctionDiagnostics").is_none(),
+                        "should omit completed-auction diagnostics after dispatch failure"
+                    );
+                } else {
+                    let resolved = snapshot
+                        .auction_resolved_ms
+                        .expect("should mark collection");
+                    let committed = snapshot
+                        .auction_committed_ms
+                        .expect("should commit targeting");
+                    assert!(
+                        dispatched <= resolved && resolved <= committed,
+                        "should preserve ordering after success or transport failure"
+                    );
+                    assert_eq!(
+                        body["auctionDiagnostics"]["auctionDispatchedMs"].as_u64(),
+                        Some(u64::from(dispatched)),
+                        "should expose the installed collector rather than a handler-local clock"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn active_page_bids_omits_timings_without_adapter_collector() {
             let mut settings = settings_with_co();
             settings.auction.providers =
@@ -24631,6 +24921,10 @@ mod tests {
                 auction_request.id, "ts-page-auction-example-123",
                 "test EC ID should produce a deterministic auction request ID"
             );
+            let timing_snapshot = request_timings.snapshot();
+            assert!(timing_snapshot.auction_dispatched_ms.is_some());
+            assert!(timing_snapshot.auction_resolved_ms.is_some());
+            assert!(timing_snapshot.auction_committed_ms.is_some());
             let winning_auction_id = winning_body["bids"]["atf"]["hb_auction_id"]
                 .as_str()
                 .expect("page-bids should expose an auction ID on the winner")

@@ -1309,21 +1309,23 @@ emitter is active only when `enabled = true`; access-log emission is not wired.
 
 ### `[tinybird]`
 
-| Field                  | Type           | Default                | Contract                                                           |
-| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------ |
-| `enabled`              | Boolean        | `false`                | Enable auction telemetry                                           |
-| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path |
-| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                |
-| `auction_token_secret` | String or null | `null`                 | Store key required when enabled; resolved value must be nonempty   |
-| `access_enabled`       | Boolean        | `false`                | Reserved; `true` fails startup because no emitter is wired         |
-| `access_dataset`       | String         | `"access_logs_raw"`    | Reserved access-log dataset name                                   |
-| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; reserved while access emission is disabled            |
-| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                              |
+| Field                  | Type           | Default                | Contract                                                                       |
+| ---------------------- | -------------- | ---------------------- | ------------------------------------------------------------------------------ |
+| `enabled`              | Boolean        | `false`                | Master switch for Tinybird telemetry                                           |
+| `auction_enabled`      | Boolean        | `true`                 | Enable auction telemetry when the master switch is on                          |
+| `api_host`             | String         | `""`                   | Required when enabled; regional host without scheme, port, or path             |
+| `auction_dataset`      | String         | `"auction_events_raw"` | 1–128 ASCII letters, digits, or `_`                                            |
+| `auction_token_secret` | String or null | `null`                 | Required for an active auction sink; resolves through the default secret store |
+| `access_enabled`       | Boolean        | `false`                | Enable sampled post-delivery access telemetry                                  |
+| `access_dataset`       | String         | `"access_logs_raw"`    | Access-log Events API datasource name                                          |
+| `access_token_secret`  | String or null | `null`                 | Required for an active access sink; resolves through the default secret store  |
+| `access_sample_rate`   | Number         | `0.0`                  | `0.0..=1.0`; must be positive when access telemetry is enabled                 |
+| `max_body_bytes`       | Integer        | `1048576`              | At least `1024` bytes                                                          |
 
-`secret_store` and `access_token_secret` are deprecated compatibility inputs.
-Both are removed during normalization; neither reaches runtime or serialized
-output. New configurations use only `auction_token_secret`, whose value is
-resolved through `trusted_server_secrets`.
+`secret_store` is a deprecated compatibility input. It is ignored and omitted
+from newly pushed config. Both sink tokens resolve through
+`trusted_server_secrets`. Disabled sinks neither require nor resolve their token
+references, even when stale keys remain in a stored config.
 
 The complete enabled example appears in
 [Tinybird auction telemetry](#tinybird-auction-telemetry).
@@ -1665,9 +1667,9 @@ overrides, and notification suppression belong under `[auction]`.
 | `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid script paths intercepted by Trusted Server                    |
 | `external_bundle_url`                | String        | Required when enabled                                                  | HTTPS publisher-specific Prebid.js bundle URL                                  |
 | `external_bundle_sha256` / `*_sri`   | String        | `None`                                                                 | Optional bundle integrity and cache metadata                                   |
-| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid bundle`                           |
-| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid bundle`                          |
-| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid bundle`                        |
+| `bundle.modules.bidder`              | Array[String] | Required and non-empty                                                 | Exact bidder module stems used by `ts prebid client`                           |
+| `bundle.modules.user_id`             | Array[String] | Curated preset when omitted                                            | Exact User ID module stems used by `ts prebid client`                          |
+| `bundle.modules.analytics`           | Array[String] | `[]`                                                                   | Exact analytics module stems used by `ts prebid client`                        |
 | `managed_user_ids`                   | Array[Table]  | `[]`                                                                   | Prebid User ID modules Trusted Server installs and keeps installed (see below) |
 
 Server-side bidder codes are derived from validated `[auction.bidders.*]`
@@ -1761,7 +1763,7 @@ module uses the same vendor-neutral surface. The managed `name` must match a
 
 The module must be present in the built bundle. Name it under
 `[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
-generator's default preset. `ts prebid bundle` resolves each managed `name`
+generator's default preset. `ts prebid client` resolves each managed `name`
 through the checked-in `user_id_modules.json` registry, rejects unknown names,
 ambiguous names, and two names that resolve to the same module, and confirms the
 required modules in the newly generated
@@ -2360,10 +2362,23 @@ stored as a shared template.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, and schema
-version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
-not: the stored template is decoded identity and the assembled result is encoded
-for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+origin identity, complete template-shaping settings, TSJS content, core build
+inputs, and schema version all participate in an opaque SHA-256 cache key. The
+build digest covers every core source file (including Rust-inlined head scripts)
+except hidden, `#`-prefixed, and `~`-suffixed editor artifacts, plus the core
+build script, core and workspace manifests, `edgezero.toml`, and the workspace
+lockfile when present. Any change to these inputs causes a cold template fill
+per URL variant after deployment, even if the change does not affect rendered
+HTML. Core-owned formats (cached metadata, the seam marker, and the assembly
+contract) are covered by the same digest. A manual `TEMPLATE_SCHEMA_VERSION`
+bump is needed only for template-compatibility changes outside those inputs,
+such as the Fastly adapter's template storage or the Rust side of
+`trusted-server-js`, unless another fingerprint input already isolates the
+change.
+
+`Accept-Encoding` does not participate in the key: the stored template is
+decoded identity and the assembled result is encoded for each reader with
+`Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
 document's meaning based on `Accept-Encoding`. Never put `Cookie` or
@@ -2945,6 +2960,12 @@ enabling one does not enable the other.
 | `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
 | `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
 
+Route sections are matched case-insensitively against the first path segment,
+with at least one further segment required. Names are trimmed, limited to 32
+entries of at most 128 UTF-8 bytes each, and must be nonempty with no slash or
+control characters. For example, `route_sections = [" news "]` normalizes to
+`["news"]`, preserving `/news/*` but not `/news`.
+
 **Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
 phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
 `ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
@@ -2953,7 +2974,10 @@ rather than rendered as zero.
 
 **Emission is conservative**: the header is appended only on responses that
 are conclusively private, meaning `Cache-Control` contains `private` or
-`no-store`. A response that is heuristically cacheable, carries a bare
+`no-store` and no recognized CDN/surrogate cache-control header is present.
+An edge-cache header suppresses timing even alongside private/no-store, since
+shared-cache overrides can replay request-specific timings. A response that is
+heuristically cacheable, carries a bare
 `max-age`, or has no cache header at all never receives the header, because a
 shared-cache object would otherwise replay one request's timings for its
 entire stored lifetime. The long-lived, shared-cacheable `tsjs` asset route is
@@ -2973,8 +2997,7 @@ server_timing_enabled = true
 ```
 
 ::: tip The Axum dev server reads this flag once at startup
-Unlike the Fastly adapter, which reads settings per request, the Axum dev
-server bakes `server_timing_enabled` into its service when it starts.
+The Axum dev server bakes `server_timing_enabled` into its service when it starts.
 Flipping the flag there requires a restart to take effect.
 :::
 
@@ -3040,9 +3063,9 @@ requires the shared transport fields (`enabled`, non-empty `api_host`,
 [tinybird]
 enabled = true
 api_host = "api.tinybird.example.com"
-auction_enabled = true
+auction_enabled = false
 
-# Access-log telemetry, decoupled from auction emission.
+# Access-only telemetry: no auction APPEND token is required.
 access_enabled = true
 access_dataset = "access_logs_raw"
 access_token_secret = "tinybird_access_append_token"

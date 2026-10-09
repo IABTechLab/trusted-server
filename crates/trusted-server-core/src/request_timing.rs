@@ -12,7 +12,7 @@ use std::time::Duration;
 use http::{Extensions, HeaderName, HeaderValue, Response};
 use uuid::Uuid;
 
-use crate::cache_policy::cache_control_headers_are_private_or_no_store;
+use crate::cache_policy::{EDGE_CACHE_HEADER_NAMES, cache_control_headers_are_private_or_no_store};
 
 /// `Server-Timing` header name. Not present in the `http` crate's `header`
 /// module (unlike `CACHE_CONTROL` etc.), so declared locally following the
@@ -181,7 +181,7 @@ impl RequestTimings {
     /// Subsequent calls are no-ops (first call wins). Drops the sample
     /// silently on lock contention; a poisoned lock is recovered.
     pub fn mark_request_elapsed(&self) {
-        let _ = self.0.mark_request_elapsed();
+        let _ = self.0.mark_request_complete();
     }
 
     /// Records the telemetry auction id, the first time this is called.
@@ -203,10 +203,11 @@ impl RequestTimings {
     /// Stamps the elapsed time since `t0` as the auction dispatch offset,
     /// the first time this is called.
     ///
-    /// Called where the bid requests leave the edge. A skipped auction and a
-    /// failed dispatch never stamp it, so a null dispatch offset alongside a
-    /// non-null `auction_id` means an auction was attempted but no bid
-    /// request went out. Subsequent calls are no-ops (first call wins).
+    /// Called after at least one provider starts a request or returns an
+    /// immediate result. Routing-only skipped outcomes and zero-launch
+    /// failures do not stamp it. A null offset alongside a non-null
+    /// `auction_id` means no provider launch was observed. Subsequent calls
+    /// are no-ops (first call wins).
     /// Drops the sample silently on lock contention; a poisoned lock is
     /// recovered.
     pub fn mark_auction_dispatched(&self) {
@@ -215,9 +216,11 @@ impl RequestTimings {
         });
     }
 
-    /// Stamps the elapsed time since `t0` as the auction resolve offset (the
-    /// final bid returned or the auction timed out), the first time this is
-    /// called.
+    /// Stamps the elapsed time since `t0` when auction collection returns,
+    /// the first time this is called.
+    ///
+    /// Collection may follow transport completion on streaming paths. This
+    /// measures the caller's collection point, not the final network reply.
     ///
     /// Stays `None` when a dispatched auction is abandoned before collection
     /// (origin error, bodiless response, reader disconnect), so a non-null
@@ -247,7 +250,7 @@ impl RequestTimings {
     ///
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn set_resp_bytes(&self, bytes: u64) {
-        let _ = self.0.set_resp_bytes(bytes);
+        let _ = self.0.set_response_bytes(bytes);
     }
 
     /// Renders a `Server-Timing` header value, or `None` before
@@ -263,7 +266,7 @@ impl RequestTimings {
     pub fn server_timing_value(&self) -> Option<String> {
         self.0
             .snapshot(|inner| {
-                let total = inner.headers_ready_total?;
+                let total = inner.headers_ready?;
                 let mut entries = vec![format_entry("ts-total", total)];
                 for phase in HEADER_PHASES {
                     let Some(name) = phase.header_name() else {
@@ -287,8 +290,8 @@ impl RequestTimings {
     pub fn snapshot(&self) -> TimingSnapshot {
         self.0
             .snapshot(|inner| TimingSnapshot {
-                time_elapsed_ms: duration_ms(inner.headers_ready_total),
-                request_elapsed_ms: duration_ms(inner.request_elapsed),
+                time_elapsed_ms: duration_ms(inner.headers_ready),
+                request_elapsed_ms: duration_ms(inner.request_complete),
                 appbuild_ms: duration_ms(inner.phases[Phase::AppBuild.index()]),
                 filter_ms: duration_ms(inner.phases[Phase::Filter.index()]),
                 geo_ms: duration_ms(inner.phases[Phase::Geo.index()]),
@@ -298,7 +301,7 @@ impl RequestTimings {
                 auction_wait_ms: duration_ms(inner.phases[Phase::AuctionWait.index()]),
                 stream_ms: duration_ms(inner.phases[Phase::Stream.index()]),
                 auction_wait_placement: inner.data.auction_wait_placement,
-                resp_bytes: inner.resp_bytes,
+                resp_bytes: inner.response_bytes,
                 auction_dispatched_ms: duration_ms(inner.data.auction_dispatched),
                 auction_resolved_ms: duration_ms(inner.data.auction_resolved),
                 auction_committed_ms: duration_ms(inner.data.auction_committed),
@@ -324,7 +327,9 @@ impl Default for RequestTimings {
 /// value set upstream survives alongside the TS-owned set. A response is
 /// never promoted to shared-cacheable just because the header would
 /// otherwise be omitted: this only gates emission, it does not touch
-/// `Cache-Control`.
+/// `Cache-Control`. Emission is also suppressed when a recognized CDN or
+/// surrogate cache-control header is present, since it may allow shared
+/// caching despite a private `Cache-Control` value.
 ///
 /// Generic over the response body type so every adapter's terminal layer can
 /// call the same emission logic regardless of which body type its HTTP stack
@@ -336,7 +341,11 @@ pub fn append_server_timing_if_private<B>(
 ) {
     timings.mark_headers_ready();
 
-    let conclusively_private = cache_control_headers_are_private_or_no_store(response.headers());
+    let headers = response.headers();
+    let conclusively_private = cache_control_headers_are_private_or_no_store(headers)
+        && !EDGE_CACHE_HEADER_NAMES
+            .iter()
+            .any(|name| headers.contains_key(*name));
     if !enabled || !conclusively_private {
         return;
     }
@@ -790,6 +799,44 @@ mod tests {
             header.starts_with("ts-total;dur="),
             "should lead with the stored total: {header}"
         );
+    }
+
+    #[test]
+    fn append_server_timing_rejects_edge_cache_header_collisions() {
+        for cache_control in ["private", "no-store"] {
+            for edge_header in EDGE_CACHE_HEADER_NAMES {
+                let mut response = Response::builder()
+                    .header("cache-control", cache_control)
+                    .header(*edge_header, "max-age=60")
+                    .body(())
+                    .expect("should build a response with conflicting cache directives");
+                let timings = RequestTimings::new();
+
+                append_server_timing_if_private(&mut response, &timings, true);
+
+                assert!(
+                    response.headers().get("server-timing").is_none(),
+                    "should suppress Server-Timing with {edge_header} and Cache-Control: {cache_control}"
+                );
+                assert!(
+                    timings.snapshot().time_elapsed_ms.is_some(),
+                    "should still stamp headers-ready"
+                );
+            }
+        }
+
+        for (cache_control, enabled) in [(None, true), (Some("public, max-age=60"), true)] {
+            let mut builder = Response::builder();
+            if let Some(cache_control) = cache_control {
+                builder = builder.header("cache-control", cache_control);
+            }
+            let mut response = builder.body(()).expect("should build response");
+            append_server_timing_if_private(&mut response, &RequestTimings::new(), enabled);
+            assert!(
+                response.headers().get("server-timing").is_none(),
+                "should suppress Server-Timing without private/no-store Cache-Control"
+            );
+        }
     }
 
     #[test]

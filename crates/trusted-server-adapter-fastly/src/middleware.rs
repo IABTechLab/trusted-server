@@ -159,6 +159,26 @@ impl Middleware for AuthMiddleware {
 // Shared geo resolution helper
 // ---------------------------------------------------------------------------
 
+/// Writes the resolved geo outcome back onto the response as a
+/// [`GeoLookupState`] extension, so a downstream access-telemetry snapshot
+/// sees what was actually looked up rather than the stale carried-in state.
+///
+/// Skips the write on a 401: [`resolve_geo_for_response`] returns `None`
+/// for unauthorized responses before consulting the carried state, so
+/// writing `Attempted` there would overwrite a carried `Resolved` with a
+/// value that was never looked up, and the row would lose a country it
+/// legitimately had.
+pub(crate) fn write_back_geo_lookup_state(response: &mut Response, geo_info: Option<&GeoInfo>) {
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return;
+    }
+    let resolved_state = match geo_info {
+        Some(geo) => GeoLookupState::Resolved(geo.clone()),
+        None => GeoLookupState::Attempted,
+    };
+    response.extensions_mut().insert(resolved_state);
+}
+
 /// Resolves geo for a response, skipping the lookup for 401 responses and
 /// reusing a request-phase lookup when one was already carried.
 ///
@@ -182,26 +202,6 @@ impl Middleware for AuthMiddleware {
 /// is intentionally more conservative: geo data is not sent to any
 /// unauthenticated caller regardless of whether the 401 originated from this
 /// server or the upstream origin.
-/// Writes the resolved geo outcome back onto the response as a
-/// [`GeoLookupState`] extension, so a downstream access-telemetry snapshot
-/// sees what was actually looked up rather than the stale carried-in state.
-///
-/// Skips the write on a 401: [`resolve_geo_for_response`] returns `None`
-/// for unauthorized responses before consulting the carried state, so
-/// writing `Attempted` there would overwrite a carried `Resolved` with a
-/// value that was never looked up, and the row would lose a country it
-/// legitimately had.
-pub(crate) fn write_back_geo_lookup_state(response: &mut Response, geo_info: Option<&GeoInfo>) {
-    if response.status() == StatusCode::UNAUTHORIZED {
-        return;
-    }
-    let resolved_state = match geo_info {
-        Some(geo) => GeoLookupState::Resolved(geo.clone()),
-        None => GeoLookupState::Attempted,
-    };
-    response.extensions_mut().insert(resolved_state);
-}
-
 pub(crate) fn resolve_geo_for_response<F>(
     response: &Response,
     carried: &GeoLookupState,

@@ -667,12 +667,19 @@ Four additive columns on `access_logs_raw`, all populated from the
 Null on an offset means "this milestone was not reached", not "no auction ran".
 `auction_id` is what separates the cases, and the two read together:
 
-| `auction_id` | `dispatched` | `resolved` | Meaning                                                     |
-| ------------ | ------------ | ---------- | ----------------------------------------------------------- |
-| null         | null         | null       | no auction was attempted (assets, EC endpoints, disabled)   |
-| set          | null         | null       | attempted, then skipped or failed to dispatch               |
-| set          | set          | null       | dispatched, never collected (origin error, 304, disconnect) |
-| set          | set          | set        | ran to completion or timed out                              |
+| `auction_id` | `dispatched` | `resolved` | `committed` | Meaning                                                             |
+| ------------ | ------------ | ---------- | ----------- | ------------------------------------------------------------------- |
+| null         | null         | null       | null        | no auction was attempted (assets, EC endpoints, disabled)           |
+| set          | null         | null       | null        | attempted, then skipped or failed to launch any provider            |
+| set          | set          | null       | null        | dispatched, never collected (origin error, 304, disconnect)         |
+| set          | set          | set        | null        | collected, but targeting was not committed to response state        |
+| set          | set          | set        | set         | collected and targeting committed, including no-bid/timeout results |
+
+Dispatch evidence means at least one provider started a request or returned an
+immediate result; routing-only skipped outcomes do not qualify. `resolved` is a
+collection-time mark, not a separately observed transport-completion timestamp.
+Whenever all three milestones exist, `dispatched <= resolved <= committed`.
+Headers-ready can fall before or after these milestones, as described below.
 
 The third row is the case worth watching: bid requests went out and the response
 they were for never used them. It is distinguishable now, where before it was

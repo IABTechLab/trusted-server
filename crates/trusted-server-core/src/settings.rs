@@ -1856,10 +1856,9 @@ pub struct TinybirdSettings {
     /// configs preserve their current auction-emission behavior after
     /// upgrading; set `false` to silence auction events while keeping
     /// `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
-    /// Serialized only when `false`: older binaries ignore the key rather
-    /// than reject it, so writing the default `true` into every pushed
-    /// config would let a rollback silently resume auction telemetry after
-    /// an operator disabled it.
+    /// The default `true` is omitted from serialized config; `false` is an
+    /// explicit opt-out for binaries that support this field. Older binaries
+    /// may ignore that opt-out and resume auction telemetry on rollback.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub auction_enabled: bool,
     /// Regional Tinybird API host, without scheme or path.
@@ -1878,7 +1877,7 @@ pub struct TinybirdSettings {
     /// `auction_enabled`.
     ///
     /// `true` requires `enabled`, non-empty `api_host`/`access_dataset`, a
-    /// resolved `access_token_secret`, `max_body_bytes > 0`, and
+    /// resolved `access_token_secret`, `max_body_bytes >= 1024`, and
     /// `access_sample_rate > 0.0`. This prevents an armed-but-silent sampler
     /// that enables the flag but emits nothing.
     #[serde(default)]
@@ -2600,6 +2599,33 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Expose the reusable-sandbox counters endpoint at `GET /_ts/debug/sandbox`
+    /// and attach the same counters to private, no-store workload responses.
+    ///
+    /// The counters are the guest-instance identifier, the request ordinal
+    /// within that instance, the application build count, and the request
+    /// correlation id. They carry no settings, secrets, or request content.
+    /// Cacheable responses omit counters without changing their cache policy;
+    /// probes of those routes cannot establish sandbox reuse.
+    ///
+    /// Independent of the adapter's `reusable-sandbox` Cargo feature by design:
+    /// the feature decides whether a `Serve` loop exists, this flag decides
+    /// whether counters are emitted. Keeping them separate is what lets the
+    /// feature-off baseline be measured on the same channel as the reuse arms.
+    ///
+    /// Skipped from serialization while false: [`DebugConfig`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed. A blob with it enabled requires restoring a
+    /// compatible blob before rolling back, the same trade
+    /// [`DebugConfig::auction_html_comment_options`] makes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_metrics_enabled: bool,
+}
+
+/// Serde predicate for omitting `false` flags from serialized config blobs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -2800,12 +2826,57 @@ pub struct ObservabilitySettings {
     /// access telemetry (`/{section}/*`); everything else collapses to
     /// `/other/*`. Matching is ASCII case-insensitive on the first path
     /// segment, and a match requires at least one further segment. Defaults
-    /// to empty, which collapses every publisher path.
+    /// to empty, which collapses every publisher path. Names are trimmed and
+    /// must be non-empty, contain no `/` or control characters, fit within 128
+    /// UTF-8 bytes, and number at most 32.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_sections: Vec<String>,
 }
 
 impl ObservabilitySettings {
+    const MAX_ROUTE_SECTIONS: usize = 32;
+    const MAX_ROUTE_SECTION_BYTES: usize = 128;
+
+    fn normalize(&mut self) {
+        self.route_sections = self
+            .route_sections
+            .iter()
+            .map(|section| {
+                section
+                    .trim_matches(|character: char| {
+                        character.is_whitespace() && !character.is_control()
+                    })
+                    .to_owned()
+            })
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.route_sections.len() > Self::MAX_ROUTE_SECTIONS {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "observability.route_sections must contain at most {} entries",
+                    Self::MAX_ROUTE_SECTIONS
+                ),
+            }));
+        }
+        for section in &self.route_sections {
+            if section.is_empty()
+                || section.len() > Self::MAX_ROUTE_SECTION_BYTES
+                || section.contains('/')
+                || section.chars().any(char::is_control)
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "observability.route_sections entries must be non-empty, contain no slash or control characters, and fit within {} UTF-8 bytes",
+                        Self::MAX_ROUTE_SECTION_BYTES
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// True when every field is at its default, i.e. observability is fully
     /// disabled and the table can be omitted from serialized output.
     fn is_default(&self) -> bool {
@@ -3058,6 +3129,7 @@ impl Settings {
         self.proxy.normalize();
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
+        self.observability.normalize();
         self.tinybird.normalize();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
@@ -3099,6 +3171,7 @@ impl Settings {
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.observability.prepare_runtime()?;
         self.debug
             .auction_html_comment_options
             .validate_metadata_keys()?;
@@ -3791,6 +3864,57 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    /// `DebugConfig` denies unknown fields, so a binary built before
+    /// `sandbox_metrics_enabled` existed must still accept a default blob.
+    /// That only holds while the flag is skipped during serialization.
+    #[test]
+    fn default_debug_config_omits_sandbox_metrics_for_rollback() {
+        let serialized =
+            serde_json::to_value(DebugConfig::default()).expect("should serialize debug config");
+
+        assert!(
+            serialized.get("sandbox_metrics_enabled").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_sandbox_metrics_serializes_and_round_trips() {
+        let config = DebugConfig {
+            sandbox_metrics_enabled: true,
+            ..DebugConfig::default()
+        };
+
+        let serialized = serde_json::to_value(&config).expect("should serialize debug config");
+        assert_eq!(
+            serialized.get("sandbox_metrics_enabled"),
+            Some(&json!(true)),
+            "an enabled flag must be written so the setting survives a round trip"
+        );
+
+        let restored: DebugConfig =
+            serde_json::from_value(serialized).expect("should deserialize debug config");
+        assert!(
+            restored.sandbox_metrics_enabled,
+            "the flag should survive a round trip"
+        );
+    }
+
+    #[test]
+    fn debug_config_accepts_a_blob_without_the_sandbox_field() {
+        let restored: DebugConfig = serde_json::from_value(json!({"ja4_endpoint_enabled": true}))
+            .expect("should deserialize a blob written before the field existed");
+
+        assert!(
+            restored.ja4_endpoint_enabled,
+            "existing fields should still load"
+        );
+        assert!(
+            !restored.sandbox_metrics_enabled,
+            "an absent flag should default to off"
+        );
+    }
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
@@ -4719,6 +4843,17 @@ mod tests {
     }
 
     #[test]
+    fn tinybird_deployment_validation_requires_default_on_auction_secret() {
+        let error =
+            settings_from_toml_with("[tinybird]\nenabled = true\napi_host = \"api.example.com\"\n")
+                .expect_err("should reject a missing default-on auction token");
+        assert!(
+            error.to_string().contains("tinybird.auction_token_secret"),
+            "should match runtime blob validation: {error:?}"
+        );
+    }
+
+    #[test]
     fn tinybird_accepts_region_host_without_scheme() {
         let toml = format!(
             "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"\n",
@@ -4830,6 +4965,49 @@ mod tests {
             toml.contains("auction_enabled = false"),
             "should serialize the operator's explicit disable"
         );
+    }
+
+    #[test]
+    fn route_sections_normalize_and_enforce_finite_limits() {
+        let mut settings = create_test_settings();
+        settings.observability.route_sections = vec!["  news  ".to_owned()];
+        settings.normalize_deserialized();
+        settings
+            .prepare_runtime()
+            .expect("should accept and normalize a valid route section");
+        assert_eq!(settings.observability.route_sections, ["news"]);
+
+        for invalid in ["", "  ", "news/archive", "news\narchive", "news\n"] {
+            let mut settings = create_test_settings();
+            settings.observability.route_sections = vec![invalid.to_owned()];
+            settings.normalize_deserialized();
+            let error = settings
+                .prepare_runtime()
+                .expect_err("should reject an invalid route section");
+            assert!(error.to_string().contains("observability.route_sections"));
+        }
+
+        let mut boundary = create_test_settings();
+        boundary.observability.route_sections = vec!["x".repeat(128)];
+        settings_normalize_and_prepare(&mut boundary);
+        boundary.observability.route_sections = vec!["x".repeat(129)];
+        assert!(boundary.prepare_runtime().is_err(), "129 bytes must fail");
+
+        let mut boundary = create_test_settings();
+        boundary.observability.route_sections = (0..32).map(|index| format!("s{index}")).collect();
+        settings_normalize_and_prepare(&mut boundary);
+        boundary
+            .observability
+            .route_sections
+            .push("extra".to_owned());
+        assert!(boundary.prepare_runtime().is_err(), "33 entries must fail");
+    }
+
+    fn settings_normalize_and_prepare(settings: &mut Settings) {
+        settings.normalize_deserialized();
+        settings
+            .prepare_runtime()
+            .expect("should accept route-section limits at the boundary");
     }
 
     #[test]

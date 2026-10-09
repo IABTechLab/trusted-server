@@ -4,9 +4,8 @@
 //! boundary the Axum dev server's router sits behind: it reuses the generic
 //! handle in request extensions or creates one, exposing it through the
 //! [`RequestTimings`](trusted_server_core::request_timing::RequestTimings)
-//! facade so
-//! downstream core handlers can record into it, and on the way back stamps
-//! `mark_headers_ready` and appends the `Server-Timing` header via
+//! facade. Downstream core handlers can record into it. The wrapper stamps
+//! `mark_headers_ready` on the way back and appends the `Server-Timing` header via
 //! [`append_server_timing_if_private`](trusted_server_core::request_timing::append_server_timing_if_private).
 //!
 //! This wraps *outside* `RouterService` rather than registering as
@@ -229,6 +228,43 @@ mod tests {
             !server_timing.contains("ts-appbuild"),
             "the Axum dev server builds state once at startup, so there is no \
              per-request app-build interval to render: {server_timing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_suppresses_timing_when_edge_cache_header_collides_with_private_cache_control() {
+        let router = RouterService::builder()
+            .get("/collision", |_ctx: RequestContext| async {
+                Ok(response_builder()
+                    .status(StatusCode::OK)
+                    .header("cache-control", "private, no-store")
+                    .header("cdn-cache-control", "max-age=60")
+                    .body(EdgeBody::from("ok"))
+                    .expect("should build a response with conflicting cache directives"))
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), true);
+
+        let request = Request::builder()
+            .uri("/collision")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, "cdn-cache-control").as_deref(),
+            Some("max-age=60")
+        );
+        assert!(
+            header(&response, "server-timing").is_none(),
+            "must not expose timing when a CDN header can make the private response cacheable"
         );
     }
 

@@ -1,6 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -188,6 +188,38 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
         guard.clear();
+    }
+}
+
+/// Per-document buffer for script text fragments split across chunks.
+///
+/// `lol_html` can deliver one text node as several chunks, so a rewriter that
+/// needs the whole script must accumulate until `is_last_in_text_node`.
+///
+/// This lives in [`IntegrationDocumentState`] rather than on the rewriter.
+/// Rewriters are registered once as `Arc<dyn IntegrationScriptRewriter>` and
+/// live as long as the [`IntegrationRegistry`], so a buffer owned by a
+/// rewriter is shared by every document that registry serves. A document whose
+/// stream ends before the final fragment — client disconnect, origin error,
+/// truncated body — leaves its partial script in that buffer, and the next
+/// document prepends the residue to its own accumulation. That corrupts the
+/// response and can disclose the previous document's content.
+///
+/// Keyed per integration id, so each integration gets its own buffer, and
+/// dropped with the document state at end of document.
+#[derive(Debug, Default)]
+pub struct ScriptTextAccumulator {
+    buffer: Mutex<String>,
+}
+
+impl ScriptTextAccumulator {
+    /// Locks the buffer.
+    ///
+    /// Recovers from poisoning rather than panicking: a poisoned buffer holds
+    /// at worst a partial script, and the caller's `is_last_in_text_node`
+    /// handling already tolerates unexpected contents.
+    pub fn buffer(&self) -> MutexGuard<'_, String> {
+        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

@@ -72,16 +72,26 @@ pub fn settings_from_config_blob(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
-            .and_then(serde_json::Value::as_object_mut)
+    if let Some(tinybird) = data
+        .get_mut("tinybird")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
+        let master_enabled =
+            tinybird.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+        let auction_enabled = tinybird
+            .get("auction_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let access_enabled = tinybird
+            .get("access_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !master_enabled || !auction_enabled {
+            tinybird.remove("auction_token_secret");
+        }
+        if !master_enabled || !access_enabled {
+            tinybird.remove("access_token_secret");
+        }
     }
 
     if let Some(partners) = data
@@ -629,6 +639,92 @@ mod tests {
         .expect_err("should reject a missing active pull-sync token");
 
         assert!(error.to_string().contains("ec.partners[0].ts_pull_token"));
+    }
+
+    #[test]
+    fn inactive_tinybird_sinks_strip_stale_secret_references_before_resolution() {
+        let mut original = test_settings();
+        let mut data = serde_json::to_value(&original).expect("should serialize settings");
+        data["tinybird"] = serde_json::json!({
+            "enabled": false,
+            "auction_token_secret": "unused-auction-token",
+            "access_token_secret": "unused-access-token",
+        });
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let loaded = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should ignore stale secrets for disabled sinks");
+        assert!(!loaded.tinybird.enabled);
+        assert!(loaded.tinybird.auction_enabled, "auction defaults on");
+        assert!(!loaded.tinybird.access_enabled, "access defaults off");
+        assert!(loaded.tinybird.auction_token_secret.is_none());
+        assert!(loaded.tinybird.access_token_secret.is_none());
+
+        let mut data = serde_json::to_value(&original).expect("should serialize settings");
+        data["tinybird"] = serde_json::json!({
+            "enabled": true,
+            "api_host": "api.example.com",
+            "auction_enabled": false,
+            "auction_token_secret": "unused-auction-token",
+            "access_enabled": true,
+            "access_token_secret": "tinybird-token-key",
+            "access_sample_rate": 1.0,
+        });
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+        let loaded = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should load active access telemetry without the disabled auction token");
+        assert!(!loaded.tinybird.auction_enabled);
+        assert!(loaded.tinybird.auction_token_secret.is_none());
+        assert_eq!(
+            loaded
+                .tinybird
+                .access_token_secret
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-tinybird-token")
+        );
+
+        let mut data = serde_json::to_value(&original).expect("should serialize settings");
+        data["tinybird"] = serde_json::json!({
+            "enabled": true,
+            "api_host": "api.example.com",
+            "auction_token_secret": "tinybird-token-key",
+            "access_token_secret": "unused-access-token",
+        });
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+        let loaded = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should load the default-on auction sink without the disabled access token");
+        assert!(loaded.tinybird.auction_enabled, "auction defaults on");
+        assert!(!loaded.tinybird.access_enabled, "access defaults off");
+        assert!(loaded.tinybird.access_token_secret.is_none());
+        assert!(loaded.tinybird.auction_token_secret.is_some());
+
+        original.tinybird.enabled = true;
+        original.tinybird.api_host = "api.example.com".to_owned();
+        original.tinybird.auction_token_secret = None;
+        let error = settings_from_config_blob(
+            &self::envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should reject a missing active default-on auction token");
+        assert!(error.to_string().contains("tinybird.auction_token_secret"));
     }
 
     #[test]

@@ -291,7 +291,7 @@ git commit -m "Add RequestTimings phase collection and Server-Timing rendering"
   - `TinybirdSettings.auction_enabled: bool` (`#[serde(default = "default_true")]`).
   - `prepare_runtime` validation: `access_enabled` requires `enabled`, non-empty
     `api_host`, `secret_store`, `access_dataset`, `access_token_secret`,
-    `max_body_bytes > 0`, and `access_sample_rate > 0.0`.
+    `max_body_bytes >= 1024`, and `access_sample_rate > 0.0`.
 
 - [ ] **Step 1: Write the failing tests** (in `settings.rs` tests module)
 

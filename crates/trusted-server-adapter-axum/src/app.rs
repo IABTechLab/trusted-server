@@ -616,6 +616,8 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
+    /// Returns the bare router without terminal timing; serve with
+    /// [`Self::dev_server_service`] to preserve `Server-Timing` emission.
     fn routes() -> RouterService {
         Self::routes_with_server_timing_flag().0
     }
@@ -660,8 +662,7 @@ impl TrustedServerApp {
     /// router.
     ///
     /// The Axum dev server's terminal timing layer ([`crate::timing`]) needs
-    /// this flag once at startup: unlike the Fastly adapter, which rebuilds
-    /// `Settings` per request, the Axum dev server builds its application
+    /// this flag once at startup. The Axum dev server builds its application
     /// state once and reuses the same [`RouterService`] for every request.
     #[must_use]
     fn routes_with_server_timing_flag() -> (RouterService, bool) {

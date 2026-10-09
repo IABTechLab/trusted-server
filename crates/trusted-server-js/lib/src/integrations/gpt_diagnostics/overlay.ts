@@ -161,7 +161,8 @@ function deliveryFact(cycle: GptDiagnosticsRequestCycle): string {
     case undefined:
       return 'Delivery evidence: Not observed';
     default:
-      return unhandledCase(cycle.delivery) ?? 'Delivery evidence: Not observed';
+      unhandledCase(cycle.delivery);
+      return 'Delivery evidence: Not observed';
   }
 }
 

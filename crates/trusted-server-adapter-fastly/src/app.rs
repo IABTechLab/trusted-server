@@ -176,8 +176,10 @@ impl RuntimeStoreConfig {
 
 /// Application state built once per Wasm instance and shared for its lifetime.
 ///
-/// In Fastly Compute each request spawns a new Wasm instance, so this struct is
-/// effectively per-request. It holds pre-parsed settings and all service handles.
+/// By default Fastly serves one request per instance. With the opt-in reusable
+/// sandbox feature and complete runtime bounds, a successful application build
+/// retains this state across requests until the sandbox retires. Settings and
+/// shared services live here; request-specific state must remain request-local.
 pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
@@ -848,7 +850,7 @@ async fn dispatch_fallback(
             route_template: TSJS_ROUTE_TEMPLATE.to_owned(),
         });
         handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
-    } else if state.registry.has_route(&method, &path) {
+    } else if let Some(pattern) = state.registry.matched_route_pattern(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
         // publisher-specific streaming finalizer instead.
@@ -858,10 +860,7 @@ async fn dispatch_fallback(
         // publisher classifier.
         route_metadata = Some(RouteMetadata {
             route_class: RouteClass::IntegrationProxy,
-            route_template: state
-                .registry
-                .matched_route_pattern(&method, &path)
-                .map_or_else(|| "/other/*".to_owned(), str::to_owned),
+            route_template: pattern.to_owned(),
         });
         state
             .registry

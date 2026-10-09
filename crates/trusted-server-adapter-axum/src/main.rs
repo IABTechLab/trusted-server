@@ -66,7 +66,12 @@ async fn serve(
     service: TimingService<EdgeZeroAxumService>,
     config: AxumDevServerConfig,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(config.addr).await?;
+    let listener = TcpListener::bind(config.addr).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind dev server to {}: {error}", config.addr),
+        )
+    })?;
 
     let axum_router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
