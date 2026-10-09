@@ -4,7 +4,7 @@
  * Builds each integration as a separate IIFE file so the Rust server can
  * concatenate only the enabled modules at runtime.
  *
- * Output (in ../dist/):
+ * Output (in ../dist/, or the directory passed as `--out-dir <dir>`):
  *   tsjs-core.js          — core API (always included)
  *   tsjs-<integration>.js — one per discovered integration
  *
@@ -12,6 +12,10 @@
  * is never bundled into tsjs. Use build-prebid-external.mjs to generate the
  * pure Prebid.js external bundle (core + adapters + user ID modules) that the
  * shim requires at runtime via integrations.prebid.external_bundle_url.
+ *
+ * The Rust build script passes `--out-dir` with a private directory under
+ * Cargo's OUT_DIR, so concurrent cargo builds never share (or clean) the same
+ * output directory.
  */
 
 import fs from 'node:fs';
@@ -23,12 +27,30 @@ import { moduleBuildOptions } from './build-module-options.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const srcDir = path.resolve(__dirname, 'src');
-const distDir = path.resolve(__dirname, '..', 'dist');
+const distDir = resolveOutDir(process.argv.slice(2));
 const integrationsDir = path.join(srcDir, 'integrations');
 
-// Clean dist directory
-fs.rmSync(distDir, { recursive: true, force: true });
+/** Resolve `--out-dir <dir>` (relative to the cwd), defaulting to ../dist. */
+function resolveOutDir(args) {
+  const flagIndex = args.indexOf('--out-dir');
+  if (flagIndex === -1) {
+    return path.resolve(__dirname, '..', 'dist');
+  }
+  const value = args[flagIndex + 1];
+  if (!value || value.startsWith('--')) {
+    throw new Error('[build-all] --out-dir requires a directory argument');
+  }
+  return path.resolve(value);
+}
+
+// Remove only the bundles this script writes, so a wrong --out-dir cannot
+// delete unrelated files.
 fs.mkdirSync(distDir, { recursive: true });
+for (const name of fs.readdirSync(distDir)) {
+  if (name.startsWith('tsjs-') && name.endsWith('.js')) {
+    fs.rmSync(path.join(distDir, name));
+  }
+}
 
 // Discover integration modules: directories in src/integrations/ with index.ts
 const integrationModules = fs.existsSync(integrationsDir)
