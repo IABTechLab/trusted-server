@@ -255,6 +255,8 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
     // nor changes system proxy state, so it is safe to run first.
     let mut cfg = config::resolve(args).change_context(ProxyError::Config)?;
 
+    crate::tls::install_crypto_provider();
+
     // Non-interactive so an unrelated startup never blocks on a sudo password
     // prompt.
     browser::restore_system_proxy_if_pending(&cfg.ca_dir, false);

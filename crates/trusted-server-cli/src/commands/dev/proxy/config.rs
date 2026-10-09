@@ -467,7 +467,7 @@ mod tests {
         let path = dir.path().join("token");
         for raw in [
             "",
-            "short",
+            "example-short-token-0123456789",
             "1234567890123456789012345678901",
             "example-forwarder-token-0123456789 ",
             " example-forwarder-token-0123456789",
