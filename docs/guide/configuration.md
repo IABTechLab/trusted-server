@@ -1246,6 +1246,8 @@ Profile sets convert small request query controls into a closed set of Image Opt
 
 Profile values live under `[image_optimizer.profile_sets.<name>.profiles]` and use query-string syntax.
 
+Profile and profile-set names are trimmed. Names within the same map that become identical after trimming are rejected, even when their values match. Empty names continue to be discarded.
+
 ```toml
 [image_optimizer.profile_sets.default_images]
 base_params = "quality=70&resize-filter=bicubic"
