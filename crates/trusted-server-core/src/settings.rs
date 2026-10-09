@@ -1848,9 +1848,19 @@ impl Proxy {
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TinybirdSettings {
-    /// Master enablement for auction telemetry ingestion.
+    /// Master enablement for Tinybird telemetry. Required by both auction and
+    /// access-log emission; each is independently toggled below.
     #[serde(default)]
     pub enabled: bool,
+    /// Emit auction telemetry when `enabled`. Defaults to `true` so existing
+    /// configs preserve their current auction-emission behavior after
+    /// upgrading; set `false` to silence auction events while keeping
+    /// `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
+    /// The default `true` is omitted from serialized config; `false` is an
+    /// explicit opt-out for binaries that support this field. Older binaries
+    /// may ignore that opt-out and resume auction telemetry on rollback.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auction_enabled: bool,
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
@@ -1863,19 +1873,26 @@ pub struct TinybirdSettings {
     /// Secret reference containing the auction datasource APPEND token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_token_secret: Option<Redacted<String>>,
-    /// Reserved for future access-log telemetry.
+    /// Emit access-log telemetry when `enabled`, independent of
+    /// `auction_enabled`.
     ///
-    /// `true` is rejected until an access-log emitter is wired, so operators
-    /// cannot enable a setting that silently emits nothing.
+    /// `true` requires `enabled`, non-empty `api_host`/`access_dataset`, a
+    /// resolved `access_token_secret`, `max_body_bytes >= 1024`, and
+    /// `access_sample_rate > 0.0`. This prevents an armed-but-silent sampler
+    /// that enables the flag but emits nothing.
     #[serde(default)]
     pub access_enabled: bool,
-    /// Future access-log Events API datasource name.
+    /// Access-log Events API datasource name. Required non-empty when
+    /// `access_enabled`.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Deprecated placeholder for the unwired access-log APPEND token.
-    #[serde(default, skip_serializing)]
+    /// Secret reference containing the access-log datasource APPEND token.
+    /// Required when `access_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token_secret: Option<Redacted<String>>,
-    /// Future fraction of requests to emit for optional access telemetry.
+    /// Fraction of requests to emit for access telemetry. Must be greater
+    /// than `0.0` when `access_enabled`, so an operator cannot enable access
+    /// telemetry while sampling it away entirely.
     #[serde(default)]
     pub access_sample_rate: f64,
     /// Defensive maximum NDJSON body size for one Events API request.
@@ -1899,6 +1916,7 @@ impl Default for TinybirdSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            auction_enabled: default_true(),
             api_host: String::new(),
             secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
@@ -1921,14 +1939,17 @@ impl TinybirdSettings {
             );
         }
         self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
-            let value = value.expose().trim().to_owned();
-            (!value.is_empty()).then(|| Redacted::new(value))
-        });
+        self.auction_token_secret = normalize_secret(self.auction_token_secret.take());
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = None;
+        self.access_token_secret = normalize_secret(self.access_token_secret.take());
     }
 
+    /// Validate this settings block, including the access-telemetry matrix:
+    /// `access_enabled` requires `enabled`, a non-empty `api_host` and
+    /// `access_dataset`, a resolved `access_token_secret`, a `max_body_bytes`
+    /// above the defensive floor enforced below, and an `access_sample_rate`
+    /// greater than `0.0`. Auction emission is independently gated by
+    /// `auction_enabled` and validated the same way.
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.normalize();
         if !(0.0..=1.0).contains(&self.access_sample_rate) {
@@ -1941,25 +1962,52 @@ impl TinybirdSettings {
                 message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
             }));
         }
-        if self.access_enabled {
+        if self.access_enabled && !self.enabled {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+                message: "tinybird.access_enabled requires tinybird.enabled".to_owned(),
             }));
         }
         if !self.enabled {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message:
-                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
-                        .to_owned(),
-            })
-        })?;
-        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
+        if self.auction_enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message:
+                        "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
+                            .to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
+        }
+        if self.access_enabled {
+            validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
+            let token = self.access_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message:
+                        "tinybird.access_token_secret is required when tinybird.access_enabled is true"
+                            .to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.access_token_secret")?;
+            if self.access_sample_rate <= 0.0 {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_sample_rate must be > 0 when tinybird.access_enabled is true".to_owned(),
+                }));
+            }
+        }
+        Ok(())
     }
+}
+
+/// Trim a resolved secret, dropping it entirely when nothing is left.
+fn normalize_secret(value: Option<Redacted<String>>) -> Option<Redacted<String>> {
+    value.and_then(|value| {
+        let value = value.expose().trim().to_owned();
+        (!value.is_empty()).then(|| Redacted::new(value))
+    })
 }
 
 fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
@@ -1982,6 +2030,17 @@ fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerErro
     })
 }
 
+// Takes the resolved secret VALUE, so the error message names only the
+// setting: formatting the value itself would disclose the credential.
+fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be non-empty after secret resolution"),
+        }));
+    }
+    Ok(())
+}
+
 fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
     if value.is_empty()
         || value.len() > 128
@@ -1991,15 +2050,6 @@ fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<Tr
     {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!("{setting} must be a non-empty datasource identifier"),
-        }));
-    }
-    Ok(())
-}
-
-fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be non-empty after secret resolution"),
         }));
     }
     Ok(())
@@ -2604,6 +2654,14 @@ pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
     "upstream_message_truncated",
 ];
 
+/// `skip_serializing_if` helper: true is the serde default for the fields
+/// that use it, so serializing it would only widen the pushed config's
+/// rollback surface.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2749,6 +2807,81 @@ pub enum AuctionDebugCommentFormat {
     #[default]
     Compact,
     Pretty,
+}
+
+/// Request-observability toggles exposed to operators.
+///
+/// The default table must stay omitted from serialized config blobs: this
+/// struct denies unknown fields, so an older binary loading a config blob
+/// carrying an `[observability]` table it does not know would reject it,
+/// breaking rollback. See [`Settings::observability`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySettings {
+    /// Emit the `Server-Timing` response header with per-phase request
+    /// timing. Defaults to `false` (off).
+    #[serde(default)]
+    pub server_timing_enabled: bool,
+    /// Section names whose publisher paths keep a named route template in
+    /// access telemetry (`/{section}/*`); everything else collapses to
+    /// `/other/*`. Matching is ASCII case-insensitive on the first path
+    /// segment, and a match requires at least one further segment. Defaults
+    /// to empty, which collapses every publisher path. Names are trimmed and
+    /// must be non-empty, contain no `/` or control characters, fit within 128
+    /// UTF-8 bytes, and number at most 32.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_sections: Vec<String>,
+}
+
+impl ObservabilitySettings {
+    const MAX_ROUTE_SECTIONS: usize = 32;
+    const MAX_ROUTE_SECTION_BYTES: usize = 128;
+
+    fn normalize(&mut self) {
+        self.route_sections = self
+            .route_sections
+            .iter()
+            .map(|section| {
+                section
+                    .trim_matches(|character: char| {
+                        character.is_whitespace() && !character.is_control()
+                    })
+                    .to_owned()
+            })
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.route_sections.len() > Self::MAX_ROUTE_SECTIONS {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "observability.route_sections must contain at most {} entries",
+                    Self::MAX_ROUTE_SECTIONS
+                ),
+            }));
+        }
+        for section in &self.route_sections {
+            if section.is_empty()
+                || section.len() > Self::MAX_ROUTE_SECTION_BYTES
+                || section.contains('/')
+                || section.chars().any(char::is_control)
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "observability.route_sections entries must be non-empty, contain no slash or control characters, and fit within {} UTF-8 bytes",
+                        Self::MAX_ROUTE_SECTION_BYTES
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when every field is at its default, i.e. observability is fully
+    /// disabled and the table can be omitted from serialized output.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Tester-cookie endpoint configuration.
@@ -2916,6 +3049,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    /// Request-observability toggles. The default table is omitted from
+    /// serialized config blobs so a config round-tripped without change
+    /// still parses under a prior binary's schema; see
+    /// [`ObservabilitySettings`].
+    #[serde(default, skip_serializing_if = "ObservabilitySettings::is_default")]
+    pub observability: ObservabilitySettings,
 }
 
 impl Settings {
@@ -2990,6 +3129,7 @@ impl Settings {
         self.proxy.normalize();
         self.image_optimizer.normalize();
         self.debug.auction_html_comment_options.normalize();
+        self.observability.normalize();
         self.tinybird.normalize();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
@@ -3031,6 +3171,7 @@ impl Settings {
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.observability.prepare_runtime()?;
         self.debug
             .auction_html_comment_options
             .validate_metadata_keys()?;
@@ -3783,6 +3924,14 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
+    /// Parses `extra` appended to the shared test fixture TOML, mirroring the
+    /// `format!("{}\n...", crate_test_settings_str())` pattern used throughout
+    /// this module's other tests.
+    fn settings_from_toml_with(extra: &str) -> Result<Settings, Report<TrustedServerError>> {
+        let toml = format!("{}\n{extra}", crate_test_settings_str());
+        Settings::from_toml(&toml)
+    }
+
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
@@ -3976,6 +4125,7 @@ mod tests {
             auction_token_secret: Some(Redacted::new(CANARY_TINYBIRD_AUCTION_TOKEN.to_string())),
             access_token_secret: Some(Redacted::new(CANARY_TINYBIRD_ACCESS_TOKEN.to_string())),
             enabled: false,
+            auction_enabled: true,
             api_host: String::new(),
             secret_store: None,
             auction_dataset: String::new(),
@@ -4693,6 +4843,17 @@ mod tests {
     }
 
     #[test]
+    fn tinybird_deployment_validation_requires_default_on_auction_secret() {
+        let error =
+            settings_from_toml_with("[tinybird]\nenabled = true\napi_host = \"api.example.com\"\n")
+                .expect_err("should reject a missing default-on auction token");
+        assert!(
+            error.to_string().contains("tinybird.auction_token_secret"),
+            "should match runtime blob validation: {error:?}"
+        );
+    }
+
+    #[test]
     fn tinybird_accepts_region_host_without_scheme() {
         let toml = format!(
             "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"\n",
@@ -4705,17 +4866,169 @@ mod tests {
     }
 
     #[test]
-    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
-        let toml = format!(
-            "{}\n[tinybird]\naccess_enabled = true\n",
-            crate_test_settings_str()
+    fn tinybird_access_enabled_with_full_config_is_accepted() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept a fully-specified access telemetry config");
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
         );
+    }
 
-        let err = Settings::from_toml(&toml)
-            .expect_err("should reject access telemetry before emitter exists");
+    #[test]
+    fn access_enabled_requires_tinybird_enabled() {
+        // access_enabled = true with tinybird.enabled omitted (defaults
+        // false) must be rejected: access telemetry cannot run without the
+        // master toggle on.
+        let err = settings_from_toml_with(
+            "[tinybird]\napi_host = \"api.example.com\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect_err("should reject access telemetry without tinybird.enabled");
         assert!(
             format!("{err:?}").contains("tinybird.access_enabled"),
-            "should report unsupported tinybird.access_enabled setting: {err:?}"
+            "should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn access_enabled_requires_positive_sample_rate() {
+        // access_enabled = true with access_sample_rate = 0 is armed-but-silent: an error.
+        let err = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 0.0\n",
+        )
+        .expect_err("should reject armed-but-silent access telemetry");
+        assert!(
+            format!("{err:?}").contains("access_sample_rate"),
+            "should name the field"
+        );
+    }
+
+    #[test]
+    fn access_and_auction_emission_are_independent() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept access without auction");
+        assert!(
+            !settings.tinybird.auction_enabled,
+            "should disable auction emission"
+        );
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_defaults_true_for_existing_configs() {
+        let settings =
+            settings_from_toml_with(
+                "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\n",
+            )
+                .expect("should parse a pre-decoupling config");
+        assert!(
+            settings.tinybird.auction_enabled,
+            "should preserve current behavior"
+        );
+    }
+
+    #[test]
+    fn observability_defaults_off_and_serializes_away() {
+        let settings = create_test_settings();
+        assert!(
+            !settings.observability.server_timing_enabled,
+            "should default off"
+        );
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("[observability]"),
+            "should omit the default table so a prior binary can parse the config"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_serializes_only_when_disabled() {
+        let mut settings = create_test_settings();
+        assert!(settings.tinybird.auction_enabled, "should default on");
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("auction_enabled"),
+            "should omit the default-true key: a rollback must not silently \
+             re-enable auction telemetry an operator disabled"
+        );
+
+        settings.tinybird.auction_enabled = false;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("auction_enabled = false"),
+            "should serialize the operator's explicit disable"
+        );
+    }
+
+    #[test]
+    fn route_sections_normalize_and_enforce_finite_limits() {
+        let mut settings = create_test_settings();
+        settings.observability.route_sections = vec!["  news  ".to_owned()];
+        settings.normalize_deserialized();
+        settings
+            .prepare_runtime()
+            .expect("should accept and normalize a valid route section");
+        assert_eq!(settings.observability.route_sections, ["news"]);
+
+        for invalid in ["", "  ", "news/archive", "news\narchive", "news\n"] {
+            let mut settings = create_test_settings();
+            settings.observability.route_sections = vec![invalid.to_owned()];
+            settings.normalize_deserialized();
+            let error = settings
+                .prepare_runtime()
+                .expect_err("should reject an invalid route section");
+            assert!(error.to_string().contains("observability.route_sections"));
+        }
+
+        let mut boundary = create_test_settings();
+        boundary.observability.route_sections = vec!["x".repeat(128)];
+        settings_normalize_and_prepare(&mut boundary);
+        boundary.observability.route_sections = vec!["x".repeat(129)];
+        assert!(boundary.prepare_runtime().is_err(), "129 bytes must fail");
+
+        let mut boundary = create_test_settings();
+        boundary.observability.route_sections = (0..32).map(|index| format!("s{index}")).collect();
+        settings_normalize_and_prepare(&mut boundary);
+        boundary
+            .observability
+            .route_sections
+            .push("extra".to_owned());
+        assert!(boundary.prepare_runtime().is_err(), "33 entries must fail");
+    }
+
+    fn settings_normalize_and_prepare(settings: &mut Settings) {
+        settings.normalize_deserialized();
+        settings
+            .prepare_runtime()
+            .expect("should accept route-section limits at the boundary");
+    }
+
+    #[test]
+    fn route_sections_serialize_only_when_configured() {
+        let mut settings = create_test_settings();
+        assert!(
+            settings.observability.route_sections.is_empty(),
+            "should default to the collapse-everything allowlist"
+        );
+        settings.observability.server_timing_enabled = true;
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("route_sections"),
+            "should omit the empty allowlist so a prior binary can parse the config"
+        );
+
+        settings.observability.route_sections = vec!["news".to_owned()];
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            toml.contains("route_sections"),
+            "should serialize a configured allowlist"
         );
     }
 

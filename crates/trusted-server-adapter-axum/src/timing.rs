@@ -1,0 +1,435 @@
+//! Terminal timing layer for the Axum dev server.
+//!
+//! [`TimingService`](crate::timing::TimingService) wraps the tower `Service`
+//! boundary the Axum dev server's router sits behind: it reuses the generic
+//! handle in request extensions or creates one, exposing it through the
+//! [`RequestTimings`](trusted_server_core::request_timing::RequestTimings)
+//! facade. Downstream core handlers can record into it. The wrapper stamps
+//! `mark_headers_ready` on the way back and appends the `Server-Timing` header via
+//! [`append_server_timing_if_private`](trusted_server_core::request_timing::append_server_timing_if_private).
+//!
+//! This wraps *outside* `RouterService` rather than registering as
+//! `RouterBuilder::middleware` because the tower boundary is the terminal
+//! freeze point: by the time a response reaches this layer -- after
+//! `RouterService::oneshot` inside `EdgeZeroAxumService::call` has
+//! converted any dispatch error into a plain response -- every response is
+//! covered uniformly regardless of how routing produced it, and the
+//! position survives future routing changes. (In this application's router
+//! a catch-all fallback spans every path and publisher method, so
+//! router-generated 404/405s that bypass middleware are close to
+//! unreachable today; the outer position does not depend on them.)
+//!
+//! `/health` is excluded by path match before a
+//! [`RequestTimings`](trusted_server_core::request_timing::RequestTimings)
+//! collector is even created: this wrapper bypasses timing for every method
+//! on that path, leaving any preinstalled handle unchanged.
+//!
+//! Unlike the Fastly adapter (state built per request, adding
+//! `Phase::AppBuild` to the rendered header), the Axum dev server builds its
+//! application state once at startup. There is no per-request app-build
+//! interval to measure, so `ts-appbuild` never appears in the header here.
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::body::Body as AxumBody;
+use axum::http::{Request, Response};
+use tower::Service;
+use trusted_server_core::request_timing::{RequestTimings, append_server_timing_if_private};
+
+/// Path excluded from timing collection and `Server-Timing` emission: health
+/// checks bypass this wrapper for every method.
+const HEALTH_PATH: &str = "/health";
+
+/// Wraps an inner Axum tower service with the request-phase timing freeze
+/// point described in the module docs.
+#[derive(Clone)]
+pub struct TimingService<S> {
+    inner: S,
+    server_timing_enabled: bool,
+}
+
+impl<S> TimingService<S> {
+    /// Wraps `inner`, appending `Server-Timing` when `server_timing_enabled`
+    /// is set and the response is conclusively private.
+    #[must_use]
+    pub fn new(inner: S, server_timing_enabled: bool) -> Self {
+        Self {
+            inner,
+            server_timing_enabled,
+        }
+    }
+}
+
+impl<S> Service<Request<AxumBody>> for TimingService<S>
+where
+    S: Service<Request<AxumBody>, Response = Response<AxumBody>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Response = Response<AxumBody>;
+
+    fn call(&mut self, mut req: Request<AxumBody>) -> Self::Future {
+        let mut inner = self.inner.clone();
+
+        // Bypass installation and finalization for `/health`, regardless of method.
+        // A preinstalled collector remains available to the inner service.
+        if req.uri().path() == HEALTH_PATH {
+            return Box::pin(async move { inner.call(req).await });
+        }
+
+        let server_timing_enabled = self.server_timing_enabled;
+        let timings = RequestTimings::from_extensions(req.extensions()).unwrap_or_else(|| {
+            let timings = RequestTimings::new();
+            req.extensions_mut().insert(timings.handle().clone());
+            timings
+        });
+
+        Box::pin(async move {
+            let mut response = inner.call(req).await?;
+            append_server_timing_if_private(&mut response, &timings, server_timing_enabled);
+            Ok(response)
+        })
+    }
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::CACHE_CONTROL;
+    use axum::http::{HeaderValue, StatusCode};
+    use edgezero_adapter_axum::service::EdgeZeroAxumService;
+    use edgezero_core::body::Body as EdgeBody;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::response_builder;
+    use edgezero_core::router::RouterService;
+    use tower::{ServiceExt as _, service_fn};
+
+    /// Builds a private (`cache-control: private, no-store`) response for a
+    /// handler under test.
+    fn private_ok_response() -> Result<edgezero_core::http::Response, EdgeError> {
+        Ok(response_builder()
+            .status(StatusCode::OK)
+            .header("cache-control", "private, no-store")
+            .body(EdgeBody::from("ok"))
+            .expect("should build a private response fixture"))
+    }
+
+    /// Reads a response header as a UTF-8 string, or `None` if absent.
+    fn header(response: &Response<AxumBody>, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_preserves_preinstalled_collector_and_origin() {
+        let timings = RequestTimings::new();
+        timings.record(
+            trusted_server_core::request_timing::Phase::Filter,
+            std::time::Duration::from_millis(7),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let router = RouterService::builder()
+            .get("/private", |ctx: RequestContext| async move {
+                let timings = RequestTimings::from_extensions(ctx.request().extensions())
+                    .expect("should receive preinstalled collector");
+                assert_eq!(
+                    timings.snapshot().filter_ms,
+                    Some(7),
+                    "should preserve upstream phase"
+                );
+                timings.mark_auction_dispatched();
+                assert!(
+                    timings
+                        .snapshot()
+                        .auction_dispatched_ms
+                        .expect("should mark dispatch")
+                        >= 20,
+                    "should preserve the pre-aged origin"
+                );
+                private_ok_response()
+            })
+            .build();
+        let terminal = TimingService::new(EdgeZeroAxumService::new(router), true);
+        let upstream_timings = timings.clone();
+        let mut upstream = service_fn(move |mut req: Request<AxumBody>| {
+            req.extensions_mut()
+                .insert(upstream_timings.handle().clone());
+            let mut service = terminal.clone();
+            async move { service.call(req).await }
+        });
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = upstream
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should handle request");
+        let value = header(&response, "server-timing").expect("should render private timing");
+        assert!(
+            value.contains("ts-filter;dur=7.0"),
+            "should render upstream phase: {value}"
+        );
+        assert!(
+            timings
+                .snapshot()
+                .time_elapsed_ms
+                .expect("should stamp original handle")
+                >= 20,
+            "terminal rendering should use the original clock"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_emits_header_on_private_response() {
+        let router = RouterService::builder()
+            .get("/private", |_ctx: RequestContext| async {
+                private_ok_response()
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), true);
+
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        let server_timing = header(&response, "server-timing").expect("should emit header");
+        assert!(
+            server_timing.contains("ts-total;dur="),
+            "should carry the collected total: {server_timing}"
+        );
+        assert!(
+            !server_timing.contains("ts-appbuild"),
+            "the Axum dev server builds state once at startup, so there is no \
+             per-request app-build interval to render: {server_timing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_suppresses_timing_when_edge_cache_header_collides_with_private_cache_control() {
+        let router = RouterService::builder()
+            .get("/collision", |_ctx: RequestContext| async {
+                Ok(response_builder()
+                    .status(StatusCode::OK)
+                    .header("cache-control", "private, no-store")
+                    .header("cdn-cache-control", "max-age=60")
+                    .body(EdgeBody::from("ok"))
+                    .expect("should build a response with conflicting cache directives"))
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), true);
+
+        let request = Request::builder()
+            .uri("/collision")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, "cdn-cache-control").as_deref(),
+            Some("max-age=60")
+        );
+        assert!(
+            header(&response, "server-timing").is_none(),
+            "must not expose timing when a CDN header can make the private response cacheable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_suppresses_header_when_flag_is_off() {
+        let router = RouterService::builder()
+            .get("/private", |_ctx: RequestContext| async {
+                private_ok_response()
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), false);
+
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        assert!(
+            header(&response, "server-timing").is_none(),
+            "should not emit server-timing when server_timing_enabled is false"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_round_trips_phase_timings_recorded_in_the_handler() {
+        // The collector crosses the adapter boundary as a request extension;
+        // this pins the round trip end to end: a phase recorded inside a
+        // core-style handler must come back out in the rendered header, so
+        // a future adapter conversion that drops request extensions fails
+        // here instead of silently losing every phase.
+        let router = RouterService::builder()
+            .get("/private", |ctx: RequestContext| async move {
+                if let Some(timings) = RequestTimings::from_extensions(ctx.request().extensions()) {
+                    timings.record(
+                        trusted_server_core::request_timing::Phase::Filter,
+                        std::time::Duration::from_millis(7),
+                    );
+                }
+                private_ok_response()
+            })
+            .build();
+        let mut service = TimingService::new(EdgeZeroAxumService::new(router), true);
+
+        let request = Request::builder()
+            .uri("/private")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        let server_timing = header(&response, "server-timing").expect("should emit header");
+        assert!(
+            server_timing.contains("ts-filter;dur=7.0"),
+            "a phase recorded in the handler should survive the adapter round trip: {server_timing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_404_carries_header_when_private() {
+        // An empty router has no routes at all, so any path dispatches
+        // through `RouterInner::dispatch`'s `NotFound` branch -- exactly the
+        // path that bypasses `RouterBuilder::middleware`. The router's own
+        // `EdgeError::into_response` does not attach `Cache-Control`, so a
+        // small wrapping service forces the response private here, standing
+        // in for whatever upstream layer would normally mark a genuinely
+        // private 404. This proves the freeze point still runs for a
+        // router-generated response without weakening
+        // `append_server_timing_if_private`'s real gating logic.
+        let empty_router = RouterService::builder().build();
+        let inner = EdgeZeroAxumService::new(empty_router);
+        let force_private = service_fn(move |req: Request<AxumBody>| {
+            let mut svc = inner.clone();
+            async move {
+                let mut response = svc.call(req).await?;
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let mut service = TimingService::new(force_private, true);
+
+        let request = Request::builder()
+            .uri("/does-not-exist")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should not fail");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should still be the router's own not-found response"
+        );
+        let server_timing = header(&response, "server-timing")
+            .expect("a router-generated 404 must still carry the header when private");
+        assert!(
+            server_timing.contains("ts-total;dur="),
+            "should carry the collected total: {server_timing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn axum_health_is_excluded() {
+        for method in [axum::http::Method::GET, axum::http::Method::POST] {
+            for path in ["/health", "/health?probe=1"] {
+                for preinstalled in [false, true] {
+                    let timings = RequestTimings::new();
+                    let inner = service_fn(move |req: Request<AxumBody>| async move {
+                        assert_eq!(
+                            RequestTimings::from_extensions(req.extensions()).is_some(),
+                            preinstalled,
+                            "health bypass should not install or remove a handle"
+                        );
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("cache-control", "private")
+                                .body(AxumBody::empty())
+                                .expect("should build private response"),
+                        )
+                    });
+                    let mut service = TimingService::new(inner, true);
+                    let mut request = Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(AxumBody::empty())
+                        .expect("should build request");
+                    if preinstalled {
+                        request.extensions_mut().insert(timings.handle().clone());
+                    }
+                    let response = service
+                        .ready()
+                        .await
+                        .expect("should be ready")
+                        .call(request)
+                        .await
+                        .expect("should not fail");
+                    assert!(
+                        header(&response, "server-timing").is_none(),
+                        "health should not emit timing"
+                    );
+                    assert_eq!(
+                        timings.snapshot().time_elapsed_ms,
+                        None,
+                        "health bypass should not finalize timing"
+                    );
+                }
+            }
+        }
+    }
+}

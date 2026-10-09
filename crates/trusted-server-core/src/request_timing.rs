@@ -1,0 +1,861 @@
+//! Per-request phase timing collection and Server-Timing rendering.
+//!
+//! Collection delegates to `EdgeZero` with saturating math and nonblocking
+//! updates. Contention drops the whole sample; poisoned locks recover
+//! best-effort without rollback. TS callbacks only assign plain optional facts
+//! under the shared clock and mutex. Rendering and exposure remain TS policy.
+//! See the design spec
+//! `docs/superpowers/specs/2026-08-24-request-phase-timing-design.md`.
+
+use std::time::Duration;
+
+use http::{Extensions, HeaderName, HeaderValue, Response};
+use uuid::Uuid;
+
+use crate::cache_policy::{EDGE_CACHE_HEADER_NAMES, cache_control_headers_are_private_or_no_store};
+
+/// `Server-Timing` header name. Not present in the `http` crate's `header`
+/// module (unlike `CACHE_CONTROL` etc.), so declared locally following the
+/// same `HeaderName::from_static` pattern used in
+/// `trusted_server_core::constants`.
+const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
+/// Number of [`Phase`] variants; sizes the fixed-slot duration array in
+/// the shared `EdgeZero` collector.
+const PHASE_COUNT: usize = 8;
+
+/// A distinct stage of request handling that duration can be attributed to.
+///
+/// Variants map to fixed slots in [`RequestTimings`], in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Time spent constructing the app/handler before request processing
+    /// begins.
+    AppBuild,
+    /// Time spent in request/response filtering (e.g. HTML rewriting).
+    Filter,
+    /// Time spent resolving geographic signals for the request.
+    Geo,
+    /// Time spent reading or writing the Edge Cookie key-value store.
+    EcKv,
+    /// Time spent waiting on the origin fetch.
+    Origin,
+    /// Time spent looking up a cached template.
+    TemplateCacheLookup,
+    /// Time spent waiting on the auction. Row-only: never rendered as a
+    /// `Server-Timing` header entry.
+    AuctionWait,
+    /// Time spent streaming the response body. Row-only: never rendered as
+    /// a `Server-Timing` header entry.
+    Stream,
+}
+
+impl Phase {
+    /// Maps this variant to its fixed slot in the generic phase array.
+    fn index(self) -> usize {
+        match self {
+            Self::AppBuild => 0,
+            Self::Filter => 1,
+            Self::Geo => 2,
+            Self::EcKv => 3,
+            Self::Origin => 4,
+            Self::TemplateCacheLookup => 5,
+            Self::AuctionWait => 6,
+            Self::Stream => 7,
+        }
+    }
+
+    /// `Server-Timing` header entry name; row-only phases return `None`.
+    fn header_name(self) -> Option<&'static str> {
+        match self {
+            Self::AppBuild => Some("ts-appbuild"),
+            Self::Filter => Some("ts-filter"),
+            Self::Geo => Some("ts-geo"),
+            Self::EcKv => Some("ts-kv"),
+            Self::Origin => Some("ts-origin"),
+            Self::TemplateCacheLookup => Some("ts-template-cache"),
+            Self::AuctionWait | Self::Stream => None,
+        }
+    }
+}
+
+/// Where in the response the auction wait occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuctionWaitPlacement {
+    /// The auction was awaited before response headers were sent.
+    PreHeader,
+    /// The auction was awaited while streaming the response body.
+    InStream,
+}
+
+/// Auction facts sharing the generic collector's origin and mutex.
+///
+/// Updates only assign plain optional facts, preserving validity on unwind.
+#[derive(Default)]
+pub struct AuctionTimingData {
+    auction_wait_placement: Option<AuctionWaitPlacement>,
+    auction_dispatched: Option<Duration>,
+    auction_resolved: Option<Duration>,
+    auction_committed: Option<Duration>,
+    auction_id: Option<Uuid>,
+}
+
+/// The sole timing type installed in request extensions on every adapter.
+pub type RequestTimingHandle =
+    edgezero_core::request_timing::RequestTimings<PHASE_COUNT, AuctionTimingData>;
+
+/// Shared attachment middleware specialized to Trusted Server's timing payload.
+/// Exclusion policy belongs at each adapter's registration site.
+pub type RequestTimingMiddleware =
+    edgezero_core::middleware::RequestTimingMiddleware<PHASE_COUNT, AuctionTimingData>;
+
+/// Typed application facade over the installed `EdgeZero` handle, not an extension.
+///
+/// Clones share one origin and mutex. Contention drops samples or yields missing
+/// facts. `EdgeZero` recovers poisoned locks best-effort, without rollback; the
+/// callbacks here only update plain optional facts and cannot invalidate payloads.
+#[derive(Clone)]
+pub struct RequestTimings(RequestTimingHandle);
+
+impl RequestTimings {
+    /// Starts a new collector with its clock reference (`t0`) set to now.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(RequestTimingHandle::new())
+    }
+
+    /// Wraps the installed generic handle without creating a clock or copying facts.
+    #[must_use]
+    pub fn from_extensions(extensions: &Extensions) -> Option<Self> {
+        extensions.get::<RequestTimingHandle>().cloned().map(Self)
+    }
+
+    /// Returns the shared generic handle for insertion into request extensions.
+    #[must_use]
+    pub fn handle(&self) -> &RequestTimingHandle {
+        &self.0
+    }
+
+    /// Accumulates `dur` into `phase`'s running total.
+    ///
+    /// Repeated calls for the same phase saturate-add rather than overwrite.
+    /// Drops the sample silently on lock contention; a poisoned lock is recovered.
+    pub fn record(&self, phase: Phase, dur: Duration) {
+        let _ = self.0.record(phase.index(), dur);
+    }
+
+    /// Records an auction wait duration under [`Phase::AuctionWait`] and
+    /// stores its placement.
+    ///
+    /// Drops the sample silently on lock contention; a poisoned lock is recovered.
+    pub fn record_auction_wait(&self, placement: AuctionWaitPlacement, dur: Duration) {
+        let _ = self
+            .0
+            .record_with(Phase::AuctionWait.index(), dur, |data, _| {
+                data.auction_wait_placement = Some(placement);
+            });
+    }
+
+    /// Starts a guard that records elapsed time into `phase` when dropped.
+    ///
+    /// # Panics
+    /// Panics only if the internal exhaustive phase-to-slot mapping is invalid.
+    pub fn span(&self, phase: Phase) -> PhaseSpan {
+        self.0
+            .span(phase.index())
+            .expect("should map every Phase to a valid slot")
+    }
+
+    /// Stamps the elapsed time since `t0` as `headers_ready_total`, the
+    /// first time this is called.
+    ///
+    /// Subsequent calls are no-ops (first call wins). Drops the sample
+    /// silently on lock contention; a poisoned lock is recovered.
+    pub fn mark_headers_ready(&self) {
+        let _ = self.0.mark_headers_ready();
+    }
+
+    /// Stamps the elapsed time since `t0` as `request_elapsed`, the first
+    /// time this is called.
+    ///
+    /// Subsequent calls are no-ops (first call wins). Drops the sample
+    /// silently on lock contention; a poisoned lock is recovered.
+    pub fn mark_request_elapsed(&self) {
+        let _ = self.0.mark_request_complete();
+    }
+
+    /// Records the telemetry auction id, the first time this is called.
+    ///
+    /// Called where the auction observation is built, which happens on every
+    /// auction-eligible request regardless of outcome, so the access row can
+    /// be joined to the `auction_events_raw` row even when the auction was
+    /// skipped or failed to dispatch. Kept separate from
+    /// [`RequestTimings::mark_auction_dispatched`] so a dropped dispatch
+    /// sample cannot also lose the join key. Subsequent calls are no-ops
+    /// (first call wins). Drops the sample silently on lock contention; a
+    /// poisoned lock is recovered.
+    pub fn set_auction_id(&self, auction_id: Uuid) {
+        let _ = self.0.update_data(|data, _| {
+            data.auction_id.get_or_insert(auction_id);
+        });
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction dispatch offset,
+    /// the first time this is called.
+    ///
+    /// Called after at least one provider starts a request or returns an
+    /// immediate result. Routing-only skipped outcomes and zero-launch
+    /// failures do not stamp it. A null offset alongside a non-null
+    /// `auction_id` means no provider launch was observed. Subsequent calls
+    /// are no-ops (first call wins).
+    /// Drops the sample silently on lock contention; a poisoned lock is
+    /// recovered.
+    pub fn mark_auction_dispatched(&self) {
+        let _ = self.0.update_data(|data, elapsed| {
+            data.auction_dispatched.get_or_insert(elapsed);
+        });
+    }
+
+    /// Stamps the elapsed time since `t0` when auction collection returns,
+    /// the first time this is called.
+    ///
+    /// Collection may follow transport completion on streaming paths. This
+    /// measures the caller's collection point, not the final network reply.
+    ///
+    /// Stays `None` when a dispatched auction is abandoned before collection
+    /// (origin error, bodiless response, reader disconnect), so a non-null
+    /// dispatch offset with a null resolve offset is the "dispatched, never
+    /// collected" case rather than "no auction ran". Subsequent calls are
+    /// no-ops (first call wins). Drops the sample silently on lock
+    /// contention; a poisoned lock is recovered.
+    pub fn mark_auction_resolved(&self) {
+        let _ = self.0.update_data(|data, elapsed| {
+            data.auction_resolved.get_or_insert(elapsed);
+        });
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction commit offset
+    /// (winning bids available to the response pipeline), the first time
+    /// this is called.
+    ///
+    /// Subsequent calls are no-ops (first call wins). Drops the sample
+    /// silently on lock contention; a poisoned lock is recovered.
+    pub fn mark_auction_committed(&self) {
+        let _ = self.0.update_data(|data, elapsed| {
+            data.auction_committed.get_or_insert(elapsed);
+        });
+    }
+
+    /// Records the response body size in bytes.
+    ///
+    /// Drops the sample silently on lock contention; a poisoned lock is recovered.
+    pub fn set_resp_bytes(&self, bytes: u64) {
+        let _ = self.0.set_response_bytes(bytes);
+    }
+
+    /// Renders a `Server-Timing` header value, or `None` before
+    /// [`RequestTimings::mark_headers_ready`] has been called.
+    ///
+    /// `ts-total` is rendered first from `headers_ready_total`, followed by
+    /// the recorded header-bearing phases (`ts-appbuild`, `ts-filter`,
+    /// `ts-geo`, `ts-kv`, `ts-origin`, `ts-template-cache`) in enum
+    /// declaration order. Unrecorded phases are omitted. Durations are
+    /// rendered as milliseconds with one decimal place. Drops the sample
+    /// silently (returning `None`) on lock contention; poison is recovered.
+    #[must_use]
+    pub fn server_timing_value(&self) -> Option<String> {
+        self.0
+            .snapshot(|inner| {
+                let total = inner.headers_ready?;
+                let mut entries = vec![format_entry("ts-total", total)];
+                for phase in HEADER_PHASES {
+                    let Some(name) = phase.header_name() else {
+                        continue;
+                    };
+                    if let Some(dur) = inner.phases[phase.index()] {
+                        entries.push(format_entry(name, dur));
+                    }
+                }
+                Some(entries.join(", "))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Captures the current state as a [`TimingSnapshot`].
+    ///
+    /// Returns an all-`None` snapshot on lock contention,
+    /// consistent with the infallibility of every other method.
+    #[must_use]
+    pub fn snapshot(&self) -> TimingSnapshot {
+        self.0
+            .snapshot(|inner| TimingSnapshot {
+                time_elapsed_ms: duration_ms(inner.headers_ready),
+                request_elapsed_ms: duration_ms(inner.request_complete),
+                appbuild_ms: duration_ms(inner.phases[Phase::AppBuild.index()]),
+                filter_ms: duration_ms(inner.phases[Phase::Filter.index()]),
+                geo_ms: duration_ms(inner.phases[Phase::Geo.index()]),
+                kv_ms: duration_ms(inner.phases[Phase::EcKv.index()]),
+                origin_ms: duration_ms(inner.phases[Phase::Origin.index()]),
+                template_cache_ms: duration_ms(inner.phases[Phase::TemplateCacheLookup.index()]),
+                auction_wait_ms: duration_ms(inner.phases[Phase::AuctionWait.index()]),
+                stream_ms: duration_ms(inner.phases[Phase::Stream.index()]),
+                auction_wait_placement: inner.data.auction_wait_placement,
+                resp_bytes: inner.response_bytes,
+                auction_dispatched_ms: duration_ms(inner.data.auction_dispatched),
+                auction_resolved_ms: duration_ms(inner.data.auction_resolved),
+                auction_committed_ms: duration_ms(inner.data.auction_committed),
+                auction_id: inner.data.auction_id,
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Default for RequestTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stamps [`RequestTimings::mark_headers_ready`] and, when `enabled` and the
+/// response is conclusively private, appends the rendered `Server-Timing`
+/// header.
+///
+/// Always stamps `mark_headers_ready` regardless of whether the header is
+/// rendered, so the collector's `ts-total` reflects the moment headers
+/// commit. Appends rather than overwrites so a pre-existing `Server-Timing`
+/// value set upstream survives alongside the TS-owned set. A response is
+/// never promoted to shared-cacheable just because the header would
+/// otherwise be omitted: this only gates emission, it does not touch
+/// `Cache-Control`. Emission is also suppressed when a recognized CDN or
+/// surrogate cache-control header is present, since it may allow shared
+/// caching despite a private `Cache-Control` value.
+///
+/// Generic over the response body type so every adapter's terminal layer can
+/// call the same emission logic regardless of which body type its HTTP stack
+/// uses.
+pub fn append_server_timing_if_private<B>(
+    response: &mut Response<B>,
+    timings: &RequestTimings,
+    enabled: bool,
+) {
+    timings.mark_headers_ready();
+
+    let headers = response.headers();
+    let conclusively_private = cache_control_headers_are_private_or_no_store(headers)
+        && !EDGE_CACHE_HEADER_NAMES
+            .iter()
+            .any(|name| headers.contains_key(*name));
+    if !enabled || !conclusively_private {
+        return;
+    }
+
+    let Some(value) = timings.server_timing_value() else {
+        return;
+    };
+    match HeaderValue::from_str(&value) {
+        Ok(header_value) => {
+            response
+                .headers_mut()
+                .append(HEADER_SERVER_TIMING, header_value);
+        }
+        Err(error) => log::warn!("skipping server-timing header: {error}"),
+    }
+}
+
+/// The header-bearing phases (see [`Phase::header_name`]), in the enum
+/// declaration order [`RequestTimings::server_timing_value`] renders them in.
+const HEADER_PHASES: [Phase; 6] = [
+    Phase::AppBuild,
+    Phase::Filter,
+    Phase::Geo,
+    Phase::EcKv,
+    Phase::Origin,
+    Phase::TemplateCacheLookup,
+];
+
+/// Formats one `Server-Timing` entry as `name;dur=<ms with one decimal>`.
+fn format_entry(name: &str, dur: Duration) -> String {
+    format!("{name};dur={:.1}", dur.as_secs_f64() * 1000.0)
+}
+
+/// Converts a recorded [`Duration`] to whole milliseconds, saturating to
+/// [`u32::MAX`] instead of overflowing.
+fn duration_ms(dur: Option<Duration>) -> Option<u32> {
+    dur.map(|dur| u32::try_from(dur.as_millis()).unwrap_or(u32::MAX))
+}
+
+/// RAII guard returned by [`RequestTimings::span`] that records its own
+/// elapsed lifetime into the originating phase when dropped.
+pub type PhaseSpan = edgezero_core::request_timing::PhaseSpan<PHASE_COUNT, AuctionTimingData>;
+
+/// A point-in-time, plain-data view of a [`RequestTimings`] collector.
+///
+/// All durations are whole milliseconds; unrecorded phases are `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimingSnapshot {
+    /// Elapsed time from request start to
+    /// [`RequestTimings::mark_headers_ready`], in milliseconds.
+    pub time_elapsed_ms: Option<u32>,
+    /// Elapsed time from request start to
+    /// [`RequestTimings::mark_request_elapsed`], in milliseconds.
+    pub request_elapsed_ms: Option<u32>,
+    /// Accumulated [`Phase::AppBuild`] duration, in milliseconds.
+    pub appbuild_ms: Option<u32>,
+    /// Accumulated [`Phase::Filter`] duration, in milliseconds.
+    pub filter_ms: Option<u32>,
+    /// Accumulated [`Phase::Geo`] duration, in milliseconds.
+    pub geo_ms: Option<u32>,
+    /// Accumulated [`Phase::EcKv`] duration, in milliseconds.
+    pub kv_ms: Option<u32>,
+    /// Accumulated [`Phase::Origin`] duration, in milliseconds.
+    pub origin_ms: Option<u32>,
+    /// Accumulated [`Phase::TemplateCacheLookup`] duration, in milliseconds.
+    pub template_cache_ms: Option<u32>,
+    /// Accumulated [`Phase::AuctionWait`] duration, in milliseconds.
+    pub auction_wait_ms: Option<u32>,
+    /// Accumulated [`Phase::Stream`] duration, in milliseconds.
+    pub stream_ms: Option<u32>,
+    /// Placement recorded by the most recent
+    /// [`RequestTimings::record_auction_wait`] call.
+    pub auction_wait_placement: Option<AuctionWaitPlacement>,
+    /// Response body size in bytes, set via
+    /// [`RequestTimings::set_resp_bytes`].
+    pub resp_bytes: Option<u64>,
+    /// T0 offset at which the auction dispatched (bid requests left the
+    /// edge). `None` when no bid request went out, which covers both "no
+    /// auction was attempted" and "the auction was skipped or failed to
+    /// dispatch" — `auction_id` separates the two.
+    pub auction_dispatched_ms: Option<u32>,
+    /// T0 offset at which the auction resolved (final bid or timeout).
+    /// `None` when the milestone was never reached, including a dispatched
+    /// auction abandoned before collection.
+    pub auction_resolved_ms: Option<u32>,
+    /// T0 offset at which winning bids became available to the response
+    /// pipeline. `None` when the milestone was never reached.
+    pub auction_committed_ms: Option<u32>,
+    /// Telemetry auction UUID joining this row to the auction dataset.
+    /// `None` only when no auction was attempted at all; an attempted
+    /// auction carries the id whatever its outcome, matching the row it
+    /// emits to `auction_events_raw`.
+    pub auction_id: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_and_header_compatibility_fixture() {
+        let timings = RequestTimings::new();
+        let clone = timings.clone();
+        clone.record(Phase::AppBuild, Duration::ZERO);
+        clone.record(Phase::Filter, Duration::from_micros(9_100));
+        clone.record(Phase::Geo, Duration::MAX);
+        clone.record(Phase::Geo, Duration::from_secs(1));
+        clone.record(Phase::EcKv, Duration::from_millis(3));
+        clone.record(Phase::Origin, Duration::from_millis(4));
+        clone.record(Phase::TemplateCacheLookup, Duration::from_millis(5));
+        clone.record_auction_wait(AuctionWaitPlacement::PreHeader, Duration::from_millis(6));
+        clone.record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(7));
+        clone.record(Phase::Stream, Duration::from_millis(8));
+        clone.set_resp_bytes(42);
+        clone.set_resp_bytes(99);
+        let snapshot = timings.snapshot();
+        assert_eq!(snapshot.appbuild_ms, Some(0));
+        assert_eq!(snapshot.filter_ms, Some(9));
+        assert_eq!(snapshot.geo_ms, Some(u32::MAX));
+        assert_eq!(snapshot.auction_wait_ms, Some(13));
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream)
+        );
+        assert_eq!(snapshot.stream_ms, Some(8));
+        assert_eq!(snapshot.resp_bytes, Some(99));
+        assert_eq!(snapshot.request_elapsed_ms, None);
+        assert_eq!(RequestTimings::new().snapshot(), TimingSnapshot::default());
+        timings.mark_headers_ready();
+        let value = timings
+            .server_timing_value()
+            .expect("should render fixture");
+        let entries: Vec<_> = value.split(", ").collect();
+        assert_eq!(entries.len(), 7, "should omit row-only phases");
+        assert!(entries[0].starts_with("ts-total;dur="));
+        assert_eq!(entries[1], "ts-appbuild;dur=0.0");
+        assert_eq!(entries[2], "ts-filter;dur=9.1");
+        assert_eq!(entries[3], format_entry("ts-geo", Duration::MAX));
+        assert_eq!(
+            &entries[4..],
+            &[
+                "ts-kv;dur=3.0",
+                "ts-origin;dur=4.0",
+                "ts-template-cache;dur=5.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn contention_drops_compound_update_and_omits_reads() {
+        let timings = RequestTimings::new();
+        timings.record_auction_wait(AuctionWaitPlacement::PreHeader, Duration::from_millis(3));
+        timings.mark_headers_ready();
+        assert!(timings.server_timing_value().is_some());
+        let before = timings.snapshot();
+        // Deliberately hold the lock while probing unavailable operations in this
+        // test. Production callbacks only assign facts and never reenter.
+        timings
+            .0
+            .update_data(|_, _| {
+                timings
+                    .record_auction_wait(AuctionWaitPlacement::InStream, Duration::from_millis(7));
+                timings.mark_request_elapsed();
+                assert_eq!(timings.snapshot(), TimingSnapshot::default());
+                assert_eq!(timings.server_timing_value(), None);
+            })
+            .expect("should hold collector lock");
+        assert_eq!(
+            timings.snapshot(),
+            before,
+            "should drop entire compound update"
+        );
+    }
+
+    #[test]
+    fn request_completion_is_first_write_and_header_append_preserves_upstream() {
+        let timings = RequestTimings::new();
+        timings.mark_request_elapsed();
+        let first = timings.snapshot().request_elapsed_ms;
+        std::thread::sleep(Duration::from_millis(5));
+        timings.mark_request_elapsed();
+        assert_eq!(timings.snapshot().request_elapsed_ms, first);
+        let mut response = Response::builder()
+            .header("cache-control", "private")
+            .header("server-timing", "upstream;dur=1.0")
+            .body(())
+            .expect("should build private response");
+        append_server_timing_if_private(&mut response, &timings, false);
+        assert!(
+            timings.snapshot().time_elapsed_ms.is_some(),
+            "should mark even when disabled"
+        );
+        assert_eq!(
+            response.headers().get_all("server-timing").iter().count(),
+            1
+        );
+        append_server_timing_if_private(&mut response, &timings, true);
+        let values: Vec<_> = response.headers().get_all("server-timing").iter().collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "upstream;dur=1.0");
+        assert_eq!(response.headers()["cache-control"], "private");
+    }
+
+    #[test]
+    fn every_phase_index_is_unique_and_in_bounds() {
+        // `PHASE_COUNT` and `Phase::index()` are hand-synced; nothing at
+        // compile time ties them together. A new variant whose `index()`
+        // returns `PHASE_COUNT` would silently lose records or panic when
+        // starting a span, so this test fails first instead. (A variant missing from this list is a compile
+        // error via the exhaustive `match` in `index()` once added there.)
+        let phases = [
+            Phase::AppBuild,
+            Phase::Filter,
+            Phase::Geo,
+            Phase::EcKv,
+            Phase::Origin,
+            Phase::TemplateCacheLookup,
+            Phase::AuctionWait,
+            Phase::Stream,
+        ];
+        let mut seen = [false; PHASE_COUNT];
+        for phase in phases {
+            let index = phase.index();
+            assert!(
+                index < PHASE_COUNT,
+                "should be in bounds: {phase:?} -> {index}"
+            );
+            assert!(!seen[index], "should be unique: {phase:?} -> {index}");
+            seen[index] = true;
+        }
+        assert!(
+            seen.iter().all(|slot| *slot),
+            "should cover every phases-array slot"
+        );
+
+        // `HEADER_PHASES` is a second hand-synced list: a phase that gains
+        // a `header_name()` but is never added there silently renders
+        // nothing in the `Server-Timing` value.
+        let header_bearing: Vec<Phase> = phases
+            .into_iter()
+            .filter(|phase| phase.header_name().is_some())
+            .collect();
+        assert_eq!(
+            header_bearing,
+            HEADER_PHASES.to_vec(),
+            "should render every header-bearing phase, in declaration order"
+        );
+    }
+
+    #[test]
+    fn auction_marks_are_first_call_wins_and_snapshot_maps_them() {
+        let timings = RequestTimings::new();
+        timings.set_auction_id(uuid::uuid!("11111111-1111-1111-1111-111111111111"));
+        timings.mark_auction_dispatched();
+        timings.mark_auction_resolved();
+        timings.mark_auction_committed();
+        let first = timings.snapshot();
+
+        // Sleep so a restamp would land on a different millisecond: without
+        // it both stamps fall in the same millisecond and an equality
+        // assertion would hold even under last-call-wins.
+        std::thread::sleep(Duration::from_millis(5));
+        timings.set_auction_id(uuid::uuid!("22222222-2222-2222-2222-222222222222"));
+        timings.mark_auction_dispatched();
+        timings.mark_auction_resolved();
+        timings.mark_auction_committed();
+
+        let second = timings.snapshot();
+        assert_eq!(
+            second.auction_dispatched_ms, first.auction_dispatched_ms,
+            "should not restamp the dispatch offset"
+        );
+        assert_eq!(
+            second.auction_resolved_ms, first.auction_resolved_ms,
+            "should not restamp the resolve offset"
+        );
+        assert_eq!(
+            second.auction_committed_ms, first.auction_committed_ms,
+            "should not restamp the commit offset"
+        );
+        assert_eq!(
+            second.auction_id,
+            Some(uuid::uuid!("11111111-1111-1111-1111-111111111111")),
+            "should keep the first-recorded auction id"
+        );
+    }
+
+    #[test]
+    fn auction_id_survives_a_dropped_dispatch_mark() {
+        // The join key is stamped where the observation is built, so an
+        // auction that is skipped or fails to dispatch still carries the id
+        // that its `auction_events_raw` row was emitted under.
+        let timings = RequestTimings::new();
+        timings.set_auction_id(uuid::uuid!("44444444-4444-4444-4444-444444444444"));
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_id,
+            Some(uuid::uuid!("44444444-4444-4444-4444-444444444444")),
+            "should carry the join key without a dispatch mark"
+        );
+        assert_eq!(
+            snapshot.auction_dispatched_ms, None,
+            "should leave the dispatch offset null when nothing was sent"
+        );
+    }
+
+    #[test]
+    fn snapshot_without_auction_marks_yields_none_for_all_offsets() {
+        let timings = RequestTimings::new();
+        timings.mark_headers_ready();
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_dispatched_ms, None,
+            "should stay None when no auction dispatched"
+        );
+        assert_eq!(
+            snapshot.auction_resolved_ms, None,
+            "should stay None when no auction resolved"
+        );
+        assert_eq!(
+            snapshot.auction_committed_ms, None,
+            "should stay None when no auction committed"
+        );
+        assert_eq!(
+            snapshot.auction_id, None,
+            "should carry no auction id when no auction ran"
+        );
+    }
+
+    #[test]
+    fn render_omits_unrecorded_phases_and_orders_total_first() {
+        let timings = RequestTimings::new();
+        timings.record(Phase::Filter, Duration::from_micros(9_100));
+        timings.mark_headers_ready();
+        let value = timings
+            .server_timing_value()
+            .expect("should render after mark_headers_ready");
+        assert!(
+            value.starts_with("ts-total;dur="),
+            "should lead with ts-total: {value}"
+        );
+        assert!(
+            value.contains("ts-filter;dur=9.1"),
+            "should render one decimal: {value}"
+        );
+        assert!(
+            !value.contains("ts-geo"),
+            "should omit unrecorded phases: {value}"
+        );
+    }
+
+    #[test]
+    fn render_returns_none_before_headers_ready() {
+        let timings = RequestTimings::new();
+        timings.record(Phase::Geo, Duration::from_millis(1));
+        assert!(
+            timings.server_timing_value().is_none(),
+            "should require the snapshot"
+        );
+    }
+
+    #[test]
+    fn repeated_phases_accumulate_saturating() {
+        let timings = RequestTimings::new();
+        timings.record(Phase::Geo, Duration::from_millis(2));
+        timings.record(Phase::Geo, Duration::from_millis(3));
+        timings.mark_headers_ready();
+        let snapshot = timings.snapshot();
+        assert_eq!(snapshot.geo_ms, Some(5), "should accumulate repeats");
+    }
+
+    #[test]
+    fn mark_headers_ready_is_first_call_wins() {
+        let timings = RequestTimings::new();
+        timings.mark_headers_ready();
+        let first = timings.snapshot().time_elapsed_ms;
+        std::thread::sleep(Duration::from_millis(5));
+        timings.mark_headers_ready();
+        assert_eq!(
+            timings.snapshot().time_elapsed_ms,
+            first,
+            "should not restamp"
+        );
+    }
+
+    #[test]
+    fn span_guard_records_on_drop() {
+        let timings = RequestTimings::new();
+        {
+            let _span = timings.span(Phase::Origin);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().origin_ms.expect("should record on drop") >= 1,
+            "should measure elapsed span time"
+        );
+    }
+
+    #[test]
+    fn auction_wait_records_placement() {
+        let timings = RequestTimings::new();
+        timings.record_auction_wait(AuctionWaitPlacement::PreHeader, Duration::from_millis(40));
+        let snapshot = timings.snapshot();
+        assert_eq!(snapshot.auction_wait_ms, Some(40), "should record wait");
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::PreHeader),
+            "should record placement"
+        );
+    }
+
+    #[test]
+    fn rendered_names_never_include_vendor_terms() {
+        let timings = RequestTimings::new();
+        for phase in [
+            Phase::AppBuild,
+            Phase::Filter,
+            Phase::Geo,
+            Phase::EcKv,
+            Phase::Origin,
+            Phase::TemplateCacheLookup,
+        ] {
+            timings.record(phase, Duration::from_millis(1));
+        }
+        timings.mark_headers_ready();
+        let value = timings.server_timing_value().expect("should render");
+        assert!(
+            !value.to_ascii_lowercase().contains("datadome"),
+            "should mask vendors"
+        );
+    }
+
+    #[test]
+    fn append_server_timing_emits_on_private_response_when_enabled() {
+        let mut response = Response::builder()
+            .header("cache-control", "private, no-store")
+            .body(())
+            .expect("should build a private response fixture");
+        let timings = RequestTimings::new();
+
+        append_server_timing_if_private(&mut response, &timings, true);
+
+        let header = response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .expect("should emit a Server-Timing header");
+        assert!(
+            header.starts_with("ts-total;dur="),
+            "should lead with the stored total: {header}"
+        );
+    }
+
+    #[test]
+    fn append_server_timing_rejects_edge_cache_header_collisions() {
+        for cache_control in ["private", "no-store"] {
+            for edge_header in EDGE_CACHE_HEADER_NAMES {
+                let mut response = Response::builder()
+                    .header("cache-control", cache_control)
+                    .header(*edge_header, "max-age=60")
+                    .body(())
+                    .expect("should build a response with conflicting cache directives");
+                let timings = RequestTimings::new();
+
+                append_server_timing_if_private(&mut response, &timings, true);
+
+                assert!(
+                    response.headers().get("server-timing").is_none(),
+                    "should suppress Server-Timing with {edge_header} and Cache-Control: {cache_control}"
+                );
+                assert!(
+                    timings.snapshot().time_elapsed_ms.is_some(),
+                    "should still stamp headers-ready"
+                );
+            }
+        }
+
+        for (cache_control, enabled) in [(None, true), (Some("public, max-age=60"), true)] {
+            let mut builder = Response::builder();
+            if let Some(cache_control) = cache_control {
+                builder = builder.header("cache-control", cache_control);
+            }
+            let mut response = builder.body(()).expect("should build response");
+            append_server_timing_if_private(&mut response, &RequestTimings::new(), enabled);
+            assert!(
+                response.headers().get("server-timing").is_none(),
+                "should suppress Server-Timing without private/no-store Cache-Control"
+            );
+        }
+    }
+
+    #[test]
+    fn append_server_timing_marks_headers_ready_even_when_not_emitted() {
+        let mut response = Response::builder()
+            .header("cache-control", "max-age=60")
+            .body(())
+            .expect("should build a shared-cacheable response fixture");
+        let timings = RequestTimings::new();
+
+        append_server_timing_if_private(&mut response, &timings, true);
+
+        assert!(
+            response.headers().get("server-timing").is_none(),
+            "should not emit on a shared-cacheable response"
+        );
+        assert!(
+            timings.server_timing_value().is_some(),
+            "should still stamp mark_headers_ready so ts-total reflects the freeze point"
+        );
+    }
+}

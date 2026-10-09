@@ -183,6 +183,10 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 true,
             ),
             field(
+                vec![optional_object("tinybird"), object("access_token_secret")],
+                true,
+            ),
+            field(
                 vec![
                     optional_object("integrations"),
                     optional_object("datadome"),
@@ -421,13 +425,22 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         )?;
     }
 
-    if settings.tinybird.enabled {
+    if settings.tinybird.enabled && settings.tinybird.auction_enabled {
         let token = settings
             .tinybird
             .auction_token_secret
             .as_ref()
             .ok_or_else(|| missing_secret_key_reference("tinybird.auction_token_secret"))?;
         validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
+    }
+
+    if settings.tinybird.enabled && settings.tinybird.access_enabled {
+        let token = settings
+            .tinybird
+            .access_token_secret
+            .as_ref()
+            .ok_or_else(|| missing_secret_key_reference("tinybird.access_token_secret"))?;
+        validate_secret_key_reference("tinybird.access_token_secret", token.expose())?;
     }
 
     if let Some(datadome) = settings.integration_config::<DataDomeConfig>("datadome")? {
@@ -830,6 +843,7 @@ formats = [{ width = 300, height = 250 }]
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
+                ("tinybird.access_token_secret".to_owned(), true),
                 (
                     "integrations.datadome.server_side_key_secret_name".to_owned(),
                     true,

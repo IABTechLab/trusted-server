@@ -56,9 +56,9 @@ impl Middleware for SanitizeRequestMiddleware {
 /// (injected by the Cloudflare Workers runtime). On the native host target the
 /// header is absent, so `X-Geo-Info-Available: false` is emitted.
 ///
-/// Registered directly inside [`SanitizeRequestMiddleware`] and ahead of
-/// [`AuthMiddleware`] so that every outgoing response — including auth-rejected
-/// ones — carries a consistent set of headers.
+/// Registered inside [`RequestTimingMiddleware`](trusted_server_core::request_timing::RequestTimingMiddleware) and ahead of [`AuthMiddleware`]
+/// so that every outgoing response — including auth-rejected ones — carries a
+/// consistent set of headers.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -161,6 +161,8 @@ pub(crate) fn apply_finalize_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::router::RouterService;
+    use trusted_server_core::request_timing::{RequestTimingMiddleware, RequestTimings};
 
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -180,15 +182,19 @@ mod tests {
             .expect("should build empty test response")
     }
 
-    fn empty_ctx() -> RequestContext {
+    fn ctx_for_path(path: &str) -> RequestContext {
         let req = request_builder()
             .method(Method::GET)
-            .uri("/test")
+            .uri(path)
             .header("x-reader-ip", "198.51.100.7")
             .header("x-reader-ip-auth", "fictional-shared-secret-0123456789")
             .body(Body::empty())
             .expect("should build test request");
         RequestContext::new(req, PathParams::new(HashMap::new()))
+    }
+
+    fn empty_ctx() -> RequestContext {
+        ctx_for_path("/test")
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
@@ -287,6 +293,77 @@ mod tests {
             Some("custom-value"),
             "should apply operator-configured response headers"
         );
+    }
+
+    #[test]
+    fn request_timing_middleware_preserves_shared_handle_and_health_policy() {
+        for method in [Method::GET, Method::POST] {
+            for path in ["/test", "/health", "/health?probe=1", "/health/child"] {
+                for preinstalled in [false, true] {
+                    let route_path = path.split('?').next().expect("should have path");
+                    let expected = preinstalled || route_path != "/health";
+                    let timings = RequestTimings::new();
+                    timings.record(
+                        trusted_server_core::request_timing::Phase::Filter,
+                        std::time::Duration::from_millis(7),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let router = RouterService::builder()
+                        .middleware(
+                            RequestTimingMiddleware::default().with_excluded_paths(&["/health"]),
+                        )
+                        .middleware(
+                            RequestTimingMiddleware::default().with_excluded_paths(&["/health"]),
+                        )
+                        .route(route_path, method.clone(), move |ctx: RequestContext| async move {
+                            let installed = RequestTimings::from_extensions(ctx.request().extensions());
+                            assert_eq!(installed.is_some(), expected, "should preserve exact health policy");
+                            if let Some(installed) = installed {
+                                if preinstalled {
+                                    assert_eq!(installed.snapshot().filter_ms, Some(7), "should retain upstream facts");
+                                    installed.mark_auction_dispatched();
+                                    assert!(installed.snapshot().auction_dispatched_ms.expect("should mark dispatch") >= 2,
+                                        "should retain upstream origin");
+                                } else {
+                                    assert_eq!(installed.snapshot(), trusted_server_core::request_timing::TimingSnapshot::default(),
+                                        "should install independent empty facts");
+                                }
+                                installed.record_auction_wait(
+                                    trusted_server_core::request_timing::AuctionWaitPlacement::PreHeader,
+                                    std::time::Duration::from_millis(3));
+                            }
+                            Ok::<Response, EdgeError>(empty_response())
+                        })
+                        .build();
+                    let mut request = request_builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("should build request");
+                    if preinstalled {
+                        request.extensions_mut().insert(timings.handle().clone());
+                    }
+                    let response =
+                        block_on(router.oneshot(request)).expect("should dispatch request");
+                    assert!(
+                        response.headers().get("server-timing").is_none(),
+                        "attachment should not expose timing"
+                    );
+                    if preinstalled {
+                        assert_eq!(
+                            timings.snapshot().auction_wait_ms,
+                            Some(3),
+                            "should share handler updates"
+                        );
+                        assert_eq!(
+                            timings.snapshot().request_elapsed_ms,
+                            None,
+                            "should not fabricate completion"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
