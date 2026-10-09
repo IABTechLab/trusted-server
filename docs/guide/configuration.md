@@ -504,9 +504,11 @@ shared_secret = "trusted_forwarder_shared_secret"
 ```
 
 Both fields are required. `shared_secret` names a key in the logical
-`trusted_server_secrets` store; the stored value must contain at least 32 ASCII
-graphic bytes. The credential is redacted in diagnostics and compared in
-constant time. Configure the same actual value in the development proxy's
+`trusted_server_secrets` store. Generate a cryptographically random token, such
+as 32 random bytes encoded as hex; the stored value must contain at least 32
+ASCII graphic bytes. Length validation does not establish entropy. The
+credential is redacted in diagnostics; temporary fixed-size digests are compared
+in constant time and are never stored or exposed. Configure the same actual value in the development proxy's
 `--forwarder-secret-file`; use `auth_header = "x-ts-forwarder-auth"` with that CLI.
 
 The forwarder must replace client-supplied `X-Forwarded-Host` and
