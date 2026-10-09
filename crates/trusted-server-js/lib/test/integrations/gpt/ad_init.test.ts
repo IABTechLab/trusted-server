@@ -10,6 +10,10 @@ import {
   resolveFirstImpressionElement,
 } from '../../../src/core/first_impression';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
+import { installTraceRuntime } from '../../../src/trace/runtime';
+import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
+import { gptTransport, joinedGptStore } from '../../trace/gpt-fixtures';
+import { AUCTION_TOKEN, SLOT_TOKEN } from '../../trace/fixtures';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
   APS_RENDERING_MODE_ATTRIBUTE_NAME,
@@ -215,6 +219,7 @@ describe('installTsAdInit', () => {
   });
 
   afterEach(() => {
+    delete window.__tsjs_trace_active;
     document.getElementById('div-atf-sidebar')?.remove();
     document.getElementById('div-new-slot')?.remove();
     document.getElementById('div-atf-sidebar-2')?.remove();
@@ -223,6 +228,115 @@ describe('installTsAdInit', () => {
     document.getElementById("ad'prefix-real")?.remove();
     document.querySelectorAll('[data-responsive-slot-test]').forEach((element) => element.remove());
   });
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'binds the actual GPT cycle to the exact delivered slot in %s adInit',
+    async (implementation) => {
+      const { mockSlot } = configureOpportunityDiagnostics(undefined, vi.fn());
+      const ts = (window as TestWindow).tsjs as TsjsApi;
+      window.__tsjs_trace_active = true;
+      const collector = installTraceRuntime(ts)!;
+      ts.adSlots![0]!.ext = { trusted_server: { trace_slot_ref: SLOT_TOKEN } };
+      const store = new GptDiagnosticsStore({
+        onTraceCorrelation: (value) => collector.recordCorrelation(value),
+      });
+      ts.gptDiagnosticsRecorder = store;
+      ts.traceGpt!.observeTransport(ts.adSlots, gptTransport(), 'initial_navigation_ssat');
+      await installHandoff(implementation);
+      ts.adInit!();
+      expect(collector.snapshot().value?.slotCorrelations).toEqual([]);
+      store.recordSlotRequested(mockSlot);
+      expect(collector.snapshot().value?.slotCorrelations).toEqual([
+        {
+          schema_version: 1,
+          diagnostic_auction_id: AUCTION_TOKEN,
+          slot_ref: SLOT_TOKEN,
+          runtime_slot_number: 1,
+          request_number: 1,
+        },
+      ]);
+      expect(store.snapshot().slots[0]!.requests[0]).toMatchObject({
+        requestPath: 'trusted_server_direct',
+        trustedServerOpportunity: 'no_candidate',
+        trustedServerAuctionId: AUCTION_TOKEN,
+      });
+      expect(joinedGptStore(store, collector)?.auctions[0]?.slots[0]?.correlation).toBe('matched');
+      expect(JSON.stringify(store.snapshot())).not.toContain(SLOT_TOKEN);
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'retains the validated binding through the %s publisher first-impression fallback',
+    async (implementation) => {
+      vi.useFakeTimers();
+      try {
+        const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+          { hb_pb: '1.10', hb_adid: 'example-creative', adm: '<div>Example</div>' },
+          vi.fn()
+        );
+        const ts = (window as TestWindow).tsjs as TsjsApi;
+        window.__tsjs_trace_active = true;
+        const collector = installTraceRuntime(ts)!;
+        ts.adSlots![0]!.ext = { trusted_server: { trace_slot_ref: SLOT_TOKEN } };
+        const store = new GptDiagnosticsStore({
+          onTraceCorrelation: (value) => collector.recordCorrelation(value),
+        });
+        ts.gptDiagnosticsRecorder = store;
+        ts.traceGpt!.observeTransport(ts.adSlots, gptTransport(), 'initial_navigation_ssat');
+        registerPublisherFirstImpressionAuctions(ts, ['div-atf-sidebar']);
+        await installHandoff(implementation);
+        ts.adInit!();
+        expect(mockPubads.refresh).not.toHaveBeenCalled();
+        expect(collector.snapshot().value?.slotCorrelations).toEqual([]);
+        vi.advanceTimersByTime(5001);
+        expect(mockPubads.refresh).toHaveBeenCalledOnce();
+        store.recordSlotRequested(mockSlot);
+        expect(collector.snapshot().value?.slotCorrelations).toEqual([
+          {
+            schema_version: 1,
+            diagnostic_auction_id: AUCTION_TOKEN,
+            slot_ref: SLOT_TOKEN,
+            runtime_slot_number: 1,
+            request_number: 1,
+          },
+        ]);
+        expect(store.snapshot().slots[0]!.requests[0]).toMatchObject({
+          requestPath: 'trusted_server_direct',
+          trustedServerOpportunity: 'renderable_candidate',
+          trustedServerAuctionId: AUCTION_TOKEN,
+        });
+        expect(joinedGptStore(store, collector)?.auctions[0]?.slots[0]?.correlation).toBe(
+          'matched'
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'preserves a conflicting ordinary auction marker without a fabricated sidecar in %s',
+    async (implementation) => {
+      const marker = 'ts-auc-2234567812344abc8def123456789abc';
+      const { mockSlot } = configureOpportunityDiagnostics({ hb_auction_id: marker }, vi.fn());
+      const ts = (window as TestWindow).tsjs as TsjsApi;
+      window.__tsjs_trace_active = true;
+      const collector = installTraceRuntime(ts)!;
+      ts.adSlots![0]!.ext = { trusted_server: { trace_slot_ref: SLOT_TOKEN } };
+      const store = new GptDiagnosticsStore({
+        onTraceCorrelation: (value) => collector.recordCorrelation(value),
+      });
+      ts.gptDiagnosticsRecorder = store;
+      ts.traceGpt!.observeTransport(ts.adSlots, gptTransport(), 'initial_navigation_ssat');
+      await installHandoff(implementation);
+      ts.adInit!();
+      store.recordSlotRequested(mockSlot);
+      expect(store.snapshot().slots[0]!.requests[0]!.trustedServerAuctionId).toBe(marker);
+      expect(collector.snapshot().value?.slotCorrelations).toEqual([]);
+      expect(collector.snapshot().value?.issues).toEqual(['correlation_unavailable']);
+      expect(joinedGptStore(store, collector)?.auctions[0]?.slots[0]?.correlation).toBe('unknown');
+    }
+  );
 
   function configureOpportunityDiagnostics(
     bid: AuctionBidData | undefined,

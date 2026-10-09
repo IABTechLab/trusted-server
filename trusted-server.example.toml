@@ -138,6 +138,14 @@ pull_sync_concurrency = 3
 # auth_header = "x-ts-client-ip-auth"
 # shared_secret = "trusted_client_ip_shared_secret"
 
+# Opt-in browser-facing origin forwarding for a trusted development proxy.
+# Forwarded host/proto need a matching secret and stay publisher-domain bounded.
+# shared_secret is a key in trusted_server_secrets, not the credential itself.
+# Use the same actual secret in ts dev proxy --forwarder-secret-file.
+# [trusted_forwarder]
+# auth_header = "x-ts-forwarder-auth"
+# shared_secret = "trusted_forwarder_shared_secret"
+
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
 # [tester_cookie]
@@ -629,9 +637,11 @@ gam_attribution_enabled = false
 
 # GPT runtime diagnostics browser overlay. Optional and enabled manually (not
 # flipped by `ts audit`); serves a diagnostics module gated behind an activation
-# query param + session cookie.
+# query param + host-only cookie. Explicit activation lasts 30 minutes;
+# ordinary requests do not extend it. Mobile trace remains off by default.
 # [integrations.gpt_diagnostics]
 # enabled = true
+# trace_page_enabled = false
 
 # APS browser renderer ownership. Server-side APS behavior belongs under an
 # [auction.providers] entry with profile = "aps".

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
+import * as traceHandoff from '../../../src/trace/handoff';
 import {
   installGptDiagnosticsRuntime,
   isGptDiagnosticsActive,
@@ -81,12 +82,14 @@ beforeEach(() => {
   delete target.googletag;
   delete target.__tsjs_gpt_diagnostics_active;
   delete target.__tsjs_gpt_diagnostics_runtime;
+  delete target.__tsjs_trace_active;
 });
 
 afterEach(() => {
   target.__tsjs_gpt_diagnostics_runtime?.destroy();
   delete target.__tsjs_gpt_diagnostics_active;
   delete target.__tsjs_gpt_diagnostics_runtime;
+  delete target.__tsjs_trace_active;
   delete target.googletag;
   delete target.tsjs;
   vi.unstubAllGlobals();
@@ -95,6 +98,54 @@ afterEach(() => {
 });
 
 describe('GPT diagnostics integration composition', () => {
+  it.each([undefined, false, 'true', 1])(
+    'installs no trace handoff for nonliteral trace flag %s',
+    (active) => {
+      const create = vi.spyOn(traceHandoff, 'createTraceHandoff');
+      const shadow = vi.spyOn(Element.prototype, 'attachShadow');
+      target.__tsjs_gpt_diagnostics_active = true;
+      target.__tsjs_trace_active = active;
+      installGptStub();
+      installGptDiagnosticsRuntime(target);
+      const root = shadow.mock.results.at(-1)?.value as ShadowRoot | undefined;
+      expect(create).not.toHaveBeenCalled();
+      expect(root?.textContent).not.toContain('View trace results');
+      expect(target.tsjs?.gptDiagnostics).toBeDefined();
+    }
+  );
+  it('connects the gated trace controls after the public snapshot API and destroys recovery with the runtime', () => {
+    const view = vi.fn();
+    const download = vi.fn();
+    const destroy = vi.fn();
+    const create = vi.spyOn(traceHandoff, 'createTraceHandoff').mockImplementation((options) => {
+      expect(options.target.tsjs?.gptDiagnostics?.snapshot).toBeTypeOf('function');
+      return { view, download, destroy };
+    });
+    const shadow = vi.spyOn(Element.prototype, 'attachShadow');
+    target.__tsjs_gpt_diagnostics_active = true;
+    target.__tsjs_trace_active = true;
+    installGptStub();
+    installGptDiagnosticsRuntime(target);
+    const root = shadow.mock.results.at(-1)?.value as ShadowRoot;
+    const traceButton = Array.from(root.querySelectorAll('button')).find(
+      (item) => item.textContent === 'View trace results'
+    );
+    expect(traceButton).toBeDefined();
+    traceButton?.click();
+    expect(view).toHaveBeenCalledTimes(1);
+    const options = create.mock.calls[0][0];
+    options.onChange?.({ kind: 'storage_unavailable', downloadAvailable: true });
+    const recovery = Array.from(root.querySelectorAll('button')).find(
+      (item) => item.textContent === 'Download trace report'
+    );
+    expect(recovery).toBeDefined();
+    recovery?.click();
+    expect(download).toHaveBeenCalledTimes(1);
+    target.__tsjs_gpt_diagnostics_runtime?.destroy();
+    expect(destroy).toHaveBeenCalledTimes(1);
+    traceButton?.click();
+    expect(view).toHaveBeenCalledTimes(1);
+  });
   it('has no inactive side effects', () => {
     const originalMutationObserver = window.MutationObserver;
 

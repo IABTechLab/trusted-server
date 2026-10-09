@@ -24,6 +24,7 @@ let analyticsArtifact;
 let noAnalyticsArtifact;
 let managedUserIdArtifact;
 let shimCode;
+let coreCode;
 
 async function buildArtifact(modules) {
   await main(['--modules-json', JSON.stringify(modules), '--out', outputDirectory]);
@@ -78,6 +79,31 @@ beforeAll(async () => {
     logLevel: 'warn',
   });
   shimCode = fs.readFileSync(path.join(outputDirectory, 'tsjs-prebid.js'), 'utf8');
+  await build({
+    configFile: false,
+    root: libDir,
+    build: {
+      emptyOutDir: false,
+      outDir: outputDirectory,
+      assetsDir: '.',
+      sourcemap: false,
+      minify: 'esbuild',
+      rollupOptions: {
+        input: path.join(libDir, 'src', 'core', 'index.ts'),
+        output: {
+          format: 'iife',
+          dir: outputDirectory,
+          entryFileNames: 'tsjs-core.js',
+          inlineDynamicImports: true,
+          extend: false,
+          name: 'tsjs_core',
+        },
+      },
+    },
+    logLevel: 'warn',
+  });
+  coreCode = fs.readFileSync(path.join(outputDirectory, 'tsjs-core.js'), 'utf8');
+  console.log('[trace-prebid-artifact] shim characters:', shimCode.length);
 }, 240_000);
 
 afterAll(() => {
@@ -320,12 +346,11 @@ describe('tsjs-prebid production artifacts', () => {
     expect(shimCode).not.toContain(analyticsArtifact.manifest.prebidVersion);
     expect(shimCode).not.toContain('_pbjsGlobals');
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
-    // A value-import of Prebid or a private rendering helper would multiply
-    // the shim size. The bound sits just above the normal compact shim output,
-    // which is roughly 40 KB: tight enough that material growth has to be
-    // noticed and re-justified here, and far enough below a multiplication
-    // that one still fails loudly. The bundle beside it is 200 KB and up.
-    expect(shimCode.length).toBeLessThan(41_000);
+    // The original shim measures 40,354 characters. Shared strict trace JSON
+    // validation, request-ID hook association, and bounded pending lifecycle add
+    // 11,676 characters (52,030 total). Keep a narrow 52.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
+    // its runtime or private rendering helpers must still fail this regression.
+    expect(shimCode.length).toBeLessThan(52_500);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
@@ -561,4 +586,219 @@ describe('tsjs-prebid production artifacts', () => {
     expect(noAnalyticsArtifact.manifest.filename).toBe(`trusted-prebid-${sha256}.js`);
     expect(noAnalyticsArtifact.manifest.sri).toBe(sri);
   });
+});
+
+describe('active trace through real Prebid 10.26 registered adapters', () => {
+  function tracedPage(mode) {
+    const dom = createPage();
+    const pageWindow = dom.window;
+    const stubs = installNetworkAndConsoleStubs(pageWindow);
+    installServerState(pageWindow);
+    pageWindow.TextEncoder = TextEncoder;
+    pageWindow.__tsjs_trace_active = true;
+    pageWindow.eval(coreCode);
+    pageWindow.eval(noAnalyticsArtifact.bundleCode);
+    pageWindow.pbjs.setConfig({ bidderTimeout: 25 });
+    const register = pageWindow.pbjs.registerBidAdapter.bind(pageWindow.pbjs);
+    let spec;
+    pageWindow.pbjs.registerBidAdapter = (adapter, code, registered) => {
+      if (code === 'trustedServer') {
+        spec = registered;
+        if (typeof registered.onTimeout === 'function')
+          registered.onTimeout = vi.fn(registered.onTimeout);
+        if (typeof registered.onBidderError === 'function')
+          registered.onBidderError = vi.fn(registered.onBidderError);
+      }
+      return register(adapter, code, registered);
+    };
+    if (mode === 'timeout') stubs.fetchSpy.mockImplementation(() => new Promise(() => {}));
+    if (mode === 'error') stubs.fetchSpy.mockRejectedValue(new Error('private-network-error'));
+    pageWindow.eval(shimCode);
+    return { dom, pageWindow, stubs, spec };
+  }
+  function auction(pageWindow, timeout = 25, bidId) {
+    return new Promise((resolve) =>
+      pageWindow.pbjs.requestBids({
+        adUnits: [
+          {
+            code: 'example-trace-unit',
+            mediaTypes: { banner: { sizes: [[300, 250]] } },
+            bids: [{ bidder: 'trustedServer', params: {}, ...(bidId ? { bid_id: bidId } : {}) }],
+          },
+        ],
+        timeout,
+        bidsBackHandler: resolve,
+      })
+    );
+  }
+  it.each(['timeout', 'error'])(
+    'routes actual %s through registerBidAdapter/newBidder/adapterManager exactly once',
+    async (mode) => {
+      const { dom, pageWindow, stubs, spec } = tracedPage(mode);
+      try {
+        expect(spec.onTimeout).toEqual(expect.any(Function));
+        expect(spec.onBidderError).toEqual(expect.any(Function));
+        const bidderEvents = [];
+        pageWindow.pbjs.onEvent(mode === 'timeout' ? 'bidTimeout' : 'bidderError', (event) =>
+          bidderEvents.push(event)
+        );
+        const completed = auction(pageWindow);
+        await vi.waitFor(
+          () => expect(mode === 'timeout' ? spec.onTimeout : spec.onBidderError).toHaveBeenCalled(),
+          { timeout: 5000 }
+        );
+        await completed;
+        const captured = pageWindow.tsjs.traceEvidence.snapshot();
+        expect(pageWindow.tsjs.traceEvidence.captureStatus()).toBe('unavailable');
+        expect(captured.value.issues).toEqual(['evidence_transport_failed']);
+        expect(captured.value.slotCorrelations).toEqual([]);
+        expect(bidderEvents.length).toBeGreaterThan(0);
+        expect(JSON.stringify(captured)).not.toContain('private-network-error');
+        const callback = mode === 'timeout' ? spec.onTimeout : spec.onBidderError;
+        callback(...callback.mock.calls[0]);
+        expect(pageWindow.tsjs.traceEvidence.snapshot()).toEqual(captured);
+        expectNoUnexpectedNetworkActivity(stubs);
+      } finally {
+        dom.window.dispatchEvent(new dom.window.PageTransitionEvent('pagehide'));
+        dom.window.close();
+      }
+    },
+    10000
+  );
+  it('consumes readable optional evidence in the real registered interpretResponse before the ordinary no-bid callback', async () => {
+    const { dom, pageWindow, stubs } = tracedPage('response');
+    try {
+      stubs.fetchSpy.mockImplementation(async (_resource, init) => {
+        const payload = JSON.parse(init?.body ?? (await _resource.text()));
+        const ref = payload.adUnits[0].ext.trusted_server.trace_slot_ref;
+        return new Response(
+          JSON.stringify({
+            seatbid: [],
+            ext: {
+              trusted_server: {
+                trace_auction: {
+                  schema_version: 1,
+                  evidence: {
+                    schema_version: 1,
+                    diagnostic_auction_id: 'ts-auc-1234567812344abc8def123456789abc',
+                    source: 'auction_api',
+                    terminal_status: 'completed',
+                    provider_calls: [],
+                    slots: [
+                      {
+                        slot_number: 1,
+                        slot_ref: ref,
+                        requested_sizes: [[300, 250]],
+                        returned_bid_count: 0,
+                        candidate: 'no_candidate',
+                      },
+                    ],
+                    truncation: {
+                      omitted_provider_calls: 0,
+                      omitted_slots: 0,
+                      omitted_nested_values: 0,
+                    },
+                    coverage: { provider_to_slot_no_bid: 'unavailable' },
+                  },
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+      await auction(pageWindow, 1000);
+      expect(pageWindow.tsjs.traceEvidence.captureStatus()).toBe('complete');
+      const captured = pageWindow.tsjs.traceEvidence.snapshot().value;
+      expect(captured.serverAuctions).toHaveLength(1);
+      expect(captured.issues).toEqual(['correlation_unavailable']);
+      expect(captured.slotCorrelations).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
+    } finally {
+      dom.window.dispatchEvent(new dom.window.PageTransitionEvent('pagehide'));
+      dom.window.close();
+    }
+  }, 10000);
+  it.each(['timeout', 'error'])(
+    'preserves a newer reused bid ID through a repeated old actual %s hook',
+    async (mode) => {
+      const { dom, pageWindow, stubs, spec } = tracedPage(mode);
+      try {
+        const callback = mode === 'timeout' ? spec.onTimeout : spec.onBidderError;
+        const first = auction(pageWindow, 25, 'example-reused-bid');
+        await vi.waitFor(() => expect(callback).toHaveBeenCalled(), { timeout: 5000 });
+        await first;
+        const oldArguments = callback.mock.calls[0];
+        const oldBids = mode === 'timeout' ? oldArguments[0] : oldArguments[0].bidderRequest.bids;
+        expect(oldBids[0].bidId).toBe('example-reused-bid');
+        expect(oldBids[0].bidderRequestId).toEqual(expect.any(String));
+        let deliver;
+        let nextPayload;
+        stubs.fetchSpy.mockImplementation(async (resource, init) => {
+          nextPayload = JSON.parse(init?.body ?? (await resource.text()));
+          return await new Promise((resolve) => {
+            deliver = resolve;
+          });
+        });
+        const build = spec.buildRequests;
+        let nextBids;
+        spec.buildRequests = (...args) => {
+          nextBids = args[0];
+          return build(...args);
+        };
+        const next = auction(pageWindow, 2000, 'example-reused-bid');
+        await vi.waitFor(() => expect(deliver).toEqual(expect.any(Function)));
+        expect(nextBids[0].bidId).toBe(oldBids[0].bidId);
+        expect(nextBids[0].bidderRequestId).not.toBe(oldBids[0].bidderRequestId);
+        callback(...oldArguments);
+        deliver(
+          new Response(
+            JSON.stringify({
+              seatbid: [],
+              ext: {
+                trusted_server: {
+                  trace_auction: {
+                    schema_version: 1,
+                    evidence: {
+                      schema_version: 1,
+                      diagnostic_auction_id: 'ts-auc-1234567812344abc8def123456789abc',
+                      source: 'auction_api',
+                      terminal_status: 'completed',
+                      provider_calls: [],
+                      slots: [
+                        {
+                          slot_number: 1,
+                          slot_ref: nextPayload.adUnits[0].ext.trusted_server.trace_slot_ref,
+                          requested_sizes: [[300, 250]],
+                          returned_bid_count: 0,
+                          candidate: 'no_candidate',
+                        },
+                      ],
+                      truncation: {
+                        omitted_provider_calls: 0,
+                        omitted_slots: 0,
+                        omitted_nested_values: 0,
+                      },
+                      coverage: { provider_to_slot_no_bid: 'unavailable' },
+                    },
+                  },
+                },
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          )
+        );
+        await next;
+        const capture = pageWindow.tsjs.traceEvidence.snapshot().value;
+        expect(capture.serverAuctions).toHaveLength(1);
+        expect(capture.issues).toEqual(['evidence_transport_failed', 'correlation_unavailable']);
+        expect(capture.slotCorrelations).toEqual([]);
+        expectNoUnexpectedNetworkActivity(stubs);
+      } finally {
+        dom.window.dispatchEvent(new dom.window.PageTransitionEvent('pagehide'));
+        dom.window.close();
+      }
+    },
+    10000
+  );
 });

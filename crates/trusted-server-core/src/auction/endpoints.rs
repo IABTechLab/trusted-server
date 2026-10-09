@@ -23,17 +23,18 @@ use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+use crate::trace::{
+    TraceAuctionCarry, TraceAuctionSource, TraceAuctionTerminalReason, TraceAuctionTerminalStatus,
+    TraceCaptureGate, TraceClientSlotRefs,
+};
 
 use super::AuctionOrchestrator;
-use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
-    convert_tsjs_to_auction_request,
-};
+use super::formats::{convert_to_openrtb_response_with_trace, convert_tsjs_to_auction_request};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
-use super::types::AuctionContext;
+use super::types::{AuctionContext, AuctionRequest};
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
@@ -167,7 +168,16 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
-    let http_req = Request::from_parts(parts, EdgeBody::empty());
+    let mut http_req = Request::from_parts(parts, EdgeBody::empty());
+    if http_req
+        .extensions()
+        .get::<TraceCaptureGate>()
+        .is_some_and(TraceCaptureGate::base_active)
+    {
+        http_req
+            .extensions_mut()
+            .insert(TraceClientSlotRefs::from_raw(&body_bytes));
+    }
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
@@ -192,6 +202,13 @@ pub async fn handle_auction(
             ec_id.as_deref(),
             None,
         )?;
+        let trace = capture_api_trace(&mut http_req, &auction_request);
+        if let Some(trace) = &trace {
+            trace.finish(
+                TraceAuctionTerminalStatus::Skipped,
+                Some(TraceAuctionTerminalReason::PolicySkipped),
+            );
+        }
         let observation = AuctionObservationContext::from_auction_request(
             AuctionSource::AuctionApi,
             &auction_request,
@@ -216,12 +233,14 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return convert_to_openrtb_response_with_trace(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
-        );
+            trace.as_ref(),
+        )
+        .map(|conversion| retain_private_trace(conversion.response, trace));
     }
 
     // Server-side auction consent gate. The publisher-navigation and
@@ -246,6 +265,13 @@ pub async fn handle_auction(
             ec_id.as_deref(),
             None,
         )?;
+        let trace = capture_api_trace(&mut http_req, &auction_request);
+        if let Some(trace) = &trace {
+            trace.finish(
+                TraceAuctionTerminalStatus::Skipped,
+                Some(TraceAuctionTerminalReason::PolicySkipped),
+            );
+        }
         let observation = AuctionObservationContext::from_auction_request(
             AuctionSource::AuctionApi,
             &auction_request,
@@ -269,12 +295,14 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return convert_to_openrtb_response_with_trace(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
-        );
+            trace.as_ref(),
+        )
+        .map(|conversion| retain_private_trace(conversion.response, trace));
     }
 
     // Parse client-provided EIDs from the current request body. When the
@@ -346,6 +374,9 @@ pub async fn handle_auction(
         log::warn!("Auction EIDs stripped by TCF consent gating");
     }
 
+    let trace = capture_api_trace(&mut http_req, &auction_request);
+    let _trace_cancellation = trace.as_ref().map(TraceAuctionCarry::cancellation_guard);
+
     // Create auction context
     let context = AuctionContext {
         settings,
@@ -385,11 +416,12 @@ pub async fn handle_auction(
         }
     };
 
-    let conversion = match convert_to_openrtb_response_with_report(
+    let conversion = match convert_to_openrtb_response_with_trace(
         &result,
         settings,
         &auction_request,
         ec_context.ec_allowed(),
+        trace.as_ref(),
     ) {
         Ok(conversion) => conversion,
         Err(error) => {
@@ -430,7 +462,41 @@ pub async fn handle_auction(
         result.total_time_ms
     );
 
-    Ok(conversion.response)
+    Ok(retain_private_trace(conversion.response, trace))
+}
+
+fn capture_api_trace(
+    request: &mut Request<EdgeBody>,
+    auction: &AuctionRequest,
+) -> Option<TraceAuctionCarry> {
+    let active = request
+        .extensions()
+        .get::<TraceCaptureGate>()
+        .is_some_and(TraceCaptureGate::base_active);
+    let carry = TraceAuctionCarry::capture_if_enabled(
+        active,
+        TraceAuctionSource::AuctionApi,
+        &auction.slots,
+    )?;
+    if let Some(refs) = request
+        .extensions()
+        .get::<TraceClientSlotRefs>()
+        .and_then(TraceClientSlotRefs::accepted_refs)
+    {
+        carry.bind_client_refs(&refs);
+    }
+    request.extensions_mut().insert(carry.clone());
+    Some(carry)
+}
+
+fn retain_private_trace(
+    mut response: Response<EdgeBody>,
+    trace: Option<TraceAuctionCarry>,
+) -> Response<EdgeBody> {
+    if let Some(trace) = trace {
+        response.extensions_mut().insert(trace);
+    }
+    response
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -625,15 +691,18 @@ mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::error::IntoHttpResponse as _;
+    use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
-        noop_services,
+        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubBackend,
+        StubHttpClient, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use edgezero_core::router::PreDispatchHook as _;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1009,6 +1078,339 @@ mod tests {
             rows[0].terminal_reason.as_deref(),
             Some("auction_disabled"),
             "should identify the disabled auction policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_slot_conversion_api_keeps_refs_out_of_actual_bidder_and_mediator_payloads() {
+        const SLOT_REF: &str = "ts-slot-00000000-0000-4000-8000-000000000001";
+        let settings_toml = format!(
+            "{}\n[auction]\nenabled = true\n\n[auction.providers.bidder]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"all_eligible\"\n",
+            crate_test_settings_str()
+        );
+        let mut settings =
+            Settings::from_toml(&settings_toml).expect("should parse live provider settings");
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should enable trace");
+        let settings = Arc::new(settings);
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings)
+                .expect("should compile production provider plan"),
+        );
+        let mediator = AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: "https://mediator.example.com/auction".to_string(),
+            timeout_ms: 500,
+            ..Default::default()
+        });
+        let orchestrator = AuctionOrchestrator::from_plan(plan, Some(Arc::new(mediator)));
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(204, Vec::new());
+        http.push_response(204, Vec::new());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(StubBackend))
+            .http_client(Arc::clone(&http) as Arc<_>)
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let body = json!({"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SLOT_REF}}}]});
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .header(header::COOKIE, "__Host-ts-console=1")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should encode source token"),
+            ))
+            .expect("should build request");
+        TracePreDispatchHook::new(
+            Arc::clone(&settings),
+            Arc::new(|_| panic!("should not load API setup metadata")),
+        )
+        .handle(&mut request)
+        .await
+        .expect("should freeze trace gate");
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("should execute bidder and mediator");
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should collect API evidence");
+        let value: JsonValue = serde_json::from_slice(&bytes).expect("should decode response");
+        let evidence = &value["ext"]["trusted_server"]["trace_auction"]["evidence"];
+        let auction_token = evidence["diagnostic_auction_id"]
+            .as_str()
+            .expect("should deliver auction token");
+        assert_eq!(
+            evidence["slots"][0]["slot_ref"], SLOT_REF,
+            "should echo exact accepted ref"
+        );
+        assert_eq!(
+            evidence["terminal_status"], "completed",
+            "should preserve completed zero bids"
+        );
+        assert_eq!(
+            evidence["slots"][0]["candidate"], "no_candidate",
+            "should observe no delivered candidate"
+        );
+        let bodies = http.recorded_request_bodies();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "should actually serialize bidder and mediator requests"
+        );
+        for bytes in bodies {
+            let body = String::from_utf8(bytes).expect("should serialize UTF-8 outbound JSON");
+            for private in [
+                SLOT_REF,
+                auction_token,
+                "trace_slot_ref",
+                "trace_auction",
+                "diagnostic_auction_id",
+            ] {
+                assert!(
+                    !body.contains(private),
+                    "should keep trace association out of outbound JSON: {private}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_slot_conversion_api_echoes_only_unique_accepted_refs_when_frozen_active() {
+        const FIRST: &str = "ts-slot-00000000-0000-4000-8000-000000000001";
+        const SECOND: &str = "ts-slot-00000000-0000-4000-8000-000000000002";
+        for active in [false, true] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "gpt_diagnostics",
+                    &json!({"enabled":true,"trace_page_enabled":true}),
+                )
+                .expect("should enable trace feature");
+            let settings = Arc::new(settings);
+            let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: false,
+                ..Default::default()
+            });
+            let services = services_with_telemetry(Arc::new(RecordingTelemetrySink::default()));
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({"adUnits":[
+                {"code":"filtered","mediaTypes":{"video":{}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}},
+                {"code":"duplicate","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
+                {"code":"duplicate","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
+                {"code":"unique","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}}
+            ]});
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("https://publisher.example.com/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize request"),
+                ))
+                .expect("should build request");
+            if active {
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    "__Host-ts-console=1".parse().expect("should build cookie"),
+                );
+            }
+            TracePreDispatchHook::new(
+                Arc::clone(&settings),
+                Arc::new(|_| panic!("should not load API setup metadata")),
+            )
+            .handle(&mut request)
+            .await
+            .expect("should freeze cookie gate");
+            let response = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &mut ec_context,
+                &services,
+                request,
+            )
+            .await
+            .expect("should preserve accepted ordinary ads request");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should preserve no-bid status"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should not refresh console cookie"
+            );
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::response_privacy::TerminalPrivateResponse>()
+                    .is_some(),
+                active,
+                "should gate private evidence response"
+            );
+            let bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should collect response");
+            let value: JsonValue = serde_json::from_slice(&bytes).expect("should decode response");
+            let transport = &value["ext"]["trusted_server"]["trace_auction"];
+            if !active {
+                assert!(transport.is_null(), "should omit inactive transport");
+                continue;
+            }
+            let evidence = &transport["evidence"];
+            assert_eq!(
+                evidence["source"], "auction_api",
+                "should observe API source"
+            );
+            assert_eq!(
+                evidence["terminal_reason"], "policy_skipped",
+                "should retain skipped reason"
+            );
+            let slots = evidence["slots"]
+                .as_array()
+                .expect("should publish accepted slots");
+            assert_eq!(slots.len(), 3, "should exclude filtered occurrence");
+            assert_ne!(
+                slots[0]["slot_ref"], FIRST,
+                "should replace repeated accepted token"
+            );
+            assert_ne!(
+                slots[1]["slot_ref"], FIRST,
+                "should replace every repeated token occurrence"
+            );
+            assert_ne!(
+                slots[0]["slot_ref"], slots[1]["slot_ref"],
+                "should preserve distinct occurrence refs"
+            );
+            assert_eq!(
+                slots[2]["slot_ref"], SECOND,
+                "should ignore filtered token repetition"
+            );
+            for (index, slot) in slots.iter().enumerate() {
+                assert_eq!(
+                    slot["slot_number"],
+                    index + 1,
+                    "should number accepted occurrences"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_auction_api_frozen_disabled_capture_delivers_private_evidence() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should enable trace capture");
+        let settings = Arc::new(settings);
+
+        let config = AuctionConfig {
+            enabled: false,
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .header("cookie", "__Host-ts-console=1")
+            .uri("https://test-publisher.example/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
+            ))
+            .expect("should build disabled-auction request");
+
+        let hook = TracePreDispatchHook::new(
+            Arc::clone(&settings),
+            Arc::new(|_| panic!("should not load setup metadata on API capture")),
+        );
+        assert!(
+            hook.handle(&mut request)
+                .await
+                .expect("should freeze API cookies")
+                .is_none(),
+            "should retain ordinary API routing"
+        );
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("disabled auction should return a no-bid response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "disabled auction should return a 200 no-bid response"
+        );
+        let carry = response
+            .extensions()
+            .get::<crate::trace::TraceAuctionCarry>()
+            .expect("should retain private API terminal facts");
+        let facts = serde_json::to_value(
+            carry
+                .transport()
+                .expect("should finish the skipped API carry"),
+        )
+        .expect("should serialize public-safe facts");
+        assert_eq!(
+            facts["evidence"]["source"], "auction_api",
+            "should preserve the real API source"
+        );
+        assert_eq!(
+            facts["evidence"]["terminal_reason"], "policy_skipped",
+            "should observe the explicit disabled policy"
+        );
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should preserve the ordinary OpenRTB response");
+        let response: JsonValue =
+            serde_json::from_slice(&bytes).expect("should decode response evidence");
+        assert_eq!(
+            response["ext"]["trusted_server"]["trace_auction"], facts,
+            "should deliver the same checked terminal facts"
         );
     }
 

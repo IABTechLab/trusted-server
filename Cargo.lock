@@ -1498,7 +1498,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "toml",
 ]
@@ -1506,7 +1506,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1534,7 +1534,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1557,7 +1557,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1586,7 +1586,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1613,7 +1613,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "chrono",
  "clap",
@@ -1638,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1669,7 +1669,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=683202c66948146ec360f490126f1d60f920288b#683202c66948146ec360f490126f1d60f920288b"
+source = "git+https://github.com/stackpop/edgezero?rev=965d482fe1066279ea409a2e629aa13c49de98d0#965d482fe1066279ea409a2e629aa13c49de98d0"
 dependencies = [
  "log",
  "proc-macro2",
@@ -6686,12 +6686,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "derive_more",
  "edgezero-adapter-axum",
  "edgezero-core",
  "env_logger",
  "error-stack",
+ "futures",
  "http",
  "http-body-util",
  "libc",
@@ -6699,6 +6701,8 @@ dependencies = [
  "reqwest 0.12.28",
  "scraper",
  "serde_json",
+ "temp-env",
+ "tempfile",
  "testcontainers",
  "tokio",
  "toml",
@@ -6707,6 +6711,8 @@ dependencies = [
  "trusted-server-adapter-cloudflare",
  "trusted-server-adapter-spin",
  "trusted-server-core",
+ "trusted-server-js",
+ "url",
  "urlencoding",
 ]
 
@@ -6716,6 +6722,7 @@ version = "0.1.0"
 dependencies = [
  "build-print",
  "hex",
+ "serde_json",
  "sha2 0.10.9",
  "which",
 ]

@@ -9,6 +9,7 @@ describe('core/index', () => {
     await vi.resetModules();
     document.body.innerHTML = '';
     delete window.tsjs;
+    delete window.__tsjs_trace_active;
   });
 
   afterEach(() => {
@@ -28,6 +29,28 @@ describe('core/index', () => {
     expect(typeof api.getConfig).toBe('function');
     expect(typeof api.requestAds).toBe('function');
   });
+  it('installs the literal gated shared trace facade before queued publisher callbacks', async () => {
+    window.__tsjs_trace_active = true;
+    let observed: unknown;
+    window.tsjs = {
+      que: [
+        () => {
+          observed = window.tsjs?.traceEvidence;
+        },
+      ],
+    } as TsjsApi;
+    await import('../../src/core/index');
+    expect(observed).toBeDefined();
+    expect(observed).toBe(window.tsjs?.traceEvidence);
+  });
+  it.each([undefined, false, 'true', 1])(
+    'keeps the trace facade absent for nonliteral gate %s',
+    async (active) => {
+      window.__tsjs_trace_active = active;
+      await import('../../src/core/index');
+      expect(window.tsjs?.traceEvidence).toBeUndefined();
+    }
+  );
 
   it('defaults adSlots and bids so gated-off pages never see undefined', async () => {
     await import('../../src/core/index');
