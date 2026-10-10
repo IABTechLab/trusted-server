@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM, requestInterceptor } from 'jsdom';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { moduleBuildOptions } from '../build-module-options.mjs';
 import { main, verifyPrebidPackageVersion } from '../build-prebid-external.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,29 +55,13 @@ beforeAll(async () => {
   });
 
   const { build } = await import('vite');
-  await build({
-    configFile: false,
-    root: libDir,
-    build: {
-      emptyOutDir: false,
+  await build(
+    moduleBuildOptions({
+      name: 'prebid',
+      entryPath: path.join(libDir, 'src', 'integrations', 'prebid', 'index.ts'),
       outDir: outputDirectory,
-      assetsDir: '.',
-      sourcemap: false,
-      minify: 'esbuild',
-      rollupOptions: {
-        input: path.join(libDir, 'src', 'integrations', 'prebid', 'index.ts'),
-        output: {
-          format: 'iife',
-          dir: outputDirectory,
-          entryFileNames: 'tsjs-prebid.js',
-          inlineDynamicImports: true,
-          extend: false,
-          name: 'tsjs_prebid',
-        },
-      },
-    },
-    logLevel: 'warn',
-  });
+    })
+  );
   shimCode = fs.readFileSync(path.join(outputDirectory, 'tsjs-prebid.js'), 'utf8');
 }, 240_000);
 
@@ -258,7 +243,15 @@ async function runAuction(pageWindow, fetchSpy) {
       {
         code: 'ad-slot-1',
         mediaTypes: { banner: { sizes: [[300, 250]] } },
-        bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 1 } },
+          { bidder: 'trustedServer', params: { storedRequest: undefined } },
+        ],
+      },
+      {
+        code: 'ad-slot-2',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [],
       },
     ],
     timeout: 1000,
@@ -284,6 +277,9 @@ async function runAuction(pageWindow, fetchSpy) {
   expect(adUnit.code).toBe('ad-slot-1');
   const trustedServerBid = adUnit.bids.find((bid) => bid.bidder === 'trustedServer');
   expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: { placementId: 1 } });
+  expect(trustedServerBid.params).not.toHaveProperty('storedRequest');
+  const generated = payload.adUnits.find((unit) => unit.code === 'ad-slot-2');
+  expect(generated.bids[0].params).toEqual({ bidderParams: {}, storedRequest: false });
 }
 
 function expectManifest(manifest, analytics) {

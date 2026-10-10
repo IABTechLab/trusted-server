@@ -278,7 +278,10 @@ Trusted Server keeps static app-config credentials under logical store ID
 as `ts_secrets`. Request-signing private keys remain in their separate,
 runtime-managed store.
 
-Set the physical mapping before provisioning:
+Create or select the service before provisioning a non-default mapping. Set its
+ID in `fastly.toml` or `FASTLY_SERVICE_ID`; if both are set, they must agree.
+Provisioning rejects non-default mappings without a service ID. Set the physical
+mapping before provisioning, alongside any config-store or KV-store overrides:
 
 ```bash
 export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
@@ -299,6 +302,12 @@ custom streaming entry point reads the service-scoped mapping before loading
 app config, so every startup and reload resolves static credentials from
 `ts_secrets` while the portable manifest continues to declare
 `trusted_server_secrets`.
+
+The same runtime mapping mechanism applies to app-config stores. See
+[Fastly runtime config stores](/guide/configuration#fastly-runtime-config-store)
+for the initial provisioning and linking sequence, subsequent CLI pushes, and
+precautions when changing a live mapping. A process-environment override alone
+does not configure the Fastly runtime.
 
 Create the separate request-signing store when that feature is enabled:
 
@@ -354,7 +363,9 @@ Verify stores are linked to your active service version:
 fastly resource-link list --service-id <service-id> --version <active-version>
 ```
 
-If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
+If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version.
+
+Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records. Withdrawals processed after the upgrade do not actively delete retained legacy records; they remain until their original TTL expires or an operator deletes them. If a rollback uses an older release that reads the legacy store, account for those stale records and keep the rollback window short.
 
 ## Verify the complete local handoff
 

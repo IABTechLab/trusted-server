@@ -489,9 +489,6 @@ function monitorAnchorMutations(): void {
 
 // Wire up capture-phase click handlers + mutation observers to protect clicks.
 export function installClickGuard(): void {
-  if (log.getLevel && log.getLevel() === 'warn') {
-    log.setLevel('info');
-  }
   enableDebugFromEnv();
   log.info('tsjs-creative:click: installing click guard');
 

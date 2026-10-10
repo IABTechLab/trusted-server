@@ -19,6 +19,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
+import { moduleBuildOptions } from './build-module-options.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const srcDir = path.resolve(__dirname, 'src');
 const distDir = path.resolve(__dirname, '..', 'dist');
@@ -39,7 +41,7 @@ const integrationModules = fs.existsSync(integrationsDir)
         );
       })
       .sort()
-      : [];
+  : [];
 
 console.log('[build-all] Discovered integrations:', integrationModules);
 
@@ -48,30 +50,7 @@ async function buildModule(name, entryPath) {
   const outFile = `tsjs-${name}.js`;
   console.log(`[build-all] Building ${outFile} from ${path.relative(__dirname, entryPath)}`);
 
-  await build({
-    configFile: false,
-    root: __dirname,
-    build: {
-      emptyOutDir: false,
-      outDir: distDir,
-      assetsDir: '.',
-      sourcemap: false,
-      minify: 'esbuild',
-      rollupOptions: {
-        input: entryPath,
-        output: {
-          format: 'iife',
-          dir: distDir,
-          entryFileNames: outFile,
-          inlineDynamicImports: true,
-          extend: false,
-          // Use a unique IIFE name per module to avoid conflicts
-          name: name === 'core' ? 'tsjs' : `tsjs_${name}`,
-        },
-      },
-    },
-    logLevel: 'warn',
-  });
+  await build(moduleBuildOptions({ name, entryPath, outDir: distDir }));
 
   console.log(`[build-all] Built ${outFile}`);
 }
