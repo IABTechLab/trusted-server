@@ -536,6 +536,7 @@ mod tests {
         crate::app::build_finalize_services(
             &test_settings(),
             Arc::new(trusted_server_core::platform::UnavailableKvStore),
+            Arc::new(trusted_server_core::platform::NoLoadingCache),
         )
     }
 

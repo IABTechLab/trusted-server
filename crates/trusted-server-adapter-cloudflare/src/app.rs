@@ -102,6 +102,9 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
+    /// The loading cache the builders this state was built with offer, or one
+    /// that holds nothing when none does, handed to every request's services.
+    loading_cache: Arc<dyn trusted_server_core::platform::PlatformLoadingCache>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -308,6 +311,7 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let loading_cache = trusted_server_core::integrations::loading_cache_from(integrations)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -316,6 +320,7 @@ fn build_state_with_registrations_and_services(
         ec_module,
         permission_signal_modules,
         services,
+        loading_cache,
     }))
 }
 
@@ -360,6 +365,7 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| {
                 build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
+                    .with_loading_cache(Arc::clone(&self.loading_cache))
             })
             .with_resolved_ec_module(self.ec_module.clone());
         if let Some(module) = self.registry.geo_module() {
