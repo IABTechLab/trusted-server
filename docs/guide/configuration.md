@@ -1098,8 +1098,9 @@ runs where a `[[fetch]]` entry for that media type on the file's path names
 it. It passes the origin's file through and writes the lines after its last
 one, on a line of their own, so a seller the deployment introduces is
 declared beside the publisher's own. A publisher whose origin has no file
-gets the origin's answer, because the module adds to the publisher's file
-and never invents one.
+gets one made of the lines alone, because an origin's `404 Not Found` on a
+path a `[[fetch]]` entry names middleware for runs that middleware on an
+empty document of the entry's media type.
 
 **Refused when the settings load**: a line that is not a data record or a
 variable, naming which part is wrong, a comment, an empty list, and a
@@ -1801,6 +1802,14 @@ names them. Head markup and the element and text handlers are decisions
 about HTML, and a middleware that makes one there is refused by name. The
 fetch entry's middleware run once on what is stored, and the serve entry's
 on each reader's copy, as on a page.
+
+**A file the origin does not have.** When the origin answers `404 Not
+Found` for a path a `[[fetch]]` entry with a `path` names middleware for,
+that middleware runs on an empty document of the entry's media type and its
+output is the file, so `ads.txt` is made from the sellers lines alone where
+the publisher has none. With no such entry, or on any other answer from the
+origin, the origin's answer stands, and an entry without a path makes
+nothing, because a page the origin does not have is the origin's answer.
 
 ```toml
 [[fetch]]
