@@ -5,8 +5,9 @@
 //! this module's middleware passes the file through and writes the lines
 //! `[ads-txt.sellers] lines` gives at its end, so a seller the deployment
 //! introduces is declared beside the publisher's own. A publisher whose
-//! origin has no file gets the origin's answer, because the module adds to
-//! the publisher's file and never invents one.
+//! origin has no file gets one made of the lines alone, because core runs
+//! the middleware on an empty document where the origin answers `404` for
+//! the path.
 //!
 //! Each line is checked as the settings load against the file's grammar,
 //! because every buyer's crawler reads the file and a typo there costs the

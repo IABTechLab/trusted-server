@@ -1498,3 +1498,36 @@ fn deploy_validation_refuses_a_misshapen_entry() {
         "should name the entry: {error}"
     );
 }
+
+#[test]
+fn the_creating_entry_is_the_first_with_a_path_covering_the_request_that_names_a_middleware() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: Vec::new(),
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+        PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec!["example.page".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .creating("/ads.txt")
+            .map(|entry| entry.middleware.as_slice()),
+        Some(&["example.sellers".to_owned()][..]),
+        "should pass the entry naming no middleware and take the first that names one"
+    );
+    assert!(
+        entries.creating("/robots.txt").is_none(),
+        "should make nothing where no entry with a path covers the request, whatever covers every path"
+    );
+}

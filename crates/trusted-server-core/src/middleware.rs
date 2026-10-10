@@ -442,6 +442,21 @@ impl PhaseEntries {
         names
     }
 
+    /// The entry that makes the document the origin does not have at
+    /// `path`, being the first with a path prefix covering it that names a
+    /// middleware. An entry covering every path makes none, because a page
+    /// the origin does not have is the origin's answer.
+    #[must_use]
+    pub fn creating(&self, path: &str) -> Option<&PhaseEntry> {
+        self.0.iter().find(|entry| {
+            entry
+                .path
+                .as_deref()
+                .is_some_and(|prefix| path.starts_with(prefix))
+                && !entry.middleware.is_empty()
+        })
+    }
+
     /// Checks each entry's media type, path and names, and that no entry is
     /// hidden behind an earlier one, or covers the same pages as one.
     ///
