@@ -775,6 +775,75 @@ Edit TOML, validate, and push again for those changes.
 Custom headers may be overwritten by application logic. Standard headers (`Content-Type`, `Content-Length`) are controlled by the application.
 :::
 
+### Origin URLs in proxied response headers
+
+Trusted Server rewrites publisher-origin URLs in page bodies to the serving
+host. It applies the same mapping to URL-bearing headers on every proxied
+publisher response, so the browser stays on the serving host. No configuration
+is required.
+
+| Header                                                               | Behavior                                                                                                                                     |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Location`, `Content-Location`                                       | An absolute or protocol-relative URL on the origin is mapped to the serving host. Relative URLs, other hosts, and other ports are unchanged. |
+| `Refresh`                                                            | The URL after the delay (`0; url=...`) is mapped the same way.                                                                               |
+| `Link`                                                               | Each `<...>` target and quoted `imagesrcset` candidate on the origin is mapped; `rel`, `as`, and other parameters are kept.                  |
+| `Content-Security-Policy`, <br>`Content-Security-Policy-Report-Only` | Every source naming the origin gains a serving-host source beside it. Origin sources are kept; `report-uri` and `report-to` are unchanged.   |
+
+For example, with the origin `origin.example.com` served at `www.example.com`:
+
+```http
+Location: https://origin.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com data:
+```
+
+is delivered as:
+
+```http
+Location: https://www.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
+```
+
+Two exceptions prevent a redirect loop. Rewriting either target would send the
+browser back to the same URL, and the origin would redirect again:
+
+- When the origin redirects to the URL being requested but under a different
+  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  HTTPS), the `Location` or `Refresh` target is left unchanged.
+- When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
+  requested and sets no cookie, the target is left unchanged. The origin is
+  redirecting because of something Trusted Server sends unchanged on every
+  retry, such as the `Host` from `publisher.origin_host_header_override`.
+
+Other same-scheme redirects to the current URL, such as after a form POST or
+one that sets a cookie, are rewritten as usual, as is a `Refresh` reload.
+
+`Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
+`Domain` attribute that does not cover the serving host (for example,
+`Domain=origin.example.com` served at `www.example.com`), the browser rejects
+it. A redirect to the current URL that relies on that cookie then repeats until
+the browser reports too many redirects. Have the origin set host-only cookies,
+or a `Domain` shared by both hosts.
+
+Each response keeps its own per-page values. A `[response_headers]` entry for
+the same header still replaces the rewritten value.
+
+Only response headers are covered. A `<meta http-equiv="refresh">` or
+`<meta http-equiv="Content-Security-Policy">` tag in the page body keeps its
+origin URLs, so the browser can still navigate to the origin or block rewritten
+resources. Deliver these as headers on proxied pages.
+
+::: warning CSP and injected scripts
+Host rewriting only adds serving-host sources. It does not authorize inline
+content Trusted Server inserts without a nonce, or the `/static/tsjs=` bundle
+when the policy allows neither `'self'` nor the serving host. Check
+`script-src` (or `default-src`) on pages with a restrictive policy.
+
+A serving-host source without a path also allows Trusted Server's own routes
+on that host, including `/first-party/proxy`, which serves any target that
+`/first-party/sign` signs. A policy that limited scripts to the origin now
+allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
+:::
+
 ## Request Signing
 
 Configuration for Ed25519 request signing and JWKS management.

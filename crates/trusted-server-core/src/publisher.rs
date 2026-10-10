@@ -76,6 +76,7 @@ use crate::platform::{
     reader_url_surrogate_key,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
+use crate::response_header_rewrite::{OriginHeaderRewrite, rewrite_origin_urls_in_headers};
 use crate::response_privacy::{
     apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
     enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
@@ -4527,6 +4528,7 @@ pub async fn handle_publisher_request(
         .path_and_query()
         .map(http::uri::PathAndQuery::as_str)
         .unwrap_or("/");
+    let request_path_and_query = origin_path_and_query.to_string();
     let target_uri = format!("{origin_scheme}://{origin_host}{origin_path_and_query}")
         .parse::<Uri>()
         .change_context(TrustedServerError::Proxy {
@@ -4537,6 +4539,7 @@ pub async fn handle_publisher_request(
 
     let request_path = req.uri().path().to_string();
     let is_get = req.method() == http::Method::GET;
+    let is_get_or_head = is_get || req.method() == http::Method::HEAD;
 
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
@@ -4774,8 +4777,7 @@ pub async fn handle_publisher_request(
     // assembly has no template key, but readthrough still needs both purge scopes.
     let readthrough_reader_url =
         if origin_readthrough_enabled && origin_response_is_shareable && request_is_document {
-            let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
-            format!("{request_scheme}://{request_host}{path}")
+            format!("{request_scheme}://{request_host}{request_path_and_query}")
         } else {
             String::new()
         };
@@ -4784,14 +4786,10 @@ pub async fn handle_publisher_request(
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
-            // Read here, before `rewrite_origin_request` below replaces the URI with the
+            // Captured before `rewrite_origin_request` below replaces the URI with the
             // origin target. Path *and* query: a different query is a different page, and
             // a purge caller types the whole address.
-            request_path: req
-                .uri()
-                .path_and_query()
-                .map(|path_and_query| path_and_query.as_str().to_owned())
-                .unwrap_or_else(|| "/".to_owned()),
+            request_path: request_path_and_query.clone(),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,
             vary_values: settings
@@ -5220,6 +5218,22 @@ pub async fn handle_publisher_request(
         enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
+
+    // Map origin URLs in navigation, preload, and CSP headers to the serving host,
+    // matching the body rewrite, on every route. Runs before the template-cache gate
+    // so a stored template replays the rewritten policy headers; the cache key is
+    // already scoped to the request host.
+    rewrite_origin_urls_in_headers(
+        response.headers_mut(),
+        &OriginHeaderRewrite {
+            origin_host: &origin_host,
+            request_host,
+            request_scheme,
+            origin_scheme: &origin_scheme,
+            request_path_and_query: &request_path_and_query,
+            request_is_get_or_head: is_get_or_head,
+        },
+    );
 
     let template_cache_policy = TemplateCachePolicy::from_settings(settings);
     let gate_content_type = response
@@ -14742,6 +14756,62 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_cache_hit_replays_policy_headers_rewritten_to_the_serving_host() {
+            // The header rewrite runs before the template-cache gate captures policy
+            // metadata, so a hit replays the serving-host CSP and Link rather than the
+            // origin-only values that would block or bypass the rewritten page.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    (
+                        "content-security-policy",
+                        "img-src https://origin.test-publisher.com",
+                    ),
+                    (
+                        "link",
+                        "<https://origin.test-publisher.com/app.css>; rel=preload; as=style",
+                    ),
+                ],
+            );
+
+            let cold = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should serve the second navigation from the template cache"
+            );
+            let value = |response: &Response<EdgeBody>, name: header::HeaderName| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .expect("should carry the policy header")
+            };
+            for name in [header::CONTENT_SECURITY_POLICY, header::LINK] {
+                let replayed = value(&warm, name.clone());
+                assert!(
+                    replayed.contains("://ts.example.com"),
+                    "should replay `{name}` rewritten to the serving host: {replayed}"
+                );
+                assert_eq!(
+                    replayed,
+                    value(&cold, name.clone()),
+                    "should replay the same `{name}` the miss delivered"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn a_cache_hit_preserves_every_repeated_policy_header_in_order() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -16167,6 +16237,200 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("max-age=31536000"),
             "matched publisher asset should receive Fastly edge policy"
+        );
+    }
+
+    fn proxy_response_headers(response: &PublisherResponse) -> &header::HeaderMap {
+        match response {
+            PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::Buffered(response) => response.headers(),
+        }
+    }
+
+    fn publisher_page_request() -> Request<EdgeBody> {
+        HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/redirect")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-ssl", "1")
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[tokio::test]
+    async fn transformed_page_headers_map_origin_urls_to_serving_host() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            302,
+            b"<html><body><a href=\"https://origin.test-publisher.com/landing.html\">go</a></body></html>"
+                .to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8"),
+                (
+                    header::LOCATION.as_str(),
+                    "https://origin.test-publisher.com/landing.html",
+                ),
+                (
+                    header::REFRESH.as_str(),
+                    "0; url=https://origin.test-publisher.com/refreshed.html",
+                ),
+                (
+                    header::LINK.as_str(),
+                    "<https://origin.test-publisher.com/preload.css>; rel=preload; as=style",
+                ),
+                (
+                    header::CONTENT_SECURITY_POLICY.as_str(),
+                    "default-src https://origin.test-publisher.com 'unsafe-inline'",
+                ),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+
+        assert!(
+            matches!(response, PublisherResponse::Stream { .. }),
+            "should stream the redirect HTML body through the rewriter"
+        );
+        let headers = proxy_response_headers(&response);
+        let value = |name: header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            value(header::LOCATION).as_deref(),
+            Some("https://publisher.example/landing.html"),
+            "should keep the redirect on the serving host"
+        );
+        assert_eq!(
+            value(header::REFRESH).as_deref(),
+            Some("0; url=https://publisher.example/refreshed.html"),
+            "should keep the refresh navigation on the serving host"
+        );
+        assert_eq!(
+            value(header::LINK).as_deref(),
+            Some("<https://publisher.example/preload.css>; rel=preload; as=style"),
+            "should preload through the serving host"
+        );
+        assert_eq!(
+            value(header::CONTENT_SECURITY_POLICY).as_deref(),
+            Some(
+                "default-src https://origin.test-publisher.com https://publisher.example 'unsafe-inline'"
+            ),
+            "should permit the serving host alongside the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn bodiless_redirect_location_maps_origin_url_to_serving_host() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            301,
+            Vec::new(),
+            vec![(
+                header::LOCATION.as_str(),
+                "http://origin.test-publisher.com/moved?x=1",
+            )],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+
+        assert!(
+            matches!(response, PublisherResponse::Buffered(_)),
+            "should return the bodiless redirect unmodified"
+        );
+        assert_eq!(
+            proxy_response_headers(&response)
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://publisher.example/moved?x=1"),
+            "should rewrite the redirect target even without a transformed body"
+        );
+    }
+
+    async fn redirect_location_for_current_url(
+        origin_url: &str,
+        method: Method,
+        location: &str,
+    ) -> String {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_url = origin_url.to_string();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            303,
+            Vec::new(),
+            vec![(header::LOCATION.as_str(), location)],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut request = publisher_page_request();
+        *request.method_mut() = method;
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+
+        proxy_response_headers(&response)
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("should keep a Location header")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn scheme_upgrade_redirect_to_current_url_is_not_rewritten_into_a_loop() {
+        let location = redirect_location_for_current_url(
+            "http://origin.test-publisher.com",
+            Method::GET,
+            "https://origin.test-publisher.com/redirect",
+        )
+        .await;
+
+        assert_eq!(
+            location, "https://origin.test-publisher.com/redirect",
+            "should not redirect the browser back to the URL it requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_scheme_redirect_to_current_url_stays_on_serving_host() {
+        let location = redirect_location_for_current_url(
+            "https://origin.test-publisher.com",
+            Method::POST,
+            "https://origin.test-publisher.com/redirect",
+        )
+        .await;
+
+        assert_eq!(
+            location, "https://publisher.example/redirect",
+            "should rewrite a POST-redirect-GET to the same URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
+        // A canonical-host redirect triggered by `origin_host_header_override`
+        // answers the retry through Trusted Server the same way, so it must leave.
+        let location = redirect_location_for_current_url(
+            "https://origin.test-publisher.com",
+            Method::GET,
+            "https://origin.test-publisher.com/redirect",
+        )
+        .await;
+
+        assert_eq!(
+            location, "https://origin.test-publisher.com/redirect",
+            "should not redirect a cookieless GET back to the URL it requested"
         );
     }
 
