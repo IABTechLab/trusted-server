@@ -1,0 +1,38 @@
+[package]
+name = "trusted-server-loading-cache-51degrees"
+description = "The loading cache core declares, written with 51Degrees' fiftyone-caching over each host's own stores."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+edgezero-core = { workspace = true }
+log = { workspace = true }
+web-time = { workspace = true }
+# The tokio feature adds the pool of threads that runs a load apart from its
+# caller on a native host, and the cloudflare feature adds the spawner that
+# keeps a load running with a Worker request's wait_until. Each pulls in its
+# platform's crate only on the target that platform runs.
+fiftyone-caching = { workspace = true, features = ["tokio", "cloudflare"] }
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this vendor crate, the way Prebid.js requires a named
+# maintainer of every adapter.
+[package.metadata.maintainers]
+owner = "51Degrees"
+status = "vendor owned"

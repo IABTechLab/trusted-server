@@ -47,6 +47,9 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
         trusted_server_ad_server_mock::builder(),
+        // The loading cache a stock build caches with, offered whatever the
+        // settings say, which no section selects either.
+        trusted_server_loading_cache_51degrees::builder(),
     ]
 }
 
@@ -433,8 +436,22 @@ mod tests {
                 "auction.prebid-server",
                 "auction.aps",
                 "ad-server.mock",
+                "loading-cache.51degrees",
             ],
             "should offer the stock modules in the order their hooks run"
+        );
+    }
+
+    /// The adapters take the loading cache from this list, so a stock build
+    /// keeps what it loads rather than asking each source every time.
+    #[test]
+    fn the_stock_list_offers_one_loading_cache() {
+        let cache = trusted_server_core::integrations::loading_cache_from(&builders())
+            .expect("the stock list should offer one loading cache");
+
+        assert!(
+            cache.keeps_values(),
+            "the stock loading cache should keep what it loads"
         );
     }
 
