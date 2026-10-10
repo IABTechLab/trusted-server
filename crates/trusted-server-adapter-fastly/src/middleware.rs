@@ -22,11 +22,12 @@ use std::net::IpAddr;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
-    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+    HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
 };
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::{ClientInfo, PlatformGeo};
 use trusted_server_core::settings::Settings;
+use trusted_server_core::version_header::apply_git_version_header;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 
@@ -49,7 +50,9 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 ///
 /// Headers are written in this order (last write wins):
 /// 1. Geo headers (or `X-Geo-Info-Available: false` when geo is unavailable)
-/// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
+/// 2. `X-TS-Version` from the compiled-in git version
+///    (`TRUSTED_SERVER__GIT_VERSION`), and `X-TS-Fastly-Version` from the
+///    `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Operator-configured `settings.response_headers` (can override any managed header)
 pub struct FinalizeResponseMiddleware {
@@ -187,7 +190,9 @@ where
 ///
 /// Header write order (last write wins):
 /// 1. Geo headers (`x-geo-*`) — or `X-Geo-Info-Available: false` when absent
-/// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
+/// 2. `X-TS-Version` from the compiled-in git version
+///    (`TRUSTED_SERVER__GIT_VERSION`), and `X-TS-Fastly-Version` from the
+///    `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Set-Cookie cache privacy — strip surrogate cache headers and downgrade
 ///    `Cache-Control` to `private, max-age=0` on cookie-bearing responses
@@ -208,11 +213,24 @@ pub(crate) fn apply_finalize_headers(
         );
     }
 
-    if let Ok(v) = std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        if let Ok(value) = HeaderValue::from_str(&v) {
-            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
-        } else {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+    apply_git_version_header(response);
+
+    // Remove an inherited origin value when the version is unknown so it is
+    // never reported as ours.
+    match std::env::var(ENV_FASTLY_SERVICE_VERSION) {
+        Ok(v) => match HeaderValue::from_str(&v) {
+            Ok(value) => {
+                response
+                    .headers_mut()
+                    .insert(HEADER_X_TS_FASTLY_VERSION, value);
+            }
+            Err(_) => {
+                log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+                response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
+            }
+        },
+        Err(_) => {
+            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
         }
     }
 
@@ -811,6 +829,30 @@ mod tests {
             response.status(),
             StatusCode::OK,
             "should reach the handler when auth is not required"
+        );
+    }
+
+    #[test]
+    fn version_headers_split_git_and_fastly_versions() {
+        let settings = settings_with_response_headers(vec![]);
+        let mut response = empty_response();
+        response.headers_mut().insert(
+            HEADER_X_TS_FASTLY_VERSION,
+            HeaderValue::from_static("origin-value"),
+        );
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(
+            header("x-ts-version"),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should report the compiled-in git version as x-ts-version"
+        );
+        assert_eq!(
+            header("x-ts-fastly-version"),
+            std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
+            "should report FASTLY_SERVICE_VERSION as x-ts-fastly-version"
         );
     }
 }
