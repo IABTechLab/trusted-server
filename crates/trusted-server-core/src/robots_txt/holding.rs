@@ -14,7 +14,8 @@
 //! and in the key-value store otherwise, because a host that starts an instance
 //! for each request may give its requests a value cache and no key-value store.
 //! A value cache may drop it sooner, so on such a host a copy past its age is
-//! likely to be there rather than certain.
+//! likely to be there rather than certain, and a key-value store that cannot
+//! give an entry a lifetime keeps it until it is replaced.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -26,8 +27,8 @@ use super::{Contribution, RobotsTxtContributor};
 use crate::error::TrustedServerError;
 use crate::module_context::{ModuleContext, ResolvedRequest};
 use crate::platform::{
-    CacheLifetimes, CacheSpec, LoadError, LoadedValue, Loader, RuntimeServices, ServerKeyPrefix,
-    StoreKey,
+    CacheLifetimes, CacheSpec, KvError, LoadError, LoadedValue, Loader, RuntimeServices,
+    ServerKeyPrefix, StoreKey,
 };
 use crate::settings::Settings;
 
@@ -113,6 +114,7 @@ pub(crate) async fn contribution_for(
 /// What a load owns to ask one contributor, because it may outlive the
 /// request that started it.
 struct Ask {
+    /// The name the contributor was declared under.
     id: &'static str,
     contributor: Arc<dyn RobotsTxtContributor>,
     request: ResolvedRequest,
@@ -188,11 +190,17 @@ async fn keep_answer(services: &RuntimeServices, kept: &StoreKey, bytes: &[u8]) 
         cache.put(&key, bytes, KEPT_LIFETIME).await;
         return;
     }
-    if let Err(error) = services
-        .kv_store()
-        .put_bytes_with_ttl(&key, bytes, KEPT_LIFETIME)
+    let store = services.kv_store();
+    let written = match store
+        .put_bytes_with_ttl(&key, bytes.clone(), KEPT_LIFETIME)
         .await
     {
+        // A store that cannot give an entry a lifetime keeps it until it is
+        // replaced, so the answer is still there when the contributor fails.
+        Err(KvError::Unsupported { .. }) => store.put_bytes(&key, bytes).await,
+        written => written,
+    };
+    if let Err(error) = written {
         log::debug!("The robots.txt answer was not kept for a later failure: {error}");
     }
 }
@@ -351,6 +359,11 @@ pub(crate) mod tests {
     #[derive(Debug, Default)]
     pub(crate) struct MemoryKvStore {
         pub(crate) entries: Mutex<std::collections::HashMap<String, bytes::Bytes>>,
+        /// The lifetime each entry was last written with.
+        pub(crate) lifetimes: Mutex<std::collections::HashMap<String, Duration>>,
+        /// Whether a write with a lifetime is refused, as it is by a store
+        /// that has none to give.
+        pub(crate) refuses_lifetimes: bool,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -383,8 +396,17 @@ pub(crate) mod tests {
             &self,
             key: &str,
             value: bytes::Bytes,
-            _ttl: Duration,
+            ttl: Duration,
         ) -> Result<(), crate::platform::KvError> {
+            if self.refuses_lifetimes {
+                return Err(KvError::Unsupported {
+                    operation: "put_bytes_with_ttl".to_owned(),
+                });
+            }
+            self.lifetimes
+                .lock()
+                .expect("should lock the test store")
+                .insert(key.to_owned(), ttl);
             self.put_bytes(key, value).await
         }
 
@@ -606,6 +628,58 @@ pub(crate) mod tests {
         assert!(
             keys[0].starts_with("ts.publisher.example/robots-txt-kept/"),
             "{keys:?}"
+        );
+        let lifetimes = store.lifetimes.lock().expect("should lock the test store");
+        assert_eq!(
+            lifetimes.values().copied().collect::<Vec<_>>(),
+            vec![KEPT_LIFETIME],
+            "the answer should be kept far longer than any refresh"
+        );
+    }
+
+    /// A store with no lifetime to give still keeps the answer, so it is
+    /// there to serve when the contributor fails.
+    #[tokio::test]
+    async fn a_store_without_lifetimes_still_keeps_the_answer() {
+        let mut scripted = Scripted::new(vec![
+            Ok(rules("User-Agent: OneBot\nDisallow: /")),
+            Err("cannot answer".to_owned()),
+        ]);
+        scripted.refresh = Duration::ZERO;
+        let scripted = Arc::new(scripted);
+        let store = Arc::new(MemoryKvStore {
+            refuses_lifetimes: true,
+            ..MemoryKvStore::default()
+        });
+        let services = services_with(Arc::default(), Arc::clone(&store));
+
+        contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings(),
+        )
+        .await
+        .expect("should ask the contributor");
+        let later = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings(),
+        )
+        .await
+        .expect("should serve the kept answer");
+
+        assert_eq!(later, rules("User-Agent: OneBot\nDisallow: /"));
+        assert!(
+            store
+                .lifetimes
+                .lock()
+                .expect("should lock the test store")
+                .is_empty(),
+            "the entry was written without a lifetime"
         );
     }
 

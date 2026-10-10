@@ -24,6 +24,9 @@ const CALLERS: usize = 16;
 struct MemoryKv {
     entries: Mutex<HashMap<String, Bytes>>,
     reads: AtomicUsize,
+    /// Whether a write with a lifetime is refused, as it is by a store that
+    /// has none to give.
+    refuses_lifetimes: bool,
 }
 
 impl MemoryKv {
@@ -87,6 +90,11 @@ impl KvStore for MemoryKv {
         value: Bytes,
         _ttl: Duration,
     ) -> Result<(), KvError> {
+        if self.refuses_lifetimes {
+            return Err(KvError::Unsupported {
+                operation: "put_bytes_with_ttl".to_owned(),
+            });
+        }
         self.put_bytes(key, value).await
     }
 }
@@ -415,6 +423,30 @@ async fn the_store_answers_another_process_without_a_load() {
         vec!["ts.example.com/test/k".to_owned()],
         "the entry should be under the publisher's prefix and the cache's name"
     );
+}
+
+/// A store with no lifetime to give still holds the entry, whose own drop
+/// time ends its use.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_that_refuses_lifetimes_still_holds_the_entry() {
+    let kv = Arc::new(MemoryKv {
+        refuses_lifetimes: true,
+        ..MemoryKv::default()
+    });
+    let services = services(Arc::clone(&kv));
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    LoadingCaches::in_caller()
+        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "value"))
+        .await
+        .expect("the first process should load");
+    let second = LoadingCaches::in_caller()
+        .get_or_load(&services, &spec(false), &key("k"), never())
+        .await
+        .expect("the second process should read the store");
+
+    assert_eq!(second, "value");
+    assert_eq!(kv.keys(), vec!["ts.example.com/test/k".to_owned()]);
 }
 
 #[tokio::test(flavor = "current_thread")]

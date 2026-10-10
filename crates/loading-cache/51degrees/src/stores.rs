@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use edgezero_core::key_value_store::KvStore as PlatformKvStore;
+use edgezero_core::key_value_store::{KvError, KvStore as PlatformKvStore};
 use fiftyone_caching::{
     ByteLookup, ByteStore, Clock, Codec, EncodedStore, Loaded, LoadingCache, Store, ValueLoader,
 };
@@ -217,11 +217,14 @@ impl ByteStore for KvBytes<'_> {
 
     async fn put(&self, key: &str, bytes: Vec<u8>, keep_for: Option<Duration>) {
         let ttl = keep_for.unwrap_or(LONGEST).max(KV_SHORTEST);
-        if let Err(error) = self
-            .0
-            .put_bytes_with_ttl(key, Bytes::from(bytes), ttl)
-            .await
-        {
+        let bytes = Bytes::from(bytes);
+        let written = match self.0.put_bytes_with_ttl(key, bytes.clone(), ttl).await {
+            // A store that cannot give an entry a lifetime keeps it until it
+            // is replaced, and the entry's own drop time ends its use.
+            Err(KvError::Unsupported { .. }) => self.0.put_bytes(key, bytes).await,
+            written => written,
+        };
+        if let Err(error) = written {
             log::debug!(
                 "A loading cache entry was not written, so the next request loads it: {error}"
             );
