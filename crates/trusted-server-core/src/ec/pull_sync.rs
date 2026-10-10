@@ -521,6 +521,7 @@ mod tests {
     use crate::ec::kv_types::KvEntry;
     use crate::platform::PlatformResponse;
     use crate::redacted::Redacted;
+    use crate::test_support::tests::purpose_one_only_consent;
 
     fn make_response(status: u16, body: &[u8]) -> PlatformResponse {
         PlatformResponse::new(
@@ -606,33 +607,7 @@ mod tests {
         // Purpose 1 granted keeps the EC, but Purpose 4 denied withholds EID
         // writes and leaves partner slots empty. Pull sync must not read those
         // empty slots as eligible and disclose the EC ID to partners.
-        let consent = ConsentContext {
-            jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
-            gdpr_applies: true,
-            tcf: Some(crate::consent::types::TcfConsent {
-                version: 2,
-                cmp_id: 1,
-                cmp_version: 1,
-                consent_screen: 0,
-                consent_language: "EN".to_owned(),
-                vendor_list_version: 1,
-                tcf_policy_version: 4,
-                created_ds: 0,
-                last_updated_ds: 0,
-                // Purpose 1 (index 0) granted; Purpose 4 (index 3) denied.
-                purpose_consents: {
-                    let mut purposes = vec![false; 24];
-                    purposes[0] = true;
-                    purposes
-                },
-                purpose_legitimate_interests: vec![false; 24],
-                vendor_consents: Vec::new(),
-                vendor_legitimate_interests: Vec::new(),
-                special_feature_opt_ins: vec![false; 12],
-            }),
-            source: crate::consent::types::ConsentSource::Cookie,
-            ..ConsentContext::default()
-        };
+        let consent = purpose_one_only_consent();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
         let graph = KvIdentityGraph::in_memory("pull_store");

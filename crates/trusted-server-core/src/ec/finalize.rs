@@ -530,11 +530,11 @@ mod tests {
 
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
-    use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
+    use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
 
     fn empty_response() -> Response<EdgeBody> {
         Response::builder()
@@ -1090,38 +1090,6 @@ mod tests {
             get_header(&response, "set-cookie").is_some(),
             "should emit replacement cookie after persistence"
         );
-    }
-
-    /// GDPR consent granting TCF Purpose 1 (storage/EC) but denying Purpose 4
-    /// (personalized ads), so EC is allowed while EID persistence is not.
-    fn purpose_one_only_consent() -> ConsentContext {
-        ConsentContext {
-            jurisdiction: Jurisdiction::Gdpr,
-            gdpr_applies: true,
-            tcf: Some(TcfConsent {
-                version: 2,
-                cmp_id: 1,
-                cmp_version: 1,
-                consent_screen: 0,
-                consent_language: "EN".to_owned(),
-                vendor_list_version: 1,
-                tcf_policy_version: 4,
-                created_ds: 0,
-                last_updated_ds: 0,
-                // Purpose 1 (index 0) granted; Purpose 4 (index 3) denied.
-                purpose_consents: {
-                    let mut purposes = vec![false; 24];
-                    purposes[0] = true;
-                    purposes
-                },
-                purpose_legitimate_interests: vec![false; 24],
-                vendor_consents: Vec::new(),
-                vendor_legitimate_interests: Vec::new(),
-                special_feature_opt_ins: vec![false; 12],
-            }),
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        }
     }
 
     #[test]

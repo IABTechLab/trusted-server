@@ -225,7 +225,7 @@ sequenceDiagram
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
-    TS->>KV: Upsert matched partner UIDs from request eids[]<br/>+ ts-eids/sharedId cookies (TCF Purpose 1 + 4 under GDPR)
+    TS->>KV: Add missing partner UIDs from request eids[]<br/>+ ts-eids/sharedId cookies (TCF Purpose 1 + 4 under GDPR)
 ```
 
 The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
