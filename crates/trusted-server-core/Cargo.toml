@@ -58,6 +58,9 @@ web-time = { workspace = true }
 # need these — this block is intentionally scoped to `target_os = "unknown"` only.
 getrandom = { workspace = true, features = ["js"] }
 uuid = { workspace = true, features = ["js"] }
+# `chrono::Utc::now()` calls `std::time::SystemTime::now()`, which panics on
+# `wasm32-unknown-unknown`, unless `wasmbind` makes it read the JS clock.
+chrono = { workspace = true, features = ["wasmbind"] }
 
 [features]
 default = []

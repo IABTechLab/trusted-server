@@ -73,6 +73,9 @@ jobs:
       - name: Run cargo clippy (Cloudflare — wasm32-unknown-unknown)
         run: cargo clippy-cloudflare-wasm
 
+      - name: Check wasm-safe clock usage in the Cloudflare build (wasm32-unknown-unknown)
+        run: scripts/lint-wasm-clock.sh
+
       - name: Run cargo clippy (Spin — native)
         run: cargo clippy-spin-native
 

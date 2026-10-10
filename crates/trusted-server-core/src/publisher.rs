@@ -22,7 +22,7 @@ use std::borrow::Cow;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
@@ -35,6 +35,7 @@ use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use sha2::Digest as _;
+use web_time::Instant;
 
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
@@ -6470,7 +6471,9 @@ fn origin_shared_ttl(
     headers: &edgezero_core::http::HeaderMap,
     max_age: Duration,
 ) -> Result<Duration, TemplateCacheBypassReason> {
-    origin_shared_ttl_at(headers, SystemTime::now(), max_age)
+    // `httpdate` parses `Date`/`Expires` into `std::time::SystemTime`, so take
+    // the wasm-safe std value rather than calling `SystemTime::now()`.
+    origin_shared_ttl_at(headers, crate::ec::std_system_time_now(), max_age)
 }
 
 fn origin_shared_ttl_at(
