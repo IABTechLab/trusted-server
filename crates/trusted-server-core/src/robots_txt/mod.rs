@@ -338,55 +338,45 @@ async fn answer(
     let mut selected: Vec<Selected> = Vec::new();
     for id in &config.modules {
         if id == ALLOW_ALL {
-            selected.push(None);
+            selected.push((ALLOW_ALL, None));
             continue;
         }
-        let Some(contributor) = registry.robots_txt_contributor(id) else {
+        let Some((declared, contributor)) = registry.robots_txt_contributor(id) else {
             // The registry refuses a selection nothing supplies when it is
             // built, so this is a wiring fault, and it still fails closed.
             return Ok(respond(Err(Report::new(configuration(format!(
                 "[robots-txt] modules names `{id}`, which no module in this deployment supplies"
             ))))));
         };
-        selected.push(Some(contributor));
+        selected.push((declared, Some(contributor)));
     }
     // The answers are held and served to every crawler, so the contributors
     // are handed the request with nothing one crawler put in the address.
     let request = ResolvedRequest::of(req, services.client_info()).without_query();
     Ok(respond(
-        file_for(
-            config,
-            &selected,
-            &request,
-            services,
-            &settings.publisher.domain,
-            crate::ec::current_timestamp(),
-        )
-        .await,
+        file_for(config, &selected, &request, services, settings).await,
     ))
 }
 
-/// One entry of `modules` as the handler resolved it. `None` is `allow_all`,
-/// and anything else is a contributor with the name it was declared under.
-type Selected = Option<(&'static str, Arc<dyn RobotsTxtContributor>)>;
+/// One entry of `modules` as the handler resolved it: the name a contributor
+/// was declared under and the contributor, or `allow_all` and none.
+type Selected = (&'static str, Option<Arc<dyn RobotsTxtContributor>>);
 
 /// The file for `config`, from the contributions of `selected` in order,
-/// each asked for `request` and held for `publisher`.
+/// each asked for `request`.
 async fn file_for(
     config: &RobotsTxtConfig,
     selected: &[Selected],
     request: &ResolvedRequest,
     services: &RuntimeServices,
-    publisher: &str,
-    now: u64,
+    settings: &Settings,
 ) -> Result<String, Report<TrustedServerError>> {
     let mut contributions = Vec::with_capacity(selected.len());
-    for entry in selected {
-        contributions.push(match entry {
+    for (id, contributor) in selected {
+        contributions.push(match contributor {
             None => document::allow_all(),
-            Some((id, contributor)) => {
-                let holder = holding::Holder { publisher, id };
-                holding::contribution_for(&holder, contributor, request, services, now).await?
+            Some(contributor) => {
+                holding::contribution_for(id, contributor, request, services, settings).await?
             }
         });
     }
@@ -430,20 +420,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::holding::tests::{
-        ECHOED, Echoing, MemoryKvStore, NOW, PUBLISHER, Scripted, request, robots_request, rules,
-        services_with,
+        ECHOED, Echoing, MemoryKvStore, Scripted, request, robots_request, rules, services_with,
+        settings,
     };
     use super::*;
     use crate::integrations::{IntegrationBuilder, IntegrationRegistration};
 
     fn parsed(document: serde_json::Value) -> RobotsTxtConfig {
         serde_json::from_value(document).expect("should read the robots.txt settings")
-    }
-
-    fn settings() -> Settings {
-        let mut settings = crate::test_support::tests::create_test_settings();
-        settings.publisher.domain = PUBLISHER.to_owned();
-        settings
     }
 
     #[test]
@@ -616,11 +600,10 @@ mod tests {
 
         let file = file_for(
             &config,
-            &[Some(("first", first)), None],
+            &[("first", Some(first)), (ALLOW_ALL, None)],
             &request(),
-            &services_with(Arc::default()),
-            PUBLISHER,
-            NOW,
+            &services_with(Arc::default(), Arc::default()),
+            &settings(),
         )
         .await
         .expect("should assemble the file");
@@ -643,11 +626,10 @@ mod tests {
         let response = respond(
             file_for(
                 &config,
-                &[Some(("failing", failing)), None],
+                &[("failing", Some(failing)), (ALLOW_ALL, None)],
                 &request(),
-                &services_with(Arc::default()),
-                PUBLISHER,
-                NOW,
+                &services_with(Arc::default(), Arc::default()),
+                &settings(),
             )
             .await,
         );
@@ -678,7 +660,7 @@ mod tests {
 
         let response = handle_robots_txt(
             &settings,
-            &services_with(Arc::clone(&store)),
+            &services_with(Arc::default(), Arc::clone(&store)),
             &registry,
             robots_request(),
         )
@@ -722,7 +704,7 @@ mod tests {
 
         let response = handle_robots_txt(
             &settings,
-            &services_with(Arc::default()),
+            &services_with(Arc::default(), Arc::default()),
             &registry,
             request,
         )
@@ -787,7 +769,7 @@ mod tests {
 
         let response = handle_robots_txt(
             &settings,
-            &services_with(Arc::default()),
+            &services_with(Arc::default(), Arc::default()),
             &registry,
             robots_request(),
         )
