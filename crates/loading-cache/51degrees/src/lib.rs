@@ -21,8 +21,9 @@
 //!
 //! A load may run apart from its caller where the host can run work on its
 //! own and the cache allows it, on a pool of threads on a native host and as a
-//! task kept running with the request's `wait_until` on Cloudflare. Fastly and
-//! Spin run each load in the caller.
+//! task of its own on Cloudflare, kept running with the request's
+//! `wait_until` where the request's handling is wrapped in [`scope_request`].
+//! Fastly and Spin run each load in the caller.
 //!
 //! An adapter takes the cache through
 //! [`trusted_server_core::integrations::loading_cache_from`] from the builder
@@ -156,9 +157,10 @@ impl Default for LoadingCaches {
 
 impl LoadingCaches {
     /// The caches for this host: a load a cache allows to run apart from its
-    /// caller does so on a pool of threads on a native host and with the
-    /// request's `wait_until` on Cloudflare, and every load runs in its caller
-    /// on Fastly and Spin.
+    /// caller does so on a pool of threads on a native host and as a task of
+    /// its own on Cloudflare, kept running with the request's `wait_until`
+    /// inside [`scope_request`], and every load runs in its caller on Fastly
+    /// and Spin.
     #[must_use]
     pub fn new() -> Self {
         Self::with_runner(default_runner())
