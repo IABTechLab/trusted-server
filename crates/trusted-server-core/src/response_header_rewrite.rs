@@ -57,6 +57,12 @@ pub(crate) struct OriginHeaderRewrite<'a> {
     /// Trusted Server would refetch the origin over the same scheme, and the
     /// origin would redirect again.
     pub request_path_and_query: &'a str,
+    /// Whether the request being answered is a `GET` or `HEAD`.
+    ///
+    /// A same-scheme `Location` to the current URL is left unchanged for these
+    /// methods when the response sets no cookie. The retry through Trusted
+    /// Server would repeat the same request, so the origin would redirect again.
+    pub request_is_get_or_head: bool,
 }
 
 impl OriginHeaderRewrite<'_> {
@@ -89,9 +95,11 @@ impl OriginHeaderRewrite<'_> {
     /// Rewrite a navigation target (`Location`, `Refresh`), unless rewriting
     /// it would loop.
     ///
-    /// Only a scheme change can loop. A same-scheme target equal to the current
-    /// request (POST-redirect-GET, a cookie-setting redirect, a periodic
-    /// reload) depends on state and is rewritten like any other target.
+    /// A target equal to the current request under a different scheme always
+    /// loops, because Trusted Server refetches the origin over the same scheme.
+    /// A same-scheme target equal to the current request (POST-redirect-GET, a
+    /// cookie-setting redirect, a periodic reload) depends on state and is
+    /// rewritten here; [`Self::rewrite_location`] adds the stateless case.
     ///
     /// `Set-Cookie` `Domain` attributes are not rewritten. A cookie-setting
     /// redirect to the current URL whose cookie names a `Domain` the serving
@@ -110,6 +118,27 @@ impl OriginHeaderRewrite<'_> {
         Some(rewritten)
     }
 
+    /// Rewrite a `Location` target, unless rewriting it would loop.
+    ///
+    /// Beyond [`Self::rewrite_navigation_url`], a same-scheme redirect of a
+    /// `GET` or `HEAD` to the current URL is left unchanged when the response
+    /// sets no cookie. Nothing the browser sends on the retry would differ, so
+    /// the origin is redirecting because of something Trusted Server sends
+    /// unchanged, such as `publisher.origin_host_header_override`.
+    fn rewrite_location(&self, url: &str, response_sets_cookie: bool) -> Option<String> {
+        let rewritten = self.rewrite_navigation_url(url)?;
+        if self.request_is_get_or_head && !response_sets_cookie && self.targets_current_request(url)
+        {
+            log::warn!(
+                "Keeping origin redirect to the current request URL; the browser leaves \
+                 the serving host. Check what the origin expects from the request, such \
+                 as `publisher.origin_host_header_override`"
+            );
+            return None;
+        }
+        Some(rewritten)
+    }
+
     fn is_scheme_change_to_current_request(&self, url: &str) -> bool {
         let Some((scheme, rest)) = url.split_once("://") else {
             return false;
@@ -120,10 +149,21 @@ impl OriginHeaderRewrite<'_> {
         if self.strip_origin_authority(rest).is_none() {
             return false;
         }
+        self.targets_current_request(url)
+    }
+
+    /// Whether `url`, an absolute or protocol-relative URL on the origin,
+    /// names the path and query of the current request.
+    fn targets_current_request(&self, url: &str) -> bool {
         // Normalize the target the way the browser will before following it:
         // an empty path becomes `/`, dot segments are resolved, and the
         // fragment is dropped.
-        let Ok(target) = Url::parse(url) else {
+        let parsed = if url.starts_with("//") {
+            Url::parse(&format!("{}:{url}", self.origin_scheme))
+        } else {
+            Url::parse(url)
+        };
+        let Ok(target) = parsed else {
             return false;
         };
         let (request_path, request_query) = match self.request_path_and_query.split_once('?') {
@@ -170,6 +210,7 @@ impl OriginHeaderRewrite<'_> {
 ///     request_scheme: "https",
 ///     origin_scheme: "https",
 ///     request_path_and_query: "/page",
+///     request_is_get_or_head: true,
 /// };
 /// rewrite_origin_urls_in_headers(response.headers_mut(), &rewrite);
 /// ```
@@ -181,8 +222,9 @@ pub(crate) fn rewrite_origin_urls_in_headers(
         return;
     }
 
+    let response_sets_cookie = headers.contains_key(header::SET_COOKIE);
     rewrite_header_values(headers, &header::LOCATION, |value| {
-        rewrite.rewrite_navigation_url(value.trim())
+        rewrite.rewrite_location(value.trim(), response_sets_cookie)
     });
     rewrite_header_values(headers, &header::CONTENT_LOCATION, |value| {
         rewrite.rewrite_url(value.trim())
@@ -293,7 +335,7 @@ fn rewrite_refresh(value: &str, rewrite: &OriginHeaderRewrite<'_>) -> Option<Str
 /// `<` inside a quoted parameter value is not treated as a link target.
 fn rewrite_link(value: &str, rewrite: &OriginHeaderRewrite<'_>) -> Option<String> {
     let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
+    let mut out = String::new();
     let mut copied_until = 0;
     let mut index = 0;
     let mut in_quotes = false;
@@ -499,6 +541,7 @@ mod tests {
         request_scheme: "https",
         origin_scheme: "http",
         request_path_and_query: "/current?page=1",
+        request_is_get_or_head: false,
     };
 
     fn rewritten(name: &HeaderName, values: &[&str]) -> Vec<String> {
@@ -578,6 +621,7 @@ mod tests {
             request_scheme: "http",
             origin_scheme: "http",
             request_path_and_query: "/",
+            request_is_get_or_head: false,
         };
         assert_eq!(
             rewrite.rewrite_url("http://127.0.0.1:8301/landing.html"),
@@ -656,6 +700,61 @@ mod tests {
             ),
             "https://www.example.com/current?page=1",
             "should rewrite non-navigation self references"
+        );
+    }
+
+    #[test]
+    fn location_keeps_stateless_get_redirect_to_current_request() {
+        let rewrite = OriginHeaderRewrite {
+            request_is_get_or_head: true,
+            ..REWRITE
+        };
+        let location_after_rewrite = |headers: &[(HeaderName, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in headers {
+                map.append(
+                    name.clone(),
+                    HeaderValue::from_str(value).expect("should build test header value"),
+                );
+            }
+            rewrite_origin_urls_in_headers(&mut map, &rewrite);
+            map.get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+                .expect("should keep the Location header")
+        };
+
+        for value in [
+            "http://origin.example.com/current?page=1",
+            "//origin.example.com/current?page=1",
+            "http://origin.example.com/a/../current?page=1#top",
+        ] {
+            assert_eq!(
+                location_after_rewrite(&[(header::LOCATION, value)]),
+                value,
+                "should keep a cookieless GET redirect `{value}` to the current URL"
+            );
+        }
+        assert_eq!(
+            location_after_rewrite(&[
+                (header::LOCATION, "http://origin.example.com/current?page=1"),
+                (header::SET_COOKIE, "gate=1; Path=/"),
+            ]),
+            "https://www.example.com/current?page=1",
+            "should rewrite a cookie-setting GET redirect to the current URL"
+        );
+        assert_eq!(
+            location_after_rewrite(&[(
+                header::LOCATION,
+                "http://origin.example.com/current?page=2"
+            )]),
+            "https://www.example.com/current?page=2",
+            "should rewrite a GET redirect to a different URL"
+        );
+        assert_eq!(
+            rewrite_refresh("60; url=http://origin.example.com/current?page=1", &rewrite),
+            Some("60; url=https://www.example.com/current?page=1".to_string()),
+            "should keep a periodic GET reload on the serving host"
         );
     }
 

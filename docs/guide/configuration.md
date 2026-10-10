@@ -803,12 +803,19 @@ Location: https://www.example.com/landing.html
 Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
 ```
 
-One exception prevents a redirect loop. When the origin redirects to the URL
-being requested but under a different scheme from `publisher.origin_url` (for
-example, an `http://` origin forcing HTTPS), the `Location` or `Refresh` target
-is left unchanged. Rewriting it would send the browser back to the same URL, and
-the origin would redirect again. Same-scheme redirects to the current URL, such
-as after a form POST, are rewritten as usual.
+Two exceptions prevent a redirect loop. Rewriting either target would send the
+browser back to the same URL, and the origin would redirect again:
+
+- When the origin redirects to the URL being requested but under a different
+  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  HTTPS), the `Location` or `Refresh` target is left unchanged.
+- When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
+  requested and sets no cookie, the target is left unchanged. The origin is
+  redirecting because of something Trusted Server sends unchanged on every
+  retry, such as the `Host` from `publisher.origin_host_header_override`.
+
+Other same-scheme redirects to the current URL, such as after a form POST or
+one that sets a cookie, are rewritten as usual, as is a `Refresh` reload.
 
 `Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
 `Domain` attribute that does not cover the serving host (for example,
@@ -820,11 +827,21 @@ or a `Domain` shared by both hosts.
 Each response keeps its own per-page values. A `[response_headers]` entry for
 the same header still replaces the rewritten value.
 
+Only response headers are covered. A `<meta http-equiv="refresh">` or
+`<meta http-equiv="Content-Security-Policy">` tag in the page body keeps its
+origin URLs, so the browser can still navigate to the origin or block rewritten
+resources. Deliver these as headers on proxied pages.
+
 ::: warning CSP and injected scripts
 Host rewriting only adds serving-host sources. It does not authorize inline
 content Trusted Server inserts without a nonce, or the `/static/tsjs=` bundle
 when the policy allows neither `'self'` nor the serving host. Check
 `script-src` (or `default-src`) on pages with a restrictive policy.
+
+A serving-host source without a path also allows Trusted Server's own routes
+on that host, including `/first-party/proxy`, which serves any target that
+`/first-party/sign` signs. A policy that limited scripts to the origin now
+allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 :::
 
 ## Request Signing

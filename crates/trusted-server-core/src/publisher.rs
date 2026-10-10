@@ -4539,6 +4539,7 @@ pub async fn handle_publisher_request(
 
     let request_path = req.uri().path().to_string();
     let is_get = req.method() == http::Method::GET;
+    let is_get_or_head = is_get || req.method() == http::Method::HEAD;
 
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
@@ -4776,8 +4777,7 @@ pub async fn handle_publisher_request(
     // assembly has no template key, but readthrough still needs both purge scopes.
     let readthrough_reader_url =
         if origin_readthrough_enabled && origin_response_is_shareable && request_is_document {
-            let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
-            format!("{request_scheme}://{request_host}{path}")
+            format!("{request_scheme}://{request_host}{request_path_and_query}")
         } else {
             String::new()
         };
@@ -4786,14 +4786,10 @@ pub async fn handle_publisher_request(
             url: target_uri.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
-            // Read here, before `rewrite_origin_request` below replaces the URI with the
+            // Captured before `rewrite_origin_request` below replaces the URI with the
             // origin target. Path *and* query: a different query is a different page, and
             // a purge caller types the whole address.
-            request_path: req
-                .uri()
-                .path_and_query()
-                .map(|path_and_query| path_and_query.as_str().to_owned())
-                .unwrap_or_else(|| "/".to_owned()),
+            request_path: request_path_and_query.clone(),
             origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
             assembly_mode,
             vary_values: settings
@@ -5235,6 +5231,7 @@ pub async fn handle_publisher_request(
             request_scheme,
             origin_scheme: &origin_scheme,
             request_path_and_query: &request_path_and_query,
+            request_is_get_or_head: is_get_or_head,
         },
     );
 
@@ -16362,7 +16359,11 @@ mod tests {
         );
     }
 
-    async fn redirect_location_for_current_url(origin_url: &str, location: &str) -> String {
+    async fn redirect_location_for_current_url(
+        origin_url: &str,
+        method: Method,
+        location: &str,
+    ) -> String {
         let mut settings = create_test_settings();
         settings.publisher.origin_url = origin_url.to_string();
         let stub = Arc::new(StubHttpClient::new());
@@ -16374,8 +16375,10 @@ mod tests {
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
+        let mut request = publisher_page_request();
+        *request.method_mut() = method;
 
-        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
+        let response = run_publisher_proxy(&settings, &services, request).await;
 
         proxy_response_headers(&response)
             .get(header::LOCATION)
@@ -16388,6 +16391,7 @@ mod tests {
     async fn scheme_upgrade_redirect_to_current_url_is_not_rewritten_into_a_loop() {
         let location = redirect_location_for_current_url(
             "http://origin.test-publisher.com",
+            Method::GET,
             "https://origin.test-publisher.com/redirect",
         )
         .await;
@@ -16402,6 +16406,7 @@ mod tests {
     async fn same_scheme_redirect_to_current_url_stays_on_serving_host() {
         let location = redirect_location_for_current_url(
             "https://origin.test-publisher.com",
+            Method::POST,
             "https://origin.test-publisher.com/redirect",
         )
         .await;
@@ -16409,6 +16414,23 @@ mod tests {
         assert_eq!(
             location, "https://publisher.example/redirect",
             "should rewrite a POST-redirect-GET to the same URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
+        // A canonical-host redirect triggered by `origin_host_header_override`
+        // answers the retry through Trusted Server the same way, so it must leave.
+        let location = redirect_location_for_current_url(
+            "https://origin.test-publisher.com",
+            Method::GET,
+            "https://origin.test-publisher.com/redirect",
+        )
+        .await;
+
+        assert_eq!(
+            location, "https://origin.test-publisher.com/redirect",
+            "should not redirect a cookieless GET back to the URL it requested"
         );
     }
 
