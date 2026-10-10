@@ -1,5 +1,6 @@
 //! Integration module registry and sample implementations.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
@@ -422,7 +423,12 @@ pub struct IntegrationBuilder {
     adserver: Option<&'static AdServerImplementation>,
     module: Option<&'static str>,
     section: Option<&'static str>,
+    loading_cache: Option<LoadingCacheFactory>,
 }
+
+/// Gives the loading cache a module supplies, see
+/// [`IntegrationBuilder::with_loading_cache`].
+pub type LoadingCacheFactory = fn() -> Arc<dyn crate::platform::PlatformLoadingCache>;
 
 /// The build function of a builder that supplies no page integration.
 fn no_registration(
@@ -462,6 +468,7 @@ impl IntegrationBuilder {
             adserver: None,
             module: None,
             section: None,
+            loading_cache: None,
         }
     }
 
@@ -489,6 +496,7 @@ impl IntegrationBuilder {
             adserver: None,
             module: None,
             section: None,
+            loading_cache: None,
         }
     }
 
@@ -616,6 +624,25 @@ impl IntegrationBuilder {
     #[must_use]
     pub const fn module_name(&self) -> Option<&'static str> {
         self.module
+    }
+
+    /// Offers the loading cache this crate supplies, see
+    /// [`crate::platform::PlatformLoadingCache`].
+    ///
+    /// Offered whatever the settings say, because the loading cache is how a
+    /// deployment caches rather than a module a document selects. An adapter
+    /// takes it with [`loading_cache_from`] when it builds its state, and a
+    /// deployment offering none asks each source itself.
+    #[must_use]
+    pub const fn with_loading_cache(mut self, factory: LoadingCacheFactory) -> Self {
+        self.loading_cache = Some(factory);
+        self
+    }
+
+    /// The loading cache this builder offers, when it offers one.
+    #[must_use]
+    pub const fn loading_cache(&self) -> Option<LoadingCacheFactory> {
+        self.loading_cache
     }
 
     /// Names the section that selects this module, for one selected outside
@@ -755,4 +782,127 @@ pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
     builders().iter().copied().chain(extra.iter().copied())
+}
+
+/// The loading cache the builders a deployment links offer, or
+/// [`NoLoadingCache`](crate::platform::NoLoadingCache) when none offers one.
+///
+/// # Errors
+///
+/// When more than one builder offers a loading cache, naming where each came
+/// from, because a deployment caches one way.
+pub fn loading_cache_from(
+    builders: &[IntegrationBuilder],
+) -> Result<Arc<dyn crate::platform::PlatformLoadingCache>, Report<TrustedServerError>> {
+    let offered: Vec<(&str, LoadingCacheFactory)> = builders
+        .iter()
+        .filter_map(|builder| {
+            builder
+                .loading_cache()
+                .map(|factory| (builder.source(), factory))
+        })
+        .collect();
+    match offered.as_slice() {
+        [] => Ok(Arc::new(crate::platform::NoLoadingCache)),
+        [(_, factory)] => Ok(factory()),
+        several => Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "more than one linked crate offers a loading cache: {}. A deployment \
+                 links one",
+                several
+                    .iter()
+                    .map(|(source, _)| *source)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })),
+    }
+}
+
+#[cfg(test)]
+mod loading_cache_from_tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::platform::{CacheSpec, LoadError, Loader, PlatformLoadingCache, StoreKey};
+
+    fn no_build(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    fn no_validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+
+    /// A cache that says it keeps values, so a test can tell it from the
+    /// default, which keeps none.
+    struct Keeping;
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformLoadingCache for Keeping {
+        async fn get_or_load(
+            &self,
+            _services: &crate::platform::RuntimeServices,
+            _spec: &CacheSpec,
+            _key: &StoreKey,
+            load: Loader,
+        ) -> Result<Bytes, LoadError> {
+            load().await.map(|loaded| loaded.bytes)
+        }
+
+        async fn remove(
+            &self,
+            _services: &crate::platform::RuntimeServices,
+            _spec: &CacheSpec,
+            _key: &StoreKey,
+        ) {
+        }
+    }
+
+    fn keeping() -> Arc<dyn PlatformLoadingCache> {
+        Arc::new(Keeping)
+    }
+
+    fn builder(source: &'static str) -> IntegrationBuilder {
+        IntegrationBuilder::new("an_id", source, no_build, no_validate)
+    }
+
+    #[test]
+    fn with_none_offered_the_deployment_keeps_nothing() {
+        let cache = loading_cache_from(&[builder("first"), builder("second")])
+            .expect("none offered is not an error");
+
+        assert!(!cache.keeps_values());
+    }
+
+    #[test]
+    fn the_one_offered_is_the_one_taken() {
+        let cache = loading_cache_from(&[
+            builder("first"),
+            builder("second").with_loading_cache(keeping),
+        ])
+        .expect("one offered should be taken");
+
+        assert!(cache.keeps_values());
+    }
+
+    #[test]
+    fn two_offered_are_refused_naming_both() {
+        let error = loading_cache_from(&[
+            builder("first").with_loading_cache(keeping),
+            builder("second").with_loading_cache(keeping),
+        ])
+        .expect_err("a deployment caches one way");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(
+                "more than one linked crate offers a loading cache: first, second. A deployment \
+                 links one"
+            ),
+            "{message}"
+        );
+    }
 }
