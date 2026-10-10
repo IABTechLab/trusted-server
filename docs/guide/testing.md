@@ -123,7 +123,7 @@ Show captured output and serialize a focused test when ordering or shared test
 state matters:
 
 ```bash
-RUST_LOG=debug cargo test-axum test_name -- --nocapture --test-threads=1
+cargo test-axum test_name -- --nocapture --test-threads=1
 cargo test-fastly test_name -- --nocapture --test-threads=1
 ```
 
