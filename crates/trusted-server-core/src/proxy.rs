@@ -660,10 +660,14 @@ fn finalize_proxied_response(
     let ct = meta.ct_raw.to_ascii_lowercase();
     let compression = Compression::from_content_encoding(&meta.content_encoding);
 
-    // A HEAD response has no body to rewrite. Decoding its empty body would fail
-    // for a compressed type, and its representation headers must describe the
-    // body a GET would return, so pass it through unchanged.
+    // A HEAD response has no body to rewrite, and decoding its empty body would
+    // fail for a compressed type, so skip the rewrite. Its representation
+    // headers must still describe the body a GET would return: the GET path
+    // rewrites HTML and CSS and drops the upstream length, so drop it here too.
     if req.method() == Method::HEAD {
+        if ct.contains("text/html") || ct.contains("text/css") {
+            beresp.headers_mut().remove(header::CONTENT_LENGTH);
+        }
         apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "");
         return Ok(beresp);
     }
@@ -1476,7 +1480,13 @@ async fn proxy_with_redirects(
                 "redirect limit reached for {}; returning redirect response",
                 current_url
             );
-            return finalize_proxied_response(settings, req, &current_url, beresp);
+            return finalize_response(
+                settings,
+                req,
+                &current_url,
+                beresp,
+                redirect_policy.stream_passthrough,
+            );
         }
 
         let next_url = url::Url::parse(location)
@@ -4219,6 +4229,135 @@ mod tests {
     }
 
     #[test]
+    fn proxy_request_post_body_stays_dropped_after_302_then_307() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            302,
+            Vec::new(),
+            vec![("location", "https://redirect.example.com/second")],
+        );
+        stub.push_response_with_headers(
+            307,
+            Vec::new(),
+            vec![("location", "https://redirect.example.com/final")],
+        );
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::POST, "https://edge.example/");
+
+        futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_body(REDIRECT_TEST_BODY.to_vec())
+                .with_header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-www-form-urlencoded"),
+                )
+                .with_header(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from(REDIRECT_TEST_BODY.len()),
+                )
+                .with_header(
+                    header::CONTENT_ENCODING,
+                    HeaderValue::from_static("identity"),
+                )
+                .with_header(header::CONTENT_LANGUAGE, HeaderValue::from_static("en-US"))
+                .with_header(
+                    header::CONTENT_LOCATION,
+                    HeaderValue::from_static("https://source.example.com/payload"),
+                ),
+            &services,
+        ))
+        .expect("should follow the 302 then 307 chain");
+
+        assert_eq!(
+            stub.recorded_request_methods(),
+            vec!["POST".to_string(), "GET".to_string(), "GET".to_string()],
+            "should keep the 302 follow-up as GET across the later 307"
+        );
+        assert_eq!(
+            stub.recorded_request_bodies(),
+            vec![REDIRECT_TEST_BODY.to_vec(), Vec::new(), Vec::new()],
+            "should not restore the dropped body on the 307 hop"
+        );
+        let first_hop_headers = recorded_header_names(&stub, 0);
+        for body_header in [
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "content-language",
+            "content-location",
+        ] {
+            assert!(
+                first_hop_headers.iter().any(|name| name == body_header),
+                "should send {body_header} on the first hop"
+            );
+            for hop in [1, 2] {
+                assert!(
+                    !recorded_header_names(&stub, hop)
+                        .iter()
+                        .any(|name| name == body_header),
+                    "should not send {body_header} on bodyless hop {hop}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_request_redirect_limit_response_strips_cors_policy() {
+        let stub = Arc::new(StubHttpClient::new());
+        for _ in 0..5 {
+            stub.push_response_with_headers(
+                302,
+                Vec::new(),
+                vec![
+                    ("location", "https://redirect.example.com/next"),
+                    ("access-control-allow-origin", "*"),
+                ],
+            );
+        }
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers(),
+            &services,
+        ))
+        .expect("should return the redirect once the limit is reached");
+
+        assert_eq!(
+            stub.recorded_request_methods().len(),
+            5,
+            "should stop following after the redirect limit"
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "should return the last redirect response"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "should strip CORS headers from the redirect-limit response"
+        );
+    }
+
+    #[test]
     fn proxy_request_head_redirect_stays_head_for_301_302_303() {
         for status in [301, 302, 303] {
             let stub = proxy_through_redirect(Method::HEAD, status);
@@ -4291,10 +4430,9 @@ mod tests {
                 Some(&HeaderValue::from_static(content_encoding)),
                 "should keep the upstream Content-Encoding on a {content_type} HEAD response"
             );
-            assert_eq!(
-                headers.get(header::CONTENT_LENGTH),
-                Some(&HeaderValue::from_static("1234")),
-                "should keep the upstream Content-Length on a {content_type} HEAD response"
+            assert!(
+                headers.get(header::CONTENT_LENGTH).is_none(),
+                "should drop the upstream Content-Length on a {content_type} HEAD response because a GET rewrites the body"
             );
             assert!(
                 headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
