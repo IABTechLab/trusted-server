@@ -39,6 +39,17 @@ jobs:
             exit 1
           fi
 
+  check-ci-node-pin:
+    name: CI Node pin guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every job that compiles trusted-server-core also runs the TSJS build, so
+      # it must set up the `.tool-versions` Node first (see issue #1204).
+      - name: Verify jobs pin Node before compiling Rust
+        run: python3 scripts/check-ci-node-pin.py
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest

@@ -51,7 +51,9 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
-      - name: Use Node.js for the served-seam contract
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the served-seam contract
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
@@ -91,12 +93,15 @@ jobs:
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
@@ -267,12 +272,15 @@ jobs:
           components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
