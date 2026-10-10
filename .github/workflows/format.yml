@@ -90,6 +90,11 @@ jobs:
       - name: Run host-target OpenRTB codegen clippy
         run: cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 
+      # The build-digest tests are native-only, so clippy-fastly compiles them
+      # to an empty crate. Lint them on the host.
+      - name: Run host-target core build-digest test clippy
+        run: cargo clippy --package trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest -- -D warnings
+
   format-typescript:
     runs-on: ubuntu-latest
     defaults:

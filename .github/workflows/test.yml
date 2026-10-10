@@ -59,6 +59,9 @@ jobs:
       - name: Run tests
         run: cargo test-fastly
 
+      - name: Run tests (reusable-sandbox feature)
+        run: cargo test-fastly-reuse
+
       - name: Run template cache ESI local harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
 
@@ -102,6 +105,9 @@ jobs:
 
       - name: Run Axum adapter tests
         run: cargo test-axum
+
+      - name: Test template build digest inputs (native)
+        run: cargo test -p trusted-server-core --test template_build_digest
 
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast

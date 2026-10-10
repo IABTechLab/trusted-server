@@ -62,9 +62,6 @@ uuid = { workspace = true, features = ["js"] }
 # `wasm32-unknown-unknown`, unless `wasmbind` makes it read the JS clock.
 chrono = { workspace = true, features = ["wasmbind"] }
 
-[build-dependencies]
-edgezero-core = { workspace = true }
-
 [features]
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
@@ -77,6 +74,16 @@ criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }
+
+[build-dependencies]
+# tests/template_build_digest.rs includes build.rs, so its dependencies must also
+# be available through normal or dev-dependencies.
+edgezero-core = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "consent_decode"
