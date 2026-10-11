@@ -18,7 +18,7 @@ use crate::integrations::{
     ScriptRewriteAction,
 };
 use crate::middleware::{
-    ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan,
+    ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan, Prepared,
     TextHandler,
 };
 use crate::publisher::build_empty_bids_script;
@@ -112,6 +112,9 @@ pub struct HtmlProcessorConfig {
     /// `None` on every path that cannot store a shared template, so an ordinary inline
     /// request does not pay for handlers whose only consumer is the template-cache gate.
     pub csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// What the middleware prepared for this document, see
+    /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
+    pub prepared: Arc<Prepared>,
 }
 
 impl HtmlProcessorConfig {
@@ -136,6 +139,7 @@ impl HtmlProcessorConfig {
             request_state: IntegrationRequestState::default(),
             body_close: BodyCloseInjection::None,
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
         }
     }
 
@@ -193,6 +197,13 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
         self.csp_nonce_observed = observed;
+        self
+    }
+
+    /// Attach what the middleware prepared for this document.
+    #[must_use]
+    pub fn with_prepared(mut self, prepared: Arc<Prepared>) -> Self {
+        self.prepared = prepared;
         self
     }
 }
@@ -282,6 +293,7 @@ pub fn create_html_processor_with_middleware(
         origin_host: &config.origin_host,
         document_state: &document_state,
         max_buffered_script_bytes: config.max_buffered_body_bytes,
+        prepared: &config.prepared,
     })?;
     let reader = match serve {
         Some(serve) => create_serve_processor(
@@ -292,6 +304,7 @@ pub fn create_html_processor_with_middleware(
                 origin_host: &config.origin_host,
                 request_state: &config.request_state,
                 max_buffered_script_bytes: config.max_buffered_body_bytes,
+                prepared: &config.prepared,
             },
         )?,
         None => None,
@@ -314,6 +327,8 @@ pub struct ReaderDocument<'a> {
     pub request_state: &'a IntegrationRequestState,
     /// The most a middleware may hold of one script while it decides.
     pub max_buffered_script_bytes: usize,
+    /// What the middleware prepared for the reader's copy.
+    pub prepared: &'a Prepared,
 }
 
 /// A processor that carries out a serve chain alone, on one reader's copy of
@@ -344,6 +359,7 @@ pub fn create_serve_processor(
         origin_host: document.origin_host,
         document_state: &document_state,
         max_buffered_script_bytes: document.max_buffered_script_bytes,
+        prepared: document.prepared,
     })?;
     if plan.is_empty() {
         return Ok(None);
@@ -1107,6 +1123,7 @@ mod tests {
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -1688,6 +1705,7 @@ mod tests {
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1766,6 +1784,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1805,6 +1824,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1845,6 +1865,7 @@ mod tests {
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -1899,6 +1920,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1931,6 +1953,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1965,6 +1988,7 @@ mod tests {
             permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            prepared: Arc::new(Prepared::default()),
             request_state: IntegrationRequestState::default(),
         }
     }
@@ -2173,6 +2197,7 @@ mod tests {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),

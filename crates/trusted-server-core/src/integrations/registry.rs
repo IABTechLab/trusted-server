@@ -2908,7 +2908,9 @@ pub(crate) mod test_support {
         use crate::integrations::{CORE_SOURCE, IntegrationBuilder};
         use crate::middleware::{
             AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+            Preparation, Refusal,
         };
+        use crate::module_context::ModuleCall;
         use crate::settings::Settings;
 
         /// The integration id the stand-in registers under.
@@ -2937,6 +2939,89 @@ pub(crate) mod test_support {
         pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
         /// The line the text middleware adds at the end of a text body.
         pub(crate) const TEXT_LINE: &str = "# added by the middleware fixture\n";
+        /// The name of the fetch middleware that prepares.
+        pub(crate) const PREPARING: &str = "testing.middleware-fixture.preparing";
+        /// The name of the fetch middleware that refuses every request.
+        pub(crate) const REFUSING: &str = "testing.middleware-fixture.refusing";
+        /// How long the refusing middleware asks the caller to wait.
+        pub(crate) const REFUSAL_RETRY_AFTER: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        /// What the refusing middleware says.
+        pub(crate) const REFUSAL_MESSAGE: &str = "the middleware fixture refuses";
+        /// What the preparing middleware writes when nothing was prepared.
+        pub(crate) const NOTHING_PREPARED: &str =
+            "<meta name=\"middleware-fixture-prepared\" content=\"nothing prepared\">";
+
+        /// The marker the preparing middleware writes, naming the module it
+        /// was called as and the host it was told of.
+        pub(crate) fn prepared_marker(module: &str, request_host: &str) -> String {
+            format!(
+                "<meta name=\"middleware-fixture-prepared\" content=\"{module} for {request_host}\">"
+            )
+        }
+
+        struct Preparing;
+
+        impl Middleware for Preparing {
+            fn middleware_id(&self) -> &'static str {
+                PREPARING
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &MiddlewarePhase::ALL
+            }
+
+            fn prepare<'a>(
+                &'a self,
+                call: ModuleCall<'a>,
+                context: &'a MiddlewareContext<'a>,
+            ) -> Option<Preparation<'a>> {
+                Some(Box::pin(async move {
+                    let marker = prepared_marker(call.module(), context.request_host);
+                    Ok(Box::new(marker) as Box<dyn std::any::Any + Send>)
+                }))
+            }
+
+            fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                let marker: String = context
+                    .prepared
+                    .take(PREPARING)
+                    .unwrap_or_else(|| NOTHING_PREPARED.to_owned());
+                MiddlewareAction {
+                    head_inserts: vec![marker],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        struct Refusing;
+
+        impl Middleware for Refusing {
+            fn middleware_id(&self) -> &'static str {
+                REFUSING
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn prepare<'a>(
+                &'a self,
+                _call: ModuleCall<'a>,
+                _context: &'a MiddlewareContext<'a>,
+            ) -> Option<Preparation<'a>> {
+                Some(Box::pin(async {
+                    Err(Refusal::service_unavailable(
+                        REFUSAL_RETRY_AFTER,
+                        REFUSAL_MESSAGE,
+                    ))
+                }))
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction::pass()
+            }
+        }
 
         /// The builder core's test build lists beside its own.
         pub(crate) const BUILDER: IntegrationBuilder =
@@ -3138,6 +3223,8 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Reader))
                     .with_middleware(Arc::new(BrokenReader))
                     .with_middleware(Arc::new(Text))
+                    .with_middleware(Arc::new(Preparing))
+                    .with_middleware(Arc::new(Refusing))
                     .build(),
             ))
         }
@@ -6044,6 +6131,8 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
             ],
             "should list the middleware the selected module supplies"
         );
@@ -6053,13 +6142,15 @@ mod tests {
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING
             ],
             "should list the middleware that run in the fetch phase"
         );
         assert_eq!(
             registry.middleware_in(MiddlewarePhase::Serve),
-            [fixture::READER, fixture::BROKEN_READER],
+            [fixture::READER, fixture::BROKEN_READER, fixture::PREPARING],
             "should list the middleware that run in the serve phase"
         );
         let chain_for = |media_type: &str, path: &str| {
@@ -6174,13 +6265,15 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING
             )),
             "should name the entry and list what could be named: {message}"
         );
@@ -6233,6 +6326,8 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING,
             ],
             "should list every middleware when there are no entries"
         );
@@ -6245,7 +6340,9 @@ mod tests {
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING
             ],
             "should leave out a middleware any entry names"
         );
@@ -6313,7 +6410,9 @@ mod tests {
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::BROKEN_READER,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::PREPARING,
+                fixture::REFUSING
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

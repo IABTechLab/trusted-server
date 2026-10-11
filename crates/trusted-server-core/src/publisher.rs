@@ -69,7 +69,8 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
-use crate::middleware::{MiddlewarePhase, media_type_of};
+use crate::middleware::{MiddlewarePhase, Prepared, Refusal, media_type_of};
+use crate::module_context::{ModuleContext, ModuleRequest};
 use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -647,14 +648,16 @@ struct ProcessResponseParams<'a> {
     shared_template_authorized: bool,
     /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
     csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
+    prepared: &'a Arc<Prepared>,
 }
 
 struct PublisherBodyProcessor {
     inner: Box<dyn StreamProcessor>,
 }
 
-/// A response that is not HTML, as the middleware the entries covering it
-/// are told of it.
+/// A response as the middleware the entries covering it are told of it:
+/// any document for its preparation, and one that is not HTML for the
+/// stream processors run on its body.
 struct TextDocument<'a> {
     /// The type and subtype of the response, in lower case.
     media_type: String,
@@ -664,6 +667,8 @@ struct TextDocument<'a> {
     origin_host: &'a str,
     request_state: &'a IntegrationRequestState,
     max_buffered_script_bytes: usize,
+    /// What the middleware prepared for the document.
+    prepared: &'a Prepared,
 }
 
 /// The stream processors the entries covering a response that is not HTML
@@ -711,11 +716,81 @@ fn middleware_stream_processors(
                 origin_host: document.origin_host,
                 document_state: &document_state,
                 max_buffered_script_bytes: document.max_buffered_script_bytes,
+                prepared: document.prepared,
             })
             .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
         processors.extend(plan.processors);
     }
     Ok(processors)
+}
+
+/// Runs the preparation of the middleware the entries of `phases` select
+/// for `document`, each as its module with the request's services, keeping
+/// what they prepare in the document's [`Prepared`].
+///
+/// # Errors
+///
+/// The first refusal, which ends the request.
+async fn prepare_document(
+    document: &TextDocument<'_>,
+    phases: &[MiddlewarePhase],
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    module_context: &ModuleContext<'_>,
+) -> Result<(), Refusal> {
+    use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
+
+    if !is_dispatched_media_type(&document.media_type) {
+        return Ok(());
+    }
+    for phase in phases {
+        let chain = integration_registry.middleware_chain(
+            settings.phase_entries(*phase),
+            *phase,
+            &document.media_type,
+            document.request_path,
+        );
+        if chain.is_empty() {
+            continue;
+        }
+        let document_state = IntegrationDocumentState::default();
+        if *phase == MiddlewarePhase::Serve {
+            document.request_state.seed(&document_state);
+        }
+        chain
+            .prepare(
+                module_context,
+                &MiddlewareContext {
+                    phase: *phase,
+                    request_host: document.request_host,
+                    request_scheme: document.request_scheme,
+                    origin_host: document.origin_host,
+                    document_state: &document_state,
+                    max_buffered_script_bytes: document.max_buffered_script_bytes,
+                    prepared: document.prepared,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// The response a refusal answers the request with: its status,
+/// `Retry-After` when it gives one, the message as plain text, and no
+/// store.
+fn refusal_response(refusal: &Refusal) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let mut builder = Response::builder()
+        .status(refusal.status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store");
+    if let Some(after) = refusal.retry_after {
+        builder = builder.header(header::RETRY_AFTER, after.as_secs().to_string());
+    }
+    builder
+        .body(EdgeBody::from(refusal.message.clone().into_bytes()))
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to build a middleware's refusal".to_string(),
+        })
 }
 
 /// A processor followed by the ones the entries add, each handed what the
@@ -777,6 +852,7 @@ impl PublisherBodyProcessor {
                 request_state: params.request_state.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
+                prepared: Arc::clone(&params.prepared),
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -806,6 +882,7 @@ impl PublisherBodyProcessor {
                     origin_host: &params.origin_host,
                     request_state: &params.request_state,
                     max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+                    prepared: &params.prepared,
                 },
                 phases,
                 settings,
@@ -887,6 +964,7 @@ fn process_response_streaming<W: Write>(
             request_state: params.request_state.clone(),
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
+            prepared: Arc::clone(params.prepared),
             deferred_inline_marker: None,
         })?;
         StreamingPipeline::new(config, processor)
@@ -919,6 +997,7 @@ fn process_response_streaming<W: Write>(
                 origin_host: params.origin_host,
                 request_state: params.request_state,
                 max_buffered_script_bytes: params.settings.publisher.max_buffered_body_bytes,
+                prepared: params.prepared,
             },
             phases,
             params.settings,
@@ -1479,6 +1558,7 @@ struct HtmlStreamProcessorParams<'a> {
     csp_nonce_observed: Option<Arc<AtomicBool>>,
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
+    prepared: Arc<Prepared>,
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1668,7 +1748,8 @@ fn create_html_stream_processor(
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_request_state(params.request_state)
         .with_body_close(body_close)
-        .with_csp_nonce_observer(csp_nonce_observed);
+        .with_csp_nonce_observer(csp_nonce_observed)
+        .with_prepared(params.prepared);
 
     // The middleware of the first [[fetch]] entry covering this path. What
     // they leave is what a shared template stores, and they are handed
@@ -1722,6 +1803,7 @@ fn reader_serve_processor(
                 origin_host: &origin_host,
                 request_state: &params.request_state,
                 max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+                prepared: &params.prepared,
             },
             &[MiddlewarePhase::Serve],
             settings,
@@ -1751,6 +1833,7 @@ fn reader_serve_processor(
             origin_host: &origin_host,
             request_state: &params.request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+            prepared: &params.prepared,
         },
     )
     .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
@@ -2011,6 +2094,9 @@ pub struct OwnedProcessResponseParams {
     /// rescanned from the output, which cannot tell a `nonce` attribute from the same
     /// word inside a script.
     pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// What the middleware prepared for this document, see
+    /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
+    pub(crate) prepared: Arc<Prepared>,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -2438,6 +2524,7 @@ fn build_template_assembly_params(
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         csp_nonce_observed: None,
+        prepared: Arc::new(Prepared::default()),
         // Already stored; storing again on a hit would be pointless work.
         template_cache_key: None,
         seam_ad_slots: None,
@@ -3247,6 +3334,7 @@ pub fn stream_publisher_body<W: Write>(
         request_state: &params.request_state,
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
+        prepared: &params.prepared,
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -3341,6 +3429,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         true,
     );
     let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
+        prepared: Arc::clone(&params.prepared),
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
@@ -5483,6 +5572,49 @@ pub async fn handle_publisher_request(
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
                     params.auction_request = auction_request_for_telemetry.clone();
+                    let prepared = Arc::new(Prepared::default());
+                    let module_request = ModuleRequest::new(
+                        &request_method,
+                        request_host,
+                        request_scheme,
+                        &request_path,
+                    );
+                    let module_context =
+                        ModuleContext::new(module_request).with_request_state(ec_context, services);
+                    let stored_origin_host = settings.publisher.origin_host();
+                    let document = TextDocument {
+                        media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                        request_path: &request_path,
+                        request_host,
+                        request_scheme,
+                        origin_host: &stored_origin_host,
+                        request_state: &params.request_state,
+                        max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+                        prepared: &prepared,
+                    };
+                    if let Err(refusal) = prepare_document(
+                        &document,
+                        &[MiddlewarePhase::Serve],
+                        settings,
+                        integration_registry,
+                        &module_context,
+                    )
+                    .await
+                    {
+                        if let Some(dispatched) = params.dispatched_auction.take() {
+                            emit_abandoned_auction(
+                                services,
+                                params.auction_observation.take(),
+                                dispatched,
+                                "middleware_refusal",
+                            )
+                            .await;
+                        }
+                        let mut response = refusal_response(&refusal)?;
+                        enforce_terminal_private_cache_privacy(&mut response);
+                        return Ok(PublisherResponse::Buffered(response));
+                    }
+                    params.prepared = prepared;
                     return Ok(PublisherResponse::AssembleTemplate {
                         response,
                         template: entry.body,
@@ -5772,6 +5904,54 @@ pub async fn handle_publisher_request(
         .trim()
         .to_ascii_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
+
+    // What the middleware the entries name for this document prepare, with
+    // the request's services, before the document is processed. A refusal
+    // answers the request here, and nothing is stored.
+    let prepared = Arc::new(Prepared::default());
+    if route == ResponseRoute::Stream {
+        let phases: &[MiddlewarePhase] = if template_cache_key.is_some() {
+            &[MiddlewarePhase::Fetch]
+        } else {
+            &MiddlewarePhase::ALL
+        };
+        let module_request =
+            ModuleRequest::new(&request_method, request_host, request_scheme, &request_path);
+        let module_context =
+            ModuleContext::new(module_request).with_request_state(ec_context, services);
+        let document = TextDocument {
+            media_type: media_type_of(&content_type),
+            request_path: &request_path,
+            request_host,
+            request_scheme,
+            origin_host: &origin_host,
+            request_state: &request_state,
+            max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+            prepared: &prepared,
+        };
+        if let Err(refusal) = prepare_document(
+            &document,
+            phases,
+            settings,
+            integration_registry,
+            &module_context,
+        )
+        .await
+        {
+            if let Some(dispatched) = dispatched_auction.take() {
+                emit_abandoned_auction(
+                    services,
+                    auction_observation.take(),
+                    dispatched,
+                    "middleware_refusal",
+                )
+                .await;
+            }
+            let mut response = refusal_response(&refusal)?;
+            enforce_terminal_private_cache_privacy(&mut response);
+            return Ok(PublisherResponse::Buffered(response));
+        }
+    }
     if template_cache_key.is_some() {
         set_response_compression(&mut response, reader_compression);
     }
@@ -5878,6 +6058,7 @@ pub async fn handle_publisher_request(
                     auction_request: auction_request_for_telemetry,
                     dispatched_auction,
                     price_granularity,
+                    prepared,
                 }),
             })
         }
@@ -9502,6 +9683,7 @@ mod tests {
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -9808,6 +9990,7 @@ mod tests {
 
             let config = HtmlProcessorConfig {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
@@ -20792,6 +20975,7 @@ mod tests {
         let registry = IntegrationRegistry::new(settings).expect("should build a registry");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -20865,6 +21049,7 @@ mod tests {
         let services = noop_services();
         let mut params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -20944,12 +21129,22 @@ mod tests {
     /// fixture in the entries given and the origin answering `status` with
     /// a page.
     async fn proxy(fetch: Vec<PhaseEntry>, method: Method, path: &str, status: u16) -> Proxied {
-        let settings = settings_running_the_middleware_fixture(fetch);
+        proxy_with(
+            settings_running_the_middleware_fixture(fetch),
+            method,
+            path,
+            status,
+        )
+        .await
+    }
+
+    /// As [`proxy`], with the settings given.
+    async fn proxy_with(settings: Settings, method: Method, path: &str, status: u16) -> Proxied {
         let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             status,
-            b"<html><body>the origin's page</body></html>".to_vec(),
+            b"<html><head></head><body>the origin's page</body></html>".to_vec(),
             vec![("content-type", "text/html; charset=utf-8")],
         );
         let services = build_services_with_http_client(
@@ -21135,6 +21330,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn what_a_middleware_prepares_reaches_its_create() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let proxied = proxy(
+            vec![PhaseEntry {
+                media_type: HTML_MEDIA_TYPE.to_owned(),
+                path: None,
+                middleware: vec![fixture::PREPARING.to_owned()],
+            }],
+            Method::GET,
+            "/article",
+            200,
+        )
+        .await;
+        let PublisherResponse::Stream { body, params, .. } = proxied.response else {
+            panic!("a page should stream through the entry's middleware");
+        };
+        let mut params = *params;
+        let mut output = Vec::new();
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should stream the page");
+        let page = String::from_utf8(output).expect("html");
+
+        assert!(
+            page.contains(&fixture::prepared_marker(
+                fixture::PREPARING,
+                "publisher.example"
+            )),
+            "should write what the preparation answered, called as the middleware for the \
+             reader's host: {page}"
+        );
+        assert!(
+            !page.contains(fixture::NOTHING_PREPARED),
+            "should not ask create before the preparation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_serve_middleware_prepares_for_each_reader() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let mut settings = settings_running_the_middleware_fixture(Vec::new());
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::PREPARING.to_owned()],
+        }]);
+        let proxied = proxy_with(settings, Method::GET, "/article", 200).await;
+        let PublisherResponse::Stream { body, params, .. } = proxied.response else {
+            panic!("a page should stream through the entry's middleware");
+        };
+        let mut params = *params;
+        let mut output = Vec::new();
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should stream the page");
+        let page = String::from_utf8(output).expect("html");
+
+        assert!(
+            page.contains(&fixture::prepared_marker(
+                fixture::PREPARING,
+                "publisher.example"
+            )),
+            "should prepare in the serve phase for this reader: {page}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_answers_the_request_with_its_status_and_stores_nothing() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let proxied = proxy(
+            vec![PhaseEntry {
+                media_type: HTML_MEDIA_TYPE.to_owned(),
+                path: None,
+                middleware: vec![fixture::REFUSING.to_owned()],
+            }],
+            Method::GET,
+            "/article",
+            200,
+        )
+        .await;
+        let PublisherResponse::Buffered(response) = proxied.response else {
+            panic!("a refusal is answered whole, with no document to stream");
+        };
+        let header_value = |name: header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header_value(header::RETRY_AFTER).as_deref(), Some("30"));
+        assert_eq!(
+            header_value(header::CONTENT_TYPE).as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            header_value(header::CACHE_CONTROL).as_deref(),
+            Some("no-store, private"),
+            "should be stored and shared by nothing"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .is_some(),
+            "should be marked as this request's alone"
+        );
+        let body = response.into_body().into_bytes().expect("a whole body");
+        assert_eq!(String::from_utf8_lossy(&body), fixture::REFUSAL_MESSAGE);
+    }
+
     #[test]
     fn tsjs_dynamic_serves_a_standalone_module_by_registration_flag_not_by_name() {
         // The module the registration marks standalone is one a vendor crate
@@ -21312,6 +21643,7 @@ mod tests {
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -21375,6 +21707,7 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -21459,6 +21792,7 @@ mod tests {
             ),
             params: Box::new(OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -21552,6 +21886,7 @@ mod tests {
         let params = || {
             Box::new(OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -21660,6 +21995,7 @@ mod tests {
 
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -21709,6 +22045,7 @@ mod tests {
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -21838,6 +22175,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -21905,6 +22243,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -21975,6 +22314,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -22045,6 +22385,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -22115,6 +22456,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -22165,6 +22507,7 @@ mod tests {
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -22391,6 +22734,7 @@ mod tests {
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -22469,6 +22813,7 @@ mod tests {
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -22549,6 +22894,7 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -22623,6 +22969,7 @@ mod tests {
             .expect("should build response");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -22779,6 +23126,7 @@ mod tests {
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -23455,6 +23803,7 @@ mod tests {
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
                 csp_nonce_observed: None,
+                prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -23653,6 +24002,7 @@ mod tests {
             .collect();
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -23735,6 +24085,7 @@ mod tests {
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -23800,6 +24151,7 @@ mod tests {
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -23920,6 +24272,7 @@ mod tests {
 
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -23980,6 +24333,7 @@ mod tests {
         let html = br#"<html><body><script>fixture_payload("link=https://origin.example.com/page")</script></body></html>"#;
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
