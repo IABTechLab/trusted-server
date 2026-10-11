@@ -242,6 +242,7 @@ fail and the service will return its startup-error response.
 | `[rewrite]`                                                                                                       | nothing               | First-party URL rewrite exclusions                                                            |
 | `[robots-txt]`                                                                                                    | several modules       | What `/robots.txt` answers, and `X-Robots-Tag` on its responses when every crawler is refused |
 | `[[serve]]`                                                                                                       | nothing               | Which page changes run on each reader's copy of a page, and in what order                     |
+| `[shared]`                                                                                                        | nothing               | What one vendor's modules share, a table per vendor, which runs that vendor's builder         |
 | `[tester_cookie]`                                                                                                 | nothing               | Optional tester-cookie endpoints                                                              |
 | `[trusted_client_ip]`                                                                                             | nothing               | Authenticated front-door client-IP forwarding                                                 |
 | `[<type>]`, such as `[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]` or `[framework]` | one module or several | The section of a module type, selecting the modules of that type that run                     |
@@ -1126,6 +1127,20 @@ lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0", "CONTACT=ads@publisher.
 media_type = "text/plain"
 path = "/ads.txt"
 middleware = ["ads-txt.sellers"]
+```
+
+## Shared Settings
+
+### `[shared]`
+
+What every module of one vendor shares, in one `[shared.<vendor>]` table per vendor, named by the vendor's folder under `crates/shared`. Core reads none of a table. The vendor's modules read their own through `Settings::shared_config`, and the table's presence is what runs the builder that registers them, so a document without it runs none of that vendor's modules and a selection naming one is refused with the table to add. A builder a table runs is selected by no section. A table that no module in the deployment reads is refused at startup, and so is a table whose name is not a folder name.
+
+A secret in a shared table is written as the name of its entry in the secret store, declared by the vendor's builder as a module's own secret settings are, and resolved when the table is present.
+
+```toml
+[shared.example]
+endpoint = "https://api.example.com/v1"
+license_key = "example_license_key"
 ```
 
 ## Request Signing
