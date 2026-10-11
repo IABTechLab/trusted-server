@@ -127,7 +127,7 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, PlatformLoadingCache, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
     build_geo_module,
 };
 use trusted_server_core::proxy::{
@@ -213,7 +213,7 @@ pub(crate) struct AppState {
     /// The loading cache the linked builders offer, taken once here and handed
     /// to every request's services, so lookups in one request share its
     /// memory copy.
-    pub(crate) loading_cache: Arc<dyn PlatformLoadingCache>,
+    pub(crate) loading_caches: Arc<LoadingCaches>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -343,7 +343,8 @@ pub(crate) fn build_state_with_registrations(
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
-    let loading_cache = trusted_server_core::integrations::loading_cache_from(integrations)?;
+    let loading_caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -353,7 +354,7 @@ pub(crate) fn build_state_with_registrations(
         auction_telemetry_sink,
         ec_module,
         permission_signal_modules,
-        loading_cache,
+        loading_caches,
     }))
 }
 
@@ -439,7 +440,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
         .value_cache(Arc::new(crate::value_cache::FastlyValueCache))
-        .loading_cache(Arc::clone(&state.loading_cache))
+        .loading_caches(Arc::clone(&state.loading_caches))
         // Constructed unconditionally, but only read when the assembly mode is a
         // shared-template one — which defaults to Inline, so this is inert until an
         // operator opts in.
@@ -497,14 +498,14 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 pub(crate) fn build_finalize_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
-    loading_cache: Arc<dyn PlatformLoadingCache>,
+    loading_caches: Arc<LoadingCaches>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
         .value_cache(Arc::new(crate::value_cache::FastlyValueCache))
-        .loading_cache(loading_cache)
+        .loading_caches(loading_caches)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
@@ -1548,7 +1549,7 @@ impl TrustedServerApp {
             build_finalize_services(
                 &state.settings,
                 Arc::clone(&state.default_kv_store),
-                Arc::clone(&state.loading_cache),
+                Arc::clone(&state.loading_caches),
             ),
         ));
 
@@ -1884,7 +1885,7 @@ mod tests {
             default_kv_store,
             ec_module,
             permission_signal_modules: Arc::default(),
-            loading_cache: Arc::new(trusted_server_core::platform::NoLoadingCache),
+            loading_caches: Arc::default(),
         });
         TrustedServerApp::routes_for_state(&state)
     }

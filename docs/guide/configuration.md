@@ -1684,20 +1684,25 @@ has used it for the idle time, and an answer with a shorter lifetime of its own
 ends sooner still. Every key starts with `ts.` and the publisher's domain, with
 a leading `www.` dropped, so publishers sharing a store never share a copy.
 
-A deployment caches this way when a crate it links offers a loading cache. A
-stock build links `loading-cache.51degrees`, from
-`crates/loading-cache/51degrees`, which no section selects, because a loading
-cache is how the deployment caches rather than a module a document selects. A
-build that links none makes each answer every time it is asked for.
+Each feature that holds answers this way selects the cache that holds them,
+by naming in its own `[cache.<name>]` table a module that offers a loading
+cache, with the module's short name or its name in full. A stock build links
+`loading-cache.51degrees`, from `crates/loading-cache/51degrees`, so
+`module = "51degrees"` selects it. A feature that names no module keeps no
+copy and makes each answer every time it is asked for, and a name that no
+linked crate offers a cache from is refused when the service starts, with
+the names that could be written.
 
 | Table                | Field                | Default            | Range         | Description                                                                     |
 | -------------------- | -------------------- | ------------------ | ------------- | ------------------------------------------------------------------------------- |
+| `[cache.robots-txt]` | `module`             | none               |               | The module whose loading cache holds each robots.txt module's answer.           |
 | `[cache.robots-txt]` | `memory_seconds`     | `60`               | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week   | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
 
 ```toml
 [cache.robots-txt]
+module = "51degrees"
 memory_seconds = 60
 store_seconds = 604800
 store_idle_seconds = 2592000
@@ -1758,9 +1763,9 @@ behind after a module is switched off is caught rather than sitting unread.
 `ad-server.mock` supply demand and ad server implementations only. They are
 not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
-`[ad-server.<name>]`. `loading-cache.51degrees` supplies the loading cache a
-stock build caches with, described under [Loading caches](#loading-caches),
-and no section selects it either.
+`[ad-server.<name>]`. `loading-cache.51degrees` supplies a loading cache,
+which a feature selects in its own `[cache.<name>]` table, described under
+[Loading caches](#loading-caches), and no section selects it either.
 
 ### Placing page changes
 

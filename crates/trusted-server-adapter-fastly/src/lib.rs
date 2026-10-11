@@ -35,9 +35,7 @@ use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::build_geo_module;
-use trusted_server_core::platform::{
-    ClientInfo, NoLoadingCache, RuntimeServices, UnavailableKvStore,
-};
+use trusted_server_core::platform::{ClientInfo, RuntimeServices, UnavailableKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -759,13 +757,9 @@ fn entry_point_finalize_services(
         Some(state) => build_finalize_services(
             settings,
             Arc::clone(&state.default_kv_store),
-            Arc::clone(&state.loading_cache),
+            Arc::clone(&state.loading_caches),
         ),
-        None => build_finalize_services(
-            settings,
-            Arc::new(UnavailableKvStore),
-            Arc::new(NoLoadingCache),
-        ),
+        None => build_finalize_services(settings, Arc::new(UnavailableKvStore), Arc::default()),
     }
 }
 
@@ -1199,11 +1193,8 @@ mod tests {
     #[test]
     fn the_device_module_the_registry_resolved_classifies_the_request() {
         let settings = test_settings();
-        let services = build_finalize_services(
-            &settings,
-            Arc::new(UnavailableKvStore),
-            Arc::new(NoLoadingCache),
-        );
+        let services =
+            build_finalize_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
         let registered: Arc<dyn DeviceModule> = Arc::new(MarkedDeviceModule);
 
         let signals = futures::executor::block_on(derive_device_signals(
@@ -1224,11 +1215,8 @@ mod tests {
     #[test]
     fn with_no_registered_module_the_built_in_module_classifies_the_request() {
         let settings = test_settings();
-        let services = build_finalize_services(
-            &settings,
-            Arc::new(UnavailableKvStore),
-            Arc::new(NoLoadingCache),
-        );
+        let services =
+            build_finalize_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
         let req = page_request();
 
         let signals =

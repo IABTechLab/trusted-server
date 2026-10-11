@@ -359,7 +359,7 @@ points at the functions that do the work.
 | `.with_plan_registration(...)`                | Optional. Registers the module from the compiled auction plan, for a module whose page support follows what the plan selects. It runs whether or not a section selects the module, and its hooks go first |
 | `.with_plan_validator(...)`                   | Optional. Checks the module's settings against the compiled auction plan, when a deployment is validated and as the settings load                                                                         |
 | `.with_demand(...)` and `.with_adserver(...)` | Optional. Registers an auction implementation that `[demand]` or `[ad-server]` can name. A crate that supplies nothing else starts from `IntegrationBuilder::implementations(...)`                        |
-| `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, whatever the settings say. An adapter takes it with `loading_cache_from`, and a deployment links one                                               |
+| `.with_loading_cache(...)`                    | Optional. Offers the loading cache the crate supplies, which a feature selects by the module's name in its `[cache.<name>]` table. An adapter takes the selections with `loading_caches_from`             |
 
 ```rust
 pub fn module_name() -> &'static str {
@@ -800,14 +800,16 @@ nothing and runs every load, and the implementation comes from a crate outside
 core.
 
 A crate supplies one by implementing `PlatformLoadingCache` and offering a
-factory on its builder with `.with_loading_cache(...)`. The offer stands
-whatever the settings say, because a loading cache is how a deployment caches
-rather than a module a document selects, so a crate that supplies nothing else
-starts from `IntegrationBuilder::implementations(...)`. An adapter takes the
-cache from the builders it is given with `loading_cache_from` when it builds
-its state and hands it to every request's services. A deployment links one
-such crate, because two offered are refused naming both. The stock list
-carries `crates/loading-cache/51degrees`.
+factory on its builder with `.with_loading_cache(...)`. The offer is not a
+selection. Each feature that holds answers selects the cache that holds them
+by naming the module in its own `[cache.<name>]` table, so a crate that
+supplies nothing else starts from `IntegrationBuilder::implementations(...)`
+and is named by its id. An adapter takes the selections from the settings and
+the builders it is given with `loading_caches_from` when it builds its state,
+which refuses a name no builder offers a cache from, and hands them to every
+request's services as `LoadingCaches`. A feature that selects nothing loads
+through `NoLoadingCache`. The stock list carries
+`crates/loading-cache/51degrees`.
 
 ```rust
 pub fn builder() -> IntegrationBuilder {

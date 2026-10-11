@@ -642,7 +642,7 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
     let services = build_finalize_services(
         &state.settings,
         Arc::clone(&state.default_kv_store),
-        Arc::new(trusted_server_core::platform::NoLoadingCache),
+        Arc::default(),
     );
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
     let method = Method::GET;
@@ -690,7 +690,7 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
     let services = build_finalize_services(
         &selected.settings,
         Arc::clone(&selected.default_kv_store),
-        Arc::new(trusted_server_core::platform::NoLoadingCache),
+        Arc::default(),
     );
     let signals = block_on(crate::derive_device_signals(
         &selected.settings,
@@ -711,7 +711,7 @@ fn device_selector_naming_a_module_classifies_a_request_with_it() {
     let services = build_finalize_services(
         &unset.settings,
         Arc::clone(&unset.default_kv_store),
-        Arc::new(trusted_server_core::platform::NoLoadingCache),
+        Arc::default(),
     );
     let signals = block_on(crate::derive_device_signals(
         &unset.settings,

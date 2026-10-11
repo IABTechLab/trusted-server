@@ -76,8 +76,8 @@ pub use image_optimizer::{
 };
 pub use kv::UnavailableKvStore;
 pub use loading_cache::{
-    CacheLifetimes, CacheSpec, LoadError, LoadFuture, LoadedValue, Loader, NoLoadingCache,
-    PlatformLoadingCache, StoreKey,
+    CacheLifetimes, CacheSpec, LoadError, LoadFuture, LoadedValue, Loader, LoadingCaches,
+    NoLoadingCache, PlatformLoadingCache, StoreKey,
 };
 pub use server_key::ServerKeyPrefix;
 pub use template_assembly::{

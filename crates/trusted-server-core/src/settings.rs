@@ -2887,15 +2887,25 @@ pub struct CacheSettings {
 /// The most seconds a loading cache lifetime setting accepts, a year.
 pub const MAX_LOADING_CACHE_SECONDS: u32 = 365 * 24 * 60 * 60;
 
+/// The name of the cache that holds each robots.txt module's answer, whose
+/// settings are `[cache.robots-txt]`.
+pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
+
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
 ///
 /// See [`crate::platform::PlatformLoadingCache`]. The memory copy is the brief
 /// one a process keeps in front of the shared store, and the shared store's
 /// copy is the one every instance reads.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadingCacheConfig {
+    /// The module whose loading cache holds this feature's copies, as its
+    /// short name or in full, for example `51degrees` or
+    /// `loading-cache.51degrees`. Absent, the feature keeps no copy and loads
+    /// on every call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero
     /// keeps no memory copy, and a missing value is still loaded once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2966,6 +2976,13 @@ fn check_loading_cache_seconds(
 }
 
 impl CacheSettings {
+    /// Each feature whose copies a loading cache holds, by the name of its
+    /// cache, with the settings its `[cache.<name>]` table carries.
+    #[must_use]
+    pub fn loading_caches(&self) -> [(&'static str, &LoadingCacheConfig); 1] {
+        [(ROBOTS_TXT_CACHE, &self.robots_txt)]
+    }
+
     fn normalize(&mut self) {
         for rule in &mut self.asset_rules {
             rule.normalize();
@@ -6585,6 +6602,35 @@ module = \"none\"",
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
 
         assert_eq!(written, serde_json::json!({ "asset_rules": [] }));
+    }
+
+    #[test]
+    fn a_loading_cache_module_is_read_and_written_back() {
+        let toml_str = format!(
+            r#"{}
+
+            [cache.robots-txt]
+            module = "51degrees"
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse the selection");
+
+        assert_eq!(
+            settings.cache.robots_txt.module.as_deref(),
+            Some("51degrees")
+        );
+        assert!(!settings.cache.robots_txt.is_default());
+        assert_eq!(
+            settings.cache.loading_caches(),
+            [(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
+            "should list the robots.txt cache by its name"
+        );
+        let written = serde_json::to_value(&settings.cache).expect("should serialize");
+        assert_eq!(
+            written,
+            serde_json::json!({ "asset_rules": [], "robots-txt": { "module": "51degrees" } })
+        );
     }
 
     #[test]

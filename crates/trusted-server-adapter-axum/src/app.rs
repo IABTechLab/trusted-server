@@ -74,7 +74,7 @@ pub struct AppState {
     services: Option<RuntimeServices>,
     /// The loading cache the linked builders offer, taken once here so every
     /// request in the process shares its memory copy and waits for one load.
-    loading_cache: Arc<dyn trusted_server_core::platform::PlatformLoadingCache>,
+    loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
 /// The permission signal modules this adapter links, in the order they run
@@ -210,7 +210,8 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
-    let loading_cache = trusted_server_core::integrations::loading_cache_from(integrations)?;
+    let loading_caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -218,7 +219,7 @@ fn build_state_with_registrations_and_services(
         registry: Arc::new(registry),
         permission_signal_modules,
         services,
-        loading_cache,
+        loading_caches,
     }))
 }
 
@@ -239,7 +240,7 @@ impl AppState {
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         let mut services = self.services.clone().unwrap_or_else(|| {
             build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
-                .with_loading_cache(Arc::clone(&self.loading_cache))
+                .with_loading_caches(Arc::clone(&self.loading_caches))
         });
         if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
@@ -919,7 +920,7 @@ mod tests {
             // This test drives the per-request path, which builds its services
             // from the request context.
             services: None,
-            loading_cache: Arc::new(trusted_server_core::platform::NoLoadingCache),
+            loading_caches: Arc::default(),
         }
     }
 

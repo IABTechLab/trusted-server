@@ -177,10 +177,11 @@ pub struct RuntimeServices {
     /// none, in which case a caller holds what it pays for in the key-value
     /// store instead.
     pub(crate) value_cache: Option<Arc<dyn super::PlatformValueCache>>,
-    /// The cache that loads a missing value once per key, keeping its copies
-    /// in [`value_cache`](Self::value_cache) or the key-value store. Defaults
-    /// to [`super::NoLoadingCache`], which holds nothing.
-    pub(crate) loading_cache: Arc<dyn super::PlatformLoadingCache>,
+    /// The loading cache each feature selected, which loads a missing value
+    /// once per key and keeps its copies in [`value_cache`](Self::value_cache)
+    /// or the key-value store. A feature that selected none loads through
+    /// [`super::NoLoadingCache`], which holds nothing.
+    pub(crate) loading_caches: Arc<super::LoadingCaches>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
     /// per request rather than failing. See
@@ -271,10 +272,11 @@ impl RuntimeServices {
         self.value_cache.as_deref()
     }
 
-    /// The cache that loads a missing value once per key.
+    /// The loading cache `feature` selected, by the name its
+    /// [`super::CacheSpec`] carries.
     #[must_use]
-    pub fn loading_cache(&self) -> &dyn super::PlatformLoadingCache {
-        &*self.loading_cache
+    pub fn loading_cache_for(&self, feature: &str) -> &dyn super::PlatformLoadingCache {
+        self.loading_caches.for_feature(feature)
     }
 
     /// The value for `key` in the cache `spec` describes, from a fresh copy
@@ -290,7 +292,9 @@ impl RuntimeServices {
         key: &super::StoreKey,
         load: super::Loader,
     ) -> Result<bytes::Bytes, super::LoadError> {
-        self.loading_cache.get_or_load(self, spec, key, load).await
+        self.loading_cache_for(spec.name)
+            .get_or_load(self, spec, key, load)
+            .await
     }
 
     /// The shared transformed-template cache.
@@ -469,13 +473,21 @@ impl RuntimeServices {
         }
     }
 
-    /// Returns a clone of this instance with the loading cache replaced.
+    /// Returns a clone of this instance with the loading caches replaced.
     #[must_use]
-    pub fn with_loading_cache(self, cache: Arc<dyn super::PlatformLoadingCache>) -> Self {
+    pub fn with_loading_caches(self, caches: Arc<super::LoadingCaches>) -> Self {
         Self {
-            loading_cache: cache,
+            loading_caches: caches,
             ..self
         }
+    }
+
+    /// Returns a clone of this instance with every feature loading through
+    /// `cache`, for a test of one cache.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_loading_cache(self, cache: Arc<dyn super::PlatformLoadingCache>) -> Self {
+        self.with_loading_caches(Arc::new(super::LoadingCaches::every(cache)))
     }
 
     /// Returns a clone of this instance with the template cache replaced.
@@ -517,7 +529,7 @@ pub struct RuntimeServicesBuilder {
     secret_store: Option<Arc<dyn PlatformSecretStore>>,
     kv_store: Option<Arc<dyn PlatformKvStore>>,
     value_cache: Option<Arc<dyn super::PlatformValueCache>>,
-    loading_cache: Option<Arc<dyn super::PlatformLoadingCache>>,
+    loading_caches: Option<Arc<super::LoadingCaches>>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
@@ -538,7 +550,7 @@ impl RuntimeServicesBuilder {
             secret_store: None,
             kv_store: None,
             value_cache: None,
-            loading_cache: None,
+            loading_caches: None,
             template_cache: None,
             template_assembler: None,
             backend: None,
@@ -574,10 +586,10 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the cache that loads a missing value once per key.
+    /// Set the loading cache each feature selected.
     #[must_use]
-    pub fn loading_cache(mut self, cache: Arc<dyn super::PlatformLoadingCache>) -> Self {
-        self.loading_cache = Some(cache);
+    pub fn loading_caches(mut self, caches: Arc<super::LoadingCaches>) -> Self {
+        self.loading_caches = Some(caches);
         self
     }
 
@@ -705,9 +717,7 @@ impl RuntimeServicesBuilder {
             value_cache: self.value_cache,
             // Defaulted rather than required: a deployment that links no
             // module supplying one asks each source itself.
-            loading_cache: self
-                .loading_cache
-                .unwrap_or_else(|| Arc::new(super::NoLoadingCache)),
+            loading_caches: self.loading_caches.unwrap_or_default(),
             // Defaulted rather than required: an adapter with no template cache
             // should degrade to transforming per request, not fail to build.
             template_cache: self

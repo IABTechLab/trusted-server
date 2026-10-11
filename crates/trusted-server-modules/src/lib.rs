@@ -442,15 +442,21 @@ mod tests {
         );
     }
 
-    /// The adapters take the loading cache from this list, so a stock build
-    /// keeps what it loads rather than asking each source every time.
+    /// A feature selects the stock loading cache by the module's short name,
+    /// so a stock build keeps what it loads rather than asking each source
+    /// every time.
     #[test]
-    fn the_stock_list_offers_one_loading_cache() {
-        let cache = trusted_server_core::integrations::loading_cache_from(&builders())
-            .expect("the stock list should offer one loading cache");
+    fn a_feature_selects_the_stock_loading_cache_by_name() {
+        let mut settings = trusted_server_core::test_support::tests::create_test_settings();
+        settings.cache.robots_txt.module = Some("51degrees".to_owned());
+
+        let caches = trusted_server_core::integrations::loading_caches_from(&settings, &builders())
+            .expect("the stock list should offer the selected loading cache");
 
         assert!(
-            cache.keeps_values(),
+            caches
+                .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
+                .keeps_values(),
             "the stock loading cache should keep what it loads"
         );
     }

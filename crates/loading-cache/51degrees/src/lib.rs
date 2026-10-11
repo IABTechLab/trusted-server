@@ -25,10 +25,11 @@
 //! `wait_until` where the request's handling is wrapped in `scope_request`.
 //! Fastly and Spin run each load in the caller.
 //!
-//! An adapter takes the cache through
-//! [`trusted_server_core::integrations::loading_cache_from`] from the builder
-//! [`builder`] returns, which the stock list carries, so no adapter names this
-//! crate.
+//! A feature selects this cache by naming the module, `51degrees` or in full,
+//! in its own `[cache.<name>]` table, and an adapter takes the selections
+//! through [`trusted_server_core::integrations::loading_caches_from`] from the
+//! builder [`builder`] returns, which the stock list carries, so no adapter
+//! names this crate.
 
 mod layer;
 mod stores;

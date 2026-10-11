@@ -263,10 +263,17 @@ fn module_constant_is_the_crate_folder() {
 
 #[test]
 fn the_builder_offers_a_cache_that_keeps_values() {
-    let cache = trusted_server_core::integrations::loading_cache_from(&[crate::builder()])
-        .expect("one builder offers one cache");
+    let mut settings = trusted_server_core::test_support::tests::create_test_settings();
+    settings.cache.robots_txt.module = Some("51degrees".to_owned());
+    let caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, &[crate::builder()])
+            .expect("a feature selecting this module should find its cache");
 
-    assert!(cache.keeps_values());
+    assert!(
+        caches
+            .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
+            .keeps_values()
+    );
     assert!(
         !crate::builder().supplies_integration(),
         "the cache is offered whatever the settings say, and no section selects it"

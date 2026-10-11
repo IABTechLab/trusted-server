@@ -17,8 +17,10 @@
 //! entry.
 
 use core::fmt;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -232,6 +234,58 @@ impl PlatformLoadingCache for NoLoadingCache {
 
     fn keeps_values(&self) -> bool {
         false
+    }
+}
+
+/// The loading cache each feature selected, by the name its [`CacheSpec`]
+/// carries. A feature that selected none loads through [`NoLoadingCache`].
+#[derive(Default)]
+pub struct LoadingCaches {
+    by_feature: HashMap<&'static str, Arc<dyn PlatformLoadingCache>>,
+    /// What a feature that selected nothing loads through, when a test gives
+    /// every feature one cache.
+    unselected: Option<Arc<dyn PlatformLoadingCache>>,
+}
+
+impl LoadingCaches {
+    /// Every feature loading through `cache`, for a test of one cache.
+    #[must_use]
+    pub fn every(cache: Arc<dyn PlatformLoadingCache>) -> Self {
+        Self {
+            by_feature: HashMap::new(),
+            unselected: Some(cache),
+        }
+    }
+
+    /// Keeps `cache` as the one `feature` selected.
+    pub fn insert(&mut self, feature: &'static str, cache: Arc<dyn PlatformLoadingCache>) {
+        self.by_feature.insert(feature, cache);
+    }
+
+    /// The cache `feature` loads through.
+    #[must_use]
+    pub fn for_feature(&self, feature: &str) -> &dyn PlatformLoadingCache {
+        match self.by_feature.get(feature).or(self.unselected.as_ref()) {
+            Some(cache) => &**cache,
+            None => &NoLoadingCache,
+        }
+    }
+
+    /// Whether no feature selected a cache.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_feature.is_empty() && self.unselected.is_none()
+    }
+}
+
+impl fmt::Debug for LoadingCaches {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut selected: Vec<&&str> = self.by_feature.keys().collect();
+        selected.sort();
+        f.debug_struct("LoadingCaches")
+            .field("selected", &selected)
+            .field("every", &self.unselected.is_some())
+            .finish()
     }
 }
 

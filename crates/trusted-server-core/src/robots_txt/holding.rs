@@ -33,7 +33,7 @@ use crate::platform::{
 use crate::settings::Settings;
 
 /// The cache contributors' answers are held in.
-pub(crate) const CACHE: &str = "robots-txt";
+pub(crate) const CACHE: &str = crate::settings::ROBOTS_TXT_CACHE;
 
 /// Where each contributor's last answer is kept apart from the cache.
 const KEPT: &str = "robots-txt-kept";
@@ -760,7 +760,9 @@ pub(crate) mod tests {
             .http_client(Arc::new(StubHttpClient::new()))
             .geo(Arc::new(crate::platform::test_support::NoopGeo))
             .value_cache(Arc::clone(&value_cache) as Arc<dyn crate::platform::PlatformValueCache>)
-            .loading_cache(Arc::new(MemoryLoadingCache::default()))
+            .loading_caches(Arc::new(crate::platform::LoadingCaches::every(Arc::new(
+                MemoryLoadingCache::default(),
+            ))))
             .client_info(crate::platform::ClientInfo::default())
             .build();
 
