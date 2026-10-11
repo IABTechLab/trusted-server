@@ -7135,6 +7135,7 @@ dependencies = [
  "trusted-server-framework-nextjs",
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
+ "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-testlight",
 ]
@@ -7189,6 +7190,21 @@ name = "trusted-server-permission-signal-us-privacy"
 version = "0.1.0"
 dependencies = [
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-tag-google-tag"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "trusted-server-tag-google-tag-manager",
+ "url",
+ "validator",
 ]
 
 [[package]]

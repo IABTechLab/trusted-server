@@ -31,7 +31,7 @@ crates/
   cmp/                                  # consent tool module crates (didomi, inmobi, osano, sourcepoint)
   framework/                            # framework module crates (nextjs)
   identity/                             # identity module crates (lockr)
-  tag/                                  # tag manager module crates (google-tag-manager)
+  tag/                                  # tag module crates (google-tag, google-tag-manager)
   testing/                              # test module crates (seam-probe, testlight)
   device/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device module)

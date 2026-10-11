@@ -368,7 +368,7 @@ pull_sync_concurrency = 3
 
 # [[serve]]
 # media_type = "text/html"
-# middleware = ["bot-protection.datadome.tag", "ad-tag.google.diagnostics"]
+# middleware = ["tag.google-tag", "bot-protection.datadome.tag", "ad-tag.google.diagnostics"]
 
 # First-party proxying of named third-party scripts. Uncomment the
 # `modules` line under [proxy] below to switch it on.
@@ -895,6 +895,18 @@ auction_timeout_ms = 500
 # `ts audit`, it serves a diagnostics module gated behind an activation query
 # param and a session cookie. It has nothing to set, so adding
 # "google.diagnostics" to [ad-tag] modules is the whole configuration.
+
+# Google's tag, Tag Manager container and AdSense loader written on the page
+# from these settings, for a publisher whose pages cannot carry them. The
+# consent mode defaults are written first and every type defaults to denied.
+# Name "google-tag" in [tag] modules and "tag.google-tag" in a [[serve]] entry
+# for "text/html".
+# [tag.google-tag]
+# analytics_tag_id = "G-REPLACE-ME"
+# container_id = "GTM-REPLACE-ME"
+# adsense_client_id = "ca-pub-0000000000000000"
+# [tag.google-tag.consent_defaults]
+# ad_storage = "denied"
 
 # Google Tag Manager first-party proxy. `ts audit` selects "google-tag-manager"
 # in [tag] and writes this table with the container_id it finds when it

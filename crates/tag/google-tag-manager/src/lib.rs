@@ -918,6 +918,73 @@ fn build(
 ///
 /// Returns an error when the Google Tag Manager configuration cannot be parsed or fails
 /// validation.
+/// Whether `value` has the shape of a tag id Google serves from `gtag/js`.
+///
+/// Offered so the google tag module accepts exactly the ids this one accepts.
+/// Two spellings of the same rule would eventually disagree, and the pair that
+/// disagreed would be a tag configured in one place and refused in the other.
+#[must_use]
+pub fn tag_id_is_well_formed(value: &str) -> bool {
+    GTM_TAG_ID_PATTERN.is_match(value)
+}
+
+/// Whether `value` has the shape of a container id, offered for the same
+/// reason as [`tag_id_is_well_formed`].
+#[must_use]
+pub fn container_id_is_well_formed(value: &str) -> bool {
+    GTM_CONTAINER_ID_PATTERN.is_match(value)
+}
+
+/// The first-party path this module serves `gtag/js` from for `tag_id`, or
+/// `None` when it would not serve that tag, either because the module is not
+/// selected or because `tag_id` is neither its container nor on its
+/// `allowed_tag_ids` list, where a request for the tag is redirected upstream
+/// rather than proxied, so naming the first-party path would only add a
+/// redirect to the page's first script.
+///
+/// # Errors
+///
+/// When the module's settings cannot be read or fail their validation.
+pub fn first_party_gtag_js_path(
+    settings: &Settings,
+    tag_id: &str,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<GoogleTagManagerConfig>(MODULE)? else {
+        return Ok(None);
+    };
+    let serves_tag = config.container_id == tag_id
+        || config
+            .allowed_tag_ids
+            .iter()
+            .any(|allowed| allowed == tag_id);
+    if !serves_tag {
+        return Ok(None);
+    }
+    Ok(Some(format!("/integrations/{GTM_INTEGRATION_ID}/gtag/js")))
+}
+
+/// The first-party path this module serves `gtm.js` from for `container_id`,
+/// or `None` when it would not serve that container. The endpoint always
+/// answers with the container this module is configured for and never with
+/// the one the request names, so a first-party path is only right when the
+/// two are the same container.
+///
+/// # Errors
+///
+/// When the module's settings cannot be read or fail their validation.
+pub fn first_party_gtm_js_path(
+    settings: &Settings,
+    container_id: &str,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<GoogleTagManagerConfig>(MODULE)? else {
+        return Ok(None);
+    };
+    if config.container_id != container_id {
+        return Ok(None);
+    }
+    Ok(Some(format!("/integrations/{GTM_INTEGRATION_ID}/gtm.js")))
+}
+
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
         .module_config::<GoogleTagManagerConfig>(MODULE)
