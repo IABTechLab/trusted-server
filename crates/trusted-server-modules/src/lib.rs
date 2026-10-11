@@ -110,6 +110,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_cmp_inmobi as inmobi;
     use trusted_server_cmp_sourcepoint as sourcepoint;
     use trusted_server_core::integrations::js_asset_proxy;
+    use trusted_server_core::robots_txt::middleware as robots_txt;
     use trusted_server_framework_nextjs as nextjs;
     use trusted_server_identity_lockr as lockr;
     use trusted_server_tag_google_tag_manager as google_tag_manager;
@@ -150,6 +151,14 @@ pub fn middleware() -> Vec<StockMiddleware> {
             phase: Fetch,
             media_type: ads_txt_sellers::MEDIA_TYPE,
             name: ads_txt_sellers::MODULE,
+        },
+        // Core makes the file `[robots-txt]` describes under the module's
+        // own name, on the file's path alone.
+        StockMiddleware {
+            integration: robots_txt::MODULE,
+            phase: Fetch,
+            media_type: robots_txt::MEDIA_TYPE,
+            name: robots_txt::MODULE,
         },
     ]
 }
@@ -250,6 +259,10 @@ mod tests {
             checked.extend(running);
         }
 
+        // Core's robots.txt middleware is registered by the section, not by a
+        // module, and `core_s_robots_txt_middleware_is_registered_with_the_section`
+        // checks it.
+        checked.push(trusted_server_core::robots_txt::middleware::MODULE);
         for row in &listed {
             assert!(
                 checked.contains(&row.integration),
@@ -259,6 +272,38 @@ mod tests {
                 row.integration
             );
         }
+    }
+
+    /// The row for core's robots.txt middleware is registered by settings
+    /// that carry the section and the entry, in the phase the row lists.
+    #[test]
+    fn core_s_robots_txt_middleware_is_registered_with_the_section() {
+        use trusted_server_core::robots_txt::middleware as robots_txt;
+
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            "[robots-txt]
+modules = \"refuse_all\"
+
+[[fetch]]
+media_type = \"text/plain\"
+\n             path = \"/robots.txt\"
+middleware = [\"robots_txt\"]
+",
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &builders())
+            .expect("should build a registry with the section");
+        let row = middleware()
+            .into_iter()
+            .find(|row| row.name == robots_txt::MODULE)
+            .expect("the stock list should carry the row");
+
+        assert!(
+            registry
+                .middleware_in(row.phase)
+                .contains(&robots_txt::MODULE),
+            "the section should register the middleware for the listed phase"
+        );
+        assert_eq!(row.media_type, robots_txt::MEDIA_TYPE);
     }
 
     #[test]
@@ -274,6 +319,9 @@ mod tests {
                 order.push(builder.id());
             }
         }
+        // Core makes the file's middleware once every registration is in,
+        // so it comes after every module's.
+        order.push(trusted_server_core::robots_txt::middleware::MODULE);
         let place = |integration: &str| {
             order
                 .iter()
@@ -327,19 +375,30 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.media_type == media_type)
                     .collect();
-                assert_eq!(
-                    covering.len(),
-                    1,
-                    "should document one [[{phase}]] entry for {media_type}"
-                );
                 if media_type == HTML_MEDIA_TYPE {
+                    assert_eq!(
+                        covering.len(),
+                        1,
+                        "should document one [[{phase}]] entry for {media_type}"
+                    );
                     assert!(
                         covering[0].path.is_none(),
                         "should document the [[{phase}]] entry that covers every page"
                     );
+                } else {
+                    // A file's middleware is placed on the file's own path, one
+                    // entry for each file.
+                    assert!(
+                        !covering.is_empty() && covering.iter().all(|entry| entry.path.is_some()),
+                        "should document a [[{phase}]] entry on a path for each {media_type} file"
+                    );
                 }
+                let named: Vec<&str> = covering
+                    .iter()
+                    .flat_map(|entry| entry.middleware.iter().map(String::as_str))
+                    .collect();
                 assert_eq!(
-                    covering[0].middleware, listed,
+                    named, listed,
                     "should document every {phase} middleware the stock modules supply for \
                      {media_type}, in the listed order"
                 );

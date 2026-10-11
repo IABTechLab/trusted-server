@@ -39,7 +39,6 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
-use trusted_server_core::robots_txt::{ROBOTS_TXT_PATH, handle_robots_txt};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store_with,
@@ -451,7 +450,6 @@ enum NamedRouteHandler {
     FirstPartyClick,
     FirstPartySign,
     FirstPartyProxyRebuild,
-    RobotsTxt,
 }
 
 struct NamedRoute {
@@ -460,7 +458,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 15] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -545,26 +543,7 @@ fn named_routes() -> [NamedRoute; 15] {
             primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
-        // The publisher's robots.txt, served only when the settings carry a
-        // `[robots-txt]` section, see `named_route_is_served`.
-        NamedRoute {
-            path: ROBOTS_TXT_PATH,
-            primary_methods: &[Method::GET, Method::HEAD],
-            handler: NamedRouteHandler::RobotsTxt,
-        },
     ]
-}
-
-/// Whether a named route is served for these settings.
-///
-/// `/robots.txt` is this server's only when the publisher's settings carry a
-/// `[robots-txt]` section. Without one the path reaches the publisher's
-/// origin like any other, so a publisher keeping their own file is left alone.
-fn named_route_is_served(settings: &Settings, handler: NamedRouteHandler) -> bool {
-    match handler {
-        NamedRouteHandler::RobotsTxt => settings.robots_txt.is_some(),
-        _ => true,
-    }
 }
 
 fn named_route_handler(
@@ -640,9 +619,6 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::FirstPartyProxyRebuild => {
                         handle_first_party_proxy_rebuild(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::RobotsTxt => {
-                        handle_robots_txt(&state.settings, &services, &state.registry, req).await
                     }
                 }
             },
@@ -823,9 +799,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     });
 
     for route in named_routes() {
-        if !named_route_is_served(&state.settings, route.handler) {
-            continue;
-        }
         for method in route.primary_methods {
             router = router.route(
                 route.path,

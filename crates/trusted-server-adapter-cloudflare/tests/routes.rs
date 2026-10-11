@@ -597,6 +597,11 @@ fn router_refusing_every_crawler() -> RouterService {
             [robots-txt]
             modules = "refuse_all"
             always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
         "#,
     )
     .expect("should parse route test settings");
@@ -621,22 +626,19 @@ fn robots_tag(response: &Response) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The file itself is the publisher path's, made by the `robots_txt`
+/// middleware the entry names, so no route of this server names the path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refusing_every_crawler_serves_the_refusal_and_tags_every_response() {
-    let file = route(
-        router_refusing_every_crawler(),
-        robots_request("GET", "/robots.txt"),
-    )
-    .await;
-
-    assert_eq!(
-        file.status().as_u16(),
-        200,
-        "the refusal should be served here"
+async fn refusing_every_crawler_tags_every_response_and_registers_no_route() {
+    let registered: Vec<String> = router_refusing_every_crawler()
+        .routes()
+        .into_iter()
+        .map(|route| route.path().to_string())
+        .collect();
+    assert!(
+        !registered.iter().any(|path| path == "/robots.txt"),
+        "the file is the publisher path's: {registered:?}"
     );
-    assert_eq!(robots_tag(&file).as_deref(), Some("noindex, nofollow"));
-    let body = file.into_body().into_bytes().unwrap_or_default();
-    assert_eq!(&body[..], b"User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
 
     let other = route(
         router_refusing_every_crawler(),
@@ -649,73 +651,6 @@ async fn refusing_every_crawler_serves_the_refusal_and_tags_every_response() {
         Some("noindex, nofollow"),
         "no route may be the one page a crawler is allowed to index"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_head_of_robots_txt_is_answered_here_with_no_body() {
-    let response = route(
-        router_refusing_every_crawler(),
-        robots_request("HEAD", "/robots.txt"),
-    )
-    .await;
-
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "a HEAD should be answered here as a GET is"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("text/plain; charset=utf-8")
-    );
-    let body = response.into_body().into_bytes().unwrap_or_default();
-    assert!(body.is_empty(), "a HEAD carries no body");
-}
-
-/// A method that is neither `GET` nor `HEAD` is the publisher's, as it is on
-/// any other path, so it is not answered with the file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn another_method_on_robots_txt_is_not_answered_with_the_file() {
-    let response = route(
-        router_refusing_every_crawler(),
-        robots_request("POST", "/robots.txt"),
-    )
-    .await;
-
-    let body = response.into_body().into_bytes().unwrap_or_default();
-    assert!(
-        !body.starts_with(b"User-agent:"),
-        "a POST should reach the publisher fallback and not be given the file"
-    );
-}
-
-#[test]
-fn robots_txt_is_this_servers_only_when_the_settings_carry_the_section() {
-    let registered = |router: RouterService| -> Vec<(String, String)> {
-        router
-            .routes()
-            .into_iter()
-            .map(|route| (route.method().to_string(), route.path().to_string()))
-            .collect()
-    };
-
-    let without = registered(test_router());
-    assert!(
-        !without.iter().any(|(_, path)| path == "/robots.txt"),
-        "without the section the path is the publisher's: {without:?}"
-    );
-
-    let with = registered(router_refusing_every_crawler());
-    for method in ["GET", "HEAD"] {
-        assert!(
-            with.iter()
-                .any(|(registered, path)| registered == method && path == "/robots.txt"),
-            "{method} /robots.txt should be answered here: {with:?}"
-        );
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

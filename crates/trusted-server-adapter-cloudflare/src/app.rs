@@ -45,7 +45,6 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
-use trusted_server_core::robots_txt::{ROBOTS_TXT_PATH, handle_robots_txt};
 use trusted_server_core::settings::Settings;
 
 use crate::middleware::{FinalizeResponseMiddleware, SanitizeRequestMiddleware};
@@ -895,23 +894,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     } else {
                         router = router.route(&route.path, method, fallback.clone());
                     }
-                }
-            }
-        }
-
-        // `/robots.txt` is this server's only when the settings carry a
-        // `[robots-txt]` section. Without one the path reaches the publisher's
-        // origin like any other, so a publisher keeping their own file is
-        // left alone.
-        if state.settings.robots_txt.is_some() {
-            let robots_txt = make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_robots_txt(&s.settings, &services, &s.registry, req).await
-            });
-            for method in publisher_fallback_methods() {
-                if matches!(method, Method::GET | Method::HEAD) {
-                    router = router.route(ROBOTS_TXT_PATH, method, robots_txt.clone());
-                } else {
-                    router = router.route(ROBOTS_TXT_PATH, method, fallback.clone());
                 }
             }
         }

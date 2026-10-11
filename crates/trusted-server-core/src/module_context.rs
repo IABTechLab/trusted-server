@@ -165,6 +165,18 @@ impl ResolvedRequest {
         }
     }
 
+    /// The method, address, host and scheme `view` carries.
+    #[must_use]
+    pub fn from_view(view: &ModuleRequest<'_>) -> Self {
+        Self {
+            method: view.method.clone(),
+            path: view.path.to_owned(),
+            query: view.query.to_owned(),
+            host: view.host.to_owned(),
+            scheme: view.scheme.to_owned(),
+        }
+    }
+
     /// The same request with no query, for an answer that is held and served
     /// to every caller, which must not depend on what one caller put in the
     /// address.

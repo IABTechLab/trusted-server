@@ -38,14 +38,15 @@
 mod contributor;
 pub mod document;
 mod holding;
+pub mod middleware;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
+use http::Response;
 use http::header::{self, HeaderValue};
-use http::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use validator::{Validate, ValidationError};
 
@@ -53,16 +54,12 @@ pub use contributor::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 pub use document::{Contribution, Group, Record};
 
 use crate::error::TrustedServerError;
-use crate::integrations::IntegrationRegistry;
 use crate::module_context::ResolvedRequest;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// The path this module answers.
 pub const ROBOTS_TXT_PATH: &str = "/robots.txt";
-
-/// How long a browser or an edge cache may hold the answer.
-const CLIENT_CACHE_SECONDS: u32 = 3600;
 
 /// How long a crawler is asked to wait when there is no file to give it.
 const RETRY_AFTER_SECONDS: u32 = 600;
@@ -294,77 +291,48 @@ pub fn apply_response_robots_tag(settings: &Settings, response: &mut Response<Ed
     );
 }
 
-/// Answers `GET` and `HEAD /robots.txt` for a publisher whose settings carry
-/// a `[robots-txt]` section. A `HEAD` is answered with the headers of the
-/// `GET` and no body.
+/// One entry of `modules` as the registry resolved it: the name a
+/// contributor was declared under and the contributor, or `allow_all` and
+/// none.
+pub(crate) type Selected = (&'static str, Option<Arc<dyn RobotsTxtContributor>>);
+
+/// The entries of `config.modules` resolved against `contributors`, the
+/// contributors a deployment runs by the names they were declared under.
 ///
 /// # Errors
 ///
-/// When the settings carry no `[robots-txt]` section. An adapter registers
-/// this route only when the section is present, so that is a wiring fault and
-/// not something a request can cause.
-pub async fn handle_robots_txt(
-    settings: &Settings,
-    services: &RuntimeServices,
-    registry: &IntegrationRegistry,
-    req: Request<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let response = answer(settings, services, registry, &req).await?;
-    Ok(if req.method() == Method::HEAD {
-        response.map(|_| EdgeBody::empty())
-    } else {
-        response
-    })
-}
-
-async fn answer(
-    settings: &Settings,
-    services: &RuntimeServices,
-    registry: &IntegrationRegistry,
-    req: &Request<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let config = settings.robots_txt.as_ref().ok_or_else(|| {
-        Report::new(configuration(
-            "the robots.txt route is registered but there is no [robots-txt] section".to_owned(),
-        ))
-    })?;
-    // A refusal answers without asking anything, before any contributor,
-    // held answer or network is involved. That is the point of it, because a
-    // site that is not ready to be crawled can then say so with nothing
-    // provisioned at all.
-    if config.refuses_all() {
-        return Ok(respond(Ok(document::refusal(&config.always_allow))));
-    }
-    let mut selected: Vec<Selected> = Vec::new();
-    for id in &config.modules {
-        if id == ALLOW_ALL {
+/// When an entry names a contributor `contributors` does not carry, which
+/// the registry refuses before it asks, so this is a wiring fault.
+pub(crate) fn select(
+    config: &RobotsTxtConfig,
+    contributors: &[(&'static str, Arc<dyn RobotsTxtContributor>)],
+) -> Result<Vec<Selected>, Report<TrustedServerError>> {
+    let mut selected = Vec::with_capacity(config.modules.len());
+    for written in &config.modules {
+        if written == REFUSE_ALL {
+            // The refusal needs no contributor, and the middleware answers it
+            // before asking any.
+            continue;
+        }
+        if written == ALLOW_ALL {
             selected.push((ALLOW_ALL, None));
             continue;
         }
-        let Some((declared, contributor)) = registry.robots_txt_contributor(id) else {
-            // The registry refuses a selection nothing supplies when it is
-            // built, so this is a wiring fault, and it still fails closed.
-            return Ok(respond(Err(Report::new(configuration(format!(
-                "[robots-txt] modules names `{id}`, which no module in this deployment supplies"
-            ))))));
+        let Some((declared, contributor)) = contributors.iter().find(|(name, _)| {
+            *name == written || crate::module_name::short_form(MODULE_TYPE, name) == written
+        }) else {
+            return Err(Report::new(configuration(format!(
+                "[robots-txt] modules names `{written}`, which no module in this deployment supplies"
+            ))));
         };
-        selected.push((declared, Some(contributor)));
+        selected.push((declared, Some(Arc::clone(contributor))));
     }
-    // The answers are held and served to every crawler, so the contributors
-    // are handed the request with nothing one crawler put in the address.
-    let request = ResolvedRequest::of(req, services.client_info()).without_query();
-    Ok(respond(
-        file_for(config, &selected, &request, services, settings).await,
-    ))
+    Ok(selected)
 }
-
-/// One entry of `modules` as the handler resolved it: the name a contributor
-/// was declared under and the contributor, or `allow_all` and none.
-type Selected = (&'static str, Option<Arc<dyn RobotsTxtContributor>>);
 
 /// The file for `config`, from the contributions of `selected` in order,
 /// each asked for `request`.
-async fn file_for(
+pub(crate) async fn file_for(
     config: &RobotsTxtConfig,
     selected: &[Selected],
     request: &ResolvedRequest,
@@ -383,38 +351,6 @@ async fn file_for(
     Ok(document::assemble(config, &contributions))
 }
 
-fn respond(file: Result<String, Report<TrustedServerError>>) -> Response<EdgeBody> {
-    match file {
-        Ok(file) => Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            )
-            .header(
-                header::CACHE_CONTROL,
-                format!("public, max-age={CLIENT_CACHE_SECONDS}"),
-            )
-            .body(EdgeBody::from(file.into_bytes()))
-            .expect("should build the robots.txt response"),
-        Err(report) => {
-            log::error!("Could not assemble robots.txt: {report:?}");
-            Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain; charset=utf-8"),
-                )
-                .header(header::RETRY_AFTER, RETRY_AFTER_SECONDS.to_string())
-                .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
-                .body(EdgeBody::from(
-                    b"robots.txt is temporarily unavailable\n".to_vec(),
-                ))
-                .expect("should build the robots.txt failure response")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -424,7 +360,10 @@ mod tests {
         settings,
     };
     use super::*;
-    use crate::integrations::{IntegrationBuilder, IntegrationRegistration};
+    use crate::integrations::{IntegrationBuilder, IntegrationRegistration, IntegrationRegistry};
+    use crate::middleware::Middleware;
+    use crate::module_context::{ModuleContext, ModuleRequest};
+    use http::StatusCode;
 
     fn parsed(document: serde_json::Value) -> RobotsTxtConfig {
         serde_json::from_value(document).expect("should read the robots.txt settings")
@@ -615,71 +554,122 @@ mod tests {
         );
     }
 
+    /// What the middleware prepares for `settings`, with the services given,
+    /// through the registry that made it from `[robots-txt]`, as the handler
+    /// runs it for `/robots.txt` in the fetch phase.
+    async fn prepared_by(
+        settings: &Settings,
+        extra: &[IntegrationBuilder],
+        services: &RuntimeServices,
+    ) -> Result<Option<String>, crate::middleware::Refusal> {
+        use crate::middleware::{MiddlewarePhase, Prepared};
+
+        let registry = IntegrationRegistry::with_registrations(settings, extra)
+            .expect("should build the registry");
+        let chain = registry.middleware_chain(
+            &settings.fetch,
+            MiddlewarePhase::Fetch,
+            middleware::MEDIA_TYPE,
+            ROBOTS_TXT_PATH,
+        );
+        assert_eq!(
+            chain.ids(),
+            [middleware::MODULE],
+            "the entry names the middleware"
+        );
+        let request = robots_request();
+        let module_context =
+            ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
+                .with_settings(settings)
+                .with_services(services);
+        let state = crate::integrations::IntegrationDocumentState::default();
+        let prepared = Prepared::default();
+        let context = crate::middleware::MiddlewareContext {
+            prepared: &prepared,
+            ..crate::middleware::test_support::context(MiddlewarePhase::Fetch, &state)
+        };
+        chain.prepare(&module_context, &context).await?;
+        Ok(prepared.take::<String>(middleware::MODULE))
+    }
+
+    /// `settings` with `config` as its `[robots-txt]` section and the entry
+    /// that places the middleware on the file.
+    fn settings_placing(config: RobotsTxtConfig) -> Settings {
+        let mut settings = settings();
+        settings.robots_txt = Some(config);
+        settings.fetch =
+            crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                media_type: middleware::MEDIA_TYPE.to_owned(),
+                path: Some(ROBOTS_TXT_PATH.to_owned()),
+                middleware: vec![middleware::MODULE.to_owned()],
+            }]);
+        settings
+    }
+
     /// Leaving out the rules of a contributor that failed would allow by
     /// omission what those rules refused, so the whole file fails closed.
     #[tokio::test]
-    async fn with_nothing_held_a_failure_is_service_unavailable() {
+    async fn with_nothing_held_a_failure_refuses_the_request() {
         let failing: Arc<dyn RobotsTxtContributor> =
             Arc::new(Scripted::new(vec![Err("cannot answer".to_owned())]));
         let config = parsed(serde_json::json!({ "modules": ["failing", "allow_all"] }));
+        let middleware =
+            middleware::RobotsTxt::new(config, vec![("failing", Some(failing)), (ALLOW_ALL, None)]);
+        let settings = settings();
+        let services = services_with(Arc::default(), Arc::default());
+        let request = robots_request();
+        let module_context =
+            ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
+                .with_settings(&settings)
+                .with_services(&services);
+        let state = crate::integrations::IntegrationDocumentState::default();
+        let context = crate::middleware::test_support::context(
+            crate::middleware::MiddlewarePhase::Fetch,
+            &state,
+        );
 
-        let response = respond(
-            file_for(
-                &config,
-                &[("failing", Some(failing)), (ALLOW_ALL, None)],
-                &request(),
-                &services_with(Arc::default(), Arc::default()),
-                &settings(),
+        let refusal = middleware
+            .prepare(
+                module_context.call(
+                    middleware::MODULE,
+                    crate::permissions::PermissionSet::none(),
+                ),
+                &context,
             )
-            .await,
-        );
+            .expect("the middleware prepares")
+            .await
+            .expect_err("a crawler reads an empty or allow everything file as permission");
 
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a crawler reads an empty or allow everything file as permission"
+            refusal.retry_after,
+            Some(std::time::Duration::from_secs(u64::from(
+                RETRY_AFTER_SECONDS
+            )))
         );
-        assert!(response.headers().contains_key(header::RETRY_AFTER));
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("no-store")),
-            "a failure must not be held in place of the file"
-        );
+        assert_eq!(refusal.message, "robots.txt is temporarily unavailable\n");
     }
 
     /// The refusal asks nothing of anything, and dominates whatever else is
     /// selected, because a refusal cannot be loosened.
     #[tokio::test]
     async fn refusing_every_crawler_asks_no_contributor_and_reads_no_store() {
-        let mut settings = settings();
         let mut refusing = parsed(serde_json::json!({ "modules": ["allow_all", "refuse_all"] }));
         refusing.always_allow = vec!["/ads.txt".to_owned()];
-        settings.robots_txt = Some(refusing);
+        let settings = settings_placing(refusing);
         let store = Arc::new(MemoryKvStore::default());
-        let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
 
-        let response = handle_robots_txt(
+        let file = prepared_by(
             &settings,
+            &[],
             &services_with(Arc::default(), Arc::clone(&store)),
-            &registry,
-            robots_request(),
         )
         .await
-        .expect("the refusal answers without asking");
+        .expect("the refusal answers without asking")
+        .expect("the refusal is prepared");
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("public, max-age=3600"))
-        );
-        let body = response
-            .into_body()
-            .into_bytes_bounded(1024)
-            .await
-            .expect("should read the body");
-        assert_eq!(
-            body.as_ref(),
-            b"User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            file, "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
             "the refusal, whatever else is selected"
         );
         assert!(
@@ -692,36 +682,24 @@ mod tests {
         );
     }
 
-    /// A crawler that asks with `HEAD` is told what a `GET` would be told and
-    /// is sent no file.
-    #[tokio::test]
-    async fn a_head_is_answered_with_the_headers_and_no_body() {
-        let mut settings = settings();
-        settings.robots_txt = Some(RobotsTxtConfig::refuse_all());
-        let registry = IntegrationRegistry::new(&settings).expect("should build the registry");
-        let mut request = robots_request();
-        *request.method_mut() = Method::HEAD;
-
-        let response = handle_robots_txt(
-            &settings,
-            &services_with(Arc::default(), Arc::default()),
-            &registry,
-            request,
-        )
-        .await
-        .expect("should answer");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE),
-            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+    /// The registry makes the middleware only for settings that carry the
+    /// section, so a publisher keeping their own file is left alone.
+    #[test]
+    fn the_middleware_exists_only_with_the_section() {
+        let without = IntegrationRegistry::new(&settings()).expect("should build the registry");
+        assert!(
+            !without.middleware_ids().contains(&middleware::MODULE),
+            "{:?}",
+            without.middleware_ids()
         );
-        let body = response
-            .into_body()
-            .into_bytes_bounded(16)
-            .await
-            .expect("should read the body");
-        assert!(body.is_empty(), "a HEAD carries no body");
+
+        let with = IntegrationRegistry::new(&settings_placing(RobotsTxtConfig::refuse_all()))
+            .expect("should build the registry");
+        assert!(
+            with.middleware_ids().contains(&middleware::MODULE),
+            "{:?}",
+            with.middleware_ids()
+        );
     }
 
     /// The id of the builder that registers the echoing contributor.
@@ -758,31 +736,23 @@ mod tests {
             .with_module_name(ECHO_BUILDER_MODULE)
     }
 
-    /// The handler asks a contributor for the request it is answering, being
-    /// its host and path, without the query and without the reader's
+    /// The middleware asks a contributor for the request it is answering,
+    /// being its host and path, without the query and without the reader's
     /// evidence.
     #[tokio::test]
-    async fn the_handler_asks_the_contributors_for_the_request_it_answers() {
-        let settings = settings_selecting_echo();
-        let registry = IntegrationRegistry::with_registrations(&settings, &[echo_builder()])
-            .expect("should build the registry");
+    async fn the_middleware_asks_the_contributors_for_the_request_it_answers() {
+        let mut settings = settings_selecting_echo();
+        settings.fetch = settings_placing(RobotsTxtConfig::refuse_all()).fetch;
 
-        let response = handle_robots_txt(
+        let file = prepared_by(
             &settings,
+            &[echo_builder()],
             &services_with(Arc::default(), Arc::default()),
-            &registry,
-            robots_request(),
         )
         .await
-        .expect("should answer");
+        .expect("should answer")
+        .expect("the file is prepared");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response
-            .into_body()
-            .into_bytes_bounded(4096)
-            .await
-            .expect("should read the body");
-        let file = String::from_utf8(body.to_vec()).expect("the file is text");
         let config = settings
             .robots_txt
             .as_ref()

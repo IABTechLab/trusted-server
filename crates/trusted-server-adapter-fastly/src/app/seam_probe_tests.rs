@@ -208,55 +208,10 @@ fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     );
 }
 
-/// `[robots-txt] modules` naming the probe serves the rules the probe gives,
-/// asked for the request's host and path and never its query, because the
-/// answer is held and served to every crawler.
-#[test]
-fn robots_txt_selection_naming_a_module_serves_the_rules_it_gives() {
-    let settings = settings_with(&format!(
-        r#"
-        [robots-txt]
-        modules = ["testing.seam-probe", "allow_all"]
-        {HMAC_BLOCK}
-        {PROBE_BLOCK}
-        "#
-    ));
-    let router = router_with(settings, &[seam_probe::builder()]);
-
-    let response = get(&router, "/robots.txt?crawler=one", None);
-
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "the file should be served here and not by the origin"
-    );
-    assert!(
-        response.headers().get("x-robots-tag").is_none(),
-        "a file made from contributors puts no blanket rule on responses"
-    );
-    let file = body_text(response);
-    let agent = seam_probe::SEAM_PROBE_ROBOTS_AGENT;
-    assert!(
-        file.starts_with(&format!("User-Agent: {agent}\nDisallow: /")),
-        "the probe's rules should come first, as `modules` orders them: {file}"
-    );
-    assert!(
-        file.contains("/robots.txt?\n"),
-        "the probe should be asked for the path with no query: {file}"
-    );
-    assert!(
-        !file.contains("crawler=one"),
-        "nothing one crawler put in the address should reach a held answer: {file}"
-    );
-    assert!(
-        file.ends_with("User-Agent: *\nAllow: /\n"),
-        "core's own rules should follow: {file}"
-    );
-}
-
-/// With `refuse_all` selected the file is the refusal, and every response
-/// this adapter finalizes says not to index, the response of another route
-/// included.
+/// With `refuse_all` selected every response this adapter finalizes says
+/// not to index, the response of another route included. The file itself is
+/// the publisher path's, made by the `robots_txt` middleware the entry
+/// names, so no route of this server names the path.
 #[test]
 fn refusing_every_crawler_tags_every_response() {
     let settings = settings_with(&format!(
@@ -264,6 +219,11 @@ fn refusing_every_crawler_tags_every_response() {
         [robots-txt]
         modules = "refuse_all"
         always_allow = ["/ads.txt"]
+
+        [[fetch]]
+        media_type = "text/plain"
+        path = "/robots.txt"
+        middleware = ["robots_txt"]
         {HMAC_BLOCK}
         {PROBE_BLOCK}
         "#
@@ -277,13 +237,12 @@ fn refusing_every_crawler_tags_every_response() {
             .map(str::to_owned)
     };
 
-    let file = get(&router, "/robots.txt", None);
-
-    assert_eq!(file.status().as_u16(), 200, "the refusal should be served");
-    assert_eq!(tag(&file).as_deref(), Some("noindex, nofollow"));
-    assert_eq!(
-        body_text(file),
-        "User-agent: *\nAllow: /ads.txt\nDisallow: /\n"
+    assert!(
+        !router
+            .routes()
+            .into_iter()
+            .any(|route| route.path() == "/robots.txt"),
+        "the file is the publisher path's"
     );
 
     let other = get(&router, seam_probe::SEAM_PROBE_REPORT_PATH, None);
@@ -295,56 +254,20 @@ fn refusing_every_crawler_tags_every_response() {
     );
 }
 
-/// The methods this adapter registers for `/robots.txt`.
-fn robots_txt_methods(router: &RouterService) -> Vec<String> {
-    router
-        .routes()
-        .into_iter()
-        .filter(|route| route.path() == "/robots.txt")
-        .map(|route| route.method().to_string())
-        .collect()
-}
-
-/// With no `[robots-txt]` section the path is the publisher's, and the probe
-/// being on offer changes nothing. With the section the path is this
-/// server's for `GET` and `HEAD`.
+/// Without the section no blanket rule is placed on responses.
 #[test]
-fn robots_txt_is_this_servers_only_when_the_settings_carry_the_section() {
+fn no_blanket_rule_is_placed_on_responses_without_the_section() {
     let without = router_with(
         settings_with(&format!("{HMAC_BLOCK}{PROBE_BLOCK}")),
         &[seam_probe::builder()],
     );
 
-    assert_eq!(
-        robots_txt_methods(&without),
-        Vec::<String>::new(),
-        "without the section no route of this server names the path"
-    );
     let other = get(&without, seam_probe::SEAM_PROBE_REPORT_PATH, None);
+
     assert!(
         other.headers().get("x-robots-tag").is_none(),
         "no blanket rule is placed on responses without the section"
     );
-
-    let with = router_with(
-        settings_with(&format!(
-            r#"
-            [robots-txt]
-            modules = "refuse_all"
-            {HMAC_BLOCK}
-            {PROBE_BLOCK}
-            "#
-        )),
-        &[seam_probe::builder()],
-    );
-
-    let methods = robots_txt_methods(&with);
-    for method in ["GET", "HEAD"] {
-        assert!(
-            methods.iter().any(|registered| registered == method),
-            "{method} /robots.txt should be answered here: {methods:?}"
-        );
-    }
 }
 
 /// A request prepares exactly once whether a named route or the fallback

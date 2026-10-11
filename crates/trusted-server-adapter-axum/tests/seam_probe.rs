@@ -256,97 +256,6 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     );
 }
 
-/// `[robots-txt] modules` naming the probe serves the rules the probe gives,
-/// asked for the request's host and path and never its query, because the
-/// answer is held and served to every crawler.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn robots_txt_selection_naming_a_module_serves_the_rules_it_gives() {
-    let settings = settings_with(&format!(
-        r#"
-            [robots-txt]
-            modules = ["testing.seam-probe", "allow_all"]
-            sitemap = "https://test-publisher.example.com/sitemap.xml"
-            {PROBE_BLOCK}
-        "#
-    ));
-    let mut service = service_with(settings, &[seam_probe::builder()]);
-
-    let response = get(&mut service, "/robots.txt?crawler=one").await;
-
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "the file should be served here and not by the origin"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("text/plain; charset=utf-8")
-    );
-    let file = body_text(response).await;
-    let agent = seam_probe::SEAM_PROBE_ROBOTS_AGENT;
-    assert!(
-        file.starts_with(&format!("User-Agent: {agent}\nDisallow: /")),
-        "the probe's rules should come first, as `modules` orders them: {file}"
-    );
-    assert!(
-        file.contains("/robots.txt?\n"),
-        "the probe should be asked for the path with no query: {file}"
-    );
-    assert!(
-        !file.contains("crawler=one"),
-        "nothing one crawler put in the address should reach a held answer: {file}"
-    );
-    assert!(
-        file.ends_with(
-            "User-Agent: *\nAllow: /\n\nSitemap: https://test-publisher.example.com/sitemap.xml\n"
-        ),
-        "core's own rules and the sitemap should follow: {file}"
-    );
-}
-
-/// With `refuse_all` selected the file is the refusal, and every response
-/// this adapter finalizes says not to index, the response of another route
-/// included.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refusing_every_crawler_tags_every_response() {
-    let settings = settings_with(&format!(
-        r#"
-            [robots-txt]
-            modules = "refuse_all"
-            always_allow = ["/ads.txt"]
-            {PROBE_BLOCK}
-        "#
-    ));
-    let mut service = service_with(settings, &[seam_probe::builder()]);
-    let tag = |response: &axum::response::Response| {
-        response
-            .headers()
-            .get("x-robots-tag")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-    };
-
-    let file = get(&mut service, "/robots.txt").await;
-
-    assert_eq!(file.status().as_u16(), 200, "the refusal should be served");
-    assert_eq!(tag(&file).as_deref(), Some("noindex, nofollow"));
-    assert_eq!(
-        body_text(file).await,
-        "User-agent: *\nAllow: /ads.txt\nDisallow: /\n"
-    );
-
-    let other = get(&mut service, seam_probe::SEAM_PROBE_REPORT_PATH).await;
-
-    assert_eq!(
-        tag(&other).as_deref(),
-        Some("noindex, nofollow"),
-        "no route may be the one page a crawler is allowed to index"
-    );
-}
-
 /// A name `[robots-txt] modules` gives that nothing the deployment runs
 /// supplies stops the adapter at startup, so the file does not fail on the
 /// first crawler to ask for it.
@@ -356,6 +265,11 @@ fn robots_txt_selection_naming_a_module_that_is_not_running_fails_at_startup() {
         r#"
             [robots-txt]
             modules = ["testing.seam-probe"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
         "#,
     );
 
@@ -372,43 +286,6 @@ fn robots_txt_selection_naming_a_module_that_is_not_running_fails_at_startup() {
         message.contains("refuse_all") && message.contains("allow_all"),
         "should say what can be named: {message}"
     );
-}
-
-/// The methods this adapter registers for `/robots.txt` under `settings`.
-fn robots_txt_methods(settings: Settings) -> Vec<String> {
-    TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()])
-        .expect("should build the routes")
-        .routes()
-        .into_iter()
-        .filter(|route| route.path() == "/robots.txt")
-        .map(|route| route.method().to_string())
-        .collect()
-}
-
-/// With no `[robots-txt]` section the path is the publisher's, and the probe
-/// being on offer changes nothing. With the section the path is this
-/// server's for `GET` and `HEAD`.
-#[test]
-fn robots_txt_is_this_servers_only_when_the_settings_carry_the_section() {
-    assert_eq!(
-        robots_txt_methods(settings_with(PROBE_BLOCK)),
-        Vec::<String>::new(),
-        "without the section no route of this server names the path"
-    );
-
-    let methods = robots_txt_methods(settings_with(&format!(
-        r#"
-            [robots-txt]
-            modules = "refuse_all"
-            {PROBE_BLOCK}
-        "#
-    )));
-    for method in ["GET", "HEAD"] {
-        assert!(
-            methods.iter().any(|registered| registered == method),
-            "{method} /robots.txt should be answered here: {methods:?}"
-        );
-    }
 }
 
 /// A request prepares exactly once whether it is served by a named route or by

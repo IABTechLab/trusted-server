@@ -5579,8 +5579,9 @@ pub async fn handle_publisher_request(
                         request_scheme,
                         &request_path,
                     );
-                    let module_context =
-                        ModuleContext::new(module_request).with_request_state(ec_context, services);
+                    let module_context = ModuleContext::new(module_request)
+                        .with_settings(settings)
+                        .with_request_state(ec_context, services);
                     let stored_origin_host = settings.publisher.origin_host();
                     let document = TextDocument {
                         media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
@@ -5917,8 +5918,9 @@ pub async fn handle_publisher_request(
         };
         let module_request =
             ModuleRequest::new(&request_method, request_host, request_scheme, &request_path);
-        let module_context =
-            ModuleContext::new(module_request).with_request_state(ec_context, services);
+        let module_context = ModuleContext::new(module_request)
+            .with_settings(settings)
+            .with_request_state(ec_context, services);
         let document = TextDocument {
             media_type: media_type_of(&content_type),
             request_path: &request_path,
@@ -21140,12 +21142,33 @@ mod tests {
 
     /// As [`proxy`], with the settings given.
     async fn proxy_with(settings: Settings, method: Method, path: &str, status: u16) -> Proxied {
+        proxy_origin(
+            settings,
+            method,
+            path,
+            status,
+            b"<html><head></head><body>the origin's page</body></html>",
+            "text/html; charset=utf-8",
+        )
+        .await
+    }
+
+    /// As [`proxy_with`], with the origin answering `status` with `body` as
+    /// `content_type`.
+    async fn proxy_origin(
+        settings: Settings,
+        method: Method,
+        path: &str,
+        status: u16,
+        body: &[u8],
+        content_type: &'static str,
+    ) -> Proxied {
         let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             status,
-            b"<html><head></head><body>the origin's page</body></html>".to_vec(),
-            vec![("content-type", "text/html; charset=utf-8")],
+            body.to_vec(),
+            vec![("content-type", content_type)],
         );
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -21220,6 +21243,93 @@ mod tests {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
+    }
+
+    /// Settings refusing every crawler, with the entry that places core's
+    /// robots.txt middleware on the file.
+    fn settings_refusing_every_crawler() -> Settings {
+        use crate::robots_txt::middleware as robots_txt;
+
+        let mut settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: robots_txt::MEDIA_TYPE.to_owned(),
+            path: Some(crate::robots_txt::ROBOTS_TXT_PATH.to_owned()),
+            middleware: vec![robots_txt::MODULE.to_owned()],
+        }]);
+        let mut refusing = crate::robots_txt::RobotsTxtConfig::refuse_all();
+        refusing.always_allow = vec!["/ads.txt".to_owned()];
+        settings.robots_txt = Some(refusing);
+        settings
+    }
+
+    /// The file a proxied robots.txt request streams, with its status and
+    /// content type checked.
+    async fn streamed_robots_txt(proxied: Proxied) -> String {
+        let PublisherResponse::Stream {
+            response,
+            body,
+            params,
+        } = proxied.response
+        else {
+            panic!("the file should stream through the entry's middleware");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should be a document of the entry's media type"
+        );
+        let mut params = *params;
+        let mut output = Vec::new();
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should stream the file");
+        String::from_utf8(output).expect("the file is text")
+    }
+
+    /// The file the middleware makes replaces the origin's own.
+    #[tokio::test]
+    async fn robots_txt_replaces_the_origins_file() {
+        let proxied = proxy_origin(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            crate::robots_txt::ROBOTS_TXT_PATH,
+            200,
+            b"User-agent: *\nAllow: /\n",
+            "text/plain; charset=utf-8",
+        )
+        .await;
+
+        assert_eq!(
+            streamed_robots_txt(proxied).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the refusal replaces the origin's file"
+        );
+    }
+
+    /// Where the origin has no file, the creating rule makes it.
+    #[tokio::test]
+    async fn robots_txt_is_made_where_the_origin_has_none() {
+        let proxied = proxy_with(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            crate::robots_txt::ROBOTS_TXT_PATH,
+            404,
+        )
+        .await;
+
+        assert_eq!(
+            streamed_robots_txt(proxied).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the file is made"
+        );
     }
 
     #[tokio::test]

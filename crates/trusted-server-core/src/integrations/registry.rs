@@ -1829,8 +1829,21 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.geo_module = geo_module;
-        check_middleware(settings, &inner)?;
         check_robots_txt_selection(settings, &inner)?;
+        if let Some(config) = settings.robots_txt.as_ref() {
+            // Core's own middleware for the file, made here because the
+            // contributors it asks are known only once every registration
+            // is in, and a middleware cannot reach the registry.
+            let selected = crate::robots_txt::select(config, &inner.robots_txt_contributors)?;
+            inner.middleware.push((
+                crate::robots_txt::middleware::MODULE,
+                Arc::new(crate::robots_txt::middleware::RobotsTxt::new(
+                    config.clone(),
+                    selected,
+                )) as Arc<dyn Middleware>,
+            ));
+        }
+        check_middleware(settings, &inner)?;
 
         Ok(Self {
             inner: Arc::new(inner),

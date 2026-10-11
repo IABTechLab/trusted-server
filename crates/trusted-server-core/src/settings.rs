@@ -4290,6 +4290,7 @@ impl Settings {
         self.validate_asset_image_optimizer_profile_sets()?;
         if let Some(robots_txt) = &self.robots_txt {
             robots_txt.prepare_runtime()?;
+            self.require_robots_txt_placed()?;
         }
 
         if let Some(co) = &mut self.creative_opportunities {
@@ -4325,6 +4326,30 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Refuses a `[robots-txt]` section that no `[[fetch]]` or `[[serve]]`
+    /// entry for `text/plain` names the `robots_txt` middleware for, because
+    /// the file would never be made.
+    fn require_robots_txt_placed(&self) -> Result<(), Report<TrustedServerError>> {
+        use crate::robots_txt::middleware::{MEDIA_TYPE, MODULE};
+
+        let placed = [&self.fetch, &self.serve].iter().any(|entries| {
+            entries.entries().iter().any(|entry| {
+                entry.media_type == MEDIA_TYPE && entry.middleware.iter().any(|name| name == MODULE)
+            })
+        });
+        if placed {
+            return Ok(());
+        }
+        Err(Report::new(TrustedServerError::Settings {
+            message: format!(
+                "[robots-txt] is set, but no [[fetch]] or [[serve]] entry for `{MEDIA_TYPE}` \
+                 names `{MODULE}`, so the file would never be made. Add an entry with \
+                 media_type = `{MEDIA_TYPE}`, path = `{}` and the middleware",
+                crate::robots_txt::ROBOTS_TXT_PATH
+            ),
+        }))
     }
 
     /// Returns compiled creative opportunity slots when template delivery is enabled.
@@ -5086,7 +5111,26 @@ mod tests {
     }
 
     fn settings_str_with_robots_txt(section: &str) -> String {
-        format!("{}\n[robots-txt]\n{section}\n", crate_test_settings_str())
+        format!(
+            "{}\n[robots-txt]\n{section}\n\n[[fetch]]\nmedia_type = \"text/plain\"\npath = \"/robots.txt\"\nmiddleware = [\"robots_txt\"]\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn a_robots_txt_section_with_no_entry_placing_the_middleware_is_refused() {
+        let toml = format!(
+            "{}\n[robots-txt]\nmodules = \"refuse_all\"\n",
+            crate_test_settings_str()
+        );
+
+        let error = Settings::from_toml(&toml).expect_err("the file would never be made");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("no [[fetch]] or [[serve]] entry for `text/plain` names `robots_txt`"),
+            "{message}"
+        );
     }
 
     #[test]
