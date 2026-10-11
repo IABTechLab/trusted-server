@@ -111,11 +111,12 @@ enabled = true
 - **Headers:**
 
 ```http
-Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=<max_age_seconds>
 Cache-Control: no-store, private
 ```
 
-The cookie domain comes from `[publisher].cookie_domain`.
+The cookie domain comes from `[publisher].cookie_domain`. The lifetime comes
+from `[tester_cookie].max_age_seconds` and defaults to 30 days (2592000).
 
 **Response when disabled:**
 
