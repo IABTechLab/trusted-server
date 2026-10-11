@@ -326,6 +326,103 @@ impl TypeSections {
 /// The type states which settings the module takes and how they are
 /// validated, and nothing else. Whether the module runs is not its business,
 /// because the section's selection names what runs.
+/// The section, and the folder under `crates`, that holds what one vendor's
+/// modules share.
+pub const SHARED_TYPE: &str = "shared";
+
+/// The `[shared]` section, one `[shared.<vendor>]` table per vendor, holding
+/// the settings every module of that vendor reads, such as an endpoint and a
+/// license key.
+///
+/// Core reads none of it. A vendor's crates read their own table through
+/// [`Settings::shared_config`], and a builder marked with
+/// [`IntegrationBuilder::with_shared_settings`](crate::integrations::IntegrationBuilder::with_shared_settings)
+/// runs when its vendor's table is present. A table that no builder reads is
+/// refused where the registry is built, the only place every builder is known.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct SharedTables(BTreeMap<String, serde_json::Map<String, JsonValue>>);
+
+impl std::fmt::Debug for SharedTables {
+    // The tables hold secrets, so only the vendors are shown.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedTables")
+            .field("vendors", &self.vendors().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SharedTables {
+    /// Whether no vendor has a table.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The vendors with a table, in name order.
+    pub fn vendors(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    /// Whether `[shared.<vendor>]` is present.
+    #[must_use]
+    pub fn contains(&self, vendor: &str) -> bool {
+        self.0.contains_key(vendor)
+    }
+
+    /// Reads and validates `[shared.<vendor>]` as `T`, or `None` when the table
+    /// is absent.
+    ///
+    /// # Errors
+    ///
+    /// When the table cannot be read as `T` or fails its validation, naming
+    /// the table and the underlying error.
+    pub fn get_typed<T>(&self, vendor: &str) -> Result<Option<T>, Report<TrustedServerError>>
+    where
+        T: DeserializeOwned + Validate,
+    {
+        let Some(table) = self.0.get(vendor) else {
+            return Ok(None);
+        };
+        let config: T =
+            serde_json::from_value(JsonValue::Object(table.clone())).map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("[{SHARED_TYPE}.{vendor}] could not be read: {error}"),
+                })
+            })?;
+        config.validate().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{SHARED_TYPE}.{vendor}] failed validation: {error}"),
+            })
+        })?;
+        Ok(Some(config))
+    }
+
+    /// Refuses a table whose name is not one folder name, being lower case
+    /// letters, digits, `_` or `-`, because a vendor's table is named by its
+    /// folder under `crates/shared`.
+    ///
+    /// # Errors
+    ///
+    /// Naming the first table at fault.
+    pub fn validate_names(&self) -> Result<(), Report<TrustedServerError>> {
+        match self
+            .vendors()
+            .find(|vendor| vendor.contains('.') || !crate::module_name::is_valid(vendor))
+        {
+            Some(vendor) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{SHARED_TYPE}] has a table named `{vendor}`, which is not a vendor's \
+                     folder name. A vendor's shared table is named by its folder under \
+                     crates/{SHARED_TYPE}, of lower case letters, digits, `_` or `-`"
+                ),
+            })),
+            None => Ok(()),
+        }
+    }
+}
+
 pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
@@ -4053,6 +4150,9 @@ pub struct Settings {
     pub consent: ConsentConfig,
     #[serde(default)]
     pub cache: CacheSettings,
+    /// What one vendor's modules share, a table per vendor, `[shared.<vendor>]`.
+    #[serde(default, skip_serializing_if = "SharedTables::is_empty")]
+    pub shared: SharedTables,
     #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
@@ -4288,6 +4388,7 @@ impl Settings {
             .auction_html_comment_options
             .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
+        self.shared.validate_names()?;
         if let Some(robots_txt) = &self.robots_txt {
             robots_txt.prepare_runtime()?;
             self.require_robots_txt_placed()?;
@@ -4558,6 +4659,20 @@ impl Settings {
             })
         })?;
         Ok(Some(config))
+    }
+
+    /// Reads `[shared.<vendor>]`, the settings every module of `vendor`
+    /// shares, or `None` when the table is absent.
+    ///
+    /// # Errors
+    ///
+    /// When the table cannot be read as `T` or fails its validation, naming
+    /// the table.
+    pub fn shared_config<T>(&self, vendor: &str) -> Result<Option<T>, Report<TrustedServerError>>
+    where
+        T: DeserializeOwned + Validate,
+    {
+        self.shared.get_typed(vendor)
     }
 
     /// The modules `section` selects, to change, with the section created
@@ -10483,5 +10598,134 @@ mod permission_signal_config_tests {
                 && message.contains("[permission-signal.<name>] block is not accepted"),
             "the refusal names the block and says why it is refused: {message}"
         );
+    }
+
+    mod shared_tables {
+        use super::*;
+
+        #[derive(Debug, Deserialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct ExampleShared {
+            #[validate(url)]
+            endpoint: String,
+        }
+
+        fn with(toml: &str) -> Result<Settings, Report<TrustedServerError>> {
+            Settings::from_toml(&format!("{}\n{toml}", crate_test_settings_str()))
+        }
+
+        #[test]
+        fn a_vendor_reads_its_own_shared_table_and_nothing_else() {
+            let settings = with(
+                r#"
+                [shared.example]
+                endpoint = "https://api.example.com/v1"
+                "#,
+            )
+            .expect("should load");
+
+            let read: ExampleShared = settings
+                .shared_config("example")
+                .expect("should read")
+                .expect("the table is present");
+            assert_eq!(read.endpoint, "https://api.example.com/v1");
+            assert!(
+                settings
+                    .shared_config::<ExampleShared>("another")
+                    .expect("an absent table reads as nothing")
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn a_shared_table_its_vendor_cannot_read_is_refused_naming_the_table() {
+            let settings = with(
+                r#"
+                [shared.example]
+                endpoint = "https://api.example.com/v1"
+                unknown = true
+                "#,
+            )
+            .expect("core reads none of the table, so it loads");
+
+            let refused = format!(
+                "{:?}",
+                settings
+                    .shared_config::<ExampleShared>("example")
+                    .expect_err("the vendor does not know the key")
+            );
+            assert!(
+                refused.contains("[shared.example] could not be read")
+                    && refused.contains("unknown"),
+                "{refused}"
+            );
+        }
+
+        #[test]
+        fn a_shared_table_failing_its_validation_is_refused_naming_the_table() {
+            let settings = with(
+                r#"
+                [shared.example]
+                endpoint = "not-a-url"
+                "#,
+            )
+            .expect("core reads none of the table, so it loads");
+
+            let refused = format!(
+                "{:?}",
+                settings
+                    .shared_config::<ExampleShared>("example")
+                    .expect_err("the endpoint is not a URL")
+            );
+            assert!(
+                refused.contains("[shared.example] failed validation"),
+                "{refused}"
+            );
+        }
+
+        #[test]
+        fn a_shared_table_not_named_as_a_folder_is_refused() {
+            for table in ["[shared.Example]", "[shared.\"an.example\"]"] {
+                let refused = with(&format!("{table}\nendpoint = \"https://api.example.com\""))
+                    .expect_err("a vendor's table is named by its folder");
+
+                assert!(
+                    format!("{refused:?}").contains("which is not a vendor's folder name"),
+                    "{table}: {refused:?}"
+                );
+            }
+        }
+
+        /// The tables hold secrets, so a settings dump shows the vendors alone,
+        /// and the serialized settings carry the tables whole.
+        #[test]
+        fn a_shared_table_is_shown_by_its_vendor_and_serialized_whole() {
+            let settings = with(
+                r#"
+                [shared.example]
+                endpoint = "https://api.example.com/v1"
+                license_key = "a-secret-value"
+                "#,
+            )
+            .expect("should load");
+
+            let shown = format!("{:?}", settings.shared);
+            assert!(shown.contains("example"), "{shown}");
+            assert!(!shown.contains("a-secret-value"), "{shown}");
+
+            let serialized = serde_json::to_value(&settings).expect("should serialize");
+            assert_eq!(
+                serialized.pointer("/shared/example/endpoint"),
+                Some(&serde_json::json!("https://api.example.com/v1"))
+            );
+        }
+
+        #[test]
+        fn settings_without_a_shared_section_are_written_without_one() {
+            let settings = with("").expect("should load");
+
+            let serialized = serde_json::to_value(&settings).expect("should serialize");
+            assert!(serialized.get("shared").is_none());
+        }
     }
 }
