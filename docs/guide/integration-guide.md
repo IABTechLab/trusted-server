@@ -246,15 +246,15 @@ one file, its path. See "Entries for a media type other than HTML" in the
 ### A middleware that prepares, and one that refuses
 
 A middleware whose decision needs the request's services, or has to wait on
-the key-value store or the network, answers `prepare` with a future. Core
-runs it in the request's handler, before the document is processed, as the
-module the middleware belongs to and with the permissions it declares in
-`required_permissions`, so the module call carries what a request hook or a
-robots.txt contributor is given. What the future answers is kept under the
-middleware's name in the context's `prepared`, and `create`, which stays
-synchronous, takes it from there as the type it prepared. A middleware that
-prepares nothing leaves `prepare` at its default and is asked `create` as
-before.
+the key-value store or the network, answers `prepare` with a future. Core runs
+it in the request's handler, before the document is processed, as the module
+the middleware belongs to and with the permissions it declares in
+`required_permissions`, so the module call carries the settings and the
+request's services, as a request hook or a robots.txt contributor is given.
+What the future answers is kept under the middleware's name in the context's
+`prepared`, and `create`, which stays synchronous, takes it from there as the
+type it prepared. A middleware that prepares nothing leaves `prepare` at its
+default and is asked `create` as before.
 
 ```rust
 impl Middleware for Sellers {
