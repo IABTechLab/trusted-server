@@ -413,6 +413,7 @@ builder every integration uses.
 | `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                         |
 | `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                                 |
 | `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                           |
+| `.with_prefix_module(name, ...)`                      | Offers a prefix module that `[prefix] module` may select by that name                           |
 | `.with_robots_txt_contributor(name, ...)`             | Offers rules for `/robots.txt` that `[robots-txt] modules` may select by that name              |
 
 The three script delivery choices are exclusive and the last call wins.
@@ -788,6 +789,26 @@ builder to that list, in the place its request hooks should run. The order of
 the list does not order page changes, which run in the order an entry names
 them. Offering a module does not run it, because the registry builds a module
 only when a section of the settings selects it.
+
+### Giving the deployment its prefixes
+
+A crate may give the start of every name the browser holds for a publisher,
+being cookies and first-party storage keys, and of every key the publisher's
+entries take in a store publishers share, by declaring a `PrefixModule` with
+`.with_prefix_module(name, ...)`. `[prefix] module` selects it by that name,
+and core's own module, which gives `ts` and `ts.<publisher.domain>`, runs when
+nothing is selected. The module is handed a module call carrying the request
+and the settings, and nothing else, and the registry asks it once when it is
+built, so a module naming a value its call never carries is refused at startup.
+
+Every request's services carry what the module gives, as
+`services.public_prefix()` and `services.server_key_prefix()`. A crate names a
+cookie with `public_prefix().cookie_name(COOKIE_EC)` rather than writing
+`ts-ec`, keys a shared store with the server key prefix, and reads the prefix
+in the browser from the bundle tag's `data-ts-public-prefix` attribute rather
+than holding a copy. A public prefix's parts are letters, digits, `_`, `-` and
+`.`, and the first starts with a letter or a single `_`, so every form is a
+valid cookie name and no cookie name starts with `__`.
 
 ### A vendor's shared table
 
