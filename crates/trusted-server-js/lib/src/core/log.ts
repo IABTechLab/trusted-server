@@ -2,7 +2,14 @@
 export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
 
 const LEVELS: Record<LogLevel, number> = { silent: -1, error: 0, warn: 1, info: 2, debug: 3 };
-let currentLevel: LogLevel = 'warn';
+// Each IIFE carries its own logger code, but all copies share one level.
+const LOG_LEVEL_KEY = Symbol.for('trusted-server.logLevel');
+
+type LogGlobal = typeof globalThis & { [LOG_LEVEL_KEY]?: LogLevel };
+
+function getLevel(): LogLevel {
+  return ((globalThis as LogGlobal)[LOG_LEVEL_KEY] ??= 'warn');
+}
 
 function levelNum(l: LogLevel) {
   return LEVELS[l] ?? 1;
@@ -50,21 +57,19 @@ function print(method: 'log' | 'info' | 'warn' | 'error', ...args: unknown[]) {
 // Thin wrapper around console that keeps timestamped output and honours a runtime log level.
 export const log = {
   setLevel(l: LogLevel) {
-    currentLevel = l;
+    (globalThis as LogGlobal)[LOG_LEVEL_KEY] = l;
   },
-  getLevel(): LogLevel {
-    return currentLevel;
-  },
+  getLevel,
   info: (...a: unknown[]) => {
-    if (levelNum(currentLevel) >= LEVELS.info) print('info', ...a);
+    if (levelNum(getLevel()) >= LEVELS.info) print('info', ...a);
   },
   warn: (...a: unknown[]) => {
-    if (levelNum(currentLevel) >= LEVELS.warn) print('warn', ...a);
+    if (levelNum(getLevel()) >= LEVELS.warn) print('warn', ...a);
   },
   error: (...a: unknown[]) => {
-    if (levelNum(currentLevel) >= LEVELS.error) print('error', ...a);
+    if (levelNum(getLevel()) >= LEVELS.error) print('error', ...a);
   },
   debug: (...a: unknown[]) => {
-    if (levelNum(currentLevel) >= LEVELS.debug) print('log', ...a);
+    if (levelNum(getLevel()) >= LEVELS.debug) print('log', ...a);
   },
 };
