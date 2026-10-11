@@ -1956,9 +1956,9 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "fiftyone-caching"
-version = "4.5.8-49"
+version = "4.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "312b19eef500787f70fa37b9c498bb2012ae68234559b181c002d3abda3db8d6"
+checksum = "dc36d31701b1d648bd354def7393b30507ac47c66d5685199a3cd80eef97cef6"
 dependencies = [
  "ahash",
  "hashlink 0.10.0",
