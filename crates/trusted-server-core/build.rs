@@ -52,10 +52,6 @@ fn write_attestation_keys() {
 
 /// Bakes the build time into the binary as `TRUSTED_SERVER_BUILT_AT`.
 ///
-/// Some hosts give a WebAssembly guest no custom environment variable when it
-/// runs, so the time a build was made has to be in the binary or it cannot be
-/// reported at all.
-///
 /// `SOURCE_DATE_EPOCH` is honored where it is set, so a reproducible build
 /// stays reproducible rather than differing only by this string.
 fn write_build_time() {

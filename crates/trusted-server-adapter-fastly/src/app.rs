@@ -1683,10 +1683,7 @@ impl TrustedServerApp {
             }
         }
 
-        // The attestation pages answer at the address the settings choose, so
-        // they are registered here rather than in the table. Reads reach the
-        // handler, and other methods reach the publisher's origin unless the
-        // deployment owns the prefix.
+        // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
             let attestation = attestation_route_handler(Arc::clone(state));
@@ -2947,10 +2944,7 @@ mod tests {
 
     /// Every endpoint the settings accept builds a router whose attestation
     /// pages answer, because a second route at one address panics when the
-    /// router is built, and this adapter builds it on every request. The
-    /// candidates are every address the router answers beneath an underscore
-    /// prefix, as a page with a sample segment for one in braces, and further
-    /// addresses beneath the same prefixes.
+    /// router is built.
     #[test]
     fn every_endpoint_the_settings_accept_builds_a_router() {
         use trusted_server_core::attestation::{DEFAULT_ENDPOINT, validate_endpoint};

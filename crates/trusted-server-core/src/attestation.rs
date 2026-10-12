@@ -1,21 +1,16 @@
 //! Signed evidence of who operates this deployment and which build it runs.
 //!
 //! The endpoint answers with evidence in the sense of RFC 9334, a description
-//! of the build and the platform signed with the operator's key. A module on
-//! a CDN cannot measure its own bytes, so the evidence proves who operates the
-//! deployment, not what its code is. A verifier holding the operator's public
-//! keys decides whether to trust it, and the page sends the reader there
+//! of the build and the platform signed with the operator's key. A deployment
+//! on a CDN cannot measure its own bytes, so the evidence proves who operates
+//! the deployment, not what its code is. A verifier holding the operator's
+//! public keys decides whether to trust it, and the page sends the reader there
 //! rather than claiming validity itself.
 //!
-//! The signing keys are constants in the binary, compiled in from a schedule
-//! the build supplies, each in force from its start until the next one starts.
-//! No store or secret the settings can reach holds them, but whoever holds the
-//! package holds every key its schedule carries, so a published build carries
-//! only the key in force when it was built and the ones after it. A build
-//! given no schedule signs nothing. The signature is ECDSA P-256 with SHA-256,
-//! deterministic per RFC 6979, over the configured context, one line feed,
-//! then the evidence bytes. The context stops a signature made here from
-//! passing as one the same key made for any other purpose.
+//! The signature is ECDSA P-256 with SHA-256, deterministic per RFC 6979, over
+//! the configured context, one line feed, then the evidence bytes.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -51,11 +46,6 @@ pub const DEFAULT_ENDPOINT: &str = "/_ts/attestation";
 /// The addresses beneath an underscore prefix that a deployment answers
 /// itself whatever the settings say, so an endpoint may take none of them. A
 /// segment in braces stands for any one segment, as it does in the router.
-///
-/// An endpoint at one of these would register a second route at the same
-/// address, which stops the router being built. Each adapter's tests check
-/// that its router registers nothing beneath an underscore prefix that is
-/// missing here.
 pub const RESERVED_PATHS: &[&str] = &[
     CONFIG_PAGE_PATH,
     CONFIG_JSON_PATH,
@@ -79,6 +69,20 @@ pub const RESERVED_PATHS: &[&str] = &[
     // fingerprint or serves several requests from one sandbox.
     "/_ts/debug/ja4",
     "/_ts/debug/sandbox",
+];
+
+/// Prefixes beneath which common web frameworks serve their assets from the
+/// origin. An endpoint under one would own the prefix and answer `404` for
+/// every asset there, so an endpoint may take none of them.
+pub const ORIGIN_ASSET_PREFIXES: &[&str] = &[
+    "_app",
+    "_astro",
+    "_content",
+    "_expo",
+    "_framework",
+    "_next",
+    "_nuxt",
+    "_vercel",
 ];
 
 /// The signature algorithm, as JOSE names it.
@@ -417,11 +421,12 @@ fn answer(
 }
 
 /// The absolute address of the JSON form of the page being served, from the
-/// scheme the request arrived over and the host it was addressed to.
+/// request's scheme and the host it was addressed to.
 ///
-/// The host is read the way [`request_host`] reads the one the evidence signs,
-/// so the link and the signature name the same host. Forwarded host headers
-/// are never read, because a caller can set them.
+/// The scheme follows a `Forwarded` or `X-Forwarded-Proto` header when one is
+/// sent. The host is read the way [`request_host`] reads the one the evidence
+/// signs, so the link and the signature name the same host, and a forwarded
+/// host header is never read.
 fn json_address(req: &Request<EdgeBody>) -> String {
     let info =
         crate::http_util::RequestInfo::from_request(req, &crate::platform::ClientInfo::default());
@@ -434,8 +439,17 @@ fn json_address(req: &Request<EdgeBody>) -> String {
     format!("{}://{authority}{}.json", info.scheme, req.uri().path())
 }
 
-/// The key in force at `now`, being the latest to have started. Warns when
-/// no later key follows it, because the build must then be refreshed.
+/// Set once the process has warned that it signs with the last key built in.
+static LAST_KEY_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this is the first time `warned` is asked, setting it.
+fn first_time(warned: &AtomicBool) -> bool {
+    !warned.swap(true, Ordering::Relaxed)
+}
+
+/// The key in force at `now`, being the latest to have started. Warns once
+/// for each process when no later key follows it, because the build must
+/// then be refreshed.
 fn key_in_force<'a>(schedule: &'a [ScheduledKey<'a>], now: u64) -> Option<&'a ScheduledKey<'a>> {
     let now = i64::try_from(now).ok()?;
     let current = schedule
@@ -445,6 +459,7 @@ fn key_in_force<'a>(schedule: &'a [ScheduledKey<'a>], now: u64) -> Option<&'a Sc
     if !schedule
         .iter()
         .any(|(_, starts_at, _)| *starts_at > current.1)
+        && first_time(&LAST_KEY_WARNED)
     {
         log::warn!(
             "attestation key `{}` is the last one built in, so the build must be refreshed",
@@ -661,12 +676,15 @@ fn escape_attribute(value: &str) -> String {
 /// case letters, digits, `_` and `-`, the first beginning with an underscore
 /// so the pages sit apart from the publisher's own, and without `.json`,
 /// which names the JSON form. Neither the page nor the JSON form may be one
-/// of the [`RESERVED_PATHS`].
+/// of the [`RESERVED_PATHS`], and the prefix may not be one of the
+/// [`ORIGIN_ASSET_PREFIXES`].
 ///
 /// # Errors
 ///
-/// Returns `invalid_endpoint` for any other shape, and `reserved_endpoint`,
-/// naming the address, when the page or the JSON form is reserved.
+/// Returns `invalid_endpoint` for any other shape, `reserved_endpoint`,
+/// naming the address, when the page or the JSON form is reserved, and
+/// `origin_prefix`, naming the prefix, when the prefix is one a framework
+/// serves its assets from.
 pub fn validate_endpoint(value: &str) -> Result<(), ValidationError> {
     let segment_ok = |segment: &str| {
         !segment.is_empty()
@@ -690,6 +708,13 @@ pub fn validate_endpoint(value: &str) -> Result<(), ValidationError> {
     if let Some(reserved) = reserved_path_taken(value, RESERVED_PATHS) {
         let mut error = ValidationError::new("reserved_endpoint");
         error.message = Some(format!("{reserved} is answered by the deployment itself").into());
+        return Err(error);
+    }
+    let prefix = prefix_of(value);
+    if ORIGIN_ASSET_PREFIXES.contains(&prefix) {
+        let mut error = ValidationError::new("origin_prefix");
+        error.message =
+            Some(format!("/{prefix} is where a web framework serves its assets").into());
         return Err(error);
     }
     Ok(())
@@ -921,6 +946,33 @@ mod tests {
         }
     }
 
+    /// Two lines sharing a key id or a start stop the build, so the key in
+    /// force never depends on the order of the lines and a key id names one
+    /// key.
+    #[test]
+    fn a_schedule_repeating_a_key_id_or_a_start_is_refused() {
+        let first = key_text(&FIRST);
+        let second = key_text(&SECOND);
+        for (case, schedule, refusal) in [
+            (
+                "a repeated key id",
+                format!("example-first\t1000\t{first}\nexample-first\t2000\t{second}\n"),
+                "line 2 should not repeat the key id of line 1",
+            ),
+            (
+                "a repeated start",
+                format!("example-first\t1000\t{first}\n\nexample-second\t1000\t{second}\n"),
+                "line 3 should not start at the same second as line 1",
+            ),
+        ] {
+            assert_eq!(
+                key_schedule::constant_source(Some(&schedule)),
+                Err(refusal.to_owned()),
+                "{case} should be refused"
+            );
+        }
+    }
+
     /// A verifier with only the public key, in the `SubjectPublicKeyInfo` DER
     /// form a key schedule publishes, accepts the signature over exactly the
     /// context, one line feed, then the payload. Without the context, without
@@ -988,6 +1040,17 @@ mod tests {
                 "at {now} the other key must not verify"
             );
         }
+    }
+
+    /// The warning that the last key built in is signing is given once for
+    /// each process, not on every request.
+    #[test]
+    fn the_last_key_warning_is_given_once() {
+        let warned = AtomicBool::new(false);
+
+        assert!(first_time(&warned), "should warn the first time");
+        assert!(!first_time(&warned), "should not warn again");
+        assert!(!first_time(&warned), "should not warn on any later request");
     }
 
     /// Nothing is signed before the first key starts, from an empty schedule,
@@ -1251,6 +1314,24 @@ mod tests {
             too_long.as_str(),
         ] {
             assert!(validate_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// An endpoint owns its prefix and answers `404` for every other address
+    /// beneath it, so a prefix a framework serves its assets from is refused,
+    /// naming it.
+    #[test]
+    fn an_endpoint_under_a_framework_asset_prefix_is_refused_naming_it() {
+        for prefix in ORIGIN_ASSET_PREFIXES {
+            let endpoint = format!("/{prefix}/attestation");
+            let error = validate_endpoint(&endpoint).expect_err("should refuse the endpoint");
+
+            assert_eq!(error.code, "origin_prefix", "{endpoint} should be refused");
+            assert_eq!(
+                error.message.as_deref(),
+                Some(format!("/{prefix} is where a web framework serves its assets").as_str()),
+                "{endpoint} should name its prefix"
+            );
         }
     }
 
