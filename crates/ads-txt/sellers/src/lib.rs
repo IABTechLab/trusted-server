@@ -1,19 +1,6 @@
 //! The sellers a deployment adds to the publisher's `ads.txt`.
 //!
-//! The publisher's own file at the origin stays authoritative. Where a
-//! `[[fetch]]` entry for `text/plain` names [`MODULE`] on the file's path,
-//! this module's middleware passes the file through and writes the lines
-//! `[ads-txt.sellers] lines` gives at its end, so a seller the deployment
-//! introduces is declared beside the publisher's own. A publisher whose
-//! origin has no file gets the origin's answer, because the module adds to
-//! the publisher's file and never invents one.
-//!
-//! Each line is checked as the settings load against the file's grammar,
-//! because every buyer's crawler reads the file and a typo there costs the
-//! publisher revenue silently: a data record is a domain, an account id, a
-//! relationship of `DIRECT` or `RESELLER` and an optional certification
-//! authority id, separated by commas, and a variable is one of the five the
-//! specification names, with its value.
+//! The publisher's own file at the origin stays authoritative.
 
 use std::sync::Arc;
 
@@ -77,9 +64,14 @@ fn check_line(line: &str) -> Result<(), String> {
     if trimmed.contains(['\n', '\r']) {
         return Err("is more than one line".to_owned());
     }
-    if let Some((name, value)) = trimmed.split_once('=') {
+    if let Some((name, value)) = trimmed.split_once('=')
+        && !name.contains(',')
+    {
         let name = name.trim();
-        if VARIABLES.contains(&name) {
+        if VARIABLES
+            .iter()
+            .any(|variable| variable.eq_ignore_ascii_case(name))
+        {
             if value.trim().is_empty() {
                 return Err(format!("gives `{name}` no value"));
             }
@@ -98,8 +90,14 @@ fn check_line(line: &str) -> Result<(), String> {
             fields.len()
         ));
     }
-    if fields[0].is_empty() || fields[0].contains(char::is_whitespace) {
+    if fields[0].is_empty() {
         return Err("has no domain where its first field should be one".to_owned());
+    }
+    if fields[0].contains(char::is_whitespace) {
+        return Err(format!(
+            "has `{}` as its domain, and a domain holds no space",
+            fields[0]
+        ));
     }
     if fields[1].is_empty() {
         return Err("has no account id in its second field".to_owned());
@@ -153,7 +151,8 @@ fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError
         message: format!(
             "[ads-txt] selects `sellers`, but no [[fetch]] entry for `{MEDIA_TYPE}` names \
              `{MODULE}`, so the lines would never be written. Add an entry with media_type = \
-             `{MEDIA_TYPE}`, path = `/ads.txt` and the middleware"
+             `{MEDIA_TYPE}`, path = `/ads.txt` and the middleware. The path is a prefix, so \
+             the entry covers every path that starts with `/ads.txt`"
         ),
     }))
 }
@@ -257,8 +256,7 @@ impl Middleware for Sellers {
 /// line of their own.
 struct AppendLines {
     tail: Arc<str>,
-    /// Whether the file so far ends with a line break, true for an empty
-    /// file, so the lines never join the publisher's last one.
+    /// Whether the file so far ends with a line break.
     ended_with_break: bool,
 }
 
@@ -409,7 +407,10 @@ mod tests {
             ("ssp.example, 12345", "has 2 fields"),
             ("ssp.example, 12345, DIRECT, abc, extra", "has 5 fields"),
             (", 12345, DIRECT", "has no domain"),
-            ("ssp example, 12345, DIRECT", "has no domain"),
+            (
+                "ssp example, 12345, DIRECT",
+                "has `ssp example` as its domain, and a domain holds no space",
+            ),
             ("ssp.example, , DIRECT", "has no account id"),
             (
                 "ssp.example, 12345, PARTNER",
@@ -458,6 +459,9 @@ mod tests {
             "ssp.example,12345,reseller,f08c47fec0942fa0",
             "  ssp.example , 12345 , Direct  ",
             "CONTACT=ads@publisher.example",
+            "contact=ads@publisher.example",
+            "Subdomain=news.publisher.example",
+            "ssp.example, pub=12345, DIRECT",
             "SUBDOMAIN=news.publisher.example",
             "INVENTORYPARTNERDOMAIN=partner.example",
             "OWNERDOMAIN=publisher.example",
@@ -491,6 +495,20 @@ mod tests {
     }
 
     #[test]
+    fn a_file_whose_lines_end_with_a_carriage_return_takes_the_lines_after_its_last_one() {
+        assert_eq!(
+            through(&[RECORD], "own.example, 1, DIRECT\r\n", 8192),
+            format!("own.example, 1, DIRECT\r\n{RECORD}\n"),
+            "a file ending with a carriage return and a line feed takes no second break"
+        );
+        assert_eq!(
+            through(&[RECORD], "a.example, 1, DIRECT\r\nb.example, 2, DIRECT", 3),
+            format!("a.example, 1, DIRECT\r\nb.example, 2, DIRECT\n{RECORD}\n"),
+            "a file without a final line break gets one before the lines"
+        );
+    }
+
+    #[test]
     fn a_file_read_in_pieces_is_the_same_file() {
         let lines = [RECORD];
         let body = "a.example, 1, DIRECT\nb.example, 2, RESELLER";
@@ -511,7 +529,7 @@ mod tests {
         assert_eq!(
             through(&["  ssp.example, 1, direct  "], "x\n", 8192),
             "x\nssp.example, 1, direct\n",
-            "the relationship is written as the publisher wrote it"
+            "the relationship is written as the deployment wrote it"
         );
     }
 

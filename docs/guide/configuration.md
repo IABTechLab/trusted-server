@@ -1083,9 +1083,9 @@ it passes through untouched.
 
 ### `[ads-txt]`
 
-| Field     | Type                    | Required | Description                                                                                 |
-| --------- | ----------------------- | -------- | ------------------------------------------------------------------------------------------- |
-| `modules` | String or Array[String] | Yes      | What adds lines to the file, in order. `sellers` writes the lines `[ads-txt.sellers]` gives |
+| Field     | Type          | Required | Description                                                                       |
+| --------- | ------------- | -------- | --------------------------------------------------------------------------------- |
+| `modules` | Array[String] | Yes      | What adds lines to the file. `sellers` writes the lines `[ads-txt.sellers]` gives |
 
 ### `[ads-txt.sellers]`
 
@@ -1093,13 +1093,9 @@ it passes through untouched.
 | ------- | ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lines` | Array[String] | Yes      | The lines written at the end of the file, each a data record (domain, account id, `DIRECT` or `RESELLER`, and an optional certification authority id) or a variable |
 
-**How the file is made.** The module is a middleware for `text/plain`, and
-runs where a `[[fetch]]` entry for that media type on the file's path names
-it. It passes the origin's file through and writes the lines after its last
-one, on a line of their own, so a seller the deployment introduces is
-declared beside the publisher's own. A publisher whose origin has no file
-gets the origin's answer, because the module adds to the publisher's file
-and never invents one.
+**How the file is made.** Where a `[[fetch]]` entry for `text/plain` names
+the module, it writes the lines after the origin's last one. The entry's
+`path` is a prefix, so `/ads.txt` also covers `/ads.txt.bak`.
 
 **Refused when the settings load**: a line that is not a data record or a
 variable, naming which part is wrong, a comment, an empty list, and a
