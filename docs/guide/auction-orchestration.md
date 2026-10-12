@@ -705,6 +705,7 @@ Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See 
 enabled = true
 sanitize_creatives = false     # Opt-in; blanks script-based creatives when enabled
 rewrite_creatives = true
+# rewrite_clicks = true       # Unset follows rewrite_creatives
 timeout_ms = 2000
 mediator = "adserver_mock"
 
@@ -838,7 +839,9 @@ The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
 override existing scalar leaves. The pinned EdgeZero loader does not create
 missing leaves or replace arrays, tables, maps, or rules. Existing configs must add
 `rewrite_creatives = true` and `sanitize_creatives = false` before relying on
-those scalar overrides. Edit and re-push TOML for other values. Provider map
+those scalar overrides. `rewrite_clicks` is unset by default; add
+`rewrite_clicks = true` or `false` under `[auction]` before relying on
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. Edit and re-push TOML for other values. Provider map
 keys preserve hyphens, so `pbs-main` uses the `PBS-MAIN` segment and needs
 `env` shell syntax:
 
@@ -853,9 +856,11 @@ env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
 ```
 
 Before rolling back to a binary that does not know a creative-processing field,
-remove that field's non-default value (`rewrite_creatives = false` or
-`sanitize_creatives = true`), push the default-compatible blob, and then roll
-back. See [Configuration](/guide/configuration#auction-configuration) for the
+remove that field's non-default value (`rewrite_creatives = false`,
+`sanitize_creatives = true`, or any explicit `rewrite_clicks`), push the default-compatible blob, and then roll
+back. Older binaries tie click wrapping to `rewrite_creatives`, so rolling back
+also changes link wrapping when `rewrite_clicks` was set. See
+[Configuration](/guide/configuration#auction-configuration) for the
 complete migration, upgrade-sequencing, and rollback guidance.
 
 ## Floor Prices
