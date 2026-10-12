@@ -705,7 +705,7 @@ impl Rewrite {
     ///
     /// The host must not match [`Self::exclude_domains`], and must match
     /// [`Self::include_domains`] when that list is non-empty. Matching is
-    /// case-insensitive; see [`is_host_allowed`] for the pattern rules.
+    /// case-insensitive; see `crate::proxy::is_host_allowed` for the pattern rules.
     #[must_use]
     pub fn should_proxy_asset(&self, host: &str) -> bool {
         !self.is_excluded_host(host) && is_host_permitted(&self.include_domains, host)
@@ -748,6 +748,16 @@ impl Rewrite {
             .iter()
             .map(|pattern| pattern.trim().to_ascii_lowercase())
             .collect();
+        // An `exclude_domains` entry that can never equal a URL host keeps its
+        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
+        // blobs from loading, so warn once per entry and keep it.
+        for pattern in &self.exclude_domains {
+            if let Err(reason) = check_include_domain(pattern) {
+                log::warn!(
+                    "rewrite.exclude_domains: entry `{pattern}` never matches a URL host ({reason})"
+                );
+            }
+        }
     }
 }
 
@@ -3611,14 +3621,11 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
 /// never equal a URL host.
 fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
     if let Some(bracketed) = pattern.strip_prefix('[') {
-        let address = bracketed
+        bracketed
             .strip_suffix(']')
             .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
             .ok_or("not a bracketed IPv6 address")?;
-        if format!("[{address}]") != pattern {
-            return Err("IPv6 address not in compressed form");
-        }
-        return Ok(());
+        return check_host_round_trip(pattern);
     }
     if pattern.parse::<std::net::Ipv6Addr>().is_ok() {
         return Err("IPv6 address without brackets");
@@ -3646,6 +3653,18 @@ fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
         && (name.len() != pattern.len() || name.parse::<std::net::Ipv4Addr>().is_err())
     {
         return Err("numeric host that is not a dotted-quad IPv4 address");
+    }
+    check_host_round_trip(name)
+}
+
+/// Parses `host` with the parser behind [`Url::host_str`] and requires the
+/// rendered form to equal the input, so an entry that `url` rewrites (an
+/// IPv4-mapped IPv6 address in dotted form, an invalid `xn--` label) or rejects
+/// can never load and then silently fail to match.
+fn check_host_round_trip(host: &str) -> Result<(), &'static str> {
+    let parsed = url::Host::parse(host).map_err(|_| "not a valid URL host")?;
+    if parsed.to_string() != host {
+        return Err("not in the form Url::host_str() renders");
     }
     Ok(())
 }
@@ -7045,7 +7064,7 @@ source_domain = "partner.example.com"
         let mut rewrite = Rewrite::default();
         rewrite
             .include_domains
-            .extend(["*.example.com", "img.example.net"].map(str::to_owned));
+            .extend(["*.example.com", "img.example.net", "*.UPPER.Example.org"].map(str::to_owned));
         rewrite
             .exclude_domains
             .push("blocked.example.com".to_owned());
@@ -7055,6 +7074,7 @@ source_domain = "partner.example.com"
             ("a.b.example.com", true),
             ("img.example.net", true),
             ("IMG.EXAMPLE.NET", true),
+            ("cdn.upper.example.org", true),
             ("evil-example.com", false),
             ("cdn.example.org", false),
             ("blocked.example.com", false),
@@ -7074,6 +7094,28 @@ source_domain = "partner.example.com"
         assert!(
             !rewrite.should_wrap_click("blocked.example.com"),
             "should not wrap a click to an excluded host"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_keep_entries_that_never_match() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["https://cdn.example.com", "cdn.example.com:443", "[2001:0db8::1]"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load inert exclude_domains entries with a warning");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec![
+                "https://cdn.example.com".to_owned(),
+                "cdn.example.com:443".to_owned(),
+                "[2001:0db8::1]".to_owned(),
+            ],
+            "should keep inert exclude_domains entries unchanged"
         );
     }
 
@@ -7118,6 +7160,8 @@ source_domain = "partner.example.com"
             "::1",
             "[::1",
             "[2001:0db8::1]",
+            "[::ffff:192.0.2.1]",
+            "xn--zz.example",
             "*.192.0.2.1",
             "192.0.2",
             "256.0.2.1",
@@ -7154,6 +7198,7 @@ source_domain = "partner.example.com"
             "192.0.2.1",
             "[2001:db8::1]",
             "[::1]",
+            "[::ffff:c000:201]",
         ] {
             let settings =
                 Settings::from_toml(&include_domains_toml(entry)).unwrap_or_else(|err| {
