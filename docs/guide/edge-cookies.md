@@ -119,7 +119,7 @@ flowchart TD
     J -- "Unknown<br/>(no geo data)" --> Deny
 ```
 
-- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented.
+- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented. Writing browser-supplied Prebid EIDs into the identity graph additionally requires TCF Purpose 4 (personalized ads); see [Prebid EID Flow](#prebid-eid-flow). Without Purpose 4, server-side pull sync is also skipped, so the EC ID is not sent to pull-sync partners.
 - **US State**: Opt-out model with three-tier fallback — GPC always blocks, then TCF if a CMP uses it, then US Privacy string, then fail-closed.
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
@@ -133,7 +133,7 @@ Partner identities flow into the KV identity graph through three channels. Each 
 ```mermaid
 flowchart LR
     subgraph Browser-initiated
-        Prebid["Prebid EID Cookies<br/><i>ts-eids + sharedId</i><br/>Passive cookie ingestion"]
+        Prebid["Prebid EIDs<br/><i>/auction body + ts-eids + sharedId</i><br/>Response-time ingestion"]
     end
 
     subgraph Server-initiated
@@ -146,9 +146,17 @@ flowchart LR
     Pull --> KV
 ```
 
-### Prebid EID Cookie Flow
+### Prebid EID Flow
 
-The `ts-eids` cookie bridges client-side Prebid user ID modules with the server-side identity graph.
+Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a response. It collects matched partner UIDs from three request-local sources, applied in this order so that, when two sources carry the same partner, the later source's UID is the candidate offered to KV:
+
+1. the `ts-eids` cookie,
+2. the `eids` array in the `/auction` request body,
+3. the `sharedId` cookie.
+
+The `/auction` body carries the full EID set Prebid.js resolved, so `/auction` ingestion is not limited by the size cap TSJS applies to the `ts-eids` cookie. The cookie still bridges Prebid user ID modules with the identity graph on requests that carry no EID body, such as `GET /_ts/page-bids` and page navigations.
+
+These Prebid EID writes follow the same consent rule as bidstream EID forwarding: when a TCF signal is present, Purpose 1 (store/access device) and Purpose 4 (personalized ads) must both be consented, and when GDPR applies without a TCF signal the writes are withheld. A user who consents to Purpose 1 but not Purpose 4 keeps their EC, but no EIDs from the request are persisted.
 
 ```mermaid
 sequenceDiagram
@@ -168,7 +176,7 @@ sequenceDiagram
     Note over B,TS: Next eligible EID-sync request
     B->>TS: Document navigation, POST /auction,<br/>or admitted GET /_ts/page-bids
     TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
-    TS->>KV: Add missing partner IDs in one conditional write<br/>skip when UIDs already match
+    TS->>KV: Add missing partner IDs in one conditional write<br/>skip when UIDs already match<br/>(requires TCF Purpose 1 + 4 under GDPR)
 ```
 
 Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
@@ -179,7 +187,7 @@ Returning-user cookie persistence runs only on publisher document navigations, `
 
 Each eligible request attempts at most one conditional cookie update. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
 
-Browser cookies do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser cookie, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
+Browser cookies and the `/auction` request body do not carry a trustworthy value timestamp or sequence. Trusted Server therefore adds missing partner IDs but does not replace a different stored UID from a browser-supplied EID, even on later eligible requests. Pull- or push-enabled partners can replace that value through their authoritative synchronization path. A cookie-only partner retains the stored UID until an authoritative freshness rule is introduced or the EC row expires.
 
 ### EID Seeding and Prebid Bidstream Forwarding
 
@@ -201,7 +209,7 @@ sequenceDiagram
     else Prebid sync seeds browser EIDs
         B->>B: Prebid User ID modules resolve IDs
         B->>TSJS: getUserIdsAsEids()
-        TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs
+        TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs (size-capped)
         B->>TS: Next eligible request with ts-eids
         TS->>KV: Add missing matched partner UIDs<br/>defer different stored values
     end
@@ -217,6 +225,7 @@ sequenceDiagram
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
+    TS->>KV: Add missing partner UIDs from request eids[]<br/>+ ts-eids/sharedId cookies (TCF Purpose 1 + 4 under GDPR)
 ```
 
 The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
@@ -254,7 +263,7 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 }
 ```
 
-Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs, from the `/auction` request body, the `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
 
 ### Pull-Sync Completeness Marker
 
