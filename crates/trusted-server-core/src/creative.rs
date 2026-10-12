@@ -24,8 +24,9 @@
 //!   click guard.
 //! - Hosts matching `[rewrite] exclude_domains` are left untouched, for assets
 //!   and links alike.
-//! - Bidder-supplied `<base>` elements are removed so root-relative first-party
-//!   URLs cannot be rebased.
+//! - Bidder-supplied `<base>` elements lose their `href` so root-relative
+//!   first-party URLs cannot be rebased. A `<base>` with a `target` keeps it;
+//!   one without is removed.
 //! - Relative URLs (e.g., `/path`, `../path`, `local/file`) remain unchanged.
 //! - Non-network schemes are ignored: `data:`, `javascript:`, `mailto:`, `tel:`,
 //!   `blob:`, `about:`.
@@ -35,7 +36,7 @@
 //!   URLs when [`AuctionConfig::rewrite_creatives`] is on and wrap links when
 //!   [`AuctionConfig::rewrites_auction_clicks`] is on; an unset
 //!   [`AuctionConfig::rewrite_clicks`] follows `rewrite_creatives`. `<base>`
-//!   removal and TSJS injection run when either is on. With both off the
+//!   handling and TSJS injection run when either is on. With both off the
 //!   rewrite pass is skipped.
 //! - HTML fetched through `/first-party/proxy` always rewrites asset URLs and
 //!   wraps links unless `rewrite_clicks` is explicitly `false`
@@ -1242,7 +1243,7 @@ impl CreativeFeatures {
 /// click paths (empty for root-relative, `https://<domain>` for absolute);
 /// `inject_tsjs` controls the `<body>` tsjs bundle injection; `max_output_size`
 /// bounds the rewritten result; `features` selects which handlers run. `<base>`
-/// removal and TSJS injection always run, since callers only invoke the pass
+/// handling and TSJS injection always run, since callers only invoke the pass
 /// when at least one feature is on. See the public wrappers,
 /// [`rewrite_creative_html`], [`rewrite_inline_creative_html`], and
 /// [`rewrite_proxied_html`], for the supported render contexts.
@@ -1277,14 +1278,18 @@ fn rewrite_creative_html_impl(
     // and proxied HTML documents have very different legitimate sizes.
     let overflowed = std::cell::Cell::new(false);
     let mut element_content_handlers = vec![
-        // Remove <base> unconditionally: a bidder-supplied base URL
-        // rebases the root-relative `/first-party/…` and `/static/tsjs=…`
-        // URLs this pass emits onto an attacker-chosen origin, hijacking
-        // proxy/click mediation and leaking signed URL data. The
+        // Drop a bidder-supplied base URL: it would rebase the root-relative
+        // `/first-party/…` and `/static/tsjs=…` URLs this pass emits onto an
+        // attacker-chosen origin, hijacking proxy/click mediation and leaking
+        // signed URL data. Keep `target` so raw links still open where the
+        // bidder intended, and remove a `<base>` left without one. The
         // sanitizer also strips <base>, but rewriting must not depend on
         // sanitization, which is independently optional.
         element!("base", |el| {
-            el.remove();
+            el.remove_attribute("href");
+            if !el.has_attribute("target") {
+                el.remove();
+            }
             Ok(())
         }),
         // Inject unified tsjs bundle at the top of body once
@@ -1930,7 +1935,7 @@ mod tests {
                     assert_eq!(
                         out.contains("<base"),
                         !(assets || clicks),
-                        "{label}: <base> removed whenever either switch is on: {out}"
+                        "{label}: <base> without target removed whenever either switch is on: {out}"
                     );
                     let expected_tsjs =
                         usize::from(matches!(path, CreativePath::Auction) && (assets || clicks));
@@ -1974,6 +1979,43 @@ mod tests {
     // keep producing these bytes on both auction paths.
     const MATRIX_DEFAULT_AUCTION_OUTPUT: &str = r#"<html><head><style>.b{background:url("/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><script src="/static/tsjs=tsjs-unified.min.js" id="trustedserver-js"></script><img src="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
     const MATRIX_DEFAULT_INLINE_OUTPUT: &str = r#"<html><head><style>.b{background:url("https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fbg.png&tstoken=xi0bmg4Ik6UU7KsG5z_quFeN5BGt_G8bt4oxgD3HiH8")}</style></head><body><img src="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad.png&tstoken=FU5VJC5ElXC43PfbzzR-TBVu0h4TFKH82LkDw5NP4to" srcset="https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fad-2x.png&tstoken=2WEq5obXUSJyIHjXhx_MatPqzMJtU1_tb_ZMZTKU1m8 2x"><div style="background:url(&quot;https://www.example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Finline.png&tstoken=eV8lwVA2y6dcTtIC8RopnFTYnb1R9VZ9fqxbMaolCBY&quot;)"></div><a href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Fpage&tstoken=DxWOVjz0AiVAcRSPJO7I69TLT0fc8RaA7E7R0H7SmCY">Ad</a><map><area href="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE" data-tsclick="https://www.example.com/first-party/click?tsurl=https%3A%2F%2Flanding.example.com%2Farea&tstoken=n0VAVAbY32ikTeYoKdkeb-GvNxbiepF_ul97VakLqUE"></map><a href="https://excluded.example.com/page">Excluded</a><a href="mailto:ads@example.com">Mail</a></body></html>"#;
+
+    #[test]
+    fn base_target_is_kept_when_the_base_url_is_dropped() {
+        let fixture = r#"<base href="https://base.example.com/" target="_blank"><img src="images/ad.png"><a href="landing">Ad</a>"#;
+        for path in [CreativePath::Auction, CreativePath::Inline] {
+            for (assets, clicks) in [(true, true), (true, false), (false, true), (false, false)] {
+                let settings = matrix_settings(assets, Some(clicks));
+                let label = format!("{path:?} assets={assets} clicks={clicks}");
+
+                let out = process_for_path(&settings, path, fixture);
+
+                if assets || clicks {
+                    assert!(
+                        out.contains(r#"<base target="_blank">"#),
+                        "{label}: should keep base target without href: {out}"
+                    );
+                    assert!(
+                        !out.contains("base.example.com"),
+                        "{label}: should drop the bidder base URL: {out}"
+                    );
+                } else {
+                    assert_eq!(
+                        out, fixture,
+                        "{label}: should pass through byte for byte with both switches off"
+                    );
+                }
+                assert!(
+                    out.contains(r#"<img src="images/ad.png">"#),
+                    "{label}: relative image should stay raw: {out}"
+                );
+                assert!(
+                    out.contains(r#"<a href="landing">"#),
+                    "{label}: relative anchor should stay raw: {out}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn default_settings_rewrite_matrix_fixture_byte_for_byte_as_before() {
