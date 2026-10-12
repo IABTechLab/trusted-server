@@ -5922,7 +5922,16 @@ fn apply_auction_eids_and_device(
         .and_then(|j| j.get(COOKIE_TS_EIDS))
         .map(|c| c.value().to_owned());
     let client_eids = if targeting.ec_id.is_some() {
-        resolve_client_auction_eids(None, ts_eids_value.as_deref())
+        let server_eids = crate::integrations::id5::server_cookie_eids(
+            targeting
+                .cookie_jar
+                .and_then(|j| j.get(crate::constants::COOKIE_TS_EIDS_S))
+                .map(cookie::Cookie::value),
+        );
+        merge_auction_eids(
+            resolve_client_auction_eids(None, ts_eids_value.as_deref()),
+            server_eids,
+        )
     } else {
         None
     };

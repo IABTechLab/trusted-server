@@ -362,6 +362,10 @@ fn validate_enabled_integrations(
     }
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
+    validate_integration::<crate::integrations::id5::Id5Config>(
+        settings,
+        crate::integrations::id5::ID5_INTEGRATION_ID,
+    )?;
 
     Ok(())
 }

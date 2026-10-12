@@ -6,6 +6,14 @@ pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+/// Server-owned `HttpOnly` cookie holding EIDs Trusted Server obtained itself,
+/// in the same structured format as [`COOKIE_TS_EIDS`]. Page scripts cannot
+/// read or overwrite it.
+pub const COOKIE_TS_EIDS_S: &str = "ts-eids-s";
+/// ID5 `signature` from the last fetch, echoed back on the next one.
+pub const COOKIE_TS_ID5_SIGNATURE: &str = "ts-id5-sig";
+/// Present while the last ID5 fetch is fresh; expiry means a refresh is due.
+pub const COOKIE_TS_ID5_FRESH: &str = "ts-id5-fresh";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
