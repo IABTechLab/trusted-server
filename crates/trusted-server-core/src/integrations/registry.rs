@@ -906,8 +906,7 @@ struct IntegrationRegistryInner {
     // Every builder's module name, with whether a section selects it, so the
     // refusal of a name a selector wrote can say what that name is.
     builder_modules: Vec<(&'static str, bool)>,
-    /// The vendors whose `[shared.<vendor>]` table a builder is run by and
-    /// the settings do not carry, so none of that vendor's modules runs.
+    // Vendors whose shared table is absent, for the refusal note.
     absent_shared: Vec<&'static str>,
     // The module `[geo] module` resolved to, or `None` when the selector
     // is `platform` and the adapter's own host lookup stands. Unset and `none`
@@ -1012,6 +1011,24 @@ impl IntegrationRegistryInner {
     /// nothing it supplies is running, or one that is selected and supplies no
     /// module of this kind. Empty when no builder's module answers to the
     /// name.
+    fn builder_note(&self, type_folder: &str, kind: &str, written: &str) -> String {
+        let names: Vec<&str> = self.builder_modules.iter().map(|(name, _)| *name).collect();
+        let Some(name) = crate::module_name::resolve(type_folder, written, &names) else {
+            return String::new();
+        };
+        let selected = self
+            .builder_modules
+            .iter()
+            .any(|(module, selected)| *module == name && *selected);
+        if selected {
+            format!(". `{written}` is selected and supplies no {kind} module")
+        } else {
+            format!(
+                ". `{written}` is a module no section selects, so nothing it supplies is running"
+            )
+        }
+    }
+
     /// A sentence naming the shared tables whose absence kept their vendors'
     /// modules from running, to follow a refusal of a module nothing supplies,
     /// or nothing when every builder a shared table runs is running.
@@ -1031,24 +1048,6 @@ impl IntegrationRegistryInner {
             "those tables run"
         };
         format!(". There is no {tables}, so the modules {those} are not running")
-    }
-
-    fn builder_note(&self, type_folder: &str, kind: &str, written: &str) -> String {
-        let names: Vec<&str> = self.builder_modules.iter().map(|(name, _)| *name).collect();
-        let Some(name) = crate::module_name::resolve(type_folder, written, &names) else {
-            return String::new();
-        };
-        let selected = self
-            .builder_modules
-            .iter()
-            .any(|(module, selected)| *module == name && *selected);
-        if selected {
-            format!(". `{written}` is selected and supplies no {kind} module")
-        } else {
-            format!(
-                ". `{written}` is a module no section selects, so nothing it supplies is running"
-            )
-        }
     }
 }
 
@@ -1479,6 +1478,7 @@ pub struct IntegrationRegistry {
 fn check_section_selections(
     settings: &Settings,
     extra: &[crate::integrations::IntegrationBuilder],
+    inner: &IntegrationRegistryInner,
 ) -> Result<(), Report<TrustedServerError>> {
     let offered: Vec<&'static str> = crate::integrations::all_builders(extra)
         .filter_map(|builder| builder.module_name())
@@ -1513,7 +1513,8 @@ fn check_section_selections(
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "[{section}] selects `{written}`, which no module this deployment \
-                     supplies. {supplied}"
+                     supplies. {supplied}{}",
+                    inner.absent_shared_note()
                 ),
             }));
         }
@@ -1643,6 +1644,19 @@ impl IntegrationRegistry {
                 }));
             }
             inner.builder_ids.push((builder.id(), builder.source()));
+            // A builder its shared table runs answers to no section, so a
+            // module name would let a section select what it does not run.
+            if let (Some(vendor), Some(name)) = (builder.shared_settings(), builder.module_name()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "integration `{}` from `{}` is run by [shared.{vendor}] and also names \
+                         the module `{name}`. A builder its shared table runs is selected by \
+                         no section, so it takes no module name",
+                        builder.id(),
+                        builder.source()
+                    ),
+                }));
+            }
             // Preparers are collected before the selection check, so an
             // integration can sanitize its own reserved query or cookie in a
             // deployment that does not run it.
@@ -1706,7 +1720,7 @@ impl IntegrationRegistry {
         // the selections are checked against them rather than in the
         // settings. Deploy validation deliberately does not make this check,
         // because a vendor crate the CLI never links may supply the name.
-        check_section_selections(settings, extra)?;
+        check_section_selections(settings, extra, &inner)?;
 
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
@@ -4812,6 +4826,42 @@ mod tests {
         assert!(
             refused.contains("There is no [shared.example]"),
             "the message has to name the table to add: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_list_selection_nothing_supplies_names_the_shared_table_that_is_absent() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.select_module("identity", "example.id");
+
+        let refused = IntegrationRegistry::with_registrations(&settings, &[shared_probe_builder()])
+            .err()
+            .expect("no identity module is supplied")
+            .to_string();
+
+        assert!(
+            refused.contains("[identity] selects `example.id`")
+                && refused.contains("There is no [shared.example]"),
+            "the message has to name the table to add: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_builder_its_shared_table_runs_is_refused_a_module_name() {
+        let mut settings = with_shared_table(crate::test_support::tests::create_test_settings());
+        settings.geo.module = Some("example".to_owned());
+
+        let refused = IntegrationRegistry::with_registrations(
+            &settings,
+            &[shared_probe_builder().with_module_name("geo.example")],
+        )
+        .err()
+        .expect("a section could select what the table runs")
+        .to_string();
+
+        assert!(
+            refused.contains("is run by [shared.example] and also names the module `geo.example`"),
+            "{refused}"
         );
     }
 

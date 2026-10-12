@@ -644,7 +644,8 @@ impl IntegrationBuilder {
 
     /// Runs this builder when `[shared.<vendor>]` is present, for a vendor
     /// whose modules all read that one table and cannot be built without it.
-    /// A builder the table runs is selected by no section.
+    /// A builder the table runs is selected by no section, so the registry
+    /// refuses one that also has a module name.
     #[must_use]
     pub const fn with_shared_settings(mut self, vendor: &'static str) -> Self {
         self.shared = Some(vendor);

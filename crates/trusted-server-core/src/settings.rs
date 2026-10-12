@@ -320,25 +320,12 @@ impl TypeSections {
     }
 }
 
-/// The settings type a module reads from its table, beneath the section that
-/// selects it.
-///
-/// The type states which settings the module takes and how they are
-/// validated, and nothing else. Whether the module runs is not its business,
-/// because the section's selection names what runs.
-/// The section, and the folder under `crates`, that holds what one vendor's
-/// modules share.
+/// The section that holds what one vendor's modules share.
 pub const SHARED_TYPE: &str = "shared";
 
 /// The `[shared]` section, one `[shared.<vendor>]` table per vendor, holding
 /// the settings every module of that vendor reads, such as an endpoint and a
-/// license key.
-///
-/// Core reads none of it. A vendor's crates read their own table through
-/// [`Settings::shared_config`], and a builder marked with
-/// [`IntegrationBuilder::with_shared_settings`](crate::integrations::IntegrationBuilder::with_shared_settings)
-/// runs when its vendor's table is present. A table that no builder reads is
-/// refused where the registry is built, the only place every builder is known.
+/// license key, read through [`Settings::shared_config`].
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct SharedTables(BTreeMap<String, serde_json::Map<String, JsonValue>>);
@@ -399,9 +386,8 @@ impl SharedTables {
         Ok(Some(config))
     }
 
-    /// Refuses a table whose name is not one folder name, being lower case
-    /// letters, digits, `_` or `-`, because a vendor's table is named by its
-    /// folder under `crates/shared`.
+    /// Refuses a table whose name is not a vendor's name, being lower case
+    /// letters, digits, `_` or `-`.
     ///
     /// # Errors
     ///
@@ -414,8 +400,8 @@ impl SharedTables {
             Some(vendor) => Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "[{SHARED_TYPE}] has a table named `{vendor}`, which is not a vendor's \
-                     folder name. A vendor's shared table is named by its folder under \
-                     crates/{SHARED_TYPE}, of lower case letters, digits, `_` or `-`"
+                     name. A vendor's shared table is named in lower case letters, \
+                     digits, `_` or `-`"
                 ),
             })),
             None => Ok(()),
@@ -423,6 +409,12 @@ impl SharedTables {
     }
 }
 
+/// The settings type a module reads from its table, beneath the section that
+/// selects it.
+///
+/// The type states which settings the module takes and how they are
+/// validated, and nothing else. Whether the module runs is not its business,
+/// because the section's selection names what runs.
 pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
@@ -10771,13 +10763,13 @@ mod permission_signal_config_tests {
         }
 
         #[test]
-        fn a_shared_table_not_named_as_a_folder_is_refused() {
+        fn a_shared_table_not_named_as_a_vendor_is_refused() {
             for table in ["[shared.Example]", "[shared.\"an.example\"]"] {
                 let refused = with(&format!("{table}\nendpoint = \"https://api.example.com\""))
                     .expect_err("a vendor's table is named by its folder");
 
                 assert!(
-                    format!("{refused:?}").contains("which is not a vendor's folder name"),
+                    format!("{refused:?}").contains("which is not a vendor's name"),
                     "{table}: {refused:?}"
                 );
             }

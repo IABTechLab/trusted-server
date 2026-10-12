@@ -783,15 +783,15 @@ only when a section of the settings selects it.
 ### A vendor's shared table
 
 What every module of one vendor needs, such as an endpoint and a license key,
-goes in one `[shared.<vendor>]` table, named by the vendor's folder under
-`crates/shared`. Core reads none of it. The vendor's crates read it as their
-own typed settings with `Settings::shared_config::<T>(vendor)`, which refuses
-a table that cannot be read as `T` or fails its validation, naming the table.
-The vendor's builder marks itself with `.with_shared_settings(vendor)`, and
-the registry builds it when the table is present and refuses a table that no
-builder reads. A secret in the table is declared with
-`.with_secret_settings(...)` at its path inside the table, as a module's own
-secrets are, and is resolved from the secret store when the table is present.
+goes in one `[shared.<vendor>]` table. Core reads none of it. The vendor's
+crates read it as their own typed settings with
+`Settings::shared_config::<T>(vendor)`, which refuses a table that cannot be
+read as `T` or fails its validation, naming the table. The vendor's builder
+marks itself with `.with_shared_settings(vendor)`, and the registry builds it
+when the table is present and refuses a table that no builder reads. A secret
+in the table is declared with `.with_secret_settings(...)` at its path inside
+the table, as a module's own secrets are, and is resolved from the secret
+store when the table is present.
 
 ### Supplying a loading cache
 
