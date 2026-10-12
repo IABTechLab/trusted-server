@@ -230,11 +230,12 @@ CSP, Next.js/RSC semantics, and the opaque parser markers; core checks marker
 multiplicity but does not parse or validate replacement structure.
 
 Full 404/500 HTML remains eligible. A signing integration should inspect
-`response_status` and return `Unchanged` for statuses it does not sign. HTML with
-status 206 or any `Content-Range` bypasses rewriting and terminal I/O while
-preserving encoded body bytes and range/framing metadata. Non-document fetches
-keep their range request semantics. Independent cookie and diagnostics privacy
-rules still apply.
+`response_status` and return `Unchanged` for statuses it does not sign. When
+finalizers are registered, HTML with status 206 or any `Content-Range` bypasses
+rewriting and terminal I/O while preserving encoded body bytes and range/framing
+metadata. Without registered finalizers, existing partial-response processing
+continues. Non-document fetches keep their range request semantics. Independent
+cookie and diagnostics privacy rules still apply.
 
 Each real consumer must test a winning auction after replacement: the marker is
 consumed once, and the bids script remains before the structural body end, outside
@@ -262,8 +263,12 @@ crossed and ordinary streaming resumes.
 Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
 `publisher_response_into_streaming_response` to execute terminal callbacks.
 `stream_publisher_body` and the generic synchronous pipeline perform synchronous
-transformations only. Client cancellation drops the callback and retains the existing
-auction guard's log warning; error paths that can await emit abandonment telemetry.
+transformations only. Callers with a pending auction must use an async entry point
+to collect or abandon it; `stream_publisher_body` borrows the response parameters
+and leaves auction ownership with the caller, including on a partial-HTML bypass.
+On async entry points, client cancellation drops the callback and retains the
+existing auction guard's log warning; error paths that can await emit abandonment
+telemetry.
 
 Finalizer-enabled HTML bypasses shared-template reads, reservations, and stores and
 uses inline auction assembly. Raw-origin readthrough remains independent. Processed

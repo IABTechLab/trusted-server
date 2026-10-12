@@ -3002,6 +3002,11 @@ impl Write for BoundedWriter {
 /// [`publisher_response_into_streaming_response`]. Adapters use those async
 /// entry points when terminal integrations are enabled.
 ///
+/// Callers with a pending auction must use an async entry point so it can be
+/// collected or abandoned. This helper borrows `params` and leaves auction
+/// ownership with the caller, including when range-associated HTML bypasses
+/// processing.
+///
 /// # Errors
 ///
 /// Returns an error if processing fails mid-stream. Since headers are already
