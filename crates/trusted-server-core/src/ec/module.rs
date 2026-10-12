@@ -222,7 +222,7 @@ const FRAMING_OR_HOP_BY_HOP_HEADERS: &[&str] = &[
 pub enum ReservedResponseEffect {
     /// A `Set-Cookie` naming a cookie in the namespace the deployment's public
     /// prefix starts, which core manages.
-    #[display("sets a cookie in the namespace the public prefix starts, which core manages")]
+    #[display("sets a cookie under the public prefix core manages")]
     ManagedCookie,
 
     /// A header in the `x-ts-` namespace core emits and strips.

@@ -1269,7 +1269,7 @@ fn resolve_device_module(
 }
 
 /// Resolves `[prefix] module` against the registered prefix modules, or to
-/// core's own when nothing is selected, and asks the module for the prefixes
+/// core's own when nothing or `ts` is selected, and asks the module for the prefixes
 /// of the publisher the settings describe, so a module that names something
 /// its call never carries is refused here rather than on every request.
 ///
@@ -1282,7 +1282,7 @@ fn resolve_prefix_module(
     inner: &IntegrationRegistryInner,
 ) -> Result<SelectedPrefixModule, Report<TrustedServerError>> {
     let selected = match settings.prefix.module.as_deref() {
-        None => SelectedPrefixModule::trusted_server(),
+        None | Some(crate::prefix::TRUSTED_SERVER_MODULE) => SelectedPrefixModule::trusted_server(),
         Some(written) => {
             let module =
                 named_module(PREFIX_TYPE, "prefix", written, &inner.prefix_modules, inner)?;
@@ -2036,21 +2036,17 @@ impl IntegrationRegistry {
     /// The prefixes of the publisher `request` was resolved to under
     /// `settings`, from the selected prefix module.
     ///
-    /// The module was asked once when the registry was built, so it names
-    /// nothing a request does not carry. Should it still give nothing, the
-    /// failure is logged and core's own prefixes stand.
+    /// # Panics
+    ///
+    /// When the module names a value its call does not carry, which the
+    /// registry refused when it was built, because a request's call carries
+    /// what the startup trial's did.
     #[must_use]
     pub fn prefixes(&self, settings: &Settings, request: ModuleRequest<'_>) -> Prefixes {
         self.inner
             .prefix_module
             .prefixes(settings, request)
-            .unwrap_or_else(|withheld| {
-                log::error!(
-                    "the prefix module `{}` gave no prefixes, so core's own stand: {withheld}",
-                    self.inner.prefix_module.name()
-                );
-                Prefixes::trusted_server(settings)
-            })
+            .expect("should give prefixes, as the startup trial proved the module names only what a call carries")
     }
 
     /// The name of every middleware a running module supplies, in
@@ -5897,8 +5893,7 @@ mod tests {
         .with_module_name(GEO_PROBE_MODULE)]
     }
 
-    /// The names the two prefix test modules run under, as modules under
-    /// `crates/testing` are named.
+    /// The names the two prefix test modules run under.
     const PREFIX_PROBE_MODULE: &str = "testing.prefix-probe";
     const PREFIX_READER_MODULE: &str = "testing.prefix-reader";
 
@@ -6024,6 +6019,20 @@ mod tests {
 
         assert_eq!(registry.prefix_module().name(), "ts");
         assert_eq!(prefixes.public().as_str(), "ts");
+        assert_eq!(prefixes.public().cookie_name("ec"), "ts-ec");
+        assert_eq!(prefixes.server_key().as_str(), "ts.example.com");
+    }
+
+    #[test]
+    fn a_prefix_selector_naming_ts_selects_cores_own() {
+        let settings = settings_selecting_prefix_module(Some("ts"));
+        let registry = IntegrationRegistry::with_registrations(&settings, &prefix_probe_builders())
+            .expect("should accept the name the registry reports core's module by");
+
+        let prefixes =
+            registry.prefixes(&settings, crate::module_context::test_support::request("/"));
+
+        assert_eq!(registry.prefix_module().name(), "ts");
         assert_eq!(prefixes.public().cookie_name("ec"), "ts-ec");
         assert_eq!(prefixes.server_key().as_str(), "ts.example.com");
     }

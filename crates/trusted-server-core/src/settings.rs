@@ -1446,10 +1446,10 @@ impl<'de> Deserialize<'de> for PermissionSignalConfig {
 pub struct PrefixConfig {
     /// The prefix module to run, named as any module is, by its crate folder.
     ///
-    /// Core's own module runs when this is absent, giving `ts` for the names
-    /// the browser holds and `ts.<publisher.domain>` for shared store keys, as
-    /// Trusted Server always has. A name no module supplies is refused when the
-    /// registry is built, in
+    /// Core's own module runs when this is absent or names `ts`, giving `ts`
+    /// for the names the browser holds and `ts.<publisher.domain>` for shared
+    /// store keys. A name no module supplies is refused when the registry is
+    /// built, in
     /// [`IntegrationRegistry::with_plan_and_registrations`](crate::integrations::IntegrationRegistry::with_plan_and_registrations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,

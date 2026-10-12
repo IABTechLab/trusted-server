@@ -1,13 +1,12 @@
 //! An integration that lives outside `trusted-server-core` and exercises every
 //! part of the integration seam from a vendor crate's position.
 //!
-//! One registration carries a browser module, a proxy route, a geo module,
-//! an Edge Cookie identity module, a device module, a prefix module, a
-//! robots.txt contributor
-//! and a middleware for each phase of a page, alongside its own configuration
-//! block, and the builder adds a request preparer, a demand implementation
-//! `[demand]` can name and an ad server implementation `[ad-server]` can
-//! name. The round-trip tests in
+//! One registration carries a browser module, a proxy route, a geo module, an
+//! Edge Cookie identity module, a device module, a prefix module, a robots.txt
+//! contributor and a middleware for each phase of a page, alongside its own
+//! configuration block, and the builder adds a request preparer, a demand
+//! implementation `[demand]` can name and an ad server implementation
+//! `[ad-server]` can name. The round-trip tests in
 //! `crates/trusted-server-adapter-axum/tests/seam_probe.rs` and
 //! `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive
 //! each of those through a real adapter, so the seam is proven by a caller that

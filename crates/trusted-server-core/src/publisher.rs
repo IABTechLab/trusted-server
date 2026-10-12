@@ -651,6 +651,8 @@ struct ProcessResponseParams<'a> {
     /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
     csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
     prepared: &'a Arc<Prepared>,
+    /// See [`OwnedProcessResponseParams::public_prefix`].
+    public_prefix: &'a crate::prefix::PublicPrefix,
 }
 
 struct PublisherBodyProcessor {
@@ -882,6 +884,7 @@ impl PublisherBodyProcessor {
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
                 prepared: Arc::clone(&params.prepared),
+                public_prefix: &params.public_prefix,
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -985,6 +988,7 @@ fn process_response_streaming<W: Write>(
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
             prepared: Arc::clone(params.prepared),
+            public_prefix: params.public_prefix,
             deferred_inline_marker: None,
         })?;
         StreamingPipeline::new(config, processor)
@@ -1573,6 +1577,8 @@ struct HtmlStreamProcessorParams<'a> {
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
     prepared: Arc<Prepared>,
+    /// See [`OwnedProcessResponseParams::public_prefix`].
+    public_prefix: &'a crate::prefix::PublicPrefix,
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1728,22 +1734,6 @@ fn deferred_inline_seam_token(
     })
 }
 
-/// The public prefix of the publisher a page is served for, from the selected
-/// prefix module, which the page's bundle tag tells the client script.
-fn page_public_prefix(
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-    request_host: &str,
-    request_scheme: &str,
-    request_path: &str,
-) -> crate::prefix::PublicPrefix {
-    let request = ModuleRequest::new(&Method::GET, request_host, request_scheme, request_path);
-    integration_registry
-        .prefixes(settings, request)
-        .public()
-        .clone()
-}
-
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
@@ -1779,13 +1769,7 @@ fn create_html_stream_processor(
         .with_request_state(params.request_state)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
-        .with_public_prefix(page_public_prefix(
-            params.settings,
-            params.integration_registry,
-            params.request_host,
-            params.request_scheme,
-            params.request_path,
-        ))
+        .with_public_prefix(params.public_prefix.clone())
         .with_prepared(params.prepared);
 
     // The middleware of the first [[fetch]] entry covering this path.
@@ -2127,6 +2111,9 @@ pub struct OwnedProcessResponseParams {
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub(crate) prepared: Arc<Prepared>,
+    /// The request's public prefix, from its services, which the page's
+    /// bundle tag tells the client script.
+    pub(crate) public_prefix: crate::prefix::PublicPrefix,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -2584,6 +2571,8 @@ fn build_template_assembly_params(
         // A request that carries any keeps to the origin path, so none reaches a
         // document served from a template.
         request_state: IntegrationRequestState::default(),
+        // Set by the caller, from the request's services.
+        public_prefix: crate::prefix::PublicPrefix::default(),
     }
 }
 
@@ -3371,6 +3360,7 @@ pub fn stream_publisher_body<W: Write>(
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
         prepared: &params.prepared,
+        public_prefix: &params.public_prefix,
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -3466,6 +3456,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     );
     let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
         prepared: Arc::clone(&params.prepared),
+        public_prefix: &params.public_prefix,
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
@@ -5273,13 +5264,6 @@ pub async fn handle_publisher_request(
         } else {
             String::new()
         };
-    let page_public_prefix = page_public_prefix(
-        settings,
-        integration_registry,
-        request_host,
-        request_scheme,
-        target_uri.path(),
-    );
     let template_cache_key =
         request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
             url: target_uri.to_string(),
@@ -5305,7 +5289,7 @@ pub async fn handle_publisher_request(
             template_fingerprint: template_fingerprint(
                 settings,
                 integration_registry,
-                &page_public_prefix,
+                services.public_prefix(),
             ),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
@@ -5623,6 +5607,7 @@ pub async fn handle_publisher_request(
                         permissions_json.clone(),
                     );
                     params.request_path.clone_from(&request_path);
+                    params.public_prefix = services.public_prefix().clone();
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -6117,6 +6102,7 @@ pub async fn handle_publisher_request(
                     dispatched_auction,
                     price_granularity,
                     prepared,
+                    public_prefix: services.public_prefix().clone(),
                 }),
             })
         }
@@ -9740,6 +9726,7 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -11286,6 +11273,31 @@ mod tests {
                 let page = String::from_utf8_lossy(&page);
                 assert!(
                     page.contains(r#"data-ts-public-prefix="ts""#),
+                    "{mode}: {page}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_tells_the_client_script_the_prefix_its_services_carry() {
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode(mode));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache)).with_prefixes(
+                    crate::prefix::Prefixes::new(
+                        crate::prefix::PublicPrefix::new(["_ex"])
+                            .expect("should accept the prefix"),
+                        crate::platform::ServerKeyPrefix::new("ex", "example.com"),
+                    ),
+                );
+                queue_shareable_html(&stub);
+
+                let page = body_of(run(&settings, &services, navigation_request()).await).await;
+
+                let page = String::from_utf8_lossy(&page);
+                assert!(
+                    page.contains(r#"data-ts-public-prefix="_ex""#),
                     "{mode}: {page}"
                 );
             }
@@ -21156,6 +21168,7 @@ mod tests {
     ) -> String {
         let registry = IntegrationRegistry::new(settings).expect("should build a registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -21230,6 +21243,7 @@ mod tests {
         );
         let services = noop_services();
         let mut params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22083,6 +22097,7 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22147,6 +22162,7 @@ mod tests {
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22232,6 +22248,7 @@ mod tests {
                 b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
             ),
             params: Box::new(OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22326,6 +22343,7 @@ mod tests {
         };
         let params = || {
             Box::new(OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22435,6 +22453,7 @@ mod tests {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22485,6 +22504,7 @@ mod tests {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22615,6 +22635,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22683,6 +22704,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22754,6 +22776,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22825,6 +22848,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22896,6 +22920,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22947,6 +22972,7 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -23174,6 +23200,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23253,6 +23280,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23334,6 +23362,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23409,6 +23438,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -23566,6 +23596,7 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24243,6 +24274,7 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24442,6 +24474,7 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24525,6 +24558,7 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24591,6 +24625,7 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24712,6 +24747,7 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24773,6 +24809,7 @@ mod tests {
         // One small script whose payload is swapped for a placeholder.
         let html = br#"<html><body><script>fixture_payload("link=https://origin.example.com/page")</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
