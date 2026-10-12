@@ -221,7 +221,12 @@ requires a verified application release root via `--application-release`; a
 bare `ts deploy --adapter fastly` without a release is accepted only for
 store-free applications. The CLI loads `edgezero.toml` from the working
 directory unless `EDGEZERO_MANIFEST` names another file, and it rejects a
-manifest outside the release root, so select the release's own manifest:
+manifest outside the release root, so select the release's own manifest.
+
+Managed deployment also requires a nonempty `FASTLY_API_TOKEN` in the process
+environment; signing in with `ts auth login` or a Fastly CLI profile alone
+does not supply the token used by the adapter's direct API calls. Export the
+token before running:
 
 ```bash
 EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
