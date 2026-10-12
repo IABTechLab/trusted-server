@@ -20,11 +20,7 @@ bytes = { workspace = true }
 edgezero-core = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
-# The tokio feature adds the pool of threads that runs a load apart from its
-# caller on a native host, and the cloudflare feature adds the spawner that
-# keeps a load running with a Worker request's wait_until. Each pulls in its
-# platform's crate only on the target that platform runs.
-fiftyone-caching = { workspace = true, features = ["tokio", "cloudflare"] }
+fiftyone-caching = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

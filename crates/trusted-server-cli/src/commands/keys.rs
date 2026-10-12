@@ -27,6 +27,9 @@ use crate::fastly_cli::{FastlyProcess, FastlyRunner};
 
 /// How the `fastly` CLI begins its report that the API found nothing at the
 /// address it was asked for.
+///
+/// Only the test fake is known to produce this wording. No recorded run of the
+/// `fastly` CLI has, and the live check saw `401` alone.
 const API_NOT_FOUND: &str = "the Fastly API returned 404";
 
 /// The entries of the config store that are not keys. A key named as one of
@@ -185,8 +188,6 @@ impl PlatformConfigStore for FastlyConfigStore {
             .and_then(|output| item_value(&output, key))
             .map_err(|message| {
                 if !message.contains(API_NOT_FOUND) {
-                    // The first failure is kept. One is enough to stop every
-                    // write, so a later one has nothing to add.
                     let _ = self.platform.failed_read.set(message.clone());
                 }
                 Report::new(PlatformError::ConfigStore).attach(message)
@@ -362,8 +363,6 @@ pub(crate) fn run_with(
             .to_string())
         }
         KeysCommand::Deactivate(deactivate) => {
-            // Looser than the rule for a new key, so that a key made under an
-            // earlier rule can still be retired.
             if !kid_is_well_formed(&deactivate.kid) {
                 return Err(format!(
                     "kid `{}` must hold only letters, digits, `-`, `_`, `.` and `:`, and be 1 \

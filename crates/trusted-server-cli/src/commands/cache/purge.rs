@@ -22,9 +22,7 @@ pub(crate) struct PurgeTarget {
 /// Returns a message when neither scope is given, when `--page` is not an absolute
 /// http(s) URL, or when the service id could be read as anything but an id.
 pub(crate) fn purge_target(purge: &PurgeArgs) -> CliResult<PurgeTarget> {
-    // A Fastly service id holds letters and digits only. Anything else is refused here,
-    // because the id becomes an argument of the `fastly` process and a value starting
-    // with `-` would be read as one of its flags.
+    // A Fastly service id holds letters and digits only.
     if purge.service_id.is_empty() || !purge.service_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return cli_error("--service-id must be a Fastly service id, of letters and digits only");
     }
@@ -33,9 +31,7 @@ pub(crate) fn purge_target(purge: &PurgeArgs) -> CliResult<PurgeTarget> {
             scope: "all",
             surrogate_key: TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY.to_owned(),
         }),
-        // Parsed, not merely non-empty. The key function hashes whatever it is given, so a
-        // path or a scheme-less host would be purged under a key nothing was ever stored
-        // with, and the command would report success having invalidated nothing.
+        // A page that is not an absolute URL names a key nothing was stored with.
         (false, Some(page)) => {
             if !url::Url::parse(page).is_ok_and(|parsed| {
                 matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
@@ -47,7 +43,7 @@ pub(crate) fn purge_target(purge: &PurgeArgs) -> CliResult<PurgeTarget> {
                 surrogate_key: reader_url_surrogate_key(page),
             })
         }
-        // Defaulting to `--all` would make a bare `ts cache purge` flush production.
+        // A bare `ts cache purge` purges nothing.
         (false, None) => cli_error("specify --all or --page <url>"),
     }
 }
@@ -65,17 +61,14 @@ pub(crate) fn run_purge(
 ) -> CliResult<()> {
     let target = purge_target(purge)?;
 
-    // By surrogate key for both scopes, and never `fastly service purge --all`, which would
-    // also flush every object this service cached without one of the template cache's tags.
+    // By surrogate key for both scopes, never `fastly service purge --all`.
     runner
         .run(
             &args(&[
                 "service",
                 "purge",
-                "--key",
-                &target.surrogate_key,
-                "--service-id",
-                &purge.service_id,
+                &format!("--key={}", target.surrogate_key),
+                &format!("--service-id={}", purge.service_id),
                 "--non-interactive",
             ]),
             None,
@@ -130,11 +123,10 @@ mod tests {
         }
     }
 
+    /// The value joined to `name` with `=`.
     fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         args.iter()
-            .position(|arg| arg == name)
-            .and_then(|at| args.get(at + 1))
-            .map(String::as_str)
+            .find_map(|arg| arg.strip_prefix(name)?.strip_prefix('='))
     }
 
     fn purge(fake: &FakeFastly, purge: &PurgeArgs) -> CliResult<serde_json::Value> {
@@ -222,6 +214,25 @@ mod tests {
                 "should name the flag for {page:?}: {error}"
             );
             assert!(fake.calls().is_empty(), "nothing should be asked of fastly");
+        }
+    }
+
+    #[test]
+    fn every_value_is_joined_to_its_flag() {
+        let fake = FakeFastly::default();
+
+        purge(
+            &fake,
+            &purge_args(false, Some("https://example.com/article")),
+        )
+        .expect("should purge");
+
+        for arg in &fake.calls()[0][2..] {
+            assert!(
+                arg.starts_with("--"),
+                "a value standing alone can be read as a flag: {:?}",
+                fake.calls()
+            );
         }
     }
 

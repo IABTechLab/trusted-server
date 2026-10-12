@@ -177,10 +177,11 @@ pub struct RuntimeServices {
     /// none, in which case a caller holds what it pays for in the key-value
     /// store instead.
     pub(crate) value_cache: Option<Arc<dyn super::PlatformValueCache>>,
-    /// The loading cache each feature selected, which loads a missing value
-    /// once per key and keeps its copies in [`value_cache`](Self::value_cache)
-    /// or the key-value store. A feature that selected none loads through
-    /// [`super::NoLoadingCache`], which holds nothing.
+    /// The loading cache each `[cache.<name>]` table selected, which loads a
+    /// missing value once per key and keeps its copies in
+    /// [`value_cache`](Self::value_cache) or the key-value store. A cache whose
+    /// table selected none loads through [`super::NoLoadingCache`], which holds
+    /// nothing.
     pub(crate) loading_caches: Arc<super::LoadingCaches>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
@@ -276,11 +277,11 @@ impl RuntimeServices {
         self.value_cache.as_deref()
     }
 
-    /// The loading cache `feature` selected, by the name its
+    /// The loading cache the table `[cache.<name>]` selected, by the name a
     /// [`super::CacheSpec`] carries.
     #[must_use]
-    pub fn loading_cache_for(&self, feature: &str) -> &dyn super::PlatformLoadingCache {
-        self.loading_caches.for_feature(feature)
+    pub fn loading_cache_for(&self, name: &str) -> &dyn super::PlatformLoadingCache {
+        self.loading_caches.for_feature(name)
     }
 
     /// The value for `key` in the cache `spec` describes, from a fresh copy
@@ -517,7 +518,7 @@ impl RuntimeServices {
         }
     }
 
-    /// Returns a clone of this instance with every feature loading through
+    /// Returns a clone of this instance with every caller loading through
     /// `cache`, for a test of one cache.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
@@ -623,7 +624,7 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the loading cache each feature selected.
+    /// Set the loading cache each `[cache.<name>]` table selected.
     #[must_use]
     pub fn loading_caches(mut self, caches: Arc<super::LoadingCaches>) -> Self {
         self.loading_caches = Some(caches);

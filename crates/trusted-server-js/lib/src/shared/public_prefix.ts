@@ -1,5 +1,5 @@
-// The deployment's public prefix, which every cookie name and first-party
-// storage key this script writes starts with, such as `ts` for `ts-eids`.
+// The deployment's public prefix, which every cookie name this script writes
+// starts with, such as `ts` for `ts-eids`.
 //
 // The server writes it on the bundle's own tag, so the script holds no copy of
 // its own. A page whose bundle tag carries none has no names to write, and a
@@ -11,9 +11,9 @@ const BUNDLE_TAG_ID = 'trustedserver-js';
 /** The bundle tag attribute that carries the public prefix. */
 export const PUBLIC_PREFIX_ATTRIBUTE = 'data-ts-public-prefix';
 
-// Letters, digits, `_`, `-` and `.`, starting with a letter or `_`, which
-// every prefix the server can write is.
-const PREFIX_SHAPE = /^[A-Za-z_][A-Za-z0-9._-]*$/;
+// Letters, digits, `_`, `-` and `.`, starting with a letter or a single `_`,
+// which every prefix the server can write is.
+const PREFIX_SHAPE = /^(?!__)[A-Za-z_][A-Za-z0-9._-]*$/;
 
 /** The public prefix for this page, or `null` where the page carries none. */
 export function publicPrefix(): string | null {
@@ -33,12 +33,4 @@ export function publicPrefix(): string | null {
 export function cookieName(name: string): string | null {
   const prefix = publicPrefix();
   return prefix ? `${prefix}-${name}` : null;
-}
-
-/**
- * The key of the first-party storage entry `name`, written as a cookie name
- * is, or `null` where the page carries no prefix.
- */
-export function storageKey(name: string): string | null {
-  return cookieName(name);
 }

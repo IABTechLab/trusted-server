@@ -222,7 +222,7 @@ const FRAMING_OR_HOP_BY_HOP_HEADERS: &[&str] = &[
 pub enum ReservedResponseEffect {
     /// A `Set-Cookie` naming a cookie in the namespace the deployment's public
     /// prefix starts, which core manages.
-    #[display("sets a cookie in the namespace the public prefix starts, which core manages")]
+    #[display("sets a cookie under the public prefix core manages")]
     ManagedCookie,
 
     /// A header in the `x-ts-` namespace core emits and strips.
@@ -610,13 +610,10 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
 
     /// Derives an Edge Cookie identifier for the request.
     ///
-    /// An implementation hands its own function to [`ModuleCall::inject`],
-    /// naming what it reads, such as the request's evidence, the permissions
-    /// and consent resolved for it, or the services. On the request path core
-    /// calls this only once the permissions the module declares are set, so
-    /// the module reads the permissions only for behavior beyond that gate. A
-    /// function that is not passed what it names produces no identifier for
-    /// the request.
+    /// See [`crate::module_context`] for what an implementation may name. On
+    /// the request path core calls this only once the permissions the module
+    /// declares are set. A function that is not passed what it names produces
+    /// no identifier for the request.
     ///
     /// A server-side module creates here. A client-side module defers here
     /// (returns `id: None`) and creates later in

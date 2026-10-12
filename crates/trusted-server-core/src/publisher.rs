@@ -67,7 +67,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, is_navigation_request, remove_deployment_headers, serve_static_with_etag,
+};
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
 use crate::middleware::{MiddlewarePhase, Prepared, Refusal, media_type_of};
 use crate::module_context::{ModuleContext, ModuleRequest};
@@ -649,6 +651,8 @@ struct ProcessResponseParams<'a> {
     /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
     csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
     prepared: &'a Arc<Prepared>,
+    /// See [`OwnedProcessResponseParams::public_prefix`].
+    public_prefix: &'a crate::prefix::PublicPrefix,
 }
 
 struct PublisherBodyProcessor {
@@ -658,65 +662,69 @@ struct PublisherBodyProcessor {
 /// A response as the middleware the entries covering it are told of it:
 /// any document for its preparation, and one that is not HTML for the
 /// stream processors run on its body.
-struct TextDocument<'a> {
-    /// The type and subtype of the response, in lower case.
-    media_type: String,
+struct TextResponse<'a> {
+    /// The response's `Content-Type`, parameters and all.
+    content_type: &'a str,
     request_path: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
     origin_host: &'a str,
     request_state: &'a IntegrationRequestState,
     max_buffered_script_bytes: usize,
-    /// What the middleware prepared for the document.
+    /// What the middleware prepared for this document, see
+    /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     prepared: &'a Prepared,
 }
 
 /// The stream processors the entries covering a response that is not HTML
-/// run on its body, phase by phase in the order given, or none when its
-/// media type is not one a middleware runs on or no entry covers it.
-///
-/// A fetch middleware is told nothing a request left, as on a page, and a
-/// serve middleware is told what this reader's request left.
+/// run on its body, the fetch entry's and then the serve entry's, or none
+/// when its media type is not one a middleware runs on, its charset is not
+/// UTF-8 or no entry covers it. Both phases run here because the template
+/// cache stores HTML alone.
 ///
 /// # Errors
 ///
-/// When a middleware decides about HTML on a document that is not HTML, or
+/// When a middleware decides about HTML on a response that is not HTML, or
 /// asks for a selector that does not parse.
 fn middleware_stream_processors(
-    document: &TextDocument<'_>,
-    phases: &[MiddlewarePhase],
+    response: &TextResponse<'_>,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<Vec<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
-    use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
+    use crate::middleware::{
+        MiddlewareContext, is_dispatched_media_type, is_utf8_or_undeclared_charset,
+    };
 
-    if !is_dispatched_media_type(&document.media_type) {
+    let media_type = media_type_of(response.content_type);
+    if !is_dispatched_media_type(&media_type)
+        || !is_utf8_or_undeclared_charset(response.content_type)
+    {
         return Ok(Vec::new());
     }
     let mut processors = Vec::new();
-    for phase in phases {
+    for phase in &MiddlewarePhase::ALL {
         let chain = integration_registry.middleware_chain(
             settings.phase_entries(*phase),
             *phase,
-            &document.media_type,
-            document.request_path,
+            &media_type,
+            response.request_path,
         );
         if chain.is_empty() {
             continue;
         }
         let document_state = IntegrationDocumentState::default();
         if *phase == MiddlewarePhase::Serve {
-            document.request_state.seed(&document_state);
+            response.request_state.seed(&document_state);
         }
         let plan = chain
             .plan(&MiddlewareContext {
                 phase: *phase,
-                request_host: document.request_host,
-                request_scheme: document.request_scheme,
-                origin_host: document.origin_host,
+                request_host: response.request_host,
+                request_scheme: response.request_scheme,
+                origin_host: response.origin_host,
                 document_state: &document_state,
-                max_buffered_script_bytes: document.max_buffered_script_bytes,
-                prepared: document.prepared,
+                max_buffered_script_bytes: response.max_buffered_script_bytes,
+                prepared: response.prepared,
             })
             .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
         processors.extend(plan.processors);
@@ -726,13 +734,15 @@ fn middleware_stream_processors(
 
 /// Runs the preparation of the middleware the entries of `phases` select
 /// for `document`, each as its module with the request's services, keeping
-/// what they prepare in the document's [`Prepared`].
+/// what they prepare in the document's [`Prepared`]. Each phase's
+/// preparations are handed a fresh document state, not the one the plan is
+/// handed, so anything a preparation writes there is dropped.
 ///
 /// # Errors
 ///
 /// The first refusal, which ends the request.
 async fn prepare_document(
-    document: &TextDocument<'_>,
+    document: &TextResponse<'_>,
     phases: &[MiddlewarePhase],
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
@@ -740,14 +750,15 @@ async fn prepare_document(
 ) -> Result<(), Refusal> {
     use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
 
-    if !is_dispatched_media_type(&document.media_type) {
+    let media_type = media_type_of(document.content_type);
+    if !is_dispatched_media_type(&media_type) {
         return Ok(());
     }
     for phase in phases {
         let chain = integration_registry.middleware_chain(
             settings.phase_entries(*phase),
             *phase,
-            &document.media_type,
+            &media_type,
             document.request_path,
         );
         if chain.is_empty() {
@@ -775,6 +786,25 @@ async fn prepare_document(
     Ok(())
 }
 
+/// The context the preparations of a document are called with. A document
+/// that may be stored is prepared in the fetch phase alone, and is handed
+/// the request's services and nothing of the reader, because what its
+/// preparations answer is stored with it.
+fn preparation_context<'r>(
+    request: ModuleRequest<'r>,
+    stored: bool,
+    settings: &'r Settings,
+    ec_context: &'r EcContext,
+    services: &'r RuntimeServices,
+) -> ModuleContext<'r> {
+    let context = ModuleContext::new(request).with_settings(settings);
+    if stored {
+        context.with_services(services)
+    } else {
+        context.with_request_state(ec_context, services)
+    }
+}
+
 /// The response a refusal answers the request with: its status,
 /// `Retry-After` when it gives one, the message as plain text, and no
 /// store.
@@ -784,7 +814,8 @@ fn refusal_response(refusal: &Refusal) -> Result<Response<EdgeBody>, Report<Trus
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store");
     if let Some(after) = refusal.retry_after {
-        builder = builder.header(header::RETRY_AFTER, after.as_secs().to_string());
+        let seconds = after.as_secs() + u64::from(after.subsec_nanos() > 0);
+        builder = builder.header(header::RETRY_AFTER, seconds.to_string());
     }
     builder
         .body(EdgeBody::from(refusal.message.clone().into_bytes()))
@@ -853,6 +884,7 @@ impl PublisherBodyProcessor {
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
                 prepared: Arc::clone(&params.prepared),
+                public_prefix: &params.public_prefix,
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -865,17 +897,9 @@ impl PublisherBodyProcessor {
                 &params.request_scheme,
             ))
         } else {
-            // The serve entry runs on each reader's copy of a stored response
-            // later, see `reader_serve_processor`, and here on one that is not
-            // stored.
-            let phases: &[MiddlewarePhase] = if params.template_cache_key.is_some() {
-                &[MiddlewarePhase::Fetch]
-            } else {
-                &MiddlewarePhase::ALL
-            };
             let processors = middleware_stream_processors(
-                &TextDocument {
-                    media_type: media_type_of(&params.content_type),
+                &TextResponse {
+                    content_type: &params.content_type,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -884,7 +908,6 @@ impl PublisherBodyProcessor {
                     max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
                     prepared: &params.prepared,
                 },
-                phases,
                 settings,
                 integration_registry,
             )?;
@@ -965,6 +988,7 @@ fn process_response_streaming<W: Write>(
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
             prepared: Arc::clone(params.prepared),
+            public_prefix: params.public_prefix,
             deferred_inline_marker: None,
         })?;
         StreamingPipeline::new(config, processor)
@@ -983,14 +1007,9 @@ fn process_response_streaming<W: Write>(
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else {
-        let phases: &[MiddlewarePhase] = if params.shared_template_authorized {
-            &[MiddlewarePhase::Fetch]
-        } else {
-            &MiddlewarePhase::ALL
-        };
         let processors = middleware_stream_processors(
-            &TextDocument {
-                media_type: media_type_of(params.content_type),
+            &TextResponse {
+                content_type: params.content_type,
                 request_path: params.request_path,
                 request_host: params.request_host,
                 request_scheme: params.request_scheme,
@@ -999,7 +1018,6 @@ fn process_response_streaming<W: Write>(
                 max_buffered_script_bytes: params.settings.publisher.max_buffered_body_bytes,
                 prepared: params.prepared,
             },
-            phases,
             params.settings,
             params.integration_registry,
         )?;
@@ -1559,6 +1577,8 @@ struct HtmlStreamProcessorParams<'a> {
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
     prepared: Arc<Prepared>,
+    /// See [`OwnedProcessResponseParams::public_prefix`].
+    public_prefix: &'a crate::prefix::PublicPrefix,
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1714,22 +1734,6 @@ fn deferred_inline_seam_token(
     })
 }
 
-/// The public prefix of the publisher a page is served for, from the selected
-/// prefix module, which the page's bundle tag tells the client script.
-fn page_public_prefix(
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-    request_host: &str,
-    request_scheme: &str,
-    request_path: &str,
-) -> crate::prefix::PublicPrefix {
-    let request = ModuleRequest::new(&Method::GET, request_host, request_scheme, request_path);
-    integration_registry
-        .prefixes(settings, request)
-        .public()
-        .clone()
-}
-
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
@@ -1765,18 +1769,10 @@ fn create_html_stream_processor(
         .with_request_state(params.request_state)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
-        .with_public_prefix(page_public_prefix(
-            params.settings,
-            params.integration_registry,
-            params.request_host,
-            params.request_scheme,
-            params.request_path,
-        ))
+        .with_public_prefix(params.public_prefix.clone())
         .with_prepared(params.prepared);
 
-    // The middleware of the first [[fetch]] entry covering this path. What
-    // they leave is what a shared template stores, and they are handed
-    // nothing the request left.
+    // The middleware of the first [[fetch]] entry covering this path.
     let fetch = params.integration_registry.middleware_chain(
         &params.settings.fetch,
         MiddlewarePhase::Fetch,
@@ -1785,9 +1781,7 @@ fn create_html_stream_processor(
     );
     // A response that may be stored leaves this processor as the template
     // every reader shares, so its [[serve]] entry runs on each reader's copy
-    // once that copy is assembled. See `run_serve_pass`. What the request
-    // left reaches a document through that entry alone, so none of it reaches
-    // a template.
+    // once that copy is assembled. See `run_serve_pass`.
     let serve = (!params.shared_template_authorized).then(|| {
         params.integration_registry.middleware_chain(
             &params.settings.serve,
@@ -1816,30 +1810,7 @@ fn reader_serve_processor(
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     if !is_html_content_type(&params.content_type) {
-        let origin_host = settings.publisher.origin_host();
-        let mut processors = middleware_stream_processors(
-            &TextDocument {
-                media_type: media_type_of(&params.content_type),
-                request_path: &params.request_path,
-                request_host: &params.request_host,
-                request_scheme: &params.request_scheme,
-                origin_host: &origin_host,
-                request_state: &params.request_state,
-                max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
-                prepared: &params.prepared,
-            },
-            &[MiddlewarePhase::Serve],
-            settings,
-            integration_registry,
-        )?;
-        return Ok(match processors.len() {
-            0 => None,
-            1 => processors.pop(),
-            _ => Some(Box::new(WithStreamProcessors {
-                inner: processors.remove(0),
-                processors,
-            })),
-        });
+        return Ok(None);
     }
     let chain = integration_registry.middleware_chain(
         &settings.serve,
@@ -2010,6 +1981,26 @@ pub(crate) fn classify_response_route(
     ResponseRoute::Stream
 }
 
+/// Whether the origin answered with a page where `entry` places core's
+/// robots.txt middleware, as a single-page application's catch-all does. A
+/// crawler reads a page there as no rules at all, so the file is made as it is
+/// where the origin has none.
+fn answers_robots_txt_with_a_page(
+    response: &Response<EdgeBody>,
+    entry: &crate::middleware::PhaseEntry,
+) -> bool {
+    response.status() == StatusCode::OK
+        && entry
+            .middleware
+            .iter()
+            .any(|name| name == crate::robots_txt::middleware::MODULE)
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_html_content_type)
+}
+
 /// An empty document of `media_type`, which the middleware a `[[fetch]]`
 /// entry names for a path the origin has nothing at is run on.
 fn empty_document(media_type: &str) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
@@ -2120,6 +2111,9 @@ pub struct OwnedProcessResponseParams {
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub(crate) prepared: Arc<Prepared>,
+    /// The request's public prefix, from its services, which the page's
+    /// bundle tag tells the client script.
+    pub(crate) public_prefix: crate::prefix::PublicPrefix,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -2328,10 +2322,8 @@ pub async fn buffer_publisher_response_async(
                 set_assembly_response_state(&mut response, state);
             }
             let bytes = if was_authorized {
-                // The transform wrote a template every reader shares, so the
-                // [[serve]] entry runs here, on this reader's assembled copy.
-                // A page that was never authorized ran it inside the
-                // transform.
+                // The [[serve]] entry runs here on a shared template, and
+                // inside the transform on a page that was never authorized.
                 let bytes = run_serve_pass(bytes, &params, settings, integration_registry)?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
@@ -2579,6 +2571,8 @@ fn build_template_assembly_params(
         // A request that carries any keeps to the origin path, so none reaches a
         // document served from a template.
         request_state: IntegrationRequestState::default(),
+        // Set by the caller, from the request's services.
+        public_prefix: crate::prefix::PublicPrefix::default(),
     }
 }
 
@@ -3366,6 +3360,7 @@ pub fn stream_publisher_body<W: Write>(
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
         prepared: &params.prepared,
+        public_prefix: &params.public_prefix,
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -3461,6 +3456,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     );
     let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
         prepared: Arc::clone(&params.prepared),
+        public_prefix: &params.public_prefix,
         origin_host: &params.origin_host,
         request_host: &params.request_host,
         request_scheme: &params.request_scheme,
@@ -5268,13 +5264,6 @@ pub async fn handle_publisher_request(
         } else {
             String::new()
         };
-    let page_public_prefix = page_public_prefix(
-        settings,
-        integration_registry,
-        request_host,
-        request_scheme,
-        target_uri.path(),
-    );
     let template_cache_key =
         request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
             url: target_uri.to_string(),
@@ -5300,7 +5289,7 @@ pub async fn handle_publisher_request(
             template_fingerprint: template_fingerprint(
                 settings,
                 integration_registry,
-                &page_public_prefix,
+                services.public_prefix(),
             ),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
@@ -5629,6 +5618,7 @@ pub async fn handle_publisher_request(
                         permissions_json.clone(),
                     );
                     params.request_path.clone_from(&request_path);
+                    params.public_prefix = services.public_prefix().clone();
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -5644,8 +5634,8 @@ pub async fn handle_publisher_request(
                         .with_settings(settings)
                         .with_request_state(ec_context, services);
                     let stored_origin_host = settings.publisher.origin_host();
-                    let document = TextDocument {
-                        media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    let document = TextResponse {
+                        content_type: crate::middleware::HTML_MEDIA_TYPE,
                         request_path: &request_path,
                         request_host,
                         request_scheme,
@@ -5734,7 +5724,12 @@ pub async fn handle_publisher_request(
         services.http_client().send(platform_request).await
     };
     let mut response = match origin_result {
-        Ok(platform_response) => platform_response.response,
+        // The origin answered, so nothing in it describes this deployment,
+        // beneath `/_ts` as anywhere else.
+        Ok(mut platform_response) => {
+            remove_deployment_headers(&mut platform_response.response);
+            platform_response.response
+        }
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
                 emit_abandoned_auction(
@@ -5757,13 +5752,12 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
-    // A file the origin does not have is made by the middleware the
-    // `[[fetch]]` entry for its path names, run on an empty document of the
-    // entry's media type, as `ads.txt` is made from the sellers lines. With
-    // no such entry the origin's answer stands.
-    if response.status() == StatusCode::NOT_FOUND
-        && (request_method == Method::GET || request_method == Method::HEAD)
-        && let Some(entry) = settings.fetch.creating(&request_path)
+    // A file the origin does not have is made, see `PhaseEntries::making`. An
+    // origin page where the robots.txt middleware is placed is no file either.
+    if (request_method == Method::GET || request_method == Method::HEAD)
+        && let Some(entry) = settings.fetch.making(&request_path)
+        && (response.status() == StatusCode::NOT_FOUND
+            || answers_robots_txt_with_a_page(&response, entry))
     {
         log::debug!(
             "Making {} for {request_path}, which the origin does not have, with {}",
@@ -5967,23 +5961,20 @@ pub async fn handle_publisher_request(
         .to_ascii_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
 
-    // What the middleware the entries name for this document prepare, with
-    // the request's services, before the document is processed. A refusal
-    // answers the request here, and nothing is stored.
     let prepared = Arc::new(Prepared::default());
     if route == ResponseRoute::Stream {
-        let phases: &[MiddlewarePhase] = if template_cache_key.is_some() {
+        let stored = template_cache_key.is_some();
+        let phases: &[MiddlewarePhase] = if stored {
             &[MiddlewarePhase::Fetch]
         } else {
             &MiddlewarePhase::ALL
         };
         let module_request =
             ModuleRequest::new(&request_method, request_host, request_scheme, &request_path);
-        let module_context = ModuleContext::new(module_request)
-            .with_settings(settings)
-            .with_request_state(ec_context, services);
-        let document = TextDocument {
-            media_type: media_type_of(&content_type),
+        let module_context =
+            preparation_context(module_request, stored, settings, ec_context, services);
+        let document = TextResponse {
+            content_type: &content_type,
             request_path: &request_path,
             request_host,
             request_scheme,
@@ -6122,6 +6113,7 @@ pub async fn handle_publisher_request(
                     dispatched_auction,
                     price_granularity,
                     prepared,
+                    public_prefix: services.public_prefix().clone(),
                 }),
             })
         }
@@ -9758,6 +9750,7 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -11304,6 +11297,31 @@ mod tests {
                 let page = String::from_utf8_lossy(&page);
                 assert!(
                     page.contains(r#"data-ts-public-prefix="ts""#),
+                    "{mode}: {page}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_tells_the_client_script_the_prefix_its_services_carry() {
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode(mode));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache)).with_prefixes(
+                    crate::prefix::Prefixes::new(
+                        crate::prefix::PublicPrefix::new(["_ex"])
+                            .expect("should accept the prefix"),
+                        crate::platform::ServerKeyPrefix::new("ex", "example.com"),
+                    ),
+                );
+                queue_shareable_html(&stub);
+
+                let page = body_of(run(&settings, &services, navigation_request()).await).await;
+
+                let page = String::from_utf8_lossy(&page);
+                assert!(
+                    page.contains(r#"data-ts-public-prefix="_ex""#),
                     "{mode}: {page}"
                 );
             }
@@ -17676,6 +17694,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_origins_answer_beneath_the_route_namespace_loses_the_deployment_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"not found".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/plain"),
+                ("x-served-by", "cache-node-1"),
+                ("x-cache", "MISS"),
+                ("x-cache-hits", "0"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/_ts/anything")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = match run_publisher_proxy(&settings, &services, request).await {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::PassThrough { response, .. } => response,
+        };
+
+        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
+            assert!(
+                response.headers().get(name).is_none(),
+                "the origin's {name} should not reach a reader"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn publisher_asset_policy_response_with_cookie_is_private_after_finalization() {
         let settings = settings_from_toml(&format!(
             r#"{}
@@ -21126,10 +21183,16 @@ mod tests {
         settings
     }
 
-    /// A text body streamed through the publisher path, as a reader gets it.
-    fn text_body_through_the_publisher(settings: &Settings, body: &str) -> String {
+    /// A text body of `content_type` streamed through the publisher path, as
+    /// a reader gets it.
+    fn text_body_through_the_publisher(
+        settings: &Settings,
+        content_type: &str,
+        body: &str,
+    ) -> String {
         let registry = IntegrationRegistry::new(settings).expect("should build a registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -21141,7 +21204,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
-            content_type: "text/plain; charset=utf-8".to_string(),
+            content_type: content_type.to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21174,7 +21237,7 @@ mod tests {
         }]);
         let body = "User-agent: *\nSee https://origin.example.com/more\n";
 
-        let output = text_body_through_the_publisher(&settings, body);
+        let output = text_body_through_the_publisher(&settings, "text/plain; charset=utf-8", body);
 
         assert_eq!(
             output,
@@ -21204,6 +21267,7 @@ mod tests {
         );
         let services = noop_services();
         let mut params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -21263,7 +21327,7 @@ mod tests {
             middleware: vec![fixture::TEXT.to_owned()],
         }]);
 
-        let output = text_body_through_the_publisher(&settings, "plain\n");
+        let output = text_body_through_the_publisher(&settings, "text/plain", "plain\n");
 
         assert_eq!(
             output, "plain\n",
@@ -21271,8 +21335,7 @@ mod tests {
         );
     }
 
-    /// What the publisher path did with one request, with what it takes
-    /// to stream the answer.
+    /// What the publisher path answered one request with.
     struct Proxied {
         settings: Settings,
         registry: IntegrationRegistry,
@@ -21281,9 +21344,7 @@ mod tests {
         response: PublisherResponse,
     }
 
-    /// A request for `path` through the publisher path, with the middleware
-    /// fixture in the entries given and the origin answering `status` with
-    /// a page.
+    /// A request through the publisher path, the origin answering `status`.
     async fn proxy(fetch: Vec<PhaseEntry>, method: Method, path: &str, status: u16) -> Proxied {
         proxy_with(
             settings_running_the_middleware_fixture(fetch),
@@ -21468,6 +21529,26 @@ mod tests {
         );
     }
 
+    /// An origin that answers every path with its page, as a single-page
+    /// application's catch-all does, has no file, so the middleware makes it
+    /// rather than the crawler being handed the page.
+    #[tokio::test]
+    async fn robots_txt_replaces_a_page_the_origin_answers_at_its_path() {
+        let proxied = proxy_with(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            crate::robots_txt::ROBOTS_TXT_PATH,
+            200,
+        )
+        .await;
+
+        assert_eq!(
+            streamed_robots_txt(proxied).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the file replaces the page"
+        );
+    }
+
     /// Where the origin has no file, the creating rule makes it.
     #[tokio::test]
     async fn robots_txt_is_made_where_the_origin_has_none() {
@@ -21540,13 +21621,76 @@ mod tests {
             404,
         )
         .await;
-        let response = response_of(proxied.response);
+        let response = buffer_publisher_response_async(
+            proxied.response,
+            &Method::HEAD,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should buffer the HEAD answer");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             content_type_of(&response),
             Some("text/plain; charset=utf-8"),
             "should answer a HEAD as the GET is answered"
+        );
+        assert!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should hold the HEAD answer in memory")
+                .is_empty(),
+            "should answer a HEAD with no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_entry_with_a_path_makes_no_missing_page() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let proxied = proxy(
+            vec![PhaseEntry {
+                media_type: HTML_MEDIA_TYPE.to_owned(),
+                path: Some("/news/".to_owned()),
+                middleware: vec![fixture::HEAD.to_owned()],
+            }],
+            Method::GET,
+            "/news/missing",
+            404,
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer for a page it does not have"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_entry_ahead_does_not_shadow_the_entry_for_a_missing_file() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let mut fetch = vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec![fixture::HEAD.to_owned()],
+        }];
+        fetch.extend(text_entry_for(Some("/ads.txt")));
+        let proxied = proxy(fetch, Method::GET, "/ads.txt", 404).await;
+        let response = response_of(proxied.response);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should make the file from the text/plain entry, not as HTML"
         );
     }
 
@@ -21731,6 +21875,77 @@ mod tests {
     }
 
     #[test]
+    fn a_text_body_in_a_charset_other_than_utf8_is_left_as_it_was() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+
+        let output =
+            text_body_through_the_publisher(&settings, "text/plain; charset=utf-16", "plain\n");
+
+        assert_eq!(
+            output, "plain\n",
+            "should hand a middleware no body it would corrupt by writing UTF-8"
+        );
+    }
+
+    #[test]
+    fn a_refusal_rounds_retry_after_up_to_whole_seconds() {
+        let response = refusal_response(&Refusal::service_unavailable(
+            std::time::Duration::from_millis(1_500),
+            "later",
+        ))
+        .expect("should build the refusal");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "should not ask the caller back before the refusal's time"
+        );
+    }
+
+    #[test]
+    fn a_fetch_preparation_of_a_document_that_may_be_stored_is_not_handed_the_reader() {
+        use crate::module_context::{EdgeCookie, FromModuleContext};
+
+        let ec_context = EcContext::new_for_test(
+            Some(crate::ec::tests::CANONICAL_COOKIE_VALUE.to_owned()),
+            ConsentContext::default(),
+        )
+        .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
+        let services = noop_services();
+        let settings = settings_running_the_middleware_fixture(Vec::new());
+        let method = Method::GET;
+        let handed = |stored: bool| {
+            let request = ModuleRequest::new(&method, "publisher.example", "https", "/article");
+            let context = preparation_context(request, stored, &settings, &ec_context, &services);
+            let call = context.call("testing.preparation", PermissionSet::none());
+            (
+                <&PermissionState>::from_module_context(&call).is_ok(),
+                EdgeCookie::from_module_context(&call).is_ok(),
+            )
+        };
+
+        assert_eq!(
+            handed(false),
+            (true, true),
+            "should hand a document that is not stored the reader's permissions and Edge Cookie"
+        );
+        assert_eq!(
+            handed(true),
+            (false, false),
+            "should hand a document that may be stored neither the reader's permissions nor              Edge Cookie"
+        );
+    }
+
+    #[test]
     fn tsjs_dynamic_serves_a_standalone_module_by_registration_flag_not_by_name() {
         // The module the registration marks standalone is one a vendor crate
         // carries, so nothing in the binary knows its name. A branch that named
@@ -21906,6 +22121,7 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -21970,6 +22186,7 @@ mod tests {
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22055,6 +22272,7 @@ mod tests {
                 b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
             ),
             params: Box::new(OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22149,6 +22367,7 @@ mod tests {
         };
         let params = || {
             Box::new(OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22258,6 +22477,7 @@ mod tests {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22308,6 +22528,7 @@ mod tests {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22438,6 +22659,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22506,6 +22728,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22577,6 +22800,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22648,6 +22872,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22719,6 +22944,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -22770,6 +22996,7 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -22997,6 +23224,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23076,6 +23304,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23157,6 +23386,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23232,6 +23462,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -23389,6 +23620,7 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24066,6 +24298,7 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24265,6 +24498,7 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24348,6 +24582,7 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24414,6 +24649,7 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24535,6 +24771,7 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24596,6 +24833,7 @@ mod tests {
         // One small script whose payload is swapped for a placeholder.
         let html = br#"<html><body><script>fixture_payload("link=https://origin.example.com/page")</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
