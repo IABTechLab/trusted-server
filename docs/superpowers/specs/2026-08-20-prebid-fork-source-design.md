@@ -1,16 +1,19 @@
 # Prebid fork source for the external bundle CLI
 
 **Date:** 2026-08-20
+**Revised:** 2026-10-12, aligned with `main` after the `ts prebid client`
+rename and the `[integrations.prebid.bundle.modules]` selection rework
 **Status:** Proposed
 **Related:** `docs/superpowers/specs/2026-06-17-prebid-bundle-cli-design.md`
 
 ## Problem
 
-`ts prebid bundle` builds the external Prebid bundle from the `prebid.js`
+`ts prebid client` builds the external Prebid bundle from the `prebid.js`
 npm package pinned in `crates/trusted-server-js/lib/package.json`. The
 generator (`build-prebid-external.mjs`) hardcodes
-`node_modules/prebid.js` as the package root and resolves every
-`prebid.js/...` import through it.
+`node_modules/prebid.js` as the package root, verifies the installed
+version against `package-lock.json`, and resolves every `prebid.js/...`
+import through it.
 
 Operators who maintain a Prebid.js fork (for example, a patched bid
 adapter) cannot use it without npm-level surgery: building the fork,
@@ -19,7 +22,7 @@ override. That workflow is manual, is not recorded anywhere a teammate
 can reproduce, and mutates a source-controlled file for what is an
 operator-local decision.
 
-The desired behavior is that `ts prebid bundle` accepts a fork source,
+The desired behavior is that `ts prebid client` accepts a fork source,
 either a git URL (with optional ref) or a local path to a built fork
 checkout, builds the bundle from it, and records exactly which fork
 commit produced the hosted artifact.
@@ -90,31 +93,52 @@ commit produced the hosted artifact.
 
 ### Rust CLI
 
-`crates/trusted-server-cli/src/prebid_bundle.rs` loads
-`[integrations.prebid.bundle]` from the config, locates
-`crates/trusted-server-js/lib`, checks prerequisites (npm on PATH,
-`package.json`, `build-prebid-external.mjs`, `node_modules`), and shells
-out through the `PrebidBundleGenerator` trait to
-`npm run build:prebid-external -- --adapters ... --out ...`. It then
-reads back `manifest.json`, validates `sha256`/`sri`/`filename`, and
-atomically patches `external_bundle_sha256` and `external_bundle_sri`
-into the config with `toml_edit`.
+`crates/trusted-server-cli/src/prebid_bundle.rs` backs `ts prebid client`;
+the old `ts prebid bundle` spelling is rejected. `load_bundle_config`
+reads `[integrations.prebid.bundle]`, whose `PrebidBundleSection` denies
+unknown fields and accepts only a `modules` table (`bidder`, optional
+`user_id`, optional `analytics`, each a list of exact upstream module
+stems). The legacy `adapters`, `user_id_modules` and
+`analytics_adapters` keys are rejected with a pointer to their
+replacements.
+
+`run_bundle` locates `crates/trusted-server-js/lib`, loads the User ID
+registry (`user_id_modules.json`), resolves which modules the configured
+managed User IDs require, and deletes any stale `manifest.json` in the
+output directory. `NpmPrebidBundleGenerator` checks prerequisites (npm on
+PATH, `package.json`, `build-prebid-external.mjs`, `node_modules`) and
+shells out through the `PrebidBundleGenerator` trait to
+`npm run build:prebid-external -- --modules-json <json> --out <dir>`. The
+CLI then reads back `manifest.json` (`schemaVersion` 1), validates
+`sha256`/`sri`/`filename`, checks that every required managed User ID
+module appears in the manifest's `modules.userId`, and atomically patches
+`external_bundle_sha256` and `external_bundle_sri` into the config with
+`toml_edit`.
 
 ### Generator
 
-`crates/trusted-server-js/lib/build-prebid-external.mjs` derives every
-Prebid path from the constant
+`crates/trusted-server-js/lib/build-prebid-external.mjs` accepts only
+`--modules-json` and `--out` and rejects any other option. It derives
+every Prebid path from the constant
 `PREBID_PACKAGE_DIR = node_modules/prebid.js`:
 
-- adapter existence checks against `modules/<name>BidAdapter.js`;
-- generated imports using bare `prebid.js/modules/*.js` specifiers,
-  which Node and Vite resolve through the published package `exports`
-  map (`./modules/*.js` maps to `./dist/src/public/*.js`);
-- bidder-code metadata reads from `metadata/modules/*.json`;
+- the version, which `verifyPrebidPackageVersion` checks against the
+  `package-lock.json` entry for `node_modules/prebid.js` and the
+  manifest records as `prebidVersion`;
+- per-module validation, shared by bidder, User ID and analytics
+  selections: `metadata/modules/<stem>.json` must declare a component of
+  the matching type, and `prebid.js/modules/<stem>.js` must resolve,
+  through `require.resolve` and the published package `exports` map
+  (`./modules/*.js` maps to `./dist/src/public/*.js`), to a regular file
+  contained in the package directory;
+- bare `prebid.js/modules/*.js` imports in the generated
+  `_modules.generated.ts` and `_external_entry.generated.ts` files,
+  including the fixed consent and `userId` modules;
 - hardcoded `dist/src/...` paths for the LiveIntent standard module,
-  `prebidGlobal`, `adapterManager`, and `adRendering` Vite aliases;
-- the version stamped into the manifest from the package
-  `package.json`.
+  `prebidGlobal`, `adapterManager`, and `adRendering` Vite aliases.
+
+`resolveBundleModules` already takes `packageDir`, `metadataDir` and
+`resolveSpecifier` parameters, defaulting to the installed package.
 
 ### Fork build reality
 
@@ -129,20 +153,25 @@ and `metadata/modules/*.json` is checked into the repo.
 
 ### 1. Source declaration and precedence
 
-Add an optional string to the bundle config:
+Add an optional string to the bundle config, beside the existing
+`modules` table:
 
 ```toml
 [integrations.prebid.bundle]
-adapters = ["rubicon", "kargo"]
 source = "https://github.com/example-org/Prebid.js#my-adapter-fix"
+
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
 ```
 
 Add an optional `--prebid-source <path|url>` argument to
 `PrebidBundleArgs`. Effective source is: CLI flag if present, else
 config key if present, else the default npm package.
 
-`load_bundle_config` gains an optional `source` field. An empty or
-whitespace-only string is a config error.
+`PrebidBundleSection` gains an optional `source` field (it denies unknown
+fields, so the key must be declared there), and `load_bundle_config`
+carries it into `PrebidBundleConfig`. An empty or whitespace-only string
+is a config error.
 
 Relative paths resolve against different bases depending on where they
 are declared: a relative `--prebid-source` path resolves against the
@@ -229,7 +258,7 @@ For `Git`:
    `XDG_CACHE_HOME` when set).
 2. Take an exclusive per-URL lock for the remaining steps: an advisory
    `flock` on a lock file beside the cache directory. Two concurrent
-   `ts prebid bundle` runs against the same URL otherwise share one
+   `ts prebid client` runs against the same URL otherwise share one
    mutable checkout and can interleave checkout/build steps, producing
    a bundle from one commit with provenance for another. A held lock
    makes the second run wait, with a periodic "waiting for
@@ -291,31 +320,38 @@ operator's config. The first build of a fork takes minutes (Prebid's
 
 ### 5. Generator: `--prebid-dir` and self-resolved specifiers
 
-`build-prebid-external.mjs` accepts an optional `--prebid-dir <abs
-path>`. When absent, behavior is unchanged. When present:
+`build-prebid-external.mjs` adds `--prebid-dir <abs path>` and
+`--source <json>` to its supported options. When `--prebid-dir` is
+absent, behavior is unchanged. When present:
 
-- `PREBID_PACKAGE_DIR` and every path derived from it (LiveIntent
-  standard module, `prebidGlobal`, metadata directory, version read)
-  come from the given directory.
-- Adapter existence is checked against the resolved
-  `dist/src/public/<name>BidAdapter.js` rather than the untranspiled
-  `modules/` folder, because `dist/` is what actually gets bundled.
+- `PREBID_PACKAGE_DIR` and every path derived from it (metadata
+  directory, LiveIntent standard module, `prebidGlobal`, the
+  `adapterManager` and `adRendering` aliases, version read) come from
+  the given directory.
+- The version is read from `<dir>/package.json` as-is.
+  `verifyPrebidPackageVersion` is skipped, because `package-lock.json`
+  pins the npm package, not the fork, and a fork may report any version
+  string.
 - The generator resolves `prebid.js/...` specifiers itself instead of
   relying on node_modules resolution, replicating the published
   `exports` layout:
   - `prebid.js` resolves to `<dir>/dist/src/src/prebid.public.js`;
-  - `prebid.js/modules/<name>.js` resolves to
-    `<dir>/dist/src/public/<name>.js`.
-- Generated modules (`_adapters.generated.ts`,
-  `_user_ids.generated.ts`, the entry file) emit absolute file paths,
-  and the existing Vite aliases (`adapterManager`, `adRendering`,
+  - `prebid.js/modules/<stem>.js` resolves to
+    `<dir>/dist/src/public/<stem>.js`.
+- That resolver is passed as `resolveSpecifier` to the existing
+  `resolveBundleModules` seam, with `packageDir` and `metadataDir`
+  pointing into the fork. Bidder, User ID and analytics stems, including
+  the curated default User ID preset used when `user_id` is omitted, all
+  go through it, so the existing metadata-type and containment checks
+  run against the fork's `dist/`, which is what actually gets bundled.
+- Generated modules (`_modules.generated.ts` and the entry file,
+  including its fixed consent and `userId` imports) emit absolute file
+  paths, and the existing Vite aliases (`adapterManager`, `adRendering`,
   LiveIntent, `prebidGlobal`) point into the given directory. A plain
   directory alias is explicitly avoided because it would bypass the
   `exports` map and import untranspiled source.
-- User ID registry entries in `user_id_modules.json` whose
-  `importPath` starts with `prebid.js/` go through the same resolver;
-  validation uses file existence at the resolved path instead of
-  `require.resolve`.
+- Module errors name the fork directory instead of "the pinned prebid.js
+  package".
 
 Bare dependencies imported by the fork's `dist/` files resolve from the
 fork's own `node_modules`, which exist because the CLI (or the
@@ -325,7 +361,9 @@ operator) just ran `npm ci` there.
 
 The CLI passes the resolved provenance to the generator as a single
 `--source <json>` argument. The generator records it verbatim under a
-new `source` key in `manifest.json`:
+new `source` key in `manifest.json`. `schemaVersion` stays 1: the field
+is additive, and the CLI's manifest deserializer ignores unknown fields,
+so older CLIs still read new manifests.
 
 ```json
 {
@@ -362,17 +400,21 @@ the default mode; the generator's own default (writing
 After generation, the CLI deserializes the optional `source` field
 from `manifest.json` and verifies it matches the provenance it passed;
 a missing or mismatched value is an error and the config is not
-patched. Older manifests without the field remain readable everywhere
-else because the deserializer keeps the field optional. The CLI also
-prints the resolved source in its summary output.
+patched. The CLI already deletes any previous `manifest.json` before
+generation, so a stale manifest cannot satisfy this check. Older
+manifests without the field remain readable everywhere else because the
+deserializer keeps the field optional. The managed User ID check runs
+unchanged against the fork's manifest. The CLI also prints the resolved
+source in its summary output.
 
 ## Testing plan
 
 ### Rust CLI tests (`prebid_bundle.rs`, `run.rs`)
 
 - Arg parsing: `--prebid-source` accepted, absent by default.
-- Config parsing: `source` read from `[integrations.prebid.bundle]`,
-  CLI flag wins over config, empty string rejected.
+- Config parsing: `source` read from `[integrations.prebid.bundle]`
+  beside `modules`, CLI flag wins over config, empty string rejected,
+  legacy-key rejection unchanged.
 - Classification: `https://...`, `git@...`, `ssh://...` parse as git
   with and without `#ref`; other strings parse as paths; `http://` is
   rejected.
@@ -421,15 +463,19 @@ prints the resolved source in its summary output.
 ### Generator tests (`test/build-prebid-external.test.mjs`)
 
 - `parseArgs` accepts `--prebid-dir` and `--source`; both default to
-  absent.
+  absent, and other unknown options are still rejected.
 - Specifier resolution maps `prebid.js` and `prebid.js/modules/*.js`
   to the expected `dist/` paths under a fixture directory.
 - Generated modules contain absolute imports when `--prebid-dir` is
   set and bare specifiers when it is not.
 - Manifest contains the passed `source` object, and `{ "kind": "npm" }`
   when none is passed.
-- Adapter existence errors name the missing `dist/src/public` file for
-  a custom directory.
+- Version handling: the `package-lock.json` check runs only without
+  `--prebid-dir`; with it, the fork's `package.json` version is
+  recorded.
+- Bidder, User ID and analytics module errors name the fork directory
+  and the missing `dist/src/public/<stem>.js` file for a custom
+  directory.
 
 ### Out of scope for automated tests
 
@@ -449,9 +495,10 @@ fixtures with the build step stubbed.
 - `docs/guide/integrations/prebid.md`: document fork workflows, that
   git URLs are the shareable form for teams while local paths are for
   local iteration, and the `source` manifest field.
-- `trusted-server.example.toml`: add a commented `source` line under
-  `[integrations.prebid.bundle]` using an `example.com`/`example-org`
-  placeholder.
+- `trusted-server.example.toml`: add a commented
+  `[integrations.prebid.bundle]` `source` line above the existing
+  `[integrations.prebid.bundle.modules]` example, using an
+  `example.com`/`example-org` placeholder.
 
 ## Files expected to change
 
@@ -475,12 +522,14 @@ fixtures with the build step stubbed.
 ```bash
 cargo fmt --all -- --check
 ./scripts/test-cli.sh
-cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm
+cargo clippy-cli
 cd crates/trusted-server-js/lib && npx vitest run && npm run format
 cd docs && npm run format
 ```
 
-Manual verification for the git path: run `ts prebid bundle` against a
+Run the full CI gate list in `AGENTS.md` before handoff.
+
+Manual verification for the git path: run `ts prebid client` against a
 public fork URL twice and confirm the second run skips the clone/build,
 the manifest records the resolved commit, and the produced bundle loads
 in the existing external-bundle flow.
