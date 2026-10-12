@@ -949,8 +949,8 @@ Selects the module that gives the start of every name the browser holds for a pu
 
 ### `[prefix]`
 
-| Field    | Type           | Required | Description                                                                                                                                                                                     |
-| -------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Field    | Type           | Required | Description                                                                                                                                                            |
+| -------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `module` | String or null | No       | Name of the prefix module, or omit it or write `ts` for core's own, which gives `ts` for the names the browser holds and `ts.<publisher.domain>` for shared store keys |
 
 Core's own module runs when nothing is selected, so a default deployment writes `ts-ec`, `ts-eids` and `ts-tester`. A module from a crate at `crates/prefix/<name>` is written `<name>` or `prefix.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the prefix modules it does run, and a module that names a value its call never carries is refused at startup rather than on a request.
