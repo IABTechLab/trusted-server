@@ -6,9 +6,7 @@
 //! names, so one service serves several publishers, each from a blob of its
 //! own.
 //!
-//! A host that has no blob is refused. It is never answered from another key,
-//! because a shared fallback is how a host nobody configured comes to be
-//! served another publisher's site.
+//! A host that has no blob is refused. It is never answered from another key.
 
 use core::fmt::Display;
 
@@ -30,12 +28,9 @@ pub(crate) enum Refusal {
 /// The host as a blob is keyed by it, or `None` when `host` is not a host
 /// name.
 ///
-/// Lowercased, with a port and one trailing dot removed, because
-/// `Publisher.Example:443` and `publisher.example.` name one site. Only
-/// letters, digits and hyphens pass, in labels joined by single dots. A
-/// request header therefore cannot be made into the key of anything but a
-/// host's blob: the logical store ID and the keys of a blob's chunks each
-/// carry an underscore, which no host does.
+/// Lowercased, with a port and one trailing dot removed. Only letters, digits
+/// and hyphens pass, in labels joined by single dots, and no label starts or
+/// ends with a hyphen.
 pub(crate) fn normalized_host(host: &str) -> Option<String> {
     let without_port = match host.rsplit_once(':') {
         Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
@@ -46,6 +41,8 @@ pub(crate) fn normalized_host(host: &str) -> Option<String> {
         && name.len() <= MAX_HOST_LEN
         && name.split('.').all(|label| {
             !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
                 && label
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -236,6 +233,28 @@ mod tests {
             resolve_key("{host}", None, no_lookup),
             Err(Refusal::NoConfigForHost),
             "a request that names no host should be refused"
+        );
+    }
+
+    #[test]
+    fn a_label_that_starts_or_ends_with_a_hyphen_is_refused() {
+        for host in [
+            "-a.example",
+            "a-.example",
+            "publisher.-example",
+            "publisher.example-",
+            "-",
+        ] {
+            assert_eq!(
+                resolve_key("{host}", Some(host), no_lookup),
+                Err(Refusal::NoConfigForHost),
+                "`{host}` is not a host name and should be refused"
+            );
+        }
+        assert_eq!(
+            normalized_host("pub-lisher.example").as_deref(),
+            Some("pub-lisher.example"),
+            "a hyphen inside a label should pass"
         );
     }
 

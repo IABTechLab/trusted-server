@@ -104,9 +104,6 @@ pub struct RobotsTxtConfig {
     /// refused crawler is sent to for example. A narrower rule, such as
     /// `Disallow: /ads`, still closes off `/ads.txt`. `/robots.txt` needs no
     /// entry, because RFC 9309 section 2.2.2 says it is implicitly allowed.
-    ///
-    /// A publisher who sells advertising almost certainly wants `/ads.txt`
-    /// here, for the reason given on [`document::refusal`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[validate(custom(function = validate_always_allow))]
     pub always_allow: Vec<String>,
@@ -265,20 +262,9 @@ fn configuration(message: String) -> TrustedServerError {
     TrustedServerError::Configuration { message }
 }
 
-/// Applies the publisher's blanket crawler rule to an outgoing response.
-///
-/// Called once where an adapter finalizes a response, rather than on each
-/// route, so a route added later cannot be the one page a crawler is allowed
-/// to index. A site taken out of search has to be taken out of search
-/// entirely.
-///
-/// Replaces rather than appends. Selecting `refuse_all` means the whole site is
-/// not to be indexed, so a tag an origin page set for its own reasons must not
-/// be able to weaken it, and two tags on one response is how a crawler is given
-/// a choice.
-///
-/// Does nothing unless `refuse_all` is selected, because a file built from
-/// contributors already says what each crawler may do.
+/// Puts [`REFUSE_ALL_ROBOTS_TAG`] on an outgoing response when `refuse_all` is
+/// selected, in place of any `X-Robots-Tag` it carried, and does nothing
+/// otherwise. Called once where an adapter finalizes a response.
 pub fn apply_response_robots_tag(settings: &Settings, response: &mut Response<EdgeBody>) {
     if settings
         .robots_txt
@@ -342,8 +328,7 @@ async fn answer(
             continue;
         }
         let Some((declared, contributor)) = registry.robots_txt_contributor(id) else {
-            // The registry refuses a selection nothing supplies when it is
-            // built, so this is a wiring fault, and it still fails closed.
+            // Unreachable, the registry refuses this name when it is built.
             return Ok(respond(Err(Report::new(configuration(format!(
                 "[robots-txt] modules names `{id}`, which no module in this deployment supplies"
             ))))));
@@ -615,8 +600,6 @@ mod tests {
         );
     }
 
-    /// Leaving out the rules of a contributor that failed would allow by
-    /// omission what those rules refused, so the whole file fails closed.
     #[tokio::test]
     async fn with_nothing_held_a_failure_is_service_unavailable() {
         let failing: Arc<dyn RobotsTxtContributor> =

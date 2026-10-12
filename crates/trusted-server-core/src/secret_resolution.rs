@@ -121,13 +121,7 @@ pub fn resolve_secret_references_with<C: ConfiguredSecretFields>(
     default_store_name: &StoreName,
     extra: Vec<SecretField>,
 ) -> Result<ResolvedSecrets, Report<TrustedServerError>> {
-    let mut listed = std::collections::BTreeSet::new();
-    let fields = C::secret_fields()
-        .into_iter()
-        .chain(C::configured_secret_fields(data))
-        .chain(extra)
-        .filter(|field| listed.insert(field.dotted_path()))
-        .collect::<Vec<_>>();
+    let fields = listed_fields::<C>(data, extra);
     let mut resolved_data = data.clone();
     let mut resolver = Resolver {
         secret_store,
@@ -146,6 +140,37 @@ pub fn resolve_secret_references_with<C: ConfiguredSecretFields>(
     }
     *data = resolved_data;
     Ok(resolver.resolved)
+}
+
+/// The secret leaves a resolution pass over `data` with `extra` looks for,
+/// with nothing resolved, for a check that runs while the secret fields still
+/// hold key names.
+pub(crate) fn unresolved_secrets<C: ConfiguredSecretFields>(
+    data: &Value,
+    extra: Vec<SecretField>,
+) -> ResolvedSecrets {
+    ResolvedSecrets {
+        patterns: listed_fields::<C>(data, extra)
+            .iter()
+            .filter(|field| !matches!(field.kind, SecretKind::StoreRef))
+            .filter_map(|field| PathPattern::from_segments(&field.path))
+            .collect(),
+        ..ResolvedSecrets::default()
+    }
+}
+
+/// Every secret leaf of `C` and `extra` in `data`, each listed once.
+fn listed_fields<C: ConfiguredSecretFields>(
+    data: &Value,
+    extra: Vec<SecretField>,
+) -> Vec<SecretField> {
+    let mut listed = std::collections::BTreeSet::new();
+    C::secret_fields()
+        .into_iter()
+        .chain(C::configured_secret_fields(data))
+        .chain(extra)
+        .filter(|field| listed.insert(field.dotted_path()))
+        .collect()
 }
 
 /// One resolution pass, recording each secret it writes.

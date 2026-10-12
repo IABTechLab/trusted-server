@@ -8,14 +8,12 @@
 //! The last answer a contributor gave is also kept apart from the cache, for
 //! far longer than any refresh, and read only when the contributor fails. It is
 //! then served past its age, because yesterday's rules are a better answer than
-//! none. A `404` or an empty file reads to a crawler as permission to crawl
-//! everything, which is the opposite of what a publisher who refused anything
-//! asked for. It is kept in the host's value cache when the host supplies one,
-//! and in the key-value store otherwise, because a host that starts an instance
+//! none. It is kept in the host's value cache when the host supplies one, and
+//! in the key-value store otherwise, because a host that starts an instance
 //! for each request may give its requests a value cache and no key-value store.
 //! A value cache may drop it sooner, so on such a host a copy past its age is
 //! likely to be there rather than certain, and a key-value store that cannot
-//! give an entry a lifetime keeps it until it is replaced.
+//! give an entry a lifetime keeps it until it is deleted there.
 
 use core::time::Duration;
 use std::sync::Arc;

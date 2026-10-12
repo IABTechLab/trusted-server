@@ -8,7 +8,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use trusted_server_core::host_rewrite::rewrite_bare_host_at_boundaries;
-use trusted_server_core::integrations::{IntegrationDocumentState, ScriptRewriteAction};
+use trusted_server_core::integrations::IntegrationDocumentState;
+use trusted_server_core::middleware::MiddlewareContext;
 
 /// What a script rewriter is told about the chunk of text in front of it.
 #[derive(Debug)]
@@ -27,14 +28,39 @@ pub(crate) struct ScriptContext<'a> {
     pub(crate) document_state: &'a IntegrationDocumentState,
 }
 
-/// A decision about the text of the scripts a selector matches, made a chunk
-/// at a time.
-pub(crate) trait ScriptRewriter: Send + Sync {
-    /// The CSS selector of the scripts this rewriter is asked about.
-    fn selector(&self) -> &'static str;
+/// What a script rewriter keeps of the document it works on, to tell it about
+/// each chunk.
+pub(crate) struct ScriptDocument {
+    request_host: String,
+    request_scheme: String,
+    origin_host: String,
+    max_buffered_script_bytes: usize,
+    document_state: IntegrationDocumentState,
+}
 
-    /// Decides what happens to one chunk of a script's text.
-    fn rewrite(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction;
+impl ScriptDocument {
+    /// What `context` says of the document.
+    pub(crate) fn new(context: &MiddlewareContext<'_>) -> Self {
+        Self {
+            request_host: context.request_host.to_owned(),
+            request_scheme: context.request_scheme.to_owned(),
+            origin_host: context.origin_host.to_owned(),
+            max_buffered_script_bytes: context.max_buffered_script_bytes,
+            document_state: context.document_state.clone(),
+        }
+    }
+
+    /// The context of one chunk of a script's text.
+    pub(crate) fn chunk(&self, is_last_in_text_node: bool) -> ScriptContext<'_> {
+        ScriptContext {
+            request_host: &self.request_host,
+            request_scheme: &self.request_scheme,
+            origin_host: &self.origin_host,
+            is_last_in_text_node,
+            max_buffered_script_bytes: self.max_buffered_script_bytes,
+            document_state: &self.document_state,
+        }
+    }
 }
 
 // These are static code-defined literals, not config-derived patterns, so they
