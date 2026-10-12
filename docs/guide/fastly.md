@@ -361,8 +361,12 @@ When upgrading an existing service:
   run `ts provision --adapter fastly`; otherwise the deploy stops with
   "selected Fastly KV store `trusted_server_kv` does not exist".
 - Re-push staging app config under the logical key into the staging Config
-  Store. Entries previously pushed under `<logical-store-id>_staging` are
-  ignored.
+  Store, with `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` set to
+  that store. Entries previously pushed under `<logical-store-id>_staging` are
+  ignored. Do not rerun an existing `ts config push --adapter fastly --staging`
+  runbook unchanged: `--staging` no longer selects a separate key, so without
+  the `__NAME` selector it writes the production entry in the logical-ID store,
+  and production instances load it on their next start.
 - Remove any `EDGEZERO__STORES__CONFIG__<ID>__KEY` selectors. On Fastly the
   CLI rejects any config key other than the logical store ID, so a leftover
   selector makes `ts config push` and `ts deploy` fail until it is removed.

@@ -134,11 +134,11 @@ fn config_push_resolves_the_physical_name_and_explicit_key() {
 }
 
 // The canonical `__KEY` selector is the push destination when `--key` is absent.
-// Under EdgeZero v0.0.8 the CLI ignored it and always wrote the logical id; the
-// pinned revision returns the selector verbatim so the pushed entry and the
-// runtime that reads it cannot diverge. The Fastly runtime reads the logical id
-// for every target, so an operator deploying to Fastly should leave this unset,
-// which the Fastly guide now states.
+// Under EdgeZero v0.0.8 the CLI ignored it and always wrote the logical id;
+// v0.0.9 returns the selector verbatim so the pushed entry and the runtime
+// that reads it cannot diverge. This test runs the Axum adapter: the Fastly
+// runtime reads the logical id for every target, and the Fastly CLI rejects
+// any other `__KEY` value, so the override only applies off Fastly.
 #[test]
 fn config_push_writes_the_runtime_key_override_without_the_key_flag() {
     let project = project();

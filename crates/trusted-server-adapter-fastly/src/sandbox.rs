@@ -353,31 +353,9 @@ pub(crate) fn read_raw_limits() -> (RawLimits, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
-
-    #[test]
-    fn limit_keys_are_unscoped_app_config_keys() {
-        // The bounds live in the application's own config store under the
-        // logical id a deployment links, so the keys carry no service scope and
-        // no reference to the removed selector store.
-        for key in [
-            KEY_MAX_REQUESTS,
-            KEY_MAX_LIFETIME_MS,
-            KEY_TIMEOUT_MS,
-            KEY_MAX_MEMORY_MIB,
-        ] {
-            assert!(
-                key.starts_with("TS__SANDBOX__"),
-                "sandbox limit key `{key}` should be an application-owned key"
-            );
-            assert!(
-                !key.contains("EDGEZERO__SERVICES__"),
-                "sandbox limit key `{key}` should carry no service scope"
-            );
-        }
-    }
 
     fn full(max_requests: u64) -> RawLimits {
         RawLimits {
@@ -646,6 +624,33 @@ mod tests {
                 "should refuse reuse with missing or invalid memory limit {memory:?}"
             );
         }
+    }
+
+    #[test]
+    fn limits_are_looked_up_unscoped_in_the_app_config_store() {
+        // The bounds live in the application's own config store under the
+        // logical id a deployment links, so every lookup must use the bare
+        // key. Asserting on the constants alone would only fail if someone
+        // edited them and this test together, and the sibling tests match on
+        // `ends_with`, so a service-scoped or otherwise prefixed lookup would
+        // slip past them. Capture the exact keys requested instead.
+        let requested = RefCell::new(Vec::new());
+
+        let (_limits, _diagnostics) = collect_raw_limits::<LookupFailed, _>(|key| {
+            requested.borrow_mut().push(key.to_owned());
+            Ok(None)
+        });
+
+        assert_eq!(
+            requested.borrow().as_slice(),
+            [
+                KEY_MAX_REQUESTS,
+                KEY_MAX_MEMORY_MIB,
+                KEY_MAX_LIFETIME_MS,
+                KEY_TIMEOUT_MS,
+            ],
+            "should look up each sandbox bound by its unscoped app-config key"
+        );
     }
 
     #[test]
