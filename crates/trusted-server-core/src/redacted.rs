@@ -6,9 +6,6 @@
 //!
 //! A settings field holding a value that is sensitive but is not a
 //! [`Redacted`] carries `#[serde(serialize_with = "crate::redacted::sensitive")]`.
-//! Serialization is unchanged, except while [`to_marked_value`] runs, when the
-//! value is wrapped in an object keyed [`SENSITIVE_MARKER`] so the view can
-//! mask it. Every [`Redacted`] value is marked the same way.
 
 use core::cell::Cell;
 use core::fmt;
@@ -68,10 +65,8 @@ pub fn is_marking() -> bool {
 }
 
 /// Serializes a sensitive settings field, for
-/// `#[serde(serialize_with = "crate::redacted::sensitive")]`.
-///
-/// Transparent, except inside [`to_marked_value`], where the value is
-/// wrapped under [`SENSITIVE_MARKER`] so the configuration view masks it.
+/// `#[serde(serialize_with = "crate::redacted::sensitive")]`, marked as
+/// [`to_marked_value`] says.
 ///
 /// # Errors
 ///
@@ -96,8 +91,7 @@ where
 /// Access the real value via [`expose`](Redacted::expose). Callers must
 /// never log or display the returned reference.
 ///
-/// Serializes as the inner value, and is marked sensitive inside
-/// [`to_marked_value`].
+/// Serializes as the inner value, marked as [`to_marked_value`] says.
 ///
 /// # Examples
 ///

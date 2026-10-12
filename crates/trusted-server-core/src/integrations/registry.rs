@@ -368,15 +368,9 @@ pub trait IntegrationProxy: Send + Sync {
 
     /// Handle the proxied request.
     ///
-    /// `call` is the route's call into the request's module context, which
-    /// carries what the request resolved to, the permissions, consent,
-    /// location, device signals and Edge Cookie identifier resolved for it,
-    /// the settings and the services. An implementation hands its own
-    /// function to [`ModuleCall::inject_with`], with `req` as its own
-    /// argument, naming what else it needs. The route holds the request
-    /// itself, so the context carries no separate copy of its evidence. A
-    /// route whose use needs a permission declares it and checks it is
-    /// granted, because nothing gates the route itself.
+    /// Hand a function to [`ModuleCall::inject_with`] with `req` as its
+    /// argument. A route whose use needs a permission declares it and checks
+    /// it is granted, because nothing gates the route itself.
     async fn handle(
         &self,
         call: ModuleCall<'_>,
