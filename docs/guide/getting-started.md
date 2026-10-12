@@ -223,6 +223,16 @@ upgrading a service that was deployed before logical store links, and
 [the CLI guide](/guide/cli#lifecycle-commands) for where `<release-root>`
 comes from.
 
+Set `TRUSTED_SERVER__GIT_VERSION` when building the Fastly package that goes
+into the release; `ts deploy` deploys the prebuilt release and does not rebuild
+it. The build compiles the value into the binary and reports it in the
+`x-ts-version` response header. The Fastly service version is in
+`x-ts-fastly-version`. Without the variable, a build reports the checked-out
+tag, else the branch, else the first 6 characters of the commit, and a build
+outside a git checkout omits the header. The value is public on every
+response, so pass a neutral value such as the commit hash when a branch name
+is sensitive.
+
 ## Next Steps
 
 - Learn about [Edge Cookies](/guide/edge-cookies)
