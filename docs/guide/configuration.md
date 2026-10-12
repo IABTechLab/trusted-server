@@ -1095,8 +1095,9 @@ it passes through untouched.
 
 **How the file is made.** Where a `[[fetch]]` entry for `text/plain` names
 the module, it writes the lines after the origin's last one, and where the
-origin has no file the file is made of the lines alone. The entry's `path` is
-a prefix, so `/ads.txt` also covers `/ads.txt.bak`.
+origin has no file the file is made of the lines alone, see A file the origin
+does not have below. The entry's `path` is a prefix, so `/ads.txt` also
+covers `/ads.txt.bak`.
 
 **Refused when the settings load**: a line that is not a data record or a
 variable, naming which part is wrong, a comment, an empty list, and a
@@ -1800,12 +1801,13 @@ template cache stores HTML alone, so the fetch entry's middleware and then
 the serve entry's run on each response as it is fetched.
 
 **A file the origin does not have.** When the origin answers `404 Not
-Found` for a path a `[[fetch]]` entry with a `path` names middleware for,
-that middleware runs on an empty document of the entry's media type and its
-output is the file, so `ads.txt` is made from the sellers lines alone where
-the publisher has none. With no such entry, or on any other answer from the
-origin, the origin's answer stands, and an entry without a path makes
-nothing, because a page the origin does not have is the origin's answer.
+Found` for a path under the `path` of a `[[fetch]]` entry for a media type
+other than HTML, that entry's middleware runs on an empty document of its
+media type and its output is the file, so `ads.txt` is made from the sellers
+lines alone where the publisher has none. With no such entry, or on any
+other answer from the origin, the origin's answer stands, and an entry for
+HTML or without a path makes nothing, because a page the origin does not
+have is the origin's answer.
 
 ```toml
 [[fetch]]

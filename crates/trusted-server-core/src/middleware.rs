@@ -443,15 +443,16 @@ impl PhaseEntries {
 
     /// The entry that makes the document the origin does not have at
     /// `path`, being the first with a path prefix covering it that names a
-    /// middleware. An entry covering every path makes none, because a page
-    /// the origin does not have is the origin's answer.
+    /// middleware, for a media type core streams other than HTML.
     #[must_use]
-    pub fn creating(&self, path: &str) -> Option<&PhaseEntry> {
+    pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
         self.0.iter().find(|entry| {
-            entry
-                .path
-                .as_deref()
-                .is_some_and(|prefix| path.starts_with(prefix))
+            entry.media_type != HTML_MEDIA_TYPE
+                && is_dispatched_media_type(&entry.media_type)
+                && entry
+                    .path
+                    .as_deref()
+                    .is_some_and(|prefix| path.starts_with(prefix))
                 && !entry.middleware.is_empty()
         })
     }

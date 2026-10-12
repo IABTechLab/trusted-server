@@ -5530,13 +5530,10 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
-    // A file the origin does not have is made by the middleware the
-    // `[[fetch]]` entry for its path names, run on an empty document of the
-    // entry's media type, as `ads.txt` is made from the sellers lines. With
-    // no such entry the origin's answer stands.
+    // A file the origin does not have is made, see `PhaseEntries::making`.
     if response.status() == StatusCode::NOT_FOUND
         && (request_method == Method::GET || request_method == Method::HEAD)
-        && let Some(entry) = settings.fetch.creating(&request_path)
+        && let Some(entry) = settings.fetch.making(&request_path)
     {
         log::debug!(
             "Making {} for {request_path}, which the origin does not have, with {}",
@@ -20941,8 +20938,7 @@ mod tests {
         );
     }
 
-    /// What the publisher path did with one request, with what it takes
-    /// to stream the answer.
+    /// What the publisher path answered one request with.
     struct Proxied {
         settings: Settings,
         registry: IntegrationRegistry,
@@ -20951,9 +20947,7 @@ mod tests {
         response: PublisherResponse,
     }
 
-    /// A request for `path` through the publisher path, with the middleware
-    /// fixture in the entries given and the origin answering `status` with
-    /// a page.
+    /// A request through the publisher path, the origin answering `status`.
     async fn proxy(fetch: Vec<PhaseEntry>, method: Method, path: &str, status: u16) -> Proxied {
         let settings = settings_running_the_middleware_fixture(fetch);
         let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
@@ -21092,13 +21086,76 @@ mod tests {
             404,
         )
         .await;
-        let response = response_of(proxied.response);
+        let response = buffer_publisher_response_async(
+            proxied.response,
+            &Method::HEAD,
+            &proxied.settings,
+            &proxied.registry,
+            &proxied.orchestrator,
+            &proxied.services,
+        )
+        .await
+        .expect("should buffer the HEAD answer");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             content_type_of(&response),
             Some("text/plain; charset=utf-8"),
             "should answer a HEAD as the GET is answered"
+        );
+        assert!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should hold the HEAD answer in memory")
+                .is_empty(),
+            "should answer a HEAD with no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_entry_with_a_path_makes_no_missing_page() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let proxied = proxy(
+            vec![PhaseEntry {
+                media_type: HTML_MEDIA_TYPE.to_owned(),
+                path: Some("/news/".to_owned()),
+                middleware: vec![fixture::HEAD.to_owned()],
+            }],
+            Method::GET,
+            "/news/missing",
+            404,
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer for a page it does not have"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_entry_ahead_does_not_shadow_the_entry_for_a_missing_file() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::middleware::HTML_MEDIA_TYPE;
+
+        let mut fetch = vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec![fixture::HEAD.to_owned()],
+        }];
+        fetch.extend(text_entry_for(Some("/ads.txt")));
+        let proxied = proxy(fetch, Method::GET, "/ads.txt", 404).await;
+        let response = response_of(proxied.response);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should make the file from the text/plain entry, not as HTML"
         );
     }
 
