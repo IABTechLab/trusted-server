@@ -669,7 +669,8 @@ struct TextResponse<'a> {
     origin_host: &'a str,
     request_state: &'a IntegrationRequestState,
     max_buffered_script_bytes: usize,
-    /// What the middleware prepared for the document.
+    /// What the middleware prepared for this document, see
+    /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     prepared: &'a Prepared,
 }
 
@@ -731,7 +732,9 @@ fn middleware_stream_processors(
 
 /// Runs the preparation of the middleware the entries of `phases` select
 /// for `document`, each as its module with the request's services, keeping
-/// what they prepare in the document's [`Prepared`].
+/// what they prepare in the document's [`Prepared`]. Each phase's
+/// preparations are handed a fresh document state, not the one the plan is
+/// handed, so anything a preparation writes there is dropped.
 ///
 /// # Errors
 ///
@@ -781,6 +784,24 @@ async fn prepare_document(
     Ok(())
 }
 
+/// The context the preparations of a document are called with. A document
+/// that may be stored is prepared in the fetch phase alone, and is handed
+/// the request's services and nothing of the reader, because what its
+/// preparations answer is stored with it.
+fn preparation_context<'r>(
+    request: ModuleRequest<'r>,
+    stored: bool,
+    ec_context: &'r EcContext,
+    services: &'r RuntimeServices,
+) -> ModuleContext<'r> {
+    let context = ModuleContext::new(request);
+    if stored {
+        context.with_services(services)
+    } else {
+        context.with_request_state(ec_context, services)
+    }
+}
+
 /// The response a refusal answers the request with: its status,
 /// `Retry-After` when it gives one, the message as plain text, and no
 /// store.
@@ -790,7 +811,8 @@ fn refusal_response(refusal: &Refusal) -> Result<Response<EdgeBody>, Report<Trus
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store");
     if let Some(after) = refusal.retry_after {
-        builder = builder.header(header::RETRY_AFTER, after.as_secs().to_string());
+        let seconds = after.as_secs() + u64::from(after.subsec_nanos() > 0);
+        builder = builder.header(header::RETRY_AFTER, seconds.to_string());
     }
     builder
         .body(EdgeBody::from(refusal.message.clone().into_bytes()))
@@ -5869,20 +5891,17 @@ pub async fn handle_publisher_request(
         .to_ascii_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
 
-    // What the middleware the entries name for this document prepare, with
-    // the request's services, before the document is processed. A refusal
-    // answers the request here, and nothing is stored.
     let prepared = Arc::new(Prepared::default());
     if route == ResponseRoute::Stream {
-        let phases: &[MiddlewarePhase] = if template_cache_key.is_some() {
+        let stored = template_cache_key.is_some();
+        let phases: &[MiddlewarePhase] = if stored {
             &[MiddlewarePhase::Fetch]
         } else {
             &MiddlewarePhase::ALL
         };
         let module_request =
             ModuleRequest::new(&request_method, request_host, request_scheme, &request_path);
-        let module_context =
-            ModuleContext::new(module_request).with_request_state(ec_context, services);
+        let module_context = preparation_context(module_request, stored, ec_context, services);
         let document = TextResponse {
             content_type: &content_type,
             request_path: &request_path,
@@ -21550,6 +21569,57 @@ mod tests {
         assert_eq!(
             output, "plain\n",
             "should hand a middleware no body it would corrupt by writing UTF-8"
+        );
+    }
+
+    #[test]
+    fn a_refusal_rounds_retry_after_up_to_whole_seconds() {
+        let response = refusal_response(&Refusal::service_unavailable(
+            std::time::Duration::from_millis(1_500),
+            "later",
+        ))
+        .expect("should build the refusal");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2"),
+            "should not ask the caller back before the refusal's time"
+        );
+    }
+
+    #[test]
+    fn a_fetch_preparation_of_a_document_that_may_be_stored_is_not_handed_the_reader() {
+        use crate::module_context::{EdgeCookie, FromModuleContext};
+
+        let ec_context = EcContext::new_for_test(
+            Some(crate::ec::tests::CANONICAL_COOKIE_VALUE.to_owned()),
+            ConsentContext::default(),
+        )
+        .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
+        let services = noop_services();
+        let method = Method::GET;
+        let handed = |stored: bool| {
+            let request = ModuleRequest::new(&method, "publisher.example", "https", "/article");
+            let context = preparation_context(request, stored, &ec_context, &services);
+            let call = context.call("testing.preparation", PermissionSet::none());
+            (
+                <&PermissionState>::from_module_context(&call).is_ok(),
+                EdgeCookie::from_module_context(&call).is_ok(),
+            )
+        };
+
+        assert_eq!(
+            handed(false),
+            (true, true),
+            "should hand a document that is not stored the reader's permissions and Edge Cookie"
+        );
+        assert_eq!(
+            handed(true),
+            (false, false),
+            "should hand a document that may be stored neither the reader's permissions nor              Edge Cookie"
         );
     }
 

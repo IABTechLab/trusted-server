@@ -317,7 +317,8 @@ pub struct ReaderDocument<'a> {
     pub request_state: &'a IntegrationRequestState,
     /// The most a middleware may hold of one script while it decides.
     pub max_buffered_script_bytes: usize,
-    /// What the middleware prepared for the reader's copy.
+    /// What the middleware prepared for this document, see
+    /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub prepared: &'a Prepared,
 }
 

@@ -249,8 +249,7 @@ A middleware whose decision needs the request's services, or has to wait on
 the key-value store or the network, answers `prepare` with a future. Core
 runs it in the request's handler, before the document is processed, as the
 module the middleware belongs to and with the permissions it declares in
-`required_permissions`, so the module call carries what a request hook or a
-robots.txt contributor is given. What the future answers is kept under the
+`required_permissions`. What the future answers is kept under the
 middleware's name in the context's `prepared`, and `create`, which stays
 synchronous, takes it from there as the type it prepared. A middleware that
 prepares nothing leaves `prepare` at its default and is asked `create` as
@@ -288,10 +287,12 @@ unchanged one through. `Refusal::service_unavailable` is the one for a
 source that cannot answer now. The preparations of one document run in the
 order the entry names the middleware, and the first refusal ends them.
 
-In the fetch phase a preparation is made once for the document that may be
-stored, so it must not depend on the reader. In the serve phase it is made
-for each reader's copy, on a document fetched for the request and on one
-read from the store alike.
+On a document that may be stored only the fetch phase is prepared, and its
+preparations are handed the request's services and nothing of the reader,
+because what they answer is stored with the document. The serve middleware
+of the reader it was fetched for then find nothing prepared. On a document
+that is not stored both phases are prepared, and on a copy read from the
+store the serve phase alone.
 
 ## Proxy implementation rules
 

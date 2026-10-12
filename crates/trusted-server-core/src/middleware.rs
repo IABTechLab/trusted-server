@@ -457,13 +457,6 @@ pub trait Middleware: Send + Sync {
     /// Work done for one document before `create` is asked, where deciding
     /// needs the request's services or has to wait, on a store or the
     /// network. `None`, the default, means none is needed.
-    ///
-    /// The future runs in the request's handler before the document is
-    /// processed, with `call` carrying what the request's services allow this
-    /// middleware. What it answers is kept under this middleware's name in
-    /// the context's [`Prepared`], for `create` to take. A refusal answers
-    /// the request with the status it carries and no document, and nothing
-    /// is stored.
     fn prepare<'a>(
         &'a self,
         call: ModuleCall<'a>,
