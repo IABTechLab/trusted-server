@@ -398,12 +398,46 @@ fn find_tchunks_with_markers(content: &str) -> Option<Vec<TChunkInfo>> {
 // Single-script T-chunk processing
 // =============================================================================
 
-pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
+fn rewrite_span(
     content: &str,
     rewriter: &RscUrlRewriter,
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
+    transform: Option<fn(&str) -> String>,
+) -> String {
+    let rewritten = rewriter.rewrite_to_string(content, origin_host, request_host, request_scheme);
+    match transform {
+        Some(transform) => transform(&rewritten),
+        None => rewritten,
+    }
+}
+
+#[cfg(test)]
+fn rewrite_rsc_tchunks_with_rewriter(
+    content: &str,
+    rewriter: &RscUrlRewriter,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+) -> String {
+    rewrite_rsc_tchunks_with_transform(
+        content,
+        rewriter,
+        origin_host,
+        request_host,
+        request_scheme,
+        None,
+    )
+}
+
+fn rewrite_rsc_tchunks_with_transform(
+    content: &str,
+    rewriter: &RscUrlRewriter,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+    transform: Option<fn(&str) -> String>,
 ) -> String {
     let Some(chunks) = find_tchunks(content) else {
         log::warn!(
@@ -413,7 +447,14 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     };
 
     if chunks.is_empty() {
-        return rewriter.rewrite_to_string(content, origin_host, request_host, request_scheme);
+        return rewrite_span(
+            content,
+            rewriter,
+            origin_host,
+            request_host,
+            request_scheme,
+            transform,
+        );
     }
 
     let mut result = String::with_capacity(content.len());
@@ -421,15 +462,24 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
 
     for chunk in &chunks {
         let before = &content[last_end..chunk.match_start];
-        result.push_str(
-            rewriter
-                .rewrite(before, origin_host, request_host, request_scheme)
-                .as_ref(),
-        );
+        result.push_str(&rewrite_span(
+            before,
+            rewriter,
+            origin_host,
+            request_host,
+            request_scheme,
+            transform,
+        ));
 
         let chunk_content = &content[chunk.header_end..chunk.content_end];
-        let rewritten_content =
-            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
+        let rewritten_content = rewrite_span(
+            chunk_content,
+            rewriter,
+            origin_host,
+            request_host,
+            request_scheme,
+            transform,
+        );
 
         let new_length = calculate_unescaped_byte_length(&rewritten_content);
         let new_length_hex = format!("{new_length:x}");
@@ -444,11 +494,14 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     }
 
     let remaining = &content[last_end..];
-    result.push_str(
-        rewriter
-            .rewrite(remaining, origin_host, request_host, request_scheme)
-            .as_ref(),
-    );
+    result.push_str(&rewrite_span(
+        remaining,
+        rewriter,
+        origin_host,
+        request_host,
+        request_scheme,
+        transform,
+    ));
 
     result
 }
@@ -520,22 +573,43 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     request_scheme: &str,
     max_combined_payload_bytes: usize,
 ) -> Vec<String> {
+    rewrite_rsc_scripts_combined_with_transform(
+        payloads,
+        rewriter,
+        origin_host,
+        request_host,
+        request_scheme,
+        max_combined_payload_bytes,
+        None,
+    )
+}
+
+pub(super) fn rewrite_rsc_scripts_combined_with_transform(
+    payloads: &[&str],
+    rewriter: &RscUrlRewriter,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+    max_combined_payload_bytes: usize,
+    transform: Option<fn(&str) -> String>,
+) -> Vec<String> {
     let Some((_, preceding_payloads)) = payloads.split_last() else {
         return Vec::new();
     };
 
     // Early exit if no payload contains the origin host - avoids regex compilation
-    if !payloads.iter().any(|p| p.contains(origin_host)) {
+    if transform.is_none() && !payloads.iter().any(|p| p.contains(origin_host)) {
         return payloads.iter().map(|p| (*p).to_owned()).collect();
     }
 
     if payloads.len() == 1 {
-        return vec![rewrite_rsc_tchunks_with_rewriter(
+        return vec![rewrite_rsc_tchunks_with_transform(
             payloads[0],
             rewriter,
             origin_host,
             request_host,
             request_scheme,
+            transform,
         )];
     }
 
@@ -570,12 +644,13 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
         return payloads
             .iter()
             .map(|p| {
-                rewrite_rsc_tchunks_with_rewriter(
+                rewrite_rsc_tchunks_with_transform(
                     p,
                     rewriter,
                     origin_host,
                     request_host,
                     request_scheme,
+                    transform,
                 )
             })
             .collect();
@@ -615,7 +690,16 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     if chunks.is_empty() {
         return payloads
             .iter()
-            .map(|p| rewriter.rewrite_to_string(p, origin_host, request_host, request_scheme))
+            .map(|p| {
+                rewrite_span(
+                    p,
+                    rewriter,
+                    origin_host,
+                    request_host,
+                    request_scheme,
+                    transform,
+                )
+            })
             .collect();
     }
 
@@ -624,15 +708,24 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
 
     for chunk in &chunks {
         let before = &combined[last_end..chunk.match_start];
-        result.push_str(
-            rewriter
-                .rewrite(before, origin_host, request_host, request_scheme)
-                .as_ref(),
-        );
+        result.push_str(&rewrite_span(
+            before,
+            rewriter,
+            origin_host,
+            request_host,
+            request_scheme,
+            transform,
+        ));
 
         let chunk_content = &combined[chunk.header_end..chunk.content_end];
-        let rewritten_content =
-            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
+        let rewritten_content = rewrite_span(
+            chunk_content,
+            rewriter,
+            origin_host,
+            request_host,
+            request_scheme,
+            transform,
+        );
 
         let new_length = calculate_unescaped_byte_length_skip_markers(&rewritten_content);
         let new_length_hex = format!("{new_length:x}");
@@ -647,11 +740,14 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
     }
 
     let remaining = &combined[last_end..];
-    result.push_str(
-        rewriter
-            .rewrite(remaining, origin_host, request_host, request_scheme)
-            .as_ref(),
-    );
+    result.push_str(&rewrite_span(
+        remaining,
+        rewriter,
+        origin_host,
+        request_host,
+        request_scheme,
+        transform,
+    ));
 
     result.split(RSC_MARKER).map(String::from).collect()
 }

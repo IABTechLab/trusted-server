@@ -5,6 +5,7 @@ use edgezero_core::request::{InboundOrigin, RequestIngress};
 use error_stack::Report;
 use http::{Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 
@@ -162,21 +163,41 @@ pub struct RequestInfo {
 }
 
 impl RequestInfo {
-    /// Extract public origin information from a prepared request.
+    /// Extract validated public origin information from a prepared request.
+    ///
+    /// The selected host must be an ASCII hostname (including underscores for
+    /// local service names), IPv4 address, or bracketed IPv6 address, optionally
+    /// followed by a numeric port. Requests without any host retain an empty host.
     ///
     /// # Examples
     ///
     /// ```ignore
-    /// let info = RequestInfo::from_request(&request, &client_info);
+    /// let info = RequestInfo::from_request(&request, &client_info)?;
     /// let origin = format!("{}://{}", info.scheme, info.host);
     /// ```
-    #[must_use]
-    pub fn from_request(req: &Request<EdgeBody>, client_info: &ClientInfo) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::BadRequest`] when the selected host is
+    /// malformed or the `Host` header is not text, rather than falling back to
+    /// a lower-priority source.
+    pub fn from_request(
+        req: &Request<EdgeBody>,
+        client_info: &ClientInfo,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let invalid_host = || {
+            Report::new(TrustedServerError::BadRequest {
+                message: "Invalid request host".to_owned(),
+            })
+        };
         if let Some(origin) = public_origin(req) {
-            return Self {
+            if !is_valid_request_host(&origin.authority) {
+                return Err(invalid_host());
+            }
+            return Ok(Self {
                 host: origin.authority.clone(),
                 scheme: origin.scheme.clone(),
-            };
+            });
         }
         let runtime_origin = req
             .extensions()
@@ -187,20 +208,69 @@ impl RequestInfo {
                     .get::<RuntimeRequestOrigin>()
                     .map(|origin| &origin.0)
             });
-        let host = runtime_origin
-            .map(InboundOrigin::authority)
-            .or_else(|| {
-                req.headers()
-                    .get(header::HOST)
-                    .and_then(|value| value.to_str().ok())
-            })
-            .unwrap_or_default()
-            .to_owned();
+        let host = match runtime_origin {
+            Some(origin) => Some(origin.authority()),
+            None => req
+                .headers()
+                .get(header::HOST)
+                .map(|value| value.to_str().map_err(|_| invalid_host()))
+                .transpose()?,
+        };
+        if host.is_some_and(|host| !is_valid_request_host(host)) {
+            return Err(invalid_host());
+        }
         let scheme = runtime_origin
             .map(|origin| origin.scheme().to_owned())
             .unwrap_or_else(|| detect_request_scheme(req, client_info));
-        Self { host, scheme }
+        Ok(Self {
+            host: host.unwrap_or_default().to_owned(),
+            scheme,
+        })
     }
+}
+
+/// Accept only literal host syntax that is safe to insert into script source.
+fn is_valid_request_host(value: &str) -> bool {
+    let port = if let Some(ipv6) = value.strip_prefix('[') {
+        let Some((address, suffix)) = ipv6.split_once(']') else {
+            return false;
+        };
+        if address.parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        if suffix.is_empty() {
+            None
+        } else if let Some(port) = suffix.strip_prefix(':') {
+            Some(port)
+        } else {
+            return false;
+        }
+    } else {
+        let (host, port) = value
+            .split_once(':')
+            .map_or((value, None), |(host, port)| (host, Some(port)));
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if host.is_empty()
+            || host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    || !label.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+        {
+            return false;
+        }
+        port
+    };
+    port.is_none_or(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
+    })
 }
 
 fn detect_request_scheme(req: &Request<EdgeBody>, client_info: &ClientInfo) -> String {
@@ -560,7 +630,8 @@ mod tests {
             );
             crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
 
-            let info = RequestInfo::from_request(&request, &default_client_info());
+            let info = RequestInfo::from_request(&request, &default_client_info())
+                .expect("should accept trusted origin precedence");
 
             assert_eq!(
                 info.host, expected_host,
@@ -585,7 +656,8 @@ mod tests {
         set_header(&mut request, "x-forwarded-host", "other.example.com");
         set_header(&mut request, "x-forwarded-proto", "https");
 
-        let info = RequestInfo::from_request(&request, &default_client_info());
+        let info = RequestInfo::from_request(&request, &default_client_info())
+            .expect("should extract request info");
 
         assert_eq!(
             info.host, "upstream.example.com",
@@ -598,11 +670,146 @@ mod tests {
     }
 
     #[test]
+    fn request_info_accepts_valid_hosts_without_normalizing_them() {
+        for host in [
+            "example.com",
+            "Sub-Domain.EXAMPLE.com.",
+            "xn--bcher-kva.example.com",
+            "example.com:443",
+            "localhost:3000",
+            "internal-proxy:8080",
+            "my_service:8080",
+            "service_.example.com:8443",
+            "_service.example.com",
+            "_.example.com",
+            "bad_label.example.com",
+            "192.0.2.1:8080",
+            "[2001:db8::1]",
+            "[2001:db8::1]:443",
+            "[::1]:3000",
+            "[::ffff:192.0.2.1]:65535",
+        ] {
+            let mut req = build_request(Method::GET, "https://example.com/page");
+            set_header(&mut req, "host", host);
+            let info = RequestInfo::from_request(&req, &default_client_info())
+                .expect("should accept valid host syntax");
+            assert_eq!(info.host, host, "should preserve Host header: {host}");
+        }
+    }
+
+    #[test]
+    fn request_info_rejects_malformed_selected_hosts_without_fallback() {
+        for host in [
+            "",
+            "example.com</script><script>alert(1)</script>",
+            "example.com'",
+            "example.com\"",
+            "example.com`",
+            "example.com\\path",
+            "example.com/path",
+            "example.com?query",
+            "example.com#fragment",
+            "user@example.com",
+            "https://example.com",
+            "example.com%22",
+            "example.com:invalid",
+            "example.com:",
+            "example.com:65536",
+            "example.com:+443",
+            "example.com:443:80",
+            "bad host.example.com",
+            "-bad.example.com",
+            "bad-.example.com",
+            "example..com",
+            ".example.com",
+            ".",
+            "::1",
+            "[not-ipv6]",
+            "[2001:db8::1",
+            "[2001:db8::1]suffix",
+            "[2001:db8::1]:",
+        ] {
+            let mut req = build_request(Method::GET, "https://example.com/page");
+            set_header(&mut req, "host", host);
+            let error = RequestInfo::from_request(&req, &default_client_info())
+                .expect_err("should reject malformed selected host");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::BadRequest { .. }
+                ),
+                "should reject Host header with a bad-request error: {host}"
+            );
+            assert!(
+                !format!("{error}").contains("</script>"),
+                "should not reflect hostile host bytes in the error"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_rejects_non_text_host_header() {
+        let mut req = build_request(Method::GET, "https://example.com/page");
+        req.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_bytes(b"example.com\xff").expect("should build non-text header"),
+        );
+        assert!(
+            RequestInfo::from_request(&req, &default_client_info()).is_err(),
+            "should reject a non-text Host header rather than treating it as absent"
+        );
+    }
+
+    #[test]
+    fn request_info_rejects_oversized_dns_names() {
+        for host in [
+            format!("{}.example.com", "a".repeat(64)),
+            format!(
+                "{}.{}.{}.{}",
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(63)
+            ),
+        ] {
+            let mut req = build_request(Method::GET, "https://example.com/page");
+            set_header(&mut req, "host", &host);
+            assert!(
+                RequestInfo::from_request(&req, &default_client_info()).is_err(),
+                "should reject oversized DNS name: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_ignores_hostile_unauthenticated_forwarding_headers() {
+        let mut req = build_request(Method::GET, "https://example.com/page");
+        set_header(&mut req, "forwarded", "host=\"example.com</script>\"");
+        set_header(&mut req, "x-forwarded-host", "example.com</script>");
+        set_header(&mut req, "host", "public.example.com");
+        let info = RequestInfo::from_request(&req, &default_client_info())
+            .expect("should validate only the selected Host header");
+        assert_eq!(
+            info.host, "public.example.com",
+            "should neither select nor validate unauthenticated forwarding hosts"
+        );
+    }
+
+    #[test]
+    fn request_info_preserves_absent_host_behavior() {
+        let req = build_request(Method::GET, "/page");
+        let info = RequestInfo::from_request(&req, &default_client_info())
+            .expect("should preserve request metadata without host headers");
+        assert!(info.host.is_empty(), "should keep absent host empty");
+    }
+
+    #[test]
     fn test_request_info_from_host_header() {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "host", "test.example.com");
 
-        let info = RequestInfo::from_request(&req, &default_client_info());
+        let info = RequestInfo::from_request(&req, &default_client_info())
+            .expect("should extract request info");
         assert_eq!(
             info.host, "test.example.com",
             "Host should use Host header when forwarded headers are missing"
@@ -619,7 +826,8 @@ mod tests {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "fastly-ssl", "1");
 
-        let info = RequestInfo::from_request(&req, &default_client_info());
+        let info = RequestInfo::from_request(&req, &default_client_info())
+            .expect("should extract request info");
         assert_eq!(
             info.scheme, "https",
             "Scheme should fall back to Fastly-SSL when other signals are missing"
@@ -709,7 +917,8 @@ mod tests {
         set_header(&mut req, "x-forwarded-proto", "http");
 
         sanitize_forwarded_headers(&mut req);
-        let info = RequestInfo::from_request(&req, &default_client_info());
+        let info = RequestInfo::from_request(&req, &default_client_info())
+            .expect("should extract request info");
 
         assert_eq!(
             info.host, "legit.example.com",
@@ -832,7 +1041,8 @@ mod tests {
             ..ClientInfo::default()
         };
 
-        let info = RequestInfo::from_request(&req, &client_info);
+        let info =
+            RequestInfo::from_request(&req, &client_info).expect("should extract request info");
 
         assert_eq!(
             info.scheme, "https",
@@ -848,7 +1058,8 @@ mod tests {
             ..ClientInfo::default()
         };
 
-        let info = RequestInfo::from_request(&req, &client_info);
+        let info =
+            RequestInfo::from_request(&req, &client_info).expect("should extract request info");
 
         assert_eq!(
             info.scheme, "https",

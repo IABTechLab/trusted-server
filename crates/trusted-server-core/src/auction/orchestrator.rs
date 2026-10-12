@@ -5139,7 +5139,8 @@ mod tests {
         let info = crate::http_util::RequestInfo::from_request(
             &snapshot,
             &crate::platform::ClientInfo::default(),
-        );
+        )
+        .expect("should extract snapshot request info");
 
         assert_eq!(
             info.scheme, "https",
@@ -5254,7 +5255,8 @@ mod tests {
             let info = crate::http_util::RequestInfo::from_request(
                 &snapshot,
                 &crate::platform::ClientInfo::default(),
-            );
+            )
+            .expect("should extract snapshot request info");
             assert_eq!(
                 info.host,
                 if accepted {

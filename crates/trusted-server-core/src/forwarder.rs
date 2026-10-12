@@ -212,7 +212,8 @@ mod tests {
         let original_uri = request.uri().clone();
         prepare_trusted_forwarder(&mut request, &settings());
 
-        let info = RequestInfo::from_request(&request, &ClientInfo::default());
+        let info = RequestInfo::from_request(&request, &ClientInfo::default())
+            .expect("should extract request info");
         assert_eq!(
             info.host, "publisher.example.com:8443",
             "should retain the public port"
@@ -341,7 +342,8 @@ mod tests {
                 !request.headers().contains_key(FORWARDER_AUTH_HEADER),
                 "should strip credentials on rejection"
             );
-            let info = RequestInfo::from_request(&request, &ClientInfo::default());
+            let info = RequestInfo::from_request(&request, &ClientInfo::default())
+                .expect("should extract request info");
             assert_eq!(
                 info.host, "upstream.example.com",
                 "should fall back to received Host"
@@ -394,7 +396,8 @@ mod tests {
             !request.headers().contains_key(FORWARDER_AUTH_HEADER),
             "should remove the known credential header even when disabled"
         );
-        let info = RequestInfo::from_request(&request, &ClientInfo::default());
+        let info = RequestInfo::from_request(&request, &ClientInfo::default())
+            .expect("should extract request info");
         assert_eq!(
             info.host, "upstream.example.com",
             "should ignore spoofed forwarding"
@@ -493,7 +496,8 @@ mod tests {
                 !health.observed_active(),
                 "should never treat folded cookies as a verified session"
             );
-            let info = RequestInfo::from_request(&request, &ClientInfo::default());
+            let info = RequestInfo::from_request(&request, &ClientInfo::default())
+                .expect("should extract request info");
             assert_eq!(
                 info.host,
                 if accepted {

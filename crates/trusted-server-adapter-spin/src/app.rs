@@ -1257,7 +1257,8 @@ mod tests {
         let info = trusted_server_core::http_util::RequestInfo::from_request(
             &req,
             &trusted_server_core::platform::ClientInfo::default(),
-        );
+        )
+        .expect("should extract request info");
         assert_eq!(
             info.scheme, "https",
             "should retain trusted Spin HTTPS scheme after forwarding sanitation"
@@ -1362,7 +1363,9 @@ mod tests {
             trusted_server_core::http_util::RequestInfo::from_request(
                 &req,
                 &ClientInfo::default(),
-            ).scheme,
+            )
+            .expect("should extract request info")
+            .scheme,
             "https",
             "should retain trusted runtime scheme"
         );
