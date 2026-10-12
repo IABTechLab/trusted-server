@@ -1,5 +1,5 @@
-//! One context for every module, and the values a module's process function
-//! may name as parameters.
+//! One context for every module, and the values a module's function may
+//! name as parameters.
 //!
 //! Core builds one [`ModuleContext`] where it calls modules, from what the
 //! request already holds. The context borrows everything it carries, so
@@ -7,7 +7,7 @@
 //! the same context. Each module is handed a [`ModuleCall`], being the context
 //! together with the permissions that module declares.
 //!
-//! A module's process function names what it needs as parameters, and
+//! A module's function names what it needs as parameters, and
 //! [`ModuleCall::inject`] passes each one in from the context. A parameter may
 //! be any type that implements [`FromModuleContext`], an `Option` of one, which
 //! is `None` when the value cannot be passed, or a tuple of them. The function
@@ -206,8 +206,6 @@ impl<T: ?Sized> Copy for Gated<'_, T> {}
 /// holds, and borrowed by every module called there. A module never sees it
 /// directly. It is handed a [`ModuleCall`] and names what it needs, see
 /// [`ModuleCall::inject`].
-///
-/// It holds only borrows, so a copy is a copy of those borrows.
 #[derive(Clone, Copy)]
 pub struct ModuleContext<'r> {
     request: ModuleRequest<'r>,
@@ -343,7 +341,9 @@ impl<'r> ModuleContext<'r> {
     /// Each gated value needs what its producer declares. The location needs
     /// what the geo module in `services` declares, the device signals what the
     /// device module in `services` declares, and the identifier what the Edge
-    /// Cookie module the state was built with declares.
+    /// Cookie module the state was built with declares. Signals from a device
+    /// module the adapter builds itself, as Fastly does with none registered,
+    /// are gated by nothing, so such a module must declare no permission.
     #[must_use]
     pub fn with_request_state(self, state: &'r EcContext, services: &'r RuntimeServices) -> Self {
         let mut context = self
@@ -441,7 +441,7 @@ impl fmt::Debug for ModuleContext<'_> {
 /// Core's call to one module, being the request's [`ModuleContext`] and the
 /// permissions the module declares.
 ///
-/// A module's process function is handed its parameters through
+/// A module's function is handed its parameters through
 /// [`inject`](Self::inject).
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleCall<'c> {
@@ -559,17 +559,25 @@ impl fmt::Display for Withheld {
 
 impl core::error::Error for Withheld {}
 
-/// A route whose parameter is withheld answers `403`, the same as a route
-/// refusing a permission itself.
+/// A route whose parameter the request's permissions withhold answers `403`.
+/// A value absent where the module runs, or needing permissions that are not
+/// resolved there, is a fault in how the module was written or placed, and
+/// answers `500`.
 impl From<Withheld> for error_stack::Report<TrustedServerError> {
     fn from(withheld: Withheld) -> Self {
-        error_stack::Report::new(TrustedServerError::Forbidden {
-            message: withheld.to_string(),
+        let message = withheld.to_string();
+        error_stack::Report::new(match withheld.reason {
+            WithheldReason::NotDeclared(_) | WithheldReason::NotGranted(_) => {
+                TrustedServerError::Forbidden { message }
+            }
+            WithheldReason::Absent | WithheldReason::Unresolved => {
+                TrustedServerError::Configuration { message }
+            }
         })
     }
 }
 
-/// A value a module's process function can name as a parameter.
+/// A value a module's function can name as a parameter.
 ///
 /// Implemented for each value a [`ModuleContext`] carries, for an `Option` of
 /// one, which is `None` rather than withheld, and for tuples of up to eight.
