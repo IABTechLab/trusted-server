@@ -1119,3 +1119,1096 @@ async fn adapter_buffers_nextjs_auction_output() {
         }
     }
 }
+#[allow(clippy::panic)]
+#[cfg(test)]
+mod trace_parity {
+    use std::net::IpAddr;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use edgezero_core::key_value_store::{KvError, KvPage};
+    use edgezero_core::request::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, Preservation, RequestIngress,
+        TargetUnavailable,
+    };
+    use error_stack::Report;
+    use http::{Method, StatusCode, header};
+    use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::platform::{
+        BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+        PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+        PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+        PlatformSelectResult, RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    };
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedForwarderConfig;
+    use trusted_server_core::trace::TraceTerminalResponse;
+
+    use super::*;
+
+    struct ForbiddenLifecycle;
+
+    impl PlatformConfigStore for ForbiddenLifecycle {
+        fn get(&self, _store: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
+            panic!("should not read trace config per request");
+        }
+        fn put(
+            &self,
+            _store: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            panic!("should not write trace config");
+        }
+        fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            panic!("should not delete trace config");
+        }
+    }
+    impl PlatformSecretStore for ForbiddenLifecycle {
+        fn get_bytes(
+            &self,
+            _store: &StoreName,
+            _key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            panic!("should not read trace secrets");
+        }
+        fn create(
+            &self,
+            _store: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            panic!("should not write trace secrets");
+        }
+        fn delete(&self, _store: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            panic!("should not delete trace secrets");
+        }
+    }
+    impl PlatformBackend for ForbiddenLifecycle {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            panic!("should not resolve trace backends");
+        }
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            panic!("should not predict trace backends");
+        }
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            panic!("should not register trace backends");
+        }
+    }
+    #[async_trait(?Send)]
+    impl PlatformKvStore for ForbiddenLifecycle {
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+            panic!("should not read trace identity");
+        }
+        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+            panic!("should not write trace identity");
+        }
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            panic!("should not refresh trace identity");
+        }
+        async fn delete(&self, _key: &str) -> Result<(), KvError> {
+            panic!("should not delete trace identity");
+        }
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            panic!("should not enumerate trace identity");
+        }
+    }
+    #[async_trait(?Send)]
+    impl PlatformHttpClient for ForbiddenLifecycle {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            panic!("should not contact trace origin");
+        }
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            panic!("should not launch trace auctions");
+        }
+        async fn select(
+            &self,
+            _requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            panic!("should not collect trace auctions");
+        }
+    }
+    #[async_trait(?Send)]
+    impl AuctionTelemetrySink for ForbiddenLifecycle {
+        fn is_enabled(&self) -> bool {
+            panic!("should not inspect trace auction telemetry");
+        }
+        async fn emit_auction_events(
+            &self,
+            _services: &RuntimeServices,
+            _batch: AuctionEventBatch,
+        ) -> Result<(), Report<TrustedServerError>> {
+            panic!("should not emit trace auction telemetry");
+        }
+    }
+    struct CountingGeo(Arc<AtomicUsize>);
+    impl PlatformGeo for CountingGeo {
+        fn lookup(&self, ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            assert_eq!(
+                ip,
+                Some(
+                    "192.0.2.99"
+                        .parse()
+                        .expect("should parse injected example IP")
+                ),
+                "should use injected trusted client metadata"
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(GeoInfo {
+                city: String::new(),
+                country: "GB".to_owned(),
+                continent: String::new(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: Some("EX".to_owned()),
+                asn: Some(64512),
+            }))
+        }
+    }
+
+    fn routers(
+        enabled: bool,
+        auth_pattern: Option<&str>,
+        calls: Arc<AtomicUsize>,
+    ) -> Vec<(&'static str, RouterService)> {
+        routers_with_client(
+            enabled,
+            auth_pattern,
+            calls,
+            Some(
+                "192.0.2.99"
+                    .parse()
+                    .expect("should parse injected client IP"),
+            ),
+        )
+    }
+
+    fn routers_with_client(
+        enabled: bool,
+        auth_pattern: Option<&str>,
+        calls: Arc<AtomicUsize>,
+        client_ip: Option<IpAddr>,
+    ) -> Vec<(&'static str, RouterService)> {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":enabled}),
+            )
+            .expect("should insert trace settings");
+        if let Some(pattern) = auth_pattern {
+            settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":pattern,"username":"example-user","password":"example-password"})).expect("should insert trace auth rule"));
+        }
+        let forbidden = Arc::new(ForbiddenLifecycle);
+        let services = RuntimeServices::builder()
+            .config_store(forbidden.clone())
+            .secret_store(forbidden.clone())
+            .kv_store(forbidden.clone())
+            .backend(forbidden.clone())
+            .http_client(forbidden.clone())
+            .auction_telemetry_sink(forbidden)
+            .geo(Arc::new(CountingGeo(calls)))
+            .client_info(ClientInfo {
+                client_ip,
+                ..ClientInfo::default()
+            })
+            .build();
+        routers_with_services(settings, services)
+    }
+
+    fn routers_with_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Vec<(&'static str, RouterService)> {
+        vec![
+            (
+                "Axum",
+                AxumApp::routes_with_settings_and_services(settings.clone(), services.clone())
+                    .expect("should build Axum trace routes"),
+            ),
+            (
+                "Cloudflare",
+                CloudflareApp::routes_with_settings_and_services(
+                    settings.clone(),
+                    services.clone(),
+                )
+                .expect("should build Cloudflare trace routes"),
+            ),
+            (
+                "Spin",
+                SpinApp::routes_with_settings_and_services(settings, services)
+                    .expect("should build Spin trace routes"),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn trace_dispatch_parity_missing_client_ip_skips_geo() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (adapter, router) in routers_with_client(true, None, Arc::clone(&calls), None) {
+            let response = RouterService::oneshot(
+                &router,
+                request_builder()
+                    .uri("/_ts/trace")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build missing-IP setup"),
+            )
+            .await
+            .expect("should render setup without optional facts");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{adapter} should render missing optional facts"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "should not synthesize a geo lookup without trusted client IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_dispatch_parity_auth_precedes_flags_aliases_and_methods_without_services() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for enabled in [false, true] {
+            for (pattern, path, expected) in [
+                (Some("^/"), "/%5Fts/trace", StatusCode::UNAUTHORIZED),
+                (
+                    Some("^/_ts"),
+                    "/%5Fts/trace",
+                    if enabled {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::NOT_FOUND
+                    },
+                ),
+                (Some("^/_ts"), "/_ts/trace/extra", StatusCode::UNAUTHORIZED),
+                (
+                    None,
+                    "/_ts/trace",
+                    if enabled {
+                        StatusCode::METHOD_NOT_ALLOWED
+                    } else {
+                        StatusCode::NOT_FOUND
+                    },
+                ),
+            ] {
+                for (adapter, router) in routers(enabled, pattern, Arc::clone(&calls)) {
+                    let request = request_builder()
+                        .method("EXAMPLE-METHOD")
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build extension method");
+                    let response = router
+                        .oneshot(request)
+                        .await
+                        .expect("should reject locally");
+                    assert_eq!(
+                        response.status(),
+                        expected,
+                        "{adapter} should apply auth then flag/path/method"
+                    );
+                    assert!(
+                        response
+                            .extensions()
+                            .get::<TraceTerminalResponse>()
+                            .is_some(),
+                        "{adapter} should retain terminal marker"
+                    );
+                    assert_eq!(
+                        response.headers()[header::CACHE_CONTROL],
+                        "no-store, private",
+                        "{adapter} should keep trace errors private"
+                    );
+                    assert!(
+                        !response.headers().contains_key(header::SET_COOKIE),
+                        "{adapter} should not write rejected cookies"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "should never lookup denied metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_dispatch_parity_read_only_setup_and_verified_assets() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (adapter, router) in routers(true, None, Arc::clone(&calls)) {
+            for (method, path, expected_calls) in [
+                (Method::HEAD, "/_ts/trace", 0),
+                (Method::GET, "/_ts/trace/state", 0),
+                (Method::GET, "/_ts/trace/assets/v1.js", 0),
+                (Method::GET, "/_ts/trace/assets/v1.css", 0),
+                (Method::GET, "/_ts/trace", 1),
+            ] {
+                calls.store(0, Ordering::SeqCst);
+                let head = method == Method::HEAD;
+                let request = request_builder()
+                    .method(method)
+                    .uri(path)
+                    .header("cookie", "__Host-ts-console=1")
+                    .header("cf-connecting-ip", "203.0.113.22")
+                    .header("spin-client-addr", "203.0.113.33:1234")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build local read");
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should serve local read");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should serve local route"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    expected_calls,
+                    "{adapter} should fetch metadata only for GET setup"
+                );
+                assert!(
+                    !response.headers().contains_key(header::SET_COOKIE),
+                    "{adapter} should not refresh cookies"
+                );
+                let headers = response.headers().clone();
+                let bytes = response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should buffer trace response");
+                if head {
+                    assert!(bytes.is_empty(), "{adapter} should remove HEAD body");
+                } else if path == "/_ts/trace" {
+                    let html = String::from_utf8(bytes.to_vec()).expect("should render UTF8 setup");
+                    assert!(
+                        html.contains("192.0.2.0/24"),
+                        "{adapter} should prefer injected client metadata"
+                    );
+                    assert!(
+                        !html.contains("192.0.2.99"),
+                        "{adapter} should redact full client IP"
+                    );
+                    assert!(
+                        html.contains("64512"),
+                        "{adapter} should project populated ASN"
+                    );
+                } else if path.contains("/assets/") {
+                    assert_eq!(
+                        headers[header::CACHE_CONTROL],
+                        "public, max-age=31536000, immutable",
+                        "{adapter} should cache unprotected fixed bytes"
+                    );
+                    assert_eq!(
+                        bytes.as_ref(),
+                        trusted_server_js_asset(path),
+                        "{adapter} should serve actual verified build bytes"
+                    );
+                } else {
+                    assert_eq!(
+                        bytes.as_ref(),
+                        br#"{"observed_active":true}"#,
+                        "{adapter} should return boolean state only"
+                    );
+                }
+            }
+        }
+    }
+
+    fn trusted_server_js_asset(path: &str) -> &'static [u8] {
+        trusted_server_js::trace_assets::trace_asset(path)
+            .expect("should locate verified fixed asset")
+            .bytes
+    }
+
+    #[tokio::test]
+    async fn trace_dispatch_parity_stream_actions_preserve_cookie_policy_and_separate_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (adapter, router) in routers(true, None, Arc::clone(&calls)) {
+            for action in ["enable", "end"] {
+                let mut request = request_builder()
+                    .method("POST")
+                    .uri(format!("https://publisher.example.com/_ts/trace/{action}"))
+                    .header("host", "publisher.example.com")
+                    .header("origin", "https://publisher.example.com")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-ts-trace-action", action)
+                    .header("cookie", "__Host-ts-console=1, unrelated=value")
+                    .body(edgezero_core::body::Body::from_stream(
+                        futures_trace_empty_stream(),
+                    ))
+                    .expect("should build no-content-type streamed action");
+                request.extensions_mut().insert(
+                    RequestIngress::new(
+                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                        Some(
+                            InboundOrigin::parse(
+                                "https",
+                                "publisher.example.com",
+                                OriginSource::RuntimeUri,
+                            )
+                            .expect("should freeze trusted origin"),
+                        ),
+                        HeaderFidelity::default(),
+                        Vec::new(),
+                    )
+                    .expect("should create ingress snapshot"),
+                );
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should request local mutation");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should accept explicit empty streamed action independently of cookie ambiguity"
+                );
+                let cookies: Vec<_> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .collect();
+                assert_eq!(
+                    cookies.len(),
+                    1,
+                    "{adapter} should emit exactly one action cookie"
+                );
+                let expected = if action == "enable" {
+                    "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1800"
+                } else {
+                    "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+                };
+                assert_eq!(
+                    cookies[0], expected,
+                    "{adapter} should reuse the shared cookie policy"
+                );
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer mutation response")
+                        .as_ref(),
+                    br#"{"mutation_requested":true}"#,
+                    "{adapter} should report requested mutation only"
+                );
+                let state = RouterService::oneshot(
+                    &router,
+                    request_builder()
+                        .uri("/_ts/trace/state")
+                        .header("cookie", "__Host-ts-console=1, unrelated=value")
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build separate state observation"),
+                )
+                .await
+                .expect("should observe separate state");
+                assert_eq!(
+                    state
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer state")
+                        .as_ref(),
+                    br#"{"observed_active":false}"#,
+                    "{adapter} should not infer accepted browser cookie mutation"
+                );
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "should not lookup metadata for actions or state"
+        );
+    }
+
+    const FORWARDER_HEADER: &str = "x-example-forwarder-key";
+    const FORWARDER_SECRET: &str = "fictional-forwarder-secret-0123456789";
+    const PUBLIC_ORIGIN: &str = "https://test-publisher.example.com:8443";
+    const TRANSPORT_AUTHORITY: &str = "upstream.example.com:8080";
+
+    fn forwarder_settings() -> Settings {
+        let mut settings = test_settings();
+        settings.trusted_forwarder = Some(TrustedForwarderConfig {
+            auth_header: FORWARDER_HEADER.to_owned(),
+            shared_secret: Redacted::new(FORWARDER_SECRET.to_owned()),
+        });
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should enable forwarded trace routes");
+        settings
+    }
+
+    fn forwarded_request(path: &str) -> http::Request<edgezero_core::body::Body> {
+        let mut request = request_builder()
+            .method(Method::POST)
+            .uri(format!("http://{TRANSPORT_AUTHORITY}{path}"))
+            .header(header::HOST, TRANSPORT_AUTHORITY)
+            .header(header::ORIGIN, PUBLIC_ORIGIN)
+            .header(FORWARDER_HEADER, FORWARDER_SECRET)
+            .header("x-ts-forwarder-auth", "fictional-default-header-canary")
+            .header("x-forwarded-host", "test-publisher.example.com:8443")
+            .header("x-forwarded-proto", "https")
+            .header("sec-fetch-site", "same-origin")
+            .header("x-ts-trace-action", "enable")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build an authenticated forwarded request");
+        request.extensions_mut().insert(
+            RequestIngress::new(
+                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                Some(
+                    InboundOrigin::parse("http", TRANSPORT_AUTHORITY, OriginSource::RuntimeUri)
+                        .expect("should freeze internal transport origin"),
+                ),
+                HeaderFidelity::default(),
+                Vec::new(),
+            )
+            .expect("should retain transport ingress"),
+        );
+        request
+    }
+
+    fn forwarder_trace_routers(settings: Settings) -> Vec<(&'static str, RouterService)> {
+        let forbidden = Arc::new(ForbiddenLifecycle);
+        let services = RuntimeServices::builder()
+            .config_store(forbidden.clone())
+            .secret_store(forbidden.clone())
+            .kv_store(forbidden.clone())
+            .backend(forbidden.clone())
+            .http_client(forbidden.clone())
+            .auction_telemetry_sink(forbidden)
+            .geo(Arc::new(CountingGeo(Arc::new(AtomicUsize::new(0)))))
+            .client_info(ClientInfo::default())
+            .build();
+        routers_with_services(settings, services)
+    }
+
+    #[tokio::test]
+    async fn trusted_forwarder_parity_trace_actions_use_public_origin() {
+        for (adapter, router) in forwarder_trace_routers(forwarder_settings()) {
+            for action in ["enable", "end"] {
+                let mut request = forwarded_request(&format!("/_ts/trace/{action}"));
+                request.headers_mut().insert(
+                    "x-ts-trace-action",
+                    http::HeaderValue::from_str(action).expect("should set action control"),
+                );
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should dispatch public-origin action");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should accept {action} over internal HTTP transport"
+                );
+                let cookies: Vec<_> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .collect();
+                let expected = if action == "enable" {
+                    "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1800"
+                } else {
+                    "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+                };
+                assert_eq!(cookies.len(), 1, "{adapter} should issue one action cookie");
+                assert_eq!(
+                    cookies[0], expected,
+                    "{adapter} should preserve the secure host-only policy"
+                );
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "no-store, private",
+                    "{adapter} should keep mutations private"
+                );
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should collect action response")
+                        .as_ref(),
+                    br#"{"mutation_requested":true}"#,
+                    "{adapter} should confirm requested mutation"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trusted_forwarder_axum_boundary_requires_transport_binding() {
+        let router = AxumApp::routes_with_settings(forwarder_settings())
+            .expect("should build native Axum forwarded routes");
+        let mut service = EdgeZeroAxumService::new(router);
+        for duplicate in [false, true] {
+            let request = forwarded_request("/_ts/trace/enable");
+            let (mut parts, _) = request.into_parts();
+            // Without the private binding from a real HTTP listener, the SDK
+            // must leave transport origin unavailable even for an absolute URI.
+            parts.extensions.remove::<RequestIngress>();
+            if duplicate {
+                parts.headers.append(
+                    FORWARDER_HEADER,
+                    http::HeaderValue::from_static(FORWARDER_SECRET),
+                );
+            }
+            let response = service
+                .ready()
+                .await
+                .expect("should ready native Axum service")
+                .call(AxumRequest::from_parts(parts, AxumBody::empty()))
+                .await
+                .expect("should convert and dispatch forwarded action");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "should not infer trusted transport from forwarding metadata or URI"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should not mutate cookies without transport binding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_forwarder_parity_rejects_untrusted_and_ambiguous_actions() {
+        for (adapter, router) in forwarder_trace_routers(forwarder_settings()) {
+            for case in [
+                "missing-auth",
+                "wrong-auth",
+                "duplicate-auth",
+                "foreign-host",
+                "duplicate-host",
+                "foreign-origin",
+                "missing-origin",
+                "duplicate-origin",
+                "query",
+                "transport-host-mismatch",
+            ] {
+                let mut request = forwarded_request(if case == "query" {
+                    "/_ts/trace/enable?example=1"
+                } else {
+                    "/_ts/trace/enable"
+                });
+                let headers = request.headers_mut();
+                match case {
+                    "missing-auth" => {
+                        headers.remove(FORWARDER_HEADER);
+                    }
+                    "wrong-auth" => {
+                        headers.insert(
+                            FORWARDER_HEADER,
+                            http::HeaderValue::from_static("fictional-wrong-forwarder-secret"),
+                        );
+                    }
+                    "duplicate-auth" => {
+                        headers.append(
+                            FORWARDER_HEADER,
+                            http::HeaderValue::from_static(FORWARDER_SECRET),
+                        );
+                    }
+                    "foreign-host" => {
+                        headers.insert(
+                            "x-forwarded-host",
+                            http::HeaderValue::from_static("foreign.example.com:8443"),
+                        );
+                    }
+                    "duplicate-host" => {
+                        headers.append(
+                            "x-forwarded-host",
+                            http::HeaderValue::from_static("test-publisher.example.com:8443"),
+                        );
+                    }
+                    "foreign-origin" => {
+                        headers.insert(
+                            header::ORIGIN,
+                            http::HeaderValue::from_static("https://foreign.example.com:8443"),
+                        );
+                    }
+                    "missing-origin" => {
+                        headers.remove(header::ORIGIN);
+                    }
+                    "duplicate-origin" => {
+                        headers.append(
+                            header::ORIGIN,
+                            http::HeaderValue::from_static(PUBLIC_ORIGIN),
+                        );
+                    }
+                    "transport-host-mismatch" => {
+                        headers.insert(
+                            header::HOST,
+                            http::HeaderValue::from_static("other-upstream.example.com:8080"),
+                        );
+                    }
+                    _ => {}
+                }
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should reject action locally");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{adapter} should reject {case}"
+                );
+                assert!(
+                    !response.headers().contains_key(header::SET_COOKIE),
+                    "{adapter} should not mutate rejected action cookies for {case}"
+                );
+                assert!(
+                    response
+                        .extensions()
+                        .get::<TraceTerminalResponse>()
+                        .is_some(),
+                    "{adapter} should terminate {case} before ordinary services"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_forwarder_parity_default_config_keeps_transport_authority() {
+        let mut settings = forwarder_settings();
+        settings.trusted_forwarder = None;
+        for (adapter, router) in forwarder_trace_routers(settings) {
+            for origin in [PUBLIC_ORIGIN, "http://upstream.example.com:8080"] {
+                let mut request = forwarded_request("/_ts/trace/enable");
+                request.headers_mut().insert(
+                    header::ORIGIN,
+                    http::HeaderValue::from_str(origin).expect("should supply browser origin"),
+                );
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should dispatch with default trust policy");
+                assert_eq!(
+                    response.status(),
+                    if origin == PUBLIC_ORIGIN {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::OK
+                    },
+                    "{adapter} should authorize only immutable transport without configured trust"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_forwarder_parity_preserves_cookie_fidelity() {
+        for (adapter, router) in forwarder_trace_routers(forwarder_settings()) {
+            for (preservation, expected) in [
+                (Preservation::Unknown, false),
+                (Preservation::Preserved, true),
+            ] {
+                let mut request = forwarded_request("/_ts/trace/state");
+                *request.method_mut() = Method::GET;
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    http::HeaderValue::from_str("__Host-ts-console=1; unrelated=\u{fffd}")
+                        .expect("should supply runtime-visible cookie marker"),
+                );
+                request.extensions_mut().insert(
+                    RequestIngress::new(
+                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                        Some(
+                            InboundOrigin::parse(
+                                "http",
+                                TRANSPORT_AUTHORITY,
+                                OriginSource::RuntimeUri,
+                            )
+                            .expect("should retain transport origin"),
+                        ),
+                        HeaderFidelity::new(
+                            preservation,
+                            preservation,
+                            Preservation::Unknown,
+                            Preservation::Unavailable,
+                        ),
+                        Vec::new(),
+                    )
+                    .expect("should supply original cookie fidelity"),
+                );
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should observe forwarded cookie state");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should serve read-only state"
+                );
+                assert!(
+                    !response.headers().contains_key(header::SET_COOKIE),
+                    "{adapter} should not refresh observed cookies"
+                );
+                let state: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer state"),
+                )
+                .expect("should parse state");
+                assert_eq!(
+                    state,
+                    serde_json::json!({"observed_active":expected}),
+                    "{adapter} should preserve {preservation:?} cookie octets evidence"
+                );
+            }
+        }
+    }
+
+    struct ForwarderOrigin {
+        base: RuntimeServices,
+        requests: Mutex<Vec<(String, HeaderMap)>>,
+    }
+
+    impl PlatformBackend for ForwarderOrigin {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            self.base.backend().naming_policy()
+        }
+
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            self.base.backend().predict_name(spec)
+        }
+
+        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.base.backend().ensure(spec)
+        }
+    }
+
+    impl PlatformGeo for ForwarderOrigin {
+        fn lookup(&self, ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            self.base.geo().lookup(ip)
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl PlatformHttpClient for ForwarderOrigin {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.requests
+                .lock()
+                .expect("should lock recorded origin requests")
+                .push((
+                    request.request.uri().to_string(),
+                    request.request.headers().clone(),
+                ));
+            if request.request.uri().host() == Some("vendor.example.com") {
+                return Ok(PlatformResponse::new(
+                    http::Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(edgezero_core::body::Body::from(
+                            serde_json::json!({"example":true}).to_string(),
+                        ))
+                        .expect("should answer fictional vendor request"),
+                ));
+            }
+            self.base.http_client().send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            panic!("should not launch auctions from forwarder fixture");
+        }
+
+        async fn select(
+            &self,
+            _requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            panic!("should not collect auctions from forwarder fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_forwarder_parity_proxy_strips_credentials_and_retains_backend_targets() {
+        let origin = Arc::new(ForwarderOrigin {
+            base: nextjs_auction::services(
+                Arc::new(nextjs_auction::NextJsAuctionOrigin::default()),
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let forbidden = Arc::new(ForbiddenLifecycle);
+        let services = RuntimeServices::builder()
+            .config_store(forbidden.clone())
+            .secret_store(forbidden)
+            .kv_store(Arc::new(UnavailableKvStore))
+            .backend(origin.clone())
+            .http_client(origin.clone())
+            .geo(origin.clone())
+            .client_info(ClientInfo::default())
+            .build();
+        let mut settings = forwarder_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({"enabled":true,"rewrite_attributes":["href","link","url"]}),
+            )
+            .expect("should enable public URL rewriting");
+        settings.integrations.insert_config("lockr", &serde_json::json!({"enabled":true,"app_id":"fictional-app","api_endpoint":"https://vendor.example.com","sdk_url":"https://vendor.example.com/sdk.js"})).expect("should configure fictional integration upstream");
+        for (adapter, router) in routers_with_services(settings, services) {
+            origin
+                .requests
+                .lock()
+                .expect("should reset recorded origin requests")
+                .clear();
+            for (method, path, target) in [
+                (
+                    Method::GET,
+                    "/article",
+                    "https://origin.test-publisher.example.com/article",
+                ),
+                (
+                    Method::PATCH,
+                    "/article",
+                    "https://origin.test-publisher.example.com/article",
+                ),
+                (
+                    Method::GET,
+                    "/integrations/lockr/api/example",
+                    "https://vendor.example.com/example",
+                ),
+            ] {
+                let mut request = forwarded_request(path);
+                *request.method_mut() = method.clone();
+                request
+                    .headers_mut()
+                    .insert(header::ACCEPT, http::HeaderValue::from_static("text/html"));
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should serve forwarded proxy request");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{adapter} should serve {method} {path}"
+                );
+                let body = response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should buffer proxied response");
+                if path == "/article" && method == Method::GET {
+                    let html = String::from_utf8(body.to_vec()).expect("should serve HTML");
+                    let document = scraper::Html::parse_document(&html);
+                    let scripts =
+                        scraper::Selector::parse("script").expect("should select Flight scripts");
+                    let payload: String = document
+                        .select(&scripts)
+                        .filter_map(|script| {
+                            let text: String = script.text().collect();
+                            let array = text
+                                .strip_prefix("self.__next_f.push(")?
+                                .strip_suffix(')')?;
+                            let value: serde_json::Value =
+                                serde_json::from_str(array).expect("should preserve Flight JSON");
+                            Some(
+                                value[1]
+                                    .as_str()
+                                    .expect("should retain Flight data")
+                                    .to_owned(),
+                            )
+                        })
+                        .collect();
+                    assert!(
+                        payload.contains("https://test-publisher.example.com:8443/app"),
+                        "{adapter} should generate public HTTPS URLs retaining :8443: {payload}"
+                    );
+                    assert!(
+                        !payload.contains(TRANSPORT_AUTHORITY),
+                        "{adapter} should not generate internal transport URLs"
+                    );
+                }
+                let requests = origin
+                    .requests
+                    .lock()
+                    .expect("should inspect actual outbound request");
+                let (actual_target, headers) =
+                    requests.last().expect("should reach configured upstream");
+                assert_eq!(
+                    actual_target, target,
+                    "{adapter} should keep configured backend target for {method} {path}"
+                );
+                for name in [FORWARDER_HEADER, "x-ts-forwarder-auth"] {
+                    assert!(
+                        !headers.contains_key(name),
+                        "{adapter} should strip {name} on {method} {path}"
+                    );
+                }
+                assert!(
+                    !headers.values().any(|value| value
+                        .as_bytes()
+                        .windows(FORWARDER_SECRET.len())
+                        .any(|part| part == FORWARDER_SECRET.as_bytes())),
+                    "{adapter} should never forward the credential under another header"
+                );
+            }
+            assert_eq!(
+                origin
+                    .requests
+                    .lock()
+                    .expect("should count outbound requests")
+                    .len(),
+                3,
+                "{adapter} should dispatch exactly the three intended upstream requests"
+            );
+            for method in [Method::GET, Method::PUT, Method::DELETE, Method::OPTIONS] {
+                let mut request = forwarded_request("/_ts/trace/enable");
+                *request.method_mut() = method.clone();
+                let response = RouterService::oneshot(&router, request)
+                    .await
+                    .expect("should reject unsupported action verb");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{adapter} should terminate {method} trace action locally"
+                );
+                assert!(
+                    !response.headers().contains_key(header::SET_COOKIE),
+                    "{adapter} should not mutate rejected cookies"
+                );
+            }
+            assert_eq!(
+                origin
+                    .requests
+                    .lock()
+                    .expect("should count requests after early returns")
+                    .len(),
+                3,
+                "{adapter} should keep forwarding credentials away from all upstreams on trace early returns"
+            );
+        }
+    }
+
+    fn futures_trace_empty_stream() -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+        futures::stream::iter([Ok(Bytes::new()), Ok(Bytes::new())])
+    }
+}

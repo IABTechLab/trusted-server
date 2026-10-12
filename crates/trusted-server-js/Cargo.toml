@@ -20,6 +20,7 @@ path = "src/lib.rs"
 build-print = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+serde_json = { workspace = true }
 which = { workspace = true }
 
 [dependencies]

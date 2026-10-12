@@ -1632,17 +1632,15 @@ pub async fn handle_first_party_proxy_sign(
     // Capture the request's own scheme before the body is consumed: a
     // protocol-relative sign target inherits it.
     //
-    // Prefer the URI's explicit scheme, which adapters that deliver absolute
-    // request targets (Fastly, Spin after normalization) always carry, and fall
-    // back to TLS/forwarded metadata otherwise. What must never be used is the
-    // parsed request target: origin-form URIs — what browsers send and the Axum
+    // Prefer the authenticated public scheme, then the URI's explicit scheme
+    // for direct requests, and fall back to runtime ingress/TLS metadata. Avoid
+    // using the parsed request target: origin-form URIs — what browsers send and the Axum
     // adapter forwards verbatim — have no scheme of their own, so parsing would
     // hand back the placeholder base's `https` and make an HTTP dev server sign
     // an HTTPS target it then proxies over TLS against a plaintext service.
-    let request_scheme = req
-        .uri()
-        .scheme_str()
-        .map(str::to_ascii_lowercase)
+    let request_scheme = crate::forwarder::public_origin(&req)
+        .map(|origin| origin.scheme.clone())
+        .or_else(|| req.uri().scheme_str().map(str::to_ascii_lowercase))
         .unwrap_or_else(|| RequestInfo::from_request(&req, _services.client_info()).scheme);
 
     let payload = if method == Method::POST {
@@ -2740,6 +2738,43 @@ mod tests {
                     "request `{uri}` should sign a {expected} target: {json}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn public_origin_proxy_sign_overrides_explicit_transport_scheme() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.publisher.domain = "publisher.example.com".to_owned();
+            settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+                auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+                shared_secret: crate::redacted::Redacted::new(
+                    "fictional-forwarder-secret-0123456789".to_owned(),
+                ),
+            });
+            let body = serde_json::json!({ "url": "//cdn.example.com/asset.js" });
+            let mut req =
+                build_http_post_json_request("http://internal.example.com/first-party/sign", &body);
+            req.headers_mut().insert(
+                crate::forwarder::FORWARDER_AUTH_HEADER,
+                HeaderValue::from_static("fictional-forwarder-secret-0123456789"),
+            );
+            req.headers_mut().insert(
+                "x-forwarded-host",
+                HeaderValue::from_static("publisher.example.com:8443"),
+            );
+            req.headers_mut()
+                .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            crate::forwarder::prepare_trusted_forwarder(&mut req, &settings);
+
+            let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect("should sign protocol-relative URL");
+            let json = response_body_string(resp);
+            assert!(
+                json.contains("\"base\":\"https://cdn.example.com/asset.js\""),
+                "should inherit authenticated public HTTPS: {json}"
+            );
         });
     }
 

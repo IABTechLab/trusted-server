@@ -84,6 +84,30 @@ await Promise.all(
   integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))
 );
 
+// The full-document trace viewer is independent of publisher integration bundles.
+await build({
+  configFile: false,
+  root: __dirname,
+  build: {
+    emptyOutDir: false,
+    outDir: distDir,
+    sourcemap: false,
+    minify: 'esbuild',
+    cssCodeSplit: false,
+    rollupOptions: {
+      input: path.join(srcDir, 'trace', 'viewer.ts'),
+      output: {
+        format: 'iife',
+        inlineDynamicImports: true,
+        entryFileNames: 'trace/v1.js',
+        assetFileNames: 'trace/v1.css',
+        name: 'tsTraceViewer',
+      },
+    },
+  },
+  logLevel: 'warn',
+});
+
 // List all built files
 const builtFiles = fs
   .readdirSync(distDir)

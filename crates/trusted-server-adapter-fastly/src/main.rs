@@ -4,7 +4,7 @@ use rand::Rng as _;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
-use edgezero_adapter_fastly::request::into_core_request;
+use edgezero_adapter_fastly::request::{capture_request_ingress, into_core_request_with_ingress};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -38,6 +38,7 @@ use trusted_server_core::publisher::TemplateCacheResponseState;
 use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace::{TraceTerminalResponse, is_trace_path};
 
 mod app;
 mod backend;
@@ -59,7 +60,7 @@ use crate::app::{
 };
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
-use crate::platform::{FastlyPlatformGeo, client_info_from_request};
+use crate::platform::{FastlyPlatformGeo, client_info_from_request, resolve_client_ip};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
 // Only the reuse path builds a serving loop, so the retirement snapshots have
@@ -174,9 +175,13 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
     // The framework counts the callback before invoking it, including early
     // returns, so this is already this request's 1-based ordinal.
     let ordinal = sandbox.requests();
+    // Captured before any native mutation, and before the health probe, so
+    // trace-path decisions and ingress facts describe the request as received.
+    let ingress = capture_request_ingress(&req);
+    let trace_path = is_trace_path(req.get_path());
 
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
-    if let Some(response) = health_response(&req) {
+    if !trace_path && let Some(response) = health_response(&req) {
         response.send_to_client();
         return;
     }
@@ -205,7 +210,7 @@ fn handle_request(req: FastlyRequest, sandbox: &mut Sandbox, startup: &mut Start
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}-{ordinal}", instance_id()));
 
-    edgezero_main(req, sandbox, ordinal, &request_id);
+    edgezero_main(req, sandbox, ordinal, &request_id, ingress, trace_path);
 }
 
 /// Builds the counters snapshot response.
@@ -328,7 +333,14 @@ fn heap_mib() -> String {
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
+fn edgezero_main(
+    mut req: FastlyRequest,
+    sandbox: &mut Sandbox,
+    ordinal: u64,
+    request_id: &str,
+    ingress: edgezero_core::request::RequestIngress,
+    trace_path: bool,
+) {
     let runtime_stores = RuntimeStoreConfig::logical();
 
     // Short-circuit the sandbox counters probe before app construction. It must
@@ -356,7 +368,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+    if !trace_path && req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
         match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
@@ -446,55 +458,72 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         .as_deref()
         .and_then(|settings| settings.trusted_client_ip.as_ref());
 
+    // Preserve the public origin before native sanitation removes its source
+    // fields. The frozen decision carries no authentication material.
+    let forwarder = settings_snapshot
+        .as_deref()
+        .map(|settings| compat::capture_fastly_forwarder(&mut req, settings));
+
     // Resolve the trusted client IP, then strip client-spoofable forwarded
     // headers before dispatch. One call keeps resolution ahead of the
     // sanitization that removes the headers it reads.
-    let resolved_client_ip = compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip);
+    let resolved_client_ip = if trace_path {
+        resolve_client_ip(&req, req.get_client_ip_addr(), trusted_client_ip)
+    } else {
+        compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip)
+    };
 
-    // Re-inject a trusted TLS scheme signal after sanitization has stripped any
-    // client-sent fastly-ssl header. Setting it from Fastly's native TLS
-    // metadata here is authoritative. detect_request_scheme in http_util checks
-    // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
-    if req.get_tls_protocol().ok().flatten().is_some()
-        || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
-    {
-        req.set_header("fastly-ssl", "1");
+    if !trace_path {
+        // Re-inject a trusted TLS scheme signal after sanitization has stripped any
+        // client-sent fastly-ssl header. Setting it from Fastly's native TLS
+        // metadata here is authoritative. detect_request_scheme in http_util checks
+        // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
+        if req.get_tls_protocol().ok().flatten().is_some()
+            || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
+        {
+            req.set_header("fastly-ssl", "1");
+        }
+
+        // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
+        // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
+        req.remove_header("x-ts-tls-protocol");
+        req.remove_header("x-ts-tls-cipher");
+        if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
+            req.set_header("x-ts-tls-protocol", proto);
+        }
+        if let Some(cipher) = req
+            .get_tls_cipher_openssl_name()
+            .ok()
+            .flatten()
+            .map(str::to_owned)
+        {
+            req.set_header("x-ts-tls-cipher", cipher);
+        }
     }
 
     // Capture the method before dispatch consumes the request. The resolved
     // client IP is retained below in `ClientInfo`.
     let request_method = req.get_method_str().to_owned();
 
-    // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
-    // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
-    req.remove_header("x-ts-tls-protocol");
-    req.remove_header("x-ts-tls-cipher");
-    if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
-        req.set_header("x-ts-tls-protocol", proto);
-    }
-    if let Some(cipher) = req
-        .get_tls_cipher_openssl_name()
-        .ok()
-        .flatten()
-        .map(str::to_owned)
-    {
-        req.set_header("x-ts-tls-cipher", cipher);
-    }
-
     // Capture metadata from the original FastlyRequest before conversion. These
     // accessors only return real values on the client request, so store them in
     // request extensions for build_per_request_services and EC bot classification.
     let client_info = client_info_from_request(&req, resolved_client_ip);
     let client_ip = client_info.client_ip;
-    let device_signals = derive_device_signals(&req);
+    let device_signals = (!trace_path).then(|| derive_device_signals(&req));
 
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
-    let mut response = match into_core_request(req) {
+    let mut response = match into_core_request_with_ingress(req, ingress) {
         Ok(mut core_req) => {
+            if let Some(forwarder) = forwarder {
+                core_req.extensions_mut().insert(forwarder);
+            }
             core_req.extensions_mut().insert(config_store);
-            core_req.extensions_mut().insert(device_signals);
+            if let Some(device_signals) = device_signals {
+                core_req.extensions_mut().insert(device_signals);
+            }
             core_req.extensions_mut().insert(client_info);
             core_req.extensions_mut().insert(timings.clone());
             match futures::executor::block_on(app.router().oneshot(core_req)) {
@@ -510,6 +539,17 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
             return;
         }
     };
+
+    if response
+        .extensions()
+        .get::<TraceTerminalResponse>()
+        .is_some()
+    {
+        // Trace responses keep their exact hardened headers: no sandbox
+        // counters, Server-Timing, or access telemetry.
+        send_response_to_client(response, None, &timings, None);
+        return;
+    }
 
     // Pop response extensions before the Fastly conversion, which drops them.
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
@@ -691,6 +731,13 @@ fn apply_entry_point_finalize_headers(
     geo_state: &GeoLookupState,
     timings: &RequestTimings,
 ) {
+    if response
+        .extensions()
+        .get::<TraceTerminalResponse>()
+        .is_some()
+    {
+        return;
+    }
     let geo_info = resolve_geo_for_response(response, geo_state, client_ip, |client_ip| {
         let _span = timings.span(Phase::Geo);
         FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
@@ -1032,6 +1079,16 @@ fn send_edgezero_response(
         .access_telemetry_enabled
         .then(|| build_access_telemetry_snapshot(&response, context));
 
+    send_response_to_client(response, counters, &context.timings, snapshot)
+}
+
+/// Sends a response, attaching sandbox counters first when supplied.
+fn send_response_to_client(
+    mut response: HttpResponse,
+    counters: Option<&SandboxCounters>,
+    timings: &RequestTimings,
+    snapshot: Option<AccessTelemetrySnapshot>,
+) -> DeliveryOutcome {
     // Captured before the body is consumed so post-commitment failures can be
     // matched back to the response that carried these counters.
     let counter_context = counters.map_or_else(String::new, |counters| {
@@ -1057,7 +1114,7 @@ fn send_edgezero_response(
                 EdgeBody::empty(),
             ));
             let (counting, drive_result) =
-                drive_streaming_body(body, skeleton.stream_to_client(), &context.timings);
+                drive_streaming_body(body, skeleton.stream_to_client(), timings);
             let bytes = counting.bytes();
             let streaming_body = counting.into_inner();
             // Computed before `drive_result` is matched by value below, since
@@ -1101,7 +1158,7 @@ fn send_edgezero_response(
             }
         }
         once => {
-            let bytes = record_buffered_delivery(&once, &context.timings);
+            let bytes = record_buffered_delivery(&once, timings);
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
             DeliveryOutcome {
                 bytes,
@@ -1194,6 +1251,13 @@ fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
+    if response
+        .extensions()
+        .get::<TraceTerminalResponse>()
+        .is_some()
+    {
+        return;
+    }
     let must_remain_private = response
         .extensions()
         .get::<TerminalPrivateResponse>()
@@ -1351,8 +1415,12 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
-    use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
+    use edgezero_core::http::{HeaderValue, Method, StatusCode};
+    use edgezero_core::request::{
+        CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, RequestIngress,
+        TargetUnavailable,
+    };
     use fastly::mime;
     use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
@@ -1406,6 +1474,230 @@ mod tests {
     }
 
     #[test]
+    fn trace_dispatch_terminal_asset_bypasses_hostile_native_finalizers() {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should configure trace");
+        settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
+            .expect("should configure trace protection"));
+        let mut request = edgezero_core::http::request_builder()
+            .uri("https://publisher.example.com/_ts/trace/assets/v1.js")
+            .header(
+                "authorization",
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode("example-user:example-password")
+                ),
+            )
+            .body(EdgeBody::empty())
+            .expect("should build protected asset request");
+        let trusted_server_core::trace::TracePreflight::Ready(dispatch) =
+            trusted_server_core::trace::preflight(&settings, &mut request)
+        else {
+            panic!("should accept protected fixed asset");
+        };
+        let mut response = dispatch.fixed_asset(b"example immutable asset");
+        let original = response.headers().clone();
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("content-security-policy", "default-src *"),
+                HeaderMutation::set("content-type", "text/plain"),
+                HeaderMutation::append("set-cookie", "example=operator"),
+                HeaderMutation::set("cache-control", "public, max-age=3600"),
+            ],
+        };
+        apply_entry_point_finalize_headers(
+            &settings,
+            &mut response,
+            None,
+            &GeoLookupState::NotAttempted,
+            &RequestTimings::new(),
+        );
+        apply_terminal_response_effects(&mut response, Some(&effects));
+        assert_eq!(
+            response.headers(),
+            &original,
+            "should bypass every ordinary trace finalizer and preserve protected digest"
+        );
+        let native = compat::to_fastly_response(response);
+        assert_eq!(
+            native.get_header("etag").map(HeaderValue::as_bytes),
+            original.get("etag").map(HeaderValue::as_bytes),
+            "should preserve strong ETag through native conversion"
+        );
+        assert!(
+            native.get_header("set-cookie").is_none(),
+            "should never acquire an operator cookie"
+        );
+    }
+
+    #[test]
+    fn trace_dispatch_terminal_actions_errors_and_head_preserve_native_contract() {
+        let mut settings = test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &serde_json::json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should configure trace");
+        settings.handlers.insert(0,serde_json::from_value(serde_json::json!({"path":"^/_ts/trace","username":"example-user","password":"example-password"}))
+            .expect("should configure trace protection"));
+        let hook = trusted_server_core::trace::TracePreDispatchHook::new(
+            Arc::new(settings.clone()),
+            Arc::new(|_| panic!("should never query metadata for actions, errors or HEAD")),
+        );
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("content-security-policy", "default-src *"),
+                HeaderMutation::set("content-type", "text/plain"),
+                HeaderMutation::append("set-cookie", "example=operator"),
+                HeaderMutation::set("cache-control", "public, max-age=3600"),
+            ],
+        };
+        for (method, path, authenticated, expected, action) in [
+            (
+                Method::GET,
+                "/_ts/trace",
+                false,
+                StatusCode::UNAUTHORIZED,
+                None,
+            ),
+            (
+                Method::HEAD,
+                "/_ts/trace",
+                false,
+                StatusCode::UNAUTHORIZED,
+                None,
+            ),
+            (Method::HEAD, "/_ts/trace", true, StatusCode::OK, None),
+            (
+                Method::PATCH,
+                "/_ts/trace/state",
+                true,
+                StatusCode::METHOD_NOT_ALLOWED,
+                None,
+            ),
+            (
+                Method::POST,
+                "/_ts/trace/enable",
+                true,
+                StatusCode::OK,
+                Some("enable"),
+            ),
+            (
+                Method::POST,
+                "/_ts/trace/end",
+                true,
+                StatusCode::OK,
+                Some("end"),
+            ),
+        ] {
+            let head = method == Method::HEAD;
+            let mut request = edgezero_core::http::request_builder()
+                .method(method)
+                .uri(path)
+                .header("host", "publisher.example.com")
+                .body(EdgeBody::empty())
+                .expect("should build terminal trace request");
+            if authenticated {
+                request.headers_mut().insert(
+                    "authorization",
+                    HeaderValue::from_str(&format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode("example-user:example-password")
+                    ))
+                    .expect("should encode fictional trace credentials"),
+                );
+            }
+            if let Some(action) = action {
+                request.headers_mut().insert(
+                    "origin",
+                    HeaderValue::from_static("https://publisher.example.com"),
+                );
+                request
+                    .headers_mut()
+                    .insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+                request.headers_mut().insert(
+                    "x-ts-trace-action",
+                    HeaderValue::from_str(action).expect("should encode fixed action"),
+                );
+                request.extensions_mut().insert(
+                    RequestIngress::new(
+                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                        Some(
+                            InboundOrigin::parse(
+                                "https",
+                                "publisher.example.com",
+                                OriginSource::RuntimeUri,
+                            )
+                            .expect("should validate fictional runtime origin"),
+                        ),
+                        HeaderFidelity::default(),
+                        vec![],
+                    )
+                    .expect("should freeze trusted runtime origin"),
+                );
+            }
+            let mut response = futures::executor::block_on(
+                edgezero_core::router::PreDispatchHook::handle(&hook, &mut request),
+            )
+            .expect("should build local trace response")
+            .expect("should intercept reserved request");
+            assert_eq!(
+                response.status(),
+                expected,
+                "should preserve action and preflight status"
+            );
+            let original = response.headers().clone();
+            apply_entry_point_finalize_headers(
+                &settings,
+                &mut response,
+                None,
+                &GeoLookupState::NotAttempted,
+                &RequestTimings::new(),
+            );
+            apply_terminal_response_effects(&mut response, Some(&effects));
+            assert_eq!(
+                response.headers(),
+                &original,
+                "should bypass hostile ordinary finalizers for every terminal response"
+            );
+            let mut native = compat::to_fastly_response(response);
+            for (name, value) in &original {
+                assert_eq!(
+                    native.get_header(name.as_str()).map(HeaderValue::as_bytes),
+                    Some(value.as_bytes()),
+                    "should preserve complete trace headers through native conversion"
+                );
+            }
+            assert_eq!(
+                native
+                    .get_headers()
+                    .filter(|(name, _)| name.as_str() == "set-cookie")
+                    .count(),
+                usize::from(action.is_some()),
+                "should emit only one deliberate action cookie and none on reads or errors"
+            );
+            if head {
+                assert!(
+                    native.take_body_bytes().is_empty(),
+                    "should preserve bodyless trace HEAD through native conversion"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn pull_sync_noop_states_skip_post_send_graph_factory() {
         let calls = std::cell::Cell::new(0);
         let result = prepare_pull_sync_after_send(None, || {
@@ -1420,6 +1712,42 @@ mod tests {
             "a skipped pull-sync plan should return none"
         );
         assert_eq!(calls.get(), 0, "should not invoke the graph factory");
+    }
+
+    #[test]
+    fn trace_path_classification_survives_core_request_conversion() {
+        // `main` skips client-IP sanitization when the native path is a trace
+        // path; the router hook later classifies the converted URI. Both must
+        // agree, or unsanitized forwarded headers could reach ordinary dispatch.
+        for url in [
+            "https://example.com/_ts/trace",
+            "https://example.com/_ts/trace/",
+            "https://example.com/_ts/trace/enable?source=example",
+            "https://example.com/_ts//trace",
+            "https://example.com/_ts/./trace",
+            "https://example.com/_ts/x/../trace",
+            "https://example.com/_ts/%2e%2e/trace",
+            "https://example.com/_ts%2Ftrace",
+            "https://example.com/_ts/trace%2Fenable",
+            "https://example.com/_TS/trace",
+            "https://example.com/_tsx",
+            "https://example.com/_ts-trace",
+            "https://example.com/_ts/admin/keys",
+            "https://example.com/auction",
+            "https://example.com/",
+        ] {
+            let req = FastlyRequest::get(url);
+            let native = is_trace_path(req.get_path());
+            let ingress = capture_request_ingress(&req);
+            let core = into_core_request_with_ingress(req, ingress)
+                .expect("should convert the native request");
+
+            assert_eq!(
+                is_trace_path(core.uri().path()),
+                native,
+                "should classify {url} identically before and after conversion"
+            );
+        }
     }
 
     #[test]
@@ -2188,6 +2516,7 @@ mod tests {
                 access_sample_rate: 1.0,
                 access_telemetry_enabled: true,
             },
+            None,
         );
         assert!(
             timings.snapshot().request_elapsed_ms.is_some(),

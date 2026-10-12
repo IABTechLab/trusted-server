@@ -276,3 +276,53 @@ fn test_ec_lifecycle_fastly() {
         );
     }
 }
+#[test]
+#[ignore = "requires Wrangler in PATH and the current Cloudflare build.sh output"]
+fn trace_runtime_boundary_cloudflare() {
+    init_logger();
+    common::trace_boundary::exercise(common::trace_boundary::TraceRuntime::Cloudflare);
+}
+
+#[test]
+#[ignore = "requires Viceroy and the current production Fastly WASM artifact"]
+fn trace_runtime_boundary_fastly() {
+    init_logger();
+    common::trace_boundary::exercise(common::trace_boundary::TraceRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires Spin and the current production Spin WASM artifact"]
+fn trace_runtime_boundary_spin() {
+    init_logger();
+    common::trace_boundary::exercise(common::trace_boundary::TraceRuntime::Spin);
+}
+
+#[test]
+#[ignore = "requires Docker, Chromium and the current native Axum binary"]
+fn trace_browser_workflow_axum() {
+    init_logger();
+    common::trace_boundary::exercise_browser(common::trace_boundary::TraceBrowserRuntime::Axum);
+}
+
+#[test]
+#[ignore = "requires Docker, Chromium, Viceroy and the current release Fastly WASM"]
+fn trace_browser_workflow_fastly() {
+    init_logger();
+    common::trace_boundary::exercise_browser(common::trace_boundary::TraceBrowserRuntime::Fastly);
+}
+
+#[test]
+#[ignore = "requires Docker, Chromium, Wrangler and the current Cloudflare build output"]
+fn trace_browser_workflow_cloudflare() {
+    init_logger();
+    common::trace_boundary::exercise_browser(
+        common::trace_boundary::TraceBrowserRuntime::Cloudflare,
+    );
+}
+
+#[test]
+#[ignore = "requires Docker, Chromium, Spin and the current release Spin component"]
+fn trace_browser_workflow_spin() {
+    init_logger();
+    common::trace_boundary::exercise_browser(common::trace_boundary::TraceBrowserRuntime::Spin);
+}
