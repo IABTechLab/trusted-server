@@ -311,7 +311,7 @@ impl Module {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the most parameters a process function may name"
+        reason = "the most parameters a module function may name"
     )]
     fn eight(
         &self,
@@ -424,4 +424,33 @@ fn the_request_state_carries_each_value_gated_by_what_its_producer_declares() {
         })
         .expect("a module declaring storage is passed the identifier");
     assert_eq!(declared, "an-id");
+}
+
+#[test]
+fn a_route_answers_forbidden_only_for_a_value_its_permissions_withhold() {
+    use crate::error::IntoHttpResponse as _;
+
+    let status = |reason| {
+        error_stack::Report::<TrustedServerError>::from(Withheld::new("geo", reason))
+            .current_context()
+            .status_code()
+    };
+
+    assert_eq!(
+        status(WithheldReason::NotDeclared(storage())),
+        http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(WithheldReason::NotGranted(storage())),
+        http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(WithheldReason::Absent),
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        "a value absent where the route runs is the route's fault, not the reader's"
+    );
+    assert_eq!(
+        status(WithheldReason::Unresolved),
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
