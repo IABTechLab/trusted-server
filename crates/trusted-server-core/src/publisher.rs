@@ -6739,8 +6739,8 @@ pub(crate) fn build_slot_json(
         "formats": formats,
         "targeting": targeting,
     });
-    // Each band as the browser takes it, a `[width, 0]` viewport and the
-    // sizes asked for from that width up to the next band's.
+    // Each band of `CreativeOpportunitySlot::viewport_sizes` as the browser
+    // takes it, with a `[width, 0]` viewport.
     if let Some(bands) = slot.viewport_sizes() {
         json["viewport_sizes"] = bands
             .into_iter()

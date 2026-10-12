@@ -2765,14 +2765,6 @@ formats = [
 ]
 ```
 
-When any format of a slot names a bound, the slot's page data carries
-`viewport_sizes`, one entry for each band of widths, widest first, and the page
-asks for only that band's sizes. A band starts at zero and at every width where
-the formats on offer change, and a band with no format asks for nothing. A slot
-whose formats name no bound asks for every format at every width, as before.
-The bounds apply in the browser only. A server-side auction is still offered
-every format.
-
 > [!WARNING]
 > A binary released before these fields refuses a format carrying either of
 > them, and fails to load its settings, which makes every request fail. Promote
