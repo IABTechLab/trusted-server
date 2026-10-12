@@ -72,8 +72,9 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
-    /// The loading cache the linked builders offer, taken once here so every
-    /// request in the process shares its memory copy and waits for one load.
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
     loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 

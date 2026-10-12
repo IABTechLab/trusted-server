@@ -629,10 +629,10 @@ impl IntegrationBuilder {
     /// Offers the loading cache this crate supplies, see
     /// [`crate::platform::PlatformLoadingCache`].
     ///
-    /// The offer is not a selection. A feature that holds answers names the
-    /// module in its own `[cache.<name>]` table, and an adapter resolves every
-    /// feature's selection with [`loading_caches_from`] when it builds its
-    /// state. A feature that selects none asks each source itself.
+    /// The offer is not a selection. A cache is selected by naming the module
+    /// in its own `[cache.<name>]` table, and an adapter resolves every table's
+    /// selection with [`loading_caches_from`] when it builds its state. A cache
+    /// whose table selects none asks each source itself.
     #[must_use]
     pub const fn with_loading_cache(mut self, factory: LoadingCacheFactory) -> Self {
         self.loading_cache = Some(factory);
@@ -785,15 +785,14 @@ pub(crate) fn all_builders(
     builders().iter().copied().chain(extra.iter().copied())
 }
 
-/// The loading cache each feature selects, from the caches the builders a
-/// deployment links offer. A feature whose `[cache.<name>]` names no module
-/// keeps no copy, and a module's cache is made once however many features
-/// select it.
+/// The loading cache each `[cache.<name>]` table selects, from the caches the
+/// builders a deployment links offer. A table that names no module keeps no
+/// copy, and a module's cache is made once however many tables select it.
 ///
 /// # Errors
 ///
-/// When a feature names a module no linked builder offers a cache from,
-/// naming the feature and the modules that do.
+/// When a table names a module no linked builder offers a cache from, naming
+/// the table and the modules that do.
 pub fn loading_caches_from(
     settings: &Settings,
     builders: &[IntegrationBuilder],
@@ -808,7 +807,7 @@ pub fn loading_caches_from(
         .collect();
     let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
     let mut caches = crate::platform::LoadingCaches::default();
-    for (feature, config) in settings.cache.loading_caches() {
+    for (table, config) in settings.cache.loading_caches() {
         let Some(written) = config.module.as_deref() else {
             continue;
         };
@@ -817,7 +816,7 @@ pub fn loading_caches_from(
         }) else {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "[cache.{feature}] module names `{written}`, which no linked crate offers \
+                    "[cache.{table}] module names `{written}`, which no linked crate offers \
                      a loading cache from. The loading cache modules this build has are: {}",
                     offered_cache_names(&offered)
                 ),
@@ -831,7 +830,7 @@ pub fn loading_caches_from(
                 cache
             }
         };
-        caches.insert(feature, cache);
+        caches.insert(table, cache);
     }
     Ok(Arc::new(caches))
 }

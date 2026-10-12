@@ -2892,10 +2892,9 @@ pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadingCacheConfig {
-    /// The module whose loading cache holds this feature's copies, as its
-    /// short name or in full, for example `51degrees` or
-    /// `loading-cache.51degrees`. Absent, the feature keeps no copy and loads
-    /// on every call.
+    /// The module whose loading cache holds this cache's copies, as its short
+    /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
+    /// Absent, no copy is kept and every call loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero
@@ -2968,8 +2967,8 @@ fn check_loading_cache_seconds(
 }
 
 impl CacheSettings {
-    /// Each feature whose copies a loading cache holds, by the name of its
-    /// cache, with the settings its `[cache.<name>]` table carries.
+    /// Each cache a loading cache may hold, by its name, with the settings
+    /// its `[cache.<name>]` table carries.
     #[must_use]
     pub fn loading_caches(&self) -> [(&'static str, &LoadingCacheConfig); 1] {
         [(ROBOTS_TXT_CACHE, &self.robots_txt)]

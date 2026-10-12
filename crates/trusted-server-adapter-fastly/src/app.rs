@@ -210,9 +210,9 @@ pub(crate) struct AppState {
     /// than the first request, and handed to every request's services.
     pub(crate) permission_signal_modules:
         Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
-    /// The loading cache the linked builders offer, taken once here and handed
-    /// to every request's services, so lookups in one request share its
-    /// memory copy.
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
     pub(crate) loading_caches: Arc<LoadingCaches>,
 }
 

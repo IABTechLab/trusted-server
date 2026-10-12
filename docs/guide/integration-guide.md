@@ -847,7 +847,7 @@ let bytes = services
 ```
 
 A caller whose load pays off only when its value is kept asks
-`services.loading_cache().keeps_values()` first, which the cache of a build
+`services.loading_cache_for(name).keeps_values()` first, which the cache of a build
 that links none answers with false, and `remove` drops a copy that turned out
 to be unusable. The lifetimes come from the settings, as `[cache.robots-txt]`
 does through `LoadingCacheConfig::lifetimes`, so an operator tunes them
