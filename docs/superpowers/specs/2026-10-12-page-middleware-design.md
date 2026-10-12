@@ -10,7 +10,7 @@
 
 ## 1. Problem
 
-A module changes a page through four hook traits, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, `IntegrationHtmlStreamProcessorFactory` and `IntegrationHeadInjector`. Every hook of a selected module runs on every page, in the one order the modules were registered in. A publisher cannot run a change on part of a site, cannot choose the order, and cannot place two changes of one module apart. Whether a hook's output may be stored in a template every reader shares rests on what the hook says about itself.
+A module changes a page through four hook traits, `IntegrationAttributeRewriter`, `IntegrationScriptRewriter`, `IntegrationHtmlStreamProcessorFactory` and `IntegrationHeadInjector`. Every hook of a selected module runs on every page, in the one order the modules were registered in. A publisher cannot run a change on part of a site, cannot choose the order, and cannot keep two changes of one module apart. Whether a hook's output may be stored in a template every reader shares rests on what the hook says about itself.
 
 ## 2. Design
 

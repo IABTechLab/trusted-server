@@ -10,7 +10,7 @@
 
 ## 1. Problem
 
-`/robots.txt` is answered by a handler of core's own, registered as a route on each of the four adapters with a cache policy of its own, while every other change to what a deployment serves is a middleware named by an entry. A publisher cannot place it, order it beside another change or run it in the serve phase, and every adapter carries a route and tests for one file.
+`/robots.txt` is answered by a handler of core's own, registered as a route on each of the four adapters with a cache policy of its own, while every other change to what a deployment serves is a middleware named by an entry. A publisher has no entry for it, so they cannot say where it runs, put another change before or after it, or run it for each reader rather than once for the stored copy, and every adapter carries a route and tests for one file.
 
 ## 2. Design
 
