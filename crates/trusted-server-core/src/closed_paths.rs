@@ -54,12 +54,6 @@ fn is_closed(path: &str) -> bool {
         return true;
     }
 
-    // Normal publisher paths carry no escape sequence, so the decode loop and
-    // its allocation are skipped entirely for them.
-    if !path.contains('%') {
-        return false;
-    }
-
     let mut current = path.to_owned();
     for _ in 0..MAX_PERCENT_DECODE_ROUNDS {
         let Some(decoded) = percent_decoded_path(&current) else {

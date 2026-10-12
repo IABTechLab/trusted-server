@@ -105,8 +105,7 @@ pub(crate) fn clear_unused(data: &mut Value, builders: &[IntegrationBuilder]) {
             continue;
         };
         // A vendor's table runs its builder, so a secret in the table counts
-        // as in use by the table's own rules, and an absent table has nothing
-        // to clear.
+        // as in use by the table's own rules.
         let selected = match builder.shared_settings() {
             Some(vendor) => Some(vendor),
             None => selected_as(data, section, &forms),

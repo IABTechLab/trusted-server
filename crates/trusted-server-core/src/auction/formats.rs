@@ -225,8 +225,7 @@ pub fn convert_tsjs_to_auction_request(
             .map(str::to_string),
         ip: services.client_info().client_ip.map(|ip| ip.to_string()),
         geo,
-        // Filled by the caller, which is async and can ask the device
-        // module. This builder is synchronous, so it cannot.
+        // Filled by `attach_device_attributes`.
         attributes: None,
     });
 
@@ -556,22 +555,8 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     Ok(OpenRtbResponseConversion { response, delivery })
 }
 
-/// Fills the bid request's device attributes from the selected device
-/// module.
-///
-/// Separate from [`convert_tsjs_to_auction_request`] and from the publisher's
-/// own builder because both of those are synchronous and a module that
-/// resolves a device model has to reach a service to do it. Every real auction
-/// path calls this after building its request, so the three surfaces offer the
-/// same inventory rather than one of them being richer by accident.
-///
-/// Does nothing when no module supplies a device module, and nothing when
-/// the module resolves nothing. Neither is a failure: a bidder reads an
-/// absent field as unknown, which is true, whereas a default would be a claim.
-///
-/// The consent-denied path deliberately does not call this. That path builds a
-/// request shape only, to echo the request id back in a no-bid response, and
-/// makes no outbound call of any kind.
+/// Fills the bid request's device attributes from the selected device module,
+/// after each request that makes an outbound auction call is built.
 pub async fn attach_device_attributes(
     request: &mut AuctionRequest,
     http_req: &http::Request<EdgeBody>,
@@ -603,9 +588,6 @@ pub async fn attach_device_attributes(
         return;
     }
 
-    // The publisher path leaves the device object out when the request
-    // carried no User-Agent, so this creates one rather than dropping
-    // attributes that were resolved.
     request
         .device
         .get_or_insert(DeviceInfo {
@@ -784,12 +766,12 @@ mod tests {
                 .device
                 .as_ref()
                 .is_some_and(|device| device.attributes.is_none()),
-            "the default deployment supplies no device provider and must send no attributes"
+            "the default deployment supplies no device module and must send no attributes"
         );
     }
 
     #[tokio::test]
-    async fn a_provider_that_resolves_nothing_adds_no_device_object() {
+    async fn a_module_that_resolves_nothing_adds_no_device_object() {
         let services = crate::platform::test_support::noop_services_with_device_module(
             std::sync::Arc::new(StubDeviceModule { attributes: None }),
         );

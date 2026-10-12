@@ -679,7 +679,7 @@ mod tests {
 
         let err = outcome.expect_err("a managed cookie effect should fail the request");
         assert!(
-            format!("{err:?}").contains("namespace the public prefix starts"),
+            format!("{err:?}").contains("sets a cookie under the public prefix core manages"),
             "the failure should name the reserved effect, got {err:?}"
         );
     }

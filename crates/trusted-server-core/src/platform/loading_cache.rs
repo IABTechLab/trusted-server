@@ -237,18 +237,19 @@ impl PlatformLoadingCache for NoLoadingCache {
     }
 }
 
-/// The loading cache each feature selected, by the name its [`CacheSpec`]
-/// carries. A feature that selected none loads through [`NoLoadingCache`].
+/// The loading cache each `[cache.<name>]` table selected, by the name a
+/// [`CacheSpec`] carries. A cache whose table selected none loads through
+/// [`NoLoadingCache`].
 #[derive(Default)]
 pub struct LoadingCaches {
     by_feature: HashMap<&'static str, Arc<dyn PlatformLoadingCache>>,
-    /// What a feature that selected nothing loads through, when a test gives
-    /// every feature one cache.
+    /// What a cache whose table selected nothing loads through, when a test
+    /// gives every caller one cache.
     unselected: Option<Arc<dyn PlatformLoadingCache>>,
 }
 
 impl LoadingCaches {
-    /// Every feature loading through `cache`, for a test of one cache.
+    /// Every caller loading through `cache`, for a test of one cache.
     #[must_use]
     pub fn every(cache: Arc<dyn PlatformLoadingCache>) -> Self {
         Self {
@@ -257,21 +258,21 @@ impl LoadingCaches {
         }
     }
 
-    /// Keeps `cache` as the one `feature` selected.
-    pub fn insert(&mut self, feature: &'static str, cache: Arc<dyn PlatformLoadingCache>) {
-        self.by_feature.insert(feature, cache);
+    /// Keeps `cache` as the one the table `name` selected.
+    pub fn insert(&mut self, name: &'static str, cache: Arc<dyn PlatformLoadingCache>) {
+        self.by_feature.insert(name, cache);
     }
 
-    /// The cache `feature` loads through.
+    /// The cache named `name` loads through.
     #[must_use]
-    pub fn for_feature(&self, feature: &str) -> &dyn PlatformLoadingCache {
-        match self.by_feature.get(feature).or(self.unselected.as_ref()) {
+    pub fn for_feature(&self, name: &str) -> &dyn PlatformLoadingCache {
+        match self.by_feature.get(name).or(self.unselected.as_ref()) {
             Some(cache) => &**cache,
             None => &NoLoadingCache,
         }
     }
 
-    /// Whether no feature selected a cache.
+    /// Whether no table selected a cache.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_feature.is_empty() && self.unselected.is_none()
