@@ -1,10 +1,8 @@
 //! The configuration a deployment is running, served to anyone at
 //! [`CONFIG_PAGE_PATH`] and [`CONFIG_JSON_PATH`].
 //!
-//! Anyone can read the scripts a page runs, and nobody can read the
-//! configuration that runs at the edge, so this shows it. What is shown is the
-//! settings the handler holds, after defaults have been applied, with values
-//! masked as [`MASK`]:
+//! What is shown is the settings the handler holds, after defaults have been
+//! applied, with values masked as [`MASK`]:
 //!
 //! 1. Every secret, meaning a value the loader filled in from the secret
 //!    store or a leaf declared as one, whatever the publisher's document says.
@@ -13,13 +11,6 @@
 //!    [`Redacted`](crate::redacted::Redacted) value, unless `[inspect] show`
 //!    names it.
 //! 3. Everything `[inspect] hide` names.
-//!
-//! Secrets are masked twice over. The loader records the path of each leaf it
-//! filled, and those paths are masked. Then any string still containing a
-//! secret value is masked wherever it sits.
-//!
-//! The view lists every masked path, and its keys are sorted, so the same
-//! settings always give the same bytes.
 
 use std::collections::HashSet;
 use std::fmt::{self, Write as _};
@@ -33,7 +24,9 @@ use serde_json::{Map, Value, json};
 
 use crate::config::TrustedServerAppConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationBuilder;
 use crate::redacted::{SENSITIVE_MARKER, to_marked_value};
+use crate::secret_resolution::unresolved_secrets;
 use crate::settings::Settings;
 
 use super::{MASK, render_page};
@@ -628,6 +621,35 @@ pub(crate) fn validate_patterns(settings: &Settings) -> Result<(), Report<Truste
         }
     }
     Ok(())
+}
+
+/// [`validate_patterns`] for a deployment's settings before they are pushed,
+/// when their secret fields still hold key names. The view is handed every
+/// secret leaf the load will look for, the ones only the configuration and
+/// `extra_integrations` name included, so a pattern the load refuses is
+/// refused here.
+///
+/// # Errors
+///
+/// As [`validate_patterns`].
+pub(crate) fn validate_patterns_for_deploy(
+    settings: &Settings,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
+    if settings.inspect.show.is_empty() && settings.inspect.hide.is_empty() {
+        return Ok(());
+    }
+    // The serializer's error is left out, as in `marked_settings`.
+    let data = serde_json::to_value(settings).map_err(|_| {
+        configuration("the settings could not be represented for the configuration view".to_owned())
+    })?;
+    let builders = crate::integrations::all_builders(extra_integrations).collect::<Vec<_>>();
+    let mut settings = settings.clone();
+    settings.set_resolved_secrets(unresolved_secrets::<TrustedServerAppConfig>(
+        &data,
+        crate::module_secrets::secret_fields(&builders),
+    ));
+    validate_patterns(&settings)
 }
 
 fn configuration(message: String) -> Report<TrustedServerError> {

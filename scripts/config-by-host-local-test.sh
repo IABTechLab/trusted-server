@@ -13,9 +13,7 @@
 #   ./scripts/config-by-host-local-test.sh          # a fresh sandbox for each request
 #   ./scripts/config-by-host-local-test.sh reuse    # one sandbox serves both publishers
 #
-# `reuse` builds with the reusable sandbox and sets its four bounds. Viceroy
-# hands a waiting sandbox the next request, so the first requests of a run are
-# served by one sandbox.
+# `reuse` builds with the reusable sandbox and sets its four bounds.
 #
 # Environment:
 #   WASM_BINARY_PATH   a built adapter, in place of building one
@@ -333,7 +331,7 @@ refused "the logical store ID is not a host" "trusted_server_config"
 refused "another publisher's key with a suffix is not that publisher" "$HOST_A.evil.example"
 fetch "unknown.example" /health
 check "the health probe answers for any host" "$STATUS" "200"
-if grep -qF "no app config for host" "$VICEROY_LOG"; then
+if grep -qF "no app-config blob for host" "$VICEROY_LOG"; then
   ok "a refusal is logged with the host it refused"
 else
   bad "a refusal is not logged"

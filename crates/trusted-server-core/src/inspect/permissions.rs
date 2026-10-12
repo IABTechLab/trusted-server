@@ -30,25 +30,13 @@ pub const PERMISSIONS_JSON_PATH: &str = "/_ts/permissions.json";
 /// Both addresses, the page first.
 pub const PERMISSIONS_PATHS: [&str; 2] = [PERMISSIONS_PAGE_PATH, PERMISSIONS_JSON_PATH];
 
-/// The permission resolution for a request, as the endpoint shows it.
+/// The permission resolution for a request, as the endpoint shows it, being
+/// the page shape of [`PermissionState::page_value`] with these fields added.
 ///
-/// It is the page shape of [`PermissionState::page_value`] with three things
-/// added that a page has no use for and a person asking why a permission is
-/// not set does.
-///
-/// `storageWithdrawn` says whether the request explicitly withdrew device
-/// storage, which is a different fact from storage not being set.
-///
-/// `modules.contributed` names the signal modules that produced a signal used
-/// in this resolution, and `modules.configured` names the ones the publisher
-/// asked to run. A module in `configured` and not in `contributed` ran and
-/// found nothing to work with, and reporting only the contributors would make
-/// it look the same as a module that was never configured. When the publisher
-/// named no modules, `configured` is `null` and not a list, because the
-/// selection is then whatever the adapter offers and core does not know what
-/// that is.
-///
-/// `version` is the version of the core crate that answered.
+/// - `storageWithdrawn`: whether the request explicitly withdrew device storage.
+/// - `modules.contributed`: the signal modules that produced a signal used here.
+/// - `modules.configured`: the signal modules the publisher named, or `null`.
+/// - `version`: the version of the core crate that answered.
 #[must_use]
 pub fn permissions_payload(state: &PermissionState, settings: &Settings) -> Value {
     let mut contributed: Vec<&str> = state.signals().iter().map(|signal| signal.module).collect();

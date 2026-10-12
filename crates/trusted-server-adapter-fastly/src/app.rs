@@ -770,8 +770,7 @@ async fn execute_named(
     ctx: RequestContext,
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
-    // Read only, and it says nothing about the request, so it is answered
-    // ahead of everything a request passes through.
+    // Read only, answered before the Edge Cookie lifecycle so nothing is written.
     if matches!(handler, NamedRouteHandler::Config) {
         return Ok(handle_config(&state.settings, &ctx.into_request()));
     }
@@ -829,9 +828,7 @@ async fn execute_named(
         return Ok(response);
     }
 
-    // Read only. The permissions are resolved for this request as a page's
-    // would be, then shown, and the Edge Cookie lifecycle never runs, so
-    // nothing is written for the reader.
+    // Read only, answered before the Edge Cookie lifecycle so nothing is written.
     if matches!(handler, NamedRouteHandler::Permissions) {
         let response = handle_permissions(&state.settings, &services, &req)
             .await
@@ -839,9 +836,7 @@ async fn execute_named(
         return Ok(response);
     }
 
-    // Read only. It shows what is held against the request's own Edge
-    // Cookie, read under the module the deployment selects, and the Edge
-    // Cookie lifecycle never runs, so nothing is written for the reader.
+    // Read only, answered before the Edge Cookie lifecycle so nothing is written.
     if matches!(handler, NamedRouteHandler::Data) {
         let kv = crate::maybe_identity_graph(&state.settings);
         let response = request_module(&state.settings.ec, &services)
@@ -931,14 +926,8 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
-        NamedRouteHandler::Permissions => {
-            unreachable!("the permissions are answered before EC setup")
-        }
-        NamedRouteHandler::Config => {
-            unreachable!("the configuration is answered before EC setup")
-        }
-        NamedRouteHandler::Data => {
-            unreachable!("what is held is answered before EC setup")
+        NamedRouteHandler::Permissions | NamedRouteHandler::Config | NamedRouteHandler::Data => {
+            unreachable!("the inspection endpoints are answered before EC setup")
         }
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before

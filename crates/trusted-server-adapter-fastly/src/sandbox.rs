@@ -59,9 +59,7 @@ pub(crate) const INSTANCE_ID_UNAVAILABLE: &str = "unavailable";
 /// Per-sandbox state, owned by `edgezero_adapter_fastly::lifecycle::Sandbox`.
 ///
 /// The framework owns the callback count and the one-time setup guard, and
-/// holds the payload this alias names. The payload owns retention, because
-/// the framework's slot holds one value and a sandbox can be asked for more
-/// than one application.
+/// holds the payload this alias names. The payload owns retention.
 pub(crate) type Sandbox = edgezero_adapter_fastly::lifecycle::Sandbox<RetainedApps>;
 
 /// How many applications a sandbox keeps.
@@ -84,15 +82,8 @@ pub(crate) struct RetainedApp {
 /// The applications a sandbox has built, each under the key of the app-config
 /// blob it was built from.
 ///
-/// A service that serves one publisher builds one. A service whose `__KEY`
-/// selector names a blob for each host is asked for several, and an
-/// application built from one publisher's blob must never answer a request
-/// for another's, so an application is found by its key and by nothing else.
-///
 /// The framework hands its payload out by shared reference, so the list sits
-/// behind a [`RefCell`]. One callback runs to completion before the next
-/// begins and no borrow is held across a build, so the cell is never borrowed
-/// twice.
+/// behind a [`RefCell`].
 #[derive(Default)]
 pub(crate) struct RetainedApps {
     /// Most recently served first.

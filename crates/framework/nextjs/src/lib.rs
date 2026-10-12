@@ -16,11 +16,9 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::{
-    IntegrationDocumentState, IntegrationRegistration, ScriptRewriteAction,
-};
+use trusted_server_core::integrations::IntegrationRegistration;
 use trusted_server_core::middleware::{
-    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
+    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
 };
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 
@@ -50,10 +48,10 @@ mod shared;
 
 pub use rsc::rewrite_rsc_scripts_combined;
 
-use rsc_placeholders::NextJsRscPlaceholderRewriter;
+use rsc_placeholders::{NextJsRscPlaceholderRewriter, RscPlaceholderText};
 use rsc_stream::NextJsRscStreamProcessorFactory;
-use script_rewriter::NextJsNextDataRewriter;
-use shared::{ScriptContext, ScriptRewriter};
+use script_rewriter::{NextDataText, NextJsNextDataRewriter};
+use shared::ScriptDocument;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -140,8 +138,8 @@ pub fn register(
 /// Moves the origin's address to the publisher's in the data Next.js writes
 /// into a page, on the pages a `[[fetch]]` entry names [`MODULE`] for.
 struct PageChange {
-    structured: Arc<dyn ScriptRewriter>,
-    placeholders: Arc<dyn ScriptRewriter>,
+    structured: Arc<NextJsNextDataRewriter>,
+    placeholders: Arc<NextJsRscPlaceholderRewriter>,
     stream: NextJsRscStreamProcessorFactory,
 }
 
@@ -158,54 +156,20 @@ impl Middleware for PageChange {
     /// placeholder rewriter, which is asked about every script. The stream
     /// processor then works on the document the two left.
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        let script_text = |rewriter: &Arc<dyn ScriptRewriter>| -> Box<dyn TextHandler> {
-            Box::new(ScriptText {
-                rewriter: Arc::clone(rewriter),
-                request_host: context.request_host.to_owned(),
-                request_scheme: context.request_scheme.to_owned(),
-                origin_host: context.origin_host.to_owned(),
-                max_buffered_script_bytes: context.max_buffered_script_bytes,
-                document_state: context.document_state.clone(),
-            })
-        };
         MiddlewareAction {
             text_handlers: vec![
-                script_text(&self.structured),
-                script_text(&self.placeholders),
+                Box::new(NextDataText {
+                    rewriter: Arc::clone(&self.structured),
+                    document: ScriptDocument::new(context),
+                }),
+                Box::new(RscPlaceholderText {
+                    rewriter: Arc::clone(&self.placeholders),
+                    document: ScriptDocument::new(context),
+                }),
             ],
             stream: Some(self.stream.create(context)),
             ..MiddlewareAction::pass()
         }
-    }
-}
-
-/// One of the module's script rewriters at work on one document.
-struct ScriptText {
-    rewriter: Arc<dyn ScriptRewriter>,
-    request_host: String,
-    request_scheme: String,
-    origin_host: String,
-    max_buffered_script_bytes: usize,
-    document_state: IntegrationDocumentState,
-}
-
-impl TextHandler for ScriptText {
-    fn selector(&self) -> &str {
-        self.rewriter.selector()
-    }
-
-    fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction {
-        self.rewriter.rewrite(
-            text,
-            &ScriptContext {
-                request_host: &self.request_host,
-                request_scheme: &self.request_scheme,
-                origin_host: &self.origin_host,
-                is_last_in_text_node: is_last,
-                max_buffered_script_bytes: self.max_buffered_script_bytes,
-                document_state: &self.document_state,
-            },
-        )
     }
 }
 
