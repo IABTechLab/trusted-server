@@ -631,7 +631,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     // simply absent on the native host target, producing Ok(None) from lookup().
     let geo = build_geo(ctx);
 
-    RuntimeServices::builder()
+    let builder = RuntimeServices::builder()
         .config_store(config_store)
         .secret_store(secret_store)
         .kv_store(kv_store)
@@ -643,8 +643,10 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             tls_protocol: None,
             tls_cipher: None,
             ..ClientInfo::default()
-        })
-        .build()
+        });
+    #[cfg(target_arch = "wasm32")]
+    let builder = builder.timer(Arc::new(CloudflareTimer));
+    builder.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +754,18 @@ fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>>
         )));
     }
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+struct CloudflareTimer;
+
+#[cfg(target_arch = "wasm32")]
+impl trusted_server_core::platform::PlatformTimer for CloudflareTimer {
+    fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+        Box::pin(async move {
+            worker::Delay::from(duration).await;
+        })
+    }
 }
 
 #[cfg(test)]

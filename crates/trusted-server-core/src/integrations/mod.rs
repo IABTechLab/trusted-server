@@ -18,6 +18,7 @@ pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
+mod html_finalization;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
@@ -27,6 +28,11 @@ pub mod prebid;
 mod registry;
 pub mod sourcepoint;
 pub mod testlight;
+
+pub use html_finalization::{
+    HtmlFinalization, HtmlFinalizationDeadline, HtmlFinalizationError, HtmlFinalizationInput,
+    HtmlReplacementWriter, IntegrationHtmlFinalizer, IntegrationHtmlFinalizerFactory,
+};
 
 pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
@@ -295,6 +301,11 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         IntegrationBuilder {
             id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             build: js_asset_proxy::register,
+        },
+        #[cfg(feature = "test-utils")]
+        IntegrationBuilder {
+            id: crate::test_support::async_html_finalization::ID,
+            build: crate::test_support::async_html_finalization::register,
         },
         IntegrationBuilder {
             id: "testlight",

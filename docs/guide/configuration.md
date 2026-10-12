@@ -309,14 +309,15 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                 |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
-| `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
-| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
+| Field                          | Type    | Required | Description                                                                        |
+| ------------------------------ | ------- | -------- | ---------------------------------------------------------------------------------- |
+| `domain`                       | String  | Yes      | Publisher's apex domain name                                                       |
+| `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                             |
+| `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                |
+| `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                      |
+| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                     |
+| `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)        |
+| `html_finalization_timeout_ms` | Integer | No       | Whole terminal-chain budget after synchronous EOF (default 5000 ms; range 1–60000) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -436,6 +437,15 @@ intentionally, and never put it in the TOML file or pushed app-config blob.
 ::: danger Security Warning
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
+
+#### `html_finalization_timeout_ms`
+
+Optional whole-chain budget for registered asynchronous HTML finalizers, in
+milliseconds. The default is `5000`; accepted values are `1` through `60000`.
+The budget starts after decoding and synchronous HTML EOF and does not change the
+auction deadline. It has no effect without enabled finalizers. Axum, Workers, and
+Spin can cancel yielding work; Fastly consumers must bound their own blocking host
+calls. Timeout keeps the current transformed document and skips later finalizers.
 
 #### `max_buffered_body_bytes`
 

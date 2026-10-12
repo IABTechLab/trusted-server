@@ -10,15 +10,22 @@
 
 ---
 
-**Status:** Proposed implementation plan; no implementation started
+**Status:** Implemented; see the execution record for verification and the existing Workers auction limitation
 
 **Date:** 2026-10-12
 
-**Branch:** `spec/1241-async-html-finalization`
+**Branch:** `feat/1241-async-html-finalization` (planning originated on `spec/1241-async-html-finalization`)
 
 **Baseline:** `2a0cb0444dc335bd09105abe5952329bbbdfb621`
 
 **Design:** [Optional asynchronous HTML document finalization](../specs/2026-10-12-1241-async-html-finalization-design.md)
+
+**Execution record:** [Implementation and bidirectional coverage review](../reviews/2026-10-12-1241-async-html-finalization-implementation.md)
+
+The task checklists below preserve the original execution instructions, including
+proposed intermediate commit boundaries. The execution record is the authoritative
+completion record: implementation was reviewed together before committing, and it
+records actual commands, deviations, and the blocked Workers auction control.
 
 ## 1. Execution boundaries
 
@@ -27,8 +34,8 @@ This plan implements the selected terminal-phase design, not the original propos
 @superpowers:test-driven-development for runtime changes and
 @superpowers:verification-before-completion before recording results or committing.
 
-The tasks below describe future implementation work. Their commands and expected outcomes
-are not claims that the feature exists or has already passed tests. Keep intermediate
+The tasks below were the implementation instructions. Their expected outcomes alone
+are not verification evidence; consult the execution record for observed results. Keep intermediate
 commits in a draft branch; do not release an API that registrations can enable before all
 publisher entry points support it.
 
@@ -666,5 +673,5 @@ The review corrected these points before handoff:
 - Workers fixture output stays in the temporary workspace; runtime timeout tests verify
   timer expiry rather than accidentally passing on an early transport error.
 
-This record covers document review only. The unchecked tasks, runtime requirements, and
-implementation acceptance criteria remain outstanding.
+This historical record covers planning review only. The linked execution record now
+maps the implemented contracts and observed verification to both documents.

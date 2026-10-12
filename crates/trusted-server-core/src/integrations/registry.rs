@@ -8,6 +8,8 @@ use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
 
+use super::IntegrationHtmlFinalizerFactory;
+
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
@@ -627,6 +629,8 @@ pub struct IntegrationRegistration {
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
+    /// Terminal finalizers in registration order.
+    pub html_finalizers: Vec<Arc<dyn IntegrationHtmlFinalizerFactory>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
@@ -653,6 +657,7 @@ impl IntegrationRegistrationBuilder {
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_stream_processors: Vec::new(),
+                html_finalizers: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
             },
@@ -686,6 +691,16 @@ impl IntegrationRegistrationBuilder {
         processor: Arc<dyn IntegrationHtmlStreamProcessorFactory>,
     ) -> Self {
         self.registration.html_stream_processors.push(processor);
+        self
+    }
+
+    /// Register an opt-in asynchronous HTML terminal phase.
+    #[must_use]
+    pub fn with_html_finalizer(
+        mut self,
+        factory: Arc<dyn IntegrationHtmlFinalizerFactory>,
+    ) -> Self {
+        self.registration.html_finalizers.push(factory);
         self
     }
 
@@ -743,6 +758,7 @@ struct IntegrationRegistryInner {
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_stream_processors: Vec<Arc<dyn IntegrationHtmlStreamProcessorFactory>>,
+    html_finalizers: Vec<Arc<dyn IntegrationHtmlFinalizerFactory>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
@@ -764,6 +780,7 @@ impl Default for IntegrationRegistryInner {
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_stream_processors: Vec::new(),
+            html_finalizers: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
         }
@@ -922,6 +939,7 @@ impl IntegrationRegistry {
             inner
                 .html_stream_processors
                 .extend(registration.html_stream_processors);
+            inner.html_finalizers.extend(registration.html_finalizers);
             inner.head_injectors.extend(registration.head_injectors);
             inner.request_filters.extend(registration.request_filters);
             if registration.js_disabled {
@@ -1111,6 +1129,31 @@ impl IntegrationRegistry {
         self.inner.html_stream_processors.clone()
     }
 
+    /// Report finalizer presence before any shared-template lookup.
+    #[must_use]
+    pub fn has_html_finalizers(&self) -> bool {
+        !self.inner.html_finalizers.is_empty()
+    }
+
+    /// Return terminal factories in registration order.
+    #[must_use]
+    pub fn html_finalizer_factories(&self) -> Vec<Arc<dyn IntegrationHtmlFinalizerFactory>> {
+        self.inner.html_finalizers.clone()
+    }
+
+    /// Construct an isolated registry for terminal-phase tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn from_html_finalizers(factories: Vec<Arc<dyn IntegrationHtmlFinalizerFactory>>) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                html_finalizers: factories,
+                ..Default::default()
+            }),
+            plan: None,
+        }
+    }
+
     /// Collect HTML snippets for insertion at the start of `<head>`.
     #[must_use]
     pub fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
@@ -1282,6 +1325,7 @@ impl IntegrationRegistry {
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_stream_processors: Vec::new(),
+                html_finalizers: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1312,6 +1356,7 @@ impl IntegrationRegistry {
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_stream_processors: Vec::new(),
+                html_finalizers: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1338,6 +1383,7 @@ impl IntegrationRegistry {
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_stream_processors: Vec::new(),
+                html_finalizers: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
                 deferred_js_ids: Vec::new(),
@@ -1404,6 +1450,7 @@ impl IntegrationRegistry {
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_stream_processors: Vec::new(),
+                html_finalizers: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
@@ -1416,6 +1463,24 @@ impl IntegrationRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn html_finalizers_are_empty_by_default() {
+        let registry = IntegrationRegistry::from_request_filters(Vec::new());
+        assert!(
+            !registry.has_html_finalizers(),
+            "should retain the ordinary streaming path"
+        );
+        assert!(
+            registry.html_finalizer_factories().is_empty(),
+            "should register no default finalizers"
+        );
+        let registration = IntegrationRegistration::builder("example_finalizer").build();
+        assert!(
+            registration.html_finalizers.is_empty(),
+            "should make finalization opt-in"
+        );
+    }
+
     use super::*;
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;

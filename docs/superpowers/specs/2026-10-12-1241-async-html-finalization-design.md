@@ -2,13 +2,15 @@
 
 **Date:** 2026-10-12
 
-**Status:** Proposed; design only, awaiting maintainer review
+**Status:** Implemented on `feat/1241-async-html-finalization`; verification and remaining runtime limitation recorded below
 
 **Issue:** trusted-server #1241
 
 **Inspected baseline:** `2a0cb0444dc335bd09105abe5952329bbbdfb621`
 
 **Implementation plan:** [Task-by-task implementation and verification](../plans/2026-10-12-1241-async-html-finalization.md)
+
+**Implementation review:** [Requirement coverage, verification, and runtime limitations](../reviews/2026-10-12-1241-async-html-finalization-implementation.md)
 
 ## 1. Decision
 

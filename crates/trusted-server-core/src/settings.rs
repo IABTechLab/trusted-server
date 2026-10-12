@@ -78,6 +78,14 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
+    /// Whole-chain HTML terminal budget in milliseconds; inert without a finalizer.
+    #[serde(default = "default_html_finalization_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
+    pub html_finalization_timeout_ms: u32,
+}
+
+fn default_html_finalization_timeout_ms() -> u32 {
+    5000
 }
 
 fn default_max_buffered_body_bytes() -> usize {
@@ -98,6 +106,7 @@ impl Default for Publisher {
             origin_host_header_override: None,
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         }
     }
 }
@@ -189,6 +198,7 @@ impl Publisher {
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
+    ///     html_finalization_timeout_ms: 5000,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -3718,6 +3728,44 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn html_finalization_timeout_defaults_and_boundaries() {
+        let parsed = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse an omitted terminal timeout");
+        assert_eq!(
+            parsed.publisher.html_finalization_timeout_ms,
+            Publisher::default().html_finalization_timeout_ms,
+            "should match TOML omission and the hand-written default"
+        );
+        assert_eq!(
+            Publisher::default().html_finalization_timeout_ms,
+            5000,
+            "should default the chain budget to five seconds"
+        );
+        for (milliseconds, invalid) in [
+            (0, true),
+            (1, false),
+            (5000, false),
+            (60000, false),
+            (60001, true),
+        ] {
+            let publisher = Publisher {
+                html_finalization_timeout_ms: milliseconds,
+                ..Publisher::default()
+            };
+            let errors = publisher
+                .validate()
+                .expect_err("should reject the other empty publisher fields");
+            assert_eq!(
+                errors
+                    .field_errors()
+                    .contains_key("html_finalization_timeout_ms"),
+                invalid,
+                "should enforce finish timeout boundaries"
+            );
+        }
+    }
+
     use super::*;
     use regex::Regex;
     use serde_json::json;
@@ -6201,6 +6249,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -6212,6 +6261,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -6223,6 +6273,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -6234,6 +6285,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -6245,6 +6297,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -6256,6 +6309,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -6269,6 +6323,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -6283,6 +6338,7 @@ source_domain = "partner.example.com"
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");

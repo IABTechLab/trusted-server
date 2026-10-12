@@ -194,8 +194,19 @@ impl HtmlProcessorConfig {
     reason = "the returned processor owns request configuration captured by its handlers"
 )]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
+    create_html_processor_with_document_state(config, &IntegrationDocumentState::default())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "static parser callbacks capture owned request configuration"
+)]
+pub(crate) fn create_html_processor_with_document_state(
+    config: HtmlProcessorConfig,
+    document_state: &IntegrationDocumentState,
+) -> impl StreamProcessor + use<> {
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
-    let document_state = IntegrationDocumentState::default();
+
     if config.suppress_datadome_client_side_tag {
         document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
     }
@@ -723,7 +734,8 @@ mod tests {
     use super::*;
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-        IntegrationHeadInjector, IntegrationHtmlContext,
+        IntegrationHeadInjector, IntegrationHtmlContext, IntegrationScriptContext,
+        IntegrationScriptRewriter, ScriptRewriteAction,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
@@ -749,6 +761,53 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+        }
+    }
+
+    #[test]
+    fn terminal_document_state_observes_parser_callbacks_and_isolates_requests() {
+        struct ArticleObserver;
+        impl IntegrationScriptRewriter for ArticleObserver {
+            fn integration_id(&self) -> &'static str {
+                "example_article"
+            }
+            fn selector(&self) -> &'static str {
+                "p"
+            }
+            fn rewrite(
+                &self,
+                content: &str,
+                context: &IntegrationScriptContext<'_>,
+            ) -> ScriptRewriteAction {
+                context
+                    .document_state
+                    .get_or_insert_with("example_article", || content.to_string());
+                ScriptRewriteAction::Keep
+            }
+        }
+        for text in ["Example first article", "Example second article"] {
+            let state = IntegrationDocumentState::default();
+            let mut config = create_test_config();
+            config.integrations =
+                IntegrationRegistry::from_rewriters(Vec::new(), vec![Arc::new(ArticleObserver)]);
+            let mut processor = create_html_processor_with_document_state(config, &state);
+            let _ = processor
+                .process_chunk(
+                    format!("<html><body><p>{text}</p></body></html>").as_bytes(),
+                    false,
+                )
+                .expect("should process article HTML");
+            let _ = processor
+                .process_chunk(&[], true)
+                .expect("should close the synchronous parser");
+            let article = state
+                .get::<String>("example_article")
+                .expect("should expose parser state to the terminal phase");
+            assert_eq!(
+                article.as_str(),
+                text,
+                "should share this document's observed text without leaking another request"
+            );
         }
     }
 

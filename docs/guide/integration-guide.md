@@ -203,6 +203,93 @@ Streaming support is an adapter capability. Request
 checked `supports_streaming_responses()`; unsupported adapters must reject
 the request instead of silently buffering it.
 
+## Asynchronous HTML finalization
+
+An integration that needs complete transformed HTML plus an outside lookup can
+register an `IntegrationHtmlFinalizerFactory` with `.with_html_finalizer(...)`.
+The factory creates one request-local `IntegrationHtmlFinalizer` session and
+receives the same `IntegrationDocumentState` as the synchronous HTML rewriters.
+Factory construction performs setup only; start I/O inside the returned future.
+The session and its future may be `?Send`.
+
+Core completes decoding and every synchronous processor, then awaits terminal
+sessions in registration order. Each session sees the previous committed HTML;
+its replacement does not pass through the parser again. The auction seam and
+encoder complete after the terminal phase. Existing `StreamProcessor` callbacks
+remain synchronous, and pages with no registered finalizers keep their existing
+streaming path.
+
+`HtmlFinalizationInput` supplies borrowed `html`, `services`, `deadline`, and a
+separate bounded `replacement` writer. Append a complete candidate and return
+`HtmlFinalization::Replace`, or return `Unchanged`. An error, timeout, invalid
+assembly marker count, or output limit violation discards the candidate and
+retains the current input. Ignoring an append error cannot commit partial output.
+An empty `Replace` intentionally emits an empty document. Callback panics propagate
+through the request and are not converted into optional-work failures. Preserve HTML structure,
+CSP, Next.js/RSC semantics, and the opaque parser markers; core checks marker
+multiplicity but does not parse or validate replacement structure.
+
+The publisher's `html_finalization_timeout_ms` is one budget for the whole chain,
+starting after synchronous EOF. Use `deadline.remaining()` to bound outside calls.
+Axum, Workers, and Spin provide cooperative timers. Fastly provides no timer
+because host calls block; the consumer must set transport timeouts itself. Dropping
+a future releases its borrows and discards its candidate, but cannot undo a remote
+write or preempt work that does not yield. The deadline wins over a simultaneously
+ready callback. Avoid logging HTML, lookup URLs, or external response contents.
+
+Enabled finalizers retain transformed HTML up to `max_buffered_body_bytes` and use
+a separate candidate with the same cap. Collection overflow skips terminal I/O
+and resumes normal delivery with the retained prefix and remaining bytes. Existing
+input, decoder, and final output errors remain fatal. Registration therefore changes
+first-byte latency only for enabled pages that fit the retention limit.
+
+Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
+`publisher_response_into_streaming_response` to execute terminal callbacks.
+`stream_publisher_body` and the generic synchronous pipeline perform synchronous
+transformations only. Client cancellation drops the callback and retains the existing
+auction guard's log warning; error paths that can await emit abandonment telemetry.
+
+Finalizer-enabled HTML bypasses shared-template reads, reservations, and stores and
+uses inline auction assembly. Raw-origin readthrough remains independent. Processed
+HTML receives `Cache-Control: no-store, private` even when a finalizer leaves it
+unchanged, fails, or is skipped after collection overflow. Document GETs strip the
+four conditional/range headers used by synthesized HTML. HEAD, bodiless responses,
+unsupported encodings, and non-HTML responses run no terminal callbacks.
+
+Callers of `handle_publisher_request` provide the enabled integration registry in
+`AuctionDispatch::integration_registry` and use that same registry for response
+finalization. This metadata is required before a shared-template lookup can happen.
+
+A fictional HTTP consumer is available only through the existing `test-utils`
+feature. To verify real asynchronous I/O and timeout fallback on local runtimes:
+
+```bash
+./scripts/async-html-finalization-local-test.sh axum
+./scripts/async-html-finalization-local-test.sh cloudflare
+./scripts/async-html-finalization-local-test.sh spin
+./scripts/async-html-finalization-local-test.sh fastly
+```
+
+Each run builds a fresh feature-enabled artifact, generates temporary configuration
+and example secrets, and retains diagnostics in the printed temporary directory.
+It uses the installed runtime CLIs and, for Workers, the `worker-build` version
+matching the locked `worker` SDK and a compatible `wasm-bindgen` CLI. The default
+Cargo output is isolated in that directory; an explicit `CARGO_TARGET_DIR` permits
+sharing the local build cache. Every run invokes Cargo and builds its fixture Worker
+bundle into a fresh directory. Workers and Spin use opt-in adapter `test-utils`
+features for local diagnostic sinks.
+
+The repository pins Viceroy 0.17 for its normal test gate. Backend transport timeout
+simulation requires Viceroy 0.19 or later. Use an isolated newer executable in `PATH`
+for the Fastly hung-call case; do not interpret a hung test on 0.17 as evidence that
+Fastly production ignores the configured timeout.
+
+Add `--release` for production-profile artifacts. Add `--auction` to run a separate
+enabled-auction control against a closed loopback
+bid endpoint. It verifies slot/bid fallback assembly and marker removal without
+external traffic. The existing Workers clock panic reported in #1240 blocks that
+control; the ordinary terminal-phase tests still run independently.
+
 ## Browser and script guards
 
 Add a browser module only when browser state is required. Immediate modules

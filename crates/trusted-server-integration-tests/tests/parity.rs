@@ -8,7 +8,13 @@
 
 // Both adapters define `TrustedServerApp` — alias both to avoid name collision.
 // axum::http re-exports from the `http` crate, so HeaderMap types are identical.
+use error_stack::Report;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use trusted_server_core::platform::{
+    PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, PlatformSelectResult,
+};
 
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
@@ -1116,6 +1122,146 @@ async fn adapter_buffers_nextjs_auction_output() {
             );
         } else {
             expected_html = Some(html);
+        }
+    }
+}
+
+#[derive(Default)]
+struct TerminalFixtureOrigin {
+    lookup_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for TerminalFixtureOrigin {
+    async fn send(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let (content_type, body) = if request.request.uri().host() == Some("lookup.example.com") {
+            tokio::task::yield_now().await;
+            let payload = request
+                .request
+                .into_body()
+                .into_bytes()
+                .expect("should send a bounded fixture payload");
+            let payload: serde_json::Value = serde_json::from_slice(&payload)
+                .expect("should encode completed-document metadata");
+            assert_eq!(
+                payload["complete"], true,
+                "should observe the EOF sentinel before I/O"
+            );
+            assert_eq!(
+                payload["sha256"]
+                    .as_str()
+                    .expect("should hash transformed HTML")
+                    .len(),
+                64,
+                "should send a complete digest"
+            );
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            ("text/plain", "EXAMPLE_APPROVED")
+        } else {
+            (
+                "text/html",
+                "<!doctype html><html><head></head><body><p>EXAMPLE_UNSIGNED</p></body></html><!--example-document-eof-->",
+            )
+        };
+        Ok(PlatformResponse::new(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", content_type)
+                .header("cache-control", "public, max-age=60")
+                .body(edgezero_core::body::Body::from(body))
+                .expect("should build an example upstream response"),
+        ))
+    }
+    async fn send_async(
+        &self,
+        _: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+    async fn select(
+        &self,
+        _: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
+    let mut settings = test_settings();
+    settings.integrations.insert_config("html_finalization_fixture", &serde_json::json!({
+        "enabled": true, "lookup_url": "https://lookup.example.com/success", "transport_timeout_ms": 1000,
+    })).expect("should enable the fictional terminal consumer");
+    let client = Arc::new(TerminalFixtureOrigin::default());
+    let services = nextjs_auction::services_with_http_client(
+        Arc::clone(&client) as Arc<dyn PlatformHttpClient>
+    );
+    let routers = [
+        (
+            "Axum",
+            AxumApp::routes_with_settings_and_services(settings.clone(), services.clone()),
+        ),
+        (
+            "Cloudflare",
+            CloudflareApp::routes_with_settings_and_services(settings.clone(), services.clone()),
+        ),
+        (
+            "Spin",
+            SpinApp::routes_with_settings_and_services(settings, services),
+        ),
+    ];
+    let mut expected = None;
+    for (adapter, router) in routers {
+        client.lookup_calls.store(0, Ordering::SeqCst);
+        let request = request_builder()
+            .method("GET")
+            .uri("https://test-publisher.example.com/article")
+            .header("host", "test-publisher.example.com")
+            .header("accept", "text/html")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build an example navigation");
+        let response = router
+            .expect("should build fixture routes")
+            .oneshot(request)
+            .await
+            .expect("should serve finalized HTML");
+        assert_eq!(
+            response.status(),
+            200,
+            "{adapter} should preserve the origin status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .expect("should set terminal privacy"),
+            "no-store, private",
+            "{adapter} should prevent downstream caching"
+        );
+        let body = response
+            .into_body()
+            .into_bytes_bounded(1024 * 1024)
+            .await
+            .expect("should drain finalized HTML");
+        assert!(
+            String::from_utf8_lossy(&body).contains("EXAMPLE_FINALIZED"),
+            "{adapter} should await the yielding consumer"
+        );
+        assert_eq!(
+            client.lookup_calls.load(Ordering::SeqCst),
+            1,
+            "{adapter} should call the terminal lookup exactly once"
+        );
+        if let Some(expected) = &expected {
+            assert_eq!(
+                &body, expected,
+                "{adapter} should produce identical terminal HTML"
+            );
+        } else {
+            expected = Some(body);
         }
     }
 }
