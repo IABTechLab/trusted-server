@@ -73,6 +73,7 @@ pub mod streaming_replacer;
 pub mod test_support;
 pub mod tester_cookie;
 pub mod tsjs;
+pub mod version_header;
 
 #[cfg(test)]
 mod migration_guards;
