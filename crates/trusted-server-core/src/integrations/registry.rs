@@ -3154,8 +3154,7 @@ pub(crate) mod test_support {
 
             fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
                 let marker: String = context
-                    .prepared
-                    .take(PREPARING)
+                    .take_prepared(PREPARING)
                     .unwrap_or_else(|| NOTHING_PREPARED.to_owned());
                 MiddlewareAction {
                     head_inserts: vec![marker],
