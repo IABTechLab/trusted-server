@@ -3,6 +3,58 @@
 The Trusted Server CLI binary is `ts`. It is a host-target operator tool for
 configuration, page audits, and EdgeZero-backed lifecycle commands.
 
+## Command index
+
+The table summarizes native `--help` output on Linux and macOS. Platform-only
+commands are shown explicitly.
+
+| Command                          | Availability  | Summary                                                                                          | Usage                                                                                                          |
+| -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `ts`                             | Linux + macOS | Trusted Server CLI                                                                               | `ts <COMMAND>`                                                                                                 |
+| `ts active-version`              | Linux + macOS | Print the currently active deployment version for a target adapter                               | `ts active-version --adapter <ADAPTER> --service-id <SERVICE_ID>`                                              |
+| `ts audit`                       | Linux + macOS | Browser-backed page and ad-template audits                                                       | `ts audit [COMMAND]`                                                                                           |
+| `ts audit ad-templates`          | Linux + macOS | Verify configured ad-template slots against live page evidence                                   | `ts audit ad-templates <COMMAND>`                                                                              |
+| `ts audit ad-templates generate` | Linux + macOS | Scrape a live page's GPT slots and update the config's `[creative_opportunities]` slots in place | `ts audit ad-templates generate [OPTIONS] <URL>`                                                               |
+| `ts audit ad-templates verify`   | Linux + macOS | Verify ad-template slots for one or more live URLs                                               | `ts audit ad-templates verify [OPTIONS] <URLS>...`                                                             |
+| `ts audit generate`              | Linux + macOS | Bootstrap a draft Trusted Server config + JS asset audit from a live page                        | `ts audit generate [OPTIONS] <URL>`                                                                            |
+| `ts audit page`                  | Linux + macOS | Audit a single page and print a read-only summary                                                | `ts audit page [OPTIONS] <URL>`                                                                                |
+| `ts auth`                        | Linux + macOS | Sign in / out / status against an `EdgeZero` adapter                                             | `ts auth <COMMAND>`                                                                                            |
+| `ts auth login`                  | Linux + macOS | Sign in (`wrangler login` / `fastly profile create` / `spin cloud login`)                        | `ts auth login --adapter <ADAPTER>`                                                                            |
+| `ts auth logout`                 | Linux + macOS | Sign out (`wrangler logout` / `fastly profile delete` / `spin cloud logout`)                     | `ts auth logout --adapter <ADAPTER>`                                                                           |
+| `ts auth status`                 | Linux + macOS | Show the current session (`wrangler whoami` / `fastly profile list` / `spin cloud info`)         | `ts auth status --adapter <ADAPTER>`                                                                           |
+| `ts build`                       | Linux + macOS | Build the project for a target adapter                                                           | `ts build --adapter <ADAPTER> [ADAPTER_ARGS]...`                                                               |
+| `ts config`                      | Linux + macOS | Trusted Server app-config commands                                                               | `ts config <COMMAND>`                                                                                          |
+| `ts config ad-templates`         | Linux + macOS | Diagnose server-side ad-template configuration and path matching                                 | `ts config ad-templates <COMMAND>`                                                                             |
+| `ts config ad-templates check`   | Linux + macOS | Assert that a page path or URL matches the expected slot set                                     | `ts config ad-templates check [OPTIONS] <--expected-slot <ID>\|--expect-no-slots> <PATH_OR_URL>`               |
+| `ts config ad-templates explain` | Linux + macOS | Explain why a page path or URL would or would not run the ad stack                               | `ts config ad-templates explain [OPTIONS] <PATH_OR_URL>`                                                       |
+| `ts config ad-templates lint`    | Linux + macOS | Validate ad-template config and summarize deploy-time implications                               | `ts config ad-templates lint [OPTIONS]`                                                                        |
+| `ts config ad-templates match`   | Linux + macOS | Show creative opportunity slots matching a page path or URL                                      | `ts config ad-templates match [OPTIONS] <PATH_OR_URL>`                                                         |
+| `ts config diff`                 | Linux + macOS | Diff `trusted-server.toml` against the live `EdgeZero` config                                    | `ts config diff [OPTIONS] --adapter <ADAPTER>`                                                                 |
+| `ts config gc`                   | Linux + macOS | Reclaim orphaned chunk entries leaked from prior oversized pushes                                | `ts config gc [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts config init`                 | Linux + macOS | Initialize a Trusted Server config file from the example template                                | `ts config init [OPTIONS]`                                                                                     |
+| `ts config push`                 | Linux + macOS | Push `trusted-server.toml` as a blob envelope through `EdgeZero`                                 | `ts config push [OPTIONS] --adapter <ADAPTER>`                                                                 |
+| `ts config validate`             | Linux + macOS | Validate `edgezero.toml` and the typed Trusted Server config                                     | `ts config validate [OPTIONS]`                                                                                 |
+| `ts deploy`                      | Linux + macOS | Deploy the project through a target adapter                                                      | `ts deploy [OPTIONS] --adapter <ADAPTER> [-- <ADAPTER_ARGS>...]`                                               |
+| `ts dev`                         | Linux + macOS | Local developer tools (e.g. the macOS-only production-hostname proxy)                            | `ts dev`                                                                                                       |
+| `ts dev proxy`                   | macOS only    | Run the local production-hostname dev proxy (macOS only)                                         | `ts dev proxy [OPTIONS] [COMMAND]`                                                                             |
+| `ts dev proxy ca`                | macOS only    | Manage the per-machine dev CA                                                                    | `ts dev proxy ca <COMMAND>`                                                                                    |
+| `ts dev proxy ca install`        | macOS only    | Add the CA to the OS trust store (macOS login keychain)                                          | `ts dev proxy ca install`                                                                                      |
+| `ts dev proxy ca path`           | macOS only    | Print the per-machine CA certificate path                                                        | `ts dev proxy ca path`                                                                                         |
+| `ts dev proxy ca regenerate`     | macOS only    | Regenerate the per-machine CA (invalidates prior trust)                                          | `ts dev proxy ca regenerate`                                                                                   |
+| `ts dev proxy ca uninstall`      | macOS only    | Remove the CA from the OS trust store                                                            | `ts dev proxy ca uninstall`                                                                                    |
+| `ts healthcheck`                 | Linux + macOS | Probe a deployed version until it reports healthy                                                | `ts healthcheck [OPTIONS] --adapter <ADAPTER> --domain <DOMAIN> --service-id <SERVICE_ID> --version <VERSION>` |
+| `ts prebid`                      | Linux + macOS | Trusted Server Prebid commands                                                                   | `ts prebid <COMMAND>`                                                                                          |
+| `ts prebid client`               | Linux + macOS | Generate a local external Prebid client bundle and update config metadata                        | `ts prebid client [OPTIONS]`                                                                                   |
+| `ts prebid server`               | Linux + macOS | Configure and operate a self-hosted Prebid Server deployment                                     | `ts prebid server [OPTIONS] <COMMAND>`                                                                         |
+| `ts prebid server inspect`       | Linux + macOS | Inspect local Trusted Server configuration without modifying it or contacting AWS                | `ts prebid server inspect [OPTIONS]`                                                                           |
+| `ts prebid server check`         | Linux + macOS | Validate declared PBS inputs and regional YAML merges locally, without AWS access                | `ts prebid server check [OPTIONS] --deployment <DEPLOYMENT>`                                                   |
+| `ts prebid server status`        | Linux + macOS | Read EC2 infrastructure status, not PBS health or the installed release                          | `ts prebid server status [OPTIONS] --deployment <DEPLOYMENT>`                                                  |
+| `ts prebid server secrets`       | Linux + macOS | Manage values for existing, explicitly declared Secrets Manager secrets                          | `ts prebid server secrets [OPTIONS] <COMMAND>`                                                                 |
+| `ts prebid server secrets set`   | Linux + macOS | Write a complete JSON credential payload; does not deploy or rotate partner credentials          | `ts prebid server secrets set [OPTIONS] --deployment <DEPLOYMENT> --region <REGION> <BIDDER>`                  |
+| `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                            | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                    | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
+| `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
+
 ## Install from source
 
 From the repository root, install the `ts` binary with the workspace Cargo alias:
@@ -70,6 +122,13 @@ overlay only overrides leaves already present in the TOML; add newly introduced
 fields to existing configs before relying on their overrides. Pass `--no-env`
 for file-only operation. See [Configuration](/guide/configuration#environment-variable-overrides-typed-cli)
 for migration and rollback guidance.
+
+`config diff`, `config push --dry-run`, and the confirmation preview shown by
+`config push` render resolved app-config values. Store-backed secret fields are
+key names at this stage, but deliberately inline values such as
+`trusted_client_ip.shared_secret` can appear verbatim. Use `--no-diff` for a
+push when terminal output or CI logs are not an approved place for inline
+configuration secrets; `--no-diff` does not change validation or publication.
 
 `config push` publishes a single EdgeZero `BlobEnvelope` containing the validated
 Trusted Server settings JSON. This blob model is intentional because full
@@ -608,35 +667,162 @@ APIs.
 
 ## Generate an external Prebid bundle
 
-`ts prebid bundle` builds the local external Prebid browser bundle configured in
+`ts prebid client` builds the local external Prebid browser bundle configured in
 `trusted-server.toml`.
 
+> This command was previously `ts prebid bundle`. Update scripts and runbooks to
+> use `ts prebid client` with the same arguments. The old spelling is retired and
+> is not accepted as an alias.
+
 ```toml
-[integrations.prebid.bundle]
-adapters = ["rubicon", "kargo"]
-user_id_modules = ["sharedIdSystem"]
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
 ```
+
+Module values are exact upstream Prebid filename stems without `.js`. The
+`bidder` list is required and cannot be empty. Omit `user_id` to use the curated
+default preset, or set it to `[]` to select none. Omitted and empty `analytics`
+lists both select no analytics adapters.
 
 Run the command after installing JS dependencies:
 
 ```bash
 cd crates/trusted-server-js/lib && npm ci
 cd ../../..
-ts prebid bundle
+ts prebid client
 ```
 
-By default, generated artifacts are written to `dist/prebid/`, and the command
-updates `integrations.prebid.external_bundle_sha256` and
-`integrations.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
-generated JavaScript file yourself, set `external_bundle_url` to its HTTPS
-asset URL, and include that host (plus any redirect targets) in
+By default, generated artifacts are written to `dist/prebid/`. The versioned
+manifest records effective module selections, bidder and analytics runtime
+codes, the content-addressed filename, SHA-256, and SRI. The command copies the
+hash and SRI into `integrations.prebid` only after the generator and manifest
+both pass validation.
+
+Upload the generated JavaScript file yourself, set `external_bundle_url` to its
+HTTPS asset URL, and include that host plus any redirect targets in
 `proxy.allowed_domains` before running `ts config validate` or `ts config push`.
 
 Use custom paths when needed:
 
 ```bash
-ts prebid bundle --config publisher-a.toml --out build/prebid
+ts prebid client --config publisher-a.toml --out build/prebid
 ```
 
-`ts prebid bundle` is local-only. It has no `--adapter` option and does not
+`ts prebid client` is local-only. It has no `--adapter` option and does not
 upload, provision, deploy, or push config.
+
+## Operate a self-hosted Prebid Server
+
+The experimental `ts prebid server` namespace supports four bounded operations:
+
+- `inspect` reads selected local Trusted Server configuration.
+- `check` validates a deployment descriptor and regional configuration locally.
+- `secrets set` writes one approved value to an existing AWS Secrets Manager secret.
+- `status` reads declared EC2 infrastructure state, not PBS health or readiness.
+
+AWS operations require AWS CLI v2 on `PATH`; `inspect` and `check` do not contact
+AWS. Add `--json` anywhere under `ts prebid server` for machine-readable output.
+Failures use exit code 2, including incomplete `status` reports that still write
+partial JSON to stdout.
+
+### Deployment descriptor and bindings
+
+Pass an explicit `--deployment <file>`; there is no automatic discovery or
+production default. This fictional descriptor is suitable only for local checks:
+
+```yaml
+schema_version: 1
+environment: sandbox
+runtime: ec2-compose
+aws:
+  account_id: '123456789012'
+  profile: pbs-sandbox
+pbs:
+  config: pbs.yaml
+  image: registry.example.com/pbs@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  bindings: bindings.json
+regions:
+  us-east-1:
+    instance_ids:
+      - i-0123456789abcdef0
+    overrides: east.yaml
+```
+
+Version 1 requires an explicit environment, `ec2-compose` runtime, 12-digit AWS
+account ID, AWS CLI profile, digest-pinned image, baseline YAML path, and nonempty
+region map. Environment and bidder identifiers use letters, digits, underscores,
+and hyphens; profile names may also contain periods. Instance IDs are optional,
+but `status` needs explicitly listed instances to report infrastructure health.
+Regional override paths and `pbs.bindings` are optional. Omit bindings when no
+host secrets are needed.
+
+Paths resolve relative to the descriptor. Unknown schema fields, duplicate YAML
+keys, tags, and implicit YAML merge keys are rejected. Regional mappings merge
+recursively over the baseline; sequences and scalars replace whole values. The
+CLI validates in memory and writes no rendered files.
+
+The binding file is a JSON or YAML mapping keyed by bidder identifier. Each
+entry requires:
+
+- `verified_image`, exactly matching the descriptor's image.
+- `source`, an HTTPS reference used by the operator to verify the mapping.
+- `secrets`, a complete Secrets Manager ARN for each descriptor region, matching
+  its account and region. Each secret must belong to only one bidder binding.
+- `keys`, mapping credential names to an environment variable `env`, a YAML path
+  array `pbs_path`, and optional `required`, which defaults to true.
+
+For example, a key mapping can be:
+
+```json
+{
+  "api_key": {
+    "env": "PBS_ADAPTERS_EXAMPLEBIDDER_API_KEY",
+    "pbs_path": ["adapters", "examplebidder", "api_key"],
+    "required": true
+  }
+}
+```
+
+Bindings support string-valued credentials. Environment variables and YAML
+destinations must not conflict across bindings or with values already present in
+the resolved YAML. These are operator-supplied mappings, not a verified adapter
+catalog. `check` does not validate the complete upstream PBS schema, verify
+bidder authorization, retrieve secrets, pull images, or prove application health.
+
+### Secret-write safeguards
+
+`secrets set` replaces the complete JSON value of an existing declared secret.
+It does not create secret metadata, deploy PBS, refresh a container, or rotate a
+bidder's credential. Use a trusted host and short-lived AWS credentials. Obtain
+separate approval for each target and value write.
+
+Before writing, the CLI verifies the account through STS, describes the declared
+secret, rejects replicas and secrets scheduled for deletion, and checks both the
+selected profile's and default AWS CLI history settings. History must be disabled
+or unset. Provider stderr is withheld and configured API endpoint overrides are
+disabled.
+
+Interactive use reads JSON in a hidden terminal prompt and requires typing
+`yes`. For approved automation, use `--file <path>` or `--stdin` with `--yes` and
+an explicit `--request-token <UUID>`. The payload must contain only declared keys,
+include required nonempty string values, and fit the Secrets Manager size limit.
+Duplicate keys and non-string values are rejected.
+
+Secret contents do not enter arguments or reports. The AWS request goes through a
+tool-owned temporary file, owner-only on Unix, removed on normal success and
+error paths. Abrupt termination can leave that file behind; Windows temporary-file
+ACLs have not been verified. Operator-provided input files are never deleted.
+Input-file errors print the full escaped path to stderr, including under `--json`.
+Keep sensitive directory and partner names out of public logs.
+
+A successful write reports its version identifier, not runtime readiness. A failed
+or unverifiable response means the outcome may be uncertain. Preserve the request
+UUID and input. Reuse that UUID only with the original identical payload; use a
+new UUID only for a separately intended update. Do not retry changed values under
+the same UUID. `--yes` authorizes only this write, not deployment or future writes.
+
+See the
+[experimental PBS command reference](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-cli/README.md)
+for complete binding fixtures, command examples, and remaining runtime limits.

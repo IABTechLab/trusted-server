@@ -72,6 +72,16 @@ edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }
+
+[build-dependencies]
+# tests/template_build_digest.rs includes build.rs, so its dependencies must also
+# be available through normal or dev-dependencies.
+edgezero-core = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
 [[bench]]
 name = "consent_decode"
 harness = false

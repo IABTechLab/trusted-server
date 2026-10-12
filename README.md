@@ -1,8 +1,6 @@
 # Trusted Server
 
-Trusted Server is an open-source, cloud based orchestration framework and runtime for publishers. It moves code execution and operations that traditionally occurs in browsers (via 3rd party JS) to secure, zero-cold-start WASM binaries running in WASI supported environments.
-
-Trusted Server is the new execution layer for the open-web, returning control of 1st party data, security, and overall user-experience back to publishers.
+Trusted Server is an open-source edge runtime from IAB Tech Lab that acts as a hyper-intelligent reverse proxy for publishers. It can sit at the CDN perimeter or behind the publisher's existing CDN as a backend in front of origin. Every page and ad request passes through it, so Trusted Server sees the content and the ad stack in the same request path and can act on both at once. It gives publishers a durable first-party identifier and stronger signal in restrictive browser environments (like Safari), auctions that run server-side at the edge instead of in the browser, and fewer third-party scripts on the page. It needs little or no change to the publisher's CMS or monetization stack. Trusted Server is written in Rust and compiled to WebAssembly. Through EdgeZero, one codebase runs on Fastly Compute, Cloudflare Workers and Akamai’s Spin, or as a native Axum server for container-based deployments.
 
 ## Documentation
 
@@ -82,9 +80,14 @@ cargo test-fastly      # Fastly/WASM (requires Viceroy)
 cargo test-axum        # Axum native adapter
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter (native host)
+
+# Install the pre-commit URL-host linter hook (once per checkout)
+ts dev install-hooks
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+Contributors should run `ts dev install-hooks` to enable the pre-commit
+URL-host linter; see [CONTRIBUTING.md](CONTRIBUTING.md) for that and the rest of
+the contribution guidelines.
 
 ## License
 

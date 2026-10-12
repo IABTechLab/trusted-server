@@ -51,9 +51,9 @@ accounts and harmless for single-service ones, so prefer it by default.
 
 ## Notes
 
-- The `ts` CLI runs from source without installing: `cargo run -p
-  trusted-server-cli -- config <args>` (binary name `ts`), or install it with
-  `cargo install --path crates/trusted-server-cli`.
+- The `ts` CLI runs from source without installing:
+  `cargo run -p trusted-server-cli -- config <args>` (binary name `ts`), or
+  install it with `cargo install --path crates/trusted-server-cli`.
 - The app-config store's logical id and blob key are `trusted_server_config`
   (`settings_data.rs` `DEFAULT_CONFIG_STORE_ID`, `config_payload.rs`
   `CONFIG_BLOB_KEY`); older builds used `app_config`. The override env-var key

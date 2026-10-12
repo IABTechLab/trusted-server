@@ -185,6 +185,36 @@
     return true;
   }
 
+  function schedulePendingRenderDiagnostic(claim) {
+    var startedAt = Date.now();
+    window.setTimeout(function () {
+      if (
+        !ts.firstImpression ||
+        ts.firstImpression.slots[claim.slotElementId] !== claim ||
+        claim.generation !== (ts.navGeneration || 0) ||
+        !claim.element.isConnected ||
+        document.getElementById(claim.slotElementId) !== claim.element ||
+        claim.owner !== "trusted_server" ||
+        claim.phase === "rendered"
+      )
+        return;
+      var diagnostic = { phase: claim.phase, ageMs: Date.now() - startedAt };
+      claim.pendingRenderDiagnostic = diagnostic;
+      try {
+        if (ts.log && ts.log.debug) {
+          ts.log.debug("[tsjs-gpt] initial render remains pending", {
+            slot: claim.slotElementId,
+            generation: claim.generation,
+            phase: diagnostic.phase,
+            ageMs: diagnostic.ageMs,
+          });
+        }
+      } catch (error) {
+        // Optional logging must never affect initial ownership or delivery.
+      }
+    }, FIRST_IMPRESSION_LEASE_MS);
+  }
+
   function claimFirstImpressionForTrustedServer(element) {
     var now = Date.now();
     var state = firstImpressionState(now);
@@ -199,10 +229,13 @@
       if (!canTransitionPublisherFallback) return null;
       existing.owner = "trusted_server";
       existing.phase = "delivery_pending";
-      existing.expiresAt = now + FIRST_IMPRESSION_LEASE_MS;
+      // Deliberately unbounded, matching first_impression.ts: only render,
+      // navigation, or element replacement ends TS initial ownership.
+      existing.expiresAt = Number.POSITIVE_INFINITY;
       Object.keys(existing.publisherAuctions || {}).forEach(function (token) {
         existing.publisherAuctions[token].suppressDelivery = true;
       });
+      schedulePendingRenderDiagnostic(existing);
       return existing;
     }
     var claim = {
@@ -211,10 +244,13 @@
       element: element,
       owner: "trusted_server",
       phase: "delivery_pending",
-      expiresAt: now + FIRST_IMPRESSION_LEASE_MS,
+      // Unbounded by contract; see the fallback transition above.
+      expiresAt: Number.POSITIVE_INFINITY,
       publisherAuctions: {},
     };
-    return storeFirstImpressionClaim(state, claim) ? claim : null;
+    if (!storeFirstImpressionClaim(state, claim)) return null;
+    schedulePendingRenderDiagnostic(claim);
+    return claim;
   }
 
   function releaseTrustedServerFirstImpressionClaim(element, claim) {
@@ -259,10 +295,10 @@
             });
             return;
           }
-          claim.phase = phase;
+          if (claim.phase !== "rendered") claim.phase = phase;
           if (claim.owner === "publisher") {
             claim.expiresAt = Number.POSITIVE_INFINITY;
-          } else {
+          } else if (phase === "rendered") {
             claim.publisherRegistrationClosed = true;
           }
         };
