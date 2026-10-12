@@ -1519,7 +1519,7 @@ fn deploy_validation_refuses_a_misshapen_entry() {
 }
 
 #[test]
-fn the_making_entry_is_the_first_with_a_path_covering_the_request_that_names_a_middleware() {
+fn the_making_entry_has_a_path_covering_the_request_and_names_a_middleware() {
     let entries = PhaseEntries::new(vec![
         PhaseEntry {
             media_type: "text/plain".to_owned(),
@@ -1555,24 +1555,25 @@ fn the_making_entry_is_the_first_with_a_path_covering_the_request_that_names_a_m
 fn what_is_prepared_is_taken_once_by_name_and_as_its_type() {
     let prepared = Prepared::default();
     assert!(prepared.is_empty());
-    prepared.insert("example.one", Box::new(String::from("one")));
-    prepared.insert("example.two", Box::new(7_u32));
+    let fetch = MiddlewarePhase::Fetch;
+    prepared.insert(fetch, "example.one", Box::new(String::from("one")));
+    prepared.insert(fetch, "example.two", Box::new(7_u32));
 
     assert_eq!(
-        prepared.take::<u32>("example.one"),
+        prepared.take::<u32>(fetch, "example.one"),
         None,
         "should leave a value of another type where it is"
     );
     assert_eq!(
-        prepared.take::<String>("example.one").as_deref(),
+        prepared.take::<String>(fetch, "example.one").as_deref(),
         Some("one")
     );
     assert_eq!(
-        prepared.take::<String>("example.one"),
+        prepared.take::<String>(fetch, "example.one"),
         None,
         "should give what was prepared once"
     );
-    assert_eq!(prepared.take::<u32>("example.two"), Some(7));
+    assert_eq!(prepared.take::<u32>(fetch, "example.two"), Some(7));
     assert!(prepared.is_empty());
 }
 
@@ -1600,8 +1601,7 @@ impl Middleware for Prepares {
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
         let prepared: String = context
-            .prepared
-            .take("example.prepares")
+            .take_prepared("example.prepares")
             .unwrap_or_else(|| "nothing prepared".to_owned());
         MiddlewareAction {
             head_inserts: vec![prepared],
@@ -1688,6 +1688,83 @@ async fn a_chain_keeps_what_each_middleware_prepares_under_its_name() {
     );
 }
 
+/// Prepares the phase it is called in, and writes it into the head.
+struct PreparesItsPhase;
+
+impl Middleware for PreparesItsPhase {
+    fn middleware_id(&self) -> &'static str {
+        "example.both"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &MiddlewarePhase::ALL
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        _call: ModuleCall<'a>,
+        context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let phase = context.phase.to_string();
+        Some(Box::pin(async move {
+            Ok(Box::new(phase) as Box<dyn Any + Send>)
+        }))
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec![
+                context
+                    .take_prepared::<String>("example.both")
+                    .unwrap_or_else(|| "nothing prepared".to_owned()),
+            ],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_middleware_preparing_in_both_phases_keeps_what_each_phase_prepared() {
+    let prepared = Prepared::default();
+    let document_state = IntegrationDocumentState::default();
+    let chains: Vec<(MiddlewarePhase, MiddlewareChain)> = MiddlewarePhase::ALL
+        .into_iter()
+        .map(|phase| {
+            (
+                phase,
+                MiddlewareChain::new(phase, HTML_MEDIA_TYPE, vec![Arc::new(PreparesItsPhase)]),
+            )
+        })
+        .collect();
+    // A document that is not stored is prepared in both phases before
+    // either phase is planned, so both preparations share one store.
+    for (phase, chain) in &chains {
+        let context = MiddlewareContext {
+            prepared: &prepared,
+            ..test_support::context(*phase, &document_state)
+        };
+        chain
+            .prepare(ModuleContext::empty(), &context)
+            .await
+            .expect("should prepare");
+    }
+    let mut plans = Vec::new();
+    for (phase, chain) in &chains {
+        let context = MiddlewareContext {
+            prepared: &prepared,
+            ..test_support::context(*phase, &document_state)
+        };
+        plans.push(chain.plan(&context).expect("should plan").head_inserts);
+    }
+
+    assert_eq!(
+        plans,
+        vec![vec!["fetch".to_owned()], vec!["serve".to_owned()]],
+        "should hand each phase what was prepared in it"
+    );
+    assert!(prepared.is_empty(), "should have given every preparation");
+}
+
 #[tokio::test]
 async fn the_first_refusal_ends_the_preparation() {
     let chain = MiddlewareChain::new(
@@ -1727,6 +1804,37 @@ fn an_html_entry_with_a_path_makes_nothing() {
     assert!(
         entries.making("/news/missing").is_none(),
         "should leave a page the origin does not have as the origin's answer"
+    );
+}
+
+#[test]
+fn the_entry_with_the_longest_covering_path_makes_the_file() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/css".to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec!["example.styles".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/plain"),
+        "should make the file from the entry for its own path, not one written ahead for every path"
+    );
+    assert_eq!(
+        entries
+            .making("/site.css")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/css"),
+        "should still make a file only the shorter path covers"
     );
 }
 

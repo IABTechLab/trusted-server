@@ -1894,14 +1894,15 @@ about HTML, and a middleware that makes one there is refused by name. The
 template cache stores HTML alone, so the fetch entry's middleware and then
 the serve entry's run on each response as it is fetched.
 
-**A file the origin does not have.** When the origin answers `404 Not
-Found` for a path under the `path` of a `[[fetch]]` entry for a media type
-other than HTML, that entry's middleware runs on an empty document of its
-media type and its output is the file, so `ads.txt` is made from the sellers
-lines alone where the publisher has none. With no such entry, or on any
-other answer from the origin, the origin's answer stands, and an entry for
-HTML or without a path makes nothing, because a page the origin does not
-have is the origin's answer.
+**A file the origin does not have.** When the origin answers `404 Not Found`
+for a path under the `path` of a `[[fetch]]` entry for a media type other
+than HTML, that entry's middleware runs on an empty document of its media
+type and its output is the file, so `ads.txt` is made from the sellers lines
+alone where the publisher has none. Where several such entries cover the
+path, the one with the longest `path` makes the file. With no such entry, or
+on any other answer from the origin, the origin's answer stands, and an
+entry for HTML or without a path makes nothing, because a page the origin
+does not have is the origin's answer.
 
 ```toml
 [[fetch]]

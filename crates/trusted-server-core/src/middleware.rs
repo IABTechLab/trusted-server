@@ -152,6 +152,15 @@ pub struct MiddlewareContext<'a> {
     pub prepared: &'a Prepared,
 }
 
+impl MiddlewareContext<'_> {
+    /// What the middleware named `id` prepared for this phase, see
+    /// [`Prepared::take`].
+    #[must_use]
+    pub fn take_prepared<T: Any>(&self, id: &str) -> Option<T> {
+        self.prepared.take(self.phase, id)
+    }
+}
+
 /// One attribute of one matched element, as a handler is asked about it.
 #[derive(Debug, Clone, Copy)]
 pub struct MatchedAttribute<'a> {
@@ -388,27 +397,34 @@ impl Refusal {
 /// [`Middleware::prepare`].
 pub type Preparation<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, Refusal>> + 'a>>;
 
-/// What the middleware of one document prepared, each under its own name,
-/// for its `create` to take.
+/// What the middleware of one document prepared, each under its own name
+/// and phase, for its `create` in that phase to take.
 #[derive(Default)]
-pub struct Prepared(Mutex<HashMap<&'static str, Box<dyn Any + Send>>>);
+pub struct Prepared(Mutex<PreparedValues>);
+
+/// What each middleware prepared, under its phase and name.
+type PreparedValues = HashMap<(MiddlewarePhase, &'static str), Box<dyn Any + Send>>;
 
 impl Prepared {
-    /// Keeps what the middleware named `id` prepared.
-    pub fn insert(&self, id: &'static str, value: Box<dyn Any + Send>) {
-        self.lock().insert(id, value);
+    /// Keeps what the middleware named `id` prepared in `phase`.
+    pub fn insert(&self, phase: MiddlewarePhase, id: &'static str, value: Box<dyn Any + Send>) {
+        self.lock().insert((phase, id), value);
     }
 
-    /// What the middleware named `id` prepared, as the type it prepared,
-    /// taken out so it is used once. `None` when it prepared nothing or
-    /// something of another type.
+    /// What the middleware named `id` prepared in `phase`, as the type it
+    /// prepared, taken out so it is used once. `None` when it prepared
+    /// nothing or something of another type.
     #[must_use]
-    pub fn take<T: Any>(&self, id: &str) -> Option<T> {
+    pub fn take<T: Any>(&self, phase: MiddlewarePhase, id: &str) -> Option<T> {
         let mut values = self.lock();
-        if !values.get(id)?.is::<T>() {
+        let key = values
+            .keys()
+            .find(|(at, name)| *at == phase && *name == id)
+            .copied()?;
+        if !values.get(&key)?.is::<T>() {
             return None;
         }
-        let value = values.remove(id)?;
+        let value = values.remove(&key)?;
         value.downcast::<T>().ok().map(|value| *value)
     }
 
@@ -418,14 +434,18 @@ impl Prepared {
         self.lock().is_empty()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<&'static str, Box<dyn Any + Send>>> {
+    fn lock(&self) -> MutexGuard<'_, PreparedValues> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl fmt::Debug for Prepared {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = self.lock().keys().copied().collect();
+        let names: Vec<String> = self
+            .lock()
+            .keys()
+            .map(|(phase, name)| format!("{phase} {name}"))
+            .collect();
         formatter
             .debug_struct("Prepared")
             .field("names", &names)
@@ -559,19 +579,29 @@ impl PhaseEntries {
     }
 
     /// The entry that makes the document the origin does not have at
-    /// `path`, being the first with a path prefix covering it that names a
-    /// middleware, for a media type core streams other than HTML.
+    /// `path`, being the one with the longest path prefix covering it that
+    /// names a middleware, for a media type core streams other than HTML. The
+    /// first written wins between two of the same length.
     #[must_use]
     pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
-        self.0.iter().find(|entry| {
-            entry.media_type != HTML_MEDIA_TYPE
-                && is_dispatched_media_type(&entry.media_type)
-                && entry
-                    .path
-                    .as_deref()
-                    .is_some_and(|prefix| path.starts_with(prefix))
-                && !entry.middleware.is_empty()
-        })
+        self.0
+            .iter()
+            .filter(|entry| {
+                entry.media_type != HTML_MEDIA_TYPE
+                    && is_dispatched_media_type(&entry.media_type)
+                    && entry
+                        .path
+                        .as_deref()
+                        .is_some_and(|prefix| path.starts_with(prefix))
+                    && !entry.middleware.is_empty()
+            })
+            .fold(None, |best: Option<&PhaseEntry>, entry| {
+                let length = |entry: &PhaseEntry| entry.path.as_deref().map_or(0, str::len);
+                match best {
+                    Some(best) if length(best) >= length(entry) => Some(best),
+                    _ => Some(entry),
+                }
+            })
     }
 
     /// Checks each entry's media type, path and names, and that no entry is
@@ -767,7 +797,7 @@ impl MiddlewareChain {
             let call = module_context.call(id, middleware.required_permissions());
             if let Some(preparation) = middleware.prepare(call, context) {
                 let value = preparation.await?;
-                context.prepared.insert(id, value);
+                context.prepared.insert(context.phase, id, value);
             }
         }
         Ok(())
