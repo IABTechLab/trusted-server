@@ -215,24 +215,10 @@ pub(crate) fn apply_finalize_headers(
 
     apply_git_version_header(response);
 
-    // Remove an inherited origin value when the version is unknown so it is
-    // never reported as ours.
-    match std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        Ok(v) => match HeaderValue::from_str(&v) {
-            Ok(value) => {
-                response
-                    .headers_mut()
-                    .insert(HEADER_X_TS_FASTLY_VERSION, value);
-            }
-            Err(_) => {
-                log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
-                response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
-            }
-        },
-        Err(_) => {
-            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
-        }
-    }
+    apply_fastly_version_header(
+        std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
+        response,
+    );
 
     if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
         response
@@ -263,6 +249,25 @@ pub(crate) use trusted_server_core::response_privacy::{
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Sets `X-TS-Fastly-Version` to `service_version`, or removes an inherited
+/// value when the version is unset or invalid, so it is never reported as ours.
+fn apply_fastly_version_header(service_version: Option<&str>, response: &mut Response) {
+    match service_version.map(HeaderValue::from_str) {
+        Some(Ok(value)) => {
+            response
+                .headers_mut()
+                .insert(HEADER_X_TS_FASTLY_VERSION, value);
+        }
+        Some(Err(_)) => {
+            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
+        }
+        None => {
+            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -854,5 +859,23 @@ mod tests {
             std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
             "should report FASTLY_SERVICE_VERSION as x-ts-fastly-version"
         );
+    }
+
+    #[test]
+    fn fastly_version_header_removes_inherited_value_when_unknown() {
+        for service_version in [None, Some("bad\nvalue")] {
+            let mut response = empty_response();
+            response.headers_mut().insert(
+                HEADER_X_TS_FASTLY_VERSION,
+                HeaderValue::from_static("origin-value"),
+            );
+
+            apply_fastly_version_header(service_version, &mut response);
+
+            assert!(
+                response.headers().get(HEADER_X_TS_FASTLY_VERSION).is_none(),
+                "should remove an inherited x-ts-fastly-version for {service_version:?}"
+            );
+        }
     }
 }
