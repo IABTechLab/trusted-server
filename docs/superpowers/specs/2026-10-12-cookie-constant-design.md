@@ -10,7 +10,7 @@
 
 ## 1. Problem
 
-`COOKIE_MTM_PREF`, the name of the cookie a preference platform writes the Model Terms for Marketing preference into, sits in core's constants. The Model Terms permission signal module, `crates/permission-signal/mtm`, is the only code that reads it. The cookie is particular to that one implementation of a permission signal. It is not a standard core supports, and nothing in core should know its name.
+`COOKIE_MTM_PREF`, the name of the cookie a preference platform writes the Model Terms for Marketing preference into, sits in core's constants. It is not in `main` today. It arrived with the stack's own Model Terms signal module, in the pull request that adds the module documentation set (#1047), so this corrects a slip the stack made earlier in itself rather than anything in `main`, and the reason is elegance alone, that core should name no one implementation's cookie. The Model Terms permission signal module, `crates/permission-signal/mtm`, is the only code that reads it. The cookie is particular to that one implementation of a permission signal. It is not a standard core supports, and nothing in core should know its name.
 
 ## 2. Design
 
