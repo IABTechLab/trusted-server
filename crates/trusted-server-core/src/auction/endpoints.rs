@@ -20,6 +20,9 @@ use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::integrations::id5::{
+    ID5_SOURCE, Id5AuctionState, Id5FetchInput, Id5InFlight, Id5Outcome,
+};
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::request_timing::RequestTimings;
@@ -337,6 +340,18 @@ pub async fn handle_auction(
     } else {
         None
     };
+    // Server-side ID5: decide whether to fetch before the server cookie's ID5
+    // entry joins the client set, so a browser-supplied ID5 EID still wins.
+    let id5 = Id5AuctionState::load(settings, &http_req, ec_id.is_some());
+    let id5_should_fetch = id5
+        .as_ref()
+        .is_some_and(|state| state.should_fetch(client_eids.as_deref()));
+    let mut client_eids = match id5.as_ref().and_then(Id5AuctionState::cookie_eid) {
+        Some(eid) if !has_id5_eid(client_eids.as_deref()) => {
+            merge_auction_eids(client_eids, Some(vec![eid.clone()]))
+        }
+        _ => client_eids,
+    };
     // Carry the full request-local EID set to response finalization so KV
     // ingestion uses what this request actually sent, not just whatever fits
     // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
@@ -380,6 +395,41 @@ pub async fn handle_auction(
         ec_id.as_deref(),
         geo,
     )?;
+
+    // Start the ID5 fetch once the sanitized page URL is known. Blocking mode
+    // waits here, bounded by the ID5 backend timeout; parallel mode returns a
+    // pending request that is collected after the auction.
+    let mut id5_in_flight = None;
+    if let Some(state) = id5.as_ref().filter(|_| id5_should_fetch) {
+        let user_agent = http_req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok());
+        let page_url = auction_request
+            .site
+            .as_ref()
+            .map_or("", |site| site.page.as_str());
+        let input = Id5FetchInput {
+            consent: ec_context.consent(),
+            page_url,
+            client_ip: services.client_info().client_ip,
+            user_agent,
+        };
+        id5_in_flight = Some(state.begin(services, &input).await);
+    }
+    let mut id5_outcome = None;
+    let id5_pending = match id5_in_flight {
+        Some(Id5InFlight::Done(outcome)) => {
+            if let Id5Outcome::Issued { eid, .. } = &outcome {
+                let eids = with_id5_eid(client_eids, eid);
+                ec_context.set_client_eids(eids.clone());
+                client_eids = Some(eids);
+            }
+            id5_outcome = Some(outcome);
+            None
+        }
+        pending => pending,
+    };
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
@@ -440,6 +490,19 @@ pub async fn handle_auction(
         }
     };
 
+    // Collect a parallel ID5 fetch. It ran alongside the bidders, so it adds
+    // latency only when ID5 is slower than the auction. A fetched ID is not in
+    // this auction's bids; it reaches KV through finalization and later
+    // auctions through the server cookie.
+    if let Some(in_flight) = id5_pending {
+        let outcome = Id5AuctionState::finish(services, in_flight).await;
+        if let Id5Outcome::Issued { eid, .. } = &outcome {
+            let eids = with_id5_eid(ec_context.client_eids().map(<[Eid]>::to_vec), eid);
+            ec_context.set_client_eids(eids);
+        }
+        id5_outcome = Some(outcome);
+    }
+
     let conversion = match convert_to_openrtb_response_with_trace(
         &result,
         settings,
@@ -490,7 +553,11 @@ pub async fn handle_auction(
         result.total_time_ms
     );
 
-    Ok(retain_private_trace(conversion.response, trace))
+    let mut response = conversion.response;
+    if let (Some(state), Some(outcome)) = (id5.as_ref(), id5_outcome.as_ref()) {
+        state.apply_cookies(settings, outcome, &mut response);
+    }
+    Ok(retain_private_trace(response, trace))
 }
 
 fn capture_api_trace(
@@ -525,6 +592,18 @@ fn retain_private_trace(
         response.extensions_mut().insert(trace);
     }
     response
+}
+
+fn has_id5_eid(eids: Option<&[Eid]>) -> bool {
+    eids.is_some_and(|eids| eids.iter().any(|eid| eid.source == ID5_SOURCE))
+}
+
+/// Replaces any ID5 entry in `eids` with a freshly fetched one.
+fn with_id5_eid(eids: Option<Vec<Eid>>, fetched: &Eid) -> Vec<Eid> {
+    let mut eids = eids.unwrap_or_default();
+    eids.retain(|eid| eid.source != ID5_SOURCE);
+    eids.push(fetched.clone());
+    eids
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -1717,6 +1796,219 @@ mod tests {
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("capture-backend".to_string())
         }
+    }
+
+    /// Provider that records the EIDs it was offered and returns no bids
+    /// without any upstream request, so the only outbound call is ID5's.
+    struct EidRecordingProvider {
+        eids: Arc<Mutex<Option<Vec<Eid>>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for EidRecordingProvider {
+        fn provider_name(&self) -> &str {
+            "eid_recording_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.eids.lock().expect("should lock recorded eids") = request.user.eids.clone();
+            Ok(ProviderRequestOutcome::Immediate(AuctionResponse::success(
+                self.provider_name(),
+                Vec::new(),
+                0,
+            )))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run for an immediate outcome");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            None
+        }
+    }
+
+    struct Id5AuctionRun {
+        bidder_eids: Option<Vec<Eid>>,
+        set_cookies: Vec<String>,
+        finalize_eids: Option<Vec<Eid>>,
+        id5_calls: usize,
+    }
+
+    async fn run_id5_auction(mode: &str, cookie: Option<&str>) -> Id5AuctionRun {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "id5",
+                &json!({"enabled": true, "partner": 173, "mode": mode}),
+            )
+            .expect("should insert ID5 config");
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_recording_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let recorded = Arc::new(Mutex::new(None));
+        orchestrator.register_provider(Arc::new(EidRecordingProvider {
+            eids: Arc::clone(&recorded),
+        }));
+        let client = Arc::new(StubHttpClient::new());
+        client.push_response(
+            200,
+            serde_json::to_vec(&json!({
+                "signature": "ID5_synthetic-signature",
+                "universal_uid": "ID5*fetched",
+                "cache_control": {"max_age_sec": 7200},
+                "ids": {"id5id": {"eid": {
+                    "source": "id5-sync.com",
+                    "uids": [{"id": "ID5*fetched", "atype": 1, "ext": {"linkType": 1}}]
+                }}}
+            }))
+            .expect("should serialize ID5 fixture"),
+        );
+        let services = crate::platform::test_support::build_services_with_http_client_and_client_ip(
+            client.clone(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 42)),
+        );
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::USER_AGENT, "Mozilla/5.0 (synthetic)")
+            .header(header::REFERER, "https://test-publisher.com/article");
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        let req = builder
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({"adUnits": [{
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": {"banner": {"sizes": [[300, 250]]}}
+                }]}))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("should complete the auction");
+
+        let set_cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+            .collect();
+        let bidder_eids = recorded.lock().expect("should lock recorded eids").clone();
+        Id5AuctionRun {
+            bidder_eids,
+            set_cookies,
+            finalize_eids: ec_context.client_eids().map(<[Eid]>::to_vec),
+            id5_calls: client.recorded_request_uris().len(),
+        }
+    }
+
+    fn id5_uid(eids: Option<&[Eid]>) -> Option<&str> {
+        eids?
+            .iter()
+            .find(|eid| eid.source == ID5_SOURCE)
+            .map(|eid| eid.uids[0].id.as_str())
+    }
+
+    #[tokio::test]
+    async fn blocking_id5_fetch_reaches_this_auction_and_sets_the_server_cookie() {
+        let run = run_id5_auction("blocking", None).await;
+
+        assert_eq!(run.id5_calls, 1, "should call ID5 once");
+        assert_eq!(
+            id5_uid(run.bidder_eids.as_deref()),
+            Some("ID5*fetched"),
+            "bidders should receive the fetched ID in this auction"
+        );
+        assert_eq!(
+            id5_uid(run.finalize_eids.as_deref()),
+            Some("ID5*fetched"),
+            "finalization should see the fetched ID for KV ingestion"
+        );
+        assert!(
+            run.set_cookies.iter().any(|c| c.starts_with("ts-eids-s=")),
+            "should set the server EID cookie: {:?}",
+            run.set_cookies
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_id5_fetch_skips_this_auction_but_sets_the_server_cookie() {
+        let run = run_id5_auction("parallel", None).await;
+
+        assert_eq!(run.id5_calls, 1, "should call ID5 once");
+        assert_eq!(
+            id5_uid(run.bidder_eids.as_deref()),
+            None,
+            "bidders should not wait for a parallel fetch"
+        );
+        assert_eq!(
+            id5_uid(run.finalize_eids.as_deref()),
+            Some("ID5*fetched"),
+            "finalization should still see the fetched ID for KV ingestion"
+        );
+        assert!(
+            run.set_cookies.iter().any(|c| c.starts_with("ts-eids-s=")),
+            "should set the server EID cookie on the same response: {:?}",
+            run.set_cookies
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_id5_cookie_reaches_the_auction_without_a_fetch() {
+        let cookie_value = BASE64.encode(
+            serde_json::to_vec(&json!([{
+                "source": "id5-sync.com",
+                "uids": [{"id": "ID5*from-cookie", "atype": 1}]
+            }]))
+            .expect("should serialize cookie"),
+        );
+        let cookie = format!("ts-eids-s={cookie_value}; ts-id5-fresh=1");
+
+        let run = run_id5_auction("parallel", Some(&cookie)).await;
+
+        assert_eq!(
+            run.id5_calls, 0,
+            "should not call ID5 while the ID is fresh"
+        );
+        assert_eq!(
+            id5_uid(run.bidder_eids.as_deref()),
+            Some("ID5*from-cookie"),
+            "bidders should receive the ID from the server cookie"
+        );
+        assert!(
+            run.set_cookies.is_empty(),
+            "should not rewrite cookies without a fetch"
+        );
     }
 
     #[tokio::test]
