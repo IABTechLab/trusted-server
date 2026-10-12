@@ -1948,8 +1948,8 @@ default), eligible absolute or protocol-relative asset URLs not excluded by
 rewrite configuration are converted to signed `/first-party/proxy` endpoints.
 `rewrite_clicks` controls click-through links (`<a href>`, `<area href>`)
 separately: when it is unset, it follows `rewrite_creatives`, so existing
-configs keep their current behavior. Any bidder-supplied `<base>` element is
-removed whenever either setting is on. The `POST /auction` path emits
+configs keep their current behavior. Whenever either setting is on, a bidder-supplied `<base>` element
+loses its `href`; it keeps a `target` and is removed when it has none. The `POST /auction` path emits
 root-relative endpoints and, when either setting is on, injects the creative
 TSJS runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
 fragments are the common `adm` shape. The foreign-origin SSAT renderer emits
@@ -2181,8 +2181,9 @@ finishes local decision and delivery. An auction can therefore exceed its
 configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
-markup before delivery. `rewrite_creatives = false` skips first-party URL
-rewriting and creative TSJS injection. See
+markup before delivery. `rewrite_creatives = false` leaves asset URLs
+direct; links still follow `rewrite_clicks`, and creative TSJS is still
+injected when `rewrite_clicks = true`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Environment overrides** replace map leaves that already exist in TOML:

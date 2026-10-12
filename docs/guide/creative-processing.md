@@ -77,7 +77,7 @@ rejected and its `adm` is dropped.
 | -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `false` (default)    | `false`             | Asset URLs stay direct. With `rewrite_clicks` unset or `false`, deliver the creative exactly as the bidder returned it (subject to the size cap); with `rewrite_clicks = true`, wrap links as described in [Assets and clicks](#assets-and-clicks).                                         |
 | `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without asset rewriting. Sanitizer-accepted external resource and inline CSS URLs remain direct; links follow `rewrite_clicks` and stay direct when it is unset or `false`. |
-| `false`              | `true` (default)    | Rewrite eligible resource/CSS URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Links are wrapped unless `rewrite_clicks = false`. Executable markup is preserved.                                                                       |
+| `false`              | `true` (default)    | Rewrite eligible resource/CSS URLs in the raw bidder markup to signed first-party endpoints, dropping any bidder `<base>` URL. Links are wrapped unless `rewrite_clicks = false`. Executable markup is preserved.                                                                           |
 | `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS exactly once, whether or not the bidder supplied a `<body>`; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle.                  |
 
 ::: warning Sanitization blanks script-based creatives
@@ -104,12 +104,12 @@ rewrite_creatives = true
 # rewrite_clicks = false
 ```
 
-| Assets (`rewrite_creatives`) | Clicks (`rewrite_clicks`) | Asset URLs           | Links                                 | `<base>` | TSJS on `POST /auction` |
-| ---------------------------- | ------------------------- | -------------------- | ------------------------------------- | -------- | ----------------------- |
-| `true`                       | `true` or unset           | `/first-party/proxy` | `/first-party/click` + `data-tsclick` | removed  | injected                |
-| `true`                       | `false`                   | `/first-party/proxy` | direct                                | removed  | injected                |
-| `false`                      | `true`                    | direct               | `/first-party/click` + `data-tsclick` | removed  | injected                |
-| `false`                      | `false` or unset          | direct               | direct                                | kept     | not injected            |
+| Assets (`rewrite_creatives`) | Clicks (`rewrite_clicks`) | Asset URLs           | Links                                 | `<base>`       | TSJS on `POST /auction` |
+| ---------------------------- | ------------------------- | -------------------- | ------------------------------------- | -------------- | ----------------------- |
+| `true`                       | `true` or unset           | `/first-party/proxy` | `/first-party/click` + `data-tsclick` | `href` dropped | injected                |
+| `true`                       | `false`                   | `/first-party/proxy` | direct                                | `href` dropped | injected                |
+| `false`                      | `true`                    | direct               | `/first-party/click` + `data-tsclick` | `href` dropped | injected                |
+| `false`                      | `false` or unset          | direct               | direct                                | kept           | not injected            |
 
 SSAT/page-bids follows the same table with absolute URLs and never injects TSJS.
 `exclude_domains` applies to both assets and links.
@@ -117,13 +117,19 @@ SSAT/page-bids follows the same table with absolute URLs and never injects TSJS.
 The client-side `tsCreativeConfig.clickGuard` flag is separate. `rewrite_clicks`
 decides whether the server emits signed click URLs; `clickGuard` decides whether
 the creative runtime re-signs them after creative script changes their query
-parameters. With `rewrite_clicks` off there is nothing for the guard to act on.
+parameters. With `rewrite_clicks` off the guard still installs its listeners but never
+acts, because no link carries `data-tsclick`.
 
 With `rewrite_creatives = false` and `rewrite_clicks = true`, `POST /auction`
-still injects TSJS. A creative that turns on `tsCreativeConfig.renderGuard` can
-therefore still send assets inserted by its own script through
-`/first-party/sign` and `/first-party/proxy`, even though the server left the
-markup's asset URLs direct.
+still injects TSJS, but this does not reopen asset proxying in practice:
+`/auction` creatives render in a sandbox without `allow-same-origin`, so the
+render guard skips `/first-party/sign` and script-inserted assets load direct.
+`/first-party/sign` itself is not gated by `rewrite_creatives`.
+
+Whenever either switch is on, a bidder `<base>` loses its `href` and keeps
+`target`; a `<base>` without `target` is removed. With `rewrite_creatives =
+false` and `rewrite_clicks = true`, relative asset URLs therefore no longer
+resolve against the bidder base, so bidders should use absolute asset URLs.
 
 ::: info Runtime protections inside the sandboxed creative iframe
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
