@@ -1,13 +1,9 @@
-//! Calling a module's process function with its parameters taken from the
-//! request's [`ModuleContext`](super::ModuleContext).
+//! Calling a module's function with its parameters taken from the request's
+//! [`ModuleContext`](super::ModuleContext).
 //!
-//! Core holds modules as trait objects, and a trait object cannot have a
-//! generic method. So each kind of module's trait method takes a
-//! [`ModuleCall`], and the module's implementation of it hands its own process
-//! function to [`ModuleCall::inject`]. That call is generic and is made where
-//! the module's type is known, so nothing is boxed, allocated or copied. This
-//! file is the one place that turns a function's parameters into values from
-//! the context.
+//! A trait method takes a [`ModuleCall`] and the implementation hands its own
+//! function to [`ModuleCall::inject`], which is generic where the module type
+//! is known.
 //!
 //! The function takes the module first, then up to eight parameters, each a
 //! [`FromModuleContext`] value. [`ModuleCall::inject_with`] passes one argument

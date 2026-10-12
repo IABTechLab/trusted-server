@@ -444,8 +444,6 @@ pub fn register(
 }
 
 impl GptIntegration {
-    /// Answers the request, with the settings and the services the route
-    /// names in its module call.
     async fn route(
         &self,
         req: http::Request<EdgeBody>,

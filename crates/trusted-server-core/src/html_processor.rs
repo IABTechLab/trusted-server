@@ -263,16 +263,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 /// `serve` is `None` for a document that may be stored, whose serve chain
 /// runs on each reader's copy instead, through [`create_serve_processor`].
 ///
-/// Each middleware is asked once, here, what it will do with this document.
-/// The state the fetch chain shares is the document's own and holds nothing a
-/// request left, because what that chain writes may be stored and served to
-/// other readers.
-///
-/// A fetch middleware's element handlers are asked after core has moved
-/// the origin's address in an attribute. Its text handlers are handed a chunk
-/// as the handlers before them left it, and its stream processor is handed
-/// what the one before it produced.
-///
 /// # Errors
 ///
 /// When a handler's selector does not parse, naming the selector.
@@ -371,13 +361,13 @@ pub fn create_serve_processor(
 /// `<head>`.
 const BUNDLE_SELECTOR: &str = "script#trustedserver-js";
 
-/// One selector and what a rewriter does with what it matches.
+/// One selector and what a handler does with what it matches.
 type ContentHandler = (
     std::borrow::Cow<'static, lol_html::Selector>,
     lol_html::ElementContentHandlers<'static>,
 );
 
-/// The rewriter handlers that carry out a plan's element and text handlers.
+/// The handlers that carry out a plan's element and text handlers.
 ///
 /// The text handlers share `edits` with every text handler registered before
 /// them, so each is handed a chunk as the one before it left it.

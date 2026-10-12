@@ -60,8 +60,6 @@ impl FastlyRunner for FastlyProcess {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not run `fastly`: {error}"))?;
-        // The pipe closes when this is done, which is how `fastly` learns the
-        // value has ended.
         let written = match stdin {
             Some(input) => match child.stdin.take() {
                 Some(mut pipe) => pipe
@@ -141,7 +139,7 @@ mod tests {
             "secret-store-entry create"
         );
         assert_eq!(
-            command_words(&args(&["service", "purge", "--key", "ts-template"])),
+            command_words(&args(&["service", "purge", "--key=ts-template"])),
             "service purge"
         );
     }

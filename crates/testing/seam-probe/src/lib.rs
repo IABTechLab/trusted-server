@@ -567,8 +567,6 @@ impl AuctionProvider for SeamProbeAdServer {
 pub struct SeamProbeProxy;
 
 impl SeamProbeProxy {
-    /// Answers the request, with the services the route names in its module
-    /// call.
     async fn route(
         &self,
         req: Request<EdgeBody>,

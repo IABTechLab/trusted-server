@@ -28,12 +28,7 @@
 //! orders the page changes of the modules that run. A middleware reads its
 //! settings from its module's own table.
 //!
-//! Fetch is obtaining the document from the origin. A fetch middleware is
-//! handed nothing about the reader, so what it leaves is what a shared
-//! template stores for every reader. Serve is preparing the document for one
-//! response. A serve middleware runs for each reader, on that reader's copy,
-//! whether the page came from the store or from the origin, and nothing it
-//! writes is stored.
+//! [`MiddlewarePhase`] says when each phase runs.
 //!
 //! A middleware whose decision needs the request's services, or has to wait
 //! on a store or the network, prepares. Before the document is processed it
@@ -66,16 +61,12 @@ pub const HTML_MEDIA_TYPE: &str = "text/html";
 /// bare `type/subtype` in lower case.
 ///
 /// HTML and the text assets that stream through core as text: every `text/`
-/// type except `text/x-component`, whose rows are length prefixed, and
-/// JavaScript, JSON and SVG. Anything else passes through untouched.
+/// type except `text/x-component`, and JavaScript and JSON.
 #[must_use]
 pub fn is_dispatched_media_type(media_type: &str) -> bool {
     media_type != "text/x-component"
         && (media_type.starts_with("text/")
-            || matches!(
-                media_type,
-                "application/javascript" | "application/json" | "image/svg+xml"
-            ))
+            || matches!(media_type, "application/javascript" | "application/json"))
 }
 
 /// The type and subtype of a content type header, in lower case and without
@@ -91,14 +82,31 @@ pub fn media_type_of(content_type: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Whether a content type declares no charset or declares UTF-8, the one a
+/// middleware's stream processor is handed. A body in another charset passes
+/// through untouched, because a processor that writes UTF-8 into it would
+/// corrupt it.
+#[must_use]
+pub fn is_utf8_or_undeclared_charset(content_type: &str) -> bool {
+    content_type.split(';').skip(1).all(|parameter| {
+        parameter.split_once('=').is_none_or(|(name, value)| {
+            !name.trim().eq_ignore_ascii_case("charset")
+                || value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+        })
+    })
+}
+
 /// When a middleware runs, relative to the store of shared templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MiddlewarePhase {
     /// On the document as the origin sent it. What is left is what a shared
-    /// template stores, so nothing here may depend on the reader.
+    /// template stores, so a fetch middleware is handed nothing a request
+    /// left.
     Fetch,
     /// On one reader's copy, on its way out, whether it came from the store
-    /// or from the origin. Nothing written here is stored.
+    /// or from the origin. A serve middleware is handed what the modules'
+    /// request preparers left for this reader's request, and nothing written
+    /// here is stored.
     Serve,
 }
 
@@ -123,11 +131,6 @@ impl fmt::Display for MiddlewarePhase {
 }
 
 /// What a middleware is told about the document it is asked to change.
-///
-/// In [`MiddlewarePhase::Fetch`] the document's state holds nothing a
-/// request left, because the document may be stored and served to other
-/// readers. In [`MiddlewarePhase::Serve`] it holds what the modules' request
-/// hooks left for this reader's request.
 #[derive(Debug, Clone, Copy)]
 pub struct MiddlewareContext<'a> {
     /// Which phase is running.
@@ -300,7 +303,7 @@ impl MiddlewareAction {
             && self.text_handlers.is_empty()
     }
 
-    /// Checks every handler's selector parses, before a rewriter is built
+    /// Checks every handler's selector parses, before a handler is built
     /// from it.
     fn validate_selectors(&self) -> Result<(), String> {
         let check = |selector: &str| {
@@ -436,11 +439,7 @@ pub trait Middleware: Send + Sync {
     fn middleware_id(&self) -> &'static str;
 
     /// Whether this middleware works on a response of `media_type`, given as
-    /// a bare `type/subtype`. HTML alone unless a middleware says otherwise,
-    /// and an entry naming it under a media type it does not handle is
-    /// refused when the registry is built. On a media type other than HTML
-    /// an action's stream processor alone runs, because head markup and the
-    /// element and text handlers are decisions about HTML.
+    /// a bare `type/subtype`.
     fn handles_media_type(&self, media_type: &str) -> bool {
         media_type == HTML_MEDIA_TYPE
     }
@@ -561,15 +560,16 @@ impl PhaseEntries {
 
     /// The entry that makes the document the origin does not have at
     /// `path`, being the first with a path prefix covering it that names a
-    /// middleware. An entry covering every path makes none, because a page
-    /// the origin does not have is the origin's answer.
+    /// middleware, for a media type core streams other than HTML.
     #[must_use]
-    pub fn creating(&self, path: &str) -> Option<&PhaseEntry> {
+    pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
         self.0.iter().find(|entry| {
-            entry
-                .path
-                .as_deref()
-                .is_some_and(|prefix| path.starts_with(prefix))
+            entry.media_type != HTML_MEDIA_TYPE
+                && is_dispatched_media_type(&entry.media_type)
+                && entry
+                    .path
+                    .as_deref()
+                    .is_some_and(|prefix| path.starts_with(prefix))
                 && !entry.middleware.is_empty()
         })
     }
@@ -584,14 +584,20 @@ impl PhaseEntries {
         for (index, entry) in self.0.iter().enumerate() {
             let at = format!("[[{phase}]] entry {}", index + 1);
             if entry.media_type != entry.media_type.to_ascii_lowercase()
-                || entry.media_type.contains([';', ' ', '*'])
+                || entry
+                    .media_type
+                    .contains(|c: char| c == ';' || c == '*' || c.is_whitespace())
+                || entry
+                    .media_type
+                    .split_once('/')
+                    .is_none_or(|(_, subtype)| subtype.is_empty())
                 || !is_dispatched_media_type(&entry.media_type)
             {
                 return Err(format!(
                     "{at} covers `{}`, which is not a media type a middleware runs on. Write a \
                      bare `type/subtype` in lower case with no parameters, being `text/html`, \
                      another `text/` type other than `text/x-component`, \
-                     `application/javascript`, `application/json` or `image/svg+xml`",
+                     `application/javascript` or `application/json`",
                     entry.media_type
                 ));
             }
@@ -769,13 +775,9 @@ impl MiddlewareChain {
 
     /// Asks every middleware in turn what it will do with one document.
     ///
-    /// A selector cannot be checked when the settings load, because a
-    /// middleware chooses its handlers for each document, so each is checked
-    /// here. The caller refuses the response when one does not parse, because
-    /// a change that silently does not happen is worse than a response that
-    /// fails. On a media type other than HTML an action may carry a stream
-    /// processor alone, and one that decides about HTML is refused the same
-    /// way.
+    /// Checks each handler's selector, refusing the document when one does
+    /// not parse. On a media type other than HTML, an action that decides
+    /// about HTML is refused the same way.
     ///
     /// # Errors
     ///

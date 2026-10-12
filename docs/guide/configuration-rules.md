@@ -55,7 +55,7 @@ setting = "value"
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `mock`                                                                                                  |
 | `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or an integration that supplies robots.txt rules                             |
-| `ads-txt`           | several, in order | `modules`, a list  | `sellers`                                                                                               |
+| `ads-txt`           | several           | `modules`, a list  | `sellers`                                                                                               |
 | `analytics`         | one               | `module`, a string | `tinybird`                                                                                              |
 | `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
 | `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |
