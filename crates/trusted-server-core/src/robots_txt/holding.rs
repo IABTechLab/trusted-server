@@ -6,9 +6,7 @@
 //!
 //! What is held is kept far longer than any refresh, and is served past its
 //! age when the contributor fails, because yesterday's rules are a better
-//! answer than none. A `404` or an empty file reads to a crawler as permission
-//! to crawl everything, which is the opposite of what a publisher who refused
-//! anything asked for.
+//! answer than none.
 //!
 //! A store that cannot give an entry a lifetime is written without one. An
 //! answer held for settings that have since changed then stays in that store,
