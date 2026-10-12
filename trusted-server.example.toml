@@ -610,15 +610,20 @@ geo_query_parameters = false
 
 # Server-side ID5 fetch on /auction. Trusted Server calls ID5's web
 # server-to-server endpoint and stores the ID in the HttpOnly `ts-eids-s`
-# cookie. Add an `id5-sync.com` [[ec.partners]] entry to also persist it in KV.
-# `parallel` never delays bidders (the ID reaches the next auction); `blocking`
-# waits up to `timeout_ms` so the current auction can include it.
+# cookie. The `id5-sync.com` [[ec.partners]] entry also persists it in KV.
+# `blocking` waits up to `timeout_ms` so the current auction can include it;
+# `parallel` never delays bidders and the ID reaches the next auction.
 # [integrations.id5]
 # enabled = true
-# partner = 173                                      # ID5's public test partner
-# mode = "parallel"                                  # or "blocking"
-# timeout_ms = 500
-# provider = "example-provider"                      # assigned by ID5 for on-behalf-of calls
+# partner = 173
+# mode = "blocking"
+# timeout_ms = 300
+#
+# [[ec.partners]]
+# name = "ID5"
+# source_domain = "id5-sync.com"
+# openrtb_atype = 1
+# bidstream_enabled = true
 
 # DataDome bot protection. Proxies tags.js + signal-collection API first-party.
 # Kept active but disabled so `ts audit` can flip `enabled` when detected.
