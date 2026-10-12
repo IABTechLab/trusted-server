@@ -88,56 +88,58 @@ impl Contribution {
     /// A contribution read from `robots.txt` text, keeping every group, record
     /// and comment in the order it came.
     ///
-    /// A `User-Agent` line after a group's records starts the next group, and
+    /// A `User-Agent` line after a group's rules starts the next group, and
     /// consecutive `User-Agent` lines name the crawlers of one group, as RFC
-    /// 9309 section 2.1 describes. Blank lines and lines with no `:` carry
-    /// nothing and are passed over. A record before the first group is kept in
-    /// the preamble rather than dropped, so nothing given is lost.
+    /// 9309 section 2.1 describes. A `#` starts a comment wherever it is, as
+    /// section 2.2 allows, and the comment is kept as a record of its own after
+    /// the rule it followed. Blank lines and lines with no `:` carry nothing
+    /// and are passed over. A record before the first group is kept in the
+    /// preamble rather than dropped, so nothing given is lost.
     #[must_use]
     pub fn parse(text: &str) -> Self {
         let mut contribution = Self::default();
         let mut current: Option<Group> = None;
         for raw in text.split('\n') {
-            let line = raw.trim();
-            if line.is_empty() {
-                continue;
+            let (rule, comment) = match raw.split_once('#') {
+                Some((rule, comment)) => (rule.trim(), Some(comment.trim_end())),
+                None => (raw.trim(), None),
+            };
+            if let Some((name, value)) = rule.split_once(':') {
+                let (name, value) = (name.trim(), value.trim().to_owned());
+                match name.to_ascii_lowercase().as_str() {
+                    "user-agent" => {
+                        if current.as_ref().is_some_and(|group| {
+                            group
+                                .records
+                                .iter()
+                                .any(|record| !matches!(record, Record::Comment(_)))
+                        }) && let Some(finished) = current.take()
+                        {
+                            contribution.groups.push(finished);
+                        }
+                        current
+                            .get_or_insert_with(Group::default)
+                            .user_agents
+                            .push(value);
+                    }
+                    "allow" => push(&mut contribution, &mut current, Record::Allow(value)),
+                    "disallow" => push(&mut contribution, &mut current, Record::Disallow(value)),
+                    _ => push(
+                        &mut contribution,
+                        &mut current,
+                        Record::Other {
+                            name: name.to_owned(),
+                            value,
+                        },
+                    ),
+                }
             }
-            if let Some(comment) = line.strip_prefix('#') {
+            if let Some(comment) = comment {
                 push(
                     &mut contribution,
                     &mut current,
                     Record::Comment(comment.to_owned()),
                 );
-                continue;
-            }
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            let (name, value) = (name.trim(), value.trim().to_owned());
-            match name.to_ascii_lowercase().as_str() {
-                "user-agent" => {
-                    if current
-                        .as_ref()
-                        .is_some_and(|group| !group.records.is_empty())
-                        && let Some(finished) = current.take()
-                    {
-                        contribution.groups.push(finished);
-                    }
-                    current
-                        .get_or_insert_with(Group::default)
-                        .user_agents
-                        .push(value);
-                }
-                "allow" => push(&mut contribution, &mut current, Record::Allow(value)),
-                "disallow" => push(&mut contribution, &mut current, Record::Disallow(value)),
-                _ => push(
-                    &mut contribution,
-                    &mut current,
-                    Record::Other {
-                        name: name.to_owned(),
-                        value,
-                    },
-                ),
             }
         }
         if let Some(group) = current {
@@ -428,6 +430,42 @@ mod tests {
             "User-Agent: ExampleBot\nDisallow: /*\n\n\
              User-Agent: ExampleBot\nAllow: /ai-notice/\n",
             "`Disallow: /*` is the same rule as `Disallow: /`"
+        );
+    }
+
+    #[test]
+    fn a_comment_after_a_rule_does_not_hide_a_whole_site_refusal() {
+        let mut settings = config();
+        settings.always_allow = vec!["/ads.txt".to_owned()];
+        let parsed = Contribution::parse("User-Agent: *\nDisallow: / # temporarily closed");
+
+        assert_eq!(
+            parsed.groups[0].records,
+            vec![
+                Record::Disallow("/".to_owned()),
+                Record::Comment(" temporarily closed".to_owned()),
+            ]
+        );
+        assert!(
+            assemble(&settings, &[parsed]).ends_with("\n\nUser-Agent: *\nAllow: /ads.txt\n"),
+            "the path stays open to the crawlers refused the site"
+        );
+    }
+
+    #[test]
+    fn a_comment_between_user_agent_lines_keeps_their_group() {
+        let mut settings = config();
+        settings.always_allow = vec!["/ads.txt".to_owned()];
+        let parsed = Contribution::parse(
+            "User-Agent: ExampleBot\n# the same rules for its sibling\nUser-Agent: OtherBot\nDisallow: /",
+        );
+
+        assert_eq!(parsed.groups.len(), 1);
+        assert_eq!(parsed.groups[0].user_agents, vec!["ExampleBot", "OtherBot"]);
+        assert!(
+            assemble(&settings, &[parsed])
+                .ends_with("\n\nUser-Agent: ExampleBot\nUser-Agent: OtherBot\nAllow: /ads.txt\n"),
+            "every crawler of the group is kept open to the path"
         );
     }
 
