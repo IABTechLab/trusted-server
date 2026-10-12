@@ -47,16 +47,12 @@ pub const HTML_MEDIA_TYPE: &str = "text/html";
 /// bare `type/subtype` in lower case.
 ///
 /// HTML and the text assets that stream through core as text: every `text/`
-/// type except `text/x-component`, whose rows are length prefixed, and
-/// JavaScript, JSON and SVG. Anything else passes through untouched.
+/// type except `text/x-component`, and JavaScript and JSON.
 #[must_use]
 pub fn is_dispatched_media_type(media_type: &str) -> bool {
     media_type != "text/x-component"
         && (media_type.starts_with("text/")
-            || matches!(
-                media_type,
-                "application/javascript" | "application/json" | "image/svg+xml"
-            ))
+            || matches!(media_type, "application/javascript" | "application/json"))
 }
 
 /// The type and subtype of a content type header, in lower case and without
@@ -70,6 +66,20 @@ pub fn media_type_of(content_type: &str) -> String {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
+}
+
+/// Whether a content type declares no charset or declares UTF-8, the one a
+/// middleware's stream processor is handed. A body in another charset passes
+/// through untouched, because a processor that writes UTF-8 into it would
+/// corrupt it.
+#[must_use]
+pub fn is_utf8_or_undeclared_charset(content_type: &str) -> bool {
+    content_type.split(';').skip(1).all(|parameter| {
+        parameter.split_once('=').is_none_or(|(name, value)| {
+            !name.trim().eq_ignore_ascii_case("charset")
+                || value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+        })
+    })
 }
 
 /// When a middleware runs, relative to the store of shared templates.
@@ -338,11 +348,7 @@ pub trait Middleware: Send + Sync {
     fn middleware_id(&self) -> &'static str;
 
     /// Whether this middleware works on a response of `media_type`, given as
-    /// a bare `type/subtype`. HTML alone unless a middleware says otherwise,
-    /// and an entry naming it under a media type it does not handle is
-    /// refused when the registry is built. On a media type other than HTML
-    /// an action's stream processor alone runs, because head markup and the
-    /// element and text handlers are decisions about HTML.
+    /// a bare `type/subtype`.
     fn handles_media_type(&self, media_type: &str) -> bool {
         media_type == HTML_MEDIA_TYPE
     }
@@ -445,14 +451,20 @@ impl PhaseEntries {
         for (index, entry) in self.0.iter().enumerate() {
             let at = format!("[[{phase}]] entry {}", index + 1);
             if entry.media_type != entry.media_type.to_ascii_lowercase()
-                || entry.media_type.contains([';', ' ', '*'])
+                || entry
+                    .media_type
+                    .contains(|c: char| c == ';' || c == '*' || c.is_whitespace())
+                || entry
+                    .media_type
+                    .split_once('/')
+                    .is_none_or(|(_, subtype)| subtype.is_empty())
                 || !is_dispatched_media_type(&entry.media_type)
             {
                 return Err(format!(
                     "{at} covers `{}`, which is not a media type a middleware runs on. Write a \
                      bare `type/subtype` in lower case with no parameters, being `text/html`, \
                      another `text/` type other than `text/x-component`, \
-                     `application/javascript`, `application/json` or `image/svg+xml`",
+                     `application/javascript` or `application/json`",
                     entry.media_type
                 ));
             }

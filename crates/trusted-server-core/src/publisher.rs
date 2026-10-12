@@ -657,9 +657,9 @@ struct PublisherBodyProcessor {
 
 /// A response that is not HTML, as the middleware the entries covering it
 /// are told of it.
-struct TextDocument<'a> {
-    /// The type and subtype of the response, in lower case.
-    media_type: String,
+struct TextResponse<'a> {
+    /// The response's `Content-Type`, parameters and all.
+    content_type: &'a str,
     request_path: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
@@ -669,50 +669,53 @@ struct TextDocument<'a> {
 }
 
 /// The stream processors the entries covering a response that is not HTML
-/// run on its body, phase by phase in the order given, or none when its
-/// media type is not one a middleware runs on or no entry covers it.
-///
-/// A fetch middleware is told nothing a request left, as on a page, and a
-/// serve middleware is told what this reader's request left.
+/// run on its body, the fetch entry's and then the serve entry's, or none
+/// when its media type is not one a middleware runs on, its charset is not
+/// UTF-8 or no entry covers it. Both phases run here because the template
+/// cache stores HTML alone.
 ///
 /// # Errors
 ///
-/// When a middleware decides about HTML on a document that is not HTML, or
+/// When a middleware decides about HTML on a response that is not HTML, or
 /// asks for a selector that does not parse.
 fn middleware_stream_processors(
-    document: &TextDocument<'_>,
-    phases: &[MiddlewarePhase],
+    response: &TextResponse<'_>,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<Vec<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
-    use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
+    use crate::middleware::{
+        MiddlewareContext, is_dispatched_media_type, is_utf8_or_undeclared_charset,
+    };
 
-    if !is_dispatched_media_type(&document.media_type) {
+    let media_type = media_type_of(response.content_type);
+    if !is_dispatched_media_type(&media_type)
+        || !is_utf8_or_undeclared_charset(response.content_type)
+    {
         return Ok(Vec::new());
     }
     let mut processors = Vec::new();
-    for phase in phases {
+    for phase in &MiddlewarePhase::ALL {
         let chain = integration_registry.middleware_chain(
             settings.phase_entries(*phase),
             *phase,
-            &document.media_type,
-            document.request_path,
+            &media_type,
+            response.request_path,
         );
         if chain.is_empty() {
             continue;
         }
         let document_state = IntegrationDocumentState::default();
         if *phase == MiddlewarePhase::Serve {
-            document.request_state.seed(&document_state);
+            response.request_state.seed(&document_state);
         }
         let plan = chain
             .plan(&MiddlewareContext {
                 phase: *phase,
-                request_host: document.request_host,
-                request_scheme: document.request_scheme,
-                origin_host: document.origin_host,
+                request_host: response.request_host,
+                request_scheme: response.request_scheme,
+                origin_host: response.origin_host,
                 document_state: &document_state,
-                max_buffered_script_bytes: document.max_buffered_script_bytes,
+                max_buffered_script_bytes: response.max_buffered_script_bytes,
             })
             .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
         processors.extend(plan.processors);
@@ -791,17 +794,9 @@ impl PublisherBodyProcessor {
                 &params.request_scheme,
             ))
         } else {
-            // The serve entry runs on each reader's copy of a stored response
-            // later, see `reader_serve_processor`, and here on one that is not
-            // stored.
-            let phases: &[MiddlewarePhase] = if params.template_cache_key.is_some() {
-                &[MiddlewarePhase::Fetch]
-            } else {
-                &MiddlewarePhase::ALL
-            };
             let processors = middleware_stream_processors(
-                &TextDocument {
-                    media_type: media_type_of(&params.content_type),
+                &TextResponse {
+                    content_type: &params.content_type,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -809,7 +804,6 @@ impl PublisherBodyProcessor {
                     request_state: &params.request_state,
                     max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
                 },
-                phases,
                 settings,
                 integration_registry,
             )?;
@@ -907,14 +901,9 @@ fn process_response_streaming<W: Write>(
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else {
-        let phases: &[MiddlewarePhase] = if params.shared_template_authorized {
-            &[MiddlewarePhase::Fetch]
-        } else {
-            &MiddlewarePhase::ALL
-        };
         let processors = middleware_stream_processors(
-            &TextDocument {
-                media_type: media_type_of(params.content_type),
+            &TextResponse {
+                content_type: params.content_type,
                 request_path: params.request_path,
                 request_host: params.request_host,
                 request_scheme: params.request_scheme,
@@ -922,7 +911,6 @@ fn process_response_streaming<W: Write>(
                 request_state: params.request_state,
                 max_buffered_script_bytes: params.settings.publisher.max_buffered_body_bytes,
             },
-            phases,
             params.settings,
             params.integration_registry,
         )?;
@@ -1710,29 +1698,7 @@ fn reader_serve_processor(
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     if !is_html_content_type(&params.content_type) {
-        let origin_host = settings.publisher.origin_host();
-        let mut processors = middleware_stream_processors(
-            &TextDocument {
-                media_type: media_type_of(&params.content_type),
-                request_path: &params.request_path,
-                request_host: &params.request_host,
-                request_scheme: &params.request_scheme,
-                origin_host: &origin_host,
-                request_state: &params.request_state,
-                max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
-            },
-            &[MiddlewarePhase::Serve],
-            settings,
-            integration_registry,
-        )?;
-        return Ok(match processors.len() {
-            0 => None,
-            1 => processors.pop(),
-            _ => Some(Box::new(WithStreamProcessors {
-                inner: processors.remove(0),
-                processors,
-            })),
-        });
+        return Ok(None);
     }
     let chain = integration_registry.middleware_chain(
         &settings.serve,
@@ -20794,8 +20760,13 @@ mod tests {
         settings
     }
 
-    /// A text body streamed through the publisher path, as a reader gets it.
-    fn text_body_through_the_publisher(settings: &Settings, body: &str) -> String {
+    /// A text body of `content_type` streamed through the publisher path, as
+    /// a reader gets it.
+    fn text_body_through_the_publisher(
+        settings: &Settings,
+        content_type: &str,
+        body: &str,
+    ) -> String {
         let registry = IntegrationRegistry::new(settings).expect("should build a registry");
         let params = OwnedProcessResponseParams {
             csp_nonce_observed: None,
@@ -20808,7 +20779,7 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
-            content_type: "text/plain; charset=utf-8".to_string(),
+            content_type: content_type.to_string(),
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -20841,7 +20812,7 @@ mod tests {
         }]);
         let body = "User-agent: *\nSee https://origin.example.com/more\n";
 
-        let output = text_body_through_the_publisher(&settings, body);
+        let output = text_body_through_the_publisher(&settings, "text/plain; charset=utf-8", body);
 
         assert_eq!(
             output,
@@ -20929,11 +20900,30 @@ mod tests {
             middleware: vec![fixture::TEXT.to_owned()],
         }]);
 
-        let output = text_body_through_the_publisher(&settings, "plain\n");
+        let output = text_body_through_the_publisher(&settings, "text/plain", "plain\n");
 
         assert_eq!(
             output, "plain\n",
             "should run nothing on a path the entry does not cover"
+        );
+    }
+
+    #[test]
+    fn a_text_body_in_a_charset_other_than_utf8_is_left_as_it_was() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+
+        let output =
+            text_body_through_the_publisher(&settings, "text/plain; charset=utf-16", "plain\n");
+
+        assert_eq!(
+            output, "plain\n",
+            "should hand a middleware no body it would corrupt by writing UTF-8"
         );
     }
 

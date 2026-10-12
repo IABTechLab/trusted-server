@@ -321,6 +321,11 @@ fn an_entry_for_a_media_type_a_middleware_does_not_run_on_is_refused() {
         "image/png",
         "application/octet-stream",
         "text/x-component",
+        "image/svg+xml",
+        "text/",
+        "text",
+        "text/plain\t",
+        "text/ plain",
     ] {
         let mut other = entry(None, &["example.a"]);
         other.media_type = media_type.to_owned();
@@ -344,7 +349,6 @@ fn an_entry_may_cover_a_text_media_type_that_is_not_html() {
         "text/css",
         "application/javascript",
         "application/json",
-        "image/svg+xml",
     ] {
         let mut text = entry(None, &["example.a"]);
         text.media_type = media_type.to_owned();
@@ -362,12 +366,26 @@ fn a_media_type_is_the_type_and_subtype_of_a_content_type_in_lower_case() {
     assert_eq!(media_type_of("application/json"), "application/json");
     assert_eq!(media_type_of(""), "");
     assert!(is_dispatched_media_type("text/plain"));
-    assert!(is_dispatched_media_type("image/svg+xml"));
+    assert!(!is_dispatched_media_type("image/svg+xml"));
     assert!(
         !is_dispatched_media_type("text/x-component"),
         "a length prefixed stream is not changed"
     );
     assert!(!is_dispatched_media_type("image/png"));
+}
+
+#[test]
+fn a_body_is_handed_to_a_middleware_only_in_utf8_or_an_undeclared_charset() {
+    assert!(is_utf8_or_undeclared_charset("text/plain"));
+    assert!(is_utf8_or_undeclared_charset("text/plain; charset=utf-8"));
+    assert!(is_utf8_or_undeclared_charset(
+        "text/plain; Charset=\"UTF-8\""
+    ));
+    assert!(is_utf8_or_undeclared_charset("text/plain; format=flowed"));
+    assert!(!is_utf8_or_undeclared_charset("text/plain; charset=utf-16"));
+    assert!(!is_utf8_or_undeclared_charset(
+        "text/plain; charset=iso-8859-1"
+    ));
 }
 
 #[test]

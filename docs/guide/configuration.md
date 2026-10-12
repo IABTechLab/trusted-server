@@ -1737,23 +1737,23 @@ table. An entry carries none and switches nothing on.
 ### Entries for a media type other than HTML
 
 An entry covers `text/html`, another `text/` type other than
-`text/x-component`, `application/javascript`, `application/json` or
-`image/svg+xml`, written as a bare `type/subtype` in lower case with no
-parameters. A response is matched by the type and subtype of its
-`Content-Type`, without the parameters, so `text/plain; charset=utf-8`
-takes the entry for `text/plain`. Anything else, an image or a length
-prefixed stream among them, passes through untouched and no entry can
-cover it.
+`text/x-component`, `application/javascript` or `application/json`, written
+as a bare `type/subtype` in lower case with no parameters. A response is
+matched by the type and subtype of its `Content-Type`, without the
+parameters, so `text/plain; charset=utf-8` takes the entry for
+`text/plain`. Anything else, an image or a length prefixed stream among
+them, passes through untouched and no entry can cover it. So does a
+response that declares a charset other than UTF-8.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
-refused when the settings load, with the entry and the middleware named. On
-a media type other than HTML a middleware changes the body as a stream,
+refused when the registry is built, with the entry and the middleware named.
+On a media type other than HTML a middleware changes the body as a stream,
 after core has moved the origin's addresses in it, in the order the entry
 names them. Head markup and the element and text handlers are decisions
 about HTML, and a middleware that makes one there is refused by name. The
-fetch entry's middleware run once on what is stored, and the serve entry's
-on each reader's copy, as on a page.
+template cache stores HTML alone, so the fetch entry's middleware and then
+the serve entry's run on each response as it is fetched.
 
 ```toml
 [[fetch]]
@@ -1787,7 +1787,7 @@ the names in and the order `trusted-server.example.toml` shows them in.
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
-other than `text/html`, a path that does not start with `/` or that holds a
+no middleware runs on, a path that does not start with `/` or that holds a
 `*`, a `?` or a `#`, an entry that names no middleware or names one twice, a
 key an entry does not read, and an entry that an earlier one already covers.
 An entry naming a middleware that no running module supplies refuses startup,
