@@ -18,6 +18,7 @@ use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::KvEntry;
 use crate::ec::module::{AcceptedModules, EdgeCookieModule};
 use crate::error::TrustedServerError;
+use crate::response_privacy::RequiredHeaders;
 
 use super::{MASK, render_page_with_lede};
 
@@ -141,8 +142,10 @@ fn page(payload: &Value) -> Response<EdgeBody> {
 
 /// A response only the person looking at it can read, being never stored,
 /// never framed, in an origin of its own, and offered to no other origin.
+/// Its headers are [`RequiredHeaders`], so an operator's own headers of the
+/// same names cannot replace them.
 fn protected(status: StatusCode, content_type: &'static str, body: String) -> Response<EdgeBody> {
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
         .header(
@@ -167,7 +170,10 @@ fn protected(status: StatusCode, content_type: &'static str, body: String) -> Re
             HeaderValue::from_static("same-origin"),
         )
         .body(EdgeBody::from(body.into_bytes()))
-        .expect("should build the data response")
+        .expect("should build the data response");
+    let required = response.headers().clone();
+    response.extensions_mut().insert(RequiredHeaders(required));
+    response
 }
 
 #[cfg(test)]
