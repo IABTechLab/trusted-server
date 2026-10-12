@@ -716,6 +716,11 @@ KV store name only when consent should persist with the EC identity graph.
 | `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
 | `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
 
+In `proxy` mode Trusted Server does not decode the TC string, so it cannot
+confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
+browser-supplied EIDs are neither forwarded in bid requests nor written to the
+EC identity graph, and server-side pull sync is skipped.
+
 ```toml
 [consent]
 mode = "interpreter"
@@ -1770,7 +1775,8 @@ unchanged.
 
 Persisting a resolved ID into the Edge Cookie identity graph additionally
 requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
-module's OpenRTB EID source.
+module's OpenRTB EID source, and, when a TCF signal is present, consent to
+TCF Purpose 1 and Purpose 4.
 
 `managed_user_ids` is an array of tables, so it cannot be set through a
 `TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
