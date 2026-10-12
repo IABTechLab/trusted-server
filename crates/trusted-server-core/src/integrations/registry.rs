@@ -1260,16 +1260,11 @@ pub struct ProxyDispatchInput<'a> {
 /// Refuses a registered middleware no entry could name, and an entry this
 /// deployment cannot run.
 ///
-/// Only knowable here, where every running module's middleware have been
-/// handed over. A name no module supplies, or one named in a phase it does not
-/// run in, would otherwise do nothing on every request and say so nowhere.
-///
-/// A middleware no entry names is left alone and logged, because a module
-/// may be selected for what else it does.
+/// A middleware no entry names is left alone and logged.
 ///
 /// # Errors
 ///
-/// Naming the integration or the entry at fault.
+/// Naming the module or the entry at fault.
 fn check_middleware(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1286,14 +1281,14 @@ fn check_middleware(
         let id = middleware.middleware_id();
         if !crate::module_name::is_valid(id) {
             return Err(refuse(format!(
-                "integration `{integration}` supplies a middleware named `{id}`, which is not a \
+                "module `{integration}` supplies a middleware named `{id}`, which is not a \
                  name an entry can write. A name is parts joined by `.`, each in lower case \
                  letters, digits, `_` or `-`"
             )));
         }
         if middleware.phases().is_empty() {
             return Err(refuse(format!(
-                "integration `{integration}` supplies the middleware `{id}`, which says it runs \
+                "module `{integration}` supplies the middleware `{id}`, which says it runs \
                  in no phase, so no entry could name it"
             )));
         }
@@ -1302,7 +1297,7 @@ fn check_middleware(
             .find(|(_, earlier)| earlier.middleware_id() == id)
         {
             return Err(refuse(format!(
-                "integrations `{earlier}` and `{integration}` both supply a middleware named \
+                "modules `{earlier}` and `{integration}` both supply a middleware named \
                  `{id}`, so an entry could not say which one it means"
             )));
         }
@@ -1335,7 +1330,7 @@ fn check_middleware(
     }
     for (integration, middleware) in unnamed_middleware(settings, inner) {
         log::warn!(
-            "Integration `{integration}` supplies the middleware `{}` and no {} entry names \
+            "Module `{integration}` supplies the middleware `{}` and no {} entry names \
              it, so it changes no page",
             middleware.middleware_id(),
             phases_of(middleware).join(" or ")

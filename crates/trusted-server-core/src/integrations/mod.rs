@@ -694,7 +694,7 @@ impl IntegrationBuilder {
     }
 }
 
-/// The built-in integrations, in hook order.
+/// The built-in integrations, in the order `trusted-server-modules` lists them.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // This stays the first module a section selects, so its middleware is
     // the first of theirs in the order the registry lists them.
@@ -744,13 +744,14 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     .with_adserver(&crate::auction::test_support::adserver_fixture::ADSERVER),
 ];
 
-/// The built-in integration builders, in hook order.
+/// The built-in integration builders, in the order `trusted-server-modules`
+/// lists them.
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     BUILT_IN_BUILDERS
 }
 
 /// Every builder the registry will consider: the built-in set followed by
-/// `extra`, in that order, so hook order for the built-ins never changes.
+/// `extra`, in that order, so the built-ins keep their order.
 pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
