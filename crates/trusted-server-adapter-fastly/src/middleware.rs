@@ -409,8 +409,13 @@ mod tests {
             .uri("https://publisher.example/_ts/data")
             .body(Body::empty())
             .expect("should build request");
-        let mut response = trusted_server_core::inspect::data::handle_data(None, None, &request)
-            .expect("should answer");
+        let mut response = trusted_server_core::inspect::data::handle_data(
+            None,
+            None,
+            &trusted_server_core::prefix::PublicPrefix::default(),
+            &request,
+        )
+        .expect("should answer");
 
         apply_finalize_headers(&settings, None, &mut response);
 

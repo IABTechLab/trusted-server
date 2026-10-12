@@ -856,7 +856,7 @@ These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environ
 
 ## Device Configuration
 
-Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie module selection. These signals serve identifier gating and bot detection. The same module may also score how confident it is that a person is looking at the page, which nothing in core gates on, and may tell a bidder what the device is, which reaches the bid request's device object.
+Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie module selection. These signals serve identifier gating and bot detection. The same module may score how confident it is that a person is looking at the page, which nothing reads yet and which is not stored in the identity graph with the other signals, and may tell a bidder what the device is, which reaches the bid request's device object. Redirect middlewares that act on the score follow this set of changes.
 
 ### `[device]`
 
@@ -949,8 +949,8 @@ Selects the module that gives the start of every name the browser holds for a pu
 
 ### `[prefix]`
 
-| Field    | Type           | Required | Description                                                                                                                                                                                     |
-| -------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Field    | Type           | Required | Description                                                                                                                                                            |
+| -------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `module` | String or null | No       | Name of the prefix module, or omit it or write `ts` for core's own, which gives `ts` for the names the browser holds and `ts.<publisher.domain>` for shared store keys |
 
 Core's own module runs when nothing is selected, so a default deployment writes `ts-ec`, `ts-eids` and `ts-tester`. A module from a crate at `crates/prefix/<name>` is written `<name>` or `prefix.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the prefix modules it does run, and a module that names a value its call never carries is refused at startup rather than on a request.
