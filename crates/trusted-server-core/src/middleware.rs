@@ -552,19 +552,29 @@ impl PhaseEntries {
     }
 
     /// The entry that makes the document the origin does not have at
-    /// `path`, being the first with a path prefix covering it that names a
-    /// middleware, for a media type core streams other than HTML.
+    /// `path`, being the one with the longest path prefix covering it that
+    /// names a middleware, for a media type core streams other than HTML. The
+    /// first written wins between two of the same length.
     #[must_use]
     pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
-        self.0.iter().find(|entry| {
-            entry.media_type != HTML_MEDIA_TYPE
-                && is_dispatched_media_type(&entry.media_type)
-                && entry
-                    .path
-                    .as_deref()
-                    .is_some_and(|prefix| path.starts_with(prefix))
-                && !entry.middleware.is_empty()
-        })
+        self.0
+            .iter()
+            .filter(|entry| {
+                entry.media_type != HTML_MEDIA_TYPE
+                    && is_dispatched_media_type(&entry.media_type)
+                    && entry
+                        .path
+                        .as_deref()
+                        .is_some_and(|prefix| path.starts_with(prefix))
+                    && !entry.middleware.is_empty()
+            })
+            .fold(None, |best: Option<&PhaseEntry>, entry| {
+                let length = |entry: &PhaseEntry| entry.path.as_deref().map_or(0, str::len);
+                match best {
+                    Some(best) if length(best) >= length(entry) => Some(best),
+                    _ => Some(entry),
+                }
+            })
     }
 
     /// Checks each entry's media type, path and names, and that no entry is
