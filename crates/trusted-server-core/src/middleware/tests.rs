@@ -1518,7 +1518,7 @@ fn deploy_validation_refuses_a_misshapen_entry() {
 }
 
 #[test]
-fn the_making_entry_is_the_first_with_a_path_covering_the_request_that_names_a_middleware() {
+fn the_making_entry_has_a_path_covering_the_request_and_names_a_middleware() {
     let entries = PhaseEntries::new(vec![
         PhaseEntry {
             media_type: "text/plain".to_owned(),
@@ -1561,6 +1561,37 @@ fn an_html_entry_with_a_path_makes_nothing() {
     assert!(
         entries.making("/news/missing").is_none(),
         "should leave a page the origin does not have as the origin's answer"
+    );
+}
+
+#[test]
+fn the_entry_with_the_longest_covering_path_makes_the_file() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/css".to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec!["example.styles".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/plain"),
+        "should make the file from the entry for its own path, not one written ahead for every path"
+    );
+    assert_eq!(
+        entries
+            .making("/site.css")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/css"),
+        "should still make a file only the shorter path covers"
     );
 }
 
