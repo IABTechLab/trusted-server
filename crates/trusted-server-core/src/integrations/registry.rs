@@ -1820,9 +1820,7 @@ impl IntegrationRegistry {
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
-            // Core's own middleware for the file, made here because the
-            // contributors it asks are known only once every registration
-            // is in, and a middleware cannot reach the registry.
+            // Core's own middleware for the file, made once every registration is in.
             let selected = crate::robots_txt::select(config, &inner.robots_txt_contributors)?;
             inner.middleware.push((
                 crate::robots_txt::middleware::MODULE,
@@ -1868,23 +1866,6 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
-    }
-
-    /// The robots.txt contributor `[robots-txt] modules` means by `written`,
-    /// with the name it was declared under, or `None` when nothing this
-    /// deployment runs supplies one under that name.
-    #[must_use]
-    pub fn robots_txt_contributor(
-        &self,
-        written: &str,
-    ) -> Option<(&'static str, Arc<dyn RobotsTxtContributor>)> {
-        let offered = &self.inner.robots_txt_contributors;
-        let names: Vec<&str> = offered.iter().map(|(name, _)| *name).collect();
-        let name = crate::module_name::resolve(ROBOTS_TXT_TYPE, written, &names)?;
-        offered
-            .iter()
-            .find(|(offered_name, _)| *offered_name == name)
-            .map(|(offered_name, contributor)| (*offered_name, Arc::clone(contributor)))
     }
 
     /// The name of every middleware a running module supplies, in

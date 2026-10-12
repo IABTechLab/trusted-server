@@ -1974,6 +1974,26 @@ pub(crate) fn classify_response_route(
     ResponseRoute::Stream
 }
 
+/// Whether the origin answered with a page where `entry` places core's
+/// robots.txt middleware, as a single-page application's catch-all does. A
+/// crawler reads a page there as no rules at all, so the file is made as it is
+/// where the origin has none.
+fn answers_robots_txt_with_a_page(
+    response: &Response<EdgeBody>,
+    entry: &crate::middleware::PhaseEntry,
+) -> bool {
+    response.status() == StatusCode::OK
+        && entry
+            .middleware
+            .iter()
+            .any(|name| name == crate::robots_txt::middleware::MODULE)
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_html_content_type)
+}
+
 /// An empty document of `media_type`, which the middleware a `[[fetch]]`
 /// entry names for a path the origin has nothing at is run on.
 fn empty_document(media_type: &str) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
@@ -5686,10 +5706,12 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
-    // A file the origin does not have is made, see `PhaseEntries::making`.
-    if response.status() == StatusCode::NOT_FOUND
-        && (request_method == Method::GET || request_method == Method::HEAD)
+    // A file the origin does not have is made, see `PhaseEntries::making`. An
+    // origin page where the robots.txt middleware is placed is no file either.
+    if (request_method == Method::GET || request_method == Method::HEAD)
         && let Some(entry) = settings.fetch.making(&request_path)
+        && (response.status() == StatusCode::NOT_FOUND
+            || answers_robots_txt_with_a_page(&response, entry))
     {
         log::debug!(
             "Making {} for {request_path}, which the origin does not have, with {}",
@@ -21336,6 +21358,26 @@ mod tests {
             streamed_robots_txt(proxied).await,
             "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
             "the refusal replaces the origin's file"
+        );
+    }
+
+    /// An origin that answers every path with its page, as a single-page
+    /// application's catch-all does, has no file, so the middleware makes it
+    /// rather than the crawler being handed the page.
+    #[tokio::test]
+    async fn robots_txt_replaces_a_page_the_origin_answers_at_its_path() {
+        let proxied = proxy_with(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            crate::robots_txt::ROBOTS_TXT_PATH,
+            200,
+        )
+        .await;
+
+        assert_eq!(
+            streamed_robots_txt(proxied).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the file replaces the page"
         );
     }
 

@@ -304,9 +304,11 @@ pub(crate) fn select(
             selected.push((ALLOW_ALL, None));
             continue;
         }
-        let Some((declared, contributor)) = contributors.iter().find(|(name, _)| {
-            *name == written || crate::module_name::short_form(MODULE_TYPE, name) == written
-        }) else {
+        let names: Vec<&str> = contributors.iter().map(|(name, _)| *name).collect();
+        let Some((declared, contributor)) =
+            crate::module_name::resolve(MODULE_TYPE, written, &names)
+                .and_then(|declared| contributors.iter().find(|(name, _)| *name == declared))
+        else {
             return Err(Report::new(configuration(format!(
                 "[robots-txt] modules names `{written}`, which no module in this deployment supplies"
             ))));

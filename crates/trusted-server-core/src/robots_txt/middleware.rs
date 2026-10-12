@@ -1,8 +1,8 @@
 //! `/robots.txt` as a middleware of core's own, named `robots_txt` in a
-//! `[[fetch]]` or `[[serve]]` entry on the file's path. Its preparation makes
-//! the file from the selected contributors, through their holding, and its
-//! action replaces whatever the origin sent with that file. Where the origin
-//! has no file, the creating rule runs it on an empty one.
+//! `[[fetch]]` entry on the file's path. Its preparation makes the file from
+//! the selected contributors, through their holding, and its action replaces
+//! the origin's file with it. Where the origin has no file, or answers with a
+//! page, the creating rule runs it on an empty one.
 
 use std::any::Any;
 use std::time::Duration;
@@ -108,9 +108,7 @@ impl Middleware for RobotsTxt {
                 stream: Some(Box::new(ReplaceBody { file: Some(file) })),
                 ..MiddlewareAction::pass()
             },
-            // Nothing prepared means the preparation did not run, which no
-            // request can cause. The origin's own file is left as it is,
-            // because an empty file would tell crawlers to crawl everything.
+            // Nothing prepared means the preparation did not run, which no request can cause.
             None => {
                 log::error!("robots.txt was not prepared, so the origin's file is served as it is");
                 MiddlewareAction::pass()
