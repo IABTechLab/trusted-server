@@ -269,7 +269,7 @@ impl Middleware for Sellers {
     }
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        let lines: Vec<String> = context.prepared.take(MODULE).unwrap_or_default();
+        let lines: Vec<String> = context.take_prepared(MODULE).unwrap_or_default();
         MiddlewareAction {
             stream: Some(Box::new(AppendLines::new(lines))),
             ..MiddlewareAction::pass()
