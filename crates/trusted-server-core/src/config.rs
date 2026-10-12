@@ -364,7 +364,7 @@ pub fn validate_settings_for_deploy_with(
     validate_integration_blocks(settings, &plan, extra_integrations)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     settings.ec.validate_resolve_allowed_origins()?;
-    crate::inspect::config::validate_patterns(settings)?;
+    crate::inspect::config::validate_patterns_for_deploy(settings, extra_integrations)?;
     Ok(())
 }
 
@@ -732,9 +732,9 @@ formats = [{ width = 300, height = 250 }]
             .expect("uncommented [analytics] with documented api_host should parse and validate");
         assert!(
             settings
-                .telemetry()
-                .is_some_and(|telemetry| !telemetry.api_host.is_empty()),
-            "the selected telemetry module should have a non-empty api_host"
+                .analytics_module()
+                .is_some_and(|module| !module.api_host.is_empty()),
+            "the selected analytics module should have a non-empty api_host"
         );
     }
 
@@ -984,8 +984,8 @@ formats = [{ width = 300, height = 250 }]
         assert_eq!(serialized["secret_access_key"], "secret_access_key");
     }
 
-    /// An `[analytics]` section selecting the telemetry module with `settings`.
-    fn telemetry_selecting(settings: TinybirdSettings) -> AnalyticsConfig {
+    /// An `[analytics]` section selecting the analytics module with `settings`.
+    fn analytics_selecting(settings: TinybirdSettings) -> AnalyticsConfig {
         AnalyticsConfig {
             module: Some("analytics.tinybird".to_string()),
             tinybird: Some(settings),
@@ -995,7 +995,7 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
         let mut settings = valid_settings();
-        settings.analytics = Some(telemetry_selecting(TinybirdSettings {
+        settings.analytics = Some(analytics_selecting(TinybirdSettings {
             secret_store: Some("legacy-tinybird-store".to_string()),
             ..TinybirdSettings::default()
         }));
@@ -1027,7 +1027,7 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn settings_debug_redacts_resolved_static_credentials() {
         let mut settings = valid_settings();
-        settings.analytics = Some(telemetry_selecting(TinybirdSettings {
+        settings.analytics = Some(analytics_selecting(TinybirdSettings {
             auction_token_secret: Some(Redacted::new("resolved-tinybird-secret".to_string())),
             ..TinybirdSettings::default()
         }));
@@ -1171,10 +1171,10 @@ gam_network_id = "99999"
         );
     }
 
-    /// The telemetry module's token is a secret reference like every other,
+    /// The analytics module's token is a secret reference like every other,
     /// so an empty or absent one is refused for deploy, by its path.
     #[test]
-    fn app_config_new_rejects_a_telemetry_secret_key_reference_that_is_empty_or_absent() {
+    fn app_config_new_rejects_an_analytics_secret_key_reference_that_is_empty_or_absent() {
         for (case, reference) in [
             ("an empty reference", Some(Redacted::new(String::new()))),
             (
@@ -1184,7 +1184,7 @@ gam_network_id = "99999"
             ("no reference", None),
         ] {
             let mut settings = valid_settings();
-            settings.analytics = Some(telemetry_selecting(TinybirdSettings {
+            settings.analytics = Some(analytics_selecting(TinybirdSettings {
                 api_host: "api.tinybird.co".to_owned(),
                 auction_token_secret: reference,
                 ..TinybirdSettings::default()
@@ -1203,9 +1203,9 @@ gam_network_id = "99999"
     }
 
     #[test]
-    fn app_config_new_accepts_a_telemetry_secret_key_reference() {
+    fn app_config_new_accepts_an_analytics_secret_key_reference() {
         let mut settings = valid_settings();
-        settings.analytics = Some(telemetry_selecting(TinybirdSettings {
+        settings.analytics = Some(analytics_selecting(TinybirdSettings {
             api_host: "api.tinybird.co".to_owned(),
             auction_token_secret: Some(Redacted::new("tinybird_auction_token".to_owned())),
             ..TinybirdSettings::default()

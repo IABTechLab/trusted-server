@@ -2,18 +2,16 @@
 
 **Category**: Consent Management Platform
 
-**Status**: Production
+**Status**: Development
 
 **Type**: Consent prompt tag, with the IAB stubs ahead of it
-
-**Maintainers**: 51Degrees, until InMobi adopt the crate (`crates/cmp/inmobi`)
 
 ## Overview
 
 InMobi Choice is a TCF consent prompt loaded from the publisher's own InMobi
 account. The module writes the prompt's tag into the head of each page a
-`[[fetch]]` or `[[serve]]` entry names it for, in three parts and in this
-order:
+`[[fetch]]` or `[[serve]]` entry for `text/html` names it for, in three parts
+and in this order:
 
 1. The IAB TCF v2 stub, which creates the `__tcfapiLocator` frame, queues
    every `__tcfapi` call made before the prompt arrives, answers `ping` as a
@@ -31,8 +29,9 @@ else of the page is changed, and the module serves no browser module of its
 own, because the two stubs and the Choice script are the whole client side.
 
 The prompt writes the reader's answer to the `euconsent-v2` cookie, which
-the TCF permission signal module reads on the next request, so the answer
-reaches the permission model the way every signal does.
+core reads on the next request. The TCF permission signal module reads the
+record core decodes from it, so the answer reaches the permission model the
+way every signal does.
 
 ## Configuration
 
@@ -64,13 +63,19 @@ for every reader, so the fetch phase stores it in the page every reader is
 served from, which is what `ts audit generate` writes, and the serve phase
 writes it on each reader's copy instead. Core writes each
 middleware's head markup in the order the entry names them, and nothing
-advertising related may run before the visitor answers the prompt, so name
+advertising related may run before the reader answers the prompt, so name
 `cmp.inmobi` before any middleware that writes a vendor's tag, as the example
 above does ahead of Google Tag Manager.
 
-Selecting the module with no entry of either phase naming it is refused
-when the settings load and by `ts config validate`, because the prompt would
-never be written.
+Selecting the module with no `text/html` entry of either phase naming it is
+refused when the settings load and by `ts config validate`, because the
+prompt would never be written.
+
+The tag is written at the start of the head, ahead of the page's own
+`<meta charset>`, and is about 3.6 KB. A browser looks for `<meta charset>`
+only in the first 1024 bytes of a page, so the origin should send the
+encoding in `Content-Type` as well, as `text/html; charset=utf-8`, or a page
+that declares it only in the meta tag has its encoding guessed.
 
 ## What is checked
 

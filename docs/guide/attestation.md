@@ -50,13 +50,13 @@ and the build that answered, the time, and the nonce when one was sent.
 
 The evidence does not prove these four things.
 
-1. **What code is running.** A module on a CDN cannot read its own code.
-   Fastly, for example, tells a module its service, version, staging flag and
-   location through
+1. **What code is running.** A deployment on a CDN cannot read its own code.
+   Fastly, for example, tells a deployment its service, version, staging flag
+   and location through
    [environment variables](https://www.fastly.com/documentation/reference/compute/ecp-env/),
-   and none of them identifies the module's bytes. Whatever a module says about
-   itself, a changed module can say too, so the `build` fields are the
-   operator's own report of what it deployed.
+   and none of them identifies the build's bytes. Whatever a build says about
+   itself, a changed build can say too, so the `build` fields are the operator's
+   own report of what it deployed.
 2. **A hardware measurement.** Attestation in trusted hardware signs a hash of
    the running code that the hardware itself took. Nothing here takes such a
    measurement, and the trust rests on the operator's key alone.
@@ -110,11 +110,19 @@ prefix. GET and HEAD reach the pages, the prefix itself lists them, and any
 other address or method beneath the prefix answers 404 from the deployment
 rather than reaching the publisher's origin.
 
-Under the default `_ts` prefix, which other routes share, only GET on the two
-attestation addresses is taken. Every other method on those addresses reaches
-the publisher's origin.
+Choose a prefix the origin serves nothing beneath. An endpoint at
+`/_next/attestation` would answer 404 for every asset a Next.js site serves
+from `/_next`. The settings refuse an endpoint under a prefix a common
+framework serves its assets from, being `_app`, `_astro`, `_content`, `_expo`,
+`_framework`, `_next`, `_nuxt` and `_vercel`, and name the prefix. Any other
+prefix the origin serves is the operator's to avoid.
+
+Under the default `_ts` prefix, which other routes share, only GET and HEAD on
+the two attestation addresses are taken. Every other method on those addresses
+reaches the publisher's origin.
 
 The tests are `an_own_prefix_is_owned_and_the_default_is_shared`,
+`an_endpoint_under_a_framework_asset_prefix_is_refused_naming_it`,
 `the_prefix_lists_its_pages` and
 `any_other_address_beneath_the_prefix_is_not_found` in core,
 `an_owned_prefix_is_answered_here_and_never_by_the_origin` in the Fastly adapter
@@ -159,12 +167,12 @@ request and reads no store.
 
 ### `[attestation]` {#attestation-section}
 
-| Field        | Type   | Rule                                                                                                                                                                                                      | Meaning                                                                             |
-| ------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `endpoint`   | String | An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, and not ending `.json`. Defaults to `/_ts/attestation`. | Where the page answers. The JSON is at the same path plus `.json`.                  |
-| `operator`   | String | 1 to 64 characters                                                                                                                                                                                        | Who the evidence says operates the deployment                                       |
-| `context`    | String | 1 to 64 characters with no control characters                                                                                                                                                             | The text signed ahead of the payload. A verifier must use exactly the same text.    |
-| `verify_url` | String | An `https` address with a host                                                                                                                                                                            | Where the page sends a reader to check the claim, and the envelope's `verify` field |
+| Field        | Type   | Rule                                                                                                                                                                                                                                                             | Meaning                                                                             |
+| ------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `endpoint`   | String | An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not under a prefix a framework serves its assets from, and not ending `.json`. Defaults to `/_ts/attestation`. | Where the page answers. The JSON is at the same path plus `.json`.                  |
+| `operator`   | String | 1 to 64 characters                                                                                                                                                                                                                                               | Who the evidence says operates the deployment                                       |
+| `context`    | String | 1 to 64 characters with no control characters                                                                                                                                                                                                                    | The text signed ahead of the payload. A verifier must use exactly the same text.    |
+| `verify_url` | String | An `https` address with a host                                                                                                                                                                                                                                   | Where the page sends a reader to check the claim, and the envelope's `verify` field |
 
 The section refuses any other field, so a document naming a signing key is
 refused, because keys are compiled into the build and never configured. A
@@ -200,14 +208,17 @@ schedule, which holds one key per line in three fields separated by tabs.
    DER encoding.
 
 Key ids and keys may hold only letters, digits and `-_.:+/=`, and a line of any
-other shape fails the build.
+other shape fails the build. No two lines may share a key id or a start, so a
+key id names one key and the key in force never depends on the order of the
+lines. The test is `a_schedule_repeating_a_key_id_or_a_start_is_refused`.
 
 The key in force is the latest to have started, and it stays in force until the
 next one starts. While the key in force is the last one in the build, the
 deployment logs the warning
 ``attestation key `<kid>` is the last one built in, so the build must be refreshed``
-and goes on signing with that key. The test is
-`the_key_in_force_is_the_latest_to_have_started`.
+once for each process and goes on signing with that key. The tests are
+`the_key_in_force_is_the_latest_to_have_started` and
+`the_last_key_warning_is_given_once`.
 
 Without the build input, or with an empty file, the schedule is empty and the
 endpoint answers 503. That is every build its builder names no schedule for,
@@ -464,10 +475,16 @@ the signature. The service check needs the operator's list of its services.
 
 A key compiled into a binary is readable by whoever holds the binary. The
 protection is that the binary never leaves the operator's hands, so the build
-that carries keys must run only where the operator controls it, and the built
-package must go only to the operator's own platform account. Anyone can copy the
-page, its wording and its layout, and nobody without the key can make the
-signature.
+that carries keys must run only where the operator controls it, and the binary
+must go only to the operator's own platform account. Anyone can copy the page,
+its wording and its layout, and nobody without the key can make the signature.
+
+A build also leaves the private keys in clear in
+`target/**/out/attestation_keys.rs`, the file the build script writes the
+schedule into. The file survives the build, and a CI job that caches its target
+directory keeps it in that cache. A build that carries keys must therefore use a
+target directory and a cache that only the operator can read, or delete the
+file once the binary is made.
 
 The context keeps signatures apart by purpose. A verifier puts the context in
 front of the payload before checking, so a signature the same key made over any

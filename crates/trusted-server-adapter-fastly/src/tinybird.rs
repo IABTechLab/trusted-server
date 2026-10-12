@@ -21,10 +21,10 @@ const TINYBIRD_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 
 /// Build the auction telemetry sink, which sends only when `[analytics]`
-/// selects the telemetry module.
+/// selects the analytics module.
 #[must_use]
 pub(crate) fn auction_sink_from_settings(settings: &Settings) -> Arc<dyn AuctionTelemetrySink> {
-    match settings.telemetry() {
+    match settings.analytics_module() {
         Some(telemetry) => Arc::new(FastlyTinybirdAuctionTelemetrySink::new(telemetry.clone())),
         None => Arc::new(NoopAuctionTelemetrySink),
     }
@@ -421,7 +421,7 @@ mod tests {
             .build()
     }
 
-    fn enabled_config() -> TinybirdSettings {
+    fn tinybird_settings() -> TinybirdSettings {
         TinybirdSettings {
             api_host: "api.us-east.aws.tinybird.co".to_owned(),
             secret_store: None,
@@ -469,7 +469,7 @@ mod tests {
             Arc::clone(&http_client),
             HashMap::new(),
         );
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(tinybird_settings());
 
         futures::executor::block_on(
             sink.emit_auction_events(&services, AuctionEventBatch::new(vec![test_row()])),
@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_selecting_no_telemetry_build_a_sink_that_sends_nothing() {
+    fn settings_selecting_no_analytics_module_build_a_sink_that_sends_nothing() {
         let backend = Arc::new(RecordingBackend::default());
         let http_client = Arc::new(RecordingHttpClient::default());
         let services = services(
@@ -548,11 +548,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_selecting_the_telemetry_module_build_a_sink_that_sends() {
+    fn settings_selecting_the_analytics_module_build_a_sink_that_sends() {
         let mut settings = Settings::default();
         settings.analytics = Some(trusted_server_core::settings::AnalyticsConfig {
             module: Some("tinybird".to_owned()),
-            tinybird: Some(enabled_config()),
+            tinybird: Some(tinybird_settings()),
         });
 
         let sink = auction_sink_from_settings(&settings);
@@ -569,7 +569,7 @@ mod tests {
             Arc::clone(&http_client),
             HashMap::new(),
         );
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(tinybird_settings());
 
         futures::executor::block_on(
             sink.emit_auction_events(&services, AuctionEventBatch::new(Vec::new())),
@@ -602,7 +602,7 @@ mod tests {
                 b"append-token".to_vec(),
             )]),
         );
-        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(tinybird_settings());
         let rows = vec![test_row(); TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH + 1];
 
         let result = futures::executor::block_on(

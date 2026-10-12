@@ -105,11 +105,8 @@ pub fn settings_from_config_blob_with(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    // The telemetry module runs when [analytics] selects it. A table the
-    // section does not select is refused once the settings are read, and
-    // clearing its references here means that refusal is what an operator
-    // sees rather than a secret lookup failing first.
-    if !crate::settings::document_selects_telemetry(data)
+    // References of a table `[analytics]` does not select are cleared before resolution.
+    if !crate::settings::document_selects_analytics_module(data)
         && let Some(table) = data
             .pointer_mut("/analytics/tinybird")
             .and_then(serde_json::Value::as_object_mut)
@@ -547,8 +544,8 @@ mod tests {
 
         assert_eq!(
             reconstructed
-                .telemetry()
-                .and_then(|telemetry| telemetry.auction_token_secret.as_ref())
+                .analytics_module()
+                .and_then(|module| module.auction_token_secret.as_ref())
                 .map(Redacted::expose)
                 .map(String::as_str),
             Some("resolved-tinybird-token")
@@ -896,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unselected_telemetry_table_is_refused_without_resolving_its_secret() {
+    fn an_unselected_analytics_module_table_is_refused_without_resolving_its_secret() {
         let mut original = test_settings();
         original.analytics = Some(AnalyticsConfig {
             module: None,
