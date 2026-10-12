@@ -2804,11 +2804,46 @@ pub enum AuctionDebugCommentFormat {
 }
 
 /// Tester-cookie endpoint configuration.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
     pub enabled: bool,
+    /// Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days.
+    ///
+    /// Without an explicit lifetime the cookie is session-scoped, and Safari
+    /// deletes session cookies when the browser quits, so testers silently
+    /// fall back to the baseline arm on their next visit. Safari's ITP may
+    /// still cap the effective lifetime (for example to 7 days when the
+    /// serving host is a CNAME to a third-party edge), which remains far
+    /// better than session scope.
+    #[validate(range(
+        min = 1,
+        max = 31_536_000,
+        message = "must be between 1 second and 1 year"
+    ))]
+    #[serde(default = "TesterCookieConfig::default_max_age_seconds")]
+    pub max_age_seconds: u32,
+}
+
+impl TesterCookieConfig {
+    /// Default tester-cookie lifetime: 30 days.
+    #[must_use]
+    pub const fn default_max_age_seconds() -> u32 {
+        30 * 24 * 60 * 60
+    }
+}
+
+// A manual impl rather than derive: derive(Default) would zero
+// `max_age_seconds` whenever the whole `[tester_cookie]` section is absent,
+// because `Settings.tester_cookie` uses `#[serde(default)]`.
+impl Default for TesterCookieConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_age_seconds: Self::default_max_age_seconds(),
+        }
+    }
 }
 
 /// Authenticated forwarding configuration for a trusted client IP header.
@@ -2925,6 +2960,7 @@ pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
     #[serde(default)]
+    #[validate(nested)]
     pub tester_cookie: TesterCookieConfig,
     /// Optional authenticated trusted client IP forwarding configuration.
     ///
@@ -4879,6 +4915,65 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "omitted max_age_seconds should fall back to the 30-day default"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_max_age_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 3600
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should parse tester-cookie max age config");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds, 3_600,
+            "tester-cookie config should use the configured max age"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_absent_section_defaults_max_age() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without a tester-cookie section");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "absent tester-cookie section should default max_age_seconds to 30 days"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_zero_max_age_fails_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 0
+        "#,
+            crate_test_settings_str()
+        );
+
+        let error =
+            Settings::from_toml(&toml_str).expect_err("should reject a zero tester-cookie max age");
+
+        assert!(
+            error.to_string().contains("validation failed"),
+            "zero max_age_seconds should fail settings validation, got: {error}"
         );
     }
 
