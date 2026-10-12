@@ -349,8 +349,7 @@ pub async fn handle_auction(
     )?;
 
     // Ask the selected device module what the bidder should be told about
-    // the device. Done here rather than in the builder above, which is
-    // synchronous and cannot reach a module.
+    // the device.
     attach_device_attributes(&mut auction_request, &http_req, settings, services).await;
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply

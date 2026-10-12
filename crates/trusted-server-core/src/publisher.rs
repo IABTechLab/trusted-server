@@ -5435,9 +5435,7 @@ pub async fn handle_publisher_request(
                 },
             );
 
-            // Fill the device object the bidder prices on. Separate from the
-            // synchronous builder above because a module that resolves a
-            // model reaches a service to do it.
+            // Fill the device object the bidder prices on.
             crate::auction::formats::attach_device_attributes(
                 &mut auction_request,
                 &auction_client_request,
@@ -7812,9 +7810,7 @@ pub async fn handle_page_bids(
                 },
             );
 
-            // Fill the device object the bidder prices on. Separate from the
-            // synchronous builder above because a module that resolves a
-            // model reaches a service to do it.
+            // Fill the device object the bidder prices on.
             crate::auction::formats::attach_device_attributes(
                 &mut auction_request,
                 &req,

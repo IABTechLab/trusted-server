@@ -74,24 +74,6 @@ impl DeviceAttributes {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-
-    /// Maps a device-type name to the `OpenRTB` code.
-    ///
-    /// Names come from a detection module and are matched case-insensitively.
-    /// An unrecognised name resolves nothing rather than guessing, because a
-    /// wrong device type is worse for a bidder than an absent one.
-    #[must_use]
-    pub fn device_type_from_name(name: &str) -> Option<i32> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "phone" | "smartphone" => Some(4),
-            "tablet" => Some(5),
-            "desktop" | "notebook" | "smallscreen" => Some(2),
-            "tv" | "smarttv" => Some(3),
-            "console" | "mediahub" | "iot" => Some(6),
-            "settopbox" => Some(7),
-            _ => None,
-        }
-    }
 }
 
 /// Device signals derived from a single request.
@@ -127,11 +109,8 @@ pub struct DeviceSignals {
     ///
     /// Unlike [`looks_like_browser`](Self::looks_like_browser) this is not a
     /// guess about the shape of a header. It is the module's answer from the
-    /// evidence it weighs, such as whether the browser window was in view,
-    /// whether a web driver is present, how old the browser is, whether the
-    /// address carries people and what kind of connection it is. A declared
-    /// agent answers `Low` by name on the first request, and a person the
-    /// module cannot place answers `Unknown` rather than being guessed at.
+    /// evidence it weighs, and a person the module cannot place answers
+    /// `Unknown` rather than being guessed at.
     pub human_confidence: HumanConfidence,
 }
 
@@ -151,34 +130,11 @@ pub enum HumanConfidence {
     /// Almost certainly no person is directly involved in viewing the content.
     Low,
 
-    /// Not established. **This is not the same as `Low`.** It is the honest
-    /// answer before the client-side script has run, because whether the
-    /// window was in view cannot be known from the request alone, and
-    /// treating it as `Low` would call every first-time visitor a machine.
+    /// Not established. **This is not the same as `Low`.** A request alone
+    /// cannot establish a person, and treating it as `Low` would call every
+    /// first-time visitor a machine.
     #[default]
     Unknown,
-}
-
-impl HumanConfidence {
-    /// The answer as text.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::High => "High",
-            Self::Medium => "Medium",
-            Self::Low => "Low",
-            Self::Unknown => "Unknown",
-        }
-    }
-
-    /// Whether this answer says a machine is almost certainly responsible.
-    ///
-    /// Only `Low` does. `Unknown` does not, which is the whole reason the two
-    /// are separate values.
-    #[must_use]
-    pub fn is_machine(self) -> bool {
-        matches!(self, Self::Low)
-    }
 }
 
 impl DeviceSignals {
@@ -208,8 +164,7 @@ impl DeviceSignals {
             h2_fp_hash: None,
             known_browser: None,
             looks_like_browser,
-            // Unknown until the client-side script has run, because whether
-            // the window was in view cannot be known from the request.
+            // Unknown, because the request alone cannot establish a person.
             human_confidence: HumanConfidence::Unknown,
         }
     }
@@ -273,8 +228,8 @@ impl DeviceSignals {
 /// result such as make, model, OS version, or screen size. Those are
 /// [`DeviceAttributes`], answered by
 /// [`advertising_attributes`](DeviceModule::advertising_attributes) on this
-/// same trait, so one module answers both questions from one lookup while
-/// the two answers stay separate types with separate lifetimes.
+/// same trait, and the two answers stay separate types with separate
+/// lifetimes.
 /// Uses `#[async_trait(?Send)]` for the same reason as
 /// [`PlatformHttpClient`](crate::platform::PlatformHttpClient): the trait
 /// object stays `Send + Sync` so it can be shared and run multi-threaded,
@@ -312,16 +267,8 @@ pub trait DeviceModule: Send + Sync {
 
     /// Attributes for the bid request, when this module can resolve them.
     ///
-    /// Separate from [`detect`](Self::detect) because the two answer different
-    /// questions and have different costs. The gate signals must always be
-    /// produced, so `detect` is infallible. These are optional: a module that
-    /// reads only the User-Agent has nothing useful to say about a model or a
-    /// screen size, and the default returns nothing so no existing module
-    /// changes.
-    ///
-    /// A module that resolves nothing should return `None` rather than an
-    /// empty value, because an absent device object and an empty one mean the
-    /// same to a bidder and the absent one is smaller.
+    /// The default returns nothing, so no existing module changes. A module
+    /// that resolves nothing returns `None` rather than an empty value.
     async fn advertising_attributes(&self, _call: ModuleCall<'_>) -> Option<DeviceAttributes> {
         None
     }
@@ -962,9 +909,7 @@ mod tests {
             DeviceSignals::unknown(),
         ] {
             assert_eq!(signals.human_confidence, HumanConfidence::Unknown);
-            assert!(!signals.human_confidence.is_machine());
         }
-        assert!(HumanConfidence::Low.is_machine());
         assert_eq!(HumanConfidence::default(), HumanConfidence::Unknown);
     }
 
@@ -1079,21 +1024,6 @@ mod tests {
             selected.id(),
             "fastly",
             "the fastly selector should use the injected module"
-        );
-    }
-
-    #[test]
-    fn a_device_type_name_maps_only_when_it_is_recognised() {
-        assert_eq!(
-            DeviceAttributes::device_type_from_name("SmartPhone"),
-            Some(4)
-        );
-        assert_eq!(DeviceAttributes::device_type_from_name("tablet"), Some(5));
-        assert_eq!(DeviceAttributes::device_type_from_name("Desktop"), Some(2));
-        assert_eq!(
-            DeviceAttributes::device_type_from_name("Nonsense"),
-            None,
-            "a wrong device type is worse for a bidder than an absent one"
         );
     }
 }

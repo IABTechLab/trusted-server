@@ -393,7 +393,8 @@ impl SeamProbeDevice {
     #[must_use]
     pub fn attributes() -> DeviceAttributes {
         DeviceAttributes {
-            device_type: DeviceAttributes::device_type_from_name("Tablet"),
+            // A tablet, as the module gives `OpenRTB`'s own code.
+            device_type: Some(5),
             make: Some("Probe".to_owned()),
             model: Some("P-1".to_owned()),
             os: Some("ProbeOS".to_owned()),
