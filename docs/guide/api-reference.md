@@ -165,7 +165,9 @@ identifier, and this page does not undo that.
 1. Only a browser opening the address as a page is answered, which the browser
    marks with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. A
    script cannot set either header, so a `fetch` from a page, a frame and an
-   embedded object are each answered `403 Forbidden`.
+   embedded object are each answered `403 Forbidden`. A browser sends these
+   headers only to a trustworthy origin, so every browser on a plain `http://`
+   host other than localhost is answered `403 Forbidden` too.
 2. The page is sent with `Content-Security-Policy: sandbox`, which gives the
    document an origin of its own, so a page that opened it cannot read it.
 3. No identifier is shown. The Edge Cookie's value and each partner's

@@ -709,6 +709,67 @@ fn the_deploy_check_refuses_a_pattern_that_matches_nothing() {
     );
 }
 
+/// A secret only the configuration or a deployment's own module names is
+/// one the load resolves, so the deploy check refuses showing it as the
+/// load does.
+#[test]
+fn the_deploy_check_refuses_showing_a_secret_only_the_load_resolves() {
+    let builder = IntegrationBuilder::new(
+        "probe",
+        "example-crate",
+        crate::integrations::registry_test_support::probe_registration,
+        crate::integrations::registry_test_support::validate_nothing,
+    )
+    .with_module_name("testing.probe")
+    .with_secret_settings(MODULE_SECRETS);
+    let labeled = crate::test_support::tests::crate_test_settings_str_with_ec_section(
+        "[ec]
+module = \"primary\"
+
+[ec.primary]
+implementation = \"hmac\"
+         passphrase = \"labeled-passphrase-key-0123456789\"",
+    );
+    let mut labeled = Settings::from_toml(&format!(
+        "{labeled}
+[inspect]
+show = [\"ec.primary.passphrase\"]
+"
+    ))
+    .expect("should parse the document");
+    labeled.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+    let mut module = settings();
+    module.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+    module
+        .insert_module_config(
+            "testing",
+            "testing.probe",
+            &json!({ "lock": true, "key_name": "module-key" }),
+        )
+        .expect("should insert the module's table");
+    module.inspect.show = vec![PathPattern::parse("testing.probe.key_name").expect("a pattern")];
+
+    for (settings, pattern) in [
+        (labeled, "ec.primary.passphrase"),
+        (module, "testing.probe.key_name"),
+    ] {
+        let reason = format!("show names `{pattern}`, which is a secret");
+        let data = serde_json::to_value(&settings).expect("should serialize the document");
+        let loaded = format!(
+            "{:?}",
+            load_with(data, &[builder]).expect_err("the load should refuse the pattern")
+        );
+        let deployed = format!(
+            "{:?}",
+            crate::config::validate_settings_for_deploy_with(&settings, &[builder])
+                .expect_err("the deploy check should refuse the pattern")
+        );
+
+        assert!(loaded.contains(&reason), "load: {loaded}");
+        assert!(deployed.contains(&reason), "deploy: {deployed}");
+    }
+}
+
 #[test]
 fn the_page_answers_not_found_when_the_publisher_does_not_publish() {
     let settings = load(document("[inspect]\nconfig = false")).expect("should load");

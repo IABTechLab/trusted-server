@@ -197,8 +197,6 @@ pull_sync_concurrency = 3
 # an empty file, which a crawler would read as permission.
 #
 # A module's own settings go in its own block, [robots-txt.<name>].
-# A publisher who sells advertising wants /ads.txt in always_allow, because
-# a crawler may ignore an ads.txt that robots.txt disallows.
 # [robots-txt]
 # modules = ["refuse_all"]
 # always_allow = ["/ads.txt"]

@@ -12,9 +12,8 @@ use crate::permissions::PermissionSet;
 /// The `[robots-txt] modules` entry that refuses every crawler.
 ///
 /// Core's own, and it names no vendor. Selecting it makes the file the refusal
-/// and nothing else, whatever else is selected, because a refusal cannot be
-/// loosened, and it puts `X-Robots-Tag: noindex, nofollow` on every response an
-/// adapter finalizes.
+/// and nothing else, whatever else is selected, and puts
+/// [`REFUSE_ALL_ROBOTS_TAG`](super::REFUSE_ALL_ROBOTS_TAG) on every response.
 pub const REFUSE_ALL: &str = "refuse_all";
 
 /// The `[robots-txt] modules` entry that allows every crawler everywhere.
@@ -71,9 +70,7 @@ pub trait RobotsTxtContributor: Send + Sync + core::fmt::Debug {
     ///
     /// A contribution with no groups is an answer, and is served as one. An
     /// error is a failure, and core serves this contributor's held copy
-    /// instead. With no held copy the whole file fails closed with `503`,
-    /// because leaving out a contributor's rules would allow by omission
-    /// whatever those rules refused.
+    /// instead. With no held copy the whole file fails closed with `503`.
     ///
     /// # Errors
     ///

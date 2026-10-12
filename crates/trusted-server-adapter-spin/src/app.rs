@@ -1079,10 +1079,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
             }
         }
-        // The attestation pages answer at the address the settings choose, so
-        // they are registered here rather than with the fixed routes. Reads reach
-        // the handler, and other methods reach the publisher's origin unless the
-        // deployment owns the prefix.
+        // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
             let s = Arc::clone(&state);
@@ -1107,10 +1104,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         }
 
-        // `/robots.txt` is this server's only when the settings carry a
-        // `[robots-txt]` section. Without one the path reaches the publisher's
-        // origin like any other, so a publisher keeping their own file is
-        // left alone.
+        // Only when the settings carry `[robots-txt]`.
         if state.settings.robots_txt.is_some() {
             let s = Arc::clone(&state);
             let robots_txt_handler = move |ctx: RequestContext| {

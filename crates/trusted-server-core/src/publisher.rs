@@ -1533,9 +1533,7 @@ fn create_html_stream_processor(
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed);
 
-    // The middleware of the first [[fetch]] entry covering this path. What
-    // they leave is what a shared template stores, and they are handed
-    // nothing the request left.
+    // The middleware of the first [[fetch]] entry covering this path.
     let fetch = params.integration_registry.middleware_chain(
         &params.settings.fetch,
         MiddlewarePhase::Fetch,
@@ -1544,9 +1542,7 @@ fn create_html_stream_processor(
     );
     // A response that may be stored leaves this processor as the template
     // every reader shares, so its [[serve]] entry runs on each reader's copy
-    // once that copy is assembled. See `run_serve_pass`. What the request
-    // left reaches a document through that entry alone, so none of it reaches
-    // a template.
+    // once that copy is assembled. See `run_serve_pass`.
     let serve = (!params.shared_template_authorized).then(|| {
         params.integration_registry.middleware_chain(
             &params.settings.serve,
@@ -2043,10 +2039,8 @@ pub async fn buffer_publisher_response_async(
                 set_assembly_response_state(&mut response, state);
             }
             let bytes = if was_authorized {
-                // The transform wrote a template every reader shares, so the
-                // [[serve]] entry runs here, on this reader's assembled copy.
-                // A page that was never authorized ran it inside the
-                // transform.
+                // The [[serve]] entry runs here on a shared template, and
+                // inside the transform on a page that was never authorized.
                 let bytes = run_serve_pass(bytes, &params, settings, integration_registry)?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
