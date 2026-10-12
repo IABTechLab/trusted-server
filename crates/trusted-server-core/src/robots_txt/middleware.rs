@@ -103,7 +103,7 @@ impl Middleware for RobotsTxt {
     }
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        match context.prepared.take::<String>(MODULE) {
+        match context.take_prepared::<String>(MODULE) {
             Some(file) => MiddlewareAction {
                 stream: Some(Box::new(ReplaceBody { file: Some(file) })),
                 ..MiddlewareAction::pass()
@@ -171,6 +171,7 @@ mod tests {
         let state = IntegrationDocumentState::default();
         let prepared = Prepared::default();
         prepared.insert(
+            MiddlewarePhase::Fetch,
             MODULE,
             Box::new(String::from("User-agent: *\nDisallow: /\n")),
         );
@@ -208,7 +209,7 @@ mod tests {
     fn a_value_of_another_type_under_the_name_is_not_a_file() {
         let state = IntegrationDocumentState::default();
         let prepared = Prepared::default();
-        prepared.insert(MODULE, Box::new(7_u32));
+        prepared.insert(MiddlewarePhase::Serve, MODULE, Box::new(7_u32));
         let context = context_with(MiddlewarePhase::Serve, &state, &prepared);
 
         assert!(middleware().create(&context).stream.is_none());
