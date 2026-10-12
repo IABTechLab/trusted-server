@@ -91,7 +91,7 @@ The render guard maps `403` to `blocked` and every other failure to `fallback`, 
 
 `Rewrite::is_excluded` (`settings.rs:647-669`) parses the URL, takes `host_str()` (already lowercase), and compares it against raw entries with `==` and `ends_with`. An entry such as `CDN.example.com` never matches. It still carries a stale `#[allow(dead_code)]` (`settings.rs:647`).
 
-`proxy::is_host_allowed` (`proxy.rs:1242-1255`) lowercases both sides and enforces a dot boundary: `example.com` matches only itself; `*.example.com` matches `example.com` and any subdomain, not `evil-example.com`. Prebid (`integrations/prebid.rs:918`) and GTM (`integrations/google_tag_manager.rs:1983`) reuse it. `Proxy::normalize` (`settings.rs:1766-1789`) trims and lowercases `allowed_domains`, drops empty entries, and drops a bare `*` with a warning.
+`proxy::is_host_allowed` (`proxy.rs:1242-1255`) lowercases both sides and enforces a dot boundary: `example.com` matches only itself; `*.example.com` matches `example.com` and any subdomain, not `evil-example.com`. Prebid (`integrations/prebid.rs:918`) reuses it directly; production GTM reaches it indirectly, through `.with_allowed_domains(...)` (`integrations/google_tag_manager.rs:805`), the redirect policy and `is_host_permitted`. `Proxy::normalize` (`settings.rs:1766-1789`) trims and lowercases `allowed_domains`, drops empty entries, and drops a bare `*` with a warning.
 
 ## Design
 
@@ -120,7 +120,7 @@ pub struct Rewrite {
 }
 ```
 
-`skip_serializing_if` keeps the default out of serialized blobs, the same pattern as `rewrite_creatives` (`auction_config_types.rs:46-50`, tested at `config_payload.rs:715-736`). `exclude_domains` keeps its current serialization so existing blob hashes do not change.
+`skip_serializing_if` keeps the default out of serialized blobs, the same pattern as `rewrite_creatives` (`auction_config_types.rs:46-50`, tested at `config_payload.rs:715-736`). `exclude_domains` keeps its current serialization, so blob hashes do not change for configs whose entries are already normalized. `TrustedServerAppConfig` serializes the normalized settings (`config.rs:97-104`), so after this change `ts config push` writes lowercased, trimmed `exclude_domains` for configs with mixed-case or whitespace entries, and the first push after upgrading shows a blob diff for them. `proxy.allowed_domains` already behaves this way.
 
 Pattern syntax is the same for both lists: an exact host, or `*.example.com`, which matches the apex and any subdomain at any depth. Matching is on `Url::host_str()` only; port, user info, path, query and fragment never participate.
 
@@ -129,8 +129,9 @@ Pattern syntax is the same for both lists: an exact host, or `*.example.com`, wh
 Add `Rewrite::normalize(&mut self)` and call it from `Settings::normalize_deserialized` (`settings.rs:2988`), next to `self.proxy.normalize()`. That function runs on every load path: TOML, config blob, and `TrustedServerAppConfig` deserialization used by `ts config push` validation (`config.rs:111-112`).
 
 - Both lists: trim each entry and lowercase it with `to_ascii_lowercase`.
-- `exclude_domains`: drop empty entries and a bare `*` with a `log::warn!`, as `Proxy::normalize` does. Neither can match a host today, so dropping them changes no behavior, and rejecting them would make an existing blob fail to load after a binary upgrade.
-- `include_domains`: keep entries as normalized. `validate_include_domains` rejects every entry that can never equal `Url::host_str()`. The key is new, so no existing config can trip this. A malformed allowlist is better caught at `ts config push` than silently widened to "proxy everything", or silently narrowed to "proxy nothing" by an entry that never matches.
+- `exclude_domains`: drop empty entries and a bare `*` with a `log::warn!`, as `Proxy::normalize` does. Neither can match a host today, so dropping them changes no behavior, and rejecting them would make an existing blob fail to load after a binary upgrade. This deviates from issue #1231, which asks to reject empty entries and a bare `*`; dropping with a warning keeps existing blobs loading.
+- `exclude_domains`: after dropping, run each remaining entry through the same `check_include_domain` check and `log::warn!` once per entry it rejects (for example `https://cdn.example.com`, `cdn.example.com:443` or `[2001:0db8::1]`). Such an entry never matches, so its host keeps being proxied and keeps receiving `ts-ec`, the leak #1231 is about. The entry is kept and nothing is rejected, so behavior does not change.
+- `include_domains`: keep entries as normalized. `validate_include_domains` rejects every entry that can never equal `Url::host_str()`: after its syntactic checks, each entry must round-trip unchanged through `url::Host::parse` (the parser behind `host_str()`), with brackets kept for IPv6. The key is new, so no existing config can trip this. A malformed allowlist is better caught at `ts config push` than silently widened to "proxy everything", or silently narrowed to "proxy nothing" by an entry that never matches.
 
   An accepted entry is one of:
   - a DNS name, optionally prefixed with `*.`, made of `.`-separated, non-empty labels of `[a-z0-9-]`;
@@ -230,7 +231,7 @@ Resulting call sites (signatures unchanged unless shown):
 
 Because no caller reads the original string, every handler in the table gets the allowlist with no per-handler code. Nested HTML and CSS fetched through `/first-party/proxy` run the same pass and pick it up too.
 
-**Output parity with an empty allowlist.** `build_signed_url_for` already parses the clear URL and signs its `Url` serialization, and `Url::parse(url.as_str())` round-trips, so for every input that parses, the rewritten bytes are identical to today's. The only difference is an absolute-looking value that `Url::parse` rejects (for example `https://exa mple.example/x`). Today `to_abs` accepts it and `build_signed_url_for` hands back the raw string, so the handler rewrites the attribute to its own value and `CssUrlRewriter` re-serializes it as a quoted string. After the change the value is left untouched. No existing fixture contains such a URL; `unparseable_absolute_url_is_left_byte_identical` pins the new behavior.
+**Output parity with an empty allowlist.** `build_signed_url_for` already parses the clear URL and signs its `Url` serialization, and `Url::parse(url.as_str())` round-trips, so for every input that parses, the rewritten bytes are identical to today's. The only difference is an absolute-looking value that `Url::parse` rejects (for example `https://exa mple.example/x`). Today `to_abs` accepts it and `build_signed_url_for` hands back the raw string, so the handler rewrites the attribute to the trimmed, `https:`-prefixed string (for example `src=" //exa mple.example/x "` becomes `https://exa mple.example/x`), anchors also gain `data-tsclick` with it, and `CssUrlRewriter` re-serializes it as a quoted string. After the change the value is left untouched. No existing fixture contains such a URL; `unparseable_absolute_url_is_left_byte_identical` pins the new behavior.
 
 ### `/first-party/sign`
 
@@ -309,7 +310,7 @@ See [Coordination with #1234](#coordination-with-1234).
 Both specs describe the same split, so either implementation can land first:
 
 - `to_abs` is replaced by `normalize_creative_url(url: &str) -> Option<url::Url>` in `creative.rs`: trimming, protocol-relative, `http(s)` only, no policy.
-- Policy lives on `Rewrite` in `settings.rs` as `should_proxy_asset(&self, host: &str) -> bool` (not excluded and (include list empty or host included)) and `should_wrap_click(&self, host: &str) -> bool` (not excluded), with a private `is_excluded_host`. Both use the existing case-insensitive matchers `proxy::is_host_allowed` and `proxy::is_host_permitted` (made `pub(crate)`): an exact host, or `*.example.com` matching the apex and subdomains.
+- Policy lives on `Rewrite` in `settings.rs` as `should_proxy_asset(&self, host: &str) -> bool` (not excluded) and `should_wrap_click(&self, host: &str) -> bool` (not excluded), with a private `is_excluded_host`. Both use the existing case-insensitive matcher `proxy::is_host_allowed`: an exact host, or `*.example.com` matching the apex and subdomains. `proxy::is_host_permitted` stays private in the shared step; #1231 makes it `pub(crate)` when it adds the include clause.
 - `creative.rs` gains two private helpers, `asset_target` and `click_target`, each `normalize_creative_url` filtered by the matching policy method. The anchor handler calls `click_target`.
 - The exact shared code is reproduced in the plan's "Shared step" section so the two PRs can be diffed against it.
 - Whichever implementation PR lands first introduces the normalizer, both policy methods, the `Rewrite::normalize` case fix, the removal of `is_excluded`, and the shared CHANGELOG Fixed entry. The second rebases and adds only its own piece: #1231 adds `include_domains` to `should_proxy_asset`; #1234 adds the click switch that gates the anchor handler.
@@ -318,25 +319,25 @@ If #1234 lands first, `should_proxy_asset` is `!self.is_excluded_host(host)`, an
 
 ## Test plan
 
-All tests are unit tests in `trusted-server-core` and run under `cargo test-fastly`, `cargo test-axum`, `cargo test-cloudflare` and `cargo test-spin`. Hosts are under `example.com`, `example.net` and `example.org`.
+All tests are unit tests in `trusted-server-core` and run under `cargo test-fastly` (or natively with `cargo test -p trusted-server-core --target <host-triple>`). Hosts are under `example.com`, `example.net` and `example.org`.
 
 ### `settings.rs`
 
-- `should_proxy_asset` table: empty include list proxies any host; exact match; wildcard matches apex and nested subdomain; wildcard does not match `evil-example.com`; off-list host is rejected; a host in both lists is rejected; uppercase host and uppercase entry both match.
+- `should_proxy_asset` table: empty include list proxies any host; exact match; wildcard matches apex and nested subdomain; wildcard does not match `evil-example.com`; off-list host is rejected; a host in both lists is rejected; uppercase host and uppercase entry both match (the uppercase entry, such as `*.EXAMPLE.com`, is pushed onto the list directly, bypassing TOML normalization).
 - `should_wrap_click` ignores `include_domains` and honors `exclude_domains`.
-- `Rewrite::normalize`: trims and lowercases both lists; drops `""` and `*` from `exclude_domains`.
+- `Rewrite::normalize`: trims and lowercases both lists; drops `""` and `*` from `exclude_domains`; keeps an inert `exclude_domains` entry such as `cdn.example.com:443` unchanged (it only warns).
 - Regression for the case bug: `exclude_domains = ["CDN.Example.com"]` loaded from TOML excludes `https://cdn.example.com/x`.
 - `include_domains` validation, through `Settings::from_toml`:
-  - rejects `""`, `"   "`, `*`, `*.`, `cdn.*.example.com`, `**.example.com`, `https://cdn.example.com`, `cdn.example.com:443`, `cdn.example.com/x`, `.example.com`, `example.com.`, `cdn..example.com`, `cdn example.com`, `cdn_assets.example.com`, `::1`, `[::1`, `[2001:0db8::1]`, `*.192.0.2.1`, `192.0.2` and `256.0.2.1` with `invalid_rewrite_include_domain`;
+  - rejects `""`, `"   "`, `*`, `*.`, `cdn.*.example.com`, `**.example.com`, `https://cdn.example.com`, `cdn.example.com:443`, `cdn.example.com/x`, `.example.com`, `example.com.`, `cdn..example.com`, `cdn example.com`, `cdn_assets.example.com`, `::1`, `[::1`, `[2001:0db8::1]`, `[::ffff:192.0.2.1]` (rendered as `[::ffff:c000:201]`), `xn--zz.example` (an IDNA error in `url`), `*.192.0.2.1`, `192.0.2` and `256.0.2.1` with `invalid_rewrite_include_domain`;
   - rejects `bücher.example` and `*.bücher.example` with `non_ascii_rewrite_include_domain`;
-  - accepts `cdn.example.com`, `*.example.com`, `xn--bcher-kva.example`, `192.0.2.1`, `[2001:db8::1]` and `[::1]` unchanged.
-- Port the `test_rewrite_is_excluded` cases (`settings.rs:6523-6546`) to the new methods. Tests build `Rewrite::default()` and extend its lists; assigning a whole field on a `Default` value trips `clippy::field_reassign_with_default`.
+  - accepts `cdn.example.com`, `*.example.com`, `xn--bcher-kva.example`, `192.0.2.1`, `[2001:db8::1]`, `[::1]` and `[::ffff:c000:201]` unchanged.
+- Port the `test_rewrite_is_excluded` cases (`settings.rs:6523-6546`) to the new methods, including the suffix-spoof case (`example.org.evil.example.net`). Tests build `Rewrite::default()` and extend its lists; assigning a whole field on a `Default` value trips `clippy::field_reassign_with_default`.
 
 ### `creative.rs`
 
 - `normalize_creative_url`: port `to_abs_conversions`, `to_abs_preserves_port_in_protocol_relative` and `to_abs_additional_cases` (`creative.rs:1700-1736`, `3420-3430`), asserting on `Url::as_str()`. `HTTPS://cdn.example/x` now yields `https://cdn.example/x`, the form already signed today. Add an unparseable absolute value returning `None`, and a rewrite test asserting that such a value survives byte-identical (by `contains`, since the TSJS tag is injected even without `<body>`).
 - Port `to_abs_respects_exclude_domains` and `to_abs_respects_wildcard_domains` (`creative.rs:3445-3504`) to `proxy_if_abs`, leaving the other exclusion tests' rewrite-output assertions untouched.
-- Allowlist matrix: one creative containing a listed host and an off-list host in each of `img src`, `img data-src`, `srcset`, `link rel=stylesheet href`, `link imagesrcset`, `script src`, `video`/`audio`/`source src`, `object data`, `embed src`, `input type=image`, SVG `image href`, `use xlink:href`, `iframe src`, inline `style`, and `<style>` with `url()`, an `image-set()` string and `@import`. Listed URLs become `/first-party/proxy`; off-list URLs are byte-identical to the input. The listed `link imagesrcset` candidate (`p1-2x.png`) differs from the link's `href` (`p1.png`), so the matrix proves `imagesrcset` itself is proxied. Run through `rewrite_creative_html`, `rewrite_inline_creative_html` (absolute output, with a realistic `base_origin`, `https://www.example.com`, that matches the include list) and `rewrite_proxied_html`.
+- Allowlist matrix: one creative containing a listed host and an off-list host in each of `img src`, `img data-src`, `srcset`, `link rel=stylesheet href`, `link imagesrcset`, `script src`, `video src`, `object data`, `embed src`, `input type=image`, SVG `image href`, `use xlink:href`, `iframe src`, inline `style`, and `<style>` with `url()`, an `image-set()` string and `@import`. Listed URLs become `/first-party/proxy`; off-list URLs are byte-identical to the input. The listed `link imagesrcset` candidate (`p1-2x.png`) differs from the link's `href` (`p1.png`), so the matrix proves `imagesrcset` itself is proxied. Run through `rewrite_creative_html`, `rewrite_inline_creative_html` (absolute output, with a realistic `base_origin`, `https://www.example.com`, that matches the include list) and `rewrite_proxied_html`.
 - `rewrite_css_body` with a listed and an off-list `@import` and `url()`.
 - A host in both lists stays raw in every handler: the full allowlist creative, plus an anchor on that host, runs through all three HTML paths with `exclude_domains = ["assets.example.com"]`. No `assets.example.com` URL is rewritten anywhere, and only the two links on other hosts are wrapped.
 - Anchors and `area` on an off-list host are wrapped with `data-tsclick` while the allowlist is set; an excluded anchor stays raw.
@@ -376,7 +377,7 @@ No changes. `proxy_sign.test.ts` already covers non-`403` fallback.
 1. Deploy the binary. With no `include_domains`, asset behavior is unchanged except for the `exclude_domains` case fix.
 2. Add `include_domains` to `trusted-server.toml` and `ts config push`. `ts config push` validates entries before publishing.
 
-Rollback is the reverse: remove `include_domains` and push, then roll back the binary. `Rewrite` uses `deny_unknown_fields` (`settings.rs:637`), so an older binary rejects a blob that carries the key. The CHANGELOG Added entry and a warning box in `configuration.md`'s `[rewrite]` section state this order, mirroring the `rewrite_clicks` warning. A blob written by the new binary with the list empty omits the key and stays readable. Rolling the binary back also restores the case-sensitive `exclude_domains` match.
+Rollback is the reverse: remove `include_domains` and push, then roll back the binary. `Rewrite` uses `deny_unknown_fields` (`settings.rs:637`), so an older binary rejects a blob that carries the key. The CHANGELOG Added entry and a warning box in `configuration.md`'s `[rewrite]` section state this order, mirroring the existing `[auction] rewrite_creatives` upgrade and rollback box (and #1234's `[auction] rewrite_clicks` box if that has landed). A blob written by the new binary with the list empty omits the key and stays readable. Rolling the binary back also restores the case-sensitive `exclude_domains` match.
 
 Recommend that operators keep `include_domains` inside `proxy.allowed_domains` when both are set. A host in the include list but not the proxy list is rewritten to a proxy URL that then fails with `403`.
 
@@ -385,7 +386,7 @@ This PR follows the coordination rule above: if #1234 has merged, rebase onto it
 ## Documentation updates
 
 - `docs/guide/configuration.md`: add `include_domains` to the `[rewrite]` table (`configuration.md:993-995`) and the section intro, state that it applies to assets only, that `exclude_domains` wins, that both lists are case-insensitive, and that neither can be set through environment overrides. List the validation rules above. Recommend the subset relationship with `proxy.allowed_domains`. Add a warning box with the upgrade order (binary first) and the rollback order (remove `include_domains`, push, then roll back the binary), explaining `deny_unknown_fields`.
-- `docs/guide/creative-processing.md`: add an "Include Domains" section beside "Exclude Domains" (`creative-processing.md:637`), and link it to the validation rules in `configuration.md`. Say that click-through wrapping depends only on `rewrite_clicks` and `exclude_domains` (just `exclude_domains` if #1234 has not landed). Fix the wildcard example at `creative-processing.md:656-663`, which says `*.cdn.example.com` does not match `cdn.example.com`; the code matches the apex, as `configuration.md:1022-1025` already says. Note that click-through links ignore the allowlist.
+- `docs/guide/creative-processing.md`: add an "Include Domains" section beside "Exclude Domains" (`creative-processing.md:637`), and link it to the validation rules in `configuration.md`. Say that click-through wrapping depends only on `[auction] rewrite_clicks` (from #1234) and `exclude_domains` (just `exclude_domains` if #1234 has not landed). Fix the wildcard example at `creative-processing.md:656-663`, which says `*.cdn.example.com` does not match `cdn.example.com`; the code matches the apex, as `configuration.md:1022-1025` already says. Note that click-through links ignore the allowlist.
 - `docs/guide/first-party-proxy.md`: extend "URL Rewrite Exclusions" (`first-party-proxy.md:509-521`) with the allowlist, and state in the `/first-party/sign` section (`first-party-proxy.md:139-175`) that excluded and off-list hosts return a non-`403` error that falls back to a direct load.
 - `docs/guide/api-reference.md`: in `/first-party/sign` error responses (`api-reference.md:565-570`), list the excluded or off-list `502`.
 - `trusted-server.example.toml`: add a commented `include_domains` line under `# [rewrite]` (`trusted-server.example.toml:127-129`) and note that `exclude_domains` also covers click-through links.
@@ -394,6 +395,10 @@ This PR follows the coordination rule above: if #1234 has merged, rebase onto it
   - Added: `[rewrite] include_domains` asset host allowlist, its effect on EC forwarding and on `/first-party/sign`, the entry rules, binary-first upgrade, and rollback (remove the key and push before rolling back the binary, because of `deny_unknown_fields`).
   - Fixed (shared step, exact text in the plan's "Shared step" section): `exclude_domains` matching is now case-insensitive and ignores surrounding whitespace. Entries that never matched before now take effect, and `/first-party/sign` returns `502` for them where it used to return `200`, or `403` off `proxy.allowed_domains`. Empty and bare `"*"` entries are dropped with a warning. Unparseable absolute `http(s)` values are left untouched instead of re-quoted or marked with `data-tsclick`. Audit mixed-case entries.
   - Fixed: inline SSAT/page-bids creatives no longer proxy `<link rel="preload" imagesrcset>` candidates twice.
+
+## Follow-ups
+
+- Trailing-dot hosts bypass `exclude_domains` (pre-existing). `https://blocked.example.com./x` has `host_str()` `blocked.example.com.`, which matches neither `blocked.example.com` nor `*.example.com` in `is_host_allowed` (`proxy.rs:1242-1255`), so it is proxied, signed and gets `ts-ec` despite the exclusion. `include_domains` fails safe here: an off-list host stays raw. Out of scope for this change; track it in a follow-up issue (for example, strip one trailing `.` before matching).
 
 ## Expected files
 
