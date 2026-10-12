@@ -2587,14 +2587,6 @@ response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
 positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
 Check `X-TS-Template-Cache: hit` to verify template reuse.
 
-Authorization has one narrow exception. A request carrying exactly the same
-single Basic credential that Trusted Server just validated at the edge may share
-a template; pass-through, repeated, appended, or replaced values still bypass.
-Trusted Server does not remove the validated header, so it remains forwarded to
-the publisher origin. If the origin uses that credential to select response
-content, it must declare `Vary: Authorization`; that response is deliberately not
-stored as a shared template.
-
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, and schema
