@@ -403,6 +403,12 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
+    /// Integration selected as the authoritative identity writer for this source.
+    ///
+    /// An owned source retains token-authenticated read access, rejects legacy
+    /// batch writes and cannot enable legacy pull acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_owner: Option<String>,
     /// Plaintext API token used by inbound batch sync and identify requests.
     ///
     /// When present, the token is hashed at startup for auth lookups. Omitting
@@ -536,6 +542,98 @@ impl EcPartner {
     }
 }
 
+/// One signing key for the authenticated identity capture handoff.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityHandoffKey {
+    /// Stable key identifier carried in authenticated handoff envelopes.
+    pub id: String,
+    /// URL-safe unpadded base64 key material, resolved from the secret store at runtime.
+    pub secret: Redacted<String>,
+}
+
+/// Configuration for the optional authenticated identity capture handoff.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_identity_handoff_config))]
+pub struct IdentityHandoffConfig {
+    /// Whether handoff issuance, auction delivery, and replay are enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Identifier of the key used to issue new handoff envelopes.
+    #[serde(default)]
+    pub active_key_id: String,
+    /// Verification keys retained for issuance and rotation overlap.
+    #[serde(default)]
+    pub keys: Vec<IdentityHandoffKey>,
+}
+
+impl IdentityHandoffConfig {
+    fn is_default(&self) -> bool {
+        !self.enabled && self.active_key_id.is_empty() && self.keys.is_empty()
+    }
+}
+
+fn validate_identity_handoff_config(config: &IdentityHandoffConfig) -> Result<(), ValidationError> {
+    let validation_error = |message: String| {
+        let mut error = ValidationError::new("invalid_identity_handoff_config");
+        error.message = Some(message.into());
+        error
+    };
+
+    if config.keys.len() > 4 {
+        return Err(validation_error(
+            "ec.identity_handoff.keys must contain at most 4 keys".to_owned(),
+        ));
+    }
+
+    let mut key_ids = HashSet::new();
+    for key in &config.keys {
+        if key.id.is_empty()
+            || key.id.len() > 32
+            || !key
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(validation_error(
+                "ec.identity_handoff key ids must be 1 to 32 ASCII alphanumeric, '_' or '-' characters"
+                    .to_owned(),
+            ));
+        }
+        if !key_ids.insert(key.id.as_str()) {
+            return Err(validation_error(format!(
+                "ec.identity_handoff key id `{}` is configured more than once",
+                key.id
+            )));
+        }
+    }
+
+    if !config.active_key_id.is_empty()
+        && (config.active_key_id.len() > 32
+            || !config
+                .active_key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    {
+        return Err(validation_error(
+            "ec.identity_handoff.active_key_id must be 1 to 32 ASCII alphanumeric, '_' or '-' characters when set"
+                .to_owned(),
+        ));
+    }
+
+    if config.enabled
+        && (config.active_key_id.is_empty() || !key_ids.contains(config.active_key_id.as_str()))
+    {
+        return Err(validation_error(
+            "enabled ec.identity_handoff requires active_key_id to name a configured key"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Edge Cookie (EC) configuration.
 ///
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
@@ -568,6 +666,11 @@ pub struct Ec {
     /// when an entry does not already have a stored `cluster_size`.
     #[serde(default = "Ec::default_cluster_recheck_secs")]
     pub cluster_recheck_secs: u64,
+
+    /// Optional authenticated handoff for validated server-side identity capture.
+    #[serde(default, skip_serializing_if = "IdentityHandoffConfig::is_default")]
+    #[validate(nested)]
+    pub identity_handoff: IdentityHandoffConfig,
 
     /// Partners (SSPs, DSPs, identity vendors) for EC identity sync.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -4595,6 +4698,7 @@ mod tests {
     fn settings_debug_output_redacts_every_secret_field() {
         const CANARY_PROXY_SECRET: &str = "CANARY-PROXY-SECRET-0123456789";
         const CANARY_EC_PASSPHRASE: &str = "CANARY-EC-PASSPHRASE-0123456789";
+        const CANARY_IDENTITY_HANDOFF_KEY: &str = "CANARY-IDENTITY-HANDOFF-KEY-0123456789";
         const CANARY_HANDLER_USERNAME: &str = "CANARY-HANDLER-USERNAME-0123456789";
         const CANARY_HANDLER_PASSWORD: &str = "CANARY-HANDLER-PASSWORD-0123456789";
         const CANARY_EC_PARTNER_API_TOKEN: &str = "CANARY-EC-PARTNER-API-TOKEN-0123456789";
@@ -4614,6 +4718,14 @@ mod tests {
 
         settings.publisher.proxy_secret = Redacted::new(CANARY_PROXY_SECRET.to_string());
         settings.ec.passphrase = Redacted::new(CANARY_EC_PASSPHRASE.to_string());
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "canary-key".to_owned(),
+            keys: vec![IdentityHandoffKey {
+                id: "canary-key".to_owned(),
+                secret: Redacted::new(CANARY_IDENTITY_HANDOFF_KEY.to_owned()),
+            }],
+        };
 
         settings.handlers = vec![Handler {
             path: "^/secure".to_string(),
@@ -4634,6 +4746,7 @@ mod tests {
             pull_sync_allowed_domains: Vec::new(),
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new(CANARY_EC_PARTNER_TS_PULL_TOKEN.to_string())),
         }];
 
@@ -4701,6 +4814,10 @@ mod tests {
         let canaries = [
             ("publisher.proxy_secret", CANARY_PROXY_SECRET),
             ("ec.passphrase", CANARY_EC_PASSPHRASE),
+            (
+                "ec.identity_handoff.keys[].secret",
+                CANARY_IDENTITY_HANDOFF_KEY,
+            ),
             ("handlers[].username", CANARY_HANDLER_USERNAME),
             ("handlers[].password", CANARY_HANDLER_PASSWORD),
             ("ec.partners[].api_token", CANARY_EC_PARTNER_API_TOKEN),
@@ -6401,6 +6518,146 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn identity_handoff_defaults_disabled_without_keys() {
+        let config = IdentityHandoffConfig::default();
+
+        assert!(!config.enabled, "handoff should default off");
+        assert!(
+            config.active_key_id.is_empty(),
+            "handoff should not select a key by default"
+        );
+        assert!(config.keys.is_empty(), "handoff should default to no keys");
+        config
+            .validate()
+            .expect("disabled empty handoff config should validate");
+    }
+
+    #[test]
+    fn identity_handoff_default_is_omitted_but_provisioned_disabled_keys_serialize() {
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without identity handoff configuration");
+        let value = serde_json::to_value(&settings).expect("should serialize default settings");
+        assert!(
+            value["ec"].get("identity_handoff").is_none(),
+            "default handoff should remain absent from pushed config"
+        );
+
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: false,
+            active_key_id: "next".to_owned(),
+            keys: vec![IdentityHandoffKey {
+                id: "next".to_owned(),
+                secret: Redacted::new("next-secret-reference".to_owned()),
+            }],
+        };
+        let value = serde_json::to_value(&settings)
+            .expect("should serialize provisioned disabled handoff settings");
+        assert_eq!(value["ec"]["identity_handoff"]["enabled"], false);
+        assert_eq!(
+            value["ec"]["identity_handoff"]["keys"][0]["secret"],
+            "next-secret-reference"
+        );
+    }
+
+    #[test]
+    fn identity_handoff_structure_accepts_rotation_keys() {
+        let config = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "current_key-2".to_owned(),
+            keys: vec![
+                IdentityHandoffKey {
+                    id: "previous-key".to_owned(),
+                    secret: Redacted::new("previous-secret-reference".to_owned()),
+                },
+                IdentityHandoffKey {
+                    id: "current_key-2".to_owned(),
+                    secret: Redacted::new("current-secret-reference".to_owned()),
+                },
+            ],
+        };
+
+        config
+            .validate()
+            .expect("rotation config should retain an old verification key");
+    }
+
+    #[test]
+    fn identity_handoff_structure_rejects_unsafe_duplicate_and_missing_active_ids() {
+        let cases = [
+            IdentityHandoffConfig {
+                enabled: false,
+                active_key_id: String::new(),
+                keys: vec![IdentityHandoffKey {
+                    id: String::new(),
+                    secret: Redacted::new("secret-reference".to_owned()),
+                }],
+            },
+            IdentityHandoffConfig {
+                enabled: false,
+                active_key_id: String::new(),
+                keys: vec![IdentityHandoffKey {
+                    id: "x".repeat(33),
+                    secret: Redacted::new("secret-reference".to_owned()),
+                }],
+            },
+            IdentityHandoffConfig {
+                enabled: false,
+                active_key_id: String::new(),
+                keys: vec![IdentityHandoffKey {
+                    id: "unsafe key".to_owned(),
+                    secret: Redacted::new("secret-reference".to_owned()),
+                }],
+            },
+            IdentityHandoffConfig {
+                enabled: false,
+                active_key_id: String::new(),
+                keys: vec![
+                    IdentityHandoffKey {
+                        id: "duplicate".to_owned(),
+                        secret: Redacted::new("first-secret-reference".to_owned()),
+                    },
+                    IdentityHandoffKey {
+                        id: "duplicate".to_owned(),
+                        secret: Redacted::new("second-secret-reference".to_owned()),
+                    },
+                ],
+            },
+            IdentityHandoffConfig {
+                enabled: true,
+                active_key_id: "missing".to_owned(),
+                keys: vec![IdentityHandoffKey {
+                    id: "configured".to_owned(),
+                    secret: Redacted::new("secret-reference".to_owned()),
+                }],
+            },
+        ];
+
+        for config in cases {
+            config
+                .validate()
+                .expect_err("invalid handoff key selection should fail validation");
+        }
+    }
+
+    #[test]
+    fn identity_handoff_structure_rejects_more_than_four_keys() {
+        let config = IdentityHandoffConfig {
+            enabled: false,
+            active_key_id: String::new(),
+            keys: (0..5)
+                .map(|index| IdentityHandoffKey {
+                    id: format!("key-{index}"),
+                    secret: Redacted::new(format!("secret-reference-{index}")),
+                })
+                .collect(),
+        };
+
+        config
+            .validate()
+            .expect_err("handoff should cap the rotation key ring at four keys");
+    }
+
+    #[test]
     fn validate_passphrase_rejects_under_32_characters() {
         let passphrase = Redacted::new("a".repeat(31));
 
@@ -6562,6 +6819,7 @@ source_domain = "partner.example.com"
             pull_sync_allowed_domains: vec!["partner.example.com".to_owned()],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: Some(Redacted::new(ts_pull_token.to_owned())),
         }
     }

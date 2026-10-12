@@ -24,6 +24,7 @@ use trusted_server_core::constants::{
 };
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identity::{IdentityEffects, send_then_apply_identity};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
@@ -609,7 +610,7 @@ fn edgezero_main(
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response, &timings) {
                 Ok(partner_registry) => {
-                    let outcome = send_edgezero_response(
+                    send_identity_response(
                         response,
                         request_filter_effects.as_ref(),
                         &SendContext {
@@ -621,16 +622,9 @@ fn edgezero_main(
                             access_telemetry_enabled,
                         },
                         counters.as_ref(),
-                    );
-                    run_post_send_steps(
-                        || {
-                            run_edgezero_pull_sync_after_send(
-                                settings,
-                                &partner_registry,
-                                &ec_state,
-                            )
-                        },
-                        || emit_access_telemetry_after_send(settings, &outcome, &timings),
+                        settings,
+                        &partner_registry,
+                        &mut ec_state,
                     );
                     return;
                 }
@@ -650,7 +644,7 @@ fn edgezero_main(
                         &timings,
                     ) {
                         Ok(partner_registry) => {
-                            let outcome = send_edgezero_response(
+                            send_identity_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 &SendContext {
@@ -662,16 +656,9 @@ fn edgezero_main(
                                     access_telemetry_enabled,
                                 },
                                 counters.as_ref(),
-                            );
-                            run_post_send_steps(
-                                || {
-                                    run_edgezero_pull_sync_after_send(
-                                        &settings,
-                                        &partner_registry,
-                                        &ec_state,
-                                    );
-                                },
-                                || emit_access_telemetry_after_send(&settings, &outcome, &timings),
+                                &settings,
+                                &partner_registry,
+                                &mut ec_state,
                             );
                             return;
                         }
@@ -783,11 +770,46 @@ fn apply_edgezero_ec_finalize(
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
-        ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
     );
     Ok(partner_registry)
+}
+
+/// Keeps capture effects through cookie finalization, then consumes them after send.
+///
+/// Pull sync is skipped when capture storage is unavailable; access telemetry
+/// always describes the delivered response.
+fn send_identity_response(
+    mut response: HttpResponse,
+    filters: Option<&RequestFilterEffects>,
+    context: &SendContext,
+    counters: Option<&SandboxCounters>,
+    settings: &Settings,
+    partners: &PartnerRegistry,
+    state: &mut EcFinalizeState,
+) {
+    let effects = response.extensions_mut().remove::<IdentityEffects>();
+    let mut outcome = None;
+    let pull_sync_allowed = send_then_apply_identity(
+        effects,
+        &mut state.ec_context,
+        partners,
+        || outcome = Some(send_edgezero_response(response, filters, context, counters)),
+        || require_identity_graph(settings).ok(),
+    );
+    run_post_send_steps(
+        || {
+            if pull_sync_allowed {
+                run_edgezero_pull_sync_after_send(settings, partners, state);
+            }
+        },
+        || {
+            if let Some(outcome) = &outcome {
+                emit_access_telemetry_after_send(settings, outcome, &context.timings);
+            }
+        },
+    );
 }
 
 fn run_edgezero_pull_sync_after_send(
@@ -1354,7 +1376,7 @@ pub(crate) fn identity_graph_with_timing(
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
 ///
-/// Deliberately untimed: pull-sync (this function's only caller) runs after
+/// Deliberately untimed: its callers, pull sync and identity capture, run after
 /// `send_edgezero_response`'s Server-Timing freeze point, so a decorated
 /// store here would record into a handle nothing ever renders.
 /// Request-path callers with a `RequestTimings` handle use
@@ -2172,6 +2194,11 @@ mod tests {
             source_domain = "example.com"
             api_token = "test-vendor-token-32-bytes-minimum"
 
+            [[ec.partners]]
+            name = "SharedID"
+            source_domain = "sharedid.org"
+            api_token = "test-sharedid-token-32-bytes-minimum"
+
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
@@ -2200,20 +2227,15 @@ mod tests {
     #[test]
     fn ec_finalize_kv_lands_before_freeze() {
         // A pre-seeded EC entry (see fastly.toml's ec_identity_store fixture)
-        // for a returning user carrying an eids cookie that matches the
-        // configured partner. This drives ec_finalize_response into
-        // ingest_eid_cookies, which reads and writes the KV identity graph.
+        // for a returning user carrying a SharedID cookie that matches a
+        // configured partner. This drives ec_finalize_response into the browser
+        // EID sync, which reads and writes the KV identity graph.
         let settings = ec_finalize_settings();
         let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
-        let eids = serde_json::json!([{
-            "source": "example.com",
-            "uids": [{ "id": "example-uid", "atype": 1 }]
-        }]);
-        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
         let request = edgezero_core::http::request_builder()
             .method(fastly::http::Method::GET)
             .uri("https://test-publisher.com/article")
-            .header("cookie", format!("ts-ec={ec_id}; ts-eids={eids_cookie}"))
+            .header("cookie", format!("ts-ec={ec_id}"))
             .body(EdgeBody::empty())
             .expect("should build EC finalize test request");
 
@@ -2245,8 +2267,7 @@ mod tests {
         let mut ec_state = EcFinalizeState {
             ec_context,
             use_finalize_kv: true,
-            eids_cookie: Some(eids_cookie),
-            sharedid_cookie: None,
+            sharedid_cookie: Some("example-sharedid-uid".to_owned()),
             is_real_browser: true,
             services,
         };

@@ -8,8 +8,8 @@ pub(crate) mod template_cache_policy;
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
-use http::Request;
 use http::header;
+use http::{HeaderValue, Request};
 
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
 use crate::error::TrustedServerError;
@@ -110,34 +110,52 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
 /// When `strip_consent` is `true`, cookies listed in [`CONSENT_COOKIE_NAMES`]
 /// are removed before forwarding. If stripping leaves no cookies or yields an
 /// invalid header value, the stripped header is omitted. Non-UTF-8 cookie
-/// headers are forwarded unchanged. Existing `Cookie` headers on `to` are
-/// preserved; source values are appended after them.
+/// headers are forwarded unchanged unless they contain a capture handoff.
+/// The authenticated `ts-eids-s` handoff is never forwarded to auction providers.
+/// Existing `Cookie` headers on `to` are preserved; source values are appended
+/// after them.
 pub fn forward_cookie_header(
     from: &Request<EdgeBody>,
     to: &mut Request<EdgeBody>,
     strip_consent: bool,
 ) {
     for cookie_value in from.headers().get_all(header::COOKIE) {
-        if !strip_consent {
-            to.headers_mut()
-                .append(header::COOKIE, cookie_value.clone());
-            continue;
+        if let Some(value) = auction_cookie_header(cookie_value, strip_consent) {
+            to.headers_mut().append(header::COOKIE, value);
         }
+    }
+}
 
-        match cookie_value.to_str() {
-            Ok(s) => {
-                let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
-                if !stripped.is_empty()
-                    && let Ok(value) = http::HeaderValue::from_str(&stripped)
-                {
-                    to.headers_mut().append(header::COOKIE, value);
-                }
+/// Removes capture replay proof, and optionally consent, from provider cookies.
+///
+/// Opaque headers retain legacy handling only when they cannot carry a handoff.
+pub(crate) fn auction_cookie_header(
+    cookie_value: &HeaderValue,
+    strip_consent: bool,
+) -> Option<HeaderValue> {
+    match cookie_value.to_str() {
+        Ok(value) => {
+            let mut names = vec![crate::constants::COOKIE_TS_EIDS_SERVER];
+            if strip_consent {
+                names.extend_from_slice(CONSENT_COOKIE_NAMES);
             }
-            Err(_) => {
-                // Non-UTF-8 Cookie header — forward as-is.
-                to.headers_mut()
-                    .append(header::COOKIE, cookie_value.clone());
+            let stripped = strip_cookies(value, &names);
+            if stripped.is_empty() {
+                return None;
             }
+            HeaderValue::from_str(&stripped).ok()
+        }
+        Err(_) => {
+            // Never forward replay proof in an otherwise unparseable header.
+            let has_handoff = cookie_value
+                .as_bytes()
+                .split(|byte| *byte == b';')
+                .any(|part| {
+                    part.split(|byte| *byte == b'=')
+                        .next()
+                        .is_some_and(|name| name.trim_ascii() == b"ts-eids-s")
+                });
+            (!has_handoff).then(|| cookie_value.clone())
         }
     }
 }
@@ -442,6 +460,36 @@ mod tests {
         let header = "euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2,6; us_privacy=1YNN";
         let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
         assert_eq!(stripped, "");
+    }
+
+    #[test]
+    fn authenticated_handoff_is_not_forwarded_to_auction_providers() {
+        for strip_consent in [false, true] {
+            let from = build_request(Some(
+                "session=abc; ts-eids-s=signed-replay-proof; __gpp=signal",
+            ));
+            let mut to = build_request(None);
+            forward_cookie_header(&from, &mut to, strip_consent);
+            let cookies = to.headers()[header::COOKIE]
+                .to_str()
+                .expect("should read cookies");
+            assert!(!cookies.contains("ts-eids-s"));
+            assert!(cookies.contains("session=abc"));
+            assert_eq!(cookies.contains("__gpp"), !strip_consent);
+        }
+        for opaque in [
+            b"session=\xff; ts-eids-s=signed-replay-proof".as_slice(),
+            b"session=\xff; ts-eids-s \t =signed-replay-proof".as_slice(),
+        ] {
+            let mut from = build_request(None);
+            from.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_bytes(opaque).expect("should create opaque header"),
+            );
+            let mut to = build_request(None);
+            forward_cookie_header(&from, &mut to, false);
+            assert!(to.headers().get(header::COOKIE).is_none());
+        }
     }
 
     #[test]

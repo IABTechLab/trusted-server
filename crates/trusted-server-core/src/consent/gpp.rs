@@ -23,7 +23,7 @@
 
 use error_stack::Report;
 
-use super::types::{ConsentDecodeError, GppConsent, TcfConsent};
+use super::types::{ConsentDecodeError, GppConsent, PrivacyFlag, TcfConsent};
 
 /// Maximum length of a raw GPP string before parsing.
 ///
@@ -35,7 +35,8 @@ const MAX_GPP_STRING_LEN: usize = 8192;
 /// Decodes a GPP string into a [`GppConsent`] struct.
 ///
 /// Parses the raw `__gpp` cookie value, extracts section IDs, and optionally
-/// decodes the EU TCF v2.2 section if present.
+/// decodes the EU TCF v2.2 section if present. Normalizes sale opt-outs across
+/// legacy US Privacy and US state/national sections.
 ///
 /// # Arguments
 ///
@@ -44,7 +45,8 @@ const MAX_GPP_STRING_LEN: usize = 8192;
 /// # Errors
 ///
 /// - [`ConsentDecodeError::InvalidGppString`] if the string exceeds
-///   `MAX_GPP_STRING_LEN` or the `iab_gpp` parser fails.
+///   `MAX_GPP_STRING_LEN`, the `iab_gpp` parser fails, or a present US Privacy
+///   section is malformed without an independently decoded US sale opt-out.
 pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentDecodeError>> {
     if gpp_string.len() > MAX_GPP_STRING_LEN {
         return Err(Report::new(ConsentDecodeError::InvalidGppString {
@@ -71,7 +73,7 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
     // Section ID 2 = TcfEuV2 in the GPP spec.
     let eu_tcf = decode_tcf_from_gpp(&parsed);
 
-    let us_sale_opt_out = decode_us_sale_opt_out(&parsed);
+    let us_sale_opt_out = decode_us_sale_opt_out(&parsed)?;
 
     Ok(GppConsent {
         // The GPP header version is always 1 for current spec.
@@ -114,15 +116,19 @@ const US_SECTION_ID_RANGE: std::ops::RangeInclusive<u16> = 7..=23;
 /// Extracts the `sale_opt_out` signal across all US sections in a parsed GPP
 /// string.
 ///
-/// Iterates through section IDs looking for any in the US range (7–23),
-/// decodes each US section, and aggregates the result conservatively:
+/// Aggregates US state/national sections (7–23) and a legacy US Privacy section
+/// (6), interpreted with the shared USP decoder:
 ///
-/// - `Some(true)` if any decodable US section says the user opted out of sale
-/// - `Some(false)` if at least one decodable US section says they did not opt
-///   out and none say they opted out
-/// - `None` if no US section is present or no decodable US section yields a
-///   usable `sale_opt_out` signal
-fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
+/// - `Some(true)` if any decoded US section says the user opted out of sale
+/// - `Some(false)` if at least one decoded US section has no sale opt-out
+/// - `None` if no decoded US section yields a usable sale signal
+///
+/// A valid sale opt-out is retained even if another section is malformed.
+/// Otherwise, malformed legacy USP fails decoding rather than being masked by
+/// another section's no-opt-out signal.
+fn decode_us_sale_opt_out(
+    parsed: &iab_gpp::v1::GPPString,
+) -> Result<Option<bool>, Report<ConsentDecodeError>> {
     let mut result = None;
 
     for us_section_id in parsed
@@ -131,7 +137,7 @@ fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
     {
         match parsed.decode_section(*us_section_id) {
             Ok(section) => match us_sale_opt_out_from_section(&section) {
-                Some(true) => return Some(true),
+                Some(true) => return Ok(Some(true)),
                 Some(false) => result = Some(false),
                 None => {}
             },
@@ -141,7 +147,16 @@ fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
         }
     }
 
-    result
+    if let Some(raw) = parsed.section(iab_gpp::sections::SectionId::UspV1) {
+        let usp = super::us_privacy::decode_us_privacy(raw).map_err(|_| {
+            Report::new(ConsentDecodeError::InvalidGppString {
+                reason: "malformed US Privacy section".to_owned(),
+            })
+        })?;
+        result = Some(usp.opt_out_sale == PrivacyFlag::Yes);
+    }
+
+    Ok(result)
 }
 
 fn us_sale_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {
@@ -231,6 +246,65 @@ mod tests {
             result.eu_tcf.is_none(),
             "should not have TCF section in USP-only string"
         );
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(false),
+            "should normalize the USP section's no-opt-out signal"
+        );
+    }
+
+    #[test]
+    fn decodes_usp_section_sale_opt_out() {
+        for (raw, expected) in [
+            ("1YYN", true),
+            ("1YNN", false),
+            ("1---", false),
+            ("1ynn", false),
+        ] {
+            let gpp = gpp_with_sections(&[(6, raw)]);
+            let result = decode_gpp_string(&gpp).expect("should decode a valid USP section");
+            assert_eq!(result.us_sale_opt_out, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_usp_sections_even_with_a_valid_us_section() {
+        for raw in ["1XNN", "2YNN", "1YN", "1YNNN"] {
+            for sections in [vec![(6, raw)], vec![(6, raw), (7, "BVQqAAAAAgA.QA")]] {
+                assert!(
+                    decode_gpp_string(&gpp_with_sections(&sections)).is_err(),
+                    "should not turn a malformed USP section into permission"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_usp_does_not_hide_a_valid_us_state_opt_out() {
+        let result = decode_gpp_string(&gpp_with_sections(&[(6, "1XNN"), (9, "BVVVVVVVVWA.AA")]))
+            .expect("should retain an independently decoded sale opt-out");
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(true),
+            "should not discard a valid opt-out because another section is malformed"
+        );
+    }
+
+    #[test]
+    fn usp_and_us_state_sections_keep_any_opt_out() {
+        for (usp, state, expected) in [
+            ("1YYN", "BVgVVVVVVWA.AA", true),
+            ("1YNN", "BVVVVVVVVWA.AA", true),
+            ("1YNN", "BVgVVVVVVWA.AA", false),
+        ] {
+            let result = decode_gpp_string(&gpp_with_sections(&[(6, usp), (9, state)]))
+                .expect("should decode USP and US-state sections");
+            assert_eq!(
+                result.us_sale_opt_out,
+                Some(expected),
+                "should preserve opt-out precedence across legacy and modern sections"
+            );
+        }
     }
 
     #[test]
@@ -395,10 +469,11 @@ mod tests {
 
     #[test]
     fn no_us_section_returns_none() {
-        let result = decode_gpp_string(GPP_TCF_AND_USP).expect("should decode GPP");
+        let gpp = gpp_with_sections(&[(2, "CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA")]);
+        let result = decode_gpp_string(&gpp).expect("should decode GPP without US sections");
         assert_eq!(
             result.us_sale_opt_out, None,
-            "should return None when no US section (7-23) is present"
+            "should return None when neither USP nor US-state sections are present"
         );
     }
 

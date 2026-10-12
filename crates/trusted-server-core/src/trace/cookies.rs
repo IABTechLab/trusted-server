@@ -1,10 +1,11 @@
 //! Read-only health inspection of runtime-visible Cookie fields.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use edgezero_core::request::{Preservation, RequestIngress};
 use http::{HeaderMap, header};
+use serde::Deserialize;
 
 use crate::ec::generation::is_valid_ec_id;
-use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 
 use super::types::{
     CookieHealth, InvalidCookieDetail, TraceCookies, UnavailableCookieDetail, ValidCookieDetail,
@@ -120,6 +121,32 @@ fn unavailable(detail: UnavailableCookieDetail) -> TraceCookies {
     TraceCookies::new([CookieHealth::unavailable(detail); 4])
 }
 
+/// A `ts-eids` entry as TSJS writes it. Legacy flat entries also match,
+/// because unknown fields are ignored and `uids` defaults to empty.
+#[derive(Deserialize)]
+struct EidsCookieEntry {
+    #[serde(rename = "source")]
+    _source: String,
+    #[serde(default, rename = "uids")]
+    _uids: Vec<EidsCookieUid>,
+}
+
+#[derive(Deserialize)]
+struct EidsCookieUid {
+    #[serde(rename = "id")]
+    _id: String,
+    #[serde(default, rename = "atype")]
+    _atype: Option<i32>,
+}
+
+/// Accept base64 JSON arrays of `ts-eids` entries; the server no longer
+/// ingests this cookie, so the trace checks its format only.
+fn is_valid_eids_cookie(value: &str) -> bool {
+    BASE64
+        .decode(value)
+        .is_ok_and(|bytes| serde_json::from_slice::<Vec<EidsCookieEntry>>(&bytes).is_ok())
+}
+
 fn validate_value(index: usize, value: Option<&str>) -> CookieHealth {
     let Some(value) = value else {
         return CookieHealth::invalid(InvalidCookieDetail::Malformed);
@@ -134,7 +161,7 @@ fn validate_value(index: usize, value: Option<&str>) -> CookieHealth {
             InvalidCookieDetail::Malformed,
         ),
         1 => (
-            parse_prebid_eids_cookie(value).is_ok(),
+            is_valid_eids_cookie(value),
             ValidCookieDetail::EidsFormat,
             InvalidCookieDetail::Malformed,
         ),
@@ -160,7 +187,7 @@ fn validate_value(index: usize, value: Option<&str>) -> CookieHealth {
 mod tests {
     use super::*;
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
     use edgezero_core::request::{
         CapturedTarget, HeaderFidelity, Preservation, RequestIngress, TargetUnavailable,
     };
