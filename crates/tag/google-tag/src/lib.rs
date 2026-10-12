@@ -25,10 +25,6 @@
 //!   <https://support.google.com/adsense/answer/9274634>
 //! - The AdSense loader tag:
 //!   <https://support.google.com/adsense/answer/9190028>
-//! - AdSense review before any ad appears:
-//!   <https://support.google.com/adsense/answer/7584263>
-//! - The AdSense crawler and robots.txt:
-//!   <https://support.google.com/adsense/answer/99376>
 
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -49,7 +45,7 @@ use trusted_server_tag_google_tag_manager as google_tag_manager;
 use validator::{Validate, ValidationError};
 
 /// The id this integration's registration carries.
-pub const GOOGLE_INTEGRATION_ID: &str = "google";
+const GOOGLE_TAG_INTEGRATION_ID: &str = "google_tag";
 
 /// The name this module is selected by, in `[tag]`.
 pub const MODULE: &str = "tag.google-tag";
@@ -60,7 +56,7 @@ const SOURCE: &str = "trusted-server-tag-google-tag";
 /// The builder the registry runs when a section selects [`MODULE`].
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
-    IntegrationBuilder::new(GOOGLE_INTEGRATION_ID, SOURCE, register, validate)
+    IntegrationBuilder::new(GOOGLE_TAG_INTEGRATION_ID, SOURCE, register, validate)
         .with_module_name(MODULE)
 }
 
@@ -103,8 +99,8 @@ static ADSENSE_CLIENT_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentState {
-    /// The default, and the only one this engine's order of events allows
-    /// before a permission signal has been read.
+    /// The default, and the only one allowed before a permission signal has
+    /// been read.
     #[default]
     Denied,
     /// Allowed before the visitor has said anything, which only a publisher
@@ -122,12 +118,11 @@ impl ConsentState {
     }
 }
 
-/// The four consent types Google's consent mode defines.
+/// The four consent types Google requires for its own services.
 ///
 /// All four default to denied. That is Google's own recommended starting
-/// point and it is also what this engine's order of events requires, because
-/// no Google identifier may be stored before a permission signal has been
-/// processed.
+/// point, and no Google identifier may be stored before a permission signal
+/// has been read.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentDefaults {
@@ -211,9 +206,7 @@ fn validate_at_least_one_id(config: &GoogleConfig) -> Result<(), ValidationError
 
 /// Refuses a tag id Google does not serve from `gtag/js`.
 ///
-/// The shape is the one the Google Tag Manager integration already accepts,
-/// borrowed rather than repeated so the two cannot drift apart and disagree
-/// about the same id.
+/// The shape is the one the Google Tag Manager integration already accepts.
 ///
 /// # Errors
 ///
@@ -230,8 +223,7 @@ fn validate_analytics_tag_id(value: &str) -> Result<(), ValidationError> {
 
 /// Refuses a container id Google Tag Manager would not recognise.
 ///
-/// The shape is the one the Google Tag Manager integration already accepts,
-/// borrowed rather than repeated for the same reason as the tag id.
+/// The shape is the one the Google Tag Manager integration already accepts.
 ///
 /// # Errors
 ///
@@ -289,9 +281,10 @@ fn consent_defaults_snippet(defaults: &ConsentDefaults) -> String {
 ///
 /// Copied from <https://developers.google.com/tag-platform/gtagjs/install>,
 /// which says to place it "immediately after the opening `<head>` HTML tag on
-/// every page you want to measure". The only substitutions are the tag id
-/// and, where the Google Tag Manager integration serves this tag, the loader
-/// address.
+/// every page you want to measure". The middleware writes it in the head
+/// immediately before the script bundle's tag, so after whatever the fetch
+/// phase wrote there. The only substitutions are the tag id and, where the
+/// Google Tag Manager integration serves this tag, the loader address.
 fn analytics_snippet(tag_id: &str, src: &str) -> String {
     format!(
         "<!-- Google tag (gtag.js) -->\n\
@@ -326,7 +319,7 @@ fn container_script_snippet(container_id: &str, gtm_js_src: &str) -> String {
 /// Tag Manager's `noscript` iframe, the second of its two parts.
 ///
 /// Copied from the same page, which says to paste it "immediately after the
-/// opening `<body>` tag". That is why the page tag writes it at the start of
+/// opening `<body>` tag". That is why the middleware writes it at the start of
 /// `<body>`, because Google places this markup there and nowhere else.
 ///
 /// The address is never substituted, because `ns.html` has no first-party
@@ -389,7 +382,7 @@ struct GoogleIntegration {
     /// Google's own address, or the first-party path when the Google Tag
     /// Manager module is selected and serves this tag. Settled once at
     /// startup because it depends on configuration rather than on the
-    /// request, and because the page tag runs on every document.
+    /// request, and because the middleware runs on every document.
     gtag_js_src: Option<String>,
     /// Where the container script's own loader points, decided the same way.
     gtm_js_src: Option<String>,
@@ -553,9 +546,7 @@ pub fn register(
     };
 
     // Where each loader points is decided once, here, because it depends on
-    // another module's configuration rather than on the request. It cannot be
-    // left to a rewrite of the page, because `lol_html` writes injected markup
-    // straight out instead of feeding it back through the parser.
+    // another module's configuration rather than on the request.
     let gtag_js_src = match config.analytics_tag_id.as_deref() {
         Some(tag_id) => Some(
             google_tag_manager::first_party_gtag_js_path(settings, tag_id)?
@@ -575,7 +566,7 @@ pub fn register(
     let integration = Arc::new(GoogleIntegration::new(config, gtag_js_src, gtm_js_src));
 
     Ok(Some(
-        IntegrationRegistration::builder(GOOGLE_INTEGRATION_ID)
+        IntegrationRegistration::builder(GOOGLE_TAG_INTEGRATION_ID)
             .with_middleware(Arc::new(PageTag(integration)))
             .build(),
     ))
@@ -595,12 +586,7 @@ mod tests {
     /// An invented container id.
     const TEST_CONTAINER_ID: &str = "GTM-EXAMPLE1";
 
-    /// Google's tag snippet exactly as
-    /// <https://developers.google.com/tag-platform/gtagjs/install> gives it.
-    ///
-    /// Held here rather than built from the code under test, because a golden
-    /// value derived from the thing it checks proves only that the code agrees
-    /// with itself.
+    /// Google's snippet as the install page gives it.
     const GOOGLE_PUBLISHED_TAG_SNIPPET: &str = "<!-- Google tag (gtag.js) -->\n\
          <script async src=\"https://www.googletagmanager.com/gtag/js?id=TAG_ID\"></script>\n\
          <script>\n  \
@@ -678,17 +664,17 @@ mod tests {
         format!("{error:?}")
     }
 
-    /// The page tag a named module registers for `settings`.
+    /// The middleware a named module registers for `settings`.
     fn page_tag_for(settings: &Settings) -> Arc<dyn Middleware> {
         Arc::clone(
             registration_for(settings)
                 .middleware
                 .first()
-                .expect("the module should register its page tag"),
+                .expect("the module should register its middleware"),
         )
     }
 
-    /// The head snippets the page tag writes for `settings`.
+    /// The head snippets the middleware writes for `settings`.
     fn head_inserts_for(settings: &Settings) -> Vec<String> {
         let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
         let context = trusted_server_core::middleware::test_support::context(
@@ -698,7 +684,7 @@ mod tests {
         page_tag_for(settings).create(&context).head_inserts
     }
 
-    /// `html` after the serve phase has run the page tag for `settings`, with
+    /// `html` after the serve phase has run the middleware for `settings`, with
     /// the Tag Manager module beside it where the settings select it.
     fn process(settings: &Settings, html: &str) -> String {
         use trusted_server_core::html_processor::test_support::{
@@ -1034,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn the_snippets_land_at_the_start_of_the_head_once() {
+    fn the_snippets_land_in_the_head_once() {
         // Arrange
         let settings = settings_with_google(&json!({
             "analytics_tag_id": TEST_TAG_ID,
@@ -1070,7 +1056,7 @@ mod tests {
             .expect("should keep the page's own head content");
         assert!(
             consent < title,
-            "Google's install page asks for the snippet immediately after the opening head tag"
+            "the snippets should come before the page's own head content"
         );
     }
 
@@ -1121,7 +1107,7 @@ mod tests {
     #[test]
     fn a_loader_the_fetch_rewrite_made_first_party_is_removed_as_well() {
         // Arrange
-        // By the time the page tag runs, a fetch phase rewrite may already have
+        // By the time the middleware runs, a fetch phase rewrite may already have
         // pointed the page's own loader at the first-party path.
         let settings = settings_with_google(&json!({ "analytics_tag_id": TEST_TAG_ID }));
         let html = format!(

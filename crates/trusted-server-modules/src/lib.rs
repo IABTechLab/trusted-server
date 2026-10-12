@@ -36,8 +36,6 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_cmp_inmobi::builder(),
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
-        // Before Tag Manager, because this module removes a duplicate loader
-        // and a removal short-circuits the rewriter chain.
         trusted_server_tag_google_tag::builder(),
         trusted_server_tag_google_tag_manager::builder(),
         trusted_server_bot_protection_datadome::builder(),
