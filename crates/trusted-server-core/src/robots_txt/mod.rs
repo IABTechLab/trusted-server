@@ -577,7 +577,7 @@ mod tests {
             ..crate::middleware::test_support::context(MiddlewarePhase::Fetch, &state)
         };
         chain.prepare(&module_context, &context).await?;
-        Ok(prepared.take::<String>(middleware::MODULE))
+        Ok(prepared.take::<String>(MiddlewarePhase::Fetch, middleware::MODULE))
     }
 
     /// `settings` with `config` as its `[robots-txt]` section and the entry
