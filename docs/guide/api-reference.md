@@ -56,7 +56,6 @@ authority, scheme, and client-address headers in the innermost middleware.
 | normal  | `/first-party/proxy`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/first-party/sign`                    | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/health`                              | `GET`                                                      | literal        | `always`                              | real                  | real                  | —                     | real                  |
-| normal  | `/robots.txt`                          | `GET`, `HEAD`                                              | literal        | `settings.robots_txt`                 | real                  | real                  | real                  | real                  |
 | normal  | `/static/tsjs=<file>`                  | `GET`                                                      | template       | `path.starts_with(/static/tsjs=)`     | real                  | real                  | real                  | real                  |
 | normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
 | normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
@@ -165,7 +164,9 @@ identifier, and this page does not undo that.
 1. Only a browser opening the address as a page is answered, which the browser
    marks with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. A
    script cannot set either header, so a `fetch` from a page, a frame and an
-   embedded object are each answered `403 Forbidden`.
+   embedded object are each answered `403 Forbidden`. A browser sends these
+   headers only to a trustworthy origin, so every browser on a plain `http://`
+   host other than localhost is answered `403 Forbidden` too.
 2. The page is sent with `Content-Security-Policy: sandbox`, which gives the
    document an origin of its own, so a page that opened it cannot read it.
 3. No identifier is shown. The Edge Cookie's value and each partner's
@@ -1024,30 +1025,6 @@ response headers. Cache behavior follows the route's normalized cache policy;
 credentialed or otherwise private responses are forced `private, no-store`.
 No dedicated CORS grant or rate limiter is installed. Example: if the prefix is
 `/assets/`, request `curl -I https://edge.example.com/assets/logo.svg`.
-
-### GET /robots.txt
-
-The publisher's `robots.txt`, written from the rules the modules named by
-`[robots-txt] modules` give, in that order, as
-[Configuration](/guide/configuration#robots-txt-configuration) describes.
-
-**Contract:** Auth: none. Request body: not applicable. Rate limit: none.
-Endpoint-specific CORS: none. Answered only when the settings carry
-`[robots-txt]`. Without the section the path reaches the publisher's origin, so
-a publisher keeps their own file. `HEAD` is answered with the headers of the
-`GET` and no body. Other methods reach the publisher's origin.
-
-**Response:**
-
-- `200 OK` with the file as `text/plain; charset=utf-8` and
-  `Cache-Control: public, max-age=3600`
-- `503 Service Unavailable` with `Retry-After: 600` and
-  `Cache-Control: no-store` when a selected module cannot answer and no earlier
-  answer of its is held, because an empty file or a `404` reads to a crawler as
-  permission to crawl everything
-
-With `refuse_all` selected the file refuses every crawler, and every response
-the deployment finalizes also carries `X-Robots-Tag: noindex, nofollow`.
 
 ### Publisher fallback: `/` and `/{*rest}`
 

@@ -812,8 +812,6 @@ pub fn register(
 }
 
 impl SourcepointIntegration {
-    /// Answers the request, with the services the route names in its module
-    /// call.
     async fn route(
         &self,
         req: Request<EdgeBody>,
@@ -1034,8 +1032,8 @@ impl IntegrationProxy for SourcepointIntegration {
     }
 }
 
-/// Sourcepoint's change to a page, on the pages a `[[fetch]]` entry names
-/// [`MODULE`] for. It writes the browser module's settings into the head and,
+/// Sourcepoint's change to a page, on the pages a `[[fetch]]` or `[[serve]]`
+/// entry names [`MODULE`] for, in the phase the publisher chooses. It writes the browser module's settings into the head and,
 /// when `rewrite_sdk` is set, the trap on `window._sp_`, and points the
 /// CDN's addresses at the first-party path.
 struct PageChange(Arc<SourcepointIntegration>);

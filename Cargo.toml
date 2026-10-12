@@ -99,9 +99,7 @@ error-stack = "0.6"
 esi = "0.7.2"
 fastly = "0.12"
 fern = "0.7.1"
-# The loading cache crate, used as a published package with the pipeline off
-# so it builds for every host. Only crates/loading-cache/51degrees depends on
-# it.
+# The published loading cache package, which builds for every host.
 fiftyone-caching = { version = "4.5.8-49", default-features = false }
 flate2 = "1.1"
 futures = "0.3"

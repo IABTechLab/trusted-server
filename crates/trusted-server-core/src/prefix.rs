@@ -13,21 +13,25 @@
 //! publishers share, so it carries the publisher's domain, see
 //! [`ServerKeyPrefix`].
 //!
+//! The template cache is the exception. Its surrogate keys, `ts-template` and
+//! `ts-template-url-<digest>`, and its store key,
+//! `ts-template-cache-v<n>-<digest>`, keep `ts` under every module, so
+//! `ts cache purge` names one key whatever the deployment. The store key's
+//! digest covers the request's host and the public prefix, so no two
+//! publishers share an entry.
+//!
 //! A module gives the parts, and each use writes its own form from them,
 //! because what is allowed differs by use:
 //!
 //! | Use | Form | `ts` | `_ex`, `www.example.com` |
 //! | --- | --- | --- | --- |
 //! | cookie | [`PublicPrefix::cookie_name`] | `ts-ec` | `_ex.www.example.com-ec` |
-//! | first-party storage | [`PublicPrefix::storage_key`] | `ts-evidence` | `_ex.www.example.com-evidence` |
-//! | script global | [`PublicPrefix::script_global`] | `ts` | `_ex_www_example_com` |
 //! | store key | [`ServerKeyPrefix::as_str`] | `ts.example.com` | as its module gives it |
 //!
 //! The page's client script is told the public prefix on its bundle tag rather
 //! than holding a copy, see [`PUBLIC_PREFIX_ATTRIBUTE`]. Its own globals, such
 //! as `window.tsjs`, are what page code calls it by and keep their names under
-//! every module, so the script global form is for a global a module names
-//! after the prefix.
+//! every module.
 
 use core::fmt;
 use std::sync::Arc;
@@ -52,16 +56,14 @@ pub const PUBLIC_PREFIX_ATTRIBUTE: &str = "data-ts-public-prefix";
 
 /// The start of every name the browser holds for a publisher, such as `_ex`.
 ///
-/// Made of parts, such as `_ex` and `www.example.com`, which each use joins
-/// in its own form. Every part holds only ASCII letters, digits, `_`, `-` and
-/// `.`, so every form is a valid cookie name, storage key and attribute value.
-/// The first part starts with a letter or a single `_`, so the script global
-/// form is an identifier and no cookie name starts with `__`, where browsers
-/// give names such as `__Host-` rules of their own and drop a cookie that
-/// breaks them.
+/// Made of parts, such as `_ex` and `www.example.com`, joined by `.`. Every
+/// part holds only ASCII letters, digits, `_`, `-` and `.`, so the prefix is a
+/// valid cookie name and attribute value. The first part starts with a letter
+/// or a single `_`, so no cookie name starts with `__`, where browsers give
+/// names such as `__Host-` rules of their own and drop a cookie that breaks
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrefix {
-    parts: Vec<String>,
     dotted: String,
 }
 
@@ -92,14 +94,9 @@ impl PublicPrefix {
         if !well_formed || !first_is_a_name {
             return None;
         }
-        let dotted = parts.join(".");
-        Some(Self { parts, dotted })
-    }
-
-    /// The parts, in order.
-    #[must_use]
-    pub fn parts(&self) -> &[String] {
-        &self.parts
+        Some(Self {
+            dotted: parts.join("."),
+        })
     }
 
     /// The parts joined by `.`, such as `_ex.www.example.com`, which every
@@ -116,13 +113,6 @@ impl PublicPrefix {
         format!("{}-{name}", self.dotted)
     }
 
-    /// The key of the first-party storage entry `name`, written as a cookie
-    /// name is.
-    #[must_use]
-    pub fn storage_key(&self, name: &str) -> String {
-        self.cookie_name(name)
-    }
-
     /// Whether `cookie` is in the namespace this prefix starts, which is every
     /// name [`Self::cookie_name`] gives, compared without regard to case.
     #[must_use]
@@ -132,22 +122,6 @@ impl PublicPrefix {
             .get(..length)
             .is_some_and(|head| head.eq_ignore_ascii_case(self.dotted.as_bytes()))
             && cookie.get(length) == Some(&b'-')
-    }
-
-    /// The prefix as a script global, being the parts joined by `_` with every
-    /// character an identifier cannot hold written as `_`, such as `ts` or
-    /// `_ex_www_example_com`. Core names no global after it.
-    #[must_use]
-    pub fn script_global(&self) -> String {
-        self.parts
-            .iter()
-            .map(|part| {
-                part.chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("_")
     }
 }
 
@@ -205,7 +179,6 @@ impl TrustedServerPrefix {
     #[must_use]
     pub fn public() -> PublicPrefix {
         PublicPrefix {
-            parts: vec![TRUSTED_SERVER_HEAD.to_owned()],
             dotted: TRUSTED_SERVER_HEAD.to_owned(),
         }
     }
@@ -408,7 +381,6 @@ mod tests {
         ] {
             assert_eq!(prefixes.public().cookie_name(name), cookie);
         }
-        assert_eq!(prefixes.public().script_global(), "ts");
     }
 
     #[test]
@@ -418,11 +390,6 @@ mod tests {
 
         assert_eq!(prefix.as_str(), "_ex.www.example.com");
         assert_eq!(prefix.cookie_name("ec"), "_ex.www.example.com-ec");
-        assert_eq!(
-            prefix.storage_key("evidence"),
-            "_ex.www.example.com-evidence"
-        );
-        assert_eq!(prefix.script_global(), "_ex_www_example_com");
     }
 
     #[test]

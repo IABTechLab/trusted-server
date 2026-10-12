@@ -446,14 +446,7 @@ impl EcContext {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
 
-        // Snapshot the request a module is handed when it creates an
-        // identifier (the headers, so it can read cookies and client hints, and
-        // what the request resolved to, with the address, so it can read
-        // request parameters). Capture only when a module is configured and
-        // either no identifier exists or the request is a document navigation,
-        // which orphan recovery may need, so a no-module deployment and a
-        // returning visitor's subresource requests clone nothing. Creation runs
-        // after the request body may be consumed, so the snapshot is owned.
+        // Owned, because creation runs after the request body may be consumed.
         let (request_headers, request) = if selected_module.is_some()
             && (ec_value.is_none() || crate::http_util::is_navigation_request(req))
         {
@@ -630,11 +623,7 @@ impl EcContext {
     /// identifier, and the finished identifier, with its module code applied,
     /// is checked against the global bounds. Generation and orphan recovery both
     /// use this, so a rotated identifier comes from the same module
-    /// and passes the same checks as a new one. The module is handed a module
-    /// context carrying the request captured at read time (the client IP, the
-    /// headers, and what the request resolved to), the settings, the services
-    /// and what this context resolved for the request, and the built-in HMAC
-    /// module reads only the client IP.
+    /// and passes the same checks as a new one.
     ///
     /// # Errors
     ///
@@ -651,11 +640,6 @@ impl EcContext {
         settings: &Settings,
         services: &RuntimeServices,
     ) -> Result<Option<String>, Report<TrustedServerError>> {
-        // Lend the request captured at read time, being the client IP, the
-        // request headers (so a module reads cookies and client hints), and
-        // what the request resolved to, with the address (so it reads request
-        // parameters). A built-in module reads only the client IP, and a vendor
-        // module names what it needs.
         let request = self.request.view();
         let request_info = BorrowedRequestInfo::new(
             self.client_ip.as_deref().unwrap_or_default(),
@@ -1045,7 +1029,6 @@ impl EcContext {
         &mut self.pull_sync_marker
     }
 
-    /// Sets pull-sync marker state in focused unit tests.
     /// The same test-only context with a resolved location.
     #[cfg(test)]
     #[must_use]
@@ -1054,6 +1037,7 @@ impl EcContext {
         self
     }
 
+    /// Sets pull-sync marker state in focused unit tests.
     #[cfg(test)]
     pub(crate) fn set_pull_sync_marker_for_test(&mut self, state: PullSyncMarkerState) {
         self.pull_sync_marker = state;

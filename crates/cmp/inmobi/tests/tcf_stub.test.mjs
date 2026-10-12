@@ -9,8 +9,9 @@ import { test } from 'node:test';
 const STUB = readFileSync(new URL('../src/tcf_stub.js', import.meta.url), 'utf8');
 
 // A window and document holding only what the stub touches. `body` is false
-// for a page whose body has not been parsed yet.
-function browser({ body = true, tcfapi } = {}) {
+// for a page whose body has not been parsed yet. `parent` and `top` are the
+// windows above a page served inside a frame.
+function browser({ body = true, tcfapi, parent, top } = {}) {
   const listeners = [];
   const appended = [];
   const timers = [];
@@ -22,6 +23,10 @@ function browser({ body = true, tcfapi } = {}) {
   };
   if (tcfapi) {
     window.__tcfapi = tcfapi;
+  }
+  if (parent) {
+    window.parent = parent;
+    window.top = top ?? parent;
   }
   const document = {
     body: body
@@ -169,4 +174,45 @@ test('a page that already has a __tcfapi keeps it', () => {
   assert.equal(page.window.__tcfapi, existing);
   assert.equal(page.listeners.length, 0, 'no relay is added');
   assert.equal(page.appended.length, 0, 'no locator frame is added');
+});
+
+// A window above the page, with the frames it holds by name.
+function ancestor(frames = {}) {
+  const window = { frames };
+  window.parent = window;
+  window.top = window;
+  return window;
+}
+
+test('a page inside a frame of a page that already has a CMP gets no second stub', () => {
+  const top = ancestor({ __tcfapiLocator: {} });
+  const middle = { frames: {}, parent: top, top };
+  const page = browser({ parent: middle, top });
+
+  assert.equal(page.window.__tcfapi, undefined, 'no __tcfapi is defined');
+  assert.equal(page.listeners.length, 0, 'no relay is added');
+  assert.equal(page.appended.length, 0, 'no locator frame is added');
+  assert.equal(page.timers.length, 0, 'no locator frame is waited for');
+});
+
+test('an ancestor that refuses to be read is passed over on the way up', () => {
+  const top = ancestor({ __tcfapiLocator: {} });
+  const refusing = {
+    get frames() {
+      throw new Error('cross origin');
+    },
+    parent: top,
+    top,
+  };
+  const page = browser({ parent: refusing, top });
+
+  assert.equal(page.window.__tcfapi, undefined, 'the CMP above it is found');
+});
+
+test('a page inside a frame with no CMP above it gets the stub', () => {
+  const top = ancestor();
+  const page = browser({ parent: top });
+
+  assert.equal(typeof page.window.__tcfapi, 'function');
+  assert.equal(page.appended.length, 1, 'the locator frame is added');
 });

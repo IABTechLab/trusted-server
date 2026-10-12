@@ -1,11 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import {
-  PUBLIC_PREFIX_ATTRIBUTE,
-  cookieName,
-  publicPrefix,
-  storageKey,
-} from '../../src/shared/public_prefix';
+import { PUBLIC_PREFIX_ATTRIBUTE, cookieName, publicPrefix } from '../../src/shared/public_prefix';
 
 function serveWith(prefix: string | null): void {
   document.getElementById('trustedserver-js')?.remove();
@@ -25,20 +20,16 @@ describe('public prefix', () => {
 
     expect(publicPrefix()).toBe('_ex.www.example.com');
     expect(cookieName('eids')).toBe('_ex.www.example.com-eids');
-    expect(storageKey('evidence')).toBe('_ex.www.example.com-evidence');
   });
 
   it('names nothing on a page whose bundle tag carries none', () => {
     serveWith(null);
     expect(publicPrefix()).toBeNull();
     expect(cookieName('eids')).toBeNull();
-
-    document.getElementById('trustedserver-js')?.remove();
-    expect(storageKey('evidence')).toBeNull();
   });
 
   it('refuses a value the server could never write', () => {
-    for (const value of ['', '9ex', 'a b', 'a;b', 'a=b', 'a"b', 'a/b']) {
+    for (const value of ['', '9ex', '__ex', '__Host', 'a b', 'a;b', 'a=b', 'a"b', 'a/b']) {
       serveWith(value);
       expect(publicPrefix(), value).toBeNull();
     }

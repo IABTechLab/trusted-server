@@ -1020,9 +1020,6 @@ impl PermissionState {
     /// terms were declared) rather than missing values, so page code never
     /// has to tell them apart.
     ///
-    /// [`page_value`](Self::page_value) is the only place the page shape is
-    /// spelled, so no caller writes the JSON by hand.
-    ///
     /// # Examples
     ///
     /// ```
@@ -1051,7 +1048,9 @@ impl PermissionState {
     /// The resolved state in the page shape, as a value, for whatever shows
     /// the same resolution somewhere other than a page.
     ///
-    /// See [`page_json`](Self::page_json) for what each key means.
+    /// See [`page_json`](Self::page_json) for what each key means. This is
+    /// the only place the page shape is spelled, so no caller writes the JSON
+    /// by hand.
     #[must_use]
     pub fn page_value(&self) -> serde_json::Value {
         let mut names: Vec<&'static str> = self.set.iter().map(Permission::as_str).collect();
