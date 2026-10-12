@@ -133,7 +133,8 @@ fn validate_script_url(url: &str) -> Result<(), Report<TrustedServerError>> {
 fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     let placed = [&settings.fetch, &settings.serve].iter().any(|entries| {
         entries.entries().iter().any(|entry| {
-            entry.media_type == HTML_MEDIA_TYPE && entry.middleware.iter().any(|name| name == MODULE)
+            entry.media_type == HTML_MEDIA_TYPE
+                && entry.middleware.iter().any(|name| name == MODULE)
         })
     });
     if placed {
