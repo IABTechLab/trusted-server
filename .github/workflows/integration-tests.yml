@@ -209,6 +209,7 @@ jobs:
           trace_spin_dir="$RUNNER_TEMP/trace-spin"
           mkdir -p "$trace_spin_dir"
           curl --fail --location --silent --show-error https://github.com/spinframework/spin/releases/download/v4.0.0/spin-v4.0.0-linux-amd64.tar.gz --output "$trace_spin_dir/spin.tar.gz"
+          echo "e705c9bfd9484a9175f392a116856680862a40f31d1a85618bed331f34ffccfa  $trace_spin_dir/spin.tar.gz" | sha256sum --check --strict
           tar -xzf "$trace_spin_dir/spin.tar.gz" -C "$trace_spin_dir" spin
           echo "$trace_spin_dir" >> "$GITHUB_PATH"
 

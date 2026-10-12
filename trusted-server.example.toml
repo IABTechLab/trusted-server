@@ -141,7 +141,8 @@ pull_sync_concurrency = 3
 # Opt-in browser-facing origin forwarding for a trusted development proxy.
 # Forwarded host/proto need a matching secret and stay publisher-domain bounded.
 # shared_secret is a key in trusted_server_secrets, not the credential itself.
-# Use the same actual secret in ts dev proxy --forwarder-secret-file.
+# Configure the forwarder to send the actual secret in auth_header.
+# The current ts dev proxy does not inject a forwarding credential.
 # [trusted_forwarder]
 # auth_header = "x-ts-forwarder-auth"
 # shared_secret = "trusted_forwarder_shared_secret"

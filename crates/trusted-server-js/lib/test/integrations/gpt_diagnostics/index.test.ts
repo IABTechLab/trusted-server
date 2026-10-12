@@ -107,7 +107,9 @@ describe('GPT diagnostics integration composition', () => {
       target.__tsjs_trace_active = active;
       installGptStub();
       installGptDiagnosticsRuntime(target);
-      const root = shadow.mock.results.at(-1)?.value as ShadowRoot | undefined;
+      const root = shadow.mock.results[shadow.mock.results.length - 1]?.value as
+        | ShadowRoot
+        | undefined;
       expect(create).not.toHaveBeenCalled();
       expect(root?.textContent).not.toContain('View trace results');
       expect(target.tsjs?.gptDiagnostics).toBeDefined();
@@ -126,7 +128,7 @@ describe('GPT diagnostics integration composition', () => {
     target.__tsjs_trace_active = true;
     installGptStub();
     installGptDiagnosticsRuntime(target);
-    const root = shadow.mock.results.at(-1)?.value as ShadowRoot;
+    const root = shadow.mock.results[shadow.mock.results.length - 1]?.value as ShadowRoot;
     const traceButton = Array.from(root.querySelectorAll('button')).find(
       (item) => item.textContent === 'View trace results'
     );
