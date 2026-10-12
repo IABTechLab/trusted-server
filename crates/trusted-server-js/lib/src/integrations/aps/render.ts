@@ -1,6 +1,11 @@
 import { log } from '../../core/log';
 import { findSlot } from '../../core/render';
-import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
+import type {
+  ApsPrebidRendererEntry,
+  ApsRendererV1,
+  GptDiagnosticsCreativeFailure,
+  TsjsApi,
+} from '../../core/types';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
 export const APS_RENDERING_MODE_ATTRIBUTE_NAME = 'data-ts-aps-rendering-mode';
@@ -9,7 +14,7 @@ export const APS_PREBID_CREATIVE_RUNNER_URL =
 export const APS_NATIVE_RENDERER_TIMEOUT_MS = 10_000;
 export const APS_RENDERER_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
-export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
+export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 5;
 
 const MAX_ACCOUNT_ID_BYTES = 1024;
 const MAX_CREATIVE_ID_BYTES = 1024;
@@ -33,6 +38,69 @@ const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
 const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
 const RENDERER_FAILED_MESSAGE = 'trusted-server/aps/renderer-failed';
 const RENDERER_READY_TIMEOUT_MS = 10_000;
+
+/**
+ * Message the Universal Creative frame relays to the top window when an APS
+ * render never completes.
+ *
+ * The creative frame is cross-origin, so the top-window listener treats every
+ * field as untrusted and resolves the reason through
+ * [`apsRenderFailureReason`] before recording it. The relay is
+ * diagnostics-only and never influences creative delivery.
+ */
+export const APS_RENDER_FAILED_MESSAGE = 'trusted-server/aps/render-failed';
+
+/**
+ * Wire reasons the render path can emit, mapped onto safe diagnostic categories.
+ *
+ * Built on a null prototype so a hostile `__proto__`, `constructor`, or
+ * `toString` relayed by the cross-origin creative frame resolves to `undefined`
+ * rather than an inherited member.
+ */
+let apsRenderFailureReasons: Readonly<Record<string, GptDiagnosticsCreativeFailure>> | undefined;
+
+/**
+ * Build the reason allowlist on first use.
+ *
+ * Deferred so the table is not a module-level side effect: the Prebid shim
+ * imports two unrelated helpers from this module, and `Object.freeze` at module
+ * scope would defeat tree-shaking and carry this table into that bundle.
+ */
+function renderFailureReasons(): Readonly<Record<string, GptDiagnosticsCreativeFailure>> {
+  apsRenderFailureReasons ??= Object.freeze(
+    Object.assign(
+      Object.create(null) as Record<string, GptDiagnosticsCreativeFailure>,
+      {
+        bad_hash: 'aps_bad_hash',
+        nonce_mismatch: 'aps_nonce_mismatch',
+        descriptor_keys: 'aps_descriptor_keys',
+        descriptor_fields: 'aps_descriptor_fields',
+        descriptor_envelope: 'aps_descriptor_envelope',
+        amazon_script_error: 'aps_runner_script_error',
+        frame_timeout: 'aps_frame_timeout',
+        frame_load_error: 'aps_frame_load_error',
+        frame_reported_failure: 'aps_frame_reported_failure',
+        unknown: 'aps_unknown',
+      } as const
+    )
+  );
+  return apsRenderFailureReasons;
+}
+
+/**
+ * Resolve a relayed render failure reason to a safe diagnostic category.
+ *
+ * Returns `undefined` for anything not on the allowlist, so an unrecognized or
+ * hostile value from the cross-origin creative frame is dropped instead of
+ * being recorded.
+ *
+ * @example
+ * apsRenderFailureReason('frame_timeout'); // 'aps_frame_timeout'
+ * apsRenderFailureReason('__proto__'); // undefined
+ */
+export function apsRenderFailureReason(value: unknown): GptDiagnosticsCreativeFailure | undefined {
+  return typeof value === 'string' ? renderFailureReasons()[value] : undefined;
+}
 const MAX_PREBID_RENDERER_ENTRIES = 256;
 const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
 const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
@@ -688,12 +756,15 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
     iframe.style.display = '';
   };
   function receive(event: MessageEvent): void {
-    if (event.source !== iframe.contentWindow || !hasExactKeys(event.data, ['message', 'nonce'])) {
+    if (event.source !== iframe.contentWindow || !isRecord(event.data)) return;
+    const { message, nonce: sent } = event.data;
+    if (message === RENDERER_READY_MESSAGE) {
+      if (hasExactKeys(event.data, ['message', 'nonce']) && sent === nonce) commit();
       return;
     }
-    if (event.data.nonce !== nonce) return;
-    if (event.data.message === RENDERER_READY_MESSAGE) commit();
-    else if (event.data.message === RENDERER_FAILED_MESSAGE) fail();
+    // A failure message also carries a `reason`, and the frame reports
+    // `bad_hash` before it has learned a nonce to echo back.
+    if (message === RENDERER_FAILED_MESSAGE && (sent === nonce || sent === undefined)) fail();
   }
 
   window.addEventListener('message', receive);
@@ -734,12 +805,13 @@ var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i+
 var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
 var f=w.document.createElement("iframe"),done=false,t;
 function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
-function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}
-function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;
-if(m.message==="${RENDERER_READY_MESSAGE}"){done=true;clean();resolve();}
-else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();}
+function report(x){try{(w.top||w).postMessage({message:"${APS_RENDER_FAILED_MESSAGE}",adId:(d&&typeof d.adId==="string")?d.adId:"",reason:x},"*");}catch(_e){}}
+function fail(x){if(done)return;done=true;clean();f.remove();report(x||"unknown");reject(new Error("APS renderer frame failed"));}
+function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m)return;
+if(m.message==="${RENDERER_READY_MESSAGE}"&&m.nonce===n){done=true;clean();resolve();}
+else if(m.message==="${RENDERER_FAILED_MESSAGE}"&&(m.nonce===n||m.nonce===undefined))fail(typeof m.reason==="string"?m.reason:"frame_reported_failure");}
 f.width=String(r.width);f.height=String(r.height);f.style.border="0";
 f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
 f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
-f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
+f.onerror=function(){fail("frame_load_error");};w.addEventListener("message",receive);t=w.setTimeout(function(){fail("frame_timeout");},${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
 }catch(e){reject(e);}});};})();`;

@@ -1,3 +1,4 @@
+import { GPT_DIAGNOSTICS_CREATIVE_FAILURES } from '../core/types';
 import { addOmissions, omissionOverflow, isOmissionOverflow } from './omissions';
 export { addOmissions } from './omissions';
 import { traceInteger, traceKeys, traceObject } from './context';
@@ -138,10 +139,13 @@ function cycleProjection(value: unknown, omissions: { value: number }): Record<s
   }
   if (data(source, 'trustedServerCreativeFailures') !== undefined) {
     const values = nestedItems(data(source, 'trustedServerCreativeFailures'));
-    if (!values.every((item) => traceEnum(item, TRACE_CREATIVE_FAILURES)))
+    if (!values.every((item) => traceEnum(item, GPT_DIAGNOSTICS_CREATIVE_FAILURES)))
       throw new Error('invalid_source');
-    output.trustedServerCreativeFailures = values.slice(0, 16);
-    omissions.value = addOmissions(omissions.value, Math.max(0, values.length - 16));
+    // APS renderer reasons are valid TS Console failures that trace reports
+    // have not been reviewed to carry, so they are dropped rather than rejected.
+    const traced = values.filter((item) => traceEnum(item, TRACE_CREATIVE_FAILURES));
+    output.trustedServerCreativeFailures = traced.slice(0, 16);
+    omissions.value = addOmissions(omissions.value, Math.max(0, traced.length - 16));
   }
   return output;
 }

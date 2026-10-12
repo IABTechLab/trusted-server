@@ -215,6 +215,27 @@ describe('explicit GPT public projection', () => {
     ])
       expect(json).not.toContain(sentinel);
   });
+  it('drops APS renderer failure reasons and still rejects unknown failures', () => {
+    const source = gptSourceFixture();
+    const cycle = source.slots[0].requests[0] as unknown as Record<string, unknown>;
+    cycle.trustedServerCreativeFailures = [
+      'cache_fetch_failed',
+      'aps_bad_hash',
+      'aps_frame_timeout',
+    ];
+    const result = projectTraceGptDiagnostics(source, TRACE_ORIGIN);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('should project source with APS failure reasons');
+    expect(result.value.slots[0]!.requests[0]!.trustedServerCreativeFailures).toEqual([
+      'cache_fetch_failed',
+    ]);
+    expect(JSON.stringify(result.value)).not.toContain('aps_');
+    cycle.trustedServerCreativeFailures = ['private-unknown-failure'];
+    expect(projectTraceGptDiagnostics(source, TRACE_ORIGIN)).toEqual({
+      ok: false,
+      reason: 'invalid_source',
+    });
+  });
   it('rejects every extra source key at each source boundary', () => {
     const source = gptSourceFixture();
     const targets = [

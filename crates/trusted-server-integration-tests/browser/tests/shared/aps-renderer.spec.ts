@@ -18,6 +18,27 @@ const PUC_BANNER = readFileSync(
     "utf8",
 );
 
+/**
+ * Read the renderer version from its declaration rather than restating it.
+ *
+ * The constant is bumped whenever the Universal Creative source changes, so a
+ * literal here turns every such change into an unrelated-looking failure in
+ * this spec.
+ */
+function universalCreativeRendererVersion(): number {
+    const source = readFileSync(
+        resolve(TSJS_CRATE, "lib/src/integrations/aps/render.ts"),
+        "utf8",
+    );
+    const match = /APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = (\d+)/.exec(source);
+    if (!match) {
+        throw new Error(
+            "could not read APS_UNIVERSAL_CREATIVE_RENDERER_VERSION from render.ts",
+        );
+    }
+    return Number(match[1]);
+}
+
 function clientAuctionBundlePaths() {
     const manifestPath = resolve(TSJS_CRATE, "dist/prebid/manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
@@ -566,7 +587,7 @@ parent.postMessage(JSON.stringify({
             expect.objectContaining({
                 message: "Prebid Response",
                 adId: result.acceptedAdId,
-                rendererVersion: 4,
+                rendererVersion: universalCreativeRendererVersion(),
                 apsRenderer,
             }),
         );
