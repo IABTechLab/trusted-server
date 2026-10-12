@@ -21,10 +21,8 @@ import type {
   TsjsApi,
 } from '../../core/types';
 import {
-  APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-  apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering,
   consumeApsPrebidRenderer,
@@ -1989,49 +1987,11 @@ function safelyRecordCreativeFailure(
   }
 }
 
-/**
- * Open a diagnostics attempt for an APS capability handshake.
- *
- * The APS path runs on the publisher's own Prebid ad units, which never pass
- * through Trusted Server slot mapping, so no creative opportunity has been
- * recorded for them. Without one the store rejects the attempt as
- * `creative_request_without_slot` and the request cycle stays `unknown`,
- * leaving a blank APS render indistinguishable from a delivered one.
- */
-function beginApsCreativeAttempt(adUnitCode: string): number | undefined {
-  try {
-    const pubads = window.googletag?.pubads?.();
-    const slot = pubads ? findGptSlotByElementId(pubads, adUnitCode) : undefined;
-    if (slot) {
-      window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-        slot,
-        adUnitCode,
-        'renderable_candidate'
-      );
-    }
-  } catch {
-    // Diagnostics must not alter creative delivery.
-  }
-  return safelyRecordCreativeRequest(adUnitCode);
-}
-
-/**
- * A consumed APS ad ID, retained as a security tombstone.
- *
- * `attemptId` carries the diagnostics attempt the capability was served under so
- * a later replay, or a failure relayed by the creative frame, is attributed to
- * the render it belongs to.
- */
-interface ApsConsumedTombstone {
-  expiresAt: number;
-  attemptId?: number;
-}
-
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
 function pruneConsumedPrebidApsIds(
-  consumedIds: Map<string, ApsConsumedTombstone>,
+  consumedIds: Map<string, { expiresAt: number }>,
   now: number
 ): void {
   for (const [adId, consumed] of consumedIds) {
@@ -2040,7 +2000,7 @@ function pruneConsumedPrebidApsIds(
 }
 
 function hasConsumedPrebidApsIdCapacity(
-  consumedIds: Map<string, ApsConsumedTombstone>,
+  consumedIds: Map<string, { expiresAt: number }>,
   adId: string
 ): boolean {
   if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
@@ -2050,12 +2010,11 @@ function hasConsumedPrebidApsIdCapacity(
 }
 
 function recordConsumedPrebidApsId(
-  consumedIds: Map<string, ApsConsumedTombstone>,
+  consumedIds: Map<string, { expiresAt: number }>,
   adId: string,
-  expiresAt: number,
-  attemptId: number | undefined
+  expiresAt: number
 ): void {
-  consumedIds.set(adId, { expiresAt, attemptId });
+  consumedIds.set(adId, { expiresAt });
 }
 
 /**
@@ -2089,7 +2048,7 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
-  const consumedPrebidApsIds = new Map<string, ApsConsumedTombstone>();
+  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
   // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
   // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
   const consumedServerApsBySlot = new Map<string, string>();
@@ -2102,20 +2061,6 @@ export function installTsRenderBridge(): void {
           ? (e.data as Record<string, unknown>)
           : (JSON.parse(e.data as string) as Record<string, unknown>);
     } catch {
-      return;
-    }
-
-    // Diagnostics relayed by the APS Universal Creative frame. The creative is
-    // cross-origin, so every field is untrusted: the reason must resolve through
-    // the allowlist and the attempt comes from our own tombstone, never the
-    // message. Recording only, and it never answers the sender.
-    if (data['message'] === APS_RENDER_FAILED_MESSAGE) {
-      const failedAdId = data['adId'];
-      const reason = apsRenderFailureReason(data['reason']);
-      if (typeof failedAdId === 'string' && reason !== undefined) {
-        pruneConsumedPrebidApsIds(consumedPrebidApsIds, Date.now());
-        safelyRecordCreativeFailure(consumedPrebidApsIds.get(failedAdId)?.attemptId, reason);
-      }
       return;
     }
 
@@ -2135,7 +2080,6 @@ export function installTsRenderBridge(): void {
       // other iframe. Letting Prebid's global handler answer a foreign source
       // would expose the creative despite the slot-bound capability check.
       e.stopImmediatePropagation();
-      safelyRecordCreativeFailure(consumedPrebidAps.attemptId, 'aps_consumed_tombstone');
       return;
     }
 
@@ -2145,28 +2089,12 @@ export function installTsRenderBridge(): void {
       // Prebid handles ad IDs globally and would otherwise answer a request from
       // an unrelated iframe when this slot-bound capability rejects it.
       e.stopImmediatePropagation();
-      const attemptId = beginApsCreativeAttempt(prebidRendererEntry.adUnitCode);
       const sourceFrame = sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode);
-      if (!sourceFrame) {
-        safelyRecordCreativeFailure(attemptId, 'aps_source_not_in_ad_unit');
-        return;
-      }
+      if (!sourceFrame) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
-      if (!renderer) {
-        safelyRecordCreativeFailure(attemptId, 'aps_descriptor_fields');
-        return;
-      }
-      if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) {
-        safelyRecordCreativeFailure(attemptId, 'aps_tombstone_capacity');
-        return;
-      }
+      if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      recordConsumedPrebidApsId(
-        consumedPrebidApsIds,
-        adId,
-        prebidRendererEntry.expiresAt,
-        attemptId
-      );
+      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
       const markUsed = (): void => {
         try {
@@ -2181,10 +2109,7 @@ export function installTsRenderBridge(): void {
         source: e.source,
         trustedServer: (validatedRenderer) => {
           const rendererUrl = apsRendererUrl();
-          if (!rendererUrl) {
-            safelyRecordCreativeFailure(attemptId, 'aps_missing_renderer_url');
-            return false;
-          }
+          if (!rendererUrl) return false;
           const stillOwnsCreative = () =>
             sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode)?.iframe ===
             sourceFrame.iframe;
@@ -2212,17 +2137,9 @@ export function installTsRenderBridge(): void {
               generation,
               stillOwnsCreative
             );
-            const isCurrent = creativeFrameIsCurrent(
-              e.source,
-              sourceFrame,
-              generation,
-              stillOwnsCreative
-            );
-            if (isCurrent) safelyRecordCreativeResponse(attemptId);
-            return isCurrent;
+            return creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative);
           } catch (err) {
             log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
-            safelyRecordCreativeFailure(attemptId, 'response_post_failed');
             return false;
           }
         },
