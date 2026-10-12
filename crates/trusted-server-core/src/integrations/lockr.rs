@@ -354,19 +354,19 @@ fn id5_token(token: &Value, ids: Option<&Value>, now: Option<u64>) -> Option<Ide
     }
 
     // An associated EID is corroboration, not a source of new authority.
-    if let Some(ids) = ids {
-        let eid = ids.as_object()?.get("id5id");
-        if let Some(eid) = eid {
-            if eid.get("source")?.as_str()? != ID5_SOURCE {
-                return None;
-            }
-            let uids = eid.get("uids")?.as_array()?;
-            if uids.len() != 1
-                || uids[0].get("id")?.as_str()? != uid
-                || uids[0].get("atype")?.as_u64()? != 1
-            {
-                return None;
-            }
+    if let Some(ids) = ids
+        && let Some(provider) = ids.as_object()?.get("id5id")
+    {
+        let eid = provider.get("eid")?;
+        if eid.get("source")?.as_str()? != ID5_SOURCE {
+            return None;
+        }
+        let uids = eid.get("uids")?.as_array()?;
+        if uids.len() != 1
+            || uids[0].get("id")?.as_str()? != uid
+            || uids[0].get("atype")?.as_u64()? != 1
+        {
+            return None;
         }
     }
 
@@ -955,12 +955,15 @@ mod tests {
         assert!(result.consent.tcf.is_none());
         let mut with_eid = sample_token();
         with_eid["ids"] = json!({"id5id":{"eid":{"source":"id5-sync.com","uids":[{"id":"ID5*synthetic","atype":1}]}}});
-        assert_eq!(
-            observed(&integration, TOKEN_PATH, &with_eid, request)
-                .expect("should capture matching EID")
-                .outcomes
-                .len(),
-            1
+        assert!(
+            matches!(
+                &observed(&integration, TOKEN_PATH, &with_eid, request)
+                    .expect("should capture matching EID")
+                    .outcomes[..],
+                [IdentityOutcome::Issued { source, uid, expires_at: Some(4102444800) }]
+                    if source == ID5_SOURCE && uid == "ID5*synthetic"
+            ),
+            "should issue the corroborated token, not a NoChange outcome"
         );
         with_eid["ids"]["id5id"]["eid"]["uids"][0]["id"] = json!("different");
         assert!(matches!(
@@ -1025,6 +1028,34 @@ mod tests {
                 .outcomes[..],
             [IdentityOutcome::NoChange]
         ));
+    }
+
+    #[test]
+    fn associated_id5_eid_requires_a_valid_nested_eid() {
+        let integration = LockrIntegration::new(test_config());
+        for associated in [
+            json!({"source": ID5_SOURCE, "uids": [{"id": "ID5*synthetic", "atype": 1}]}),
+            json!({}),
+            json!({"eid": null}),
+            json!({"eid": {"source": ID5_SOURCE, "uids": []}}),
+            json!({"eid": {"source": ID5_SOURCE, "uids": [{"id": "ID5*synthetic", "atype": 3}]}}),
+            json!({"eid": {"source": ID5_SOURCE, "uids": [
+                {"id": "ID5*synthetic", "atype": 1}, {"id": "another-uid", "atype": 1}
+            ]}}),
+        ] {
+            let mut response = sample_token();
+            response["ids"] = json!({"id5id": associated});
+
+            assert!(
+                matches!(
+                    &observed(&integration, TOKEN_PATH, &response, b"{}")
+                        .expect("should preserve the response without acquiring an invalid EID")
+                        .outcomes[..],
+                    [IdentityOutcome::NoChange]
+                ),
+                "should reject malformed, unwrapped or inconsistent associated EIDs"
+            );
+        }
     }
 
     #[test]

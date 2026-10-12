@@ -431,6 +431,46 @@ mod tests {
     }
 
     #[test]
+    fn usp_section_in_gpp_allows_capture_persistence_from_request_or_body() {
+        let id = ec_id("gppusp01");
+        let partners = registry(Some(MODULE));
+        for mode in [ConsentMode::Proxy, ConsentMode::Interpreter] {
+            let mut settings = create_test_settings();
+            settings.consent.mode = mode;
+            for in_body in [false, true] {
+                let graph = live_graph(&id);
+                let mut request = context(&id);
+                let mut observation = issued(SOURCE, "synthetic-uid", None);
+                if in_body {
+                    observation.consent.gpp = Some("DBABTA~1YNN".to_owned());
+                } else {
+                    request.consent =
+                        crate::consent::build_context_from_signals(&RawConsentSignals {
+                            raw_gpp_string: Some("DBABTA~1YNN".to_owned()),
+                            ..Default::default()
+                        });
+                    request.consent.jurisdiction = Jurisdiction::NonRegulated;
+                }
+
+                assert!(
+                    capture_and_apply(
+                        &graph,
+                        &mut request,
+                        &partners,
+                        &settings,
+                        observation,
+                        CLAIMS,
+                    ),
+                    "should accept a valid no-opt-out USP section in request or body GPP"
+                );
+                let (entry, _) = stored(&graph, &id);
+                assert_eq!(entry.ids[SOURCE].uid, "synthetic-uid");
+                assert_eq!(entry.ids[SOURCE].writer.as_deref(), Some(MODULE));
+            }
+        }
+    }
+
+    #[test]
     fn restrictive_body_signals_fail_closed_even_when_jurisdiction_or_mode_is_permissive() {
         let id = ec_id("consent1");
         let graph = live_graph(&id);
@@ -445,6 +485,18 @@ mod tests {
                 },
                 IdentityConsentSignals {
                     gpp: Some("not-gpp".to_owned()),
+                    ..Default::default()
+                },
+                IdentityConsentSignals {
+                    gpp: Some("DBABTA~1YYN".to_owned()),
+                    ..Default::default()
+                },
+                IdentityConsentSignals {
+                    gpp: Some("DBABTA~1XNN".to_owned()),
+                    ..Default::default()
+                },
+                IdentityConsentSignals {
+                    gpp: Some("DBACNY~not-a-valid-tcf~1YNN".to_owned()),
                     ..Default::default()
                 },
                 IdentityConsentSignals {
@@ -479,9 +531,15 @@ mod tests {
         let partners = registry(Some(MODULE));
         let settings = create_test_settings();
         let graph = live_graph(&id);
-        for (raw_usp, gpc) in [(Some("1YYN"), false), (None, true)] {
+        for (raw_usp, raw_gpp, gpc) in [
+            (Some("1YYN"), None, false),
+            (None, Some("DBABTA~1YYN"), false),
+            (None, Some("DBABTA~1XNN"), false),
+            (None, None, true),
+        ] {
             let mut denied = context(&id);
             denied.consent.raw_us_privacy = raw_usp.map(str::to_owned);
+            denied.consent.raw_gpp_string = raw_gpp.map(str::to_owned);
             denied.consent.gpc = gpc;
             assert!(
                 stage_capture(

@@ -468,6 +468,7 @@ fn restrictive_identity_signals_allow(signals: &RawConsentSignals, config: &Cons
         };
         if gpp.us_sale_opt_out == Some(true)
             || gpp.eu_tcf.as_ref().is_some_and(|tcf| !tcf_allowed(tcf))
+            || (gpp.section_ids.contains(&GPP_SECTION_ID_TCF_EU_V2) && gpp.eu_tcf.is_none())
             || (gpp.us_sale_opt_out.is_none() && gpp.eu_tcf.is_none())
         {
             return false;
