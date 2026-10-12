@@ -219,7 +219,7 @@ encoder complete after the terminal phase. Existing `StreamProcessor` callbacks
 remain synchronous, and pages with no registered finalizers keep their existing
 streaming path.
 
-`HtmlFinalizationInput` supplies borrowed `html`, `services`, `deadline`, and a
+`HtmlFinalizationInput` supplies the actual `response_status`, borrowed `html`, `services`, `deadline`, and a
 separate bounded `replacement` writer. Append a complete candidate and return
 `HtmlFinalization::Replace`, or return `Unchanged`. An error, timeout, invalid
 assembly marker count, or output limit violation discards the candidate and
@@ -229,6 +229,18 @@ through the request and are not converted into optional-work failures. Preserve 
 CSP, Next.js/RSC semantics, and the opaque parser markers; core checks marker
 multiplicity but does not parse or validate replacement structure.
 
+Full 404/500 HTML remains eligible. A signing integration should inspect
+`response_status` and return `Unchanged` for statuses it does not sign. HTML with
+status 206 or any `Content-Range` bypasses rewriting and terminal I/O while
+preserving encoded body bytes and range/framing metadata. Non-document fetches
+keep their range request semantics. Independent cookie and diagnostics privacy
+rules still apply.
+
+Each real consumer must test a winning auction after replacement: the marker is
+consumed once, and the bids script remains before the structural body end, outside
+scripts, comments, and attributes. Unchanged bytes beside a marker cannot establish
+its parsing context, so adjacent-byte checks are not a structural guarantee.
+
 The publisher's `html_finalization_timeout_ms` is one budget for the whole chain,
 starting after synchronous EOF. Use `deadline.remaining()` to bound outside calls.
 Axum, Workers, and Spin provide cooperative timers. Fastly provides no timer
@@ -236,12 +248,16 @@ because host calls block; the consumer must set transport timeouts itself. Dropp
 a future releases its borrows and discards its candidate, but cannot undo a remote
 write or preempt work that does not yield. The deadline wins over a simultaneously
 ready callback. Avoid logging HTML, lookup URLs, or external response contents.
+The default backend first-byte timeout is 15 seconds; it is not a total-call
+deadline. Use the remaining budget for supported transport limits and verify the
+consumer's blocking-call behavior on Fastly before enabling it.
 
 Enabled finalizers retain transformed HTML up to `max_buffered_body_bytes` and use
 a separate candidate with the same cap. Collection overflow skips terminal I/O
 and resumes normal delivery with the retained prefix and remaining bytes. Existing
-input, decoder, and final output errors remain fatal. Registration therefore changes
-first-byte latency only for enabled pages that fit the retention limit.
+input, decoder, and final output errors remain fatal. Enabled pages wait for EOF
+within the cap; oversized pages also delay first-byte delivery until the cap is
+crossed and ordinary streaming resumes.
 
 Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
 `publisher_response_into_streaming_response` to execute terminal callbacks.
@@ -256,9 +272,19 @@ unchanged, fails, or is skipped after collection overflow. Document GETs strip t
 four conditional/range headers used by synthesized HTML. HEAD, bodiless responses,
 unsupported encodings, and non-HTML responses run no terminal callbacks.
 
+This first version therefore removes transformed-template and downstream HTML
+caching for enabled pages, including page-level signing. Raw-origin caching and
+an integration's own KV result cache can still reduce origin and lookup work.
+Cacheable finalization needs a separate contract for reader-neutral output,
+external-data/signing-key identity, expiry, invalidation, optional failure caching,
+and whether callbacks execute on hits; a user-independent flag alone is insufficient.
+
 Callers of `handle_publisher_request` provide the enabled integration registry in
 `AuctionDispatch::integration_registry` and use that same registry for response
 finalization. This metadata is required before a shared-template lookup can happen.
+It is a source-compatibility change for external `AuctionDispatch` struct literals:
+add the required field using the same request registry. An omitted or optional
+registry could incorrectly admit a cached document before finalization is known.
 
 A fictional HTTP consumer is available only through the existing `test-utils`
 feature. To verify real asynchronous I/O and timeout fallback on local runtimes:
@@ -287,8 +313,14 @@ Fastly production ignores the configured timeout.
 Add `--release` for production-profile artifacts. Add `--auction` to run a separate
 enabled-auction control against a closed loopback
 bid endpoint. It verifies slot/bid fallback assembly and marker removal without
-external traffic. The existing Workers clock panic reported in #1240 blocks that
-control; the ordinary terminal-phase tests still run independently.
+external traffic. The auction telemetry clock now uses the platform-compatible
+`web_time::Instant`; the combined Workers control passes after this targeted
+correction. This does not verify every other clock path covered by #1240.
+
+CI runs the actual Axum harness with `--auction`, including delayed success,
+hung-call fallback, privacy, and auction assembly. It also checks process-group
+cleanup and retains runtime diagnostics on failure. The other runtime harnesses
+remain explicit local verification commands.
 
 ## Browser and script guards
 

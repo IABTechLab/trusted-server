@@ -106,6 +106,31 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Set up Python for actual-runtime finalization checks
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify finalization harness process cleanup
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s scripts/fixtures -p 'test_async_html_finalization_runtime.py' -v
+
+      - name: Verify actual Axum HTML finalization and auction assembly
+        timeout-minutes: 10
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/async-html-finalization-local-test.sh axum --auction
+
+      - name: Upload finalization runtime diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axum-html-finalization-diagnostics
+          path: ${{ runner.temp }}/trusted-server-finalize-axum-*/
+          if-no-files-found: ignore
+
       - name: Test template build digest inputs (native)
         run: cargo test -p trusted-server-core --test template_build_digest
 

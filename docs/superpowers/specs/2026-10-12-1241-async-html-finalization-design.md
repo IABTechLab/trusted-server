@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-12
 
-**Status:** Implemented on `feat/1241-async-html-finalization`; verification and remaining runtime limitation recorded below
+**Status:** Implemented on `feat/1241-async-html-finalization`; review hardening and verification recorded below
 
 **Issue:** trusted-server #1241
 
@@ -11,6 +11,8 @@
 **Implementation plan:** [Task-by-task implementation and verification](../plans/2026-10-12-1241-async-html-finalization.md)
 
 **Implementation review:** [Requirement coverage, verification, and runtime limitations](../reviews/2026-10-12-1241-async-html-finalization-implementation.md)
+
+**Review hardening:** [Response metadata, range safety, telemetry clock, and CI refinements](../plans/2026-10-12-1241-review-hardening.md)
 
 ## 1. Decision
 
@@ -173,6 +175,7 @@ pub trait IntegrationHtmlFinalizer {
 }
 
 pub struct HtmlFinalizationInput<'a> {
+    pub response_status: StatusCode,
     pub html: &'a [u8],
     pub replacement: &'a mut HtmlReplacementWriter,
     pub services: &'a RuntimeServices,
@@ -346,8 +349,9 @@ repin EdgeZero to obtain a timer.
 
 Use `web_time::Instant` for absolute budget accounting and elapsed observations in core.
 Do not introduce `std::time::Instant::now()` or `SystemTime::now()` on the Cloudflare path.
-The existing clock sites reported in #1240 are separate work and may block a real-runtime
-auction smoke test until corrected; fixing them is not part of this design.
+The review hardening exception corrects the traced auction telemetry clock using
+that existing abstraction. Broader clock sites reported in #1240 remain separate
+work; one successful auction smoke does not verify all of them.
 
 ### 9.3 Race and fallback rules
 
@@ -451,8 +455,18 @@ guard when the ad stack is active. This feature does not turn an existing 502 in
 
 ### 11.3 Response selection and framing
 
-Run finalizers only on HTML that the existing routing rules already process, including
-processable non-2xx HTML. Do not rewrite unsupported encodings, unmodified pass-through
+Run finalizers only on complete HTML that the existing routing rules already process, including
+processable non-2xx HTML. Expose the actual response status so consumers can choose
+which complete documents to process. With enabled finalizers, HTML with status 206
+or any `Content-Range` bypasses all body transformations and terminal I/O. Preserve
+encoded bytes, range/framing metadata, and origin policy; independent cookie and
+diagnostics privacy still applies. This covers range-associated error responses
+such as 416 as well as partial representations. The handler and both response
+wrappers must make this decision before body-dependent policy or framing mutation;
+direct body helpers carry the same private metadata. Abandon dispatched bids once.
+Keep non-document range forwarding intact and feature-off behavior unchanged.
+
+Do not rewrite unsupported encodings, unmodified pass-through
 responses, assets, or standalone `text/x-component` bodies.
 
 HEAD and `204`, `205`, or `304` responses invoke no finalizer or finalizer I/O. Preserve
@@ -586,8 +600,11 @@ fixtures and run a bounded delayed/hung lookup on Viceroy, local Workers, Spin, 
 Record the exact setup, SDK/runtime versions, observed behavior, and limitations. Do not
 claim a universal exact wall-clock release; cooperative scheduling adds tolerance.
 
-The Cloudflare clock issue #1240 must be resolved separately, or its affected auction smoke
-must be explicitly reported as blocked rather than marked passing. Keep KV wiring under
+Review hardening permits one targeted correction under #1240: auction telemetry
+uses `web_time::Instant`, consistent with the orchestrator, because the captured
+Workers stack names that unsupported standard-clock call. Verify the actual
+Workers auction control after the correction. Broader clock paths remain separate;
+do not claim all of #1240 resolved from one successful fixture. Keep KV wiring under
 #1139 separate; HTTP-backed and unavailable-KV fixtures can verify this lifecycle without
 requiring new mandatory store bindings.
 
@@ -612,7 +629,8 @@ Expected production touch points:
 
 Keep the generic streaming trait, synchronous pipeline, JS runtime, platform manifests,
 and EdgeZero pin unchanged. Do not bundle the real signing consumer, KV-store wiring,
-Cloudflare clock fixes, or unrelated publisher refactoring into this feature.
+broader Cloudflare clock fixes, or unrelated publisher refactoring into this feature.
+The narrowly traced auction telemetry clock correction above is the reviewed exception.
 
 The implementation plan should separate contract/registration work, terminal coordination,
 adapter timers, cache/privacy behavior, and verification into small reviewable changes,

@@ -10,7 +10,7 @@
 
 ---
 
-**Status:** Implemented; see the execution record for verification and the existing Workers auction limitation
+**Status:** Implemented; see the execution record and review hardening for current verification
 
 **Date:** 2026-10-12
 
@@ -25,7 +25,12 @@
 The task checklists below preserve the original execution instructions, including
 proposed intermediate commit boundaries. The execution record is the authoritative
 completion record: implementation was reviewed together before committing, and it
-records actual commands, deviations, and the blocked Workers auction control.
+records actual commands, deviations, and the initially blocked Workers auction control.
+
+The [review hardening addendum](2026-10-12-1241-review-hardening.md) records the
+subsequently authorized response-status/range refinements, telemetry clock
+correction, runtime CI coverage, and renewed verification. It supplements the
+original task instructions below.
 
 ## 1. Execution boundaries
 
@@ -40,7 +45,7 @@ commits in a draft branch; do not release an API that registrations can enable b
 publisher entry points support it.
 
 Keep the EdgeZero revision, generic streaming traits, JS runtime, and production platform
-manifests unchanged. KV wiring under #1139, clock fixes under #1240, and a real signing
+manifests unchanged. KV wiring under #1139, broader clock fixes under #1240, and a real signing
 integration are separate work. Do not mask a live-runtime failure by replacing actual
 SDK services with stubs or by reporting a native test as a runtime smoke.
 

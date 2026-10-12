@@ -85,15 +85,6 @@ pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn runtime_timer_is_optional() {
-        let services = noop_services();
-        assert!(
-            services.timer().is_none(),
-            "should allow platforms without cooperative timers"
-        );
-    }
-
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -104,6 +95,15 @@ mod tests {
 
     use super::test_support::{noop_services, noop_services_with_client_ip};
     use super::*;
+
+    #[test]
+    fn runtime_timer_is_optional() {
+        let services = noop_services();
+        assert!(
+            services.timer().is_none(),
+            "should allow platforms without cooperative timers"
+        );
+    }
 
     struct MarkerKvStore(&'static str);
 

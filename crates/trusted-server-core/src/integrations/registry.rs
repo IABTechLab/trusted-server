@@ -1463,6 +1463,11 @@ impl IntegrationRegistry {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::constants::COOKIE_TS_EC;
+    use crate::platform::test_support::noop_services;
+    use http::{HeaderValue, StatusCode, header};
+
     #[test]
     fn html_finalizers_are_empty_by_default() {
         let registry = IntegrationRegistry::from_request_filters(Vec::new());
@@ -1480,11 +1485,6 @@ mod tests {
             "should make finalization opt-in"
         );
     }
-
-    use super::*;
-    use crate::constants::COOKIE_TS_EC;
-    use crate::platform::test_support::noop_services;
-    use http::{HeaderValue, StatusCode, header};
 
     struct DefaultMetadataHeadInjector;
 

@@ -38,11 +38,14 @@ def stop(process):
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=5)
     except (ProcessLookupError, subprocess.TimeoutExpired):
+        # An exited group needs no TERM; a graceful-wait timeout proceeds to KILL.
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
+        # The process group may already have exited after TERM.
         pass
+    process.wait(timeout=5)
 
 
 def run(adapter, auction=False, release=False):

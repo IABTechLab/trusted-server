@@ -11,6 +11,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 use flate2::{Decompress, FlushDecompress, Status};
 use futures::FutureExt as _;
+use http::StatusCode;
 use web_time::Instant;
 
 use super::{
@@ -46,6 +47,7 @@ fn log_timeout(integration_id: &str, started_at: Instant, bytes: usize) {
 }
 
 async fn finalize_document(
+    response_status: StatusCode,
     mut current: Vec<u8>,
     sessions: &mut [HtmlFinalizerSession],
     marker: Option<&[u8]>,
@@ -65,6 +67,7 @@ async fn finalize_document(
             let work = session
                 .finalizer
                 .finalize(HtmlFinalizationInput {
+                    response_status,
                     html: &current,
                     replacement: &mut replacement,
                     services,
@@ -306,6 +309,7 @@ impl TerminalInput {
 }
 
 pub(super) struct HtmlFinalizationDriver {
+    response_status: StatusCode,
     input: TerminalInput,
     encoder: BodyStreamEncoder,
     processor: Box<dyn StreamProcessor>,
@@ -369,6 +373,9 @@ impl HtmlFinalizationDriver {
                 finalizer: factory.create(context.clone()),
             })
             .collect();
+        let compression = Compression::from_content_encoding(&params.content_encoding);
+        let limit = settings.publisher.max_buffered_body_bytes;
+        let input = TerminalInput::new(body, compression, limit)?;
         let hold = params.dispatched_auction.take().map(|dispatched| {
             AuctionHoldState::new(
                 DispatchedAuctionGuard::new(dispatched),
@@ -379,10 +386,9 @@ impl HtmlFinalizationDriver {
                 marker.clone(),
             )
         });
-        let compression = Compression::from_content_encoding(&params.content_encoding);
-        let limit = settings.publisher.max_buffered_body_bytes;
         Ok(Self {
-            input: TerminalInput::new(body, compression, limit)?,
+            response_status: params.response_status,
+            input,
             encoder: BodyStreamEncoder::new(compression),
             processor: Box::new(processor),
             collector: HtmlCollector::new(limit),
@@ -484,6 +490,7 @@ impl HtmlFinalizationDriver {
                 self.source_finished = true;
                 if let Some(current) = self.collector.finish() {
                     let current = finalize_document(
+                        self.response_status,
                         current,
                         &mut self.sessions,
                         self.marker.as_deref(),
@@ -510,8 +517,8 @@ impl HtmlFinalizationDriver {
         Ok(())
     }
 
-    pub(super) fn input_finished(&self) -> bool {
-        self.source_finished
+    pub(super) fn at_finish_barrier(&self) -> bool {
+        self.source_finished && self.seam_flushed && !self.finished
     }
 
     pub(super) async fn collect_close(
@@ -534,25 +541,6 @@ impl HtmlFinalizationDriver {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn collection_overflow_replays_prefix_and_crossing_chunk_once() {
-        let mut collector = HtmlCollector::new(4);
-        assert!(
-            collector.push(b"page".to_vec()).is_empty(),
-            "should retain input at the cap"
-        );
-        let mut emitted = collector.push(b"!".to_vec()).concat();
-        emitted.extend(collector.push(b"tail".to_vec()).concat());
-        assert_eq!(
-            emitted, b"page!tail",
-            "should release overflow without duplication"
-        );
-        assert!(
-            collector.finish().is_none(),
-            "should skip finalizer I/O after bypass"
-        );
-    }
-
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::time::Duration;
@@ -571,6 +559,25 @@ mod tests {
     use crate::platform::{PlatformTimer, RuntimeServices};
 
     use super::*;
+
+    #[test]
+    fn collection_overflow_replays_prefix_and_crossing_chunk_once() {
+        let mut collector = HtmlCollector::new(4);
+        assert!(
+            collector.push(b"page".to_vec()).is_empty(),
+            "should retain input at the cap"
+        );
+        let mut emitted = collector.push(b"!".to_vec()).concat();
+        emitted.extend(collector.push(b"tail".to_vec()).concat());
+        assert_eq!(
+            emitted, b"page!tail",
+            "should release overflow without duplication"
+        );
+        assert!(
+            collector.finish().is_none(),
+            "should skip finalizer I/O after bypass"
+        );
+    }
 
     struct AppendFinalizer {
         suffix: &'static [u8],
@@ -638,6 +645,7 @@ mod tests {
         ];
         let services = noop_services();
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,
@@ -667,6 +675,7 @@ mod tests {
         let input = b"page".to_vec();
         let allocation = input.as_ptr();
         let output = block_on(finalize_document(
+            StatusCode::OK,
             input,
             &mut sessions,
             None,
@@ -766,6 +775,7 @@ mod tests {
         let input = b"page".to_vec();
         let allocation = input.as_ptr();
         let output = block_on(finalize_document(
+            StatusCode::OK,
             input,
             &mut sessions,
             None,
@@ -808,6 +818,7 @@ mod tests {
             }),
         }];
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,
@@ -833,6 +844,7 @@ mod tests {
             }),
         }];
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"pageTOKEN".to_vec(),
             &mut sessions,
             Some(b"TOKEN"),
@@ -845,6 +857,7 @@ mod tests {
             "should reject a duplicated assembly marker"
         );
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             Some(b"TOKEN"),
@@ -887,6 +900,7 @@ mod tests {
             }),
         }];
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,
@@ -919,6 +933,7 @@ mod tests {
             },
         ];
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,
@@ -948,6 +963,7 @@ mod tests {
         }];
         let services = noop_services();
         let work = finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,
@@ -1020,6 +1036,7 @@ mod tests {
                 }),
             }];
             let output = block_on(finalize_document(
+                StatusCode::OK,
                 b"pageTOKEN".to_vec(),
                 &mut sessions,
                 marker,
@@ -1040,6 +1057,7 @@ mod tests {
             }),
         }];
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,
@@ -1075,6 +1093,7 @@ mod tests {
             finalizer: Box::new(LateFinalizer),
         }];
         let output = block_on(finalize_document(
+            StatusCode::OK,
             b"page".to_vec(),
             &mut sessions,
             None,

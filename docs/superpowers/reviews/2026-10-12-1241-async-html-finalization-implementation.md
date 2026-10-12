@@ -6,12 +6,16 @@
 
 **Planning commit:** `b750c879a`
 
-**Status:** Implemented and reviewed. Repository regression gates pass. The actual
-Workers enabled-auction control remains blocked by the existing clock panic in #1240.
+**Status:** Implemented and reviewed. Review hardening adds range safety, response
+status metadata, a targeted telemetry clock correction, and actual-runtime CI. The
+Workers enabled-auction control now passes. See the linked hardening execution
+record for the latest verification; the original evidence below is historical.
 
 **Design:** [Optional asynchronous HTML document finalization](../specs/2026-10-12-1241-async-html-finalization-design.md)
 
 **Plan:** [Implementation and verification tasks](../plans/2026-10-12-1241-async-html-finalization.md)
+
+**Review hardening:** [Fixes, retained design decisions, and renewed verification](../plans/2026-10-12-1241-review-hardening.md)
 
 ## Result and scope
 
@@ -23,7 +27,8 @@ unchanged-input fallback. The generic streaming traits remain unchanged.
 The callback belongs in Trusted Server because its document state, auction assembly,
 cache admission, privacy policy, and runtime service container belong here. No
 EdgeZero revision, production platform manifest, JS behavior, KV implementation,
-signing consumer, or existing clock behavior changes in this delivery.
+signing consumer changes in this delivery. Review hardening corrects only the
+traced unsupported auction telemetry clock; broader clock work remains separate.
 
 Enabled finalizers deliberately retain the completed transformed document. They
 bypass shared-template caching before lookup or reservation, and eligible HTML
@@ -34,8 +39,9 @@ Raw origin readthrough caching remains independent.
 
 The original granular checklists describe instructions, rather than claiming each
 suggested intermediate commit exists. All thirteen tasks have implementation or
-verification evidence below. Task 11's Workers auction control has an explicit
-external blocker; passing native parity is not substituted for that live check.
+verification evidence below. Initially Task 11's Workers auction control was
+blocked; the review hardening record replaces that gap with actual runtime
+evidence after the targeted clock correction.
 
 | Plan tasks | Spec sections             | Implementation and observed evidence                                                                                                                                                                                                                                                                                                                                                                         |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -86,7 +92,7 @@ to validate arbitrary HTML structure or integration-specific semantics.
   the plan's suggested per-task commits. No implementation API was published
   between contract creation and complete routing.
 
-## Repository verification
+## Initial repository verification
 
 All commands ran against the implementation worktree, with Rust 1.95.0 and Node
 24.12.0. Target-matched checks used the workspace aliases; shared Cargo cache use
@@ -128,7 +134,7 @@ double, rather than claiming a live platform cache hit. Local verification logs
 and generated artifacts remain outside version control; they contain exact
 command output and runtime diagnostics.
 
-## Actual-runtime verification and limits
+## Initial actual-runtime verification and limits
 
 The fixture uses a 750 ms chain budget, delays document EOF by 50 ms, and delays a
 successful lookup by 150 ms. On timer adapters the hung transport timeout is
@@ -149,19 +155,18 @@ The optional actual-auction fallback control passed on Axum, Spin, and Fastly.
 Positive winning-bid assembly is additionally covered by the native/WASI core
 regression and the existing template-cache controls.
 
-Two runtime qualifications remain explicit:
+The initial runtime qualifications were:
 
 1. Pinned Viceroy 0.17 does not simulate backend timeouts, so it cannot prove a
    Fastly hung-call bound. An isolated official 0.19 executable was used for that
    live check; repository pins remain unchanged. Backend timeout support is
    documented in the [official 0.19 release](https://github.com/fastly/Viceroy/releases/tag/v0.19.0).
-2. The Workers actual-auction control returns HTTP 500 with
+2. The initial Workers actual-auction control returned HTTP 500 with
    `time not implemented on this platform` from `std::time` and then a WASM
-   trap. This reproduces the separate #1240 clock problem. Ordinary Workers
-   finalization controls pass. Native parity and mocked auction tests do not
-   establish that the combined actual-Workers auction route works. No clock
-   workaround is bundled, and that live combination remains unverified until
-   #1240 is resolved.
+   trap. The named WASM stack traced it to auction telemetry using the standard
+   clock. Review hardening changes that clock to the already-used platform
+   abstraction and verifies a fresh release Workers combined control. The
+   broader #1240 issue is not declared resolved by that one path.
 
 ## Independent review
 
@@ -172,7 +177,8 @@ both were added and re-reviewed. Architecture review requested a positive winnin
 bid with an enabled finalizer; that regression now passes natively and on WASI.
 
 The spec, plan, code, and tests agree on ownership, ordering, deadline scope,
-cache/privacy policy, optional fallback, and excluded response types. The remaining
-Workers runtime limitation is documented rather than counted as a passing test.
+cache/privacy policy, optional fallback, and excluded response types. The initial
+Workers runtime limitation was documented rather than counted as a passing test;
+its subsequently verified correction is recorded in the hardening addendum.
 The implementation branch and isolated worktree are preserved for maintainer
 review; no merge, push, deployment, or public issue comment is part of this work.

@@ -447,6 +447,14 @@ auction deadline. It has no effect without enabled finalizers. Axum, Workers, an
 Spin can cancel yielding work; Fastly consumers must bound their own blocking host
 calls. Timeout keeps the current transformed document and skips later finalizers.
 
+Enabled finalizers disable shared-template and downstream caching for processed
+HTML, including unchanged/error outcomes; raw-origin readthrough remains separate.
+HTML with status 206 or any `Content-Range` bypasses rewriting and terminal I/O,
+preserving its encoded bytes and range/framing metadata. Full error pages remain
+eligible and expose their status to the integration. See
+[Asynchronous HTML finalization](/guide/integration-guide#asynchronous-html-finalization)
+for consumer requirements and the cacheability contract needed for a future mode.
+
 #### `max_buffered_body_bytes`
 
 **Purpose**: Upper bound on how much of a publisher origin body the rewrite

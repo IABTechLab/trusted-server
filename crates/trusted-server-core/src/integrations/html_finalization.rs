@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use error_stack::Report;
 use futures::future::LocalBoxFuture;
+use http::StatusCode;
 use web_time::Instant;
 
 use super::IntegrationHtmlStreamContext;
@@ -50,6 +51,8 @@ pub trait IntegrationHtmlFinalizer {
 
 /// Borrows the current document, separate candidate storage, and request services.
 pub struct HtmlFinalizationInput<'a> {
+    /// Origin status of this complete response, including eligible error HTML.
+    pub response_status: StatusCode,
     /// Complete transformed HTML; ownership stays with the driver.
     pub html: &'a [u8],
     /// Separate bounded sink for an atomic replacement candidate.
@@ -125,16 +128,14 @@ impl HtmlReplacementWriter {
             .len()
             .checked_add(chunk.len())
             .filter(|length| *length <= self.limit);
-        if self.poisoned || next.is_none() {
-            self.poisoned = true;
-            return Err(Report::new(HtmlFinalizationError::OutputLimitExceeded {
-                limit: self.limit,
-            }));
-        }
-        let Some(next) = next else {
-            return Err(Report::new(HtmlFinalizationError::OutputLimitExceeded {
-                limit: self.limit,
-            }));
+        let next = match next {
+            Some(next) if !self.poisoned => next,
+            _ => {
+                self.poisoned = true;
+                return Err(Report::new(HtmlFinalizationError::OutputLimitExceeded {
+                    limit: self.limit,
+                }));
+            }
         };
         if next > self.bytes.capacity() {
             let capacity = self
