@@ -20,7 +20,7 @@
 - `exclude_domains` wins over `include_domains`. `include_domains` never applies to `<a href>` or `<area href>`.
 - Pattern syntax for both lists: exact host, or `*.example.com` matching the apex and any subdomain. Case-insensitive, dot boundary, matched against `Url::host_str()` only.
 - Load-time normalization: trim and ASCII-lowercase both lists. `exclude_domains` drops `""` and `*` with a `log::warn!`.
-- `include_domains` validation rejects every entry that can never equal `Url::host_str()`. After normalization an entry must be a DNS name of non-empty `[a-z0-9-]` labels with an optional leading `*.`, a dotted-quad IPv4 address, or a bracketed, compressed IPv6 address such as `[::1]`. Rejected entries include `""`, `*`, `*.`, a `*` other than a leading `*.`, a scheme, a port, a path, spaces or other characters outside `[a-z0-9.-]`, a leading or trailing `.`, an empty label, an unbracketed IPv6 address, and a wildcard or malformed IP address. These fail with `invalid_rewrite_include_domain`. Non-ASCII (IDN) entries fail with `non_ascii_rewrite_include_domain` and are not converted to punycode.
+- `include_domains` validation rejects every entry that can never equal `Url::host_str()`. After normalization an entry must be a DNS name of non-empty `[a-z0-9-]` labels with an optional leading `*.`, a dotted-quad IPv4 address, or a bracketed IPv6 address in the form `Url::host_str()` renders, such as `[::1]` or `[::ffff:c000:201]`. Every entry finishes with a round trip through `url::Host::parse`, so an entry that `url` would rewrite or reject fails. Rejected entries include `""`, `*`, `*.`, a `*` other than a leading `*.`, a scheme, a port, a path, spaces or other characters outside `[a-z0-9.-]`, a leading or trailing `.`, an empty label, an unbracketed IPv6 address, and a wildcard or malformed IP address. These fail with `invalid_rewrite_include_domain`. Non-ASCII (IDN) entries fail with `non_ascii_rewrite_include_domain` and are not converted to punycode.
 - `/first-party/sign`: an excluded or off-list host returns `TrustedServerError::Proxy { message: "unsupported url" }` (`502`) for absolute and `//` input, through GET and POST. That check runs before `proxy.allowed_domains`; `403` stays reserved for `proxy.allowed_domains`.
 - No JS, adapter, routing or dependency changes.
 - Fictional data only: `example.com`, `example.net`, `example.org` hosts.
@@ -62,7 +62,7 @@ impl Rewrite {
     /// `/first-party/proxy`.
     ///
     /// The host must not match [`Self::exclude_domains`]. Matching is
-    /// case-insensitive; see [`is_host_allowed`] for the pattern rules.
+    /// case-insensitive; see `crate::proxy::is_host_allowed` for the pattern rules.
     #[must_use]
     pub fn should_proxy_asset(&self, host: &str) -> bool {
         !self.is_excluded_host(host)
@@ -307,6 +307,7 @@ Skip if `fn should_proxy_asset` is already on `main` (see Coordination).
             ("example.org", false),
             ("a.b.example.org", false),
             ("evil-example.org", true),
+            ("example.org.evil.example.net", true),
             ("sub.cdn.example.com", true),
             ("other.example.com", true),
         ] {
@@ -654,7 +655,7 @@ Directly after it, add:
 
 Run: `cargo test-fastly -- normalize_creative_url proxy_if_abs_respects unparseable_absolute exclude_domains_match_case proxy_sign_rejects_excluded`
 
-Expected: `error[E0432]: unresolved import super::normalize_creative_url`. `unparseable_absolute_click_url_is_left_byte_identical`, `exclude_domains_match_case_insensitively_in_the_rewrite_pass` and `proxy_sign_rejects_excluded_urls_case_insensitively` use only existing APIs. Against the pre-change code they fail at runtime: the anchor gains `data-tsclick`, the mixed-case-excluded link is wrapped, and sign returns `200`. Run each alone with `--exact <name> --nocapture` to see the panic.
+Expected: `error[E0432]: unresolved import super::normalize_creative_url`. To observe the runtime reds, do this in two passes. First add only `unparseable_absolute_click_url_is_left_byte_identical`, `exclude_domains_match_case_insensitively_in_the_rewrite_pass` and `proxy_sign_rejects_excluded_urls_case_insensitively`, keeping the old `use super::{...}` list; they use only existing APIs. Run `cargo test-fastly -- unparseable_absolute_click exclude_domains_match_case proxy_sign_rejects_excluded_urls_case` and watch all three fail: the anchor gains `data-tsclick`, the mixed-case-excluded link is wrapped, and sign returns `200`. Then switch the import and add the rest of Step 1, which brings the compile error above.
 
 - [ ] **Step 3: Implement the normalizer, helpers and call sites**
 
@@ -668,7 +669,7 @@ Apply the `proxy.rs` parts of [Shared step](#shared-step): the new normalization
 
 Delete `Rewrite::is_excluded` (with its `#[allow(dead_code)]`) and the `test_rewrite_is_excluded` test (`settings.rs:6522-6546`); Task 1's tests cover its cases.
 
-Run: `git grep -n "to_abs\|is_excluded(" crates/`
+Run: `git grep -nw -e to_abs -e is_excluded crates/`
 
 Expected: no matches.
 
@@ -721,6 +722,28 @@ In `settings.rs` tests:
 
 ```rust
     #[test]
+    fn rewrite_exclude_domains_keep_entries_that_never_match() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["https://cdn.example.com", "cdn.example.com:443", "[2001:0db8::1]"]
+            "#;
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load inert exclude_domains entries with a warning");
+
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec![
+                "https://cdn.example.com".to_owned(),
+                "cdn.example.com:443".to_owned(),
+                "[2001:0db8::1]".to_owned(),
+            ],
+            "should keep inert exclude_domains entries unchanged"
+        );
+    }
+
+    #[test]
     fn rewrite_include_domains_are_normalized_from_toml() {
         let toml_str = crate_test_settings_str()
             + r#"
@@ -763,6 +786,8 @@ In `settings.rs` tests:
             "::1",
             "[::1",
             "[2001:0db8::1]",
+            "[::ffff:192.0.2.1]",
+            "xn--zz.example",
             "*.192.0.2.1",
             "192.0.2",
             "256.0.2.1",
@@ -799,6 +824,7 @@ In `settings.rs` tests:
             "192.0.2.1",
             "[2001:db8::1]",
             "[::1]",
+            "[::ffff:c000:201]",
         ] {
             let settings =
                 Settings::from_toml(&include_domains_toml(entry)).unwrap_or_else(|err| {
@@ -871,9 +897,9 @@ In `config_payload.rs` tests:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test-fastly -- rewrite_include_domains legacy_blob_without_rewrite`
+Run: `cargo test-fastly -- rewrite_include_domains rewrite_exclude_domains_keep legacy_blob_without_rewrite`
 
-Expected: compile errors, `error[E0609]: no field include_domains on type settings::Rewrite`. The reject tests compile, and against a validator that only checks `*` placement they fail on `https://cdn.example.com`, which that validator accepts.
+Expected: compile errors, `error[E0609]: no field include_domains on type settings::Rewrite`.
 
 - [ ] **Step 3: Implement**
 
@@ -911,6 +937,16 @@ At the end of `Rewrite::normalize`, after the `exclude_domains` warning block:
             .iter()
             .map(|pattern| pattern.trim().to_ascii_lowercase())
             .collect();
+        // An `exclude_domains` entry that can never equal a URL host keeps its
+        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
+        // blobs from loading, so warn once per entry and keep it.
+        for pattern in &self.exclude_domains {
+            if let Err(reason) = check_include_domain(pattern) {
+                log::warn!(
+                    "rewrite.exclude_domains: entry `{pattern}` never matches a URL host ({reason})"
+                );
+            }
+        }
 ```
 
 Before `validate_publisher_domain`:
@@ -960,14 +996,11 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
 /// never equal a URL host.
 fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
     if let Some(bracketed) = pattern.strip_prefix('[') {
-        let address = bracketed
+        bracketed
             .strip_suffix(']')
             .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
             .ok_or("not a bracketed IPv6 address")?;
-        if format!("[{address}]") != pattern {
-            return Err("IPv6 address not in compressed form");
-        }
-        return Ok(());
+        return check_host_round_trip(pattern);
     }
     if pattern.parse::<std::net::Ipv6Addr>().is_ok() {
         return Err("IPv6 address without brackets");
@@ -996,19 +1029,31 @@ fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
     {
         return Err("numeric host that is not a dotted-quad IPv4 address");
     }
+    check_host_round_trip(name)
+}
+
+/// Parses `host` with the parser behind [`Url::host_str`] and requires the
+/// rendered form to equal the input, so an entry that `url` rewrites (an
+/// IPv4-mapped IPv6 address in dotted form, an invalid `xn--` label) or rejects
+/// can never load and then silently fail to match.
+fn check_host_round_trip(host: &str) -> Result<(), &'static str> {
+    let parsed = url::Host::parse(host).map_err(|_| "not a valid URL host")?;
+    if parsed.to_string() != host {
+        return Err("not in the form Url::host_str() renders");
+    }
     Ok(())
 }
 ```
 
 The `validator` derive passes `&Vec<String>`, which coerces to `&[String]`, so no `clippy::ptr_arg` allowance is needed.
 
-`validation_error_summary` reports only each error's code, so the code carries the distinction an operator needs. `non_ascii_rewrite_include_domain` says to use punycode, and `invalid_rewrite_include_domain` covers everything else. The `message` and `value`/`reason` params give the detail to anyone reading `ValidationErrors` directly. The checks are exact on purpose. Patterns are compared with `Url::host_str()`, so an entry with a scheme, a port, a path, a non-canonical IPv6 form or a non-ASCII name would load fine and then never match. The operator would see a silently empty allowlist instead of an error at `ts config push`.
+`validation_error_summary` reports only each error's code, so the code carries the distinction an operator needs. `non_ascii_rewrite_include_domain` says to use punycode, and `invalid_rewrite_include_domain` covers everything else. The `message` and `value`/`reason` params give the detail to anyone reading `ValidationErrors` directly. The checks are exact on purpose. Patterns are compared with `Url::host_str()`, so an entry with a scheme, a port, a path, a non-canonical IPv6 form (including dotted IPv4-mapped forms such as `[::ffff:192.0.2.1]`), an invalid `xn--` label or a non-ASCII name would load fine and then never match. The operator would see a silently empty allowlist instead of an error at `ts config push`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test-fastly -- rewrite_include_domains legacy_blob_without_rewrite`
+Run: `cargo test-fastly -- rewrite_include_domains rewrite_exclude_domains_keep legacy_blob_without_rewrite`
 
-Expected: the seven new tests pass (`rewrite_include_domains_are_normalized_from_toml`, `rewrite_include_domains_reject_malformed_entries`, `rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint`, `rewrite_include_domains_accept_hosts_and_ip_literals`, `rewrite_include_domains_default_to_empty`, `legacy_blob_without_rewrite_include_domains_loads_with_empty_list` and `rewrite_include_domains_survive_blob_round_trip`), together with the existing `legacy_blob_without_rewrite_*` tests.
+Expected: the eight new tests pass (`rewrite_exclude_domains_keep_entries_that_never_match`, `rewrite_include_domains_are_normalized_from_toml`, `rewrite_include_domains_reject_malformed_entries`, `rewrite_include_domains_reject_non_ascii_entries_with_a_punycode_hint`, `rewrite_include_domains_accept_hosts_and_ip_literals`, `rewrite_include_domains_default_to_empty`, `legacy_blob_without_rewrite_include_domains_loads_with_empty_list` and `rewrite_include_domains_survive_blob_round_trip`), together with the existing `legacy_blob_without_rewrite_*` tests.
 
 - [ ] **Step 5: Lint**
 
@@ -1048,7 +1093,7 @@ In `settings.rs` tests:
         let mut rewrite = Rewrite::default();
         rewrite
             .include_domains
-            .extend(["*.example.com", "img.example.net"].map(str::to_owned));
+            .extend(["*.example.com", "img.example.net", "*.UPPER.Example.org"].map(str::to_owned));
         rewrite
             .exclude_domains
             .push("blocked.example.com".to_owned());
@@ -1058,6 +1103,7 @@ In `settings.rs` tests:
             ("a.b.example.com", true),
             ("img.example.net", true),
             ("IMG.EXAMPLE.NET", true),
+            ("cdn.upper.example.org", true),
             ("evil-example.com", false),
             ("cdn.example.org", false),
             ("blocked.example.com", false),
@@ -1467,7 +1513,7 @@ Replace `should_proxy_asset` and its doc comment:
     ///
     /// The host must not match [`Self::exclude_domains`], and must match
     /// [`Self::include_domains`] when that list is non-empty. Matching is
-    /// case-insensitive; see [`is_host_allowed`] for the pattern rules.
+    /// case-insensitive; see `crate::proxy::is_host_allowed` for the pattern rules.
     #[must_use]
     pub fn should_proxy_asset(&self, host: &str) -> bool {
         !self.is_excluded_host(host) && is_host_permitted(&self.include_domains, host)
@@ -1476,7 +1522,7 @@ Replace `should_proxy_asset` and its doc comment:
 
 `is_host_permitted` returns `true` for an empty list, which is the "include list empty" half of the rule.
 
-In the `creative.rs` module docs, after the `exclude_domains` key behavior, add:
+In the `creative.rs` module docs, append to the key behaviors list after the "Non-network schemes are ignored" bullet (`creative.rs:21-22`):
 
 ```rust
 //! - When `[rewrite] include_domains` is non-empty, only asset URLs on listed
@@ -1587,27 +1633,25 @@ Expected:
 
 - [ ] **Step 3: Implement**
 
-In the `link[href]` handler, delete the `imagesrcset` block and keep the `href` handling:
+In the `link[href]` handler, delete the `imagesrcset` block and keep the `href` handling. A let-chain keeps `clippy::collapsible_if` quiet without depending on where a comment sits:
 
 ```rust
-                // Stylesheets and preloads
+                // Stylesheets and preloads. `imagesrcset` is left to the
+                // `[imagesrcset]` handler, which also runs on this element;
+                // rewriting it here too would proxy the inline path's absolute
+                // proxy URLs a second time.
                 element!("link[href]", |el| {
                     let rel = el
                         .get_attribute("rel")
                         .unwrap_or_default()
                         .to_ascii_lowercase();
-                    if rel.contains("stylesheet")
+                    if (rel.contains("stylesheet")
                         || rel.contains("preload")
-                        || rel.contains("prefetch")
-                    {
-                        // `imagesrcset` is left to the `[imagesrcset]` handler, which
-                        // also runs on this element; rewriting it here too would
-                        // proxy the inline path's absolute proxy URLs a second time.
-                        if let Some(p) =
+                        || rel.contains("prefetch"))
+                        && let Some(p) =
                             proxied_attr_value(settings, el.get_attribute("href"), base_origin)
-                        {
-                            let _ = el.set_attribute("href", &p);
-                        }
+                    {
+                        let _ = el.set_attribute("href", &p);
                     }
                     Ok(())
                 }),
@@ -1717,7 +1761,7 @@ matching.
 :::
 ```
 
-The warning box mirrors the `[auction]` one for `rewrite_clicks`.
+The warning box mirrors the existing `[auction] rewrite_creatives` upgrade and rollback box (and #1234's `[auction] rewrite_clicks` box if that has landed).
 
 - [ ] **Step 3: `docs/guide/creative-processing.md`**
 
