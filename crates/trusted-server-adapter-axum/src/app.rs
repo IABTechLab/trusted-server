@@ -283,10 +283,9 @@ where
     let services = state.services_for_request(&ctx);
     let mut req = ctx.into_request();
     // The single preparation point for the adapter. Every route in the table
-    // except `/health` and the attestation pages is registered to
-    // `named_route_handler` or `fallback_handler`, and both wrap this
-    // function, so each request has its modules' preparers run exactly once
-    // and always before routing.
+    // except `/health` is registered to `named_route_handler` or
+    // `fallback_handler`, and both wrap this function, so each request has its
+    // modules' preparers run exactly once and always before routing.
     if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&error));
     }
@@ -538,8 +537,7 @@ fn named_routes() -> [NamedRoute; 15] {
             primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
-        // The publisher's robots.txt, served only when the settings carry a
-        // `[robots-txt]` section, see `named_route_is_served`.
+        // Only when the settings carry `[robots-txt]`.
         NamedRoute {
             path: ROBOTS_TXT_PATH,
             primary_methods: &[Method::GET, Method::HEAD],
@@ -549,10 +547,6 @@ fn named_routes() -> [NamedRoute; 15] {
 }
 
 /// Whether a named route is served for these settings.
-///
-/// `/robots.txt` is this server's only when the publisher's settings carry a
-/// `[robots-txt]` section. Without one the path reaches the publisher's
-/// origin like any other, so a publisher keeping their own file is left alone.
 fn named_route_is_served(settings: &Settings, handler: NamedRouteHandler) -> bool {
     match handler {
         NamedRouteHandler::RobotsTxt => settings.robots_txt.is_some(),

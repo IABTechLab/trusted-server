@@ -889,10 +889,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         }
 
-        // `/robots.txt` is this server's only when the settings carry a
-        // `[robots-txt]` section. Without one the path reaches the publisher's
-        // origin like any other, so a publisher keeping their own file is
-        // left alone.
+        // Only when the settings carry `[robots-txt]`.
         if state.settings.robots_txt.is_some() {
             let robots_txt = make_handler(Arc::clone(&state), |s, services, req| async move {
                 handle_robots_txt(&s.settings, &services, &s.registry, req).await

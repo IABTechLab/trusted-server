@@ -52,7 +52,7 @@ setting = "value"
 | `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `mock`                                                                                                  |
-| `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or an integration that supplies robots.txt rules                             |
+| `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or a module that supplies robots.txt rules                                   |
 | `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
 | `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |
 | `ad-tag`            | several           | `modules`, a list  | `google`, `google.diagnostics`                                                                          |

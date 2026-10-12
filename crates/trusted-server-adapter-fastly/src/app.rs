@@ -1413,8 +1413,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
     },
-    // The publisher's robots.txt, served only when the settings carry a
-    // `[robots-txt]` section, see `named_route_is_served`.
+    // Only when the settings carry `[robots-txt]`.
     NamedRoute {
         path: ROBOTS_TXT_PATH,
         primary_methods: &[Method::GET, Method::HEAD],
@@ -1423,10 +1422,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
 ];
 
 /// Whether a named route is served for these settings.
-///
-/// `/robots.txt` is this server's only when the publisher's settings carry a
-/// `[robots-txt]` section. Without one the path reaches the publisher's
-/// origin like any other, so a publisher keeping their own file is left alone.
 fn named_route_is_served(settings: &Settings, handler: NamedRouteHandler) -> bool {
     match handler {
         NamedRouteHandler::RobotsTxt => settings.robots_txt.is_some(),
