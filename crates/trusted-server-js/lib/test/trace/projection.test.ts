@@ -191,6 +191,30 @@ describe('explicit GPT public projection', () => {
     });
     expect(calls).toBe(0);
   });
+  it('accepts and drops TS Console auction evidence on request cycles', () => {
+    const source = gptSourceFixture();
+    Object.assign(source.slots[0].requests[0], {
+      auctionType: 'private-auction-type',
+      auctionWinner: { bidder: 'private-winner', priceBucket: '1.00', currency: 'USD' },
+      prebidAuction: { auctionId: 'private-prebid-auction' },
+      serverAuctionTimings: { private: 'private-server-timings' },
+      serverAuctionTimingOrigin: 'private-timing-origin',
+    });
+    const result = projectTraceGptDiagnostics(source, TRACE_ORIGIN);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('should project source with auction evidence');
+    expect(result.value).toEqual(projectedGptFixture());
+    const json = JSON.stringify(result.value);
+    for (const sentinel of [
+      'auctionType',
+      'auctionWinner',
+      'prebidAuction',
+      'serverAuctionTimings',
+      'serverAuctionTimingOrigin',
+      'private-',
+    ])
+      expect(json).not.toContain(sentinel);
+  });
   it('rejects every extra source key at each source boundary', () => {
     const source = gptSourceFixture();
     const targets = [

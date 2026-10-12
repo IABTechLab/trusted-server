@@ -23,6 +23,19 @@ export type TraceProjectionResult =
         | 'omission_counter_overflow';
     };
 
+/**
+ * Auction evidence the TS Console records on each request cycle. Trace reports
+ * have not been reviewed to carry it, so these members are accepted and dropped
+ * like `adManager`, never copied.
+ */
+const EXCLUDED_AUCTION_EVIDENCE_KEYS = [
+  'auctionType',
+  'auctionWinner',
+  'prebidAuction',
+  'serverAuctionTimings',
+  'serverAuctionTimingOrigin',
+] as const;
+
 function sourceObject(
   value: unknown,
   required: readonly string[],
@@ -86,7 +99,7 @@ function cycleProjection(value: unknown, omissions: { value: number }): Record<s
   const source = sourceObject(
     value,
     ['requestNumber', 'durations', 'incompleteSequence'],
-    [...TRACE_CYCLE_KEYS, 'adManager', 'previousCreativeId']
+    [...TRACE_CYCLE_KEYS, 'adManager', 'previousCreativeId', ...EXCLUDED_AUCTION_EVIDENCE_KEYS]
   );
   const output: Record<string, unknown> = {
     requestNumber: data(source, 'requestNumber'),
