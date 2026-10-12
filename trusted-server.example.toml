@@ -438,7 +438,7 @@ auction_timeout_ms = 500
 #   "/news/x"    -> /123456789/example/news
 #   "/reviews/y" -> /123456789/example/reviews
 
-# Direct Tinybird auction telemetry (off by default). When enabled, `api_host`
+# Direct Tinybird auction/access telemetry (off by default). When enabled, `api_host`
 # is required and must be a bare host (no scheme or path).
 # [tinybird]
 # enabled = true
@@ -447,7 +447,7 @@ auction_timeout_ms = 500
 # auction_token_secret = "tinybird_auction_append_token"  # key in the default secret store
 # auction_enabled = true                       # emit auction telemetry
 # access_enabled = true                        # positive sample rate required
-# access_dataset = "access_logs_raw"          # access Events API datasource
+# access_dataset = "access_logs_v2"           # deploy this schema before enabling access
 # access_token_secret = "tinybird_access_append_token"    # key in the default secret store
 # access_sample_rate = 0.05                    # sample 5%; sink defaults off
 # max_body_bytes = 1048576                     # maximum NDJSON body, at least 1024

@@ -1000,9 +1000,9 @@ fn send_edgezero_response(
     context: &SendContext,
     counters: Option<&SandboxCounters>,
 ) -> DeliveryOutcome {
-    apply_terminal_response_effects(&mut response, request_filter_effects);
-    apply_server_timing_header(
+    finalize_send_response_headers(
         &mut response,
+        request_filter_effects,
         &context.timings,
         context.server_timing_enabled,
     );
@@ -1191,7 +1191,18 @@ fn env_var_or_unknown(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| "unknown".to_owned())
 }
 
-/// Apply every late response mutation, then restore privacy invariants before headers commit.
+/// Apply terminal response effects before evaluating Server-Timing at the send freeze point.
+fn finalize_send_response_headers(
+    response: &mut HttpResponse,
+    request_filter_effects: Option<&RequestFilterEffects>,
+    timings: &RequestTimings,
+    server_timing_enabled: bool,
+) {
+    apply_terminal_response_effects(response, request_filter_effects);
+    apply_server_timing_header(response, timings, server_timing_enabled);
+}
+
+/// Apply late response effects and restore cache-privacy invariants before headers commit.
 fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
@@ -1580,6 +1591,31 @@ mod tests {
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
         assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn send_freeze_applies_filter_effects_before_server_timing_privacy_gate() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![HeaderMutation::set(
+                "cache-control",
+                "public, s-maxage=3600",
+            )],
+        };
+        let context = send_context_fixture();
+        drop(context.timings.span(Phase::Origin));
+
+        finalize_send_response_headers(&mut response, Some(&effects), &context.timings, true);
+
+        assert_eq!(response.headers()["cache-control"], "public, s-maxage=3600");
+        assert!(
+            response.headers().get("server-timing").is_none(),
+            "late public cache policy must be visible to the Server-Timing privacy gate"
+        );
     }
 
     #[test]
@@ -2139,6 +2175,56 @@ mod tests {
         assert_eq!(snapshot.route_template, "/auction");
         assert_eq!(snapshot.country, "US");
         assert_eq!(snapshot.template_cache_state, "hit");
+    }
+
+    #[test]
+    fn entry_point_404_finalization_writes_geo_state_before_access_snapshot() {
+        let settings = Settings::default();
+        let timings = RequestTimings::new();
+        let resolved_geo = trusted_server_core::platform::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+
+        for (geo_state, expected_country) in [
+            (GeoLookupState::NotAttempted, "unknown"),
+            (GeoLookupState::Resolved(resolved_geo), "US"),
+        ] {
+            let mut response = response_builder()
+                .status(404)
+                .body(EdgeBody::empty())
+                .expect("should build router 404");
+
+            apply_entry_point_finalize_headers(
+                &settings,
+                &mut response,
+                None,
+                &geo_state,
+                &timings,
+            );
+
+            match (geo_state, response.extensions().get::<GeoLookupState>()) {
+                (GeoLookupState::NotAttempted, Some(GeoLookupState::Attempted)) => {}
+                (GeoLookupState::Resolved(expected), Some(GeoLookupState::Resolved(actual))) => {
+                    assert_eq!(actual.country, expected.country)
+                }
+                (_, actual) => {
+                    panic!("should write back the entry-point geo result, got {actual:?}")
+                }
+            }
+            let snapshot = build_access_telemetry_snapshot(&response, &send_context_fixture());
+            assert_eq!(
+                snapshot.status, 404,
+                "should preserve the router 404 status"
+            );
+            assert_eq!(snapshot.country, expected_country);
+        }
     }
 
     #[test]

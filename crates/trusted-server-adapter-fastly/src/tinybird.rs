@@ -629,7 +629,7 @@ mod tests {
             auction_dataset: "auction_events_raw".to_owned(),
             auction_token_secret: Some(Redacted::new("append-token".to_owned())),
             access_enabled: false,
-            access_dataset: "access_logs_raw".to_owned(),
+            access_dataset: "access_logs_v2".to_owned(),
             access_token_secret: Some(Redacted::new("access-append-token".to_owned())),
             access_sample_rate: 0.0,
             max_body_bytes: 1024 * 1024,
@@ -871,6 +871,26 @@ mod tests {
     }
 
     #[test]
+    fn access_emitter_accepts_row_exactly_at_body_limit_including_newline() {
+        let mut config = enabled_config();
+        config.max_body_bytes = 1024;
+        let target = TinybirdEventsTarget::from_access_config(config);
+        let http_client = RecordingHttpClient::respond_with(202);
+        let row = "x".repeat(1023);
+
+        futures::executor::block_on(emit_access_event(&http_client, &target, row.clone()))
+            .expect("a newline-terminated row exactly at the limit should send");
+
+        let requests = http_client
+            .requests
+            .lock()
+            .expect("should lock recorded requests");
+        assert_eq!(requests.len(), 1, "should send the boundary-sized row");
+        assert_eq!(requests[0].body.len(), 1024, "newline counts toward limit");
+        assert_eq!(requests[0].body.last(), Some(&b'\n'));
+    }
+
+    #[test]
     fn access_emitter_posts_ndjson_and_validates_2xx() {
         let target = TinybirdEventsTarget::from_access_config(enabled_config());
         let http_client = RecordingHttpClient::respond_with(202);
@@ -886,7 +906,7 @@ mod tests {
         assert_eq!(requests.len(), 1, "should send exactly one request");
         assert_eq!(
             requests[0].uri,
-            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_raw"
+            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_v2"
         );
         assert_eq!(requests[0].method, Method::POST.to_string());
         assert_eq!(

@@ -34,7 +34,7 @@ use crate::request_signing::RequestSigner;
 /// TTFB ≈ auction timeout.
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
-    /// Whether dispatch produced an immediate provider response or started at least one request.
+    /// Whether dispatch started at least one provider request.
     provider_launched: bool,
     backend_to_provider: HashMap<String, ProviderLaunchState>,
     planned_backend_to_provider: HashMap<String, PlannedLaunchState>,
@@ -89,7 +89,7 @@ pub enum DispatchAuctionOutcome {
 }
 
 impl DispatchedAuction {
-    /// Whether at least one provider produced an immediate outcome or started a request.
+    /// Whether at least one provider request was started.
     #[must_use]
     pub fn has_provider_launch(&self) -> bool {
         self.provider_launched
@@ -1792,8 +1792,9 @@ impl AuctionOrchestrator {
                     }
                 }
                 Ok(ProviderRequestOutcome::Immediate(response)) => {
+                    // Planned providers use Immediate for routing-only skips such
+                    // as NoImpressions; no request left the edge.
                     immediate_response_count += 1;
-                    provider_launch_count += 1;
                     completed_responses.push(response);
                 }
                 Err(error) => {
@@ -5393,6 +5394,108 @@ mod tests {
         assert_eq!(
             result.provider_responses[0].metadata["error_type"], ERROR_TYPE_TRANSPORT,
             "harness should match production transport classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_no_impressions_immediate_outcome_is_not_a_provider_launch() {
+        let http = Arc::new(StubHttpClient::new());
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let mut config = planned_prebid_config(&[(
+            "pbs-a",
+            serde_json::json!({}),
+            NotificationConfig::default(),
+        )]);
+        config.bidders.insert(
+            "alpha".parse().expect("should parse bidder ID"),
+            crate::auction::plan::BidderRouteConfig {
+                provider: "pbs-a".parse().expect("should parse provider ID"),
+            },
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(
+            Arc::new(AuctionPlan::compile(config).expect("should compile PBS plan")),
+            None,
+        );
+        let mut request = planned_prebid_request();
+        request.slots[0].bidders.insert(
+            "trustedServer".to_string(),
+            serde_json::json!({"storedRequest":false,"bidderParams":{"alpha":{}}}),
+        );
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("should retain the routing-only provider response for collection");
+        };
+        assert_eq!(
+            http.recorded_backend_names().len(),
+            0,
+            "should not start an outbound request for NoImpressions"
+        );
+        assert!(
+            !dispatched.has_provider_launch(),
+            "should not establish launch evidence for a routing-only Immediate response"
+        );
+        assert_eq!(
+            dispatched.completed_responses[0].metadata["routing"]["skipped_no_usable_demand"], true,
+            "should retain the routing skip response for collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_started_request_keeps_launch_evidence_after_backend_bookkeeping_failure() {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(204, Vec::new());
+        http.push_pending_backend_name_override(None);
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("provider-a", RoutingMode::AllEligible)],
+                false,
+            ))
+            .expect("should compile planned auction"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let DispatchAuctionOutcome::DispatchFailed {
+            provider_launched, ..
+        } = orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("missing backend bookkeeping should fail dispatch");
+        };
+        assert_eq!(http.recorded_backend_names().len(), 1);
+        assert!(
+            provider_launched,
+            "should retain launch evidence for a started request when bookkeeping fails"
         );
     }
 

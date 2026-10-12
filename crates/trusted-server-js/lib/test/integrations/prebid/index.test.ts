@@ -5660,6 +5660,38 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     });
   });
 
+  it('does not record a completed auction for duplicate ad-unit element IDs', () => {
+    const code = 'duplicate-client-slot';
+    const firstSlot = {
+      getSlotElementId: () => code,
+      getTargeting: () => ['example-client'],
+      clearTargeting: vi.fn(),
+    };
+    const secondSlot = {
+      getSlotElementId: () => code,
+      getTargeting: () => ['example-client'],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidAuction = vi.fn();
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: {
+        recordPrebidRefresh: vi.fn(),
+        recordPrebidAuction,
+      },
+    };
+    const { originalRefresh, pubads } = installGpt([firstSlot, secondSlot]);
+    mockPbjs.setTargetingForGPTAsync = vi.fn();
+    mockRequestBids.mockImplementation((opts) => {
+      opts.bidsBackHandler?.({}, false, 'duplicate-client-auction');
+    });
+    installPrebidNpm();
+
+    pubads.refresh([firstSlot, secondSlot]);
+
+    expect(recordPrebidAuction).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith([firstSlot, secondSlot], undefined);
+  });
+
   it.each(['expiry', 'navigation change'] as const)(
     'rejects a Prebid bidWon observation after %s',
     (reason) => {

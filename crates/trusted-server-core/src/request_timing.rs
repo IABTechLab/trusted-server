@@ -203,8 +203,8 @@ impl RequestTimings {
     /// Stamps the elapsed time since `t0` as the auction dispatch offset,
     /// the first time this is called.
     ///
-    /// Called after at least one provider starts a request or returns an
-    /// immediate result. Routing-only skipped outcomes and zero-launch
+    /// Called after at least one provider starts a request.
+    /// Routing-only skipped outcomes and zero-launch
     /// failures do not stamp it. A null offset alongside a non-null
     /// `auction_id` means no provider launch was observed. Subsequent calls
     /// are no-ops (first call wins).

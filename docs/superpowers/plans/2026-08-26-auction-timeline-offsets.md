@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Record three T0-anchored auction milestones (dispatched, resolved, committed) plus the auction id on `RequestTimings`, and emit them as four additive columns on the `access_logs_raw` row.
+**Goal:** Record three T0-anchored auction milestones (dispatched, resolved, committed) plus the auction id on `RequestTimings`, and emit them as four auction columns on the versioned `access_logs_v2` row.
 
 **Architecture:** Follows spec section 18. All state lives in the existing `RequestTimings` inner (same `try_lock`/first-call-wins/saturating model as `mark_headers_ready`); the row builder reads the values from `TimingSnapshot`, so no new emission path and no adapter changes.
 
@@ -14,8 +14,8 @@
 
 - Marks are first-call-wins; `try_lock` only; a contended lock drops the sample, a poisoned lock is recovered (matching every other write on the collector).
 - A null offset means "this milestone was not reached", not "no auction ran". `auction_id` is what separates the two: null id means no auction was attempted; a non-null id with a null dispatch offset means attempted but nothing sent; a non-null dispatch offset with a null resolve offset means dispatched and never collected.
-- The id is stamped where the observation is built, not on dispatch, so skipped and dispatch-failed auctions stay joinable to the `auction_events_raw` rows they emit.
-- Column names: `auction_dispatched_ms`, `auction_resolved_ms`, `auction_committed_ms`, `auction_id`; JSONPaths `json:$.<name>`; FORWARD_QUERY extended in the same order.
+- The id is stamped where an active-auction observation is built, not on dispatch, so active skipped and dispatch-failed auctions stay joinable. Disabled auctions have null access UUIDs on all three routes.
+- Column names: `auction_dispatched_ms`, `auction_resolved_ms`, `auction_committed_ms`, `auction_id`; JSONPaths `json:$.<name>`. The new versioned datasource has no `FORWARD_QUERY`; the legacy dataset is preserved.
 - `auction_id` is `Nullable(UUID)`, matching `auction_events_raw.auction_id` so the join needs no cast and no sentinel.
 - All three `AuctionSource` variants are instrumented: `InitialNavigation`, `SpaNavigation` (`/_ts/page-bids`), and `AuctionApi` (`POST /auction`).
 - No header emission and no config surface. Changes are confined to `trusted-server-core`, `tinybird/`, and the spec and plan documents.
@@ -61,12 +61,12 @@
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/access_telemetry.rs`
-- Modify: `tinybird/datasources/access_logs_raw.datasource`
-- Modify: `tinybird/fixtures/access_logs_raw.ndjson`
+- Create: `tinybird/datasources/access_logs_v2.datasource`
+- Create: `tinybird/fixtures/access_logs_v2.ndjson`
 
 - [x] `access_event_row`: add the three offset keys and `auction_id`, all nullable, after the existing phase keys.
 - [x] Extend `row_serializes_nulls_for_missing_phases` (including `auction_id` in the nullable-column loop) and `row_serializes_recorded_phases_as_numbers` for the new keys.
-- [x] Datasource: four schema columns with JSONPaths (`Nullable(UInt32)` ×3, `Nullable(UUID)`), appended at the end of SCHEMA and FORWARD_QUERY so existing column order stays stable.
+- [x] Datasource: four schema columns with JSONPaths (`Nullable(UInt32)` ×3, `Nullable(UUID)`) on the new `access_logs_v2` datasource. Preserve the legacy nine-column datasource without a forward query or backfill.
 - [x] Fixture: extend the existing row with a full timeline reusing the `auction_events_raw` fixture's UUID so the pair demonstrates the join, and add a second row covering the no-auction case.
 - [x] Full gates: fmt, clippy (all six), test-fastly/axum/cloudflare/spin, parity. Commit.
 

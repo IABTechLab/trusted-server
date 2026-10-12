@@ -5098,12 +5098,12 @@ pub async fn handle_publisher_request(
         // Written on the value, before it is moved into `auction_observation` below. Sites
         // after that move reach it through `auction_observation.as_mut()` instead.
         observation.set_origin_cache_shareable(origin_response_is_shareable && request_is_document);
-        // T0-anchored timeline (spec section 18): stamp the join key here
-        // rather than on dispatch, because every branch below emits an
-        // `auction_events_raw` row under this id — completed, dispatch
-        // failed, and skipped alike. Stamping it on dispatch would leave the
-        // failed and skipped rows unjoinable.
-        timings.set_auction_id(observation.auction_id);
+        // Disabled auctions are unattempted and keep a null access join key;
+        // enabled auctions stamp the ID before dispatch so failed/skipped rows
+        // remain joinable to their summary event.
+        if auction.orchestrator.is_enabled() {
+            timings.set_auction_id(observation.auction_id);
+        }
 
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
@@ -5146,7 +5146,7 @@ pub async fn handle_publisher_request(
             {
                 DispatchAuctionOutcome::Dispatched(dispatched) => {
                     // The outcome can also carry skipped-provider diagnostics;
-                    // only a real provider result/request establishes dispatch.
+                    // only a started provider request establishes dispatch.
                     if dispatched.has_provider_launch() {
                         timings.mark_auction_dispatched();
                     }
@@ -7343,7 +7343,9 @@ pub async fn handle_page_bids(
         // This route runs the auction through `run_auction` rather than the
         // dispatch/collect split, so dispatch and resolve bracket that one
         // call instead of the origin fetch.
-        timings.set_auction_id(observation.auction_id);
+        if auction.orchestrator.is_enabled() {
+            timings.set_auction_id(observation.auction_id);
+        }
         if ad_stack_enabled && !is_bot && !is_prefetch {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
@@ -10763,6 +10765,47 @@ mod tests {
             price: f64,
         }
 
+        struct FailingNavigationProvider;
+
+        #[async_trait::async_trait(?Send)]
+        impl crate::auction::provider::AuctionProvider for FailingNavigationProvider {
+            fn provider_name(&self) -> &'static str {
+                STUB_BIDDER
+            }
+
+            async fn request_bids(
+                &self,
+                _request: &AuctionRequest,
+                _context: &crate::auction::types::AuctionContext<'_>,
+            ) -> Result<crate::auction::provider::ProviderRequestOutcome, Report<TrustedServerError>>
+            {
+                Err(Report::new(TrustedServerError::Auction {
+                    message: "navigation provider admission failed".to_string(),
+                }))
+            }
+
+            async fn parse_response(
+                &self,
+                _response: crate::platform::PlatformResponse,
+                _response_time_ms: u64,
+            ) -> Result<crate::auction::types::AuctionResponse, Report<TrustedServerError>>
+            {
+                panic!("should not parse a response after navigation dispatch failure");
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                2_000
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some("stub-bidder-backend".to_string())
+            }
+        }
+
         #[async_trait::async_trait(?Send)]
         impl crate::auction::provider::AuctionProvider for WinningBidProvider {
             fn provider_name(&self) -> &'static str {
@@ -11030,7 +11073,32 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn harness_emits_a_summary_row_for_an_ad_serving_navigation() {
+        async fn disabled_navigation_keeps_access_auction_id_null() {
+            let stub = Arc::new(StubHttpClient::new());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+            let mut disabled_settings = settings_with_mode("esi");
+            disabled_settings.auction.enabled = false;
+            let settings = Arc::new(disabled_settings);
+            queue_shareable_html(&stub);
+            let mut request = navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.handle().clone());
+
+            let response = run(&settings, &services, request).await;
+            let _ = body_of(response).await;
+
+            assert!(
+                timings.snapshot().auction_id.is_none(),
+                "should keep the disabled navigation access join key null"
+            );
+        }
+
+        #[tokio::test]
+        async fn skipped_navigation_joins_summary_without_milestones() {
             let stub = Arc::new(StubHttpClient::new());
             let sink = Arc::new(RecordingTelemetrySink::default());
             let services = services_with_cache_and_telemetry(
@@ -11040,13 +11108,168 @@ mod tests {
             );
             let settings = Arc::new(settings_with_mode("esi"));
             queue_shareable_html(&stub);
+            let mut request = prefetch_navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.handle().clone());
 
-            let _ = run(&settings, &services, navigation_request()).await;
-
-            assert!(
-                last_summary_row(&sink).is_some(),
-                "the harness must emit a summary row, or every assertion built on it is vacuous"
+            let response = run(&settings, &services, request).await;
+            let _ = body_of(response).await;
+            let summary =
+                last_summary_row(&sink).expect("should emit a skipped summary for prefetch");
+            assert_eq!(summary.terminal_reason.as_deref(), Some("prefetch"));
+            assert_eq!(
+                timings
+                    .snapshot()
+                    .auction_id
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some(summary.auction_id.as_str()),
+                "should join the enabled skipped navigation to its summary"
             );
+            assert!(timings.snapshot().auction_dispatched_ms.is_none());
+            assert!(timings.snapshot().auction_resolved_ms.is_none());
+            assert!(timings.snapshot().auction_committed_ms.is_none());
+        }
+
+        #[tokio::test]
+        async fn routing_only_dispatched_navigation_keeps_milestones_null() {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n\
+                 [auction.providers.skipped]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"explicit\"\n\n\
+                 [creative_opportunities]\ngam_network_id = \"99999\"\nassembly_mode = \"esi\"\n\n\
+                 [[creative_opportunities.slot]]\nid = \"test-slot\"\npage_patterns = [\"/article\"]\nformats = [{{ width = 728, height = 90 }}]\n",
+                crate_test_settings_str()
+            );
+            let mut parsed_settings = Settings::from_toml(&toml)
+                .expect("should parse explicit-routing navigation settings");
+            parsed_settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            let settings = Arc::new(parsed_settings);
+            let plan = Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile explicit-routing navigation plan"),
+            );
+            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let stub = Arc::new(StubHttpClient::new());
+            queue_shareable_html(&stub);
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let mut request = navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.handle().clone());
+
+            let response = run_with_orchestrator(
+                &settings,
+                &services,
+                request,
+                orchestrator,
+                Finalizer::Streaming,
+            )
+            .await;
+            let _ = body_of(response).await;
+            let summary = last_summary_row(&sink)
+                .expect("should emit a summary for the routing-only dispatch");
+            assert_eq!(summary.terminal_status.as_deref(), Some("completed"));
+            assert_eq!(
+                timings
+                    .snapshot()
+                    .auction_id
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some(summary.auction_id.as_str()),
+                "should join the routing-only dispatch to its navigation summary"
+            );
+            let snapshot = timings.snapshot();
+            assert!(snapshot.auction_dispatched_ms.is_none());
+            assert!(snapshot.auction_resolved_ms.is_none());
+            assert!(snapshot.auction_committed_ms.is_none());
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://origin.test-publisher.com/article"],
+                "should send only the origin request for the explicit routing skip"
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_navigation_joins_summary_without_launch_milestones() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_bidder("esi"));
+            queue_shareable_html(&stub);
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(FailingNavigationProvider));
+            let mut request = navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.handle().clone());
+
+            let response = run_with_orchestrator(
+                &settings,
+                &services,
+                request,
+                orchestrator,
+                Finalizer::Streaming,
+            )
+            .await;
+            let _ = body_of(response).await;
+            let summary = last_summary_row(&sink)
+                .expect("should emit a dispatch-failed summary for failed navigation");
+            assert_eq!(summary.terminal_reason.as_deref(), Some("dispatch_failed"));
+            assert_eq!(
+                timings
+                    .snapshot()
+                    .auction_id
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some(summary.auction_id.as_str()),
+                "should join the enabled failed navigation to its summary"
+            );
+            assert!(timings.snapshot().auction_dispatched_ms.is_none());
+            assert!(timings.snapshot().auction_resolved_ms.is_none());
+            assert!(timings.snapshot().auction_committed_ms.is_none());
+        }
+
+        #[tokio::test]
+        async fn harness_emits_a_summary_row_for_an_ad_serving_navigation() {
+            let stub = Arc::new(StubHttpClient::new());
+            let sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with_cache_and_telemetry(
+                Arc::clone(&stub),
+                Arc::new(MemoryTemplateCache::default()),
+                Arc::clone(&sink),
+            );
+            let settings = Arc::new(settings_with_bidder("esi"));
+            queue_bid_response(&stub);
+            queue_shareable_html(&stub);
+            let mut request = navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.handle().clone());
+
+            let response = run_bidding(&settings, &services, request).await;
+            let _ = body_of(response).await;
+            let summary = last_summary_row(&sink)
+                .expect("should emit a summary row for the navigation handler");
+            assert_eq!(
+                timings
+                    .snapshot()
+                    .auction_id
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some(summary.auction_id.as_str()),
+                "the installed navigation collector must join its summary row"
+            );
+            let snapshot = timings.snapshot();
+            assert!(snapshot.auction_dispatched_ms.is_some());
+            assert!(snapshot.auction_resolved_ms.is_some());
+            assert!(snapshot.auction_committed_ms.is_some());
         }
 
         /// Drive `handle_publisher_request` through the **EC-preload** fetch path.
@@ -16970,6 +17193,16 @@ mod tests {
         #[derive(Default)]
         struct RecordingTelemetrySink {
             batches: Mutex<Vec<AuctionEventBatch>>,
+            delay: std::time::Duration,
+        }
+
+        impl RecordingTelemetrySink {
+            fn with_delay(delay: std::time::Duration) -> Self {
+                Self {
+                    batches: Mutex::new(Vec::new()),
+                    delay,
+                }
+            }
         }
 
         #[async_trait::async_trait(?Send)]
@@ -16979,6 +17212,9 @@ mod tests {
                 _services: &RuntimeServices,
                 batch: AuctionEventBatch,
             ) -> Result<(), Report<TrustedServerError>> {
+                if !self.delay.is_zero() {
+                    tokio::time::sleep(self.delay).await;
+                }
                 self.batches
                     .lock()
                     .expect("should lock telemetry batches")
@@ -17216,7 +17452,8 @@ mod tests {
             let settings = settings_with_dispatching_provider();
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             orchestrator.register_provider(Arc::new(DispatchingTestProvider));
-            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let telemetry_delay = std::time::Duration::from_millis(250);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::with_delay(telemetry_delay));
             let stub = Arc::new(StubHttpClient::new());
             stub.set_streaming_responses_supported(true);
             stub.set_pending_streaming_responses_supported(true);
@@ -17230,6 +17467,10 @@ mod tests {
             let graph = KvIdentityGraph::new(InMemoryEcKv::new("wait-error-store"));
             let mut ec_context = active_ec_context();
             let slots = [article_slot()];
+            let mut request = conditional_navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.handle().clone());
+            let started = std::time::Instant::now();
 
             let error = match handle_publisher_request(
                 &settings,
@@ -17241,7 +17482,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                conditional_navigation_request(),
+                request,
                 EdgeCacheHeader::SurrogateControl,
             )
             .await
@@ -17275,7 +17516,21 @@ mod tests {
             );
             assert_eq!(
                 summaries[0].publisher_domain, settings.publisher.domain,
-                "reordered path should retain configured publisher attribution"
+                "should retain configured publisher attribution"
+            );
+            drop(batches);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            assert!(elapsed_ms >= telemetry_delay.as_millis() as u64);
+            timings.mark_headers_ready();
+            let origin_ms = u64::from(
+                timings
+                    .snapshot()
+                    .origin_ms
+                    .expect("should record origin timing before abandonment telemetry"),
+            );
+            assert!(
+                origin_ms + telemetry_delay.as_millis() as u64 / 2 < elapsed_ms,
+                "origin span must exclude the deliberately slow abandonment sink: origin={origin_ms}ms total={elapsed_ms}ms"
             );
         }
 
@@ -22059,6 +22314,162 @@ mod tests {
     }
 
     #[test]
+    fn template_hit_streaming_finalizer_records_in_stream_placement() {
+        let settings = Arc::new(create_test_settings());
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let timings = RequestTimings::new();
+        let mut params = make_stream_params(&settings, "");
+        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
+            test_auction_request(),
+            500,
+        ));
+        params.auction_request = Some(test_auction_request());
+        params.timings = timings.clone();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(EdgeBody::empty())
+            .expect("should build template-hit response");
+        let template = format!("<html><body>cached{}</body></html>", AD_ASSEMBLY_SEAM).into_bytes();
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
+            PublisherResponse::AssembleTemplate {
+                response,
+                template,
+                params: Box::new(params),
+            },
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            Arc::clone(&orchestrator),
+            noop_services(),
+        ))
+        .expect("should build lazy template-hit response");
+        let body = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+        )
+        .expect("should drain the template-hit body");
+        assert!(
+            !String::from_utf8_lossy(&body).contains(AD_ASSEMBLY_SEAM),
+            "should replace the cached template seam while streaming"
+        );
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream),
+            "should attribute the template-hit wait to the committed stream"
+        );
+        assert!(snapshot.auction_resolved_ms.is_some());
+        assert!(snapshot.auction_committed_ms.is_some());
+    }
+
+    #[test]
+    fn streamed_non_html_auction_wait_records_in_stream_placement() {
+        let settings = Arc::new(create_test_settings());
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let timings = RequestTimings::new();
+        let mut params = make_stream_params(&settings, "");
+        params.dispatched_auction = Some(DispatchedAuction::immediate_no_bid_for_test(
+            test_auction_request(),
+            500,
+        ));
+        params.auction_request = Some(test_auction_request());
+        params.timings = timings.clone();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+            b"{\"ok\":true}",
+        )]));
+
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
+            PublisherResponse::Stream {
+                response,
+                body,
+                params: Box::new(params),
+            },
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            Arc::clone(&orchestrator),
+            noop_services(),
+        ))
+        .expect("streaming finalize should succeed");
+        let _ = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+        )
+        .expect("non-HTML body should drain");
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream)
+        );
+        assert!(snapshot.auction_resolved_ms.is_some());
+        assert!(snapshot.auction_committed_ms.is_some());
+    }
+
+    #[test]
+    fn empty_collector_tokens_do_not_mark_resolved_or_committed() {
+        let settings = create_test_settings();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let services = noop_services();
+        let request = test_auction_request();
+        let streamed_timings = RequestTimings::new();
+        let state = AdBidsState::default();
+        let deps = AuctionCollectDeps {
+            price_granularity: PriceGranularity::default(),
+            ad_bids_state: &state,
+            orchestrator: &orchestrator,
+            services: &services,
+            settings: &settings,
+            request_origin: String::new(),
+            timings: streamed_timings.clone(),
+            placement: AuctionWaitPlacement::InStream,
+        };
+        futures::executor::block_on(collect_stream_auction(
+            DispatchedAuction::empty_for_test(request.clone(), 10),
+            AuctionTelemetryCarry {
+                observation: None,
+                auction_request: None,
+            },
+            &deps,
+        ));
+        let streamed = streamed_timings.snapshot();
+        assert!(streamed.auction_resolved_ms.is_none());
+        assert!(streamed.auction_committed_ms.is_none());
+
+        let mut params = make_stream_params(&settings, "");
+        params.timings = RequestTimings::new();
+        let buffered_timings = params.timings.clone();
+        futures::executor::block_on(collect_non_html_auction(
+            DispatchedAuction::empty_for_test(request, 10),
+            AuctionTelemetryCarry {
+                observation: None,
+                auction_request: None,
+            },
+            &params,
+            &orchestrator,
+            &services,
+            &settings,
+            AuctionWaitPlacement::PreHeader,
+        ));
+        let buffered = buffered_timings.snapshot();
+        assert!(buffered.auction_resolved_ms.is_none());
+        assert!(buffered.auction_committed_ms.is_none());
+    }
+
+    #[test]
     fn buffered_template_miss_records_pre_header_placement() {
         // The buffered finalizer materializes the entire response — headers and
         // body — before any of it reaches the client. Even though the wait runs
@@ -24635,19 +25046,41 @@ mod tests {
                 .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
                 .expect("should enable diagnostics");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-
-            let body = run_page_bids_consent_allowed(
+            let slots = article_slot();
+            let mut req = make_active_page_bids_request("/2024/01/my-article/");
+            let timings = RequestTimings::new();
+            req.extensions_mut().insert(timings.handle().clone());
+            let mut ec_context = consent_allowing_ec_context();
+            let response = handle_page_bids(
                 &settings,
-                &orchestrator,
-                &article_slot(),
-                make_active_page_bids_request("/2024/01/my-article/"),
+                &noop_services(),
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
             )
-            .await;
+            .await
+            .expect("should produce a no-bid response");
+            let body_bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should read page-bids response body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes).expect("should parse page-bids response");
 
             assert!(
                 body.get("auctionDiagnostics").is_none(),
-                "a failed launch must not fabricate auction dispatch timings"
+                "should omit diagnostics when no provider dispatched"
             );
+            let snapshot = timings.snapshot();
+            assert!(snapshot.auction_id.is_some());
+            assert!(snapshot.auction_dispatched_ms.is_none());
+            assert!(snapshot.auction_resolved_ms.is_none());
+            assert!(snapshot.auction_committed_ms.is_none());
         }
 
         #[tokio::test]
@@ -25522,9 +25955,28 @@ mod tests {
             let settings = settings_with_co_auction_disabled();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot();
-            let req = make_page_bids_request("/2024/01/my-article/");
-
-            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            let timings = RequestTimings::new();
+            req.extensions_mut().insert(timings.handle().clone());
+            let mut ec_context = consent_allowing_ec_context();
+            let response = run_page_bids_response_with_ec(
+                &settings,
+                &orchestrator,
+                &slots,
+                &mut ec_context,
+                req,
+            )
+            .await;
+            let body_bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should read disabled page-bids response body");
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes)
+                .expect("should parse disabled page-bids response");
+            assert!(
+                timings.snapshot().auction_id.is_none(),
+                "should keep the disabled page-bids access join key null"
+            );
 
             assert_eq!(
                 body["slots"]

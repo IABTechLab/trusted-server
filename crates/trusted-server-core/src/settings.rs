@@ -1905,7 +1905,7 @@ fn default_tinybird_auction_dataset() -> String {
 }
 
 fn default_tinybird_access_dataset() -> String {
-    "access_logs_raw".to_owned()
+    "access_logs_v2".to_owned()
 }
 
 fn default_tinybird_max_body_bytes() -> usize {
@@ -4918,6 +4918,21 @@ mod tests {
         assert!(
             settings.tinybird.access_enabled,
             "should enable access emission"
+        );
+    }
+
+    #[test]
+    fn access_dataset_defaults_to_versioned_schema() {
+        assert_eq!(
+            TinybirdSettings::default().access_dataset,
+            "access_logs_v2",
+            "should target the versioned access schema rather than the reserved legacy datasource"
+        );
+        let settings = settings_from_toml_with("[tinybird]\nenabled = false\n")
+            .expect("should parse settings without an explicit access dataset");
+        assert_eq!(
+            settings.tinybird.access_dataset, "access_logs_v2",
+            "should apply the same versioned default during deserialization"
         );
     }
 

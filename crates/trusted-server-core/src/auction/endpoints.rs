@@ -1055,13 +1055,15 @@ mod tests {
                 "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
             }]
         });
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("https://test-publisher.example/auction")
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
             ))
             .expect("should build disabled-auction request");
+        let timings = RequestTimings::new();
+        request.extensions_mut().insert(timings.handle().clone());
 
         let response = handle_auction(
             &settings,
@@ -1079,6 +1081,10 @@ mod tests {
             response.status(),
             StatusCode::OK,
             "disabled auction should return a 200 no-bid response"
+        );
+        assert!(
+            timings.snapshot().auction_id.is_none(),
+            "should keep the disabled /auction access join key null"
         );
         let batches = telemetry_sink
             .batches

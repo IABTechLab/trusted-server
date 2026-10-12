@@ -52,7 +52,7 @@ task.
 | `crates/trusted-server-adapter-fastly/src/middleware.rs` (modify) | finalize consumes `GeoLookupState`                                                                 |
 | `crates/trusted-server-adapter-fastly/src/tinybird.rs` (modify)   | access sink with confirmed delivery                                                                |
 | `crates/trusted-server-adapter-axum/src/` (modify)                | terminal freeze layer, header emission                                                             |
-| `tinybird/datasources/access_logs_raw.datasource` (modify)        | phase-column schema, non-null sorting key                                                          |
+| `tinybird/datasources/access_logs_v2.datasource` (create)         | versioned phase-column schema; preserve the legacy reserved datasource                             |
 | `trusted-server.example.toml` (modify)                            | `[observability]`, tinybird keys                                                                   |
 
 Out of scope for this plan: the Grafana dashboard JSON (separate telemetry repo,
@@ -861,7 +861,7 @@ git commit -m "Add access telemetry snapshot, route classes, and coarse route te
 ```rust
 #[test]
 fn access_emitter_posts_ndjson_and_validates_2xx() {
-    // RecordingHttpClient returning 202: assert URI is /v0/events?name=access_logs_raw,
+    // RecordingHttpClient returning 202: assert URI is /v0/events?name=access_logs_v2,
     // body is the row, Authorization bearer from the secret stub.
 }
 
@@ -920,20 +920,20 @@ git commit -m "Emit confirmed access telemetry rows after pull-sync post-send"
 
 **Files:**
 
-- Modify: `tinybird/datasources/access_logs_raw.datasource`
+- Create: `tinybird/datasources/access_logs_v2.datasource`
+- Preserve: `tinybird/datasources/access_logs_raw.datasource`
 
 **Interfaces:**
 
 - Consumes: column names exactly as serialized by `access_event_row` (Task 7).
 - Produces: the deployed schema contract for the dashboard (separate repo).
 
-- [ ] **Step 1: Rewrite the schema** per spec section 9: keep
-      `event_ts DateTime64(3)`, `method`, `status UInt16`, `time_elapsed_ms UInt32`,
-      `sample_rate Float64` + 30-day TTL; add the columns from spec 9 with
-      dimension columns non-nullable `LowCardinality(String)` and phase columns
-      `Nullable(UInt32)`; drop `path` and `cache_state`; set
-      `ENGINE_SORTING_KEY "toDate(event_ts), service_id, publisher_domain, env, route_class, pop, status"`
-      (`event_date` was dropped for the sorting-key expression; see spec section 9).
+- [ ] **Step 1: Create the versioned schema** per spec section 9, with the
+      30 producer fields and JSONPaths, non-nullable dimension columns, nullable
+      phase/milestone columns, and a 30-day TTL. Use
+      `ENGINE_SORTING_KEY "toDate(event_ts), service_id, publisher_domain, env, route_class, pop, status"`.
+      Keep the legacy nine-column datasource unchanged. No `FORWARD_QUERY` or
+      historical raw-path backfill is part of this cutover.
 
 - [ ] **Step 2: Validate** with the tinybird toolchain if available locally
       (`tb check` / project tests under `tinybird/tests`); otherwise assert the file
@@ -943,8 +943,8 @@ git commit -m "Emit confirmed access telemetry rows after pull-sync post-send"
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tinybird/datasources/access_logs_raw.datasource tinybird/fixtures
-git commit -m "Extend access_logs_raw with phase columns and a non-null sorting key"
+git add tinybird/datasources/access_logs_v2.datasource tinybird/fixtures
+git commit -m "Add the versioned access timing datasource"
 ```
 
 ---

@@ -204,6 +204,36 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(emptyBadge, 'an empty cycle must not claim a Trusted Server response').toBe('Empty');
   });
 
+  it('shows Multiple paths for a competing SPA auction without a redundant path badge', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const observedSlot = slot('competing-spa-badge');
+
+    store.recordTrustedServerOpportunity(
+      observedSlot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: { auctionDispatchedMs: 12, auctionResolvedMs: 84 },
+      }
+    );
+    store.recordPrebidRefresh([observedSlot]);
+    store.recordPrebidAuction(observedSlot, 'client-auction');
+    store.recordSlotRequested(observedSlot);
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle).toMatchObject({
+      auctionType: 'competing',
+      serverAuctionTimingOrigin: 'spa_auction',
+      serverAuctionTimings: { auctionDispatchedMs: 12, auctionResolvedMs: 84 },
+    });
+    const badge = gptDiagnosticsBadgeTextForTest(cycle);
+    expect(badge).toContain('Multiple paths');
+    expect(badge).not.toContain('Competing paths');
+  });
+
   it('renders compact evidence-safe labels for every delivery state', () => {
     const responseSentBadge = gptDiagnosticsBadgeTextForTest({
       requestNumber: 1,

@@ -275,14 +275,16 @@ share the adapter clock, but have no header or telemetry emission wiring in v1.
 
 ## 9. Access telemetry row
 
-Extends the reserved `tinybird/datasources/access_logs_raw.datasource`.
+Creates `tinybird/datasources/access_logs_v2.datasource`, preserving the reserved
+nine-column `access_logs_raw` datasource unchanged. There is no backfill or
+`FORWARD_QUERY`; historical raw paths do not enter the new dataset.
 
-Kept columns: `event_ts`, `method`, `status`, `time_elapsed_ms` (defined as the
+Retained concepts: `event_ts`, `method`, `status`, `time_elapsed_ms` (defined as the
 `mark_headers_ready()` snapshot; nullable because a contended lock drop can lose the
-snapshot), `sample_rate`, 30-day TTL. (`event_date` was later dropped for the
-`toDate(event_ts)` sorting-key expression; see section 9's schema note.)
+snapshot), `sample_rate`, 30-day TTL. The new sorting key uses `toDate(event_ts)`
+rather than the legacy `event_date` column.
 
-Removed: raw `path`. Route identifiers like `/_ts/admin/ec/{id}` would otherwise put
+Excluded from the new row: raw `path`. Route identifiers like `/_ts/admin/ec/{id}` would otherwise put
 EC identifiers into a 30-day dataset, and publisher paths carry unbounded cardinality
 and user-generated content (search terms, usernames, emails in slugs). Replaced by
 `route_template`:
@@ -372,9 +374,9 @@ dropped in favor of the sorting-key expression because a DEFAULT column cannot
 carry a JSONPath the producer never sends. Grafana time filtering uses `$__timeFilter(event_ts)` and every panel query
 also carries a `toDate(event_ts)` predicate so the primary index prunes; rollout validates
 the panel queries with `EXPLAIN` before the dashboard is committed. This replaces the
-reserved key `(event_date, path, status, method)`. Rollout step 4 verifies whether the
-reserved datasource was ever deployed to the remote workspace; if it was, this schema
-ships as a versioned replacement datasource with a cutover, not an in-place edit.
+reserved key `(event_date, path, status, method)` only in the new datasource.
+The legacy datasource and its key remain unchanged. Rollout step 4 creates the
+versioned replacement and cuts consumers over after verifying ingestion.
 
 ## 10. Emission mechanics
 
@@ -428,7 +430,7 @@ ships as a versioned replacement datasource with a cutover, not an in-place edit
 
 ## 11. Dashboard and query model
 
-No endpoint pipe in v1. Grafana queries `access_logs_raw` directly through the
+No endpoint pipe in v1. Grafana queries `access_logs_v2` directly through the
 ClickHouse connector with `$__timeFilter(event_ts)` plus a `toDate(event_ts)`
 predicate, matching the auction dashboards.
 
@@ -549,12 +551,13 @@ Rollback and compatibility, because `Settings` is `deny_unknown_fields`:
    in a real browser session, and separately confirm what the publisher's RUM tooling
    actually collects; the publisher monitoring extension renders it only after a small
    change on their side.
-4. Verify whether `access_logs_raw` exists in the remote Tinybird workspace. If yes,
-   ship the schema as a versioned replacement with cutover; if no, edit in place.
-   Validate the dashboard panel queries with `EXPLAIN` against the sorting key. Then
-   land the row schema, sink, and settings changes; sample at 1.0 during stall
-   diagnosis with ingestion-freshness monitoring on the datasource; then the
-   dashboard.
+4. Inspect the deployed workspace, preserving any `access_logs_raw` datasource.
+   Deploy `access_logs_v2` and its `ts_access_v2_ingest` APPEND token before the
+   emitting binary. Update explicit dataset names and token references, then
+   enable sampling and verify ingestion/quarantine before switching dashboards.
+   Validate panel queries with `EXPLAIN` against the new sorting key. Sample at
+   1.0 only deliberately during stall diagnosis, accounting for the post-send
+   ingest wait. Follow the cutover and rollback steps in `tinybird/README.md`.
 5. Success criterion: the next stall window is attributable from one response header
    or one dashboard query, with no live probing session.
 
@@ -654,7 +657,7 @@ Notes on the definitions:
 
 ### Row changes
 
-Four additive columns on `access_logs_raw`, all populated from the
+Four auction columns on the new `access_logs_v2` row, all populated from the
 `TimingSnapshot` at the existing freeze/emission points (no new emission path):
 
 ```
@@ -675,8 +678,8 @@ Null on an offset means "this milestone was not reached", not "no auction ran".
 | set          | set          | set        | null        | collected, but targeting was not committed to response state        |
 | set          | set          | set        | set         | collected and targeting committed, including no-bid/timeout results |
 
-Dispatch evidence means at least one provider started a request or returned an
-immediate result; routing-only skipped outcomes do not qualify. `resolved` is a
+Dispatch evidence means at least one provider started a request;
+routing-only skipped outcomes do not qualify. `resolved` is a
 collection-time mark, not a separately observed transport-completion timestamp.
 Whenever all three milestones exist, `dispatched <= resolved <= committed`.
 Headers-ready can fall before or after these milestones, as described below.
@@ -695,10 +698,10 @@ indistinguishable from "no auction".
   reason it is accepted in the auction dataset. It is not in the sorting key, so
   the section 9 non-nullable-dimension rule (which exists because ClickHouse
   sorting keys cannot contain nullable columns) does not apply to it.
-- Schema evolution is additive with JSONPaths on every new column and
-  `FORWARD_QUERY` carrying the existing columns, per the deployed datasource's
-  established evolution path. Verified with `tb --cloud deploy --check` before
-  deploy.
+- The versioned `access_logs_v2` datasource uses JSONPaths on every column and
+  no `FORWARD_QUERY`. The nine-column legacy datasource remains intact. Validate
+  deployment against the intended workspace before cutover; local field
+  alignment is not evidence of a successful remote deployment.
 
 ### Interpretation model
 
@@ -743,7 +746,7 @@ Joining to per-bidder detail, now that both sides are `UUID`:
 ```sql
 SELECT a.auction_id, a.auction_resolved_ms - a.auction_dispatched_ms AS edge_window,
        e.provider, e.provider_response_time_ms
-FROM access_logs_raw a
+FROM access_logs_v2 a
 INNER JOIN auction_events_raw e ON a.auction_id = e.auction_id
 WHERE a.auction_id IS NOT NULL AND e.event_kind = 'provider_call'
 ```

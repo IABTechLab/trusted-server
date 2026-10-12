@@ -450,6 +450,39 @@ describe('installTsAdInit', () => {
     );
   });
 
+  it('classifies a winning SPA auction and snapshots its server timings', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      {
+        hb_pb: '1.00',
+        hb_bidder: 'example',
+        hb_adid: 'creative-1',
+        hb_auction_id: 'auction-spa-123',
+      },
+      recordTrustedServerOpportunity
+    );
+    const ts = (window as TestWindow).tsjs!;
+    ts.navGeneration = 1;
+    ts.auctionDiagnostics = { auctionDispatchedMs: 12, auctionResolvedMs: 84 };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    ts.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      'auction-spa-123',
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        winner: { bidder: 'example', priceBucket: '1.00' },
+        serverTimings: { auctionDispatchedMs: 12, auctionResolvedMs: 84 },
+      }
+    );
+  });
+
   it('snapshots auction timing with the bids before queued GPT work runs', async () => {
     const recordTrustedServerOpportunity = vi.fn();
     const { mockSlot } = configureOpportunityDiagnostics(

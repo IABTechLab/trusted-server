@@ -1,6 +1,6 @@
 //! Access telemetry: route classification and the per-request access log row.
 //!
-//! Extends the reserved `access_logs_raw` Tinybird datasource with bounded,
+//! Uses the versioned `access_logs_v2` Tinybird datasource with bounded,
 //! content-free route identity (see [`RouteClass`] and
 //! [`publisher_route_template`]) instead of the raw request path, which would
 //! otherwise carry identifiers, search terms, and other user-generated
@@ -200,8 +200,8 @@ pub struct AccessTelemetrySnapshot {
     pub service_id: String,
     /// Fastly POP code, or `unknown` when unavailable.
     pub pop: String,
-    /// Trusted Server build/version identifier, or `unknown` when
-    /// unavailable.
+    /// Fastly service version, matching `FASTLY_SERVICE_VERSION` and the
+    /// `x-ts-version` header, or `unknown` when unavailable.
     pub ts_version: String,
     /// Two-letter geo country code, or `unknown` when no geo lookup
     /// resolved one.

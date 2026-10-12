@@ -1,7 +1,7 @@
 # Tinybird project
 
 This directory is the tracked Tinybird resource project for Trusted Server
-auction telemetry.
+auction and access telemetry.
 
 - `datasources/auction_events_raw.datasource` is the runtime ingest target.
 - The auction overview, provider, and bid-stat rollups are materialized
@@ -10,8 +10,10 @@ auction telemetry.
   yield endpoints or materialized views.
 - `fixtures/auction_events_raw.ndjson` is test data only.
 - `tests/` checks auction summary, provider health, and seat-yield results.
-- `datasources/access_logs_raw.datasource` is reserved; Trusted Server does
-  not currently emit access logs.
+- `datasources/access_logs_v2.datasource` is the sampled access-telemetry ingest
+  target, with a 30-day TTL. `fixtures/access_logs_v2.ndjson` is test data only.
+- `datasources/access_logs_raw.datasource` preserves the reserved legacy schema.
+  It is not the target for the new emitter and is not replaced or backfilled.
 
 Authenticate the Tinybird CLI against the intended workspace, change to this
 directory, run `tb test`, inspect `tb deploy --dry-run`, and deploy with
@@ -22,9 +24,16 @@ platform secret store, and put only its key name in
 `tinybird.auction_token_secret`. The runtime sends directly to the regional
 Events API host configured by `tinybird.api_host`.
 
-For runtime behavior, limits, privacy properties, and the Fastly-only emission
-boundary, see [Auction Telemetry](../docs/guide/telemetry.md). For exact
-configuration fields, see [Configuration](../docs/guide/configuration.md).
+For access telemetry, use the distinct `ts_access_v2_ingest` APPEND token scoped
+only to `access_logs_v2`. Store its value in the default app-config secret store
+under the key named by `tinybird.access_token_secret`. Set
+`tinybird.access_dataset = "access_logs_v2"` explicitly when updating a config
+that still carries the legacy dataset name. Keep access disabled until this
+schema and token are ready.
+
+For runtime behavior, sampling, privacy properties, and the Fastly-only emission
+boundary, see [Telemetry](../docs/guide/telemetry.md). For exact configuration
+fields, see [Configuration](../docs/guide/configuration.md).
 
 ## Deploy ordering
 
@@ -37,10 +46,45 @@ is an unconfigured placeholder returning `NULL`, not a working monitor. Connect 
 workspace quarantine source before relying on its counts. A code-first deploy can lose
 rows silently until the schema catches up.
 
-Adding a field means changing three things together: the struct in
+Adding an auction field means changing three things together: the struct in
 `crates/trusted-server-core/src/auction/telemetry.rs`, the `SCHEMA` block in
 `datasources/auction_events_raw.datasource`, and every row in
-`fixtures/auction_events_raw.ndjson`.
+`fixtures/auction_events_raw.ndjson`. Access fields likewise must agree between
+`crates/trusted-server-core/src/access_telemetry.rs`,
+`datasources/access_logs_v2.datasource`, and `fixtures/access_logs_v2.ndjson`,
+including the JSONPaths and nullable types.
+
+### Access datasource cutover
+
+The new emitter uses a versioned datasource rather than evolving
+`access_logs_raw`. Main's legacy datasource has nine columns, including raw
+`path` and `cache_state`; it never had the phase columns from the intermediate
+stacked PRs. `access_logs_v2` has no `FORWARD_QUERY` and does not copy historical
+raw paths into bounded route templates.
+
+1. Inspect the deployed workspace resources and retention requirements. Preserve
+   any existing `access_logs_raw` and its token; do not drop or recreate it.
+2. Run the Tinybird deployment check against that workspace and confirm the diff
+   creates `access_logs_v2` and `ts_access_v2_ingest` without changing the legacy
+   datasource. Deploy the new resources before the emitting binary.
+3. Provision the new APPEND token in the platform secret store. Deploy the new
+   binary with access telemetry still disabled, then push a config selecting
+   `access_logs_v2`, the new token key, and a positive sample rate. Use separate
+   token keys for the access and auction sinks.
+4. Verify accepted rows, their stored `sample_rate`, ingestion freshness, and
+   workspace quarantine. Confirm the UUID join against `auction_events_raw` for
+   active auction observations. Disabled auctions have null access UUIDs.
+5. Switch dashboards and queries to `access_logs_v2`. Leave legacy resources in
+   place for retention and rollback; any later removal is a separate operator
+   decision.
+
+Rollback disables access emission before restoring an older binary. Re-push a
+compatible config with no non-default `[observability]` table; for access-only
+telemetry also set `tinybird.enabled = false`, since older binaries interpret it
+as auction enablement. Keep both datasets and tokens intact during rollback.
+
+These steps are a rollout requirement, not evidence that a live workspace
+migration has already been tested.
 
 ## Reading `origin_cache_shareable`
 
