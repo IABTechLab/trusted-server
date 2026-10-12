@@ -13,15 +13,17 @@
 ///
 /// A key id and a key may hold only letters, digits and `-_.:+/=`. Each is
 /// written into Rust source as a string, so nothing a schedule holds can end
-/// the string it is written in.
+/// the string it is written in. No two lines share a key id or a start, so
+/// one key is in force at any second and a key id names one key.
 ///
 /// # Errors
 ///
-/// Returns the number of the first line of any other shape and what is wrong
-/// with it. The line itself is never repeated, because it holds a private
-/// key.
+/// Returns the number of the first line of any other shape, or of the first
+/// that repeats an earlier line's key id or start, and what is wrong with it.
+/// The line itself is never repeated, because it holds a private key.
 pub(crate) fn constant_source(schedule: Option<&str>) -> Result<String, String> {
     let mut source = String::from("const ATTESTATION_KEYS: &[(&str, i64, &str)] = &[");
+    let mut seen: Vec<(usize, &str, i64)> = Vec::new();
     for (index, line) in schedule.unwrap_or_default().lines().enumerate() {
         let line = line.trim_matches([' ', '\r']);
         if line.is_empty() {
@@ -42,6 +44,17 @@ pub(crate) fn constant_source(schedule: Option<&str>) -> Result<String, String> 
                 "line {number} should hold a key id and a key of letters, digits and -_.:+/= only"
             ));
         }
+        if let Some((earlier, _, _)) = seen.iter().find(|(_, id, _)| id == key_id) {
+            return Err(format!(
+                "line {number} should not repeat the key id of line {earlier}"
+            ));
+        }
+        if let Some((earlier, _, _)) = seen.iter().find(|(_, _, start)| *start == starts_at) {
+            return Err(format!(
+                "line {number} should not start at the same second as line {earlier}"
+            ));
+        }
+        seen.push((number, *key_id, starts_at));
         source.push_str(&format!("({key_id:?}, {starts_at}, {private_key:?}),"));
     }
     source.push_str("];");

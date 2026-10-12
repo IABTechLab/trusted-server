@@ -1079,10 +1079,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
             }
         }
-        // The attestation pages answer at the address the settings choose, so
-        // they are registered here rather than with the fixed routes. Reads reach
-        // the handler, and other methods reach the publisher's origin unless the
-        // deployment owns the prefix.
+        // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
             let s = Arc::clone(&state);

@@ -868,10 +868,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         });
         router = router.route(DATA_PAGE_PATH, Method::GET, data);
 
-        // The attestation pages answer at the address the settings choose, so
-        // they are registered here rather than with the fixed routes. Reads reach
-        // the handler, and other methods reach the publisher's origin unless the
-        // deployment owns the prefix.
+        // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
             let attestation = make_handler(Arc::clone(&state), |s, _services, req| async move {
