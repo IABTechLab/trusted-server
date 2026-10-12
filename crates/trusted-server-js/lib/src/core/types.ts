@@ -28,9 +28,8 @@ export interface AuctionSlot {
   formats: Array<[number, number]>;
   targeting?: Record<string, string>;
   /**
-   * The sizes asked for by viewport width, widest first. Each entry is a
-   * `[width, 0]` viewport and the sizes asked for from that width up to the
-   * next entry's. Absent when no format names a viewport bound.
+   * The bands of the core's `CreativeOpportunitySlot::viewport_sizes`, each
+   * with a `[width, 0]` viewport. Absent when no format names a viewport bound.
    */
   viewport_sizes?: Array<[[number, number], Array<[number, number]>]>;
 }

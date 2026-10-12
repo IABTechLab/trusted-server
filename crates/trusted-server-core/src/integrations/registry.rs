@@ -370,15 +370,9 @@ pub trait IntegrationProxy: Send + Sync {
 
     /// Handle the proxied request.
     ///
-    /// `call` is the route's call into the request's module context, which
-    /// carries what the request resolved to, the permissions, consent,
-    /// location, device signals and Edge Cookie identifier resolved for it,
-    /// the settings and the services. An implementation hands its own
-    /// function to [`ModuleCall::inject_with`], with `req` as its own
-    /// argument, naming what else it needs. The route holds the request
-    /// itself, so the context carries no separate copy of its evidence. A
-    /// route whose use needs a permission declares it and checks it is
-    /// granted, because nothing gates the route itself.
+    /// Hand a function to [`ModuleCall::inject_with`] with `req` as its
+    /// argument. A route whose use needs a permission declares it and checks
+    /// it is granted, because nothing gates the route itself.
     async fn handle(
         &self,
         call: ModuleCall<'_>,
@@ -932,8 +926,7 @@ struct IntegrationRegistryInner {
     // Every builder's module name, with whether a section selects it, so the
     // refusal of a name a selector wrote can say what that name is.
     builder_modules: Vec<(&'static str, bool)>,
-    /// The vendors whose `[shared.<vendor>]` table a builder is run by and
-    /// the settings do not carry, so none of that vendor's modules runs.
+    // Vendors whose shared table is absent, for the refusal note.
     absent_shared: Vec<&'static str>,
     // The module `[geo] module` resolved to, or `None` when the selector
     // is `platform` and the adapter's own host lookup stands. Unset and `none`
@@ -1047,6 +1040,24 @@ impl IntegrationRegistryInner {
     /// nothing it supplies is running, or one that is selected and supplies no
     /// module of this kind. Empty when no builder's module answers to the
     /// name.
+    fn builder_note(&self, type_folder: &str, kind: &str, written: &str) -> String {
+        let names: Vec<&str> = self.builder_modules.iter().map(|(name, _)| *name).collect();
+        let Some(name) = crate::module_name::resolve(type_folder, written, &names) else {
+            return String::new();
+        };
+        let selected = self
+            .builder_modules
+            .iter()
+            .any(|(module, selected)| *module == name && *selected);
+        if selected {
+            format!(". `{written}` is selected and supplies no {kind} module")
+        } else {
+            format!(
+                ". `{written}` is a module no section selects, so nothing it supplies is running"
+            )
+        }
+    }
+
     /// A sentence naming the shared tables whose absence kept their vendors'
     /// modules from running, to follow a refusal of a module nothing supplies,
     /// or nothing when every builder a shared table runs is running.
@@ -1066,24 +1077,6 @@ impl IntegrationRegistryInner {
             "those tables run"
         };
         format!(". There is no {tables}, so the modules {those} are not running")
-    }
-
-    fn builder_note(&self, type_folder: &str, kind: &str, written: &str) -> String {
-        let names: Vec<&str> = self.builder_modules.iter().map(|(name, _)| *name).collect();
-        let Some(name) = crate::module_name::resolve(type_folder, written, &names) else {
-            return String::new();
-        };
-        let selected = self
-            .builder_modules
-            .iter()
-            .any(|(module, selected)| *module == name && *selected);
-        if selected {
-            format!(". `{written}` is selected and supplies no {kind} module")
-        } else {
-            format!(
-                ". `{written}` is a module no section selects, so nothing it supplies is running"
-            )
-        }
     }
 }
 
@@ -1276,7 +1269,7 @@ fn resolve_device_module(
 }
 
 /// Resolves `[prefix] module` against the registered prefix modules, or to
-/// core's own when nothing is selected, and asks the module for the prefixes
+/// core's own when nothing or `ts` is selected, and asks the module for the prefixes
 /// of the publisher the settings describe, so a module that names something
 /// its call never carries is refused here rather than on every request.
 ///
@@ -1289,7 +1282,7 @@ fn resolve_prefix_module(
     inner: &IntegrationRegistryInner,
 ) -> Result<SelectedPrefixModule, Report<TrustedServerError>> {
     let selected = match settings.prefix.module.as_deref() {
-        None => SelectedPrefixModule::trusted_server(),
+        None | Some(crate::prefix::TRUSTED_SERVER_MODULE) => SelectedPrefixModule::trusted_server(),
         Some(written) => {
             let module =
                 named_module(PREFIX_TYPE, "prefix", written, &inner.prefix_modules, inner)?;
@@ -1437,16 +1430,11 @@ pub struct ProxyDispatchInput<'a> {
 /// Refuses a registered middleware no entry could name, and an entry this
 /// deployment cannot run.
 ///
-/// Only knowable here, where every running module's middleware have been
-/// handed over. A name no module supplies, or one named in a phase it does not
-/// run in, would otherwise do nothing on every request and say so nowhere.
-///
-/// A middleware no entry names is left alone and logged, because a module
-/// may be selected for what else it does.
+/// A middleware no entry names is left alone and logged.
 ///
 /// # Errors
 ///
-/// Naming the integration or the entry at fault.
+/// Naming the module or the entry at fault.
 fn check_middleware(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1463,14 +1451,14 @@ fn check_middleware(
         let id = middleware.middleware_id();
         if !crate::module_name::is_valid(id) {
             return Err(refuse(format!(
-                "integration `{integration}` supplies a middleware named `{id}`, which is not a \
+                "module `{integration}` supplies a middleware named `{id}`, which is not a \
                  name an entry can write. A name is parts joined by `.`, each in lower case \
                  letters, digits, `_` or `-`"
             )));
         }
         if middleware.phases().is_empty() {
             return Err(refuse(format!(
-                "integration `{integration}` supplies the middleware `{id}`, which says it runs \
+                "module `{integration}` supplies the middleware `{id}`, which says it runs \
                  in no phase, so no entry could name it"
             )));
         }
@@ -1479,7 +1467,7 @@ fn check_middleware(
             .find(|(_, earlier)| earlier.middleware_id() == id)
         {
             return Err(refuse(format!(
-                "integrations `{earlier}` and `{integration}` both supply a middleware named \
+                "modules `{earlier}` and `{integration}` both supply a middleware named \
                  `{id}`, so an entry could not say which one it means"
             )));
         }
@@ -1519,7 +1507,7 @@ fn check_middleware(
     }
     for (integration, middleware) in unnamed_middleware(settings, inner) {
         log::warn!(
-            "Integration `{integration}` supplies the middleware `{}` and no {} entry names \
+            "Module `{integration}` supplies the middleware `{}` and no {} entry names \
              it, so it changes no page",
             middleware.middleware_id(),
             phases_of(middleware).join(" or ")
@@ -1564,6 +1552,7 @@ pub struct IntegrationRegistry {
 fn check_section_selections(
     settings: &Settings,
     extra: &[crate::integrations::IntegrationBuilder],
+    inner: &IntegrationRegistryInner,
 ) -> Result<(), Report<TrustedServerError>> {
     let offered: Vec<&'static str> = crate::integrations::all_builders(extra)
         .filter_map(|builder| builder.module_name())
@@ -1598,7 +1587,8 @@ fn check_section_selections(
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "[{section}] selects `{written}`, which no module this deployment \
-                     supplies. {supplied}"
+                     supplies. {supplied}{}",
+                    inner.absent_shared_note()
                 ),
             }));
         }
@@ -1728,6 +1718,19 @@ impl IntegrationRegistry {
                 }));
             }
             inner.builder_ids.push((builder.id(), builder.source()));
+            // A builder its shared table runs answers to no section, so a
+            // module name would let a section select what it does not run.
+            if let (Some(vendor), Some(name)) = (builder.shared_settings(), builder.module_name()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "integration `{}` from `{}` is run by [shared.{vendor}] and also names \
+                         the module `{name}`. A builder its shared table runs is selected by \
+                         no section, so it takes no module name",
+                        builder.id(),
+                        builder.source()
+                    ),
+                }));
+            }
             // Preparers are collected before the selection check, so an
             // integration can sanitize its own reserved query or cookie in a
             // deployment that does not run it.
@@ -1791,7 +1794,7 @@ impl IntegrationRegistry {
         // the selections are checked against them rather than in the
         // settings. Deploy validation deliberately does not make this check,
         // because a vendor crate the CLI never links may supply the name.
-        check_section_selections(settings, extra)?;
+        check_section_selections(settings, extra, &inner)?;
 
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
@@ -1975,9 +1978,7 @@ impl IntegrationRegistry {
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
-            // Core's own middleware for the file, made here because the
-            // contributors it asks are known only once every registration
-            // is in, and a middleware cannot reach the registry.
+            // Core's own middleware for the file, made once every registration is in.
             let selected = crate::robots_txt::select(config, &inner.robots_txt_contributors)?;
             inner.middleware.push((
                 crate::robots_txt::middleware::MODULE,
@@ -2035,38 +2036,17 @@ impl IntegrationRegistry {
     /// The prefixes of the publisher `request` was resolved to under
     /// `settings`, from the selected prefix module.
     ///
-    /// The module was asked once when the registry was built, so it names
-    /// nothing a request does not carry. Should it still give nothing, the
-    /// failure is logged and core's own prefixes stand.
+    /// # Panics
+    ///
+    /// When the module names a value its call does not carry, which the
+    /// registry refused when it was built, because a request's call carries
+    /// what the startup trial's did.
     #[must_use]
     pub fn prefixes(&self, settings: &Settings, request: ModuleRequest<'_>) -> Prefixes {
         self.inner
             .prefix_module
             .prefixes(settings, request)
-            .unwrap_or_else(|withheld| {
-                log::error!(
-                    "the prefix module `{}` gave no prefixes, so core's own stand: {withheld}",
-                    self.inner.prefix_module.name()
-                );
-                Prefixes::trusted_server(settings)
-            })
-    }
-
-    /// The robots.txt contributor `[robots-txt] modules` means by `written`,
-    /// with the name it was declared under, or `None` when nothing this
-    /// deployment runs supplies one under that name.
-    #[must_use]
-    pub fn robots_txt_contributor(
-        &self,
-        written: &str,
-    ) -> Option<(&'static str, Arc<dyn RobotsTxtContributor>)> {
-        let offered = &self.inner.robots_txt_contributors;
-        let names: Vec<&str> = offered.iter().map(|(name, _)| *name).collect();
-        let name = crate::module_name::resolve(ROBOTS_TXT_TYPE, written, &names)?;
-        offered
-            .iter()
-            .find(|(offered_name, _)| *offered_name == name)
-            .map(|(offered_name, contributor)| (*offered_name, Arc::clone(contributor)))
+            .expect("should give prefixes, as the startup trial proved the module names only what a call carries")
     }
 
     /// The name of every middleware a running module supplies, in
@@ -4955,6 +4935,42 @@ mod tests {
     }
 
     #[test]
+    fn a_list_selection_nothing_supplies_names_the_shared_table_that_is_absent() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.select_module("identity", "example.id");
+
+        let refused = IntegrationRegistry::with_registrations(&settings, &[shared_probe_builder()])
+            .err()
+            .expect("no identity module is supplied")
+            .to_string();
+
+        assert!(
+            refused.contains("[identity] selects `example.id`")
+                && refused.contains("There is no [shared.example]"),
+            "the message has to name the table to add: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_builder_its_shared_table_runs_is_refused_a_module_name() {
+        let mut settings = with_shared_table(crate::test_support::tests::create_test_settings());
+        settings.geo.module = Some("example".to_owned());
+
+        let refused = IntegrationRegistry::with_registrations(
+            &settings,
+            &[shared_probe_builder().with_module_name("geo.example")],
+        )
+        .err()
+        .expect("a section could select what the table runs")
+        .to_string();
+
+        assert!(
+            refused.contains("is run by [shared.example] and also names the module `geo.example`"),
+            "{refused}"
+        );
+    }
+
+    #[test]
     fn with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
         let settings = crate::test_support::tests::create_test_settings();
         let extra = [crate::integrations::IntegrationBuilder::new(
@@ -5880,8 +5896,7 @@ mod tests {
         .with_module_name(GEO_PROBE_MODULE)]
     }
 
-    /// The names the two prefix test modules run under, as modules under
-    /// `crates/testing` are named.
+    /// The names the two prefix test modules run under.
     const PREFIX_PROBE_MODULE: &str = "testing.prefix-probe";
     const PREFIX_READER_MODULE: &str = "testing.prefix-reader";
 
@@ -6007,6 +6022,20 @@ mod tests {
 
         assert_eq!(registry.prefix_module().name(), "ts");
         assert_eq!(prefixes.public().as_str(), "ts");
+        assert_eq!(prefixes.public().cookie_name("ec"), "ts-ec");
+        assert_eq!(prefixes.server_key().as_str(), "ts.example.com");
+    }
+
+    #[test]
+    fn a_prefix_selector_naming_ts_selects_cores_own() {
+        let settings = settings_selecting_prefix_module(Some("ts"));
+        let registry = IntegrationRegistry::with_registrations(&settings, &prefix_probe_builders())
+            .expect("should accept the name the registry reports core's module by");
+
+        let prefixes =
+            registry.prefixes(&settings, crate::module_context::test_support::request("/"));
+
+        assert_eq!(registry.prefix_module().name(), "ts");
         assert_eq!(prefixes.public().cookie_name("ec"), "ts-ec");
         assert_eq!(prefixes.server_key().as_str(), "ts.example.com");
     }

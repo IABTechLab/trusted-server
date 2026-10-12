@@ -405,10 +405,8 @@ fn build_common_request(
             }),
             dnt: routed.dnt(),
             language: language.clone(),
-            // Attributes the selected device module resolved. Each is
-            // absent when nothing resolved it, which a bidder reads as
-            // unknown, where an invented default would misprice the
-            // inventory.
+            // Attributes the selected device module resolved, each absent
+            // when nothing resolved it.
             devicetype: device.attributes.as_ref().and_then(|a| a.device_type),
             make: device.attributes.as_ref().and_then(|a| a.make.clone()),
             model: device.attributes.as_ref().and_then(|a| a.model.clone()),

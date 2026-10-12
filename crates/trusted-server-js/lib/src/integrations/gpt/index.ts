@@ -855,12 +855,7 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
   return (target as Element).id || undefined;
 }
 
-/**
- * Defines a slot and, where the page data gives viewport bands, the sizes it
- * asks for at each width. Each band is a viewport and the sizes asked for from
- * that width up to the next band's, widest first. A slot with no bands asks for
- * every format at every width.
- */
+/** Defines the slot and applies its viewport bands as a size mapping. */
 function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown): unknown }>(
   api: {
     defineSlot?(adUnitPath: string, size: Array<number | number[]>, elementId?: string): S | null;

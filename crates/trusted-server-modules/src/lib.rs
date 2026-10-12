@@ -36,8 +36,6 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_cmp_inmobi::builder(),
         trusted_server_cmp_sourcepoint::builder(),
         trusted_server_cmp_osano::builder(),
-        // Before Tag Manager, because this module removes a duplicate loader
-        // and a removal short-circuits the rewriter chain.
         trusted_server_tag_google_tag::builder(),
         trusted_server_tag_google_tag_manager::builder(),
         trusted_server_bot_protection_datadome::builder(),
@@ -265,9 +263,6 @@ mod tests {
             checked.extend(running);
         }
 
-        // Core's robots.txt middleware is registered by the section, not by a
-        // module, and `core_s_robots_txt_middleware_is_registered_with_the_section`
-        // checks it.
         checked.push(trusted_server_core::robots_txt::middleware::MODULE);
         for row in &listed {
             assert!(
@@ -292,7 +287,7 @@ modules = \"refuse_all\"
 
 [[fetch]]
 media_type = \"text/plain\"
-\n             path = \"/robots.txt\"
+path = \"/robots.txt\"
 middleware = [\"robots_txt\"]
 ",
         );

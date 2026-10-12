@@ -944,10 +944,12 @@ impl CreativeOpportunitySlot {
 
     /// The sizes this slot asks for at each viewport width.
     ///
-    /// [`None`] when no format names a viewport bound, so the slot asks for
-    /// every format at every width. Otherwise a band starts at zero and at
-    /// every width where the formats on offer change, and a band may be
-    /// empty, meaning the slot asks for nothing at those widths.
+    /// Each band is the narrowest viewport width of the band and the
+    /// `[width, height]` sizes asked for from that width up to the next band's,
+    /// widest first. A band starts at zero and at every width where the formats
+    /// on offer change, and a band may be empty, meaning the slot asks for
+    /// nothing at those widths. [`None`] when no format names a viewport bound,
+    /// so the slot asks for every format at every width.
     #[must_use]
     pub fn viewport_sizes(&self) -> Option<ViewportSizes> {
         if self.formats.iter().all(|format| {
@@ -1032,19 +1034,15 @@ pub struct CreativeOpportunityFormat {
     /// Media type for this format. Defaults to `Banner`.
     #[serde(default)]
     pub media_type: MediaType,
-    /// The narrowest browser viewport, in CSS pixels, at which the page asks
-    /// for this format. Unset means no lower bound.
+    /// Narrowest viewport width, in CSS pixels, at which the page asks for this format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_viewport_width: Option<u32>,
-    /// The widest browser viewport, in CSS pixels, at which the page asks for
-    /// this format. Unset means no upper bound.
+    /// Widest viewport width, in CSS pixels, at which the page asks for this format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_viewport_width: Option<u32>,
 }
 
-/// The sizes a slot asks for by viewport width, widest first. Each entry is
-/// the narrowest viewport width of a band and the `[width, height]` sizes
-/// asked for from that width up to the next entry's.
+/// The bands [`CreativeOpportunitySlot::viewport_sizes`] gives.
 pub type ViewportSizes = Vec<(u32, Vec<[u32; 2]>)>;
 
 impl CreativeOpportunityFormat {

@@ -360,10 +360,7 @@
     );
   }
 
-  // Defines a slot and, where the page data gives viewport bands, the sizes
-  // it asks for at each width. Each band is a viewport and the sizes asked
-  // for from that width up to the next band's, widest first. A slot with no
-  // bands asks for every format at every width.
+  // Defines the slot and applies its viewport bands as a size mapping.
   function defineWithViewportSizes(api, slot, elementId) {
     var definedSlot = api.defineSlot(
       slot.gam_unit_path,

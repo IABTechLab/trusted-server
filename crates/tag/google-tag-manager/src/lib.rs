@@ -911,25 +911,13 @@ fn build(
     Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
-/// Validates the Google Tag Manager configuration for deployment and reports whether
-/// a section selects the integration's module.
-///
-/// # Errors
-///
-/// Returns an error when the Google Tag Manager configuration cannot be parsed or fails
-/// validation.
 /// Whether `value` has the shape of a tag id Google serves from `gtag/js`.
-///
-/// Offered so the google tag module accepts exactly the ids this one accepts.
-/// Two spellings of the same rule would eventually disagree, and the pair that
-/// disagreed would be a tag configured in one place and refused in the other.
 #[must_use]
 pub fn tag_id_is_well_formed(value: &str) -> bool {
     GTM_TAG_ID_PATTERN.is_match(value)
 }
 
-/// Whether `value` has the shape of a container id, offered for the same
-/// reason as [`tag_id_is_well_formed`].
+/// Whether `value` has the shape of a container id.
 #[must_use]
 pub fn container_id_is_well_formed(value: &str) -> bool {
     GTM_CONTAINER_ID_PATTERN.is_match(value)
@@ -985,6 +973,13 @@ pub fn first_party_gtm_js_path(
     Ok(Some(format!("/integrations/{GTM_INTEGRATION_ID}/gtm.js")))
 }
 
+/// Validates the Google Tag Manager configuration for deployment and reports whether
+/// a section selects the integration's module.
+///
+/// # Errors
+///
+/// Returns an error when the Google Tag Manager configuration cannot be parsed or fails
+/// validation.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     settings
         .module_config::<GoogleTagManagerConfig>(MODULE)
@@ -1014,8 +1009,6 @@ pub fn register(
 }
 
 impl GoogleTagManagerIntegration {
-    /// Answers the request, with the settings and the services the route
-    /// names in its module call.
     async fn route(
         &self,
         req: http::Request<EdgeBody>,

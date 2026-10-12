@@ -252,9 +252,8 @@ pub trait PermissionSignalModule: Send + Sync {
     /// taken silently. Core carries what every module vouched for on the
     /// permission state, and a signal nobody vouched for is dropped from
     /// everything Trusted Server sends on, so a corrupt record never reaches
-    /// a page or a bid request. An implementation hands its own function to
-    /// [`ModuleCall::inject`], naming what it reads, usually the consent or
-    /// the evidence.
+    /// a page or a bid request. See [`crate::module_context`] for what an
+    /// implementation may name.
     fn valid_signal(&self, _call: ModuleCall<'_>) -> Option<ValidSignal> {
         None
     }
@@ -272,8 +271,7 @@ pub trait PermissionSignalModule: Send + Sync {
     /// says stays between the parties bound by it.
     ///
     /// A locator must point at a document that is never edited once
-    /// published, which [`Tdl`] documents and cannot enforce. An
-    /// implementation names what it reads through [`ModuleCall::inject`].
+    /// published, which [`Tdl`] documents and cannot enforce.
     fn tdls(&self, _call: ModuleCall<'_>) -> Vec<Tdl> {
         Vec::new()
     }

@@ -322,6 +322,11 @@ fn an_entry_for_a_media_type_a_middleware_does_not_run_on_is_refused() {
         "image/png",
         "application/octet-stream",
         "text/x-component",
+        "image/svg+xml",
+        "text/",
+        "text",
+        "text/plain\t",
+        "text/ plain",
     ] {
         let mut other = entry(None, &["example.a"]);
         other.media_type = media_type.to_owned();
@@ -345,7 +350,6 @@ fn an_entry_may_cover_a_text_media_type_that_is_not_html() {
         "text/css",
         "application/javascript",
         "application/json",
-        "image/svg+xml",
     ] {
         let mut text = entry(None, &["example.a"]);
         text.media_type = media_type.to_owned();
@@ -363,12 +367,26 @@ fn a_media_type_is_the_type_and_subtype_of_a_content_type_in_lower_case() {
     assert_eq!(media_type_of("application/json"), "application/json");
     assert_eq!(media_type_of(""), "");
     assert!(is_dispatched_media_type("text/plain"));
-    assert!(is_dispatched_media_type("image/svg+xml"));
+    assert!(!is_dispatched_media_type("image/svg+xml"));
     assert!(
         !is_dispatched_media_type("text/x-component"),
         "a length prefixed stream is not changed"
     );
     assert!(!is_dispatched_media_type("image/png"));
+}
+
+#[test]
+fn a_body_is_handed_to_a_middleware_only_in_utf8_or_an_undeclared_charset() {
+    assert!(is_utf8_or_undeclared_charset("text/plain"));
+    assert!(is_utf8_or_undeclared_charset("text/plain; charset=utf-8"));
+    assert!(is_utf8_or_undeclared_charset(
+        "text/plain; Charset=\"UTF-8\""
+    ));
+    assert!(is_utf8_or_undeclared_charset("text/plain; format=flowed"));
+    assert!(!is_utf8_or_undeclared_charset("text/plain; charset=utf-16"));
+    assert!(!is_utf8_or_undeclared_charset(
+        "text/plain; charset=iso-8859-1"
+    ));
 }
 
 #[test]
@@ -1501,7 +1519,7 @@ fn deploy_validation_refuses_a_misshapen_entry() {
 }
 
 #[test]
-fn the_creating_entry_is_the_first_with_a_path_covering_the_request_that_names_a_middleware() {
+fn the_making_entry_is_the_first_with_a_path_covering_the_request_that_names_a_middleware() {
     let entries = PhaseEntries::new(vec![
         PhaseEntry {
             media_type: "text/plain".to_owned(),
@@ -1522,13 +1540,13 @@ fn the_creating_entry_is_the_first_with_a_path_covering_the_request_that_names_a
 
     assert_eq!(
         entries
-            .creating("/ads.txt")
+            .making("/ads.txt")
             .map(|entry| entry.middleware.as_slice()),
         Some(&["example.sellers".to_owned()][..]),
         "should pass the entry naming no middleware and take the first that names one"
     );
     assert!(
-        entries.creating("/robots.txt").is_none(),
+        entries.making("/robots.txt").is_none(),
         "should make nothing where no entry with a path covers the request, whatever covers every path"
     );
 }
@@ -1695,5 +1713,43 @@ async fn the_first_refusal_ends_the_preparation() {
     assert!(
         prepared.is_empty(),
         "should prepare nothing after the refusal"
+    );
+}
+
+#[test]
+fn an_html_entry_with_a_path_makes_nothing() {
+    let entries = PhaseEntries::new(vec![PhaseEntry {
+        media_type: HTML_MEDIA_TYPE.to_owned(),
+        path: Some("/news/".to_owned()),
+        middleware: vec!["example.page".to_owned()],
+    }]);
+
+    assert!(
+        entries.making("/news/missing").is_none(),
+        "should leave a page the origin does not have as the origin's answer"
+    );
+}
+
+#[test]
+fn an_html_entry_ahead_does_not_shadow_the_entry_that_makes_the_file() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec!["example.page".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/plain"),
+        "should make the file from the text/plain entry, not as HTML"
     );
 }

@@ -632,10 +632,10 @@ impl IntegrationBuilder {
     /// Offers the loading cache this crate supplies, see
     /// [`crate::platform::PlatformLoadingCache`].
     ///
-    /// The offer is not a selection. A feature that holds answers names the
-    /// module in its own `[cache.<name>]` table, and an adapter resolves every
-    /// feature's selection with [`loading_caches_from`] when it builds its
-    /// state. A feature that selects none asks each source itself.
+    /// The offer is not a selection. A cache is selected by naming the module
+    /// in its own `[cache.<name>]` table, and an adapter resolves every table's
+    /// selection with [`loading_caches_from`] when it builds its state. A cache
+    /// whose table selects none asks each source itself.
     #[must_use]
     pub const fn with_loading_cache(mut self, factory: LoadingCacheFactory) -> Self {
         self.loading_cache = Some(factory);
@@ -644,7 +644,8 @@ impl IntegrationBuilder {
 
     /// Runs this builder when `[shared.<vendor>]` is present, for a vendor
     /// whose modules all read that one table and cannot be built without it.
-    /// A builder the table runs is selected by no section.
+    /// A builder the table runs is selected by no section, so the registry
+    /// refuses one that also has a module name.
     #[must_use]
     pub const fn with_shared_settings(mut self, vendor: &'static str) -> Self {
         self.shared = Some(vendor);
@@ -740,7 +741,7 @@ impl IntegrationBuilder {
     }
 }
 
-/// The built-in integrations, in hook order.
+/// The built-in integrations, in the order `trusted-server-modules` lists them.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // This stays the first module a section selects, so its middleware is
     // the first of theirs in the order the registry lists them.
@@ -790,28 +791,28 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     .with_adserver(&crate::auction::test_support::adserver_fixture::ADSERVER),
 ];
 
-/// The built-in integration builders, in hook order.
+/// The built-in integration builders, in the order `trusted-server-modules`
+/// lists them.
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     BUILT_IN_BUILDERS
 }
 
 /// Every builder the registry will consider: the built-in set followed by
-/// `extra`, in that order, so hook order for the built-ins never changes.
+/// `extra`, in that order, so the built-ins keep their order.
 pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
     builders().iter().copied().chain(extra.iter().copied())
 }
 
-/// The loading cache each feature selects, from the caches the builders a
-/// deployment links offer. A feature whose `[cache.<name>]` names no module
-/// keeps no copy, and a module's cache is made once however many features
-/// select it.
+/// The loading cache each `[cache.<name>]` table selects, from the caches the
+/// builders a deployment links offer. A table that names no module keeps no
+/// copy, and a module's cache is made once however many tables select it.
 ///
 /// # Errors
 ///
-/// When a feature names a module no linked builder offers a cache from,
-/// naming the feature and the modules that do.
+/// When a table names a module no linked builder offers a cache from, naming
+/// the table and the modules that do.
 pub fn loading_caches_from(
     settings: &Settings,
     builders: &[IntegrationBuilder],
@@ -826,7 +827,7 @@ pub fn loading_caches_from(
         .collect();
     let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
     let mut caches = crate::platform::LoadingCaches::default();
-    for (feature, config) in settings.cache.loading_caches() {
+    for (table, config) in settings.cache.loading_caches() {
         let Some(written) = config.module.as_deref() else {
             continue;
         };
@@ -835,7 +836,7 @@ pub fn loading_caches_from(
         }) else {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "[cache.{feature}] module names `{written}`, which no linked crate offers \
+                    "[cache.{table}] module names `{written}`, which no linked crate offers \
                      a loading cache from. The loading cache modules this build has are: {}",
                     offered_cache_names(&offered)
                 ),
@@ -849,7 +850,7 @@ pub fn loading_caches_from(
                 cache
             }
         };
-        caches.insert(feature, cache);
+        caches.insert(table, cache);
     }
     Ok(Arc::new(caches))
 }

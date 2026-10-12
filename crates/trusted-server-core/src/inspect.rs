@@ -32,10 +32,6 @@ const DATA_FORM_LEDE: &str =
     "Add <code>.json</code> to this address for the same information as data.";
 
 /// Renders `payload` as a page titled `title`.
-///
-/// Plain and self-contained. It carries no publisher branding, loads nothing
-/// and reads at any width, because a reader on a phone opens it as easily as
-/// an engineer does.
 #[must_use]
 pub fn render_page(title: &str, payload: &Value) -> String {
     page(title, DATA_FORM_LEDE, payload)

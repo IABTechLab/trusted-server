@@ -1134,9 +1134,26 @@ function bannerSizesFromGptSlot(slot: RefreshGptSlot): BannerSize[] | undefined 
   return parsedSizes.length > 0 ? parsedSizes : undefined;
 }
 
+/**
+ * The sizes the slot's viewport band asks for at the current viewport width,
+ * or `undefined` when the slot names no band. See `AuctionSlot.viewport_sizes`.
+ */
+function injectedSlotBandSizes(slot: AuctionSlot | undefined): Array<[number, number]> | undefined {
+  const bands = slot?.viewport_sizes;
+  if (!bands?.length) return undefined;
+  const width = window.innerWidth;
+  return bands.find(([[minimumWidth]]) => width >= minimumWidth)?.[1] ?? [];
+}
+
 function bannerSizesFromInjectedSlot(slot: AuctionSlot | undefined): BannerSize[] | undefined {
-  const parsedSizes = slot?.formats?.map(parseBannerSize).filter(isDefined) ?? [];
+  const sizes = injectedSlotBandSizes(slot) ?? slot?.formats;
+  const parsedSizes = sizes?.map(parseBannerSize).filter(isDefined) ?? [];
   return parsedSizes.length > 0 ? parsedSizes : undefined;
+}
+
+/** Whether the slot's viewport band asks for no size at the current width. */
+function asksForNoSizeAtThisWidth(slot: RefreshGptSlot): boolean {
+  return injectedSlotBandSizes(findInjectedSlotForRefresh(slot))?.length === 0;
 }
 
 function refreshSlotElementId(slot: RefreshGptSlot): string | undefined {
@@ -2701,7 +2718,9 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         getInjectedConfig()?.excludedGamAdUnitPathSuffixes
       );
       const auctionSlots = independentSlots.filter(
-        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+        (slot) =>
+          !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes) &&
+          !asksForNoSizeAtThisWidth(slot)
       );
       if (!auctionSlots.length) {
         const immediateSlotCodes = new Map<RefreshGptSlot, string>();
