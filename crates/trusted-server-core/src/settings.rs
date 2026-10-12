@@ -648,7 +648,7 @@ impl Rewrite {
     /// `/first-party/proxy`.
     ///
     /// The host must not match [`Self::exclude_domains`]. Matching is
-    /// case-insensitive; see [`is_host_allowed`] for the pattern rules.
+    /// case-insensitive; see `crate::proxy::is_host_allowed` for the pattern rules.
     #[must_use]
     pub fn should_proxy_asset(&self, host: &str) -> bool {
         !self.is_excluded_host(host)
@@ -6552,6 +6552,7 @@ source_domain = "partner.example.com"
             ("example.org", false),
             ("a.b.example.org", false),
             ("evil-example.org", true),
+            ("example.org.evil.example.net", true),
             ("sub.cdn.example.com", true),
             ("other.example.com", true),
         ] {
