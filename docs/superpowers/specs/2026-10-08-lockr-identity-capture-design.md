@@ -122,6 +122,8 @@ retiring the cookie path.
    including when current request consent no longer allows identity use.
 7. Retain consent, size, UID, root and tombstone safety requirements from the
    foundation. A failed capture must not break the SDK call.
+8. Reconstruct the fixed ID5 OpenRTB provenance on later auctions only for
+   usable records whose persisted acquisition writer is `lockr`.
 
 Out of scope: server-to-server calls to lockr, identifier intake, cross-browser
 linking, changing Prebid provider discovery, direct ID5 or LiveRamp proxies,
@@ -251,10 +253,30 @@ response bytes. Other adapters follow the foundation's supported timing and
 KV capability rules.
 
 Auctions resolve usable registered records from KV, deriving `atype` from the
-source registry. Set the registry type to the confirmed mapping. Do not stamp
-`Lockr-For-Publishers` onto every KV ID for a source: another input may have
-populated it. Provider `ext`, extra UIDs and OpenRTB provenance remain absent
-from later KV-only auctions, as defined by the foundation.
+source registry. Set the registry type to the confirmed mapping. Carry the
+persisted record's `writer` through resolution. For `source = "id5-sync.com"`
+and `writer = "lockr"`, reconstruct the fixed SDK provenance:
+
+```json
+{
+  "inserter": "Lockr-For-Publishers",
+  "matcher": "",
+  "mm": 2
+}
+```
+
+This delivery adopts these values for Lockr ID5 issuance and refresh. The mapping
+belongs to the Lockr integration and adds no KV fields. Do not infer it from
+`identity_owner`, source alone, or current capture configuration. Browser,
+legacy, other-writer and unknown-origin records remain without reconstructed
+Lockr provenance; other sources are not covered by this ID5 mapping. Disabling
+new capture does not remove provenance from already stored usable Lockr records.
+
+Explicit browser provenance retains current-request merge precedence, including
+an empty `matcher` and zero-valued `mm`. If browser input adds a different UID
+for the same source, omit reconstructed provenance for that merged EID rather
+than attribute all its UIDs to Lockr. Keep existing UID merging unchanged.
+Provider `ext` and extra UIDs are still not stored in KV.
 
 ## 5. Data flow and freshness
 
@@ -266,7 +288,7 @@ flowchart TD
     D --> E[Original response sent without an EID cookie]
     E --> F[Shared service applies authoritative updates after send]
     F --> G[EC identity graph stores IDs and lifecycle metadata]
-    G --> H[Later auctions read visible unexpired IDs]
+    G --> H[Later auctions read visible unexpired IDs and reconstruct writer-based provenance]
 ```
 
 | Event                           | Persistence                                       | Auction availability                                                           |
@@ -348,6 +370,13 @@ prove that this consumer reaches those paths correctly:
   scope and does not duplicate request-finalization tombstones.
 - Owned/registered sources persist; unregistered or differently owned sources
   do not; browser input cannot impersonate Lockr authority.
+- Persisted Lockr ID5 writer reconstructs `inserter`, empty `matcher` and `mm=2`
+  in later bidder-facing payloads without a KV mutation. Configured ownership
+  alone, browser/legacy/unknown writers and other sources do not acquire these
+  fields. Existing expiry, withdrawal and bidstream gates still apply.
+- Matching body UIDs retain reconstructed provenance unless explicit body fields
+  override it. Different body UIDs suppress reconstruction for the merged EID,
+  without dropping UIDs or explicit body provenance.
 - Capture effects execute after Fastly send through the foundation, not a
   separate Lockr adapter implementation; persisted snapshot handoff is retained.
 - No newly emitted TS EID cookie or diagnostic EID header; provider browser
@@ -359,7 +388,8 @@ Live acceptance on an approved publisher test route:
 2. Confirm original response bytes and no TS EID cookie from capture.
 3. Allow for post-send work and KV visibility. Inspect the session's admin EC
    record for the registered source and lifecycle metadata, without exporting IDs.
-4. Trigger a later auction and inspect bidder-facing payload evidence. Do not
+4. Trigger a later auction and inspect bidder-facing payload evidence, including
+   the stored Lockr ID5 record's `inserter`, empty `matcher` and `mm=2`. Do not
    require the browser body to contain a server-added ID or rely on `x-ts-eids`.
 5. Reload with no new tokens: unchanged UID and expiry do not cause a write.
 6. Trigger SDK refresh: confirm changed UID or expiry persists after visibility.
@@ -400,7 +430,8 @@ rollback contract. No `ts-eids-s` is introduced at any stage.
    infer provider issuance order from edge wall clocks.
 
 Known expiry persistence is now a proposed foundation decision rather than an
-unimplemented Lockr-local open question. OpenRTB provenance storage remains
-outside this delivery. Active Lockr resolution from `ltid`, direct provider
+unimplemented Lockr-local open question. Arbitrary OpenRTB provenance storage
+remains outside this delivery; the fixed Lockr ID5 mapping is reconstructed from
+the persisted writer instead. Active Lockr resolution from `ltid`, direct provider
 capture and client-side consumers require separate follow-up specs; no current
 S2S contract is assumed.

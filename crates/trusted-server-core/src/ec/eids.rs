@@ -16,6 +16,8 @@ pub struct ResolvedPartnerId {
     pub source_domain: String,
     /// The synced user ID value.
     pub uid: String,
+    /// Persisted acquisition writer, never inferred from configured ownership.
+    pub writer: Option<String>,
     /// `OpenRTB` agent type for this partner's identifiers.
     pub openrtb_atype: i32,
 }
@@ -50,6 +52,7 @@ pub fn resolve_partner_ids(
         resolved.push(ResolvedPartnerId {
             source_domain: partner.source_domain.clone(),
             uid: partner_uid.uid.clone(),
+            writer: partner_uid.writer.clone(),
             openrtb_atype: partner.openrtb_atype,
         });
     }
@@ -58,21 +61,25 @@ pub fn resolve_partner_ids(
     resolved
 }
 
-/// Converts resolved partner IDs to `OpenRTB` `Eid` entries.
+/// Converts resolved partner IDs to `OpenRTB` EIDs with supported writer provenance.
+///
+/// Lockr owns the fixed ID5 mapping. Other writers retain absent provenance.
 #[must_use]
 pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
-        .map(|item| Eid {
-            inserter: None,
-            matcher: None,
-            mm: None,
-            source: item.source_domain.clone(),
-            uids: vec![Uid {
-                id: item.uid.clone(),
-                atype: Some(item.openrtb_atype),
-                ext: None,
-            }],
+        .map(|item| {
+            let mut eid = Eid {
+                source: item.source_domain.clone(),
+                uids: vec![Uid {
+                    id: item.uid.clone(),
+                    atype: Some(item.openrtb_atype),
+                    ext: None,
+                }],
+                ..Eid::default()
+            };
+            crate::integrations::lockr::apply_eid_provenance(&mut eid, item.writer.as_deref());
+            eid
         })
         .collect()
 }
@@ -199,20 +206,67 @@ mod tests {
     }
 
     #[test]
+    fn lockr_provenance_requires_the_stored_writer_and_id5_source() {
+        for source in ["id5-sync.com", "ids.example.com"] {
+            let mut partner = make_test_partner(source);
+            partner.identity_owner = Some("lockr".to_owned());
+            let registry =
+                PartnerRegistry::from_config(&[partner]).expect("should build source registry");
+            for writer in [
+                None,
+                Some("browser"),
+                Some("legacy_pull"),
+                Some("other"),
+                Some("lockr"),
+            ] {
+                let mut entry = KvEntry::minimal(source, "synthetic-uid", 1_000);
+                let record = entry.ids.get_mut(source).expect("should contain source");
+                record.writer = writer.map(str::to_owned);
+                record.expires_at = Some(2_000);
+                let resolved = resolve_partner_ids(&registry, &entry, Some(1_999));
+                let payload = serde_json::to_value(to_eids(&resolved))
+                    .expect("should serialize resolved EIDs");
+                let eid = &payload[0];
+                assert_eq!(eid["source"], source);
+                assert_eq!(eid["uids"][0]["id"], "synthetic-uid");
+                if source == "id5-sync.com" && writer == Some("lockr") {
+                    assert_eq!(eid["inserter"], "Lockr-For-Publishers");
+                    assert_eq!(eid["matcher"], "");
+                    assert_eq!(eid["mm"], 2);
+                } else {
+                    for field in ["inserter", "matcher", "mm"] {
+                        assert!(
+                            eid.get(field).is_none(),
+                            "should not infer provenance from owner or source alone"
+                        );
+                    }
+                }
+                assert!(resolve_partner_ids(&registry, &entry, Some(2_000)).is_empty());
+                assert!(resolve_partner_ids(&registry, &entry, None).is_empty());
+                entry.consent.ok = false;
+                assert!(resolve_partner_ids(&registry, &entry, Some(1_999)).is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn to_eids_maps_resolved_ids_correctly() {
         let resolved = vec![
             ResolvedPartnerId {
                 uid: "LR_xyz".to_owned(),
+                writer: None,
                 source_domain: "liveramp.com".to_owned(),
                 openrtb_atype: 3,
             },
             ResolvedPartnerId {
                 uid: "ID5_abc".to_owned(),
+                writer: None,
                 source_domain: "id5-sync.com".to_owned(),
                 openrtb_atype: 1,
             },
             ResolvedPartnerId {
                 uid: "pair-id".to_owned(),
+                writer: None,
                 source_domain: "google.com".to_owned(),
                 openrtb_atype: 571187,
             },

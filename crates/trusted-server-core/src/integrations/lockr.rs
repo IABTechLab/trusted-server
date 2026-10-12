@@ -30,6 +30,7 @@ use crate::integrations::{
     UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
     ensure_integration_backend,
 };
+use crate::openrtb::Eid;
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -43,6 +44,18 @@ const LOCKR_TOKEN_PATHS: [&str; 4] = [
     "/publisher/app/v2/identityLockr/sync-no-hem-ids",
 ];
 const LOCKR_REVOKE_PATH: &str = "/publisher/app/v2/identityLockr/revoke-consent";
+
+/// Reconstructs Lockr's fixed ID5 provenance from the persisted acquisition writer.
+///
+/// Source or configured ownership alone cannot establish Lockr origin. This
+/// mapping remains valid for stored captures even when new capture is disabled.
+pub(crate) fn apply_eid_provenance(eid: &mut Eid, writer: Option<&str>) {
+    if eid.source == ID5_SOURCE && writer == Some(LOCKR_INTEGRATION_ID) {
+        eid.inserter = Some("Lockr-For-Publishers".to_owned());
+        eid.matcher = Some(String::new());
+        eid.mm = Some(2);
+    }
+}
 
 /// Configuration for Lockr integration.
 #[derive(Debug, Deserialize, Validate)]

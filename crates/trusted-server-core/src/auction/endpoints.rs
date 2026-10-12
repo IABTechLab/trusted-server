@@ -576,8 +576,25 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
 
 pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
-    resolved_eids: Option<Vec<Eid>>,
+    mut resolved_eids: Option<Vec<Eid>>,
 ) -> Option<Vec<Eid>> {
+    // EID-level provenance applies to all UIDs for the source. Do not extend
+    // a stored writer's provenance to additional browser UIDs of unknown origin.
+    for resolved in resolved_eids.iter_mut().flatten() {
+        let has_other_browser_uid = client_eids.iter().flatten().any(|client| {
+            client.source == resolved.source
+                && client.uids.iter().any(|uid| {
+                    !uid.id.trim().is_empty()
+                        && uid.id.len() <= MAX_UID_LENGTH
+                        && !resolved.uids.iter().any(|stored| stored.id == uid.id)
+                })
+        });
+        if has_other_browser_uid {
+            resolved.inserter = None;
+            resolved.matcher = None;
+            resolved.mm = None;
+        }
+    }
     let mut merged = Vec::new();
 
     for eid in resolved_eids
@@ -604,8 +621,8 @@ pub(crate) fn merge_auction_eids(
             }
         };
 
-        // Browser provenance wins over missing KV provenance. Empty matcher
-        // and zero-valued mm are both meaningful supplied values.
+        // Explicit browser provenance wins over reconstructed KV provenance.
+        // Empty matcher and zero-valued mm are meaningful supplied values.
         if eid.inserter.is_some() {
             merged[source_index].inserter = eid.inserter;
         }
@@ -1700,6 +1717,79 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn auction_delivers_lockr_provenance_from_persisted_writer() {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            ..Default::default()
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            requests: Arc::clone(&requests),
+        }));
+        let mut partner = counting_test_partner("id5-sync.com");
+        partner.openrtb_atype = 1;
+        let registry =
+            PartnerRegistry::from_config(&[partner]).expect("should build source registry");
+        let graph = KvIdentityGraph::in_memory("lockr-provenance-auction");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let now = crate::ec::current_timestamp();
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("id5-sync.com", "synthetic-uid", now);
+        let record = entry
+            .ids
+            .get_mut("id5-sync.com")
+            .expect("should contain ID5");
+        record.writer = Some("lockr".to_owned());
+        record.expires_at = Some(now + 3_600);
+        record.revision = Some("synthetic-revision".to_owned());
+        graph
+            .create(&ec_id, &entry)
+            .expect("should persist identity");
+        let stored_before = graph.get(&ec_id).expect("should read identity");
+        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({"adUnits": [{
+                    "code": "example-slot",
+                    "mediaTypes": {"banner": {"sizes": [[300, 250]]}}
+                }]}))
+                .expect("should serialize auction"),
+            ))
+            .expect("should build auction request");
+        // This provider deliberately fails after recording its bidder-facing request.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut context,
+            &noop_services(),
+            request,
+        )
+        .await;
+        let captured = requests.lock().expect("should lock bidder requests");
+        let sent = captured.last().expect("should dispatch bidder request");
+        let payload = serde_json::to_value(sent.user.eids.as_ref().expect("should deliver ID5"))
+            .expect("should serialize bidder EIDs");
+        assert_eq!(
+            payload,
+            json!([{
+                "source": "id5-sync.com", "inserter": "Lockr-For-Publishers",
+                "matcher": "", "mm": 2,
+                "uids": [{"id": "synthetic-uid", "atype": 1}]
+            }])
+        );
+        assert_eq!(
+            graph.get(&ec_id).expect("should read identity"),
+            stored_before,
+            "should reconstruct provenance without changing persisted state"
+        );
+    }
+
     #[test]
     fn resolve_auction_eids_returns_empty_without_snapshot() {
         let registry = PartnerRegistry::empty();
@@ -1821,22 +1911,94 @@ mod tests {
     }
 
     #[test]
+    fn lockr_provenance_does_not_label_other_browser_uids() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let now = crate::ec::current_timestamp();
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("id5-sync.com", "captured-uid", now);
+        let record = entry
+            .ids
+            .get_mut("id5-sync.com")
+            .expect("should contain ID5");
+        record.writer = Some("lockr".to_owned());
+        record.expires_at = Some(now + 3_600);
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        };
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
+            .expect("should build source registry");
+        let context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        for (uids, body_provenance, captured_provenance) in [
+            (vec!["captured-uid"], false, true),
+            (vec!["browser-uid"], false, false),
+            (vec!["captured-uid", "browser-uid"], false, false),
+            (vec!["browser-uid"], true, false),
+        ] {
+            let mut raw = json!([{"source": "id5-sync.com",
+                "uids": uids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>() }]);
+            if body_provenance {
+                raw[0]["inserter"] = json!("Browser-Integration");
+                raw[0]["matcher"] = json!("");
+                raw[0]["mm"] = json!(0);
+            }
+            let client = parse_client_auction_eids(Some(&raw));
+            let merged =
+                resolve_and_merge_auction_eids(client, &snapshot, Some(&registry), &context)
+                    .expect("should merge captured and browser EIDs");
+            let payload = serde_json::to_value(&merged).expect("should serialize EIDs");
+            let eid = &payload[0];
+            if body_provenance {
+                assert_eq!(eid["inserter"], "Browser-Integration");
+                assert_eq!(eid["matcher"], "");
+                assert_eq!(eid["mm"], 0);
+            } else if captured_provenance {
+                assert_eq!(eid["inserter"], "Lockr-For-Publishers");
+                assert_eq!(eid["matcher"], "");
+                assert_eq!(eid["mm"], 2);
+            } else {
+                for field in ["inserter", "matcher", "mm"] {
+                    assert!(
+                        eid.get(field).is_none(),
+                        "should not attribute a mixed-origin EID to Lockr"
+                    );
+                }
+            }
+            let mut expected_uids = vec!["captured-uid"];
+            if uids.contains(&"browser-uid") {
+                expected_uids.push("browser-uid");
+            }
+            assert_eq!(
+                merged[0]
+                    .uids
+                    .iter()
+                    .map(|uid| uid.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_uids,
+                "should preserve existing UID merge behavior"
+            );
+        }
+    }
+
+    #[test]
     fn body_provenance_survives_parse_merge_and_serialization() {
-        let raw = json!([{"source":"id5-sync.com", "inserter":"Lockr-For-Publishers",
+        let raw = json!([{"source":"id5-sync.com", "inserter":"Browser-Integration",
             "matcher":"", "mm":0, "uids":[{"id":"uid", "ext":{"linkType":1}}]}]);
         let client = parse_client_auction_eids(Some(&raw));
         let resolved = Some(vec![Eid {
             source: "id5-sync.com".to_owned(),
+            inserter: Some("Lockr-For-Publishers".to_owned()),
+            matcher: Some("stored-matcher".to_owned()),
+            mm: Some(2),
             uids: vec![Uid {
                 id: "uid".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
-            ..Eid::default()
         }]);
         let merged = merge_auction_eids(client, resolved).expect("should merge body and KV");
         let output = serde_json::to_value(&merged).expect("should serialize");
-        assert_eq!(output[0]["inserter"], "Lockr-For-Publishers");
+        assert_eq!(output[0]["inserter"], "Browser-Integration");
         assert_eq!(output[0]["matcher"], "");
         assert_eq!(output[0]["mm"], 0);
         assert_eq!(output[0]["uids"][0]["atype"], 1);

@@ -93,7 +93,9 @@ User data is stored securely in Lockr's privacy vault:
 
 ### Extended ID (EID) Support
 
-A later server-side auction can include a usable registered ID5 record as an `id5-sync.com` EID with `atype=1`. Trusted Server does not store provider `ext` or OpenRTB `inserter`/`matcher` metadata in KV; browser-supplied provenance remains current-request-only. Other provider token mappings are not enabled by the ID5 parser.
+A later server-side auction can include a usable registered ID5 record as an `id5-sync.com` EID with the registry's `atype=1`. When the persisted record's writer is `lockr`, Trusted Server reconstructs `inserter: "Lockr-For-Publishers"`, `matcher: ""` and `mm: 2`. These fixed values require no extra KV fields and remain available if new capture is disabled. Source or configured ownership alone does not establish Lockr origin; browser, legacy and unknown-writer records are not labeled as Lockr.
+
+Explicit browser-supplied provenance retains current-request precedence. If the browser adds a different UID for the same source, the merged EID omits reconstructed provenance to avoid attributing every UID to Lockr. Trusted Server does not store arbitrary provenance, provider `ext` or extra UIDs in KV. Other provider token mappings are not enabled by the ID5 parser.
 
 ## Use Cases
 
@@ -136,7 +138,7 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 **ID Mapping**:
 
 - The only supported capture mapping is Lockr `id5id` to registered `id5-sync.com` with `atype=1`.
-- The EC identity graph retains the source, UID and lifecycle metadata, including known provider expiry. It does not store provider `ext` or additional UIDs.
+- The EC identity graph retains the source, UID and lifecycle metadata, including known provider expiry and the acquisition writer. Later auctions reconstruct fixed Lockr ID5 provenance only for a usable Lockr-written record. KV does not store arbitrary provenance, provider `ext` or additional UIDs.
 - Publisher SDK storage remains the SDK's responsibility. Capture does not add an EID cookie.
 
 **Consent Validation**:

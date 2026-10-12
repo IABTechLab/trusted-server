@@ -242,8 +242,12 @@ that legacy IDs are still valid; tightening unknown-expiry policy is a separate
 operator decision.
 
 The record extension does not store OpenRTB provenance, UID `ext`, or extra UIDs.
-Writer identity is storage metadata, not proof that a provider requires a
-particular `inserter` or `matcher` value in the bidstream.
+Writer identity identifies the acquisition path. An integration can use that
+persisted writer and source to reconstruct fixed provenance defined by its spec;
+do not infer provenance from the current configured owner or source alone.
+The first mapping is Lockr ID5, with `inserter = "Lockr-For-Publishers"`,
+`matcher = ""` and `mm = 2`. Other sources and browser, legacy or unknown writers
+remain without reconstructed provenance. No additional storage fields are needed.
 
 ### 6.2 Mutation classes
 
@@ -285,9 +289,17 @@ becoming an authoritative replacement in KV.
 
 Body-supplied OpenRTB provenance remains current-request metadata. Add optional
 `inserter`, `matcher` and `mm` to `Eid` parsing and merging; an empty `matcher`
-is a supplied value. Later KV-derived EIDs use source registry `atype` and do
-not synthesize provider provenance. The first delivery preserves existing caps
-and consent gates across all auction paths.
+is a supplied value. Later KV-derived EIDs use source registry `atype` and the
+persisted acquisition writer. For usable Lockr-written `id5-sync.com` records,
+reconstruct the fixed provenance in section 6.1 through Lockr's mapping, even
+when new capture is disabled. Do not label all records for an owned source.
+
+Explicit body fields take precedence over reconstructed fields, including empty
+`matcher` and zero-valued `mm`. If browser input adds a different UID for the
+same source, suppress reconstructed provenance for the resulting mixed-origin
+EID because its top-level fields apply to every UID. Preserve explicit body
+provenance and the existing UID merge rules. The first delivery preserves
+existing caps and consent gates across all auction paths.
 
 ## 7. Consent and execution timing
 
@@ -447,6 +459,10 @@ Foundation tests must cover:
   skips writes; unrelated sources survive CAS conflicts.
 - Known expiry boundaries across publisher, `/auction` and SPA auction paths,
   including an expired UID resubmitted in the auction body.
+- Writer-aware Lockr ID5 provenance through KV reads and bidder-facing auctions,
+  including browser/legacy/unknown writers, configured-owner-only records,
+  unrelated sources, matching versus different body UIDs and explicit body
+  field precedence. Reconstruction must not write KV or bypass usability gates.
 - Revision-conditional invalidation and stale resolver-result rejection,
   with same-UID/new-expiry and concurrent-withdrawal cases.
 - Missing versus failed roots, no-create enrichment, snapshot identity
@@ -470,4 +486,5 @@ Resolve before implementation activation:
 Provider expiry, writer and revision storage are proposed foundation decisions,
 not already implemented capabilities. LiveRamp protocol approval, identifier
 intake, refresh response semantics and country-specific TTL remain for its
-future spec. OpenRTB provenance storage remains outside this first delivery.
+future spec. Arbitrary OpenRTB provenance storage remains outside this first
+delivery; fixed Lockr ID5 provenance is reconstructed from the persisted writer.
