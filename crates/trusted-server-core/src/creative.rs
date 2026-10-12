@@ -1109,6 +1109,12 @@ fn process_auction_creative_with_rewriter(
 /// resolves only when the creative's document base URL is the first-party origin.
 /// For creatives handed to a renderer in a foreign origin (e.g. the Prebid
 /// Universal Creative's `srcdoc` under GAM), use [`rewrite_inline_creative_html`].
+///
+/// # Warning
+///
+/// This wrapper applies neither `rewrite_creatives` nor `rewrite_clicks`.
+/// Production code must go through the auction processing entry points, which
+/// honor both switches.
 #[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     rewrite_creative_html_impl(
@@ -1164,6 +1170,12 @@ pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
 /// - The `tsjs` bundle is **not** injected into `<body>`: its click guard is
 ///   unnecessary for click URLs that are already absolute here, and shipping the
 ///   full core-plus-integrations bundle into every creative iframe is pure weight.
+///
+/// # Warning
+///
+/// This wrapper applies neither `rewrite_creatives` nor `rewrite_clicks`.
+/// Production code must go through the auction processing entry points, which
+/// honor both switches.
 #[must_use]
 pub fn rewrite_inline_creative_html(
     settings: &Settings,
