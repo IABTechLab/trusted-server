@@ -16,13 +16,8 @@ pub(crate) enum CacheCommand {
 
 /// Arguments for `ts cache purge`.
 ///
-/// # Why this asks the platform rather than the service
-///
-/// A purge is administration, and the service answers readers on the publisher's own
-/// domain. Asking the platform leaves the credential that can empty the cache with the
-/// platform's access control, which ties a token to the user who made it, can limit it
-/// to purging by key and can revoke it, and keeps that credential off the domain every
-/// reader reaches.
+/// The platform is asked, so the credential that can empty the cache stays off the
+/// publisher's domain.
 ///
 /// The surrogate key is derived here by the function the service tags its cached objects
 /// with, so the command cannot drift out of agreement with the cache it is purging.
