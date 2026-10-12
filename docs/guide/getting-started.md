@@ -207,9 +207,21 @@ Restart or redeploy instances after secret rotation. See
 
 ## Deploy to Fastly
 
+Trusted Server declares Config, KV, and Secret Stores, so deployment must go
+through EdgeZero's managed path. That path links each selected physical store
+to the service version under its logical ID; `fastly compute publish` clones
+the active version's links instead and activates a version whose logical links
+are missing.
+
 ```bash
-fastly compute publish
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 ```
+
+See [the Fastly guide](/guide/fastly#upgrading-from-edgezero-v0-0-8) when
+upgrading a service that was deployed before logical store links, and
+[the CLI guide](/guide/cli#lifecycle-commands) for where `<release-root>`
+comes from.
 
 ## Next Steps
 

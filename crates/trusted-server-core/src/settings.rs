@@ -2592,6 +2592,33 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Expose the reusable-sandbox counters endpoint at `GET /_ts/debug/sandbox`
+    /// and attach the same counters to private, no-store workload responses.
+    ///
+    /// The counters are the guest-instance identifier, the request ordinal
+    /// within that instance, the application build count, and the request
+    /// correlation id. They carry no settings, secrets, or request content.
+    /// Cacheable responses omit counters without changing their cache policy;
+    /// probes of those routes cannot establish sandbox reuse.
+    ///
+    /// Independent of the adapter's `reusable-sandbox` Cargo feature by design:
+    /// the feature decides whether a `Serve` loop exists, this flag decides
+    /// whether counters are emitted. Keeping them separate is what lets the
+    /// feature-off baseline be measured on the same channel as the reuse arms.
+    ///
+    /// Skipped from serialization while false: [`DebugConfig`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed. A blob with it enabled requires restoring a
+    /// compatible blob before rolling back, the same trade
+    /// [`DebugConfig::auction_html_comment_options`] makes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_metrics_enabled: bool,
+}
+
+/// Serde predicate for omitting `false` flags from serialized config blobs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -2806,11 +2833,46 @@ impl ObservabilitySettings {
 }
 
 /// Tester-cookie endpoint configuration.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
     pub enabled: bool,
+    /// Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days.
+    ///
+    /// Without an explicit lifetime the cookie is session-scoped, and Safari
+    /// deletes session cookies when the browser quits, so testers silently
+    /// fall back to the baseline arm on their next visit. Safari's ITP may
+    /// still cap the effective lifetime (for example to 7 days when the
+    /// serving host is a CNAME to a third-party edge), which remains far
+    /// better than session scope.
+    #[validate(range(
+        min = 1,
+        max = 31_536_000,
+        message = "must be between 1 second and 1 year"
+    ))]
+    #[serde(default = "TesterCookieConfig::default_max_age_seconds")]
+    pub max_age_seconds: u32,
+}
+
+impl TesterCookieConfig {
+    /// Default tester-cookie lifetime: 30 days.
+    #[must_use]
+    pub const fn default_max_age_seconds() -> u32 {
+        30 * 24 * 60 * 60
+    }
+}
+
+// A manual impl rather than derive: derive(Default) would zero
+// `max_age_seconds` whenever the whole `[tester_cookie]` section is absent,
+// because `Settings.tester_cookie` uses `#[serde(default)]`.
+impl Default for TesterCookieConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_age_seconds: Self::default_max_age_seconds(),
+        }
+    }
 }
 
 /// Authenticated forwarding configuration for a trusted client IP header.
@@ -2927,6 +2989,7 @@ pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
     #[serde(default)]
+    #[validate(nested)]
     pub tester_cookie: TesterCookieConfig,
     /// Optional authenticated trusted client IP forwarding configuration.
     ///
@@ -3783,6 +3846,57 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    /// `DebugConfig` denies unknown fields, so a binary built before
+    /// `sandbox_metrics_enabled` existed must still accept a default blob.
+    /// That only holds while the flag is skipped during serialization.
+    #[test]
+    fn default_debug_config_omits_sandbox_metrics_for_rollback() {
+        let serialized =
+            serde_json::to_value(DebugConfig::default()).expect("should serialize debug config");
+
+        assert!(
+            serialized.get("sandbox_metrics_enabled").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_sandbox_metrics_serializes_and_round_trips() {
+        let config = DebugConfig {
+            sandbox_metrics_enabled: true,
+            ..DebugConfig::default()
+        };
+
+        let serialized = serde_json::to_value(&config).expect("should serialize debug config");
+        assert_eq!(
+            serialized.get("sandbox_metrics_enabled"),
+            Some(&json!(true)),
+            "an enabled flag must be written so the setting survives a round trip"
+        );
+
+        let restored: DebugConfig =
+            serde_json::from_value(serialized).expect("should deserialize debug config");
+        assert!(
+            restored.sandbox_metrics_enabled,
+            "the flag should survive a round trip"
+        );
+    }
+
+    #[test]
+    fn debug_config_accepts_a_blob_without_the_sandbox_field() {
+        let restored: DebugConfig = serde_json::from_value(json!({"ja4_endpoint_enabled": true}))
+            .expect("should deserialize a blob written before the field existed");
+
+        assert!(
+            restored.ja4_endpoint_enabled,
+            "existing fields should still load"
+        );
+        assert!(
+            !restored.sandbox_metrics_enabled,
+            "an absent flag should default to off"
+        );
+    }
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
@@ -4946,6 +5060,65 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "omitted max_age_seconds should fall back to the 30-day default"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_max_age_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 3600
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should parse tester-cookie max age config");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds, 3_600,
+            "tester-cookie config should use the configured max age"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_absent_section_defaults_max_age() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without a tester-cookie section");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "absent tester-cookie section should default max_age_seconds to 30 days"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_zero_max_age_fails_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 0
+        "#,
+            crate_test_settings_str()
+        );
+
+        let error =
+            Settings::from_toml(&toml_str).expect_err("should reject a zero tester-cookie max age");
+
+        assert!(
+            error.to_string().contains("validation failed"),
+            "zero max_age_seconds should fail settings validation, got: {error}"
         );
     }
 

@@ -48,10 +48,13 @@ const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EVIDENCE_ENTRIES: usize = 128;
 /// Hard cap on the UTF-8 JSON payload before CDP transfers it back to Rust.
 const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
-/// Hard cap on browser startup, allowing cold launches on shared CI runners.
-const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on Chrome startup until it reports its debugging websocket URL.
+///
+/// Replaces chromiumoxide's 20s default, which a cold start on a loaded CI
+/// runner or a slow operator machine can exceed.
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Page-settle timing thresholds.
 #[derive(Debug, Clone, Copy)]
