@@ -9,7 +9,7 @@
 
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, toml_error_location};
 
 /// Validates the candidate config text the generator is about to persist.
 ///
@@ -54,9 +54,9 @@ pub(super) fn check_candidate(candidate: &str, baseline: &str) -> CliResult<Vec<
 /// values, including validator parameters and invalid patterns.
 fn validate_source_config(source: &str) -> CliResult<()> {
     let config: TrustedServerAppConfig = toml::from_str(source).map_err(|error| {
-        error.span().map_or_else(
-            || "config could not be loaded".to_string(),
-            |span| format!("config could not be loaded at byte offset {}", span.start),
+        format!(
+            "config could not be loaded{}",
+            toml_error_location(error.span())
         )
     })?;
     TrustedServerAppConfig::new(config.into_settings())
