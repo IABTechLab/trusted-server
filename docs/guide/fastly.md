@@ -309,8 +309,8 @@ for the initial provisioning and linking sequence, subsequent CLI pushes, and
 precautions when changing a live mapping. A process-environment override alone
 does not configure the Fastly runtime.
 
-One service can serve several publishers, each from an application config of
-its own that the request's host chooses. See
+One service can serve several publishers, each from an app-config blob of its
+own that the request's host chooses. See
 [One blob for each host](/guide/configuration#one-blob-for-each-host).
 
 Create the separate request-signing store when that feature is enabled:

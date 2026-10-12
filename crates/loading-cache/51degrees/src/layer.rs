@@ -14,11 +14,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fiftyone_caching::{
-    Clock, Inline, Loaded, LoadingCache, LruLoadingCache, LruStore, SpawnedLocal, ValueLoader,
+    Clock, Inline, Loaded, LoadingCache, LruLoadingCache, LruStore, ValueLoader,
 };
 use trusted_server_core::platform::{LoadError, StoreKey};
-
-use crate::{LocalSpawner, Runner};
 
 /// Loads a value through the shared store, for the caller that leads.
 pub(crate) type Below = Box<dyn FnOnce() -> BelowFuture + Send>;
@@ -93,75 +91,30 @@ impl ValueLoader<Call, Bytes> for FromCall {
     }
 }
 
-/// The memory layer's cache, which drops its least recently used entry when
-/// full, and whose loader is the shared store layer below it.
-type Memory<R> = LruLoadingCache<Call, Bytes, FromCall, R>;
-
-/// One cache's memory layer, with the runner its loads use.
-pub(crate) enum Layer {
-    InCaller(Memory<Inline>),
-    #[cfg(not(target_family = "wasm"))]
-    Pool(Memory<fiftyone_caching::Spawned<PoolSpawner>>),
-    Local(Memory<SpawnedLocal<LocalSpawner>>),
-}
+/// One cache's memory layer, which drops its least recently used entry when
+/// full, and whose loader is the shared store layer below it. Every load runs
+/// in its caller.
+pub(crate) struct Layer(LruLoadingCache<Call, Bytes, FromCall, Inline>);
 
 impl Layer {
-    pub(crate) fn new(
-        lifetime: Duration,
-        entries: usize,
-        runner: Runner,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub(crate) fn new(lifetime: Duration, entries: usize, clock: Arc<dyn Clock>) -> Self {
         let store = LruStore::builder()
             .size(entries)
             .clock(Arc::clone(&clock))
             .build();
-        let builder = LoadingCache::builder(store, FromCall)
-            .time_to_live(lifetime)
-            .clock(clock);
-        match runner {
-            Runner::InCaller => Self::InCaller(builder.build()),
-            #[cfg(not(target_family = "wasm"))]
-            Runner::Pool(pool, threads) => {
-                Self::Pool(builder.spawner(PoolSpawner { pool, threads }).build())
-            }
-            Runner::Local(spawner) => Self::Local(builder.local_spawner(spawner).build()),
-        }
+        Self(
+            LoadingCache::builder(store, FromCall)
+                .time_to_live(lifetime)
+                .clock(clock)
+                .build(),
+        )
     }
 
     pub(crate) async fn get(&self, call: &Call) -> Result<Bytes, LoadError> {
-        match self {
-            Self::InCaller(cache) => cache.get(call).await,
-            #[cfg(not(target_family = "wasm"))]
-            Self::Pool(cache) => cache.get(call).await,
-            Self::Local(cache) => cache.get(call).await,
-        }
+        self.0.get(call).await
     }
 
     pub(crate) async fn remove(&self, call: &Call) {
-        match self {
-            Self::InCaller(cache) => cache.remove(call).await,
-            #[cfg(not(target_family = "wasm"))]
-            Self::Pool(cache) => cache.remove(call).await,
-            Self::Local(cache) => cache.remove(call).await,
-        }
-    }
-}
-
-/// Runs each load on a pool of threads, made the first time a load needs one,
-/// so a process whose loads all run in their callers starts no threads.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) struct PoolSpawner {
-    pool: Arc<std::sync::OnceLock<fiftyone_caching::tokio::LocalPool>>,
-    threads: usize,
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl fiftyone_caching::Spawn for PoolSpawner {
-    fn spawn(&self, start: fiftyone_caching::StartLoad) {
-        let pool = self
-            .pool
-            .get_or_init(|| fiftyone_caching::tokio::LocalPool::new(self.threads));
-        fiftyone_caching::Spawn::spawn(pool, start);
+        self.0.remove(call).await;
     }
 }

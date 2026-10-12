@@ -8,14 +8,12 @@
 //! The last answer a contributor gave is also kept apart from the cache, for
 //! far longer than any refresh, and read only when the contributor fails. It is
 //! then served past its age, because yesterday's rules are a better answer than
-//! none. A `404` or an empty file reads to a crawler as permission to crawl
-//! everything, which is the opposite of what a publisher who refused anything
-//! asked for. It is kept in the host's value cache when the host supplies one,
-//! and in the key-value store otherwise, because a host that starts an instance
+//! none. It is kept in the host's value cache when the host supplies one, and
+//! in the key-value store otherwise, because a host that starts an instance
 //! for each request may give its requests a value cache and no key-value store.
 //! A value cache may drop it sooner, so on such a host a copy past its age is
 //! likely to be there rather than certain, and a key-value store that cannot
-//! give an entry a lifetime keeps it until it is replaced.
+//! give an entry a lifetime keeps it until it is deleted there.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -83,32 +81,77 @@ pub(crate) async fn contribution_for(
     let held = held_key(id, &contributor.fingerprint());
     let key = StoreKey::new(&prefix, CACHE, held.clone());
     let kept = StoreKey::new(&prefix, KEPT, held);
-    let ask = Ask {
-        id,
-        contributor: Arc::clone(contributor),
-        request: request.clone(),
-        services: services.clone(),
+    let spec = cache_spec(settings);
+    let ask = || {
+        load(
+            Ask {
+                id,
+                contributor: Arc::clone(contributor),
+                request: request.clone(),
+                services: services.clone(),
+            },
+            kept.clone(),
+        )
     };
-    let loaded = services
-        .load_cached(&cache_spec(settings), &key, load(ask, kept.clone()))
-        .await
-        .and_then(|bytes| {
-            serde_json::from_slice::<Contribution>(&bytes)
-                .map_err(|error| LoadError::new(format!("the held answer is unreadable: {error}")))
-        });
+    let loaded = match held_answer(services, &spec, &key, ask()).await {
+        Err(Held::Unreadable(error)) => {
+            // A copy that no longer reads would answer every request until
+            // it ends, so it is removed and the contributor asked again.
+            log::warn!(
+                "Asking `{id}` again for robots.txt rules, the held copy is unreadable: {error}"
+            );
+            services
+                .loading_cache_for(CACHE)
+                .remove(services, &spec, &key)
+                .await;
+            held_answer(services, &spec, &key, ask()).await
+        }
+        loaded => loaded,
+    };
     match loaded {
         Ok(contribution) => Ok(contribution),
-        Err(error) => match kept_answer(services, &kept).await {
-            Some(contribution) => {
-                log::warn!("Serving the held robots.txt rules of `{id}` past their age: {error}");
-                Ok(contribution)
+        Err(Held::Failed(error) | Held::Unreadable(error)) => {
+            match kept_answer(services, &kept).await {
+                Some(contribution) => {
+                    log::warn!(
+                        "Serving the kept robots.txt rules of `{id}` past their age: {error}"
+                    );
+                    Ok(contribution)
+                }
+                None => Err(Report::new(TrustedServerError::Integration {
+                    integration: id.to_owned(),
+                    message: format!("the robots.txt contributor did not answer: {error}"),
+                })),
             }
-            None => Err(Report::new(TrustedServerError::Integration {
-                integration: id.to_owned(),
-                message: format!("the robots.txt contributor did not answer: {error}"),
-            })),
-        },
+        }
     }
+}
+
+/// Why no held or fresh answer was read.
+enum Held {
+    /// The load failed.
+    Failed(LoadError),
+    /// The cache answered with a copy that does not read as a contribution.
+    Unreadable(LoadError),
+}
+
+/// The answer the cache holds for `key`, loaded with `load` when it holds
+/// none.
+async fn held_answer(
+    services: &RuntimeServices,
+    spec: &CacheSpec,
+    key: &StoreKey,
+    load: Loader,
+) -> Result<Contribution, Held> {
+    let bytes = services
+        .load_cached(spec, key, load)
+        .await
+        .map_err(Held::Failed)?;
+    serde_json::from_slice::<Contribution>(&bytes).map_err(|error| {
+        Held::Unreadable(LoadError::new(format!(
+            "the held answer is unreadable: {error}"
+        )))
+    })
 }
 
 /// What a load owns to ask one contributor, because it may outlive the
@@ -714,6 +757,60 @@ pub(crate) mod tests {
 
         assert_eq!(answer, rules("User-Agent: LateBot\nDisallow: /"));
         assert_eq!(scripted.times_asked(), 2);
+    }
+
+    /// A held copy that no longer reads is removed and the contributor asked
+    /// again, rather than every request failing until the copy ends.
+    #[tokio::test]
+    async fn an_unreadable_held_copy_is_removed_and_the_contributor_asked_again() {
+        let scripted = Arc::new(Scripted::new(vec![Ok(rules(
+            "User-Agent: FreshBot\nDisallow: /",
+        ))]));
+        let cache = Arc::new(MemoryLoadingCache::default());
+        let services = services_with(Arc::clone(&cache), Arc::default());
+        let settings = settings();
+        let key = StoreKey::new(
+            &ServerKeyPrefix::for_settings(&settings),
+            CACHE,
+            held_key("a", &scripted.fingerprint()),
+        );
+        services
+            .load_cached(
+                &cache_spec(&settings),
+                &key,
+                Box::new(|| {
+                    Box::pin(async {
+                        Ok(LoadedValue::new(bytes::Bytes::from_static(
+                            b"not a contribution",
+                        )))
+                    })
+                }),
+            )
+            .await
+            .expect("should hold the unreadable copy");
+
+        let answer = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings,
+        )
+        .await
+        .expect("should ask the contributor again");
+        let again = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings,
+        )
+        .await
+        .expect("should serve the fresh copy");
+
+        assert_eq!(answer, rules("User-Agent: FreshBot\nDisallow: /"));
+        assert_eq!(again, answer);
+        assert_eq!(scripted.times_asked(), 1, "the fresh answer should be held");
     }
 
     /// A value cache held in memory for the life of one test.

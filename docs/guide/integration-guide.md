@@ -208,11 +208,11 @@ last chunk marked. Head markup and the element and text handlers are
 decisions about HTML, and an action that makes one on another media type is
 refused by name when the chain is planned.
 
-A middleware named in an entry with a path also runs where the origin
-answers `404 Not Found` for that path, on an empty document of the entry's
-media type, and what it writes is the file. A middleware that adds to a file
-therefore writes the same on an empty one, with nothing before its first
-line.
+A middleware named in an entry with a path, for a media type other than
+HTML, also runs where the origin answers `404 Not Found` for a path under
+it, on an empty document of the entry's media type, and what it writes is
+the file. A middleware that adds to a file therefore writes the same on an
+empty one, with nothing before its first line.
 
 ```rust
 struct Sellers;
@@ -246,15 +246,14 @@ one file, its path. See "Entries for a media type other than HTML" in the
 ### A middleware that prepares, and one that refuses
 
 A middleware whose decision needs the request's services, or has to wait on
-the key-value store or the network, answers `prepare` with a future. Core runs
-it in the request's handler, before the document is processed, as the module
-the middleware belongs to and with the permissions it declares in
-`required_permissions`, so the module call carries the settings and the
-request's services, as a request hook or a robots.txt contributor is given.
-What the future answers is kept under the middleware's name in the context's
-`prepared`, and `create`, which stays synchronous, takes it from there as the
-type it prepared. A middleware that prepares nothing leaves `prepare` at its
-default and is asked `create` as before.
+the key-value store or the network, answers `prepare` with a future. Core
+runs it in the request's handler, before the document is processed, as the
+module the middleware belongs to and with the permissions it declares in
+`required_permissions`. What the future answers is kept under the
+middleware's name in the context's `prepared`, and `create`, which stays
+synchronous, takes it from there as the type it prepared. A middleware that
+prepares nothing leaves `prepare` at its default and is asked `create` as
+before.
 
 ```rust
 impl Middleware for Sellers {
@@ -288,10 +287,12 @@ unchanged one through. `Refusal::service_unavailable` is the one for a
 source that cannot answer now. The preparations of one document run in the
 order the entry names the middleware, and the first refusal ends them.
 
-In the fetch phase a preparation is made once for the document that may be
-stored, so it must not depend on the reader. In the serve phase it is made
-for each reader's copy, on a document fetched for the request and on one
-read from the store alike.
+On a document that may be stored only the fetch phase is prepared, and its
+preparations are handed the request's services and nothing of the reader,
+because what they answer is stored with the document. The serve middleware
+of the reader it was fetched for then find nothing prepared. On a document
+that is not stored both phases are prepared, and on a copy read from the
+store the serve phase alone.
 
 ## Proxy implementation rules
 
@@ -301,9 +302,9 @@ request as that function's own argument, and names what else it needs as
 parameters, such as `&Settings` and `&RuntimeServices`, which is the complete
 runtime service graph. Register or predict backends through
 `services.backend()`, send through `services.http_client()`, bound request and
-response bodies, and return `Report<TrustedServerError>` with integration
-context. The registry strips internal identity headers before dispatch; an
-integration must opt into any explicit forwarding behavior.
+response bodies, and return `Report<TrustedServerError>` with the route's
+context. The registry strips internal identity headers before dispatch, and a
+route must opt into any explicit forwarding behavior.
 
 A route that names a value whose use needs a permission, such as the Edge
 Cookie identifier, declares that permission in `required_permissions` and is
@@ -617,27 +618,17 @@ impl IntegrationProxy for ExampleProxy {
 }
 ```
 
-| Parameter          | What it is                                                 |
-| ------------------ | ---------------------------------------------------------- |
-| `ModuleRequest`    | The method, path, query, host and scheme of the request    |
-| `&dyn RequestInfo` | The reader's evidence, being the headers and the client IP |
-| `&ClientInfo`      | The reader's connection                                    |
-| `&PermissionState` | The permissions resolved for the request                   |
-| `&ConsentContext`  | The decoded consent signals                                |
-| `&Settings`        | The deployment's settings                                  |
-| `&RuntimeServices` | Stores, caches, backends and the HTTP client               |
-| `&GeoInfo`         | The reader's location                                      |
-| `&DeviceSignals`   | The device classification                                  |
-| `EdgeCookie`       | The request's Edge Cookie identifier                       |
-
-A parameter may be an `Option` of one of these, which is `None` where the
-value is absent or withheld, or a tuple of several. A function that names a
-value itself is not called when the value cannot be passed, and the reason
-goes to the debug log. The module decides what that means. A device module
-answers the unknown device, an Edge Cookie module creates no identifier, and
-a route's `?` answers `403`. `call.inject_with` passes one argument of the
-caller's own after the module, which is how a route takes its request and
-how an Edge Cookie module takes the value a page posted.
+The values a function may name, and where each is absent, are listed in the
+documentation of `trusted_server_core::module_context`. A parameter may be an
+`Option` of one of them, which is `None` where the value is absent or
+withheld, or a tuple of several. A function that names a value itself is not
+called when the value cannot be passed, and the reason goes to the debug log.
+The module decides what that means. A device module answers the unknown
+device, an Edge Cookie module creates no identifier, and a route's `?` answers
+`403` for a value the request's permissions withhold and `500` for one absent
+where the route runs. `call.inject_with` passes one argument of the caller's
+own after the module, which is how a route takes its request and how an Edge
+Cookie module takes the value a page posted.
 
 The location, the device signals and the Edge Cookie identifier each carry
 the permissions that the module which produced them declares. One of them is
@@ -856,7 +847,7 @@ let bytes = services
 ```
 
 A caller whose load pays off only when its value is kept asks
-`services.loading_cache().keeps_values()` first, which the cache of a build
+`services.loading_cache_for(name).keeps_values()` first, which the cache of a build
 that links none answers with false, and `remove` drops a copy that turned out
 to be unusable. The lifetimes come from the settings, as `[cache.robots-txt]`
 does through `LoadingCacheConfig::lifetimes`, so an operator tunes them

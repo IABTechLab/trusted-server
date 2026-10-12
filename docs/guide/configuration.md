@@ -716,12 +716,12 @@ keys and how a relying party checks it.
 
 ### `[attestation]`
 
-| Field        | Type   | Required | Description                                                                                                                                                                                                                                                                                                                  |
-| ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `endpoint`   | String | No       | Where the page answers, with the JSON form at the same path plus `.json`. Default `/_ts/attestation`. An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not ending `.json` and not an address the deployment already answers |
-| `operator`   | String | Yes      | Who the evidence says operates the deployment, 1 to 64 characters                                                                                                                                                                                                                                                            |
-| `context`    | String | Yes      | The text signed ahead of the evidence, 1 to 64 characters with no control characters. A verifier must use exactly the same text                                                                                                                                                                                              |
-| `verify_url` | String | Yes      | An `https` address with a host, where the page sends a reader to check the claim                                                                                                                                                                                                                                             |
+| Field        | Type   | Required | Description                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`   | String | No       | Where the page answers, with the JSON form at the same path plus `.json`. Default `/_ts/attestation`. An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not ending `.json`, not an address the deployment already answers and not under a prefix a framework serves its assets from, such as `_next` |
+| `operator`   | String | Yes      | Who the evidence says operates the deployment, 1 to 64 characters                                                                                                                                                                                                                                                                                                                                    |
+| `context`    | String | Yes      | The text signed ahead of the evidence, 1 to 64 characters with no control characters. A verifier must use exactly the same text                                                                                                                                                                                                                                                                      |
+| `verify_url` | String | Yes      | An `https` address with a host, where the page sends a reader to check the claim                                                                                                                                                                                                                                                                                                                     |
 
 The section refuses any other field, so a configuration naming a signing key
 is refused. Keys are compiled into the build from the file the build input
@@ -1034,7 +1034,7 @@ Custom headers may be overwritten by application logic. Standard headers (`Conte
 
 `X-Served-By`, `X-Cache` and `X-Cache-Hits` name the node that answered and say how a cache treated the request. They arrive on a response from the publisher's origin or from a cache on the way to it. On a publisher's page they tell a reader nothing, and tell something probing the site how it is built.
 
-Every adapter removes the three from a response before it finalizes it, unless the request was for a path beneath `/_ts`, which is where a deployment is asked about itself. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
+Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
 ## robots.txt Configuration
 
@@ -1057,9 +1057,9 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. A module's answer is held in the deployment's loading cache, briefly in the process and in the shared store outside it, so a module is asked once per refresh however many instances and requests want its rules, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+4. Holding is opt-in. With `module` set in `[cache.robots-txt]`, a module's answer is held in the loading cache that module offers, briefly in the process and in the shared store outside it, so a module is asked once per refresh however many instances and requests want its rules, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all the file is `503` with `Retry-After`, never an empty file, which a crawler would read as permission to crawl everything.
-6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. A build that links no loading cache keeps no copies, so there every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
+6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no `module` in `[cache.robots-txt]` no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
 7. The file is made by the `robots_txt` middleware, which runs on `text/plain` in the phase the entry places it in, prepares the file before the document is processed, and replaces whatever the origin sent with it. The response takes the deployment's cache policy for the path, as every file does. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
 
 **Which responses carry the header.** An adapter writes `X-Robots-Tag` last when it finalizes a response, replacing any tag already there, so neither an origin page nor `[response_headers]` can loosen it. That covers every route, the publisher fallback and the error path. A response sent before that step does not carry it. On every adapter but Fastly that is the `404` or `405` the router gives a request it does not route. On Fastly it is the two debug endpoints under `/_ts/debug` and a failure before the settings are read.
@@ -1089,9 +1089,9 @@ it passes through untouched.
 
 ### `[ads-txt]`
 
-| Field     | Type                    | Required | Description                                                                                 |
-| --------- | ----------------------- | -------- | ------------------------------------------------------------------------------------------- |
-| `modules` | String or Array[String] | Yes      | What adds lines to the file, in order. `sellers` writes the lines `[ads-txt.sellers]` gives |
+| Field     | Type          | Required | Description                                                                       |
+| --------- | ------------- | -------- | --------------------------------------------------------------------------------- |
+| `modules` | Array[String] | Yes      | What adds lines to the file. `sellers` writes the lines `[ads-txt.sellers]` gives |
 
 ### `[ads-txt.sellers]`
 
@@ -1099,14 +1099,11 @@ it passes through untouched.
 | ------- | ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lines` | Array[String] | Yes      | The lines written at the end of the file, each a data record (domain, account id, `DIRECT` or `RESELLER`, and an optional certification authority id) or a variable |
 
-**How the file is made.** The module is a middleware for `text/plain`, and
-runs where a `[[fetch]]` entry for that media type on the file's path names
-it. It passes the origin's file through and writes the lines after its last
-one, on a line of their own, so a seller the deployment introduces is
-declared beside the publisher's own. A publisher whose origin has no file
-gets one made of the lines alone, because an origin's `404 Not Found` on a
-path a `[[fetch]]` entry names middleware for runs that middleware on an
-empty document of the entry's media type.
+**How the file is made.** Where a `[[fetch]]` entry for `text/plain` names
+the module, it writes the lines after the origin's last one, and where the
+origin has no file the file is made of the lines alone, see A file the origin
+does not have below. The entry's `path` is a prefix, so `/ads.txt` also
+covers `/ads.txt.bak`.
 
 **Refused when the settings load**: a line that is not a data record or a
 variable, naming which part is wrong, a comment, an empty list, and a
@@ -1835,31 +1832,32 @@ table. An entry carries none and switches nothing on.
 ### Entries for a media type other than HTML
 
 An entry covers `text/html`, another `text/` type other than
-`text/x-component`, `application/javascript`, `application/json` or
-`image/svg+xml`, written as a bare `type/subtype` in lower case with no
-parameters. A response is matched by the type and subtype of its
-`Content-Type`, without the parameters, so `text/plain; charset=utf-8`
-takes the entry for `text/plain`. Anything else, an image or a length
-prefixed stream among them, passes through untouched and no entry can
-cover it.
+`text/x-component`, `application/javascript` or `application/json`, written
+as a bare `type/subtype` in lower case with no parameters. A response is
+matched by the type and subtype of its `Content-Type`, without the
+parameters, so `text/plain; charset=utf-8` takes the entry for
+`text/plain`. Anything else, an image or a length prefixed stream among
+them, passes through untouched and no entry can cover it. So does a
+response that declares a charset other than UTF-8.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
-refused when the settings load, with the entry and the middleware named. On
-a media type other than HTML a middleware changes the body as a stream,
+refused when the registry is built, with the entry and the middleware named.
+On a media type other than HTML a middleware changes the body as a stream,
 after core has moved the origin's addresses in it, in the order the entry
 names them. Head markup and the element and text handlers are decisions
 about HTML, and a middleware that makes one there is refused by name. The
-fetch entry's middleware run once on what is stored, and the serve entry's
-on each reader's copy, as on a page.
+template cache stores HTML alone, so the fetch entry's middleware and then
+the serve entry's run on each response as it is fetched.
 
 **A file the origin does not have.** When the origin answers `404 Not
-Found` for a path a `[[fetch]]` entry with a `path` names middleware for,
-that middleware runs on an empty document of the entry's media type and its
-output is the file, so `ads.txt` is made from the sellers lines alone where
-the publisher has none. With no such entry, or on any other answer from the
-origin, the origin's answer stands, and an entry without a path makes
-nothing, because a page the origin does not have is the origin's answer.
+Found` for a path under the `path` of a `[[fetch]]` entry for a media type
+other than HTML, that entry's middleware runs on an empty document of its
+media type and its output is the file, so `ads.txt` is made from the sellers
+lines alone where the publisher has none. With no such entry, or on any
+other answer from the origin, the origin's answer stands, and an entry for
+HTML or without a path makes nothing, because a page the origin does not
+have is the origin's answer.
 
 ```toml
 [[fetch]]
@@ -1898,7 +1896,7 @@ generated configuration places it in.
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
-other than `text/html`, a path that does not start with `/` or that holds a
+no middleware runs on, a path that does not start with `/` or that holds a
 `*`, a `?` or a `#`, an entry that names no middleware or names one twice, a
 key an entry does not read, and an entry that an earlier one already covers.
 An entry naming a middleware that no running module supplies refuses startup,
@@ -2809,14 +2807,6 @@ response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
 positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
 Check `X-TS-Template-Cache: hit` to verify template reuse.
 
-Authorization has one narrow exception. A request carrying exactly the same
-single Basic credential that Trusted Server just validated at the edge may share
-a template; pass-through, repeated, appended, or replaced values still bypass.
-Trusted Server does not remove the validated header, so it remains forwarded to
-the publisher origin. If the origin uses that credential to select response
-content, it must declare `Vary: Authorization`; that response is deliberately not
-stored as a shared template.
-
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, and schema
@@ -3364,12 +3354,16 @@ staging key; staged deployments need their own runtime-env store.
 
 ### One blob for each host
 
-One Fastly service can serve several publishers, each from an application
-config of its own. Write `{host}` in the `__KEY` selector and the runtime
-replaces it with the host of each request before it reads any settings, so
-every host reads the blob stored under its own name.
+One Fastly service can serve several publishers, each from an app-config blob
+of its own. Write `{host}` in the `__KEY` selector and the runtime replaces it
+with the host of each request before it reads any settings, so every host
+reads the blob stored under its own name.
 
 Push a blob for each host the service answers for, then set the selector.
+Push each key in lower case. The runtime lowercases the request's host and
+`--key` stores the key as typed, so a blob pushed under
+`WWW.Publisher-A.example` is never read and every request for that host is
+answered `421`.
 
 ```bash
 ts config push --adapter fastly --key www.publisher-a.example --app-config publisher-a.toml
@@ -3396,9 +3390,11 @@ any entry of its `edgezero_runtime_env` store does, so the blobs come first.
 A host with no blob is never answered from the logical store ID or from
 another host's blob, because a shared fallback is how a host nobody configured
 comes to be served another publisher's site. A host name is letters, digits
-and hyphens in labels joined by single dots. Nothing else is looked up, so a
-request cannot name the logical store ID or a part of a stored blob, each of
-which carries an underscore.
+and hyphens in labels joined by single dots, and no label starts or ends with
+a hyphen. An IPv4 address such as `127.0.0.1` passes, and an IPv6 literal such
+as `[::1]` is refused. Nothing else is looked up, so a request cannot name the
+logical store ID or a part of a stored blob, each of which carries an
+underscore.
 
 - A publisher with several names has a blob under each. `www.publisher.example`
   and `publisher.example` are two keys, and what each serves is for the
@@ -3413,7 +3409,7 @@ which carries an underscore.
   `<logical-store-id>_staging`, which carries no placeholder. A staged version
   therefore reads that one blob for every host and never a production blob.
 - Only the Fastly adapter reads the placeholder. The Axum, Cloudflare and Spin
-  adapters read one application config.
+  adapters read one app-config blob.
 
 `./scripts/config-by-host-local-test.sh` serves two publishers from one local
 Viceroy instance. It checks that each host is answered from its own blob and

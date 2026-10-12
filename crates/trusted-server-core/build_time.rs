@@ -6,10 +6,8 @@
 
 /// Formats seconds since the Unix epoch as RFC 3339 in UTC.
 ///
-/// Written out rather than taken from a date crate, because a build script
-/// dependency is a dependency of every build of this crate and this is a dozen
-/// lines of arithmetic. Days are civil days from the epoch, using the standard
-/// days-to-civil algorithm, which is correct for any date this will see.
+/// Days are civil days from the epoch, using the standard days-to-civil
+/// algorithm, which is correct for any date this will see.
 pub(crate) fn rfc3339_utc(seconds: i64) -> String {
     let days = seconds.div_euclid(86_400);
     let rem = seconds.rem_euclid(86_400);
