@@ -36,3 +36,13 @@ pub enum CliError {
 }
 
 impl Error for CliError {}
+
+/// Formats a TOML error's location without the parser's message.
+///
+/// Parser and deserializer messages quote the offending source line or value,
+/// which can hold data an operator keeps private, so only the byte offset of
+/// the error is reported.
+pub(crate) fn toml_error_location(span: Option<core::ops::Range<usize>>) -> String {
+    span.map(|span| format!(" at byte offset {}", span.start))
+        .unwrap_or_default()
+}
