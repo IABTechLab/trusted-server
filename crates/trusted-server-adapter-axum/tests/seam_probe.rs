@@ -298,6 +298,52 @@ async fn a_vendors_shared_table_runs_its_builder() {
     );
 }
 
+/// With `refuse_all` selected every response this adapter finalizes says not
+/// to index, and the file itself is the publisher path's, made by the
+/// `robots_txt` middleware the entry names, so no route of this server names
+/// the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refusing_every_crawler_tags_every_response_and_registers_no_route() {
+    let settings = || {
+        settings_with(&format!(
+            r#"
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+            {PROBE_BLOCK}
+        "#
+        ))
+    };
+    let registered: Vec<String> =
+        TrustedServerApp::routes_with_registrations(settings(), &[seam_probe::builder()])
+            .expect("should build the routes")
+            .routes()
+            .into_iter()
+            .map(|route| route.path().to_string())
+            .collect();
+    assert!(
+        !registered.iter().any(|path| path == "/robots.txt"),
+        "the file is the publisher path's: {registered:?}"
+    );
+
+    let mut service = service_with(settings(), &[seam_probe::builder()]);
+    let other = get(&mut service, seam_probe::SEAM_PROBE_REPORT_PATH).await;
+
+    assert_eq!(
+        other
+            .headers()
+            .get("x-robots-tag")
+            .and_then(|value| value.to_str().ok()),
+        Some("noindex, nofollow"),
+        "no route may be the one page a crawler is allowed to index"
+    );
+}
+
 /// A name `[robots-txt] modules` gives that nothing the deployment runs
 /// supplies stops the adapter at startup, so the file does not fail on the
 /// first crawler to ask for it.

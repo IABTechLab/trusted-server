@@ -369,15 +369,9 @@ pub trait IntegrationProxy: Send + Sync {
 
     /// Handle the proxied request.
     ///
-    /// `call` is the route's call into the request's module context, which
-    /// carries what the request resolved to, the permissions, consent,
-    /// location, device signals and Edge Cookie identifier resolved for it,
-    /// the settings and the services. An implementation hands its own
-    /// function to [`ModuleCall::inject_with`], with `req` as its own
-    /// argument, naming what else it needs. The route holds the request
-    /// itself, so the context carries no separate copy of its evidence. A
-    /// route whose use needs a permission declares it and checks it is
-    /// granted, because nothing gates the route itself.
+    /// Hand a function to [`ModuleCall::inject_with`] with `req` as its
+    /// argument. A route whose use needs a permission declares it and checks
+    /// it is granted, because nothing gates the route itself.
     async fn handle(
         &self,
         call: ModuleCall<'_>,
@@ -1363,16 +1357,11 @@ pub struct ProxyDispatchInput<'a> {
 /// Refuses a registered middleware no entry could name, and an entry this
 /// deployment cannot run.
 ///
-/// Only knowable here, where every running module's middleware have been
-/// handed over. A name no module supplies, or one named in a phase it does not
-/// run in, would otherwise do nothing on every request and say so nowhere.
-///
-/// A middleware no entry names is left alone and logged, because a module
-/// may be selected for what else it does.
+/// A middleware no entry names is left alone and logged.
 ///
 /// # Errors
 ///
-/// Naming the integration or the entry at fault.
+/// Naming the module or the entry at fault.
 fn check_middleware(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1389,14 +1378,14 @@ fn check_middleware(
         let id = middleware.middleware_id();
         if !crate::module_name::is_valid(id) {
             return Err(refuse(format!(
-                "integration `{integration}` supplies a middleware named `{id}`, which is not a \
+                "module `{integration}` supplies a middleware named `{id}`, which is not a \
                  name an entry can write. A name is parts joined by `.`, each in lower case \
                  letters, digits, `_` or `-`"
             )));
         }
         if middleware.phases().is_empty() {
             return Err(refuse(format!(
-                "integration `{integration}` supplies the middleware `{id}`, which says it runs \
+                "module `{integration}` supplies the middleware `{id}`, which says it runs \
                  in no phase, so no entry could name it"
             )));
         }
@@ -1405,7 +1394,7 @@ fn check_middleware(
             .find(|(_, earlier)| earlier.middleware_id() == id)
         {
             return Err(refuse(format!(
-                "integrations `{earlier}` and `{integration}` both supply a middleware named \
+                "modules `{earlier}` and `{integration}` both supply a middleware named \
                  `{id}`, so an entry could not say which one it means"
             )));
         }
@@ -1445,7 +1434,7 @@ fn check_middleware(
     }
     for (integration, middleware) in unnamed_middleware(settings, inner) {
         log::warn!(
-            "Integration `{integration}` supplies the middleware `{}` and no {} entry names \
+            "Module `{integration}` supplies the middleware `{}` and no {} entry names \
              it, so it changes no page",
             middleware.middleware_id(),
             phases_of(middleware).join(" or ")
@@ -1896,9 +1885,7 @@ impl IntegrationRegistry {
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
-            // Core's own middleware for the file, made here because the
-            // contributors it asks are known only once every registration
-            // is in, and a middleware cannot reach the registry.
+            // Core's own middleware for the file, made once every registration is in.
             let selected = crate::robots_txt::select(config, &inner.robots_txt_contributors)?;
             inner.middleware.push((
                 crate::robots_txt::middleware::MODULE,
@@ -1944,23 +1931,6 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn device_module(&self) -> Option<Arc<dyn DeviceModule>> {
         self.inner.device_module.clone()
-    }
-
-    /// The robots.txt contributor `[robots-txt] modules` means by `written`,
-    /// with the name it was declared under, or `None` when nothing this
-    /// deployment runs supplies one under that name.
-    #[must_use]
-    pub fn robots_txt_contributor(
-        &self,
-        written: &str,
-    ) -> Option<(&'static str, Arc<dyn RobotsTxtContributor>)> {
-        let offered = &self.inner.robots_txt_contributors;
-        let names: Vec<&str> = offered.iter().map(|(name, _)| *name).collect();
-        let name = crate::module_name::resolve(ROBOTS_TXT_TYPE, written, &names)?;
-        offered
-            .iter()
-            .find(|(offered_name, _)| *offered_name == name)
-            .map(|(offered_name, contributor)| (*offered_name, Arc::clone(contributor)))
     }
 
     /// The name of every middleware a running module supplies, in

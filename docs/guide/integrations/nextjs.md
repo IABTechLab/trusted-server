@@ -2,7 +2,7 @@
 
 **Category**: Framework Support
 **Status**: Production
-**Type**: HTML/Script Rewriter
+**Type**: Middleware
 
 ## Overview
 

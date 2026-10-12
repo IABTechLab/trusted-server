@@ -183,7 +183,7 @@ fn services(kv: Arc<MemoryKv>) -> RuntimeServices {
     services_builder(kv).build()
 }
 
-fn spec(detachable: bool) -> CacheSpec {
+fn spec() -> CacheSpec {
     CacheSpec {
         name: "test",
         lifetimes: CacheLifetimes {
@@ -192,7 +192,7 @@ fn spec(detachable: bool) -> CacheSpec {
             store_idle: Duration::from_secs(60),
         },
         memory_entries: 16,
-        detachable,
+        detachable: false,
     }
 }
 
@@ -281,32 +281,12 @@ fn the_builder_offers_a_cache_that_keeps_values() {
 }
 
 #[test]
-fn many_callers_on_many_threads_load_a_missing_key_once_on_the_pool() {
-    let runs = Arc::new(AtomicUsize::new(0));
-    let caches = Arc::new(LoadingCaches::with_threads(2));
-    let services = services(Arc::new(MemoryKv::default()));
-
-    let answers =
-        ask_from_many_threads(&caches, &services, &spec(true), || counted(&runs, "value"));
-
-    assert_eq!(
-        runs.load(Ordering::SeqCst),
-        1,
-        "the source should be asked once"
-    );
-    for answer in answers {
-        assert_eq!(answer.expect("every caller should get the value"), "value");
-    }
-}
-
-#[test]
 fn many_callers_on_many_threads_load_a_missing_key_once_in_the_caller() {
     let runs = Arc::new(AtomicUsize::new(0));
-    let caches = Arc::new(LoadingCaches::in_caller());
+    let caches = Arc::new(LoadingCaches::new());
     let services = services(Arc::new(MemoryKv::default()));
 
-    let answers =
-        ask_from_many_threads(&caches, &services, &spec(false), || counted(&runs, "value"));
+    let answers = ask_from_many_threads(&caches, &services, &spec(), || counted(&runs, "value"));
 
     assert_eq!(
         runs.load(Ordering::SeqCst),
@@ -316,57 +296,16 @@ fn many_callers_on_many_threads_load_a_missing_key_once_in_the_caller() {
     for answer in answers {
         assert_eq!(answer.expect("every caller should get the value"), "value");
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn many_callers_on_one_thread_load_a_missing_key_once_as_a_task() {
-    // One thread serving many requests in turn, as a Cloudflare isolate does,
-    // with each load a task of its own on that thread.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let runs = Arc::new(AtomicUsize::new(0));
-            let spawned = Arc::new(AtomicUsize::new(0));
-            let counted_spawns = Arc::clone(&spawned);
-            let caches = LoadingCaches::with_local_spawner(LocalSpawner::new(move |task| {
-                counted_spawns.fetch_add(1, Ordering::SeqCst);
-                tokio::task::spawn_local(task);
-            }));
-            let services = services(Arc::new(MemoryKv::default()));
-            let spec = spec(true);
-            let key = key("k");
-
-            let answers = futures::future::join_all(
-                (0..CALLERS)
-                    .map(|_| caches.get_or_load(&services, &spec, &key, counted(&runs, "value"))),
-            )
-            .await;
-
-            assert_eq!(
-                runs.load(Ordering::SeqCst),
-                1,
-                "the source should be asked once"
-            );
-            assert_eq!(
-                spawned.load(Ordering::SeqCst),
-                1,
-                "the load should be a task of its own"
-            );
-            for answer in answers {
-                assert_eq!(answer.expect("every caller should get the value"), "value");
-            }
-        })
-        .await;
 }
 
 #[test]
 fn a_failed_load_reaches_every_waiter_and_is_not_kept() {
     let runs = Arc::new(AtomicUsize::new(0));
-    let caches = Arc::new(LoadingCaches::with_threads(2));
+    let caches = Arc::new(LoadingCaches::new());
     let kv = Arc::new(MemoryKv::default());
     let services = services(Arc::clone(&kv));
 
-    let answers = ask_from_many_threads(&caches, &services, &spec(true), || {
+    let answers = ask_from_many_threads(&caches, &services, &spec(), || {
         let runs = Arc::clone(&runs);
         Box::new(move || {
             Box::pin(async move {
@@ -397,7 +336,7 @@ fn a_failed_load_reaches_every_waiter_and_is_not_kept() {
         .build()
         .expect("should build a runtime");
     let next = runtime
-        .block_on(caches.get_or_load(&services, &spec(true), &key("k"), counted(&runs, "value")))
+        .block_on(caches.get_or_load(&services, &spec(), &key("k"), counted(&runs, "value")))
         .expect("the next caller should load again");
     assert_eq!(next, "value");
     assert_eq!(
@@ -413,12 +352,12 @@ async fn the_store_answers_another_process_without_a_load() {
     let services = services(Arc::clone(&kv));
     let runs = Arc::new(AtomicUsize::new(0));
 
-    let first = LoadingCaches::in_caller()
-        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "value"))
+    let first = LoadingCaches::new()
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
         .await
         .expect("the first process should load");
-    let second = LoadingCaches::in_caller()
-        .get_or_load(&services, &spec(false), &key("k"), never())
+    let second = LoadingCaches::new()
+        .get_or_load(&services, &spec(), &key("k"), never())
         .await
         .expect("the second process should read the store");
 
@@ -443,12 +382,12 @@ async fn a_store_that_refuses_lifetimes_still_holds_the_entry() {
     let services = services(Arc::clone(&kv));
     let runs = Arc::new(AtomicUsize::new(0));
 
-    LoadingCaches::in_caller()
-        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "value"))
+    LoadingCaches::new()
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
         .await
         .expect("the first process should load");
-    let second = LoadingCaches::in_caller()
-        .get_or_load(&services, &spec(false), &key("k"), never())
+    let second = LoadingCaches::new()
+        .get_or_load(&services, &spec(), &key("k"), never())
         .await
         .expect("the second process should read the store");
 
@@ -460,14 +399,14 @@ async fn a_store_that_refuses_lifetimes_still_holds_the_entry() {
 async fn two_publishers_never_share_an_entry() {
     let kv = Arc::new(MemoryKv::default());
     let services = services(Arc::clone(&kv));
-    let caches = LoadingCaches::in_caller();
+    let caches = LoadingCaches::new();
     let runs = Arc::new(AtomicUsize::new(0));
     let of = |domain: &str| StoreKey::new(&ServerKeyPrefix::for_domain(domain), "test", "k");
 
     let one = caches
         .get_or_load(
             &services,
-            &spec(false),
+            &spec(),
             &of("one.example"),
             counted(&runs, "one"),
         )
@@ -476,7 +415,7 @@ async fn two_publishers_never_share_an_entry() {
     let other = caches
         .get_or_load(
             &services,
-            &spec(false),
+            &spec(),
             &of("other.example"),
             counted(&runs, "other"),
         )
@@ -508,23 +447,23 @@ async fn the_memory_copy_is_brief_and_the_store_is_read_after_it() {
     let kv = Arc::new(MemoryKv::default());
     let services = services(Arc::clone(&kv));
     let (now, clock) = manual_clock();
-    let caches = LoadingCaches::in_caller().with_clock(clock);
+    let caches = LoadingCaches::new().with_clock(clock);
     let runs = Arc::new(AtomicUsize::new(0));
 
     caches
-        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "value"))
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
         .await
         .expect("should load");
     let reads = kv.reads();
     caches
-        .get_or_load(&services, &spec(false), &key("k"), never())
+        .get_or_load(&services, &spec(), &key("k"), never())
         .await
         .expect("the memory copy should answer");
     assert_eq!(kv.reads(), reads, "the memory copy should answer first");
 
     advance(&now, Duration::from_secs(6));
     caches
-        .get_or_load(&services, &spec(false), &key("k"), never())
+        .get_or_load(&services, &spec(), &key("k"), never())
         .await
         .expect("the store should answer once the memory copy has gone");
     assert_eq!(kv.reads(), reads + 1, "the store should then be read");
@@ -536,9 +475,9 @@ async fn an_entry_left_unused_for_its_idle_time_is_loaded_again() {
     let kv = Arc::new(MemoryKv::default());
     let services = services(Arc::clone(&kv));
     let (now, clock) = manual_clock();
-    let caches = LoadingCaches::in_caller().with_clock(clock);
+    let caches = LoadingCaches::new().with_clock(clock);
     let runs = Arc::new(AtomicUsize::new(0));
-    let mut idle = spec(false);
+    let mut idle = spec();
     idle.lifetimes.store = Duration::from_secs(3600);
     idle.lifetimes.store_idle = Duration::from_secs(10);
 
@@ -564,7 +503,7 @@ async fn a_value_with_a_lifetime_of_its_own_ends_by_then() {
     let kv = Arc::new(MemoryKv::default());
     let services = services(Arc::clone(&kv));
     let (now, clock) = manual_clock();
-    let caches = LoadingCaches::in_caller().with_clock(clock);
+    let caches = LoadingCaches::new().with_clock(clock);
     let runs = Arc::new(AtomicUsize::new(0));
     let short =
         |runs: &Arc<AtomicUsize>| -> Loader {
@@ -579,12 +518,12 @@ async fn a_value_with_a_lifetime_of_its_own_ends_by_then() {
         };
 
     caches
-        .get_or_load(&services, &spec(false), &key("k"), short(&runs))
+        .get_or_load(&services, &spec(), &key("k"), short(&runs))
         .await
         .expect("should load");
     advance(&now, Duration::from_secs(3));
     caches
-        .get_or_load(&services, &spec(false), &key("k"), short(&runs))
+        .get_or_load(&services, &spec(), &key("k"), short(&runs))
         .await
         .expect("should load again");
 
@@ -603,10 +542,10 @@ async fn a_reserving_value_cache_is_filled_by_the_load_and_released_by_a_failure
         .build();
     let runs = Arc::new(AtomicUsize::new(0));
 
-    let failed = LoadingCaches::in_caller()
+    let failed = LoadingCaches::new()
         .get_or_load(
             &services,
-            &spec(false),
+            &spec(),
             &key("k"),
             Box::new(|| Box::pin(async { Err(LoadError::new("down")) })),
         )
@@ -619,8 +558,8 @@ async fn a_reserving_value_cache_is_filled_by_the_load_and_released_by_a_failure
     );
     assert_eq!(cache.filled.load(Ordering::SeqCst), 0);
 
-    let value = LoadingCaches::in_caller()
-        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "value"))
+    let value = LoadingCaches::new()
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
         .await
         .expect("should load");
     assert_eq!(value, "value");
@@ -630,8 +569,8 @@ async fn a_reserving_value_cache_is_filled_by_the_load_and_released_by_a_failure
         "the load should fill the reservation"
     );
 
-    let again = LoadingCaches::in_caller()
-        .get_or_load(&services, &spec(false), &key("k"), never())
+    let again = LoadingCaches::new()
+        .get_or_load(&services, &spec(), &key("k"), never())
         .await
         .expect("another process should read the filled entry");
     assert_eq!(again, "value");
@@ -641,16 +580,16 @@ async fn a_reserving_value_cache_is_filled_by_the_load_and_released_by_a_failure
 async fn remove_drops_the_memory_copy_and_the_stored_one() {
     let kv = Arc::new(MemoryKv::default());
     let services = services(Arc::clone(&kv));
-    let caches = LoadingCaches::in_caller();
+    let caches = LoadingCaches::new();
     let runs = Arc::new(AtomicUsize::new(0));
 
     caches
-        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "old"))
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "old"))
         .await
         .expect("should load");
-    caches.remove(&services, &spec(false), &key("k")).await;
+    caches.remove(&services, &spec(), &key("k")).await;
     let fresh = caches
-        .get_or_load(&services, &spec(false), &key("k"), counted(&runs, "new"))
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "new"))
         .await
         .expect("should load again");
 

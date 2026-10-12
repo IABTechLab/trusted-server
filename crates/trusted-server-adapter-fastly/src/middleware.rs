@@ -18,7 +18,7 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_diagnostic_headers};
+use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
 use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
 use trusted_server_core::settings::Settings;
 
@@ -104,7 +104,7 @@ impl Middleware for FinalizeResponseMiddleware {
         };
 
         // Before finalizing, so a header finalizing writes is kept.
-        strip_diagnostic_headers(&path, ROUTE_NAMESPACE, &mut response);
+        strip_deployment_headers(&path, ROUTE_NAMESPACE, &mut response);
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
         response
             .headers_mut()
@@ -841,41 +841,18 @@ mod tests {
     }
 
     #[test]
-    fn finalize_middleware_strips_diagnostic_headers_from_a_publisher_page() {
-        let response = finalized(
-            "/articles/an-article",
-            settings_with_response_headers(vec![]),
-        );
-
-        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
-            assert!(
-                !response.headers().contains_key(name),
-                "should strip {name} from a publisher's page"
-            );
-        }
-    }
-
-    #[test]
-    fn finalize_middleware_keeps_diagnostic_headers_on_the_servers_own_path() {
-        let response = finalized("/_ts/permissions", settings_with_response_headers(vec![]));
-
-        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
-            assert!(
-                response.headers().contains_key(name),
-                "should keep {name} where a deployment is asked about itself"
-            );
-        }
-    }
-
-    /// The strip comes before finalizing, so a header an operator configures
-    /// reaches every page even when its name is a diagnostic one.
-    #[test]
-    fn finalize_middleware_keeps_a_diagnostic_header_the_operator_configures() {
+    fn finalize_middleware_strips_deployment_headers_before_it_writes_the_operators() {
         let response = finalized(
             "/articles/an-article",
             settings_with_response_headers(vec![("X-Cache", "configured")]),
         );
 
+        for name in ["x-served-by", "x-cache-hits"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should strip {name} from a publisher's page"
+            );
+        }
         assert_eq!(
             response
                 .headers()
