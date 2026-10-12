@@ -1,38 +1,13 @@
 //! What a deployment holds against the reader's own Edge Cookie, at
 //! [`DATA_PAGE_PATH`].
 //!
-//! A deployment that writes an identifier to a browser can show the person
-//! using that browser what it keeps against it, being when the record was
-//! made, the consent recorded, the location and device class kept, and which
-//! partners hold an identifier of their own for the same browser.
-//!
-//! # Who can read it
-//!
-//! The Edge Cookie is `HttpOnly`, so a script on the page cannot read the
-//! identifier, and this page does not undo that.
-//!
 //! 1. Only a browser opening the address as a page is answered, which the
 //!    browser marks with `Sec-Fetch-Mode: navigate` and
-//!    `Sec-Fetch-Dest: document`. A script cannot set either header, so its
-//!    `fetch` is refused, and so is a frame.
+//!    `Sec-Fetch-Dest: document`.
 //! 2. The page is sent with `Content-Security-Policy: sandbox`, which gives
 //!    the document an origin of its own, so a page that opened it cannot
 //!    read it.
-//! 3. No identifier is shown. The Edge Cookie's value and each partner's
-//!    identifier show as [`MASK`], so the page never carries what the
-//!    `HttpOnly` cookie keeps from scripts.
-//! 4. It is never stored, and no other origin is told it may read it.
-//!
-//! Two parties other than the reader can still read the page, and neither
-//! finds an identifier in it.
-//!
-//! - Whoever holds an identifier, because the record shown is the one stored
-//!   against the identifier in the request's own cookie, and a tool can send
-//!   a cookie and both headers itself.
-//! - A service worker the publisher's site registers for the whole site,
-//!   because it handles this navigation as it does every other on the site.
-//!
-//! There is no `.json` form, because the answer is for a person.
+//! 3. No identifier is shown.
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
@@ -43,6 +18,7 @@ use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::KvEntry;
 use crate::ec::module::{AcceptedModules, EdgeCookieModule};
 use crate::error::TrustedServerError;
+use crate::response_privacy::RequiredHeaders;
 
 use super::{MASK, render_page_with_lede};
 
@@ -109,9 +85,8 @@ pub fn handle_data(
 
 /// Whether `req` is a browser opening the address as a page of its own.
 ///
-/// A browser sets both headers itself and a script cannot set either, so a
-/// `fetch`, a frame and an embedded object all fail this, as does a client
-/// that sends neither.
+/// A browser sends `Sec-Fetch-*` only to a trustworthy origin, so every
+/// browser on a plain `http://` host other than localhost fails this.
 fn is_opened_as_a_page(req: &Request<EdgeBody>) -> bool {
     let is = |name: &str, expected: &str| {
         req.headers()
@@ -169,8 +144,10 @@ fn page(payload: &Value) -> Response<EdgeBody> {
 
 /// A response only the person looking at it can read, being never stored,
 /// never framed, in an origin of its own, and offered to no other origin.
+/// Its headers are [`RequiredHeaders`], so an operator's own headers of the
+/// same names cannot replace them.
 fn protected(status: StatusCode, content_type: &'static str, body: String) -> Response<EdgeBody> {
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
         .header(
@@ -195,7 +172,10 @@ fn protected(status: StatusCode, content_type: &'static str, body: String) -> Re
             HeaderValue::from_static("same-origin"),
         )
         .body(EdgeBody::from(body.into_bytes()))
-        .expect("should build the data response")
+        .expect("should build the data response");
+    let required = response.headers().clone();
+    response.extensions_mut().insert(RequiredHeaders(required));
+    response
 }
 
 #[cfg(test)]

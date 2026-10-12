@@ -71,8 +71,9 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
-    /// The loading cache the linked builders offer, taken once here so every
-    /// request in the process shares its memory copy and waits for one load.
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
     loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
@@ -298,10 +299,9 @@ where
     let services = state.services_for_request(&ctx);
     let mut req = ctx.into_request();
     // The single preparation point for the adapter. Every route in the table
-    // except `/health` and the attestation pages is registered to
-    // `named_route_handler` or `fallback_handler`, and both wrap this
-    // function, so each request has its modules' preparers run exactly once
-    // and always before routing.
+    // except `/health` is registered to `named_route_handler` or
+    // `fallback_handler`, and both wrap this function, so each request has its
+    // modules' preparers run exactly once and always before routing.
     if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&error));
     }
@@ -824,10 +824,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
     }
 
-    // The attestation pages answer at the address the settings choose, so
-    // they are registered here rather than with the fixed routes. Reads reach
-    // the handler, and other methods reach the publisher's origin unless the
-    // deployment owns the prefix.
+    // Routes chosen by the settings, so not in the fixed table.
     let routes = prefix_routes(&state.settings);
     if !routes.is_empty() {
         let attestation = attestation_route_handler(Arc::clone(state));

@@ -595,8 +595,6 @@ impl AuctionProvider for SeamProbeAdServer {
 pub struct SeamProbeProxy;
 
 impl SeamProbeProxy {
-    /// Answers the request, with the services the route names in its module
-    /// call.
     async fn route(
         &self,
         req: Request<EdgeBody>,
@@ -784,8 +782,8 @@ pub fn builder() -> IntegrationBuilder {
         .with_adserver(&SEAM_PROBE_ADSERVER)
 }
 
-/// The vendor's folder under `crates/shared`, which names the table
-/// `[shared.seam-probe]` that runs [`shared_builder`].
+/// The vendor's name, which names the table `[shared.seam-probe]` that runs
+/// [`shared_builder`].
 pub const SEAM_PROBE_SHARED_VENDOR: &str = "seam-probe";
 
 /// The id of the builder the shared table runs.

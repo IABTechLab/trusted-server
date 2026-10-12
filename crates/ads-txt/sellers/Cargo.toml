@@ -22,9 +22,7 @@ validator = { workspace = true }
 [dev-dependencies]
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
-# The visible owner of this crate, the way Prebid.js requires a named
-# maintainer of every adapter. The module is the project's own, because it
-# writes what the settings say and names no vendor.
+# The visible owner of this crate.
 [package.metadata.maintainers]
 owner = "Trusted Server maintainers"
 status = "project owned"

@@ -90,8 +90,9 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
-    /// The loading cache the builders this state was built with offer, or one
-    /// that holds nothing when none does, handed to every request's services.
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
     loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
@@ -1100,10 +1101,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
             }
         }
-        // The attestation pages answer at the address the settings choose, so
-        // they are registered here rather than with the fixed routes. Reads reach
-        // the handler, and other methods reach the publisher's origin unless the
-        // deployment owns the prefix.
+        // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
             let s = Arc::clone(&state);

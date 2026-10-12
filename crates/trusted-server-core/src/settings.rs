@@ -320,25 +320,12 @@ impl TypeSections {
     }
 }
 
-/// The settings type a module reads from its table, beneath the section that
-/// selects it.
-///
-/// The type states which settings the module takes and how they are
-/// validated, and nothing else. Whether the module runs is not its business,
-/// because the section's selection names what runs.
-/// The section, and the folder under `crates`, that holds what one vendor's
-/// modules share.
+/// The section that holds what one vendor's modules share.
 pub const SHARED_TYPE: &str = "shared";
 
 /// The `[shared]` section, one `[shared.<vendor>]` table per vendor, holding
 /// the settings every module of that vendor reads, such as an endpoint and a
-/// license key.
-///
-/// Core reads none of it. A vendor's crates read their own table through
-/// [`Settings::shared_config`], and a builder marked with
-/// [`IntegrationBuilder::with_shared_settings`](crate::integrations::IntegrationBuilder::with_shared_settings)
-/// runs when its vendor's table is present. A table that no builder reads is
-/// refused where the registry is built, the only place every builder is known.
+/// license key, read through [`Settings::shared_config`].
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct SharedTables(BTreeMap<String, serde_json::Map<String, JsonValue>>);
@@ -399,9 +386,8 @@ impl SharedTables {
         Ok(Some(config))
     }
 
-    /// Refuses a table whose name is not one folder name, being lower case
-    /// letters, digits, `_` or `-`, because a vendor's table is named by its
-    /// folder under `crates/shared`.
+    /// Refuses a table whose name is not a vendor's name, being lower case
+    /// letters, digits, `_` or `-`.
     ///
     /// # Errors
     ///
@@ -414,8 +400,8 @@ impl SharedTables {
             Some(vendor) => Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "[{SHARED_TYPE}] has a table named `{vendor}`, which is not a vendor's \
-                     folder name. A vendor's shared table is named by its folder under \
-                     crates/{SHARED_TYPE}, of lower case letters, digits, `_` or `-`"
+                     name. A vendor's shared table is named in lower case letters, \
+                     digits, `_` or `-`"
                 ),
             })),
             None => Ok(()),
@@ -423,6 +409,12 @@ impl SharedTables {
     }
 }
 
+/// The settings type a module reads from its table, beneath the section that
+/// selects it.
+///
+/// The type states which settings the module takes and how they are
+/// validated, and nothing else. Whether the module runs is not its business,
+/// because the section's selection names what runs.
 pub trait IntegrationConfig: DeserializeOwned + Validate {}
 
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
@@ -2723,9 +2715,9 @@ impl Proxy {
     }
 }
 
-/// The table holding the auction telemetry module's settings, which every
-/// message about them names.
-const TELEMETRY_TABLE: &str = "analytics.tinybird";
+/// The analytics module's name in full, which is also the table holding its
+/// settings and which every message about them names.
+const ANALYTICS_MODULE: &str = "analytics.tinybird";
 
 /// Direct Tinybird Events API telemetry configuration, the settings of the
 /// module `[analytics]` selects.
@@ -2797,7 +2789,7 @@ impl TinybirdSettings {
         self.api_host = self.api_host.trim().to_ascii_lowercase();
         if self.secret_store.take().is_some() {
             log::warn!(
-                "{TELEMETRY_TABLE}.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+                "{ANALYTICS_MODULE}.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
             );
         }
         self.auction_dataset = self.auction_dataset.trim().to_owned();
@@ -2814,37 +2806,37 @@ impl TinybirdSettings {
         if !(0.0..=1.0).contains(&self.access_sample_rate) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "{TELEMETRY_TABLE}.access_sample_rate must be between 0.0 and 1.0"
+                    "{ANALYTICS_MODULE}.access_sample_rate must be between 0.0 and 1.0"
                 ),
             }));
         }
         if self.max_body_bytes < 1024 {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: format!("{TELEMETRY_TABLE}.max_body_bytes must be at least 1024"),
+                message: format!("{ANALYTICS_MODULE}.max_body_bytes must be at least 1024"),
             }));
         }
         if self.access_enabled {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "{TELEMETRY_TABLE}.access_enabled is reserved for future access-log telemetry; no emitter is currently wired"
+                    "{ANALYTICS_MODULE}.access_enabled is reserved for future access-log telemetry; no emitter is currently wired"
                 ),
             }));
         }
         validate_tinybird_api_host(&self.api_host)?;
         validate_tinybird_dataset(
             &self.auction_dataset,
-            &format!("{TELEMETRY_TABLE}.auction_dataset"),
+            &format!("{ANALYTICS_MODULE}.auction_dataset"),
         )?;
         let token = self.auction_token_secret.as_ref().ok_or_else(|| {
             Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "{TELEMETRY_TABLE}.auction_token_secret is required when [analytics] selects the module"
+                    "{ANALYTICS_MODULE}.auction_token_secret is required when [analytics] selects the module"
                 ),
             })
         })?;
         validate_tinybird_secret(
             token.expose(),
-            &format!("{TELEMETRY_TABLE}.auction_token_secret"),
+            &format!("{ANALYTICS_MODULE}.auction_token_secret"),
         )
     }
 }
@@ -2859,13 +2851,13 @@ fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerErro
     {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!(
-                "{TELEMETRY_TABLE}.api_host must be a regional host without scheme, port, or path"
+                "{ANALYTICS_MODULE}.api_host must be a regional host without scheme, port, or path"
             ),
         }));
     }
     validate_host_header_override_value(host).map_err(|reason| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("{TELEMETRY_TABLE}.api_host {reason}"),
+            message: format!("{ANALYTICS_MODULE}.api_host {reason}"),
         })
     })
 }
@@ -2893,48 +2885,43 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
     Ok(())
 }
 
-/// The `[analytics]` section, named by the folder analytics modules take
-/// under `crates/`.
-///
-/// Its one module is the auction telemetry, which runs when `module` selects
-/// it, written in full or by its name within the section, with its settings
-/// in the table at that name.
+/// The `[analytics]` section, selecting the module that sends auction telemetry.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyticsConfig {
     /// The module that runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
-    /// The telemetry module's settings.
+    /// The analytics module's settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tinybird: Option<TinybirdSettings>,
 }
 
-/// Whether `written`, selected in `[analytics]`, names the telemetry module,
+/// Whether `written`, selected in `[analytics]`, names the analytics module,
 /// in full or by its name within the section.
-fn names_telemetry(written: &str) -> bool {
-    written == TELEMETRY_TABLE
-        || written == crate::module_name::short_form("analytics", TELEMETRY_TABLE)
+fn names_analytics_module(written: &str) -> bool {
+    written == ANALYTICS_MODULE
+        || written == crate::module_name::short_form("analytics", ANALYTICS_MODULE)
 }
 
-/// Whether the document `data` selects the telemetry module in `[analytics]`,
+/// Whether the document `data` selects the analytics module in `[analytics]`,
 /// read before the settings are, to tell which secret references are live.
-pub(crate) fn document_selects_telemetry(data: &JsonValue) -> bool {
+pub(crate) fn document_selects_analytics_module(data: &JsonValue) -> bool {
     data.pointer("/analytics/module")
         .and_then(JsonValue::as_str)
-        .is_some_and(names_telemetry)
+        .is_some_and(names_analytics_module)
 }
 
 impl AnalyticsConfig {
-    /// Whether `module` selects the telemetry module.
-    fn selects_telemetry(&self) -> bool {
-        self.module.as_deref().is_some_and(names_telemetry)
+    /// Whether `module` selects the analytics module.
+    fn selects_analytics_module(&self) -> bool {
+        self.module.as_deref().is_some_and(names_analytics_module)
     }
 
-    /// The telemetry module's settings, when `module` selects it.
+    /// The analytics module's settings, when `module` selects it.
     #[must_use]
-    pub fn telemetry(&self) -> Option<&TinybirdSettings> {
-        if self.selects_telemetry() {
+    pub fn analytics_module(&self) -> Option<&TinybirdSettings> {
+        if self.selects_analytics_module() {
             self.tinybird.as_ref()
         } else {
             None
@@ -2948,26 +2935,23 @@ impl AnalyticsConfig {
     }
 
     /// Refuses a section that selects nothing or a module this build does
-    /// not have, and checks the selected module's settings. A table the
-    /// selection does not name cannot pass, because the one table there is
-    /// can only be named by selecting its module.
+    /// not have, and checks the selected module's settings.
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
-        let short = crate::module_name::short_form("analytics", TELEMETRY_TABLE);
+        let short = crate::module_name::short_form("analytics", ANALYTICS_MODULE);
         match self.module.as_deref() {
             None => {
                 return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "[analytics] selects no module. Select one with [analytics] module = \
-                         \"<name>\", or remove the section. The analytics modules this build \
-                         has are: {short}"
-                    ),
+                    message: "[analytics] selects no module. A module type's section names \
+                              what runs with `module` or `modules`, so select one or remove \
+                              the section"
+                        .to_owned(),
                 }));
             }
-            Some(written) if !self.selects_telemetry() => {
+            Some(written) if !self.selects_analytics_module() => {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "[analytics] module names `{written}`, which this build does not have. \
-                         The analytics modules it has are: {short}"
+                        "[analytics] selects `{written}`, which no module this deployment \
+                         supplies. The analytics modules it supplies are [{short}]"
                     ),
                 }));
             }
@@ -3015,10 +2999,9 @@ pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadingCacheConfig {
-    /// The module whose loading cache holds this feature's copies, as its
-    /// short name or in full, for example `51degrees` or
-    /// `loading-cache.51degrees`. Absent, the feature keeps no copy and loads
-    /// on every call.
+    /// The module whose loading cache holds this cache's copies, as its short
+    /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
+    /// Absent, no copy is kept and every call loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero
@@ -3091,8 +3074,8 @@ fn check_loading_cache_seconds(
 }
 
 impl CacheSettings {
-    /// Each feature whose copies a loading cache holds, by the name of its
-    /// cache, with the settings its `[cache.<name>]` table carries.
+    /// Each cache a loading cache may hold, by its name, with the settings
+    /// its `[cache.<name>]` table carries.
     #[must_use]
     pub fn loading_caches(&self) -> [(&'static str, &LoadingCacheConfig); 1] {
         [(ROBOTS_TXT_CACHE, &self.robots_txt)]
@@ -3815,9 +3798,7 @@ refused_table! {
     /// The `[tinybird]` table, now `[analytics.tinybird]`.
     MovedTinybirdTable => "Configuration table `[tinybird]` is now `[analytics.tinybird]`. \
         Select it with `[analytics] module = \"tinybird\"`, which replaces its `enabled` \
-        line, and move its other settings there unchanged. A stored configuration written by \
-        an earlier version carries the table even where telemetry was off, so push the \
-        configuration again with this version"
+        line, and move its other settings there unchanged"
 }
 
 refused_table! {
@@ -4331,10 +4312,12 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
-    /// The auction telemetry module's settings, when `[analytics]` selects it.
+    /// The analytics module's settings, when `[analytics]` selects it.
     #[must_use]
-    pub fn telemetry(&self) -> Option<&TinybirdSettings> {
-        self.analytics.as_ref().and_then(AnalyticsConfig::telemetry)
+    pub fn analytics_module(&self) -> Option<&TinybirdSettings> {
+        self.analytics
+            .as_ref()
+            .and_then(AnalyticsConfig::analytics_module)
     }
 
     pub(crate) fn normalize_deserialized(&mut self) {
@@ -4455,26 +4438,55 @@ impl Settings {
         Ok(())
     }
 
-    /// Refuses a `[robots-txt]` section that no `[[fetch]]` or `[[serve]]`
-    /// entry for `text/plain` names the `robots_txt` middleware for, because
-    /// the file would never be made.
+    /// Refuses a `[robots-txt]` section unless a `[[fetch]]` entry for
+    /// `text/plain` with `path = "/robots.txt"` names the `robots_txt`
+    /// middleware, and refuses any entry naming it on another path or media
+    /// type. Only a `[[fetch]]` entry makes the file where the origin has
+    /// none, and an entry on another path would replace that file with the
+    /// robots.txt rules.
     fn require_robots_txt_placed(&self) -> Result<(), Report<TrustedServerError>> {
+        use crate::robots_txt::ROBOTS_TXT_PATH;
         use crate::robots_txt::middleware::{MEDIA_TYPE, MODULE};
 
-        let placed = [&self.fetch, &self.serve].iter().any(|entries| {
-            entries.entries().iter().any(|entry| {
-                entry.media_type == MEDIA_TYPE && entry.middleware.iter().any(|name| name == MODULE)
-            })
-        });
-        if placed {
+        let names = |entry: &crate::middleware::PhaseEntry| {
+            entry.middleware.iter().any(|name| name == MODULE)
+        };
+        let on_the_file = |entry: &crate::middleware::PhaseEntry| {
+            entry.media_type == MEDIA_TYPE && entry.path.as_deref() == Some(ROBOTS_TXT_PATH)
+        };
+        for (phase, entries) in [("fetch", &self.fetch), ("serve", &self.serve)] {
+            for (index, entry) in entries.entries().iter().enumerate() {
+                if names(entry) && !on_the_file(entry) {
+                    return Err(Report::new(TrustedServerError::Settings {
+                        message: format!(
+                            "[[{phase}]] entry {} names `{MODULE}` for `{}` on {}, where it \
+                             would replace each file it covers with robots.txt. Name it only \
+                             in an entry with media_type = `{MEDIA_TYPE}` and path = \
+                             `{ROBOTS_TXT_PATH}`",
+                            index + 1,
+                            entry.media_type,
+                            entry.path.as_deref().map_or_else(
+                                || "every path".to_owned(),
+                                |path| format!("`{path}`")
+                            ),
+                        ),
+                    }));
+                }
+            }
+        }
+        if self
+            .fetch
+            .entries()
+            .iter()
+            .any(|entry| names(entry) && on_the_file(entry))
+        {
             return Ok(());
         }
         Err(Report::new(TrustedServerError::Settings {
             message: format!(
-                "[robots-txt] is set, but no [[fetch]] or [[serve]] entry for `{MEDIA_TYPE}` \
-                 names `{MODULE}`, so the file would never be made. Add an entry with \
-                 media_type = `{MEDIA_TYPE}`, path = `{}` and the middleware",
-                crate::robots_txt::ROBOTS_TXT_PATH
+                "[robots-txt] is set, but no [[fetch]] entry with media_type = `{MEDIA_TYPE}` and \
+                 path = `{ROBOTS_TXT_PATH}` names `{MODULE}`, so the file would never be made \
+                 where the origin has none. Add that entry"
             ),
         }))
     }
@@ -5269,8 +5281,65 @@ mod tests {
 
         let message = format!("{error:?}");
         assert!(
-            message.contains("no [[fetch]] or [[serve]] entry for `text/plain` names `robots_txt`"),
+            message.contains(
+                "no [[fetch]] entry with media_type = `text/plain` and path = `/robots.txt` names \
+                 `robots_txt`"
+            ),
             "{message}"
+        );
+    }
+
+    /// The `[[fetch]]` or `[[serve]]` entry placing the middleware on
+    /// `/robots.txt`.
+    const ROBOTS_TXT_ENTRY: &str =
+        "media_type = \"text/plain\"\npath = \"/robots.txt\"\nmiddleware = [\"robots_txt\"]\n";
+
+    /// Settings with `[robots-txt]` refusing every crawler and `entries`.
+    fn settings_str_placing_robots_txt(entries: &str) -> String {
+        format!(
+            "{}\n[robots-txt]\nmodules = \"refuse_all\"\n\n{entries}\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn a_fetch_entry_on_the_files_path_places_robots_txt() {
+        let toml = settings_str_placing_robots_txt(&format!(
+            "[[fetch]]\n{ROBOTS_TXT_ENTRY}\n[[serve]]\n{ROBOTS_TXT_ENTRY}"
+        ));
+
+        Settings::from_toml(&toml).expect("an entry on the file's path places the middleware");
+    }
+
+    /// An entry with no path would replace every text file, `ads.txt`
+    /// included, with the robots.txt rules.
+    #[test]
+    fn an_entry_naming_robots_txt_on_another_path_is_refused() {
+        let toml = settings_str_placing_robots_txt(&format!(
+            "[[fetch]]\n{ROBOTS_TXT_ENTRY}\n[[fetch]]\nmedia_type = \"text/plain\"\nmiddleware = [\"robots_txt\"]\n"
+        ));
+
+        let error = Settings::from_toml(&toml).expect_err("every text file would be robots.txt");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("[[fetch]] entry 2 names `robots_txt` for `text/plain` on every path"),
+            "{message}"
+        );
+    }
+
+    /// Only a `[[fetch]]` entry makes the file where the origin has none, so
+    /// a `[[serve]]` placement alone would leave an origin's `404` standing,
+    /// which a crawler reads as permission to crawl everything.
+    #[test]
+    fn robots_txt_placed_only_in_serve_is_refused() {
+        let toml = settings_str_placing_robots_txt(&format!("[[serve]]\n{ROBOTS_TXT_ENTRY}"));
+
+        let error = Settings::from_toml(&toml).expect_err("the file would never be made");
+
+        assert!(
+            format!("{error:?}").contains("no [[fetch]] entry with media_type = `text/plain`"),
+            "{error:?}"
         );
     }
 
@@ -5581,7 +5650,7 @@ module = \"none\"",
         settings.proxy.asset_routes = vec![asset_route];
 
         settings.analytics = Some(AnalyticsConfig {
-            module: Some(TELEMETRY_TABLE.to_string()),
+            module: Some(ANALYTICS_MODULE.to_string()),
             tinybird: Some(TinybirdSettings {
                 auction_token_secret: Some(Redacted::new(
                     CANARY_TINYBIRD_AUCTION_TOKEN.to_string(),
@@ -6407,9 +6476,9 @@ module = \"none\"",
         );
     }
 
-    /// `[analytics]` selecting the telemetry module, with `table` as the
+    /// `[analytics]` selecting the analytics module, with `table` as the
     /// lines of its settings table.
-    fn settings_str_with_telemetry(table: &str) -> String {
+    fn settings_str_with_analytics_module(table: &str) -> String {
         format!(
             "{}\n[analytics]\nmodule = \"tinybird\"\n\n[analytics.tinybird]\n{table}\n",
             crate_test_settings_str()
@@ -6417,16 +6486,19 @@ module = \"none\"",
     }
 
     /// The lines of a telemetry table that passes every check.
-    const TELEMETRY_LINES: &str =
+    const ANALYTICS_MODULE_LINES: &str =
         "api_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"";
 
     #[test]
-    fn settings_without_an_analytics_section_select_no_telemetry() {
+    fn settings_without_an_analytics_section_select_no_module() {
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without an analytics section");
 
         assert!(settings.analytics.is_none(), "should hold no section");
-        assert!(settings.telemetry().is_none(), "should select no telemetry");
+        assert!(
+            settings.analytics_module().is_none(),
+            "should select no module"
+        );
         let value = serde_json::to_value(&settings).expect("should serialize the settings");
         assert!(
             value.get("analytics").is_none() && value.get("tinybird").is_none(),
@@ -6435,27 +6507,28 @@ module = \"none\"",
     }
 
     #[test]
-    fn the_telemetry_module_is_selected_by_its_short_or_full_name() {
+    fn the_analytics_module_is_selected_by_its_short_or_full_name() {
         for name in ["tinybird", "analytics.tinybird"] {
             let toml = format!(
-                "{}\n[analytics]\nmodule = \"{name}\"\n\n[analytics.tinybird]\n{TELEMETRY_LINES}\n",
+                "{}\n[analytics]\nmodule = \"{name}\"\n\n[analytics.tinybird]\n{ANALYTICS_MODULE_LINES}\n",
                 crate_test_settings_str()
             );
 
             let settings = Settings::from_toml(&toml).expect("should accept the selection");
 
             let telemetry = settings
-                .telemetry()
-                .expect("should select the telemetry module");
+                .analytics_module()
+                .expect("should select the analytics module");
             assert_eq!(telemetry.api_host, "api.us-east.aws.tinybird.co");
             assert_eq!(telemetry.auction_dataset, "auction_events_raw");
         }
     }
 
     #[test]
-    fn a_selected_telemetry_module_survives_the_stored_form() {
-        let settings = Settings::from_toml(&settings_str_with_telemetry(TELEMETRY_LINES))
-            .expect("should accept the selection");
+    fn a_selected_analytics_module_survives_the_stored_form() {
+        let settings =
+            Settings::from_toml(&settings_str_with_analytics_module(ANALYTICS_MODULE_LINES))
+                .expect("should accept the selection");
 
         let stored = serde_json::to_value(&settings).expect("should serialize the settings");
 
@@ -6471,8 +6544,9 @@ module = \"none\"",
     }
 
     #[test]
-    fn the_telemetry_module_needs_a_regional_host() {
-        let toml = settings_str_with_telemetry("api_host = \"https://api.example.com/path\"");
+    fn the_analytics_module_needs_a_regional_host() {
+        let toml =
+            settings_str_with_analytics_module("api_host = \"https://api.example.com/path\"");
 
         let err = Settings::from_toml(&toml).expect_err("should reject invalid api host");
 
@@ -6483,8 +6557,8 @@ module = \"none\"",
     }
 
     #[test]
-    fn the_telemetry_module_needs_its_token() {
-        let toml = settings_str_with_telemetry("api_host = \"api.us-east.aws.tinybird.co\"");
+    fn the_analytics_module_needs_its_token() {
+        let toml = settings_str_with_analytics_module("api_host = \"api.us-east.aws.tinybird.co\"");
 
         let err = Settings::from_toml(&toml).expect_err("should require the token");
 
@@ -6498,7 +6572,7 @@ module = \"none\"",
     }
 
     #[test]
-    fn a_selected_telemetry_module_with_no_table_is_told_what_it_needs() {
+    fn a_selected_analytics_module_with_no_table_is_told_what_it_needs() {
         let toml = format!(
             "{}\n[analytics]\nmodule = \"tinybird\"\n",
             crate_test_settings_str()
@@ -6514,8 +6588,9 @@ module = \"none\"",
 
     #[test]
     fn access_telemetry_is_rejected_until_an_emitter_is_wired() {
-        let toml =
-            settings_str_with_telemetry(&format!("{TELEMETRY_LINES}\naccess_enabled = true"));
+        let toml = settings_str_with_analytics_module(&format!(
+            "{ANALYTICS_MODULE_LINES}\naccess_enabled = true"
+        ));
 
         let err = Settings::from_toml(&toml)
             .expect_err("should reject access telemetry before an emitter exists");
@@ -6529,7 +6604,7 @@ module = \"none\"",
     #[test]
     fn an_analytics_section_selecting_nothing_is_refused() {
         let toml = format!(
-            "{}\n[analytics.tinybird]\n{TELEMETRY_LINES}\n",
+            "{}\n[analytics.tinybird]\n{ANALYTICS_MODULE_LINES}\n",
             crate_test_settings_str()
         );
 
@@ -6552,11 +6627,13 @@ module = \"none\"",
         let message = format!("{err:?}");
 
         assert!(
-            message.contains("[analytics] module names `another`, which this build does not have"),
+            message.contains(
+                "[analytics] selects `another`, which no module this deployment supplies"
+            ),
             "should name what was written: {message}"
         );
         assert!(
-            message.contains("has are: tinybird"),
+            message.contains("The analytics modules it supplies are [tinybird]"),
             "should list what can be selected: {message}"
         );
     }
@@ -6564,7 +6641,7 @@ module = \"none\"",
     /// The token is a secret reference, and an empty or absent one is refused
     /// as the settings load, before any deploy step sees the document.
     #[test]
-    fn a_telemetry_token_reference_that_is_empty_or_absent_is_refused_when_the_settings_load() {
+    fn an_analytics_token_reference_that_is_empty_or_absent_is_refused_when_the_settings_load() {
         for (case, table) in [
             (
                 "an empty token",
@@ -6572,7 +6649,7 @@ module = \"none\"",
             ),
             ("no token", "api_host = \"api.us-east.aws.tinybird.co\""),
         ] {
-            let err = Settings::from_toml(&settings_str_with_telemetry(table))
+            let err = Settings::from_toml(&settings_str_with_analytics_module(table))
                 .err()
                 .unwrap_or_else(|| panic!("{case}: the settings should not load"));
 
@@ -6584,8 +6661,10 @@ module = \"none\"",
     }
 
     #[test]
-    fn a_telemetry_table_refuses_a_key_it_does_not_know() {
-        let toml = settings_str_with_telemetry(&format!("{TELEMETRY_LINES}\nenabled = true"));
+    fn the_analytics_module_table_refuses_a_key_it_does_not_know() {
+        let toml = settings_str_with_analytics_module(&format!(
+            "{ANALYTICS_MODULE_LINES}\nenabled = true"
+        ));
 
         let err = Settings::from_toml(&toml).expect_err("the enabled line is gone");
 
@@ -6596,14 +6675,14 @@ module = \"none\"",
     }
 
     #[test]
-    fn a_table_the_section_does_not_select_gives_no_telemetry() {
+    fn a_table_the_section_does_not_select_gives_no_analytics_module() {
         let analytics = AnalyticsConfig {
             module: None,
             tinybird: Some(TinybirdSettings::default()),
         };
 
         assert!(
-            analytics.telemetry().is_none(),
+            analytics.analytics_module().is_none(),
             "a table nothing selects should give no settings"
         );
     }
@@ -10710,13 +10789,13 @@ mod permission_signal_config_tests {
         }
 
         #[test]
-        fn a_shared_table_not_named_as_a_folder_is_refused() {
+        fn a_shared_table_not_named_as_a_vendor_is_refused() {
             for table in ["[shared.Example]", "[shared.\"an.example\"]"] {
                 let refused = with(&format!("{table}\nendpoint = \"https://api.example.com\""))
                     .expect_err("a vendor's table is named by its folder");
 
                 assert!(
-                    format!("{refused:?}").contains("which is not a vendor's folder name"),
+                    format!("{refused:?}").contains("which is not a vendor's name"),
                     "{table}: {refused:?}"
                 );
             }

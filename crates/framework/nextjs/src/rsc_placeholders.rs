@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use trusted_server_core::integrations::ScriptRewriteAction;
+use trusted_server_core::middleware::TextHandler;
 
 use super::NextJsIntegrationConfig;
 use super::rsc::DEFAULT_MAX_COMBINED_PAYLOAD_BYTES;
@@ -11,7 +12,7 @@ use super::rsc_stream::{
     capture_fragment, classify_rsc_group, document_state, rsc_payload_placeholder,
 };
 use super::shared::{
-    RSC_RECEIVER_CONTEXT_BYTES, ScriptContext, ScriptRewriter, find_rsc_push_payload_range,
+    RSC_RECEIVER_CONTEXT_BYTES, ScriptContext, ScriptDocument, find_rsc_push_payload_range,
     find_trimmed_rsc_push_payload_range, receiver_context_is_flight_push,
 };
 
@@ -167,11 +168,24 @@ impl NextJsRscPlaceholderRewriter {
     }
 }
 
-impl ScriptRewriter for NextJsRscPlaceholderRewriter {
-    fn selector(&self) -> &'static str {
+/// The RSC placeholder rewriter at work on one document.
+pub(super) struct RscPlaceholderText {
+    pub(super) rewriter: Arc<NextJsRscPlaceholderRewriter>,
+    pub(super) document: ScriptDocument,
+}
+
+impl TextHandler for RscPlaceholderText {
+    fn selector(&self) -> &str {
         "script"
     }
 
+    fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction {
+        self.rewriter.rewrite(text, &self.document.chunk(is_last))
+    }
+}
+
+impl NextJsRscPlaceholderRewriter {
+    /// Decides what happens to one chunk of a script's text.
     fn rewrite(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction {
         if self.config.rewrite_attributes.is_empty() {
             return ScriptRewriteAction::keep();

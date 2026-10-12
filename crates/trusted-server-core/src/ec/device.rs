@@ -149,9 +149,7 @@ pub trait DeviceModule: Send + Sync {
 
     /// Classifies the request into [`DeviceSignals`].
     ///
-    /// An implementation hands its own function to [`ModuleCall::inject`],
-    /// naming what it reads, usually the request's evidence and the
-    /// services, as well as any host signals injected into its constructor.
+    /// See [`crate::module_context`] for what an implementation may name.
     /// Classification runs before the permissions are resolved, so no value
     /// whose use needs a permission is passed here.
     ///
