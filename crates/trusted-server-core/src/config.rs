@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -148,6 +149,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             field(
                 vec![
                     object("ec"),
+                    optional_object("identity_handoff"),
+                    optional_object("keys"),
+                    SecretPathSegment::ArrayEach,
+                    object("secret"),
+                ],
+                false,
+            ),
+            field(
+                vec![
+                    object("ec"),
                     optional_object("partners"),
                     SecretPathSegment::ArrayEach,
                     object("api_token"),
@@ -245,7 +256,9 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when non-secret configuration or a secret key
 /// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    validate_identity_handoff_structure(settings)?;
     validate_secret_key_references(settings)?;
+    validate_identity_handoff_uses_dedicated_keys(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
 
@@ -269,6 +282,9 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    validate_identity_handoff_structure(settings)?;
+    validate_identity_handoff_runtime_keys(settings)?;
+    validate_identity_handoff_uses_dedicated_keys(settings)?;
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
     settings.validate_admin_handler_passwords()?;
@@ -387,12 +403,93 @@ fn validate_non_secret_deploy_placeholders(
     }))
 }
 
+fn validate_identity_handoff_structure(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    settings.ec.identity_handoff.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("ec.identity_handoff configuration is invalid: {error}"),
+        })
+    })
+}
+
+fn validate_identity_handoff_runtime_keys(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    for (index, key) in settings.ec.identity_handoff.keys.iter().enumerate() {
+        let decoded = URL_SAFE_NO_PAD.decode(key.secret.expose()).map_err(|_| {
+            invalid_identity_handoff_secret(index, &key.id, "must use URL_SAFE_NO_PAD base64")
+        })?;
+        if decoded.len() != 32 {
+            return Err(invalid_identity_handoff_secret(
+                index,
+                &key.id,
+                "must decode to exactly 32 bytes",
+            ));
+        }
+        if decoded.as_slice() == settings.ec.passphrase.expose().as_bytes() {
+            return Err(invalid_identity_handoff_secret(
+                index,
+                &key.id,
+                "must not reuse ec.passphrase key material",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity_handoff_uses_dedicated_keys(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    if let Some((index, key)) = settings
+        .ec
+        .identity_handoff
+        .keys
+        .iter()
+        .enumerate()
+        .find(|(_, key)| key.secret.expose() == settings.ec.passphrase.expose())
+    {
+        return Err(invalid_identity_handoff_secret(
+            index,
+            &key.id,
+            "must not reuse ec.passphrase",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_identity_handoff_secret(
+    index: usize,
+    key_id: &str,
+    requirement: &str,
+) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "secret at `ec.identity_handoff.keys[{index}].secret` for key `{key_id}` {requirement}"
+        ),
+    })
+}
+
 fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_reference(
         "publisher.proxy_secret",
         settings.publisher.proxy_secret.expose(),
     )?;
     validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
+
+    for (index, key) in settings.ec.identity_handoff.keys.iter().enumerate() {
+        validate_secret_key_reference(
+            &format!("ec.identity_handoff.keys[{index}].secret"),
+            key.secret.expose(),
+        )?;
+        if key.secret.expose().trim() != key.secret.expose() {
+            return Err(invalid_identity_handoff_secret(
+                index,
+                &key.id,
+                "reference must not contain surrounding whitespace",
+            ));
+        }
+    }
 
     for (index, partner) in settings.ec.partners.iter().enumerate() {
         if let Some(token) = &partner.api_token {
@@ -520,7 +617,10 @@ mod tests {
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::platform::{StoreName, test_support::HashMapSecretStore};
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::settings::{
+        IdentityHandoffConfig, IdentityHandoffKey, ProxyAssetRoute, S3SigV4AuthConfig,
+        TrustedClientIpConfig,
+    };
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -578,6 +678,13 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    fn handoff_key(id: &str, secret: &str) -> IdentityHandoffKey {
+        IdentityHandoffKey {
+            id: id.to_owned(),
+            secret: Redacted::new(secret.to_owned()),
+        }
     }
 
     #[test]
@@ -828,6 +935,7 @@ formats = [{ width = 300, height = 250 }]
             vec![
                 ("publisher.proxy_secret".to_owned(), false),
                 ("ec.passphrase".to_owned(), false),
+                ("ec.identity_handoff.keys[*].secret".to_owned(), false,),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
@@ -861,7 +969,7 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn partner_secret_metadata_makes_the_defaulted_array_optional() {
+    fn defaulted_array_secret_metadata_uses_optional_container_segments() {
         let fields = TrustedServerAppConfig::secret_fields();
 
         for field in fields.iter().filter(|field| {
@@ -875,6 +983,19 @@ formats = [{ width = 300, height = 250 }]
                 SecretPathSegment::OptionalField(name) if name == "partners"
             ));
         }
+
+        let handoff = fields
+            .iter()
+            .find(|field| field.dotted_path() == "ec.identity_handoff.keys[*].secret")
+            .expect("should expose identity handoff key secret metadata");
+        assert!(matches!(
+            &handoff.path[1],
+            SecretPathSegment::OptionalField(name) if name == "identity_handoff"
+        ));
+        assert!(matches!(
+            &handoff.path[2],
+            SecretPathSegment::OptionalField(name) if name == "keys"
+        ));
     }
 
     #[test]
@@ -1081,6 +1202,140 @@ gam_network_id = "99999"
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the whitespace-only secret reference: {err:?}"
         );
+    }
+
+    #[test]
+    fn identity_handoff_disabled_empty_config_validates_at_deploy_and_runtime() {
+        let settings = valid_settings();
+
+        validate_settings_for_deploy(&settings)
+            .expect("disabled empty handoff should pass deploy validation");
+        validate_settings_for_runtime(&settings)
+            .expect("disabled empty handoff should pass runtime validation");
+    }
+
+    #[test]
+    fn identity_handoff_deploy_validation_accepts_unresolved_rotation_key_references() {
+        let mut settings = valid_settings();
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "current".to_owned(),
+            keys: vec![
+                handoff_key("previous", "identity_handoff_previous"),
+                handoff_key("current", "identity_handoff_current"),
+            ],
+        };
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy validation should treat handoff secrets as key references");
+    }
+
+    #[test]
+    fn identity_handoff_deploy_validation_rejects_invalid_or_reused_key_references() {
+        for secret in ["   ", " padded_reference ", "same_key_as_ec_passphrase"] {
+            let mut settings = valid_settings();
+            if secret == "same_key_as_ec_passphrase" {
+                settings.ec.passphrase = Redacted::new(secret.to_owned());
+            }
+            settings.ec.identity_handoff.keys = vec![handoff_key("key-1", secret)];
+
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("deploy validation should reject an unusable handoff key reference");
+            assert!(
+                error
+                    .to_string()
+                    .contains("ec.identity_handoff.keys[0].secret"),
+                "error should name the handoff secret path without its value: {error:?}"
+            );
+            if !secret.trim().is_empty() {
+                assert!(
+                    !error.to_string().contains(secret.trim()),
+                    "error should not expose the handoff secret or reference: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identity_handoff_structure_fails_the_same_deploy_and_runtime_boundaries() {
+        let mut settings = valid_settings();
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "not-configured".to_owned(),
+            keys: vec![handoff_key("configured", "identity_handoff_key")],
+        };
+
+        for error in [
+            validate_settings_for_deploy(&settings)
+                .expect_err("deploy should reject a missing active key"),
+            validate_settings_for_runtime(&settings)
+                .expect_err("runtime should reject a missing active key"),
+        ] {
+            assert!(
+                error.to_string().contains("active_key_id"),
+                "both boundaries should report the active key invariant: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_handoff_runtime_validation_requires_canonical_32_byte_keys() {
+        let valid = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let invalid_cases = [
+            ("not-base64url".to_owned(), "URL_SAFE_NO_PAD"),
+            (URL_SAFE_NO_PAD.encode([7_u8; 31]), "exactly 32 bytes"),
+            (format!("{valid}="), "URL_SAFE_NO_PAD"),
+        ];
+
+        for (secret, expected) in invalid_cases {
+            let mut settings = valid_settings();
+            settings.ec.identity_handoff.keys = vec![handoff_key("key-1", &secret)];
+
+            let error = validate_settings_for_runtime(&settings)
+                .expect_err("runtime should reject invalid handoff key material");
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "runtime error should explain the key shape: {error:?}"
+            );
+            assert!(
+                !message.contains(&secret),
+                "runtime error should not expose handoff key material: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_handoff_runtime_rejects_encoded_ec_passphrase_key_material() {
+        let mut settings = valid_settings();
+        let ec_key = "synthetic-ec-key-with-32-bytes!!";
+        assert_eq!(ec_key.len(), 32);
+        settings.ec.passphrase = Redacted::new(ec_key.to_owned());
+        settings.ec.identity_handoff.keys =
+            vec![handoff_key("dedicated", &URL_SAFE_NO_PAD.encode(ec_key))];
+        let error = validate_settings_for_runtime(&settings)
+            .expect_err("should reject reused decoded EC key material");
+        assert!(error.to_string().contains("must not reuse ec.passphrase"));
+        assert!(!error.to_string().contains(ec_key));
+    }
+
+    #[test]
+    fn identity_handoff_runtime_validation_accepts_rotation_and_active_key_changes() {
+        let mut settings = valid_settings();
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "current".to_owned(),
+            keys: vec![
+                handoff_key("previous", &URL_SAFE_NO_PAD.encode([3_u8; 32])),
+                handoff_key("current", &URL_SAFE_NO_PAD.encode([7_u8; 32])),
+            ],
+        };
+
+        validate_settings_for_runtime(&settings)
+            .expect("runtime should accept current and previous rotation keys");
+        settings.ec.identity_handoff.active_key_id = "previous".to_owned();
+        validate_settings_for_runtime(&settings)
+            .expect("runtime should accept switching issuance to a retained key");
     }
 
     #[test]
@@ -1674,6 +1929,85 @@ password = "production-admin-password-32-bytes"
         assert!(
             runtime_error.to_string().contains("legacy pull disabled"),
             "runtime error should identify the owned-source pull conflict: {runtime_error:?}"
+        );
+    }
+
+    #[test]
+    fn startup_blob_resolves_provided_disabled_identity_handoff_keys() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new("handoff-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("handoff-ec-passphrase".to_owned());
+        for (index, handler) in settings.handlers.iter_mut().enumerate() {
+            handler.password = Redacted::new(format!("handoff-handler-password-{index}"));
+        }
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: false,
+            active_key_id: "next".to_owned(),
+            keys: vec![handoff_key("next", "identity-handoff-next")],
+        };
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy should accept a disabled provisioned key reference");
+
+        let resolved_key = URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        let secret_store = |handoff_secret: &str| {
+            let mut secrets = HashMap::new();
+            for (key, value) in [
+                (
+                    "handoff-proxy-secret".to_owned(),
+                    "resolved-proxy-secret-not-placeholder".to_owned(),
+                ),
+                (
+                    "handoff-ec-passphrase".to_owned(),
+                    "resolved-ec-passphrase-32-bytes-valid".to_owned(),
+                ),
+                (
+                    "identity-handoff-next".to_owned(),
+                    handoff_secret.to_owned(),
+                ),
+            ] {
+                secrets.insert(key, value.into_bytes());
+            }
+            for index in 0..settings.handlers.len() {
+                secrets.insert(
+                    format!("handoff-handler-password-{index}"),
+                    format!("resolved-handler-password-{index}-32-bytes").into_bytes(),
+                );
+            }
+            HashMapSecretStore::new(secrets)
+        };
+        let envelope = BlobEnvelope::new(
+            serde_json::to_value(&settings).expect("should serialize settings"),
+            "2026-10-10T00:00:00Z".to_owned(),
+        );
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let started = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &secret_store(&resolved_key),
+            &StoreName::from("identity-handoff-test-secrets"),
+        )
+        .expect("startup should resolve and validate the disabled provisioned key");
+
+        assert!(!started.ec.identity_handoff.enabled);
+        assert_eq!(started.ec.identity_handoff.active_key_id, "next");
+        assert_eq!(
+            started.ec.identity_handoff.keys[0].secret.expose(),
+            &resolved_key,
+            "startup should replace the key reference with resolved key material"
+        );
+
+        let malformed = "not-valid-key-material";
+        let error = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &secret_store(malformed),
+            &StoreName::from("identity-handoff-test-secrets"),
+        )
+        .expect_err("startup should reject malformed resolved handoff key material");
+        assert!(error.to_string().contains("URL_SAFE_NO_PAD"));
+        assert!(
+            !error.to_string().contains(malformed),
+            "startup error should not expose resolved handoff key material: {error:?}"
         );
     }
 

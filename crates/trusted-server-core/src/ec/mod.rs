@@ -41,6 +41,8 @@ pub mod finalize;
 pub mod generation;
 pub mod identify;
 pub mod identity;
+pub(crate) mod identity_handoff;
+pub(crate) mod identity_handoff_codec;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
@@ -74,7 +76,7 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_SERVER};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -278,6 +280,8 @@ pub struct EcContext {
     eid_sync_source: Option<EidSyncSource>,
     /// Normalized browser body updates retained even when auction dispatch fails.
     browser_eid_updates: Vec<kv::PartnerIdUpdate>,
+    /// Authenticated capture observations, bound to the incoming full EC ID.
+    pub(crate) identity_handoff: identity_handoff::HandoffState,
 }
 
 impl EcContext {
@@ -346,7 +350,17 @@ impl EcContext {
             consent.jurisdiction,
         );
 
+        let identity_handoff = identity_handoff::HandoffState::from_cookie(
+            settings,
+            ec_value.as_deref(),
+            parsed
+                .jar
+                .as_ref()
+                .and_then(|jar| jar.get(COOKIE_TS_EIDS_SERVER))
+                .map(cookie::Cookie::value),
+        );
         Ok(Self {
+            identity_handoff,
             ec_value,
             cookie_ec_value: parsed.cookie_ec,
             ec_was_present,
@@ -527,6 +541,13 @@ impl EcContext {
         self.geo_info.as_ref()
     }
 
+    /// Allows authenticated handoff work on an adapter with supported KV/post-send execution.
+    ///
+    /// Adapters must leave this disabled for bot-gated or unsupported requests.
+    pub fn set_identity_handoff_supported(&mut self, supported: bool) {
+        self.identity_handoff.supported = supported;
+    }
+
     /// Returns the request-scoped identity-graph snapshot.
     #[must_use]
     pub fn kv_snapshot(&self) -> &EcKvSnapshot {
@@ -646,6 +667,7 @@ impl EcContext {
     #[must_use]
     pub fn new_for_test(ec_value: Option<String>, consent: ConsentContext) -> Self {
         Self {
+            identity_handoff: identity_handoff::HandoffState::default(),
             browser_eid_updates: Vec::new(),
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -671,6 +693,7 @@ impl EcContext {
         client_ip: Option<String>,
     ) -> Self {
         Self {
+            identity_handoff: identity_handoff::HandoffState::default(),
             browser_eid_updates: Vec::new(),
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -699,6 +722,7 @@ impl EcContext {
         consent: ConsentContext,
     ) -> Self {
         Self {
+            identity_handoff: identity_handoff::HandoffState::default(),
             browser_eid_updates: Vec::new(),
             ec_value,
             cookie_ec_value,

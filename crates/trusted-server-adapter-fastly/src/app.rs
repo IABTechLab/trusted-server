@@ -418,7 +418,7 @@ fn build_ec_request_state(
             None
         });
 
-    let (ec_context, setup_error) =
+    let (mut ec_context, setup_error) =
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
@@ -446,6 +446,7 @@ fn build_ec_request_state(
         None
     };
     let kv_graph = if is_real_browser { kv_graph } else { None };
+    ec_context.set_identity_handoff_supported(finalize_kv_graph.is_some());
 
     EcRequestState {
         ec_context,

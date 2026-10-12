@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use crate::consent::{RawConsentSignals, identity_capture_consent_allowed};
 use crate::settings::Settings;
 
+use super::identity_handoff_codec::{HANDOFF_TTL_SECS, HandoffEntry};
 use super::kv::KvIdentityGraph;
 use super::kv_types::MAX_UID_LENGTH;
 use super::partner::normalize_partner_source_domain;
@@ -61,6 +62,8 @@ pub(crate) struct ManagedPartnerIdUpdate {
     pub(crate) source: String,
     pub(crate) uid: String,
     pub(crate) expires_at: Option<u64>,
+    /// Matching authenticated pending expiry, used only when filling an absent source.
+    pub(crate) pending_expires_at: Option<u64>,
 }
 
 /// Request-scoped effects sealed by the framework's proxy dispatch boundary.
@@ -73,6 +76,7 @@ pub struct IdentityEffects {
     ec_id: String,
     snapshot: EcKvSnapshot,
     action: IdentityAction,
+    replay: Vec<HandoffEntry>,
 }
 
 #[derive(Clone)]
@@ -82,6 +86,61 @@ enum IdentityAction {
 }
 
 impl IdentityEffects {
+    pub(crate) fn handoff_entries(&self, context: &EcContext, now: u64) -> Vec<HandoffEntry> {
+        if context.ec_value() != Some(self.ec_id.as_str()) {
+            return Vec::new();
+        }
+        let IdentityAction::Enrich(updates) = &self.action else {
+            return Vec::new();
+        };
+        updates
+            .iter()
+            .map(|update| {
+                let expiry = update.expires_at.or(update.pending_expires_at);
+                let mut entry = HandoffEntry {
+                    module: self.module.to_owned(),
+                    source: update.source.clone(),
+                    uid: update.uid.clone(),
+                    expires_at: expiry,
+                    deadline: expiry.map_or(now.saturating_add(HANDOFF_TTL_SECS), |expiry| {
+                        expiry.min(now.saturating_add(HANDOFF_TTL_SECS))
+                    }),
+                };
+                if let Some(pending) = context.identity_handoff.matching_capture(
+                    context,
+                    self.module,
+                    &update.source,
+                    &update.uid,
+                    now,
+                ) && pending.expires_at == expiry
+                {
+                    entry.deadline = entry.deadline.min(pending.deadline);
+                }
+                entry
+            })
+            .collect()
+    }
+
+    pub(crate) fn handoff_replay(context: &EcContext, replay: Vec<HandoffEntry>) -> Self {
+        Self {
+            module: "handoff",
+            ec_id: context.ec_value().unwrap_or_default().to_owned(),
+            snapshot: context.kv_snapshot().clone(),
+            action: IdentityAction::Enrich(Vec::new()),
+            replay,
+        }
+    }
+
+    pub(crate) fn add_handoff_replay(&mut self, replay: Vec<HandoffEntry>) {
+        if matches!(self.action, IdentityAction::Enrich(_)) {
+            self.replay = replay;
+        }
+    }
+
+    pub(crate) fn protects_source(&self, source: &str) -> bool {
+        matches!(&self.action, IdentityAction::Enrich(updates) if updates.iter().any(|update| update.source == source))
+    }
+
     /// Whether this effect requests withdrawal for the current full EC identity.
     #[must_use]
     pub fn withdraws(&self, context: &EcContext) -> bool {
@@ -120,6 +179,11 @@ impl IdentityEffects {
                     snapshot,
                 ),
             IdentityAction::Enrich(_) => return,
+        };
+        let result = if !self.replay.is_empty() && context.ec_allowed() {
+            graph.upsert_handoff_ids_from_snapshot(&self.ec_id, partners, &self.replay, result)
+        } else {
+            result
         };
         context.set_kv_snapshot(result);
     }
@@ -174,18 +238,10 @@ pub(crate) fn stage_capture(
             ec_id: ec_id.to_owned(),
             snapshot: context.kv_snapshot().clone(),
             action: IdentityAction::Withdraw,
+            replay: Vec::new(),
         });
     }
-    let signals = RawConsentSignals {
-        raw_tc_string: observation.consent.tcf,
-        raw_gpp_string: observation.consent.gpp,
-        raw_us_privacy: observation.consent.usp,
-        ..Default::default()
-    };
-    if observation.consent.malformed
-        || !context.ec_allowed()
-        || !identity_capture_consent_allowed(context.consent(), &signals, &settings.consent)
-    {
+    if !observation_consent_allowed(&observation.consent, context, settings) {
         return None;
     }
     let now = checked_current_timestamp();
@@ -218,12 +274,20 @@ pub(crate) fn stage_capture(
         if !updates.contains_key(&source) && updates.len() >= MAX_CAPTURE_SOURCES {
             continue;
         }
+        let pending_expires_at = now
+            .and_then(|now| {
+                context
+                    .identity_handoff
+                    .matching_capture(context, module, &source, &uid, now)
+            })
+            .and_then(|entry| entry.expires_at);
         updates.insert(
             source.clone(),
             ManagedPartnerIdUpdate {
                 source,
                 uid,
                 expires_at,
+                pending_expires_at,
             },
         );
     }
@@ -235,7 +299,24 @@ pub(crate) fn stage_capture(
         ec_id: ec_id.to_owned(),
         snapshot: context.kv_snapshot().clone(),
         action: IdentityAction::Enrich(updates.into_values().collect()),
+        replay: Vec::new(),
     })
+}
+
+pub(crate) fn observation_consent_allowed(
+    signals: &IdentityConsentSignals,
+    context: &EcContext,
+    settings: &Settings,
+) -> bool {
+    let raw = RawConsentSignals {
+        raw_tc_string: signals.tcf.clone(),
+        raw_gpp_string: signals.gpp.clone(),
+        raw_us_privacy: signals.usp.clone(),
+        ..Default::default()
+    };
+    !signals.malformed
+        && context.ec_allowed()
+        && identity_capture_consent_allowed(context.consent(), &raw, &settings.consent)
 }
 
 #[cfg(test)]
@@ -788,7 +869,9 @@ mod tests {
                 source: SOURCE.to_owned(),
                 uid: "expired-uid".to_owned(),
                 expires_at: Some(1),
+                pending_expires_at: None,
             }]),
+            replay: Vec::new(),
         };
         effect.apply(&graph, &partners, &mut request);
         assert_eq!(

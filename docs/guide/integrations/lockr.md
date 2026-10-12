@@ -1,7 +1,7 @@
 # Lockr Integration
 
 **Category**: Identity
-**Status**: Production
+**Status**: Proxy production; identity capture and handoff rollout gated
 **Type**: Identity Management & Privacy Vault
 
 ## Overview
@@ -27,9 +27,12 @@ flowchart TD
     A[Browser loads first-party Lockr SDK] --> B[SDK calls first-party API proxy]
     B --> C[Lockr returns provider tokens]
     C --> D[Capture validates ID5, consent and source ownership]
-    D --> E[Original response sent to browser]
+    D --> E[Original response sent with optional authenticated handoff]
     E --> F[Eligible EC record updated after send on Fastly]
-    F --> G[Later auctions read usable IDs from KV]
+    E --> G[Later live-root request validates handoff]
+    G --> H[Absent source reaches auction and stages bounded retry]
+    F --> I[Later auctions read usable IDs from KV]
+    H --> I
 ```
 
 ## Configuration
@@ -37,6 +40,15 @@ flowchart TD
 Add Lockr configuration to `trusted-server.toml`:
 
 ```toml
+[ec.identity_handoff]
+# Separate opt-in. Leave off until the handoff rollout and live gates pass.
+enabled = false
+active_key_id = "handoff-2026-10"
+
+[[ec.identity_handoff.keys]]
+id = "handoff-2026-10"
+secret = "identity_handoff_2026_10"
+
 [integrations.lockr]
 enabled = true
 app_id = "example-app-id"
@@ -66,7 +78,11 @@ identity_owner = "lockr"
 | `rewrite_sdk`               | boolean | No       | Rewrite matching SDK URLs to the first-party route (default: `true`)           |
 | `origin_override`           | URL     | No       | Origin header override for local or approved domains                           |
 
-`rewrite_sdk_host` is deprecated and ignored. An absent Lockr configuration does not register the integration.
+`rewrite_sdk_host` is deprecated and ignored. An absent Lockr configuration
+does not register the integration. `[ec.identity_handoff]` is shared EC
+configuration, not a Lockr option. Its keys come from
+`trusted_server_secrets`; see the [configuration reference](../configuration)
+for provisioning and rotation.
 
 ### Environment Variables
 
@@ -139,7 +155,7 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 
 - The only supported capture mapping is Lockr `id5id` to registered `id5-sync.com` with `atype=1`.
 - The EC identity graph retains the source, UID and lifecycle metadata, including known provider expiry and the acquisition writer. Later auctions reconstruct fixed Lockr ID5 provenance only for a usable Lockr-written record. KV does not store arbitrary provenance, provider `ext` or additional UIDs.
-- Publisher SDK storage remains the SDK's responsibility. Capture does not add an EID cookie.
+- Publisher SDK storage remains the SDK's responsibility. Capture never restores the browser-written `ts-eids` cookie. The separately enabled shared handoff may add authenticated `ts-eids-s`.
 
 **Consent Validation**:
 
@@ -151,13 +167,55 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 
 Capture inspects only exact POST `page-view`, `generate-tokens`, `refresh-tokens` and `sync-no-hem-ids` routes under `/publisher/app/v2/identityLockr/`. It decodes URL-encoded `advertising_token.universal_uid` from `aimTokens`, verifies an associated `ids.id5id.eid` when present, and converts `identity_expires` milliseconds to Unix seconds. Unknown provider keys, mismatched source or UID, expired tokens and malformed responses do not change stored identity. SDK, settings and unlisted API requests stay on the original proxy path. The proxy still strips publisher `Cookie` and `Authorization` headers.
 
-Original and decoded capture responses have separate 64 KiB limits. Inspection failure leaves upstream response bytes and headers intact. With capture enabled, Fastly sends the SDK response before shared capture persistence against the existing consenting EC record. Missing, unreadable or tombstoned roots cannot be created or revived by acquisition. There is no native resolver, extra EID cookie, first-auction guarantee or durable retry queue.
+Original and decoded capture responses have separate 64 KiB limits. Inspection failure leaves upstream response bytes and headers intact. With capture enabled, Fastly sends the SDK response before shared capture persistence against the existing consenting EC record. Missing, unreadable or tombstoned roots cannot be created or revived by acquisition. There is no native resolver, first-auction guarantee or durable retry queue.
+
+### Authenticated capture handoff
+
+The optional shared handoff can add `ts-eids-s` to a validated capture response.
+It defaults off independently of Lockr capture. Enabling it requires both
+`ec.identity_handoff.enabled = true` and `integrations.lockr.capture_identity =
+true`, plus an active dedicated signing key. Do not reuse `ec.passphrase`. Keep
+the handoff off until key management, source ownership, consent behavior,
+metadata-compatible deployment, synthetic verification, and live acceptance
+have passed for the publisher route.
+
+`ts-eids-s` has a maximum five-minute lifetime and a 2,048-byte encoded-value
+budget. It binds the publisher, full EC ID, capture writer, source, UID, expiry,
+and original handoff deadline in an authenticated envelope. `Secure`,
+`HttpOnly`, and `SameSite=Lax` cookie flags do not replace signature checking.
+Provider expiry may shorten the deadline, and reads or retries never extend it.
+
+A later request can use an eligible ID5 handoff only when the registered source
+is absent from an existing live, consenting EC root. Current Lockr capture,
+source ownership, consent, expiry, and bidstream gates are checked again. Any
+existing record wins, including an expired, invalidated, or conflicting record.
+The handoff never creates or recovers a root, replaces a UID, extends stored
+expiry, or accelerates refresh of an existing source.
+
+Eligibility uses the existing request-local KV snapshot. A stale live read can
+still miss a newer record or withdrawal at another POP; the handoff does not add
+strong reads or instant cross-POP revocation. Current request consent still
+applies. Replay uses generation-checked writes and cannot overwrite that newer
+record or revive its tombstone.
+
+The same later request may stage one bounded fill-absent persistence attempt.
+Fastly runs it after sending the response. This retry is best-effort and needs a
+qualifying request before the original deadline. It has no durable queue or
+recursive provider call. A successful after-send write cannot clear the cookie
+already sent; a subsequent request reconciles and clears acknowledged entries.
+
+This feature does not restore the retired browser-written `ts-eids` cookie.
+`ts-eids-s` contains validated server capture only. It does not ingest late
+browser EIDs or restore the old diagnostic headers. Cookie-bearing responses
+are private/no-store, and auction-provider Cookie forwarding strips the handoff.
+Only Fastly's admitted EC/KV requests support issuance and post-send replay;
+other adapters keep the feature inactive.
 
 `capture_identity` defaults to `true` but must be explicitly set to `false` during rollout until sanitized provider fixtures, consent requirements, source ownership, metadata-aware binary drain and an approved publisher test route have been verified. Disabling capture keeps the registered ID5 source claim and already-stored metadata. Do not roll back to a metadata-unaware binary after managed writes without an approved compatibility procedure. Reject conflicting legacy push or pull writers before assigning `identity_owner = "lockr"`.
 
 `capture_global_withdrawal` remains `false` until Lockr confirms that a 2xx `revoke-consent` response with `"success": true` means global withdrawal for this EC identity. Only then may operators opt in: the normal finalizer expires `ts-ec` and the existing-key-only tombstone prevents later enrichment. Empty token arrays, network failures and other responses never imply withdrawal. Overlapping SDK calls have no provider sequence contract; CAS follows observation order.
 
-Use synthetic or sanitized source/count/status evidence for an approved test route. Verify unchanged proxy response, delayed KV read-back of UID/source/expiry/writer/revision without exporting values, later auction source presence, same-UID expiry extension, expired omission and confirmed opt-out/revoke. No live IDs, consent strings, credentials or query URLs belong in test records.
+Use synthetic or sanitized source/count/status evidence for an approved test route. Verify unchanged proxy response, delayed KV read-back of UID/source/expiry/writer/revision without exporting values, later auction source presence, same-UID expiry extension, expired omission and confirmed opt-out/revoke. For handoff acceptance, also hold back KV visibility, verify absent-source auction delivery only after cookie installation, inject a failed post-send write, observe later best-effort repair and acknowledgement cleanup, then test expiry, consent denial, root read failure, EC rotation, ownership changes and key rotation. These are rollout gates, not completed acceptance. No live IDs, consent strings, credentials or query URLs belong in test records.
 
 ## Best Practices
 

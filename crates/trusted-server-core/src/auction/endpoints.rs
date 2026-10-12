@@ -453,7 +453,11 @@ pub(crate) fn resolve_auction_eids(
     }
 
     let resolved = resolve_partner_ids(registry, entry, now);
-    Some(to_eids(&resolved))
+    let mut eids = to_eids(&resolved);
+    eids.extend(crate::ec::identity_handoff::resolve_eids(
+        ec_context, snapshot, registry, now,
+    ));
+    Some(eids)
 }
 
 /// Merges browser and KV EIDs without letting browser input revive an unusable UID.

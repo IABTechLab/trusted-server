@@ -1,6 +1,8 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
+/// Authenticated, short-lived handoff for server-captured identity observations.
+pub const COOKIE_TS_EIDS_SERVER: &str = "ts-eids-s";
 /// Short-lived signed proof that the current EC row has every pull-partner UID.
 pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Retired EID cookie name, retained only for transition regression fixtures.

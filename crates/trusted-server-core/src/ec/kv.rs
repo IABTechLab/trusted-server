@@ -905,6 +905,10 @@ impl KvIdentityGraph {
                 let expiry = update.expires_at.or_else(|| {
                     if same_uid {
                         previous.and_then(|record| record.expires_at)
+                    } else if previous.is_none() {
+                        // Preserve known pending metadata only in an absent
+                        // slot. A cookie never changes any stored expiry.
+                        update.pending_expires_at
                     } else {
                         None
                     }
@@ -926,6 +930,108 @@ impl KvIdentityGraph {
                         uid: update.uid.clone(),
                         expires_at: expiry,
                         writer: Some(module.to_owned()),
+                        revision: Some(uuid::Uuid::new_v4().to_string()),
+                    },
+                );
+                changed = true;
+            }
+            if !changed {
+                return current;
+            }
+            let Ok((body, metadata)) = Self::serialize_entry(&candidate, self.store_name()) else {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &metadata,
+                ENTRY_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => {
+                    return EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(candidate),
+                        generation: None,
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => current = self.load_snapshot(ec_id),
+                Err(_) => {
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            }
+        }
+        EcKvSnapshot::Failed {
+            ec_id: ec_id.to_owned(),
+        }
+    }
+
+    /// Replays authenticated capture only into absent sources on an existing live root.
+    ///
+    /// Rechecks deadline, expiry and ownership after every conflict. Existing
+    /// records, including expired records, never become replacement slots.
+    pub(crate) fn upsert_handoff_ids_from_snapshot(
+        &self,
+        ec_id: &str,
+        partners: &super::registry::PartnerRegistry,
+        updates: &[super::identity_handoff_codec::HandoffEntry],
+        snapshot: EcKvSnapshot,
+    ) -> EcKvSnapshot {
+        if updates.is_empty() {
+            return snapshot;
+        }
+        let mut current = match snapshot {
+            EcKvSnapshot::NotRead => self.load_snapshot(ec_id),
+            EcKvSnapshot::Present {
+                ec_id: ref id,
+                generation: None,
+                ..
+            } if id == ec_id => self.load_snapshot(ec_id),
+            state if state.belongs_to(ec_id) => state,
+            _ => {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            }
+        };
+        for _ in 0..MAX_CAS_RETRIES {
+            let EcKvSnapshot::Present {
+                ec_id: ref id,
+                ref entry,
+                generation: Some(generation),
+            } = current
+            else {
+                return current;
+            };
+            if id != ec_id || !entry.consent.ok {
+                return current;
+            }
+            let Some(now) = checked_current_timestamp() else {
+                return current;
+            };
+            let mut candidate = entry.as_ref().clone();
+            let mut changed = false;
+            for update in updates {
+                if now >= update.deadline
+                    || update.expires_at.is_some_and(|expiry| now >= expiry)
+                    || partners
+                        .get(&update.source)
+                        .and_then(|partner| partner.identity_owner.as_deref())
+                        != Some(update.module.as_str())
+                    || candidate.ids.contains_key(&update.source)
+                {
+                    continue;
+                }
+                candidate.ids.insert(
+                    update.source.clone(),
+                    super::kv_types::KvPartnerId {
+                        uid: update.uid.clone(),
+                        expires_at: update.expires_at,
+                        writer: Some(update.module.clone()),
                         revision: Some(uuid::Uuid::new_v4().to_string()),
                     },
                 );

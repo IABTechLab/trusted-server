@@ -2,7 +2,9 @@
 
 Status: ID5-only capture implemented in the draft change, awaiting code review.
 Provider fixtures, consent approval, revocation semantics and live acceptance
-remain gated; rollout configuration explicitly disables capture. Depends on the
+remain gated; rollout configuration explicitly disables capture. The default-off
+`ts-eids-s` handoff is implemented in the draft change, with separate local
+verification in the implementation plan. Depends on the
 [server-side identity foundation](2026-10-09-server-side-identity-foundation-design.md).
 See the [implementation plan and verification](../plans/2026-10-09-server-side-identity-foundation-and-lockr.md).
 
@@ -35,12 +37,18 @@ common identity outcomes to the shared service, which persists them under the
 visitor's existing EC ID after sending the response on Fastly.
 
 The lockr SDK still runs in the browser. Capture does not depend on Prebid
-configuration or the TS JavaScript EID collector. There is no `ts-eids-s` or
-replacement EID cookie. `ts-ec` remains the browser's identity pointer.
+configuration or the TS JavaScript EID collector. `ts-ec` remains the browser's
+identity pointer. Reintroduce `ts-eids-s` as an optional, short-lived authenticated
+capture handoff through the shared identity service, not a long-lived identity
+store or restoration of the browser-written `ts-eids` cookie.
 
-Delayed availability is accepted: a later auction sees an ID only after the
-deferred write completes and its KV read can see the record. The first auction
-may miss it. There is no cookie fallback or durable capture retry queue.
+For a source absent from a live, consenting EC row, a request carrying the handoff
+can use the captured ID before its post-send write becomes visible and can stage
+a bounded persistence retry. An auction that starts before the capture response
+installs the cookie can still miss it. Existing-source refresh still waits for
+the direct capture update; stale cookie replay must not replace stored state.
+Without handoff opt-in, the implemented KV-only behavior remains unchanged.
+There is no durable capture retry queue.
 
 ## 2. Observed lockr flow
 
@@ -112,8 +120,9 @@ retiring the cookie path.
    a TS browser capture module.
 2. Implement the foundation's optional capture capability only. Lockr has no
    active server-side resolver in this delivery.
-3. Return original proxy responses intact, with no added EID cookie and no
-   Fastly KV enrichment write before send.
+3. Preserve original proxy body bytes and encoding/length headers. With shared
+   handoff enabled, finalization may add `ts-eids-s` and cache privacy headers.
+   No Fastly capture or handoff-replay KV write runs before send.
 4. Submit authoritative `Issued` outcomes for owned, registered sources;
    subsequent SDK token responses use the same path.
 5. Preserve known provider expiry through the foundation's lifecycle record.
@@ -124,6 +133,9 @@ retiring the cookie path.
    foundation. A failed capture must not break the SDK call.
 8. Reconstruct the fixed ID5 OpenRTB provenance on later auctions only for
    usable records whose persisted acquisition writer is `lockr`.
+9. Offer immediate absent-source delivery and bounded retry through the
+   foundation's authenticated capture handoff, without weakening live-root,
+   consent, ownership, expiry or stale-replay rules.
 
 Out of scope: server-to-server calls to lockr, identifier intake, cross-browser
 linking, changing Prebid provider discovery, direct ID5 or LiveRamp proxies,
@@ -136,8 +148,9 @@ OpenRTB provenance/provider `ext` storage, and client-side delivery of KV IDs.
 Register `LockrIntegration` through `.with_identity_capture()` alongside its
 existing proxy and attribute rewriter. Its identity descriptor claims the
 confirmed source mappings in section 4.2. It registers no resolver capability.
-`capture_identity = false` disables observation while preserving the descriptor
-needed to validate configured source ownership.
+`capture_identity = false` disables observation and Lockr handoff delivery/retry
+while preserving the descriptor needed to validate configured source ownership.
+Usable records already persisted in KV retain their existing delivery rules.
 
 The capture paths are exact POST paths relative to `/integrations/lockr/api`:
 
@@ -230,9 +243,9 @@ provider-specific opt-out must not be widened into a global withdrawal.
 
 This outcome does not pass through token-consent eligibility: revocation must
 still work after consent becomes denied. The shared finalizer expires `ts-ec`
-and the service applies the existing-key-only tombstone path. Normal request
-withdrawal takes precedence and suppresses duplicate work. Lockr never clears
-or recreates a root independently.
+and any capture handoff cookie, and the service applies the existing-key-only
+tombstone path. Normal request withdrawal takes precedence and suppresses
+duplicate work. Lockr never clears or recreates a root independently.
 
 ### 4.5 Shared persistence and auction delivery
 
@@ -278,6 +291,66 @@ for the same source, omit reconstructed provenance for that merged EID rather
 than attribute all its UIDs to Lockr. Keep existing UID merging unchanged.
 Provider `ext` and extra UIDs are still not stored in KV.
 
+### 4.6 Short-lived capture handoff
+
+Use the foundation's section 8.2 contract for `ts-eids-s`. The shared service,
+not `LockrIntegration`, authenticates the envelope, sets the cookie, resolves
+eligible auction IDs, stages retry and reconciles acknowledgement. Start with
+ID5 only; no unconfirmed mapping becomes eligible through the cookie.
+
+Each entry binds the publisher, full EC ID, acquisition module `lockr`, registered
+source, UID, optional provider expiry and fixed handoff deadline. The foundation
+implements a five-minute lifetime and a 2,048-byte cap for the complete authenticated
+value. Provider expiry can shorten that lifetime. Cookie reads, retries, merging
+and no-token responses do not extend it. Keep `Secure; HttpOnly; SameSite=Lax`;
+base64 and `HttpOnly` alone do not authenticate replay.
+
+Create entries only from acquisitions that pass the existing capture consent,
+source-claim and ownership gates. Normal deferred capture persistence still runs
+if cookie creation fails. A `NotRead` snapshot at capture does not force an added
+pre-send lookup, but it also does not prove root eligibility for later delivery.
+
+On later requests, validate the handoff against current policy and the existing
+full-ID-bound snapshot. An absent source on a live, consenting root may use the
+handoff UID for a bidstream-enabled auction and stage fill-absent-only persistence
+after send. Recheck absence, consent, provider expiry and the original handoff
+deadline at mutation time. A matching persisted UID, writer and effective expiry
+acknowledges the entry. A conflicting existing record wins and
+retires the handoff; expired or invalidated records also block replay. No handoff
+replaces a stored UID, extends its expiry, changes its writer or creates a root.
+This first version does not accelerate refresh of an existing source.
+
+Snapshot eligibility retains existing KV read consistency. A stale live snapshot
+that lacks the source can still deliver the handoff before it observes a newer
+record or withdrawal elsewhere. Replay uses generation-checked writes and cannot
+replace that newer record or revive its tombstone. Current request consent always
+applies; the handoff does not promise instant cross-POP withdrawal propagation.
+
+Authenticated, eligible ID5 handoff entries use the fixed Lockr provenance from
+section 4.5. Do not infer acquisition authority from an unsigned cookie or current
+configured ownership. Browser mixed-origin and explicit-field precedence remain
+unchanged. Provider `ext` is not added to the cookie.
+
+A later request carrying an existing valid entry may retry a missed first-issue
+write even if its Lockr response contains no new tokens. Retry is shared, bounded
+and conditional; it is not another provider call. Remove acknowledged, conflicting,
+expired or unauthorized entries on a subsequent response, clearing the cookie
+when none remain. After-send success cannot alter a cookie already sent.
+Withdrawal or EC rotation invalidates the handoff. No cookie permits delivery
+from a missing, unreadable or withdrawn root.
+
+The original standalone draft proposed an unsigned source/UID array lasting up
+to 30 days, with
+cookie-first precedence and generic cookie ingestion. Do not restore it as-is.
+It omitted expiry needed by its own merge rules and offered no authenticated
+full-EC binding or stale-replay contract. The revised handoff restores useful
+absent-source availability and retry while keeping lifecycle policy in EC.
+
+The existing `ts-eids` fallback was largely redundant with normal `/auction`
+body submission and did not merge missing sources into a valid body. Restoring
+its late-browser-ID ingestion benefit is a separate decision, not part of this
+capture handoff.
+
 ## 5. Data flow and freshness
 
 ```mermaid
@@ -285,36 +358,44 @@ flowchart TD
     A[Lockr SDK calls TS first-party proxy] --> B[Lockr API returns tokens]
     B --> C[Lockr capture module normalizes IDs and expiry]
     C --> D[Shared identity service validates consent and ownership]
-    D --> E[Original response sent without an EID cookie]
+    D --> E[Original body sent with optional authenticated handoff cookie]
     E --> F[Shared service applies authoritative updates after send]
     F --> G[EC identity graph stores IDs and lifecycle metadata]
-    G --> H[Later auctions read visible unexpired IDs and reconstruct writer-based provenance]
+    E --> H[Later request validates handoff against live EC root]
+    H --> I[Absent-source auction delivery and bounded after-send retry]
+    I --> G
+    G --> J[Later requests use KV state and clear acknowledged handoff]
 ```
 
-| Event                           | Persistence                                       | Auction availability                                                           |
-| ------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------ |
-| First issue                     | Authoritative update after send                   | Once a later KV read sees the record                                           |
-| SDK refresh                     | Replacement or expiry update after send           | Once new state is visible                                                      |
-| Provider expiry                 | Stored record becomes unusable; no timer required | Omitted when request time reaches known expiry                                 |
-| Explicit global revoke          | EC cookie expired; existing-key-only tombstone    | Later requests stop using the identity; dispatched auctions cannot be recalled |
-| Returning visitor, no new token | No capture mutation                               | Existing usable KV state only                                                  |
+| Event                              | Persistence                                                                                 | Auction availability                                                                        |
+| ---------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| First issue, source absent         | Authoritative update after send; eligible handoff can stage a later fill-absent retry       | After cookie installation on a qualifying live-root request, or once KV exposes the record  |
+| SDK refresh, source already stored | Authoritative replacement or expiry update after send; replay cannot replace existing state | Existing usable KV record until the new state is visible                                    |
+| Provider or handoff expiry         | No read-triggered cleanup write                                                             | Expired handoff is rejected; known-expired stored IDs remain omitted                        |
+| Explicit global revoke             | EC and handoff cookies expired; existing-key-only tombstone                                 | Later requests stop using the identity; dispatched auctions cannot be recalled              |
+| Returning visitor, no new token    | No new capture effect; valid pending handoff can independently stage replay                 | Existing usable KV state, or an eligible absent-source handoff before its original deadline |
 
 Inspection can retain 64 KiB of original bytes and 64 KiB of decoded JSON, plus
-bounded stream/decoder overhead. There are no additional TS EID cookie bytes
-on later requests.
+bounded stream/decoder overhead. While pending, the handoff adds up to 2,048
+cookie-value bytes plus cookie-name/separator overhead to same-origin requests.
+Cleanup requires a later request that observes acknowledgement or ineligibility;
+otherwise the fixed deadline ends the handoff.
 
-There is no cookie-based repair of a failed capture write. A later token-bearing
-SDK response, browser-body submission or separately authorized partner path can
-attempt persistence again under the foundation's writer rules. A returning
-`page-view` with no token does not repair a missed capture. Expiry-aware omission
-also does not initiate a Lockr fetch. These limits and delayed KV visibility are
-accepted for this draft.
+Cookie repair is best-effort, limited to absent sources and dependent on another
+qualifying request within that deadline. Once the handoff expires, a returning
+`page-view` with no token cannot repair a missed capture. Later token-bearing
+responses, browser-body submissions or separately authorized partner paths keep
+their existing mutation rules. Expiry-aware omission does not initiate a Lockr
+fetch. Without shared handoff opt-in, availability still waits for KV visibility.
 
 ## 6. Configuration
 
 Add `capture_identity` under `[integrations.lockr]`, default `true`, as the
-publisher capture kill switch. It does not disable browser-body ingestion,
-expiry-aware reads or normal EC consent withdrawal.
+publisher capture kill switch. It also disables Lockr handoff delivery and retry,
+but does not disable browser-body ingestion, expiry-aware KV reads or normal EC
+consent withdrawal. Shared handoff is separately opt-in and defaults off; its
+publisher key/configuration contract must be approved before implementation.
+Capture alone must not silently enable a new cookie.
 
 Capturing a source requires its foundation source policy, for example:
 
@@ -327,12 +408,12 @@ bidstream_enabled = true
 identity_owner = "lockr"
 ```
 
-`identity_owner` is a proposed foundation field, not an existing runtime option.
+`identity_owner` is implemented by the foundation and validated at deployment and runtime.
 Check the publisher registry and disable conflicting legacy authoritative paths
 before enabling the owner. Missing registration or another selected owner means
-Lockr does not persist the source. There is no cookie to forward an unregistered
-captured ID. Valid browser-body EIDs can still reach their current auction under
-the foundation's existing forwarding rules.
+Lockr does not persist the source or issue an eligible handoff entry. The handoff
+cannot forward an unregistered captured ID. Valid browser-body EIDs can still
+reach their current auction under the foundation's existing forwarding rules.
 
 ## 7. Error handling
 
@@ -345,9 +426,15 @@ Use the foundation's redaction, bounds and root safety policy:
 - Denied token consent, missing EC, missing registration or owner mismatch:
   no enrichment; the SDK call still succeeds independently.
 - Missing, unreadable or withdrawn root: no creation or resurrection.
-- Post-send persistence failure: redacted log; no immediate retry, durable
-  queue or change to the already-sent response.
-- No tokens: `NoChange`, not invalidation or consent withdrawal.
+- Post-send persistence failure: redacted log; an already-issued handoff may
+  support a later bounded retry until its original deadline. No immediate retry,
+  durable queue or change to the already-sent response.
+- Invalid signature, expired handoff, EC/publisher mismatch, disabled capture or
+  changed ownership: no handoff delivery or retry; no unsigned fallback.
+- Cookie creation or size failure: preserve direct deferred capture and the
+  upstream body; do not turn cookie failure into an SDK error.
+- No tokens: `NoChange`, not invalidation or withdrawal. An independently valid
+  pending handoff can still be reconciled and replayed.
 
 ## 8. Verification
 
@@ -362,8 +449,9 @@ prove that this consumer reaches those paths correctly:
   same-UID expiry extension; known expiry survives the persisted record.
 - Original and decoded cap overflow, including compressed expansion, skips
   Lockr effects while retaining response bytes and encoding headers.
-- No-token response produces no token mutation; non-2xx/malformed token
-  response cannot invalidate existing records.
+- No-token observation produces no new direct capture mutation; incoming handoff
+  replay is independently validated. Non-2xx/malformed token responses cannot
+  invalidate existing records.
 - Populated body opt-outs, malformed signals, empty optional fields and cookie
   consent conflicts exercise shared consent policy without modifying forwarding.
 - Explicit revoke works with denied consent, chooses the confirmed withdrawal
@@ -379,24 +467,43 @@ prove that this consumer reaches those paths correctly:
   without dropping UIDs or explicit body provenance.
 - Capture effects execute after Fastly send through the foundation, not a
   separate Lockr adapter implementation; persisted snapshot handoff is retained.
-- No newly emitted TS EID cookie or diagnostic EID header; provider browser
-  stores and existing publisher credential stripping remain unchanged.
+- Capture handoff defaults off; enabling it emits only the bounded authenticated
+  `ts-eids-s`, never the retired `ts-eids` or diagnostic EID headers. Provider
+  browser stores and existing publisher credential stripping remain unchanged.
+- With capture KV visibility held back, an installed valid handoff reaches a
+  later live-root auction for an absent registered source. An earlier auction,
+  root-read failure or existing stored source receives no handoff guarantee.
+- No-token requests can repair pending absent-source capture after send; changed
+  UID/expiry/writer, expired stored records, CAS conflicts and withdrawal cannot
+  be overwritten by replay. Acknowledgement cleanup waits for a later response.
+- Tampered/oversized cookies, expiry, wrong full EC, owner/capture changes and
+  key rotation exercise foundation rejection and cleanup without SDK failure.
 
 Live acceptance on an approved publisher test route:
 
 1. Fresh profile, grant consent and wait for `page-view`.
-2. Confirm original response bytes and no TS EID cookie from capture.
+2. Confirm unchanged upstream body/encoding and, with handoff explicitly enabled,
+   authenticated `ts-eids-s` plus private/no-store response handling. Confirm
+   `ts-eids` and diagnostic EID headers remain absent.
 3. Allow for post-send work and KV visibility. Inspect the session's admin EC
    record for the registered source and lifecycle metadata, without exporting IDs.
 4. Trigger a later auction and inspect bidder-facing payload evidence, including
    the stored Lockr ID5 record's `inserter`, empty `matcher` and `mm=2`. Do not
    require the browser body to contain a server-added ID or rely on `x-ts-eids`.
-5. Reload with no new tokens: unchanged UID and expiry do not cause a write.
+5. Observe a later request clearing an acknowledged handoff. Reload with no new
+   tokens: unchanged UID and expiry do not cause a capture write. Separately
+   inject a failed first-issue write and confirm an eligible pending handoff
+   repairs the absent source after a no-token request, without extending its
+   deadline or overwriting an existing record.
 6. Trigger SDK refresh: confirm changed UID or expiry persists after visibility.
 7. Exercise known expiry in a controlled fixture and confirm omission, including
    a stale matching UID resubmitted in a browser auction body.
-8. Trigger confirmed global revoke: EC cookie expires, tombstone exists and
-   later enrichment cannot revive it.
+8. Trigger confirmed global revoke: EC and handoff cookies expire, tombstone
+   exists and later enrichment or handoff replay cannot revive it.
+9. On an approved controlled fixture, delay first-issue KV visibility and prove
+   handoff delivery for an absent source after cookie installation. Verify
+   rejection after deadline, root-read failure and EC rotation. Measure later
+   auction coverage; do not infer an unconditional next-auction guarantee.
 
 No live identifiers, placement settings or credentials belong in fixtures or
 committed validation notes. Keep sanitized status/source/count evidence only.
@@ -404,19 +511,26 @@ committed validation notes. Keep sanitized status/source/count evidence only.
 ## 9. Rollout
 
 1. Deliver the foundation, including metadata-preserving writers/readers,
-   source ownership, browser-body migration and EID cookie/header retirement.
+   source ownership, browser-body migration and `ts-eids` cookie/header retirement.
 2. Confirm Lockr path, provider token shapes, consent and revoke contracts using
    sanitized fixtures; leave unconfirmed source mappings disabled.
 3. Register the capture consumer and its `capture_identity` kill switch.
 4. Configure the affected registered sources with `identity_owner = "lockr"`
    and their confirmed `atype`, after resolving conflicting authoritative paths.
 5. Complete the foundation's deployment compatibility gate before activation.
-6. Enable capture on an approved test route and run live acceptance, including
-   visibility delay, expiry extension and withdrawal.
+6. Provision the shared handoff's dedicated publisher signing keys through
+   app-config secret handling. Keep its opt-in off until provider-approved fixture
+   sizes, rotation and deployed auction/replay/cache-privacy checks pass.
+7. Enable capture and separately opt into handoff on an approved test route.
+   Run live acceptance, including delayed visibility, failed-write repair,
+   acknowledgement cleanup, expiry extension and withdrawal.
 
 Disabling capture stops new observations; it does not make already stored
 expiry metadata safe for an older UID-only binary. Follow the foundation's
-rollback contract. No `ts-eids-s` is introduced at any stage.
+rollback contract. Disabling capture also stops Lockr handoff delivery and retry;
+turning handoff off alone leaves direct capture and usable KV delivery intact.
+Local synthetic tests cover the handoff's codec, policy and proxy/send/replay paths.
+They do not prove provider approval or deployed availability.
 
 ## 10. Open questions and future work
 
@@ -427,10 +541,15 @@ rollback contract. No `ts-eids-s` is introduced at any stage.
 3. Confirm successful revoke response semantics and whether withdrawal is
    global or source-specific before enabling that outcome.
 4. Confirm token ordering when SDK requests overlap. The foundation does not
-   infer provider issuance order from edge wall clocks.
+   infer provider issuance order from edge wall clocks. Handoff signatures also
+   do not establish order; first-version replay never replaces an existing source.
+5. Verify publisher-scoped signing-key provisioning and rotation on deployment.
+   The approved implementation uses a five-minute lifetime and 2,048-byte
+   complete signed-value cap. Validate provider-approved fixture sizes including
+   binding, expiry and signature overhead before enabling it. Immediate existing-source refresh through a
+   cookie requires a later revision-bound design, not cookie-first precedence.
 
-Known expiry persistence is now a proposed foundation decision rather than an
-unimplemented Lockr-local open question. Arbitrary OpenRTB provenance storage
+Known expiry persistence is implemented by the foundation. Arbitrary OpenRTB provenance storage
 remains outside this delivery; the fixed Lockr ID5 mapping is reconstructed from
 the persisted writer instead. Active Lockr resolution from `ltid`, direct provider
 capture and client-side consumers require separate follow-up specs; no current

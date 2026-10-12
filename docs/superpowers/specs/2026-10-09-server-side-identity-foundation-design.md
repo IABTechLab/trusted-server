@@ -3,6 +3,9 @@
 Status: Architecture implemented in the draft change, awaiting code review.
 See the [implementation plan and verification](../plans/2026-10-09-server-side-identity-foundation-and-lockr.md).
 Provider activation and metadata-compatible deployment remain unverified.
+The default-off `ts-eids-s` capture handoff in section 8.2 is implemented in the
+draft change. Its local checks are recorded separately in the implementation
+plan; deployed acceptance remains gated.
 
 First consumer: [Lockr proxy-side identity capture](2026-10-08-lockr-identity-capture-design.md).
 
@@ -70,7 +73,9 @@ approved provider spec.
 
 Invariants:
 
-1. No additional EID cookie. `ts-ec` remains the pointer to an existing EC row.
+1. `ts-ec` remains the pointer to an existing EC row. An optional, short-lived
+   `ts-eids-s` cookie can carry authenticated capture observations across
+   requests; it is not a replacement identity root or a long-lived EID store.
 2. Integration capture and `/auction` enrichment never create or recover a
    root. Existing eligible publisher-navigation creation and recovery remain.
 3. Missing and unreadable rows are distinct. Neither authorizes enrichment.
@@ -165,9 +170,12 @@ If the provider needs consent values from a POST body, the integration extracts
 them from its existing forwarding buffer and supplies normalized signals.
 It must not consume the body twice or let a second parser modify forwarding.
 
-Only framework-associated upstream responses can produce authoritative capture
-updates. An arbitrary browser body or inbound diagnostic header cannot select
-this trust level or impersonate a module.
+Only framework-associated upstream responses can originate authoritative capture
+updates. The shared service can seal a validated observation into the capture
+handoff defined in section 8.2. Later requests must authenticate and revalidate
+that handoff before staging its restricted retry. An arbitrary browser body,
+unsigned cookie or inbound diagnostic header cannot select this trust level or
+impersonate a module.
 
 ### 5.2 Resolution and refresh
 
@@ -275,6 +283,14 @@ They do not promise chronological provider freshness across overlapping SDK
 requests. A provider requiring stronger ordering must supply an ordering
 contract in its integration spec, not rely on edge wall clocks.
 
+Authenticated handoff replay is a separate, fill-absent-only mutation class.
+It retains the capture writer and known expiry but cannot replace an existing
+source or alter its lifecycle metadata. Recheck source absence, root consent,
+provider expiry and the original handoff deadline at mutation time; a conflict
+that introduces the source makes the replay a no-op.
+Do not send replay through browser enrichment, which discards lifecycle metadata,
+or unrestricted authoritative replacement, which could replay an older token.
+
 ### 6.3 Auction reads
 
 Resolve only live, consented, bidstream-enabled records whose known expiry has
@@ -301,6 +317,12 @@ EID because its top-level fields apply to every UID. Preserve explicit body
 provenance and the existing UID merge rules. The first delivery preserves
 existing caps and consent gates across all auction paths.
 
+When the optional handoff is enabled, resolve eligible captured IDs under
+section 8.2 before the existing browser merge. Handoff entries require a live,
+consenting root and an absent stored source. Stored records retain precedence,
+including expired or invalidated records that block replay. Handoff delivery
+does not relax current-request browser consent gates.
+
 ## 7. Consent and execution timing
 
 The shared service evaluates global EC consent and each module's additional
@@ -313,7 +335,7 @@ root consent through conditional-write semantics.
 flowchart TD
     A[Request has existing EC and consent context] --> B[Integration captures identity outcomes]
     B --> C[Shared service stages permitted effects]
-    C --> D[Normal response finalization handles withdrawal]
+    C --> D[Finalization handles withdrawal and optional capture handoff cookie]
     D --> E[Response sent to browser]
     E --> F[Shared service applies captured updates]
     F --> G[Persisted snapshot passed to later identity work]
@@ -334,15 +356,21 @@ forward, including changed generations and failed states.
 Capture routes can have `NotRead` snapshots. Their first required lookup occurs
 after send. A reusable snapshot avoids that lookup, but unusable generations,
 stale misses and CAS conflicts can require refresh reads. No zero-read claim is
-made. No-token responses queue no token mutation.
+made. No-token observations queue no new direct capture mutation. A valid
+incoming handoff can independently stage restricted replay under section 8.2.
 
 Best-effort after-send work adds execution time, not Fastly response latency.
 There is no durable queue, guaranteed retry or first-auction availability.
+The optional handoff allows another qualifying request to attempt persistence
+within a fixed deadline, without holding the capture response for a KV write.
+Replayed capture persistence also runs after send on Fastly, before legacy pull.
 Other adapters use the shared service only where EC KV support exists. Document
 before-send behavior where no post-send execution hook exists; do not claim
 persistence on unsupported adapters.
 
-## 8. Browser-body migration and EID cookie retirement
+## 8. Browser-body migration and capture handoff
+
+### 8.1 Retire the redundant browser EID cookie
 
 Use validated `/auction` body EIDs both for current-request forwarding and for
 registered-source browser enrichment. Expose the existing EID-to-update helper
@@ -352,14 +380,22 @@ finalization instead of performing a second unconditional lookup.
 Remove the `ts-eids` writer and server readers only after body ingestion is
 verified. Final behavior:
 
-- `/auction` gets current-request client EIDs from the body, with no EID-cookie
-  fallback. Unknown sources remain usable only in that current auction.
-- Publisher and SPA page-bid auctions read registered IDs from KV.
+- `/auction` gets current-request client EIDs from the body, with no `ts-eids`
+  fallback. Unknown browser sources remain usable only in that current auction.
+- Publisher and SPA page-bid auctions read registered IDs from KV. All auction
+  paths may also use eligible `ts-eids-s` observations under section 8.2.
 - The separate `sharedId` cookie retains its existing ingestion behavior;
   combine browser inputs into one finalization mutation attempt.
 - Orphan recovery no longer seeds IDs from a `ts-eids` cookie.
 - Late browser IDs need another auction submission for persistence. No new
-  page-exit beacon or cookie fallback is introduced.
+  page-exit beacon or browser EID cookie fallback is introduced. `ts-eids-s`
+  contains validated server capture only; it does not collect late browser IDs.
+
+Normal `/auction` callers already submit available browser EIDs in the body.
+The old `ts-eids` reader used body-or-cookie fallback, not missing-source merge.
+Its current-auction role was therefore largely redundant. It could also ingest
+IDs discovered after request construction on a later navigation. Restoring that
+behavior remains a separate benefit decision; this handoff does not restore it.
 
 Retire `x-ts-eids` and `x-ts-eids-truncated` emission, checking external diagnostic
 tooling first. Keep both names on the inbound internal-header strip list.
@@ -370,6 +406,131 @@ its existing max-age is one day. New servers ignore it even if cached older
 bundles still write it. Remove the cleanup shim once the transition artifacts
 have aged out. Do not add unconditional server cookie cleanup that changes
 cache privacy on every response.
+
+### 8.2 Short-lived authenticated capture handoff
+
+Reintroduce `ts-eids-s` as an optional transient handoff, not the original
+unsigned source/UID array. It has two material benefits for a newly captured
+source: auction delivery before capture persistence becomes visible, and a
+later persistence attempt after a failed post-send write. It does not duplicate
+browser-body intake or replace KV as the identity graph.
+
+The shared identity service owns encoding, validation, auction resolution,
+retry staging and cleanup. Integrations provide observations and approved
+source/writer mappings, not private cookie readers or writers.
+
+#### Envelope and lifetime
+
+- Use a versioned authenticated envelope with a key identifier, publisher
+  binding, full EC ID, absolute handoff deadline and a bounded source-keyed
+  list. Each entry carries the acquisition module, UID, its original absolute
+  deadline and optional provider expiry in Unix seconds. Do not include raw
+  consent strings or credentials.
+- Protect the complete envelope with a publisher-scoped signing key and a
+  reviewed encoding and verification scheme. Base64 is encoding, not integrity
+  protection; `HttpOnly` does not authenticate an incoming cookie. Never fall
+  back to unsigned acceptance when a key or signature is unavailable.
+- Use `Path=/; Secure; HttpOnly; SameSite=Lax` and the configured EC cookie
+  domain. Default entry lifetime is five minutes, never longer than its known
+  provider expiry. Set the envelope deadline to the latest retained entry
+  deadline and browser `Max-Age` to the remaining envelope lifetime. Filter each
+  entry by its own authenticated deadline; `Max-Age` alone cannot establish expiry.
+- Cap the complete encoded value, including authentication overhead, at 2,048
+  bytes. Retain the existing UID and source caps. Reject an entry that cannot
+  fit; never emit a partial envelope. Any multi-source truncation is
+  deterministic and removes the earliest-expiring entries first.
+- Each entry must retain its original absolute deadline when cookies merge or
+  entries are removed. Reading, retrying, clearing another entry or receiving
+  `NoChange` must not extend that deadline. An actually new validated capture
+  can get a new deadline. A matching UID and effective expiry retain the pending
+  deadline; omission of expiry retains the same UID's known pending expiry.
+  That pending expiry may only fill an absent source, never alter a stored record.
+  Enforce both entry and envelope deadlines.
+
+The shared finalizer can set the cookie from already validated capture without
+adding a pre-send KV lookup or write. A `NotRead` snapshot remains permitted at
+issuance; the cookie itself does not prove that a live root exists. Handoff
+creation failure leaves the original response and normal deferred capture
+persistence intact. Responses carrying the cookie remain private and uncacheable.
+Upstream body bytes and encoding/length headers remain unchanged, but the response
+is no longer header-identical because it adds `Set-Cookie` and cache privacy.
+
+#### Eligibility, precedence and replay
+
+On a later request, authenticate within the encoded size cap and revalidate the
+full EC ID, publisher, clock, entry expiry, current acquisition consent, module
+claims, enabled capture and configured ownership. Use the normal request-local
+KV snapshot. Missing, unreadable or withdrawn roots authorize neither handoff
+auction delivery nor handoff persistence. No cookie creates or recovers a root.
+An unusable clock cannot authorize a time-bounded handoff.
+
+Eligibility reflects the row observed in this request, not a strongly consistent
+or globally current read. A stale live snapshot that still lacks the source can
+deliver a handoff while another POP has newer stored state or a withdrawal.
+This retains the foundation's existing KV read-consistency limit. Current request
+consent still gates delivery; post-send replay checks the authoritative generation
+and cannot overwrite the newer record or revive its tombstone. No cross-POP
+instant-withdrawal guarantee is made.
+
+For each registered source:
+
+| Stored source state                                          | Handoff action                                                                                                                  |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| Absent on a live, consenting root                            | Allow the unexpired captured UID for a bidstream-enabled source and stage a fill-absent-only retry.                             |
+| Expired or invalidated record                                | Retire the handoff without delivery or retry for that source; the retained record is not an empty slot.                         |
+| Usable record with the same UID, writer and effective expiry | Acknowledge the handoff and remove it; use the stored record.                                                                   |
+| Any other existing record                                    | Use the stored record if usable and retire the conflicting handoff; do not replace the UID, extend expiry or change its writer. |
+
+Source/UID equality alone cannot acknowledge a handoff with different expiry or
+writer metadata. When capture omitted expiry, a stored same-UID known expiry is
+retained rather than erased. A matching browser UID does not turn handoff
+metadata into browser authority. Provenance reconstruction uses only the
+validated acquisition module and its approved source mapping; mixed-origin
+browser merges follow section 6.3.
+
+This conservative first version accelerates absent-source capture only. A refresh
+of an existing source still depends on the direct authoritative capture write.
+It does not make an older cookie beat a newer record observed in the snapshot. Supporting immediate
+replacement or expiry extension from replay requires a separate revision-bound
+contract; edge timestamps and signatures do not prove provider ordering.
+
+The shared service owns retry. A new direct capture observation supersedes any
+incoming handoff for the same source; do not replay the older entry alongside it.
+Combine remaining eligible handoff entries into at most one replay batch per
+qualifying request, using bounded CAS and preserving unrelated sources. On
+conflict, refresh and recheck source absence; do not blindly retry replacement. Fastly applies the replay after send, in the shared capture executor
+before pull sync. No immediate recursive retry, private integration dispatcher,
+provider refetch or durable queue is introduced.
+
+Remove acknowledged, conflicting, expired or no-longer-authorized entries on
+responses that already have a validated handoff to reconcile. Clear the cookie
+when none remain. Withdrawal, EC rotation or publisher/owner mismatch invalidate
+the affected handoff. Do not emit unconditional cleanup cookies on unrelated
+responses. A post-send success cannot clear the cookie in an already-sent response;
+cleanup waits for a later request that observes the persisted result. A failed
+write can retain the handoff only until its original deadline.
+
+A later SDK response with no new tokens may therefore repair a previously missed
+capture by carrying an existing valid handoff. No new token means no new direct
+capture effect; it does not mean no independently validated replay. Retry remains
+best-effort and requires another qualifying request before expiry.
+
+The capture response must install the cookie before a later request can carry it.
+An auction starting earlier can still miss the ID. The handoff does not guarantee
+the first auction, immediate refresh of an existing source, delivery during a
+root-read failure, or repair after its deadline.
+
+Shared handoff issuance, delivery and retries default off behind explicit
+publisher opt-in. The integration capture kill switch also stops handoff delivery
+and retry for that module, without making stored KV records unusable. Confirm the
+publisher key provisioning and rotation before activation. The implemented
+interface is `[ec.identity_handoff]` with `enabled`, `active_key_id` and at most
+four `keys`. Each key has a safe identifier and a dedicated app-config secret-store
+reference; runtime material must be URL-safe unpadded base64 of 32 random bytes.
+Issuance uses the active key and verification accepts retained rotation keys.
+The versioned envelope uses domain-separated HMAC-SHA256; the EC passphrase
+cannot be reused. Only Fastly requests admitted to its EC/KV finalization path
+enable handoff work. Unsupported adapters neither issue nor replay it.
 
 ## 9. Bounded transport and failure policy
 
@@ -439,11 +600,12 @@ Delivery stages:
    mutation plumbing with managed acquisition inactive.
 2. Add common outcomes, source ownership and capture registration. Keep
    authoritative and browser mutation classes distinct.
-3. Add browser-body ingestion, verify it, then retire EID cookie/header paths.
+3. Add browser-body ingestion, verify it, then retire `ts-eids` cookie/header paths.
 4. Add bounded capture handling and shared Fastly effect execution, using
    synthetic integration fixtures before enabling Lockr.
-5. Implement and enable the separate Lockr consumer after ownership and
-   provider validation checks pass.
+5. Implement the separate Lockr consumer, then the optional authenticated
+   handoff through the shared service. Enable each only after its ownership,
+   provider, key-management and safety gates pass.
 6. Implement active resolution and refresh only with its later provider spec.
 
 ## 12. Verification and open decisions
@@ -474,6 +636,20 @@ Foundation tests must cover:
 - Fastly send-before-capture-write ordering and resulting snapshot handoff to
   pull sync; no-token and failed-update paths; supported adapter behavior.
 - Redacted errors and no private data in logs, including provider query URLs.
+- Handoff authentication, publisher/full-ID binding, key rotation, malformed and
+  oversized values, independent entry deadlines and no deadline extension on
+  replay, merge, cleanup or `NoChange`.
+- Handoff auction eligibility across publisher, `/auction` and SPA paths before
+  capture KV visibility; no delivery for missing/failed/withdrawn roots, denied
+  consent, expired entries, disabled capture or changed ownership.
+- Absent-source-only replay, exact acknowledgement, different-UID and same-UID
+  changed-expiry conflicts, retained expired records, duplicate requests and CAS
+  races with acquisition or withdrawal. No stale replacement or metadata loss.
+- Send-before-replay-write ordering, combined replay bounds, acknowledgement
+  cleanup on a later response, no-token request repair and failure retention only
+  until the original deadline. Cookie failure must not break direct capture.
+- `Set-Cookie` cache privacy, unchanged upstream bytes/encoding, deterministic
+  complete-envelope size limits and no cleanup cookies on unrelated responses.
 
 Resolve before implementation activation:
 
@@ -482,9 +658,13 @@ Resolve before implementation activation:
 2. Confirm capture ordering expectations when an SDK issues overlapping token
    requests; no provider sequence is assumed by this foundation.
 3. Identify external consumers of the diagnostic EID headers before retirement.
+4. Provision dedicated publisher signing keys and verify rotation operationally.
+   The implemented defaults are five minutes and 2,048 encoded bytes, including
+   binding, metadata and signature overhead. Validate provider-approved ID5
+   fixtures and cross-POP visibility/withdrawal behavior on the approved route.
+   Synthetic local tests do not establish live acceptance or strong KV reads.
 
-Provider expiry, writer and revision storage are proposed foundation decisions,
-not already implemented capabilities. LiveRamp protocol approval, identifier
+Provider expiry, writer and revision storage are implemented foundation decisions. LiveRamp protocol approval, identifier
 intake, refresh response semantics and country-specific TTL remain for its
 future spec. Arbitrary OpenRTB provenance storage remains outside this first
 delivery; fixed Lockr ID5 provenance is reconstructed from the persisted writer.

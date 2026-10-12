@@ -75,6 +75,7 @@ pub fn ec_finalize_response(
             consent_withdrawn,
             response,
         );
+        super::identity_handoff::finalize_response(settings, registry, ec_context, response);
         return;
     }
 
@@ -82,11 +83,12 @@ pub fn ec_finalize_response(
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
             let source = ec_context.eid_sync_source();
-            let collected = source
+            let mut collected = source
                 .map(|_| {
                     collect_browser_eid_updates(body_updates.clone(), sharedid_cookie, registry)
                 })
                 .unwrap_or_default();
+            protect_pending_capture_updates(&mut collected, ec_context, response);
             let had_eid_updates = !collected.is_empty();
             let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
             // `sync_eid_cookie_updates` early-returns without refreshing the
@@ -121,8 +123,9 @@ pub fn ec_finalize_response(
 
         reconcile_pull_sync_marker(settings, registry, ec_context, response);
 
-        // Ordinary returning-user page views no longer refresh the browser
-        // cookie, emit the EC header, or update KV TTL.
+        // Capture handoff reconciliation is separate from browser EID ingestion.
+        super::identity_handoff::finalize_response(settings, registry, ec_context, response);
+        // Ordinary returning-user page views do not refresh the EC cookie.
         return;
     }
 
@@ -149,6 +152,21 @@ pub fn ec_finalize_response(
     }
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
+    super::identity_handoff::finalize_response(settings, registry, ec_context, response);
+}
+
+fn protect_pending_capture_updates(
+    updates: &mut Vec<PartnerIdUpdate>,
+    context: &EcContext,
+    response: &Response<EdgeBody>,
+) {
+    let capture = response
+        .extensions()
+        .get::<super::identity::IdentityEffects>();
+    updates.retain(|update| {
+        !super::identity_handoff::protects_source(context, &update.partner_id)
+            && !capture.is_some_and(|effects| effects.protects_source(&update.partner_id))
+    });
 }
 
 fn sync_eid_cookie_updates(

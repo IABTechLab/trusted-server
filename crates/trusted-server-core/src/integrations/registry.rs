@@ -990,6 +990,23 @@ impl IntegrationRegistry {
         Self::check_identity_owners(settings, &captures)
     }
 
+    /// Checks a replay writer against its current registered capture descriptor.
+    ///
+    /// Construct only the selected module, using the same builder as startup.
+    pub(crate) fn capture_claim_enabled(settings: &Settings, module: &str, source: &str) -> bool {
+        crate::integrations::builders()
+            .iter()
+            .find(|builder| builder.id == module)
+            .and_then(|builder| (builder.build)(settings).ok().flatten())
+            .and_then(|registration| registration.identity_capture)
+            .is_some_and(|capture| {
+                capture.enabled()
+                    && capture.sources().iter().any(|claim| {
+                        normalize_partner_source_domain(claim).ok().as_deref() == Some(source)
+                    })
+            })
+    }
+
     fn check_identity_owners(
         settings: &Settings,
         captures: &BTreeMap<&'static str, Arc<dyn IdentityCapture>>,
@@ -1158,17 +1175,29 @@ impl IntegrationRegistry {
                         status: response.status(),
                         decoded_body: &decoded,
                     })
-                    && let Ok(partners) = PartnerRegistry::from_config(&settings.ec.partners)
-                    && let Some(effects) = stage_capture(
-                        integration_id,
-                        capture.sources(),
-                        observation,
-                        ec_context,
-                        &partners,
-                        settings,
-                    )
                 {
-                    response.extensions_mut().insert(effects);
+                    // An admitted no-token response can independently replay an
+                    // incoming handoff, but body privacy signals still restrict it.
+                    ec_context.identity_handoff.proxy_replay_allowed =
+                        crate::ec::identity::observation_consent_allowed(
+                            &observation.consent,
+                            ec_context,
+                            settings,
+                        );
+                    ec_context.identity_handoff.proxy_replay_denied =
+                        !ec_context.identity_handoff.proxy_replay_allowed;
+                    if let Ok(partners) = PartnerRegistry::from_config(&settings.ec.partners)
+                        && let Some(effects) = stage_capture(
+                            integration_id,
+                            capture.sources(),
+                            observation,
+                            ec_context,
+                            &partners,
+                            settings,
+                        )
+                    {
+                        response.extensions_mut().insert(effects);
+                    }
                 }
             }
             Some(Ok(response))
