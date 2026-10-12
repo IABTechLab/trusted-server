@@ -21,12 +21,29 @@ pub fn integration_app_config_envelope_with_trace(
     origin_port: u16,
     trace: bool,
 ) -> TestResult<String> {
+    app_config_envelope(origin_port, trace, |_| Ok(()))
+}
+
+/// Builds the integration app-config envelope after `customize` edits the
+/// parsed fixture.
+fn app_config_envelope(
+    origin_port: u16,
+    trace: bool,
+    customize: impl FnOnce(&mut toml::Table) -> TestResult<()>,
+) -> TestResult<String> {
     let origin_url = format!("http://127.0.0.1:{origin_port}");
-    let app_config: TrustedServerAppConfig = toml::from_str(APP_CONFIG).map_err(|error| {
+    let mut table: toml::Table = toml::from_str(APP_CONFIG).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
             "invalid Trusted Server integration config: {error}"
         ))
     })?;
+    customize(&mut table)?;
+    let app_config: TrustedServerAppConfig =
+        toml::Value::Table(table).try_into().map_err(|error| {
+            Report::new(TestError::ConfigGeneration).attach(format!(
+                "invalid customized Trusted Server integration config: {error}"
+            ))
+        })?;
     let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
     if trace {
@@ -60,7 +77,37 @@ pub fn integration_app_config_envelope_with_trace(
 
 pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
     let envelope = integration_app_config_envelope(origin_port)?;
-    serde_json::to_string(&serde_json::json!({ CONFIG_BLOB_KEY: envelope })).map_err(|error| {
+    cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
+}
+
+/// Builds a Cloudflare config binding with server-side auctions enabled.
+///
+/// The fixture's providers are removed so the enabled auction completes
+/// through the orchestrator and telemetry without any outbound provider call.
+pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
+    let envelope = app_config_envelope(origin_port, false, |table| {
+        let auction = table_mut(table, "auction")?;
+        auction.insert("enabled".to_string(), toml::Value::Boolean(true));
+        auction.remove("providers");
+        auction.remove("bidders");
+        Ok(())
+    })?;
+    cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
+}
+
+fn table_mut<'a>(table: &'a mut toml::Table, key: &str) -> TestResult<&'a mut toml::Table> {
+    table
+        .get_mut(key)
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| {
+            Report::new(TestError::ConfigGeneration).attach(format!(
+                "integration config should contain a `[{key}]` table"
+            ))
+        })
+}
+
+fn cloudflare_binding_json(binding: &serde_json::Value) -> TestResult<String> {
+    serde_json::to_string(binding).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
             "failed to serialize Cloudflare config binding: {error}"
         ))
