@@ -41,6 +41,31 @@ Keep a pull request in draft while required checks or known changes remain.
 Before requesting review, inspect the complete diff, resolve all failures, and
 state any platform path that could not be exercised.
 
+### Pre-commit URL-host linter
+
+`ts dev lint domains` flags non-allowlisted URL hosts in source, config, and
+docs. Install the managed hook once per checkout so staged changes are checked
+before every commit:
+
+```bash
+ts dev install-hooks
+```
+
+This writes a `pre-commit` hook into `.git/hooks`, shared by every linked
+worktree of the clone. It never edits git configuration and never writes into
+the working tree. It refuses to replace a hook it did not write (`--force`
+replaces it and prints the backup path), and refuses when `core.hooksPath` is
+set, since git then runs hooks from that directory instead. To uninstall, delete
+`.git/hooks/pre-commit` and restore any `pre-commit.bak.*` backup.
+
+To scan on demand, `ts dev lint domains` audits the whole working tree and
+`--changed-vs <ref>` limits it to lines added against a ref. The full audit
+reports pre-existing violations, so a non-zero exit is expected today.
+
+To allow a new host, add it to the allowlist constants in
+`crates/trusted-server-cli/src/commands/dev/lint/domains.rs`. To suppress a
+single line, append `// allow-domain: <host>` in a comment.
+
 ## Commits
 
 Write concise, imperative, sentence-case subjects without semantic prefixes or
