@@ -25,8 +25,8 @@ serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named
-# maintainer of every adapter. 51Degrees wrote the crate and holds it until
-# InMobi adopt it.
+# maintainer of every adapter. InMobi has not yet adopted this crate, so the
+# Trusted Server maintainers own it until a vendor owner steps up.
 [package.metadata.maintainers]
-owner = "51Degrees"
+owner = "Trusted Server maintainers"
 status = "seeking vendor owner"

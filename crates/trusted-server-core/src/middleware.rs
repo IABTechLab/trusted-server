@@ -28,12 +28,7 @@
 //! orders the page changes of the modules that run. A middleware reads its
 //! settings from its module's own table.
 //!
-//! Fetch is obtaining the document from the origin. A fetch middleware is
-//! handed nothing about the reader, so what it leaves is what a shared
-//! template stores for every reader. Serve is preparing the document for one
-//! response. A serve middleware runs for each reader, on that reader's copy,
-//! whether the page came from the store or from the origin, and nothing it
-//! writes is stored.
+//! [`MiddlewarePhase`] says when each phase runs.
 
 use std::fmt;
 use std::rc::Rc;
@@ -81,10 +76,13 @@ pub fn media_type_of(content_type: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MiddlewarePhase {
     /// On the document as the origin sent it. What is left is what a shared
-    /// template stores, so nothing here may depend on the reader.
+    /// template stores, so a fetch middleware is handed nothing a request
+    /// left.
     Fetch,
     /// On one reader's copy, on its way out, whether it came from the store
-    /// or from the origin. Nothing written here is stored.
+    /// or from the origin. A serve middleware is handed what the modules'
+    /// request preparers left for this reader's request, and nothing written
+    /// here is stored.
     Serve,
 }
 
@@ -109,11 +107,6 @@ impl fmt::Display for MiddlewarePhase {
 }
 
 /// What a middleware is told about the document it is asked to change.
-///
-/// In [`MiddlewarePhase::Fetch`] the document's state holds nothing a
-/// request left, because the document may be stored and served to other
-/// readers. In [`MiddlewarePhase::Serve`] it holds what the modules' request
-/// hooks left for this reader's request.
 #[derive(Debug, Clone, Copy)]
 pub struct MiddlewareContext<'a> {
     /// Which phase is running.
@@ -283,7 +276,7 @@ impl MiddlewareAction {
             && self.text_handlers.is_empty()
     }
 
-    /// Checks every handler's selector parses, before a rewriter is built
+    /// Checks every handler's selector parses, before a handler is built
     /// from it.
     fn validate_selectors(&self) -> Result<(), String> {
         let check = |selector: &str| {
@@ -613,13 +606,9 @@ impl MiddlewareChain {
 
     /// Asks every middleware in turn what it will do with one document.
     ///
-    /// A selector cannot be checked when the settings load, because a
-    /// middleware chooses its handlers for each document, so each is checked
-    /// here. The caller refuses the response when one does not parse, because
-    /// a change that silently does not happen is worse than a response that
-    /// fails. On a media type other than HTML an action may carry a stream
-    /// processor alone, and one that decides about HTML is refused the same
-    /// way.
+    /// Checks each handler's selector, refusing the document when one does
+    /// not parse. On a media type other than HTML, an action that decides
+    /// about HTML is refused the same way.
     ///
     /// # Errors
     ///

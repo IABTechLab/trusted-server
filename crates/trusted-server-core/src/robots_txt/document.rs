@@ -10,14 +10,8 @@
 //!    refuses the whole site to, see [`assemble`].
 //! 3. The publisher's own text and the `Sitemap` line go where the publisher
 //!    put them, around what the contributors gave.
-//!
-//! The record names in a contribution are written in one spelling,
-//! `User-Agent`, `Allow` and `Disallow`, and everything else is written back
-//! exactly as it was read. A contributor that reads a finished file in that
-//! spelling and hands it over as a [`Contribution`] therefore changes nothing in
-//! its bytes, which is what lets another implementation agree with this one byte
-//! for byte. The [`refusal`] is written whole rather than from contributions,
-//! and spells its first record `User-agent`.
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,15 +40,28 @@ pub enum Record {
 impl Record {
     fn line(&self) -> String {
         match self {
-            Self::Allow(path) => format!("Allow: {path}"),
-            Self::Disallow(path) => format!("Disallow: {path}"),
-            Self::Comment(text) => format!("#{text}"),
-            Self::Other { name, value } => format!("{name}: {value}"),
+            Self::Allow(path) => format!("Allow: {}", one_line(path)),
+            Self::Disallow(path) => format!("Disallow: {}", one_line(path)),
+            Self::Comment(text) => format!("#{}", one_line(text)),
+            Self::Other { name, value } => format!("{}: {}", one_line(name), one_line(value)),
         }
     }
 
+    /// `Disallow: /`, or the same rule written with wildcards, such as
+    /// `Disallow: /*`, which RFC 9309 section 2.2.3 reads as matching every path.
     fn refuses_the_whole_site(&self) -> bool {
-        matches!(self, Self::Disallow(path) if path == "/")
+        matches!(self, Self::Disallow(path)
+            if one_line(path).strip_prefix('/').is_some_and(|rest| rest.bytes().all(|b| b == b'*')))
+    }
+}
+
+/// `value` with every CR and LF taken out, so that it cannot end its line and
+/// start a record of its own.
+fn one_line(value: &str) -> Cow<'_, str> {
+    if value.contains(['\r', '\n']) {
+        Cow::Owned(value.replace(['\r', '\n'], ""))
+    } else {
+        Cow::Borrowed(value)
     }
 }
 
@@ -162,7 +169,7 @@ impl Contribution {
             let mut lines: Vec<String> = group
                 .user_agents
                 .iter()
-                .map(|agent| format!("User-Agent: {agent}"))
+                .map(|agent| format!("User-Agent: {}", one_line(agent)))
                 .collect();
             lines.extend(group.records.iter().map(Record::line));
             parts.push(lines.join("\n"));
@@ -181,8 +188,7 @@ fn push(contribution: &mut Contribution, current: &mut Option<Group>, record: Re
 /// What `allow_all` contributes, which is every crawler allowed everywhere.
 ///
 /// Permission the document says, rather than permission that follows from a
-/// lookup coming back empty. The two produce the same bytes, and only one of
-/// them was meant.
+/// lookup coming back empty.
 #[must_use]
 pub fn allow_all() -> Contribution {
     Contribution {
@@ -201,13 +207,6 @@ pub fn allow_all() -> Contribution {
 /// added, because a refusal cannot be loosened. `Allow` beats `Disallow` on
 /// the longest match under RFC 9309 section 2.2.2, so each allowance lets that
 /// one path through.
-///
-/// A publisher selling advertising should allow `/ads.txt`, because the
-/// advertising platforms may ignore an `ads.txt` that robots.txt disallows,
-/// and a blanket `Disallow: /` is exactly that case. It is not added by
-/// default, because a domain with no `ads.txt` would be inviting crawlers to
-/// a path it does not have. The configuration guide quotes one platform's own
-/// statement of this.
 #[must_use]
 pub fn refusal(always_allow: &[String]) -> String {
     let mut file = String::from("User-agent: *");
@@ -291,7 +290,7 @@ fn kept_open(contributions: &[Contribution], paths: &[String]) -> Option<String>
     }
     let mut lines: Vec<String> = names
         .iter()
-        .map(|name| format!("User-Agent: {name}"))
+        .map(|name| format!("User-Agent: {}", one_line(name)))
         .collect();
     lines.extend(paths.iter().map(|path| format!("Allow: {path}")));
     Some(lines.join("\n"))
@@ -413,6 +412,48 @@ mod tests {
             ),
             "User-Agent: *\nDisallow: /\n\nUser-Agent: *\nAllow: /ai-notice/\n",
             "a group for `*` below the contribution keeps the path open"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_that_matches_every_path_refuses_the_whole_site() {
+        let mut settings = config();
+        settings.always_allow = vec!["/ai-notice/".to_owned()];
+
+        assert_eq!(
+            assemble(
+                &settings,
+                &[Contribution::parse("User-Agent: ExampleBot\nDisallow: /*")]
+            ),
+            "User-Agent: ExampleBot\nDisallow: /*\n\n\
+             User-Agent: ExampleBot\nAllow: /ai-notice/\n",
+            "`Disallow: /*` is the same rule as `Disallow: /`"
+        );
+    }
+
+    #[test]
+    fn a_line_break_in_a_value_cannot_start_a_record() {
+        let contribution = Contribution {
+            preamble: vec![Record::Comment(" note\nAllow: /".to_owned())],
+            groups: vec![Group {
+                user_agents: vec!["ExampleBot\r\nUser-Agent: *".to_owned()],
+                records: vec![
+                    Record::Disallow("/x\nUser-Agent: *\nAllow: /".to_owned()),
+                    Record::Other {
+                        name: "TDL\r".to_owned(),
+                        value: "a\rAllow: /".to_owned(),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            assemble(&config(), &[contribution]),
+            "# noteAllow: /\n\n\
+             User-Agent: ExampleBotUser-Agent: *\n\
+             Disallow: /xUser-Agent: *Allow: /\n\
+             TDL: aAllow: /\n",
+            "every value stays on the line its record starts"
         );
     }
 

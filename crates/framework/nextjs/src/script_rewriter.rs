@@ -5,10 +5,11 @@ use regex::{Regex, escape};
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::ScriptRewriteAction;
+use trusted_server_core::middleware::TextHandler;
 
 use super::NextJsIntegrationConfig;
 use super::rsc_stream::{FragmentCapture, capture_fragment, document_state};
-use super::shared::{ScriptContext, ScriptRewriter, strip_origin_host_with_optional_port};
+use super::shared::{ScriptContext, ScriptDocument, strip_origin_host_with_optional_port};
 
 pub(super) struct NextJsNextDataRewriter {
     config: Arc<NextJsIntegrationConfig>,
@@ -46,11 +47,24 @@ impl NextJsNextDataRewriter {
     }
 }
 
-impl ScriptRewriter for NextJsNextDataRewriter {
-    fn selector(&self) -> &'static str {
+/// The `__NEXT_DATA__` rewriter at work on one document.
+pub(super) struct NextDataText {
+    pub(super) rewriter: Arc<NextJsNextDataRewriter>,
+    pub(super) document: ScriptDocument,
+}
+
+impl TextHandler for NextDataText {
+    fn selector(&self) -> &str {
         "script#__NEXT_DATA__"
     }
 
+    fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction {
+        self.rewriter.rewrite(text, &self.document.chunk(is_last))
+    }
+}
+
+impl NextJsNextDataRewriter {
+    /// Decides what happens to one chunk of the `__NEXT_DATA__` script.
     fn rewrite(&self, content: &str, ctx: &ScriptContext<'_>) -> ScriptRewriteAction {
         if self.config.rewrite_attributes.is_empty() {
             return ScriptRewriteAction::keep();

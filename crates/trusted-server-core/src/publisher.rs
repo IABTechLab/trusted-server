@@ -67,7 +67,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, is_navigation_request, remove_deployment_headers, serve_static_with_etag,
+};
 use crate::integrations::{IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState};
 use crate::middleware::{MiddlewarePhase, media_type_of};
 use crate::permissions::PermissionState;
@@ -1670,9 +1672,7 @@ fn create_html_stream_processor(
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed);
 
-    // The middleware of the first [[fetch]] entry covering this path. What
-    // they leave is what a shared template stores, and they are handed
-    // nothing the request left.
+    // The middleware of the first [[fetch]] entry covering this path.
     let fetch = params.integration_registry.middleware_chain(
         &params.settings.fetch,
         MiddlewarePhase::Fetch,
@@ -1681,9 +1681,7 @@ fn create_html_stream_processor(
     );
     // A response that may be stored leaves this processor as the template
     // every reader shares, so its [[serve]] entry runs on each reader's copy
-    // once that copy is assembled. See `run_serve_pass`. What the request
-    // left reaches a document through that entry alone, so none of it reaches
-    // a template.
+    // once that copy is assembled. See `run_serve_pass`.
     let serve = (!params.shared_template_authorized).then(|| {
         params.integration_registry.middleware_chain(
             &params.settings.serve,
@@ -2202,10 +2200,8 @@ pub async fn buffer_publisher_response_async(
                 set_assembly_response_state(&mut response, state);
             }
             let bytes = if was_authorized {
-                // The transform wrote a template every reader shares, so the
-                // [[serve]] entry runs here, on this reader's assembled copy.
-                // A page that was never authorized ran it inside the
-                // transform.
+                // The [[serve]] entry runs here on a shared template, and
+                // inside the transform on a page that was never authorized.
                 let bytes = run_serve_pass(bytes, &params, settings, integration_registry)?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
@@ -5523,7 +5519,12 @@ pub async fn handle_publisher_request(
         services.http_client().send(platform_request).await
     };
     let mut response = match origin_result {
-        Ok(platform_response) => platform_response.response,
+        // The origin answered, so nothing in it describes this deployment,
+        // beneath `/_ts` as anywhere else.
+        Ok(mut platform_response) => {
+            remove_deployment_headers(&mut platform_response.response);
+            platform_response.response
+        }
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
                 emit_abandoned_auction(
@@ -17301,6 +17302,45 @@ mod tests {
             Some("max-age=31536000"),
             "matched publisher asset should receive Fastly edge policy"
         );
+    }
+
+    #[tokio::test]
+    async fn the_origins_answer_beneath_the_route_namespace_loses_the_deployment_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"not found".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/plain"),
+                ("x-served-by", "cache-node-1"),
+                ("x-cache", "MISS"),
+                ("x-cache-hits", "0"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/_ts/anything")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = match run_publisher_proxy(&settings, &services, request).await {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::PassThrough { response, .. } => response,
+        };
+
+        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
+            assert!(
+                response.headers().get(name).is_none(),
+                "the origin's {name} should not reach a reader"
+            );
+        }
     }
 
     #[tokio::test]

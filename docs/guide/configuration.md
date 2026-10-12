@@ -715,12 +715,12 @@ keys and how a relying party checks it.
 
 ### `[attestation]`
 
-| Field        | Type   | Required | Description                                                                                                                                                                                                                                                                                                                  |
-| ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `endpoint`   | String | No       | Where the page answers, with the JSON form at the same path plus `.json`. Default `/_ts/attestation`. An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not ending `.json` and not an address the deployment already answers |
-| `operator`   | String | Yes      | Who the evidence says operates the deployment, 1 to 64 characters                                                                                                                                                                                                                                                            |
-| `context`    | String | Yes      | The text signed ahead of the evidence, 1 to 64 characters with no control characters. A verifier must use exactly the same text                                                                                                                                                                                              |
-| `verify_url` | String | Yes      | An `https` address with a host, where the page sends a reader to check the claim                                                                                                                                                                                                                                             |
+| Field        | Type   | Required | Description                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`   | String | No       | Where the page answers, with the JSON form at the same path plus `.json`. Default `/_ts/attestation`. An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not ending `.json`, not an address the deployment already answers and not under a prefix a framework serves its assets from, such as `_next` |
+| `operator`   | String | Yes      | Who the evidence says operates the deployment, 1 to 64 characters                                                                                                                                                                                                                                                                                                                                    |
+| `context`    | String | Yes      | The text signed ahead of the evidence, 1 to 64 characters with no control characters. A verifier must use exactly the same text                                                                                                                                                                                                                                                                      |
+| `verify_url` | String | Yes      | An `https` address with a host, where the page sends a reader to check the claim                                                                                                                                                                                                                                                                                                                     |
 
 The section refuses any other field, so a configuration naming a signing key
 is refused. Keys are compiled into the build from the file the build input
@@ -1033,7 +1033,7 @@ Custom headers may be overwritten by application logic. Standard headers (`Conte
 
 `X-Served-By`, `X-Cache` and `X-Cache-Hits` name the node that answered and say how a cache treated the request. They arrive on a response from the publisher's origin or from a cache on the way to it. On a publisher's page they tell a reader nothing, and tell something probing the site how it is built.
 
-Every adapter removes the three from a response before it finalizes it, unless the request was for a path beneath `/_ts`, which is where a deployment is asked about itself. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
+Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
 ## robots.txt Configuration
 
@@ -2698,14 +2698,6 @@ response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
 positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
 Check `X-TS-Template-Cache: hit` to verify template reuse.
 
-Authorization has one narrow exception. A request carrying exactly the same
-single Basic credential that Trusted Server just validated at the edge may share
-a template; pass-through, repeated, appended, or replaced values still bypass.
-Trusted Server does not remove the validated header, so it remains forwarded to
-the publisher origin. If the origin uses that credential to select response
-content, it must declare `Vary: Authorization`; that response is deliberately not
-stored as a shared template.
-
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, and schema
@@ -3253,12 +3245,16 @@ staging key; staged deployments need their own runtime-env store.
 
 ### One blob for each host
 
-One Fastly service can serve several publishers, each from an application
-config of its own. Write `{host}` in the `__KEY` selector and the runtime
-replaces it with the host of each request before it reads any settings, so
-every host reads the blob stored under its own name.
+One Fastly service can serve several publishers, each from an app-config blob
+of its own. Write `{host}` in the `__KEY` selector and the runtime replaces it
+with the host of each request before it reads any settings, so every host
+reads the blob stored under its own name.
 
 Push a blob for each host the service answers for, then set the selector.
+Push each key in lower case. The runtime lowercases the request's host and
+`--key` stores the key as typed, so a blob pushed under
+`WWW.Publisher-A.example` is never read and every request for that host is
+answered `421`.
 
 ```bash
 ts config push --adapter fastly --key www.publisher-a.example --app-config publisher-a.toml
@@ -3285,9 +3281,11 @@ any entry of its `edgezero_runtime_env` store does, so the blobs come first.
 A host with no blob is never answered from the logical store ID or from
 another host's blob, because a shared fallback is how a host nobody configured
 comes to be served another publisher's site. A host name is letters, digits
-and hyphens in labels joined by single dots. Nothing else is looked up, so a
-request cannot name the logical store ID or a part of a stored blob, each of
-which carries an underscore.
+and hyphens in labels joined by single dots, and no label starts or ends with
+a hyphen. An IPv4 address such as `127.0.0.1` passes, and an IPv6 literal such
+as `[::1]` is refused. Nothing else is looked up, so a request cannot name the
+logical store ID or a part of a stored blob, each of which carries an
+underscore.
 
 - A publisher with several names has a blob under each. `www.publisher.example`
   and `publisher.example` are two keys, and what each serves is for the
@@ -3302,7 +3300,7 @@ which carries an underscore.
   `<logical-store-id>_staging`, which carries no placeholder. A staged version
   therefore reads that one blob for every host and never a production blob.
 - Only the Fastly adapter reads the placeholder. The Axum, Cloudflare and Spin
-  adapters read one application config.
+  adapters read one app-config blob.
 
 `./scripts/config-by-host-local-test.sh` serves two publishers from one local
 Viceroy instance. It checks that each host is answered from its own blob and
