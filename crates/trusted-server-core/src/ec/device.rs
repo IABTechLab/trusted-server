@@ -118,12 +118,13 @@ pub struct DeviceSignals {
     /// the TLS and HTTP/2 signals.
     ///
     /// [`human_confidence`](Self::human_confidence) is the module's answer
-    /// about a person, which nothing gates on.
+    /// about a person, which nothing reads yet.
     pub looks_like_browser: bool,
 
     /// How confident the device module is that a person is looking at the
     /// page. A module that scores the request writes it, and every other
-    /// module leaves it `Unknown`.
+    /// module leaves it `Unknown`. Nothing reads it yet, and it is not stored
+    /// in the identity graph with the other signals.
     ///
     /// Unlike [`looks_like_browser`](Self::looks_like_browser) this is not a
     /// guess about the shape of a header. It is the module's answer from the
