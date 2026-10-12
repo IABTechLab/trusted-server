@@ -65,7 +65,10 @@ writes it on each reader's copy instead. Core writes each
 middleware's head markup in the order the entry names them, and nothing
 advertising related may run before the reader answers the prompt, so name
 `cmp.inmobi` before any middleware that writes a vendor's tag, as the example
-above does ahead of Google Tag Manager.
+above does ahead of Google Tag Manager. A serve middleware's head markup is
+written after every fetch middleware's, so a prompt placed in `[[serve]]`
+comes after a vendor's tag that a `[[fetch]]` entry writes. Place the prompt
+in `[[fetch]]` wherever a fetch middleware writes a vendor's tag.
 
 Selecting the module with no `text/html` entry of either phase naming it is
 refused when the settings load and by `ts config validate`, because the
