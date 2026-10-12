@@ -1,6 +1,6 @@
 # Design Spec: The Integration Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07 and 2026-10-08. This PR adds design
+**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07, 2026-10-08 and 2026-10-12. This PR adds design
 documents only and targets `main` directly. Following the review of #1043
 (27 August) the seam it defines is a precondition for the module series
 rather than a follow-up to it, so the order is now this spec, then its
@@ -13,7 +13,7 @@ the code lands.
 `2026-07-30-provider-migration-rollout-design.md`,
 `provider-code-registry.md`
 **Related PRs:** #986, #1043, #1044, #1045, #1046, #1047, #1054
-**Last updated:** 2026-10-08
+**Last updated:** 2026-10-12
 
 > **Why this spec exists.** PRs #1043 to #1047 open the identity, device and
 > geo seams, so a vendor can ship an Edge Cookie module in its own crate
@@ -810,6 +810,11 @@ first vendor outside this repository is asked to use it.
 
 ## Revision record
 
+- 2026-10-12. One design document for each of the stack's pull requests
+  above the seam, the 23 files dated 2026-10-12 in this folder, so this pull
+  request carries every design document of the stack in one place. Each
+  names the fork pull request that implements it and the Tech Lab issue it
+  answers, and is written from both as they stand.
 - 2026-10-06. Merged `main` at 7a0ecb4. Added the module name (§2), build-time
   discovery of the built-in set (§3.1), the reasons for the maintainers
   convention (§2), and page changes as middleware in ordered phase entries
