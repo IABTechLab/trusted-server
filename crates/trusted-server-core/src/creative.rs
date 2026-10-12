@@ -24,13 +24,13 @@
 //!   click guard.
 //! - Hosts matching `[rewrite] exclude_domains` are left untouched, for assets
 //!   and links alike.
-//! - When `[rewrite] include_domains` is non-empty, only asset URLs on listed
-//!   hosts are proxied. Links ignore it.
 //! - Bidder-supplied `<base>` elements are removed so root-relative first-party
 //!   URLs cannot be rebased.
 //! - Relative URLs (e.g., `/path`, `../path`, `local/file`) remain unchanged.
 //! - Non-network schemes are ignored: `data:`, `javascript:`, `mailto:`, `tel:`,
 //!   `blob:`, `about:`.
+//! - When `[rewrite] include_domains` is non-empty, only asset URLs on listed
+//!   hosts are proxied. Links ignore it.
 //!
 //! Switches:
 //! - Auction creatives (`POST /auction` and inline SSAT/page-bids) rewrite asset
@@ -1314,22 +1314,22 @@ fn rewrite_creative_html_impl(
                 }
                 Ok(())
             }),
-            // Stylesheets and preloads
+            // Stylesheets and preloads. `imagesrcset` is left to the
+            // `[imagesrcset]` handler, which also runs on this element;
+            // rewriting it here too would proxy the inline path's absolute
+            // proxy URLs a second time.
             element!("link[href]", |el| {
                 let rel = el
                     .get_attribute("rel")
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if rel.contains("stylesheet") || rel.contains("preload") || rel.contains("prefetch")
-                {
-                    // `imagesrcset` is left to the `[imagesrcset]` handler, which
-                    // also runs on this element; rewriting it here too would
-                    // proxy the inline path's absolute proxy URLs a second time.
-                    if let Some(p) =
+                if (rel.contains("stylesheet")
+                    || rel.contains("preload")
+                    || rel.contains("prefetch"))
+                    && let Some(p) =
                         proxied_attr_value(settings, el.get_attribute("href"), base_origin)
-                    {
-                        let _ = el.set_attribute("href", &p);
-                    }
+                {
+                    let _ = el.set_attribute("href", &p);
                 }
                 Ok(())
             }),
