@@ -2700,7 +2700,7 @@ mod tests {
 
     #[test]
     fn build_draft_config_extracts_gtm_container_id_from_url_evidence() {
-        let url = Url::parse("https://example.com").expect("should parse URL");
+        let url = Url::parse("https://publisher.example.com").expect("should parse URL");
         let artifact = AuditArtifact {
             audited_url: url.to_string(),
             page_title: None,
@@ -2729,6 +2729,60 @@ mod tests {
             Some("GTM-ABC123"),
             "should write only the container ID rather than the evidence URL"
         );
+        let warnings =
+            validate::check_candidate(&draft, &draft).expect("should validate draft config");
+        assert!(
+            warnings.is_empty(),
+            "should pass deploy validation, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn build_draft_config_does_not_enable_gtm_with_invalid_container_id() {
+        let url = Url::parse("https://publisher.example.com").expect("should parse URL");
+        for evidence in [
+            "https://tags.example.com/gtm.js?id=GTM-ABC",
+            "https://tags.example.com/gtm.js?id=GTM-ABCDEFGHIJKLMNOPQRSTU",
+        ] {
+            let artifact = AuditArtifact {
+                audited_url: url.to_string(),
+                page_title: None,
+                js_asset_count: 1,
+                third_party_asset_count: 1,
+                detected_integrations: vec![DetectedIntegration {
+                    id: "google_tag_manager".to_string(),
+                    evidence: evidence.to_string(),
+                }],
+                assets: vec![AuditedAsset {
+                    kind: "script".to_string(),
+                    url: evidence.to_string(),
+                    host: "tags.example.com".to_string(),
+                    party: AssetParty::ThirdParty,
+                    integration: Some("google_tag_manager".to_string()),
+                }],
+                warnings: Vec::new(),
+            };
+
+            let draft = build_draft_config(&url, &artifact, &gpt_slots::DiscoveredSlots::default())
+                .expect("should build draft config");
+            let config = toml::from_str::<toml::Value>(&draft).expect("should parse draft config");
+
+            assert_eq!(
+                config["integrations"]["google_tag_manager"]["enabled"].as_bool(),
+                Some(false),
+                "should not enable GTM with an invalid ID in {evidence}"
+            );
+            assert!(
+                draft.contains("# - Detected google_tag_manager;"),
+                "should retain manual-review guidance for {evidence}"
+            );
+            let warnings =
+                validate::check_candidate(&draft, &draft).expect("should validate draft config");
+            assert!(
+                warnings.is_empty(),
+                "should pass deploy validation for {evidence}, got {warnings:?}"
+            );
+        }
     }
 
     #[test]
