@@ -1031,7 +1031,7 @@ Custom headers may be overwritten by application logic. Standard headers (`Conte
 
 `X-Served-By`, `X-Cache` and `X-Cache-Hits` name the node that answered and say how a cache treated the request. They arrive on a response from the publisher's origin or from a cache on the way to it. On a publisher's page they tell a reader nothing, and tell something probing the site how it is built.
 
-Every adapter removes the three from a response before it finalizes it, unless the request was for a path beneath `/_ts`, which is where a deployment is asked about itself. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
+Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
 ## robots.txt Configuration
 

@@ -67,7 +67,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, is_navigation_request, remove_deployment_headers, serve_static_with_etag,
+};
 use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
 use crate::permissions::PermissionState;
 use crate::platform::{
@@ -5358,7 +5360,12 @@ pub async fn handle_publisher_request(
         services.http_client().send(platform_request).await
     };
     let mut response = match origin_result {
-        Ok(platform_response) => platform_response.response,
+        // The origin answered, so nothing in it describes this deployment,
+        // beneath `/_ts` as anywhere else.
+        Ok(mut platform_response) => {
+            remove_deployment_headers(&mut platform_response.response);
+            platform_response.response
+        }
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
                 emit_abandoned_auction(
@@ -17135,6 +17142,45 @@ mod tests {
             Some("max-age=31536000"),
             "matched publisher asset should receive Fastly edge policy"
         );
+    }
+
+    #[tokio::test]
+    async fn the_origins_answer_beneath_the_route_namespace_loses_the_deployment_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"not found".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/plain"),
+                ("x-served-by", "cache-node-1"),
+                ("x-cache", "MISS"),
+                ("x-cache-hits", "0"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/_ts/anything")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = match run_publisher_proxy(&settings, &services, request).await {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. }
+            | PublisherResponse::PassThrough { response, .. } => response,
+        };
+
+        for name in ["x-served-by", "x-cache", "x-cache-hits"] {
+            assert!(
+                response.headers().get(name).is_none(),
+                "the origin's {name} should not reach a reader"
+            );
+        }
     }
 
     #[tokio::test]
