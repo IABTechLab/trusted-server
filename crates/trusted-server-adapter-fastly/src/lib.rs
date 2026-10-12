@@ -114,11 +114,13 @@ fn stores_for_request(
             let named = host.unwrap_or_default();
             match &refusal {
                 config_selection::Refusal::NoConfigForHost => log::warn!(
-                    "no app config for host {named:?} under key selector `{}`",
+                    "no app-config blob for host {named:?} under key selector `{}`",
                     stores.config_key
                 ),
                 config_selection::Refusal::StoreUnavailable(reason) => {
-                    log::error!("cannot tell whether host {named:?} has an app config: {reason}");
+                    log::error!(
+                        "cannot tell whether host {named:?} has an app-config blob: {reason}"
+                    );
                 }
             }
             Err(refusal)
@@ -128,10 +130,9 @@ fn stores_for_request(
 
 /// The answer to a request no app-config blob serves.
 ///
-/// A host with no blob is answered `421 Misdirected Request`, because this
-/// service is not configured to answer for it. The answer is not to be
-/// stored, so a host is served as soon as its blob is pushed. A store that
-/// could not say whether the host has a blob is answered `500`.
+/// A host with no blob is answered `421 Misdirected Request`. The answer is
+/// not to be stored, so a host is served as soon as its blob is pushed. A
+/// store that could not say whether the host has a blob is answered `500`.
 fn refusal_response(refusal: &config_selection::Refusal) -> FastlyResponse {
     match refusal {
         config_selection::Refusal::NoConfigForHost => {
@@ -488,13 +489,6 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Build lazily, once per sandbox for each app-config key it is asked for.
     // Reached only past the health, JA4, and counters short-circuits, so none
     // of those pays for construction.
-    //
-    // `get_or_build` builds only when the sandbox holds no application for
-    // this key, retains only success, and returns the error unchanged. A
-    // failed build hands back its error router as the error payload: that
-    // serves this request and is then dropped, so a transient config-store
-    // failure cannot pin the sandbox into permanent error mode, and the next
-    // callback retries construction.
     crate::sandbox::hold_applications(sandbox);
     let Some(apps) = sandbox.state() else {
         log::error!("no application holder available after initialization");
@@ -1324,13 +1318,13 @@ mod tests {
             assert_eq!(
                 refusal,
                 config_selection::Refusal::NoConfigForHost,
-                "should refuse host {host:?} as one with no app config"
+                "should refuse host {host:?} as one with no app-config blob"
             );
         }
     }
 
     #[test]
-    fn a_host_with_no_app_config_is_answered_421_and_the_answer_is_not_stored() {
+    fn a_host_with_no_app_config_blob_is_answered_421_and_the_answer_is_not_stored() {
         let mut response = refusal_response(&config_selection::Refusal::NoConfigForHost);
 
         assert_eq!(
