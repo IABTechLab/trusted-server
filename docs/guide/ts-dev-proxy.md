@@ -287,9 +287,20 @@ certificate is imported until the subject check succeeds.
 
 The proxy sends the validated inbound browser authority as `X-Forwarded-Host`,
 including any explicit browser port, and `X-Forwarded-Proto: https` because the
-browser leg uses TLS. With authenticated forwarding enabled on both proxy and
-server, Trusted Server uses those values for public URLs and trace Origin checks.
-The upstream routing `Host` remains a separate choice.
+browser leg uses TLS. Trusted Server accepts these fields for public URLs and
+trace Origin checks only when the upstream configures
+[`[trusted_forwarder]`](./configuration.md#trusted-forwarder) and the proxy is
+given the matching token through `--forwarder-secret-file`. The forwarded
+hostname must also match `publisher.domain` or one of its subdomains. The upstream
+routing `Host` remains a separate choice. Every adapter strips raw `Forwarded`,
+`X-Forwarded-Host` and `X-Forwarded-Proto` fields before routing; unauthenticated
+fields do not influence the public origin.
+
+Without authenticated forwarding, first-party URLs use the upstream's runtime or
+transport host and scheme. An Axum upstream reached over plain HTTP emits
+`http://` first-party URLs even though the browser-to-proxy connection uses HTTPS.
+Configuring `[trusted_forwarder]` alone does not change that; the proxy must also
+supply the matching credential.
 
 By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
 through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
@@ -309,9 +320,11 @@ ts dev proxy \
 ```
 
 The proxy dials `192.0.2.10` while the SNI stays `ts.example-publisher.com` and
-`X-Forwarded-Host` stays `www.example-publisher.com`. With authenticated
-forwarding configured, TS rewrites first-party URLs onto the production domain. This keeps the tool self-contained — no
-`/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
+the default `Host` stays `www.example-publisher.com`. The upstream must accept
+that production Host; `X-Forwarded-Host` alone does not establish trust for URL
+rewriting. With authenticated forwarding configured, Trusted Server uses the
+browser's production origin for first-party URLs. This keeps the tool
+self-contained — no `/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
 which sends no SNI extension at all, so a host-routed endpoint serves its default
 vhost.) Add `--insecure` if the endpoint serves a certificate that doesn't match
 the hostname.
@@ -322,6 +335,13 @@ hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pa
 value on all routes, including trace Enable/End, publisher requests, and vendor
 integration requests. Trusted Server validates the browser Origin against the
 authenticated public origin when forwarding is configured.
+
+> **Trusted Server upstreams.** Fastly, Axum, Cloudflare and Spin all use their
+> runtime or transport origin without authenticated forwarding. With
+> `--rewrite-host`, this commonly means first-party URLs use `TO`. Use the option
+> when the upstream requires its own Host for routing or validation. Omit it when
+> the upstream accepts `Host: <FROM>` and you need the production hostname; the
+> scheme still follows the upstream transport.
 
 The TLS SNI is always the `TO` host either way:
 

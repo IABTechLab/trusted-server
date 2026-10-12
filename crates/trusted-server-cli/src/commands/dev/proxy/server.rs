@@ -812,6 +812,9 @@ fn rewrite_headers(
         );
     }
     headers.insert(hyper::header::HOST, outcome.host_header.clone());
+    // Replace client-supplied host hints with the browser authority and remove
+    // competing `Forwarded` metadata. Trusted Server accepts the forwarded host
+    // and scheme only with a matching `[trusted_forwarder]` credential.
     headers.remove("forwarded");
     headers.insert(
         HeaderName::from_static(X_FORWARDED_HOST),
@@ -821,11 +824,9 @@ fn rewrite_headers(
         HeaderName::from_static(X_ORIG_HOST),
         outcome.orig_host.clone(),
     );
-    // The browser→proxy leg is always TLS, so the original scheme is `https`.
-    // Stamp it authoritatively (overwriting any inbound value) and drop the
-    // spoofable `Fastly-SSL` signal, so a plaintext upstream (`--upstream-plaintext`)
-    // — or a spoofed header — cannot downgrade the first-party scheme Trusted
-    // Server derives for its URL rewriting (spec §8.3).
+    // The browser-to-proxy leg is always TLS. Replace any inbound scheme hint
+    // with `https` and remove the spoofable `Fastly-SSL` signal. Trusted Server
+    // still requires authenticated forwarding to use this scheme hint.
     headers.insert(
         HeaderName::from_static(X_FORWARDED_PROTO),
         HeaderValue::from_static("https"),
@@ -1192,9 +1193,8 @@ mod tests {
 
     #[test]
     fn rewrite_headers_strips_inbound_forwarded_so_injected_host_wins() {
-        // Trusted Server resolves the request host from `Forwarded` BEFORE
-        // `X-Forwarded-Host`. A client-supplied `Forwarded` must therefore be
-        // dropped, or it would outrank the FROM host the proxy injects.
+        // Remove client-supplied `Forwarded` metadata so the proxy sends only
+        // its own host hints, regardless of the upstream's trust policy.
         let outcome = rewrite_outcome("to.edgecompute.app");
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
@@ -1204,7 +1204,7 @@ mod tests {
         rewrite_headers(&mut headers, &outcome, None, ForwardingHeaders::default());
         assert!(
             !headers.contains_key("forwarded"),
-            "inbound Forwarded must be stripped so it cannot outrank X-Forwarded-Host"
+            "should strip inbound Forwarded rather than send competing host hints"
         );
         assert_eq!(
             headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),

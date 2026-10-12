@@ -492,7 +492,7 @@ it but keep using their own runtime client address.
 ### `[trusted_forwarder]`
 
 Trusted Server can accept the browser-facing authority and scheme from an
-explicitly authenticated forwarder. This is useful for `ts dev proxy` when the
+explicitly authenticated forwarder. This preserves the public origin when the
 upstream leg uses plain HTTP or sends a different Host. Leave the section absent
 for direct traffic. Unauthenticated forwarding headers never establish a public
 origin.
@@ -508,8 +508,11 @@ Both fields are required. `shared_secret` names a key in the logical
 as 32 random bytes encoded as hex; the stored value must contain at least 32
 ASCII graphic bytes. Length validation does not establish entropy. The
 credential is redacted in diagnostics; temporary fixed-size digests are compared
-in constant time and are never stored or exposed. Configure the same actual value in the development proxy's
-`--forwarder-secret-file`; use `auth_header = "x-ts-forwarder-auth"` with that CLI.
+in constant time and are never stored or exposed. Configure the forwarder to send
+the same actual value in the header named by `auth_header`. For `ts dev proxy`,
+use `auth_header = "x-ts-forwarder-auth"` and pass the local token file through
+`--forwarder-secret-file`; see its
+[authenticated forwarding setup](./ts-dev-proxy.md#authenticated-forwarding).
 
 The forwarder must replace client-supplied `X-Forwarded-Host` and
 `X-Forwarded-Proto` with the actual browser-facing authority and HTTP/HTTPS
