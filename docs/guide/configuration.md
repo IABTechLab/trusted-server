@@ -1183,14 +1183,19 @@ Matches:
   - a host name of ASCII letters, digits, `-` and `.`, optionally prefixed with
     `*.`, with no leading or trailing `.` and no empty label;
   - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
-  - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
+  - an IPv6 address in brackets, written the way URL hosts render it, such as
+    `[2001:db8::1]` or `[::ffff:c000:201]` (not `[::ffff:192.0.2.1]`).
 - Settings load and `ts config validate` reject any other `include_domains`
   entry: an empty entry, a bare `*`, a `*` other than a leading `*.`, a scheme
-  (`https://`), a port, a path, spaces, or an unbracketed IPv6 address.
+  (`https://`), a port, a path, spaces, an unbracketed IPv6 address, or any
+  entry a URL parser would rewrite or reject, such as an invalid `xn--` label.
   Non-ASCII (internationalized) names are rejected too; write them in punycode,
   such as `xn--bcher-kva.example`.
 - Empty and bare `*` entries in `exclude_domains` are dropped with a warning,
-  because they never match a host.
+  because they never match a host. Other `exclude_domains` entries that can
+  never match a host (for example `https://cdn.example.com` or
+  `cdn.example.com:443`) are kept but logged with a warning at load; fix them,
+  or their hosts stay proxied.
 
 ::: tip
 When both `include_domains` and `proxy.allowed_domains` are set, keep every
