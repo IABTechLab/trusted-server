@@ -364,6 +364,7 @@ Every PR must pass:
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. URL-host linter on lines the PR adds (`lint-domains` job, PRs only); run it locally with `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target <host-triple> --bin ts -- dev lint domains --changed-vs origin/main`
+11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
 
 ---
 

@@ -311,16 +311,22 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          cache-shared-key: cargo-lint-domains-${{ runner.os }}
+          cache-key: cargo-lint-domains
+
+      - name: Read pinned Node.js version
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
 
       # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
       - name: Lint URL hosts on lines added by this PR
