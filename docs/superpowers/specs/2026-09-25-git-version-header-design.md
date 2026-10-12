@@ -256,7 +256,9 @@ The same applies when git's top level (`git rev-parse --show-toplevel`) is not
 the workspace root: git searches parent directories, so an exported tree nested
 in an unrelated repository would otherwise report that repository's tag or
 branch. When the version is unknown, an `x-ts-version` already on the response
-(for example from a proxied origin) is removed rather than passed through.
+(for example from a proxied origin) is removed rather than passed through. The
+Fastly adapter does the same for an inherited `x-ts-fastly-version` when
+`FASTLY_SERVICE_VERSION` is unset or invalid.
 Sending a placeholder such as `unknown` was rejected: a missing header is easier
 to tell apart from a real ref.
 
@@ -356,6 +358,11 @@ handoff reports the commands run and their observed results.
   `### Changed`.
 - Update the header write-order doc comments in the Fastly middleware, and the
   Axum middleware comment that calls `X-TS-Version` Fastly-specific.
+- In `docs/guide/getting-started.md`, pass `TRUSTED_SERVER__GIT_VERSION` to
+  `fastly compute publish` and describe the `x-ts-version` and
+  `x-ts-fastly-version` split and the local git fallback.
+- In `docs/guide/edgezero.md`, add a deploy verification step that checks
+  `x-ts-version` reports the deployed release.
 
 ## Acceptance Criteria
 
@@ -398,6 +405,8 @@ handoff reports the commands run and their observed results.
 - `crates/trusted-server-adapter-spin/src/middleware.rs`
 - `crates/trusted-server-adapter-spin/src/app.rs`
 - `docs/guide/first-party-proxy.md`
+- `docs/guide/getting-started.md`
+- `docs/guide/edgezero.md`
 - `CHANGELOG.md`
 - `docs/superpowers/specs/2026-09-25-git-version-header-design.md`
 - `docs/superpowers/plans/2026-09-25-git-version-header.md`

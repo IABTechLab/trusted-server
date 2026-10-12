@@ -21,7 +21,7 @@ use git_version::{Candidates, is_usable, resolve_git_version};
 use sha2::{Digest as _, Sha256};
 
 /// Crate-relative build inputs that are both watched and hashed besides `src/`.
-const CRATE_INPUTS: [&str; 2] = ["build.rs", "Cargo.toml"];
+const CRATE_INPUTS: [&str; 3] = ["build.rs", "build_support/git_version.rs", "Cargo.toml"];
 /// Workspace-relative inputs hashed under a `workspace/` logical prefix.
 const WORKSPACE_INPUTS: [&str; 3] = ["Cargo.toml", "Cargo.lock", "edgezero.toml"];
 
@@ -156,7 +156,6 @@ fn main() {
 
 /// Compiles the deployed git version in as `TRUSTED_SERVER__GIT_VERSION`.
 fn emit_git_version() {
-    println!("cargo:rerun-if-changed=build_support/git_version.rs");
     println!("cargo:rerun-if-env-changed={OVERRIDE_ENV}");
 
     let override_value = std::env::var(OVERRIDE_ENV).ok();
