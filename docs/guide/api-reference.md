@@ -900,7 +900,7 @@ curl -u 'admin:<resolved-admin-password>' \
 
 ### GET /\_ts/admin/eids
 
-Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter.
+Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
 
 After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
 
