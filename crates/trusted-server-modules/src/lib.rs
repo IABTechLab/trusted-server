@@ -92,8 +92,8 @@ pub struct StockMiddleware {
 }
 
 /// The middleware a stock build's modules supply, core's script proxy among
-/// them, in the order a deployment that runs them all names them in an
-/// entry.
+/// them and core's service version last, in the order a deployment that
+/// runs them all names them in an entry.
 ///
 /// That is the order the registry registers the modules in. Prebid registers
 /// from the auction plan and so comes first, core's script proxy is the first
@@ -111,6 +111,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_cmp_sourcepoint as sourcepoint;
     use trusted_server_core::integrations::js_asset_proxy;
     use trusted_server_core::robots_txt::middleware as robots_txt;
+    use trusted_server_core::service_version;
     use trusted_server_framework_nextjs as nextjs;
     use trusted_server_identity_lockr as lockr;
     use trusted_server_tag_google_tag_manager as google_tag_manager;
@@ -160,6 +161,9 @@ pub fn middleware() -> Vec<StockMiddleware> {
             media_type: robots_txt::MEDIA_TYPE,
             name: robots_txt::MODULE,
         },
+        // Core writes the platform's service version where a serve entry
+        // names it.
+        row(service_version::MODULE, Serve, service_version::MODULE),
     ]
 }
 
@@ -319,6 +323,8 @@ middleware = [\"robots_txt\"]
         // Core makes the file's middleware once every registration is in,
         // so it comes after every module's.
         order.push(trusted_server_core::robots_txt::middleware::MODULE);
+        // Core's own middleware is registered after every module's.
+        order.push(trusted_server_core::service_version::MODULE);
         let place = |integration: &str| {
             order
                 .iter()
