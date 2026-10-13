@@ -320,7 +320,7 @@ Run:
 ```bash
 git -C /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero remote -v
 git -C /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero branch --contains ce6bcf74b529d9066d08ba87b2971af8379eb29e
-git ls-remote https://github.com/stackpop/edgezero ce6bcf74b529d9066d08ba87b2971af8379eb29e
+git ls-remote https://github.com/IABTechLab/edgezero ce6bcf74b529d9066d08ba87b2971af8379eb29e
 ```
 
 Expected: the SHA is present on the upstream GitHub remote. If `git ls-remote` returns nothing, stop: do not pin Trusted Server to a local-only EdgeZero commit. Use the actual merged upstream SHA instead.
@@ -330,11 +330,11 @@ Expected: the SHA is present on the upstream GitHub remote. If `git ls-remote` r
 Change the EdgeZero dependencies together:
 
 ```toml
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-core = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
 ```
 
 Add:
@@ -351,8 +351,8 @@ Verify the existing workspace dependency block already includes `brotli` and `fl
 In `crates/integration-tests/Cargo.toml`, update both EdgeZero dev dependencies to the same rev:
 
 ```toml
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", features = ["axum"] }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e" }
+edgezero-adapter-axum = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", features = ["axum"] }
+edgezero-core = { git = "https://github.com/IABTechLab/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e" }
 ```
 
 Do this in the same dependency task as the root update so in-process parity tests do not link two different `edgezero_core` versions.
