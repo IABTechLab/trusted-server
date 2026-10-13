@@ -420,7 +420,7 @@ describe('GptDiagnosticsStore', () => {
     assertCoverageEquation(store);
   });
 
-  it('evicts least-recently-active slots and re-enters only on a new request', () => {
+  it('evicts least-recently-active slots and preserves their number on re-entry', () => {
     let now = 0;
     const store = new GptDiagnosticsStore({ now: () => ++now });
     const slots = Array.from({ length: MAX_DIAGNOSTIC_SLOTS + 1 }, (_, index) =>
@@ -444,7 +444,7 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRequested(slots[1]);
     store.recordSlotResponseReceived(slots[1]);
     const reentered = store.snapshot().slots.find((slot) => slot.slotElementId === 'lru-1');
-    expect(reentered).toMatchObject({ runtimeSlotNumber: 66 });
+    expect(reentered).toMatchObject({ runtimeSlotNumber: 2 });
     expect(reentered?.requests[0]).toMatchObject({ requestNumber: 2 });
     expect(reentered?.requests[0].responseAtMs).toBeDefined();
     expect(store.snapshot().slots).toHaveLength(MAX_DIAGNOSTIC_SLOTS);
@@ -570,8 +570,10 @@ describe('GptDiagnosticsStore', () => {
       direct: 'renderable_candidate',
       prebid: false,
       publisher: false,
+      auctionFacts: { auctionType: 'trusted_server' as const },
       expectedPath: 'trusted_server_direct',
       expectedOpportunity: 'renderable_candidate',
+      expectedAuctionType: 'trusted_server' as const,
     },
     {
       name: 'a direct unrenderable candidate',
@@ -580,6 +582,7 @@ describe('GptDiagnosticsStore', () => {
       publisher: false,
       expectedPath: 'trusted_server_direct',
       expectedOpportunity: 'unrenderable_candidate',
+      expectedAuctionType: undefined,
     },
     {
       name: 'a direct request without a candidate',
@@ -588,22 +591,28 @@ describe('GptDiagnosticsStore', () => {
       publisher: false,
       expectedPath: 'trusted_server_direct',
       expectedOpportunity: 'no_candidate',
+      expectedAuctionType: undefined,
     },
     {
-      name: 'a Prebid refresh',
+      name: 'a completed Prebid auction',
       direct: undefined,
       prebid: true,
+      completedPrebid: true,
       publisher: false,
       expectedPath: 'prebid_refresh',
       expectedOpportunity: undefined,
+      expectedAuctionType: 'client_side' as const,
     },
     {
-      name: 'competing direct and Prebid evidence',
+      name: 'competing Trusted Server and Prebid auctions',
       direct: 'renderable_candidate',
       prebid: true,
+      completedPrebid: true,
       publisher: false,
+      auctionFacts: { auctionType: 'trusted_server' as const },
       expectedPath: 'competing',
       expectedOpportunity: 'renderable_candidate',
+      expectedAuctionType: 'competing' as const,
     },
     {
       name: 'an unattributed request',
@@ -612,6 +621,7 @@ describe('GptDiagnosticsStore', () => {
       publisher: false,
       expectedPath: 'unattributed',
       expectedOpportunity: undefined,
+      expectedAuctionType: undefined,
     },
     {
       name: 'a publisher refresh',
@@ -620,14 +630,25 @@ describe('GptDiagnosticsStore', () => {
       publisher: true,
       expectedPath: 'publisher_refresh',
       expectedOpportunity: undefined,
+      expectedAuctionType: undefined,
     },
     {
-      name: 'competing Prebid and publisher evidence',
+      name: 'direct auction with publisher refresh evidence',
+      direct: 'renderable_candidate',
+      prebid: false,
+      publisher: true,
+      expectedPath: 'competing',
+      expectedOpportunity: 'renderable_candidate',
+      expectedAuctionType: undefined,
+    },
+    {
+      name: 'client-side auction with publisher refresh evidence',
       direct: undefined,
       prebid: true,
       publisher: true,
       expectedPath: 'competing',
       expectedOpportunity: undefined,
+      expectedAuctionType: undefined,
     },
     {
       name: 'competing all source evidence',
@@ -636,25 +657,221 @@ describe('GptDiagnosticsStore', () => {
       publisher: true,
       expectedPath: 'competing',
       expectedOpportunity: 'renderable_candidate',
+      expectedAuctionType: undefined,
     },
   ] as const)(
     'attributes $name without inferring demand ownership',
-    ({ direct, prebid, publisher, expectedPath, expectedOpportunity }) => {
+    ({
+      direct,
+      prebid,
+      completedPrebid,
+      publisher,
+      auctionFacts,
+      expectedPath,
+      expectedOpportunity,
+      expectedAuctionType,
+    }) => {
       const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
       const slot = fakeSlot('path-slot');
 
       if (direct !== undefined) {
-        store.recordTrustedServerOpportunity(slot, 'auction-slot', direct);
+        store.recordTrustedServerOpportunity(
+          slot,
+          'auction-slot',
+          direct,
+          undefined,
+          undefined,
+          auctionFacts
+        );
       }
       if (prebid) store.recordPrebidRefresh([slot]);
+      if (completedPrebid) store.recordPrebidAuction(slot, 'path-auction');
       if (publisher) store.recordPublisherRefresh([slot]);
       store.recordSlotRequested(slot);
 
       const cycle = store.snapshot().slots[0].requests[0];
       expect(cycle.requestPath).toBe(expectedPath);
       expect(cycle.trustedServerOpportunity).toBe(expectedOpportunity);
+      expect(cycle.auctionType).toBe(expectedAuctionType);
     }
   );
+
+  it('retains a completed Prebid candidate and only an exact correlated win', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('prebid-facts');
+
+    store.recordPrebidRefresh([slot]);
+    store.recordPrebidAuction(slot, 'auction-client-1', {
+      bidder: ' example-client ',
+      priceBucket: '2.40',
+      currency: 'eur',
+    });
+    store.recordSlotRequested(slot);
+    store.recordPrebidWin(slot, 'other-auction', {
+      bidder: 'wrong',
+      priceBucket: '9.99',
+    });
+    store.recordPrebidWin(slot, 'auction-client-1', {
+      bidder: ' example-client ',
+      priceBucket: '2.40',
+      currency: 'eur',
+    });
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      auctionType: 'client_side',
+      prebidAuction: {
+        auctionId: 'auction-client-1',
+        targetingCandidate: {
+          bidder: 'example-client',
+          priceBucket: '2.40',
+          currency: 'EUR',
+        },
+        win: { bidder: 'example-client', priceBucket: '2.40', currency: 'EUR' },
+      },
+    });
+  });
+
+  it('drops a Prebid win when the same auction ID matches multiple retained cycles', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('prebid-ambiguous-auction');
+
+    store.recordPrebidAuction(slot, 'reused-auction-id', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+    store.recordSlotRequested(slot);
+    store.recordPrebidAuction(slot, 'reused-auction-id', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+    store.recordSlotRequested(slot);
+
+    store.recordPrebidWin(slot, 'reused-auction-id', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+
+    expect(store.snapshot().slots[0].requests).toHaveLength(2);
+    expect(store.snapshot().slots[0].requests.map((cycle) => cycle.prebidAuction?.win)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('does not carry an earlier auction into a later bare Prebid refresh', () => {
+    let now = 10;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot('prebid-replaced-intent');
+    store.recordPrebidRefresh([slot]);
+    store.recordPrebidAuction(slot, 'auction-client-1', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+
+    now = 20;
+    store.recordPrebidRefresh([slot]);
+    store.recordSlotRequested(slot);
+    store.recordPrebidWin(slot, 'auction-client-1', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.requestPath).toBe('prebid_refresh');
+    expect(cycle.auctionType).toBeUndefined();
+    expect(cycle.prebidAuction).toBeUndefined();
+  });
+
+  it('retains bounded winner and server timing facts for a Trusted Server auction', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('auction-facts');
+
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      'auction-123',
+      [[300, 250]],
+      {
+        auctionType: 'trusted_server',
+        winner: { bidder: ' example-bidder ', priceBucket: '1.20' },
+        serverTimings: {
+          auctionDispatchedMs: 4,
+          auctionResolvedMs: 84,
+          auctionCommittedMs: 85,
+          auctionWaitMs: 80,
+          auctionWaitPlacement: 'pre_header',
+        },
+      }
+    );
+    store.recordSlotRequested(slot);
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      auctionType: 'trusted_server',
+      auctionWinner: { bidder: 'example-bidder', priceBucket: '1.20' },
+      serverAuctionTimings: {
+        auctionDispatchedMs: 4,
+        auctionResolvedMs: 84,
+        auctionCommittedMs: 85,
+        auctionWaitMs: 80,
+        auctionWaitPlacement: 'pre_header',
+      },
+    });
+  });
+
+  it('does not treat a Prebid refresh route as client-auction evidence', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('competing-spa-auction');
+
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'trusted_server',
+        serverTimings: { auctionDispatchedMs: 0, auctionResolvedMs: 84 },
+      }
+    );
+    store.recordPrebidRefresh([slot]);
+    store.recordSlotRequested(slot);
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      auctionType: 'trusted_server',
+      serverAuctionTimingOrigin: 'spa_auction',
+      serverAuctionTimings: { auctionDispatchedMs: 0, auctionResolvedMs: 84 },
+    });
+  });
+
+  it('drops malformed winner and auction timing fields at the diagnostics boundary', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('invalid-auction-facts');
+
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      undefined,
+      {
+        auctionType: 'invalid' as never,
+        winner: { bidder: 'example-bidder', priceBucket: 'not-a-price' },
+        serverTimings: {
+          auctionDispatchedMs: -1,
+          auctionResolvedMs: Number.NaN,
+          auctionCommittedMs: 0x1_0000_0000,
+          auctionWaitPlacement: 'elsewhere' as never,
+        },
+      }
+    );
+    store.recordSlotRequested(slot);
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.auctionType).toBeUndefined();
+    expect(cycle.auctionWinner).toBeUndefined();
+    expect(cycle.serverAuctionTimings).toBeUndefined();
+  });
 
   it('consumes direct and Prebid markers exactly once', () => {
     let now = 10;
