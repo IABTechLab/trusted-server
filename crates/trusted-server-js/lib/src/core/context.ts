@@ -8,7 +8,16 @@ import { log } from './log';
  */
 export type ContextProvider = () => Record<string, unknown> | undefined;
 
-const providers = new Map<string, ContextProvider>();
+// Independently built IIFEs must register and collect from the same map.
+// Resolve it on each call rather than capturing a bundle-local registry.
+const CONTEXT_PROVIDERS_KEY = Symbol.for('trusted-server.contextProviders');
+
+function getProviders(): Map<string, ContextProvider> {
+  const sharedGlobal = globalThis as typeof globalThis & {
+    [CONTEXT_PROVIDERS_KEY]?: Map<string, ContextProvider>;
+  };
+  return (sharedGlobal[CONTEXT_PROVIDERS_KEY] ??= new Map<string, ContextProvider>());
+}
 
 /**
  * Register a context provider that will be called before every auction request.
@@ -19,6 +28,7 @@ const providers = new Map<string, ContextProvider>();
  * duplicate accumulation in SPA environments.
  */
 export function registerContextProvider(id: string, provider: ContextProvider): void {
+  const providers = getProviders();
   providers.set(id, provider);
   log.debug('context: registered provider', { id, total: providers.size });
 }
@@ -32,7 +42,7 @@ export function registerContextProvider(id: string, provider: ContextProvider): 
  */
 export function collectContext(): Record<string, unknown> {
   const context: Record<string, unknown> = {};
-  for (const provider of providers.values()) {
+  for (const provider of getProviders().values()) {
     try {
       const data = provider();
       if (data) Object.assign(context, data);
