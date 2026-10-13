@@ -620,14 +620,15 @@ default and should only be enabled for intentional QA or troubleshooting flows.
 
 ### `[tester_cookie]`
 
-| Field     | Type    | Required | Description                                        |
-| --------- | ------- | -------- | -------------------------------------------------- |
-| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+| Field             | Type    | Required | Description                                                                  |
+| ----------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `enabled`         | Boolean | No       | Enables routes to set and clear `ts-tester` cookie                           |
+| `max_age_seconds` | Integer | No       | Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days (2592000) |
 
 When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
 
 ```http
-Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=<max_age_seconds>
 Cache-Control: no-store, private
 ```
 
@@ -970,6 +971,11 @@ KV store name only when consent should persist with the EC identity graph.
 | `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
 | `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
 | `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+
+In `proxy` mode Trusted Server does not decode the TC string, so it cannot
+confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
+browser-supplied EIDs are neither forwarded in bid requests nor written to the
+EC identity graph, and server-side pull sync is skipped.
 
 ```toml
 [consent]
@@ -1454,6 +1460,8 @@ Profile sets convert small request query controls into a closed set of Image Opt
 | `debug_param`        | String | No       | `_io_debug`   | Query parameter that disables IO when set to `1` |
 
 Profile values live under `[image_optimizer.profile_sets.<name>.profiles]` and use query-string syntax.
+
+Profile and profile-set names are trimmed. Names within the same map that become identical after trimming are rejected, even when their values match. Empty names continue to be discarded.
 
 ```toml
 [image_optimizer.profile_sets.default_images]
@@ -2142,7 +2150,7 @@ unchanged.
 
 Persisting a resolved ID into the Edge Cookie identity graph additionally
 requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
-module's OpenRTB EID source.
+module's OpenRTB EID source, and the storage and personalised-ad permissions.
 
 `managed_user_ids` is an array of tables, so it cannot be set through a
 `TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves
@@ -2758,10 +2766,23 @@ Check `X-TS-Template-Cache: hit` to verify template reuse.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, and schema
-version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
-not: the stored template is decoded identity and the assembled result is encoded
-for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+origin identity, complete template-shaping settings, TSJS content, core build
+inputs, and schema version all participate in an opaque SHA-256 cache key. The
+build digest covers every core source file (including Rust-inlined head scripts)
+except hidden, `#`-prefixed, and `~`-suffixed editor artifacts, plus the core
+build script, core and workspace manifests, `edgezero.toml`, and the workspace
+lockfile when present. Any change to these inputs causes a cold template fill
+per URL variant after deployment, even if the change does not affect rendered
+HTML. Core-owned formats (cached metadata, the seam marker, and the assembly
+contract) are covered by the same digest. A manual `TEMPLATE_SCHEMA_VERSION`
+bump is needed only for template-compatibility changes outside those inputs,
+such as the Fastly adapter's template storage or the Rust side of
+`trusted-server-js`, unless another fingerprint input already isolates the
+change.
+
+`Accept-Encoding` does not participate in the key: the stored template is
+decoded identity and the assembled result is encoded for each reader with
+`Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
 document's meaning based on `Accept-Encoding`. Never put `Cookie` or
