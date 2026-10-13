@@ -2957,6 +2957,12 @@ pub(crate) mod test_support {
         pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
         /// The line the text middleware adds at the end of a text body.
         pub(crate) const TEXT_LINE: &str = "# added by the middleware fixture\n";
+        /// The name of the serve middleware that writes a header on a text
+        /// response.
+        pub(crate) const TEXT_HEADER: &str = "testing.middleware-fixture.text-header";
+        /// The header the text header middleware writes, name and value.
+        pub(crate) const TEXT_HEADER_NAME: &str = "x-fixture-text";
+        pub(crate) const TEXT_HEADER_VALUE: &str = "served";
 
         /// The builder core's test build lists beside its own.
         pub(crate) const BUILDER: IntegrationBuilder =
@@ -3118,6 +3124,32 @@ pub(crate) mod test_support {
             }
         }
 
+        struct TextHeader;
+
+        impl Middleware for TextHeader {
+            fn middleware_id(&self) -> &'static str {
+                TEXT_HEADER
+            }
+
+            fn handles_media_type(&self, media_type: &str) -> bool {
+                media_type == TEXT_MEDIA_TYPE
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    response_headers: vec![(
+                        http::HeaderName::from_static(TEXT_HEADER_NAME),
+                        http::HeaderValue::from_static(TEXT_HEADER_VALUE),
+                    )],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
         struct Broken;
 
         impl Middleware for Broken {
@@ -3158,6 +3190,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Reader))
                     .with_middleware(Arc::new(BrokenReader))
                     .with_middleware(Arc::new(Text))
+                    .with_middleware(Arc::new(TextHeader))
                     .build(),
             ))
         }
@@ -6064,6 +6097,7 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::TEXT_HEADER,
                 crate::service_version::MODULE,
             ],
             "should list the middleware the selected module supplies, and core's own after them"
@@ -6083,6 +6117,7 @@ mod tests {
             [
                 fixture::READER,
                 fixture::BROKEN_READER,
+                fixture::TEXT_HEADER,
                 crate::service_version::MODULE
             ],
             "should list the middleware that run in the serve phase, core's own last"
@@ -6199,13 +6234,14 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::TEXT_HEADER,
                 crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
@@ -6259,6 +6295,7 @@ mod tests {
                 fixture::READER,
                 fixture::BROKEN_READER,
                 fixture::TEXT,
+                fixture::TEXT_HEADER,
             ],
             "should list every middleware when there are no entries"
         );
@@ -6271,7 +6308,8 @@ mod tests {
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::TEXT_HEADER
             ],
             "should leave out a middleware any entry names"
         );
@@ -6339,7 +6377,8 @@ mod tests {
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::BROKEN_READER,
-                fixture::TEXT
+                fixture::TEXT,
+                fixture::TEXT_HEADER
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

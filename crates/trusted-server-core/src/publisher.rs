@@ -673,7 +673,8 @@ struct TextResponse<'a> {
 }
 
 /// The stream processors the entries covering a response that is not HTML
-/// run on its body, the fetch entry's and then the serve entry's, or none
+/// run on its body, the fetch entry's and then the serve entry's, with the
+/// headers the serve entry's middleware write on the response, or none
 /// when its media type is not one a middleware runs on, its charset is not
 /// UTF-8 or no entry covers it. Both phases run here because the template
 /// cache stores HTML alone.
@@ -686,7 +687,7 @@ fn middleware_stream_processors(
     response: &TextResponse<'_>,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
-) -> Result<Vec<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
+) -> Result<TextPass, Report<TrustedServerError>> {
     use crate::middleware::{
         MiddlewareContext, is_dispatched_media_type, is_utf8_or_undeclared_charset,
     };
@@ -695,9 +696,10 @@ fn middleware_stream_processors(
     if !is_dispatched_media_type(&media_type)
         || !is_utf8_or_undeclared_charset(response.content_type)
     {
-        return Ok(Vec::new());
+        return Ok(TextPass::default());
     }
     let mut processors = Vec::new();
+    let mut response_headers = Vec::new();
     for phase in &MiddlewarePhase::ALL {
         let chain = integration_registry.middleware_chain(
             settings.phase_entries(*phase),
@@ -724,8 +726,20 @@ fn middleware_stream_processors(
             })
             .map_err(|message| Report::new(TrustedServerError::Configuration { message }))?;
         processors.extend(plan.processors);
+        response_headers.extend(plan.response_headers);
     }
-    Ok(processors)
+    Ok(TextPass {
+        processors,
+        response_headers,
+    })
+}
+
+/// What the entries covering a text response do to it: the processors over
+/// its body and the headers the serve entry's middleware write.
+#[derive(Default)]
+struct TextPass {
+    processors: Vec<Box<dyn StreamProcessor>>,
+    response_headers: Vec<ResponseHeader>,
 }
 
 /// A processor followed by the ones the entries add, each handed what the
@@ -802,7 +816,7 @@ impl PublisherBodyProcessor {
                 &params.request_scheme,
             ))
         } else {
-            let processors = middleware_stream_processors(
+            let pass = middleware_stream_processors(
                 &TextResponse {
                     content_type: &params.content_type,
                     request_path: &params.request_path,
@@ -815,6 +829,7 @@ impl PublisherBodyProcessor {
                 settings,
                 integration_registry,
             )?;
+            response_headers = pass.response_headers;
             Box::new(WithStreamProcessors {
                 inner: Box::new(create_url_replacer(
                     &params.origin_host,
@@ -822,7 +837,7 @@ impl PublisherBodyProcessor {
                     &params.request_host,
                     &params.request_scheme,
                 )),
-                processors,
+                processors: pass.processors,
             })
         };
 
@@ -924,7 +939,7 @@ fn process_response_streaming<W: Write>(
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else {
-        let processors = middleware_stream_processors(
+        let pass = middleware_stream_processors(
             &TextResponse {
                 content_type: params.content_type,
                 request_path: params.request_path,
@@ -937,6 +952,7 @@ fn process_response_streaming<W: Write>(
             params.settings,
             params.integration_registry,
         )?;
+        response_headers = pass.response_headers;
         let processor = WithStreamProcessors {
             inner: Box::new(create_url_replacer(
                 params.origin_host,
@@ -944,7 +960,7 @@ fn process_response_streaming<W: Write>(
                 params.request_host,
                 params.request_scheme,
             )),
-            processors,
+            processors: pass.processors,
         };
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -21172,6 +21188,123 @@ mod tests {
             ),
             "should move the origin's address and then run the entry's middleware"
         );
+    }
+
+    /// The parameters of a text response at `/a.txt`, from the origin as
+    /// `content_type` says, for a reader of `proxy.example.com`.
+    fn text_params(content_type: &str) -> OwnedProcessResponseParams {
+        OwnedProcessResponseParams {
+            csp_nonce_observed: None,
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: "identity".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: content_type.to_string(),
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        }
+    }
+
+    /// Settings running the fixture with a serve entry on `text/plain`
+    /// naming its header-writing middleware.
+    fn settings_serving_the_text_header() -> Settings {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let mut settings = settings_running_the_middleware_fixture(Vec::new());
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT_HEADER.to_owned()],
+        }]);
+        settings
+    }
+
+    fn named_headers(headers: &[ResponseHeader]) -> Vec<(&str, &[u8])> {
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn a_text_body_s_serve_middleware_write_their_headers_on_the_response() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_serving_the_text_header();
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let params = text_params("text/plain; charset=utf-8");
+        let mut output = Vec::new();
+
+        let headers = stream_publisher_body(
+            EdgeBody::from(b"plain\n".to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should stream a text body");
+
+        assert_eq!(
+            named_headers(&headers),
+            [(
+                fixture::TEXT_HEADER_NAME,
+                fixture::TEXT_HEADER_VALUE.as_bytes()
+            )],
+            "should hand back the header the serve middleware writes on a text response"
+        );
+        assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_text_body_s_serve_middleware_write_their_headers_on_the_response() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::platform::test_support::noop_services;
+
+        let settings = settings_serving_the_text_header();
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
+        let services = noop_services();
+        let mut params = text_params("text/plain; charset=utf-8");
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"pla"),
+            bytes::Bytes::from_static(b"in\n"),
+        ]));
+        let mut output = Vec::new();
+
+        let headers = stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should stream a text body");
+
+        assert_eq!(
+            named_headers(&headers),
+            [(
+                fixture::TEXT_HEADER_NAME,
+                fixture::TEXT_HEADER_VALUE.as_bytes()
+            )],
+            "should hand back the header the serve middleware writes on a streamed text response"
+        );
+        assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
     }
 
     #[test]

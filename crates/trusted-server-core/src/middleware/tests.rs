@@ -431,6 +431,30 @@ fn a_chain_on_another_media_type_runs_a_stream_processor_alone() {
     assert!(plan.head_inserts.is_empty());
 }
 
+#[test]
+fn a_serve_chain_on_another_media_type_may_write_a_header() {
+    let document_state = IntegrationDocumentState::default();
+    let context = super::test_support::context(MiddlewarePhase::Serve, &document_state);
+
+    let plan = MiddlewareChain::new(
+        MiddlewarePhase::Serve,
+        "text/plain",
+        vec![header("example.version", "x-example", "1")],
+    )
+    .plan(&context)
+    .expect("a header is not a decision about HTML");
+
+    assert_eq!(
+        plan.response_headers.len(),
+        1,
+        "should keep the header for the response"
+    );
+    assert!(
+        plan.processors.is_empty() && plan.head_inserts.is_empty(),
+        "should change nothing in the body"
+    );
+}
+
 /// A stream processor that adds `text` at the end of a body.
 struct Append(String);
 
