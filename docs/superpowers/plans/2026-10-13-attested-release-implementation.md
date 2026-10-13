@@ -70,9 +70,9 @@ New files below are proposed, not existing APIs. Keep security parsing and opera
 
 **Create:** `scripts/release/common.py`, `scripts/release/tests/test_common.py`, `scripts/release/tests/fixtures/README.md`, `scripts/release/requirements.txt`.
 
-- [ ] Write unittest cases for duplicate keys, nonfinite JSON, trailing controls, unsafe names, depth 65, oversized input, negative lengths and ambiguous duplicate identities.
-- [ ] Run `python3 -m unittest discover -s scripts/release/tests -p 'test_common.py' -v`; expect failure because the module does not exist.
-- [ ] Implement strict byte-first loading, bounded reads, SHA-256, safe flat asset names, deterministic output and atomic writes. Start duplicate handling with:
+- [x] Write unittest cases for duplicate keys, nonfinite JSON, trailing controls, unsafe names, depth 65, oversized input, negative lengths and ambiguous duplicate identities.
+- [x] Run `python3 -m unittest discover -s scripts/release/tests -p 'test_common.py' -v`; expect failure because the module does not exist.
+- [x] Implement strict byte-first loading, bounded reads, SHA-256, safe flat asset names, deterministic output and atomic writes. Start duplicate handling with:
 
 ```python
 def unique_object(pairs):
@@ -86,8 +86,8 @@ def unique_object(pairs):
 
 Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_constant)` after size/depth checks. Hash original file bytes, not parsed/reserialized objects.
 
-- [ ] Qualify and pin the schema-validator distribution and hashes in `requirements.txt`; install through a private venv. Add explicit dependency installation to producer validation, rather than relying on ambient Python packages.
-- [ ] Re-run the tests; expect all negatives rejected and deterministic positive bytes. Commit `Add strict release document utilities`.
+- [x] Qualify and pin the schema-validator distribution and hashes in `requirements.txt`; install through a private venv. Add explicit dependency installation to producer validation, rather than relying on ambient Python packages.
+- [x] Re-run the tests; expect all negatives rejected and deterministic positive bytes. Commit `Add strict release document utilities`.
 
 ### Task 3: Encode cohort, tools and fail-closed release preflight
 
@@ -432,3 +432,5 @@ Task 1 investigation confirms the four-artifact cohort, its existing compatibili
 Permission-policy reconciliation remains an enablement dependency owned by the #1045/#1084 work (`jwrosewell`), not a blocker for local implementation. The current checkout loads app configuration at runtime and has no embedded permission-policy module. #1045 at `a028c00da096cc722dd95307ab8ee0e3514a448e` embeds `config/permissions/sample.yaml`; #1084 at `3c43876fc8b0d316d812a8c74aba47cc87d17279` explicitly defers runtime policy. Those proposals must satisfy R-CONFIG before release enablement. This record neither approves their embedded policy nor selects a new transport.
 
 Task completion requires implementation evidence and both independent reviews. Task 1's owner reconciliation and maintainer milestone review remain pending; subsequent local implementation can proceed. Hosted qualification, governance setup, signing/publication rehearsal and live Fastly submission remain distinct evidence gates, and no production release trigger is enabled by this record.
+
+Task 2 is implemented in `1cfca1357`, with review corrections in `c29940908` and `fbb88d2e`. Independent spec and quality reviews pass after resolving tuple-contained key validation, serialization exception consistency and iterator identity selectors. The controller's fresh utility run passes 35 tests. A fresh private Python 3.12 environment installs all six pinned dependencies with `--require-hashes --only-binary=:all:`; `pip check`, the normative release-index schema check and Draft 2020-12 positive/negative semantics pass. The reproducible installation/validation procedure is in `scripts/release/tests/fixtures/README.md`; Task 14 must wire this explicit installation into hosted producer validation before using the validator. These checks establish utility behavior and local validator compatibility, not artifact or hosted qualification.
