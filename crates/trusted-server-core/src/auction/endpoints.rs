@@ -22,6 +22,7 @@ use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::id5::{
     ID5_SOURCE, Id5AuctionState, Id5FetchInput, Id5InFlight, Id5Outcome,
+    drop_stored_id5_when_current,
 };
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
@@ -429,6 +430,14 @@ pub async fn handle_auction(
             None
         }
         pending => pending,
+    };
+
+    // When TS has a current ID5 ID for this request, the KV copy is an older
+    // encryption of the same ID; send bidders only the current one.
+    let eids = if id5.is_some() {
+        drop_stored_id5_when_current(eids, client_eids.as_deref())
+    } else {
+        eids
     };
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
@@ -1847,7 +1856,11 @@ mod tests {
         id5_calls: usize,
     }
 
-    async fn run_id5_auction(mode: &str, cookie: Option<&str>) -> Id5AuctionRun {
+    async fn run_id5_auction(
+        mode: &str,
+        cookie: Option<&str>,
+        stored_id5: Option<&str>,
+    ) -> Id5AuctionRun {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -1887,6 +1900,20 @@ mod tests {
         );
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let graph = KvIdentityGraph::in_memory("id5_store");
+        let registry = PartnerRegistry::from_config(&[counting_test_partner(ID5_SOURCE)])
+            .expect("should build partner registry");
+        if let Some(uid) = stored_id5 {
+            let mut entry = crate::ec::kv_types::KvEntry::minimal(
+                ID5_SOURCE,
+                uid,
+                crate::ec::current_timestamp(),
+            );
+            entry.consent.ok = true;
+            graph
+                .create(&ec_id, &entry)
+                .expect("should seed stored ID5");
+        }
         let mut builder = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
@@ -1908,8 +1935,8 @@ mod tests {
         let response = handle_auction(
             &settings,
             &orchestrator,
-            None,
-            None,
+            stored_id5.map(|_| &graph),
+            stored_id5.map(|_| &registry),
             &mut ec_context,
             &services,
             req,
@@ -1941,7 +1968,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_id5_fetch_reaches_this_auction_and_sets_the_server_cookie() {
-        let run = run_id5_auction("blocking", None).await;
+        let run = run_id5_auction("blocking", None, None).await;
 
         assert_eq!(run.id5_calls, 1, "should call ID5 once");
         assert_eq!(
@@ -1963,7 +1990,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_id5_fetch_skips_this_auction_but_sets_the_server_cookie() {
-        let run = run_id5_auction("parallel", None).await;
+        let run = run_id5_auction("parallel", None, None).await;
 
         assert_eq!(run.id5_calls, 1, "should call ID5 once");
         assert_eq!(
@@ -1984,6 +2011,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_id5_replaces_the_stored_copy_in_the_bid_request() {
+        let cookie_value = BASE64.encode(
+            serde_json::to_vec(&json!([{
+                "source": "id5-sync.com",
+                "uids": [{"id": "ID5*from-cookie", "atype": 1, "ext": {"linkType": 1}}]
+            }]))
+            .expect("should serialize cookie"),
+        );
+        let cookie = format!("ts-eids-s={cookie_value}; ts-id5-fresh=1");
+
+        let run = run_id5_auction("parallel", Some(&cookie), Some("ID5*stored-earlier")).await;
+
+        let id5_uids: Vec<&str> = run
+            .bidder_eids
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|eid| eid.source == ID5_SOURCE)
+            .flat_map(|eid| eid.uids.iter().map(|uid| uid.id.as_str()))
+            .collect();
+        assert_eq!(
+            id5_uids,
+            vec!["ID5*from-cookie"],
+            "bidders should get only the current ID5 ID, not the stored copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_id5_still_reaches_bidders_when_ts_has_no_current_id() {
+        let run = run_id5_auction(
+            "parallel",
+            Some("ts-id5-fresh=1"),
+            Some("ID5*stored-earlier"),
+        )
+        .await;
+
+        assert_eq!(
+            id5_uid(run.bidder_eids.as_deref()),
+            Some("ID5*stored-earlier"),
+            "the stored ID5 should be used when the request carries no current one"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_id5_cookie_reaches_the_auction_without_a_fetch() {
         let cookie_value = BASE64.encode(
             serde_json::to_vec(&json!([{
@@ -1994,7 +2065,7 @@ mod tests {
         );
         let cookie = format!("ts-eids-s={cookie_value}; ts-id5-fresh=1");
 
-        let run = run_id5_auction("parallel", Some(&cookie)).await;
+        let run = run_id5_auction("parallel", Some(&cookie), None).await;
 
         assert_eq!(
             run.id5_calls, 0,

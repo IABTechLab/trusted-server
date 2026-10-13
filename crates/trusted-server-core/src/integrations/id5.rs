@@ -630,6 +630,24 @@ fn server_cookie_id5_eid(value: &str) -> Option<Eid> {
     }
 }
 
+/// Drops the KV-stored ID5 EID when the request already carries a current one.
+///
+/// ID5 re-encrypts `universal_uid` on every fetch, and KV keeps the first value
+/// it stored. Forwarding both would send bidders two ID5 IDs for one user, the
+/// older one without ID5's `ext`. Other stored sources are kept.
+pub(crate) fn drop_stored_id5_when_current(
+    stored: Option<Vec<Eid>>,
+    current: Option<&[Eid]>,
+) -> Option<Vec<Eid>> {
+    if !current.is_some_and(|eids| eids.iter().any(|eid| eid.source == ID5_SOURCE)) {
+        return stored;
+    }
+    stored.map(|mut eids| {
+        eids.retain(|eid| eid.source != ID5_SOURCE);
+        eids
+    })
+}
+
 /// Parses the server-owned EID cookie for any auction path.
 ///
 /// Returns `None` when the cookie is absent, malformed, or carries no ID5 ID.
@@ -1164,6 +1182,50 @@ mod tests {
             DEMO_CONSENT_BANNER_SCRIPT.contains("ts-demo-consent")
                 && !DEMO_CONSENT_BANNER_SCRIPT.contains("innerHTML"),
             "banner should write the demo cookie without innerHTML"
+        );
+    }
+
+    fn eid(source: &str, id: &str) -> Eid {
+        Eid {
+            source: source.to_owned(),
+            uids: vec![Uid {
+                id: id.to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn stored_id5_is_dropped_only_when_a_current_id5_exists() {
+        let stored = Some(vec![
+            eid(ID5_SOURCE, "ID5*stored"),
+            eid("partner.example.com", "kept"),
+        ]);
+        let current = [eid(ID5_SOURCE, "ID5*current")];
+
+        let kept = drop_stored_id5_when_current(stored.clone(), Some(&current))
+            .expect("should keep the stored list");
+
+        assert_eq!(kept.len(), 1, "should drop only the stored ID5 entry");
+        assert_eq!(
+            kept[0].source, "partner.example.com",
+            "should keep other sources"
+        );
+        assert_eq!(
+            drop_stored_id5_when_current(stored.clone(), None).map(|eids| eids.len()),
+            Some(2),
+            "should keep the stored ID5 when the request has none"
+        );
+        assert_eq!(
+            drop_stored_id5_when_current(stored, Some(&[eid("partner.example.com", "x")]))
+                .map(|eids| eids.len()),
+            Some(2),
+            "should keep the stored ID5 when the request has other sources only"
+        );
+        assert!(
+            drop_stored_id5_when_current(None, Some(&current)).is_none(),
+            "should leave an absent stored list absent"
         );
     }
 }

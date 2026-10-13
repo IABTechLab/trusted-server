@@ -5921,24 +5921,32 @@ fn apply_auction_eids_and_device(
         .cookie_jar
         .and_then(|j| j.get(COOKIE_TS_EIDS))
         .map(|c| c.value().to_owned());
-    let client_eids = if targeting.ec_id.is_some() {
-        let server_eids = crate::integrations::id5::server_cookie_eids(
+    let server_eids = if targeting.ec_id.is_some() {
+        crate::integrations::id5::server_cookie_eids(
             targeting
                 .cookie_jar
                 .and_then(|j| j.get(crate::constants::COOKIE_TS_EIDS_S))
                 .map(cookie::Cookie::value),
-        );
-        merge_auction_eids(
-            resolve_client_auction_eids(None, ts_eids_value.as_deref()),
-            server_eids,
         )
     } else {
         None
     };
-    let kv_eids = resolve_auction_eids(
-        targeting.kv_snapshot,
-        targeting.partner_registry,
-        targeting.ec_context,
+    let client_eids = if targeting.ec_id.is_some() {
+        merge_auction_eids(
+            resolve_client_auction_eids(None, ts_eids_value.as_deref()),
+            server_eids.clone(),
+        )
+    } else {
+        None
+    };
+    // A current ID5 ID from the server cookie replaces the older KV copy.
+    let kv_eids = crate::integrations::id5::drop_stored_id5_when_current(
+        resolve_auction_eids(
+            targeting.kv_snapshot,
+            targeting.partner_registry,
+            targeting.ec_context,
+        ),
+        server_eids.as_deref(),
     );
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
