@@ -126,6 +126,12 @@ entries must have identical size, bytes, type and mode, and their canonical file
 is materialized once. Other duplicates, dot aliases, traversal, links, devices
 and privileged modes fail. SHA-256/exact-root registry validation and exact Git
 revision/whole-tree validation are also reusable by later Cargo preparation.
+Source acquisition and repeated source checks first query all selected object
+metadata in bounded batches, rejecting objects above 32 MiB or aggregate bodies
+above 512 MiB before requesting any bodies. Body headers then rejoin the checked
+OID, type and exact integer size. This precheck assumes the sanitized trusted Git
+tool reads an immutable object store; it does not claim race-proof streaming
+against a mutable or corrupted store.
 
 Each private cache is seeded via pinned npm's public `cache add` API using only
 verified archives, offline and with scripts disabled. Fresh pinned npm ci runs
@@ -149,6 +155,9 @@ existing config. Only final bundle bytes must match: all tracked integrations an
 are compared. A's bundles and inventory are published together only after
 equality, in one atomic parent with `bundles/` and sibling `tsjs-inventory.json`.
 B's inventory can legitimately contain different virtual-code hashes.
+Publication rechecks the closed root/module shape and exact integer sizes and
+digests against A's final bytes, retaining A's original inventory encoding.
+Contribution, package and tool semantics remain the collector's responsibility.
 
 Run ordinary fixtures with `python3 -B -m unittest discover -s
 scripts/release/tests -p 'test_*.py' -v`. On macOS, explicitly enable actual local

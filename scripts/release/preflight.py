@@ -21,6 +21,10 @@ sys.dont_write_bytecode = True
 from common import deterministic_json_bytes, read_json_file, require_nonnegative_integer, sha256_bytes
 
 LIMIT = 1048576
+GIT_OBJECT_LIMIT = 33554432
+GIT_TOTAL_LIMIT = 536870912
+GIT_MEMBER_LIMIT = 100000
+GIT_METADATA_BATCH = 256
 SOURCE_DIRECTORIES = ("src", "build_support", "tests", "benches", "examples")
 PLATFORMS = (
     "aarch64-apple-darwin",
@@ -436,6 +440,66 @@ def _git(repo, arguments, data=None):
     return result.stdout
 
 
+def read_git_objects(repo, objects, *, max_object=GIT_OBJECT_LIMIT,
+                     max_total=GIT_TOTAL_LIMIT, max_members=GIT_MEMBER_LIMIT):
+    """Check pinned object sizes before capturing any selected Git bodies.
+
+    Use the sanitized trusted Git executable and immutable object store, never
+    replacement/alternate channels. At most 256 validated full OIDs are queried
+    per metadata request; Git's fixed SHA-1/type/64-bit-size format bounds each
+    response. Reject oversized objects or aggregate bodies before requesting
+    them, then rejoin body headers to the measured OID, type and size. This is
+    metadata prechecking, not race-proof streaming against a mutable/corrupt
+    object store. Raise ValueError for invalid pins, metadata, limits or bodies.
+    """
+    for bound in (max_object, max_total, max_members):
+        require_nonnegative_integer(bound)
+    if not isinstance(objects, dict) or len(objects) > max_members:
+        raise ValueError("source object member bound exceeded")
+    for oid, kind in objects.items():
+        if (not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}", oid)
+                or not isinstance(kind, str) or kind not in {"blob", "tree", "commit"}):
+            raise ValueError("invalid pinned source object identity")
+    selected = list(objects)
+    sizes = {}
+    total = 0
+    for start in range(0, len(selected), GIT_METADATA_BATCH):
+        batch = selected[start:start + GIT_METADATA_BATCH]
+        metadata = _git(repo, ["cat-file", "--batch-check"],
+                        "".join(oid + "\n" for oid in batch).encode("ascii"))
+        if len(metadata) > 80 * len(batch):
+            raise ValueError("source object metadata bound exceeded")
+        lines = metadata.splitlines()
+        if len(lines) != len(batch):
+            raise ValueError("source object metadata membership mismatch")
+        for oid, line in zip(batch, lines):
+            fields = line.decode("ascii").split()
+            if (len(fields) != 3 or fields[:2] != [oid, objects[oid]]
+                    or not re.fullmatch(r"[0-9]+", fields[2])):
+                raise ValueError("source object metadata identity/type/size mismatch")
+            size = int(fields[2])
+            total += size
+            if size > max_object or total > max_total:
+                raise ValueError("source object size bound exceeded")
+            sizes[oid] = size
+    if not selected:
+        return {}
+    bodies = io.BytesIO(_git(repo, ["cat-file", "--batch"],
+                            "".join(oid + "\n" for oid in selected).encode("ascii")))
+    result = {}
+    for oid, size in sizes.items():
+        header = bodies.readline().decode("ascii").strip().split()
+        if header != [oid, objects[oid], str(size)]:
+            raise ValueError("source object body disagrees with checked metadata")
+        content = bodies.read(size)
+        if len(content) != size or bodies.read(1) != b"\n":
+            raise ValueError("incomplete source object body")
+        result[oid] = content
+    if bodies.read(1):
+        raise ValueError("extra source object bodies")
+    return result
+
+
 def _audit_configuration(repo, inherited):
     configuration = _git(repo, ["config", "--local", "--no-includes", "--name-only", "--list"])
     for key in configuration.decode("utf-8").splitlines():
@@ -580,13 +644,6 @@ def source_snapshot(repo, commit, inherited):
     _audit_configuration(repo, inherited)
     if _git(repo, ["cat-file", "-t", commit]).strip() != b"commit":
         raise ValueError("source revision must be an actual commit object")
-    # Read the selected object directly; tracked snapshots need no parent history.
-    header = _git(repo, ["cat-file", "commit", commit]).split(b"\n\n", 1)[0]
-    committers = [line for line in header.splitlines() if line.startswith(b"committer ")]
-    if len(committers) != 1 or not re.search(rb" [0-9]+ [+-][0-9]{4}$", committers[0]):
-        raise ValueError("invalid committed source timestamp")
-    epoch = int(committers[0].rsplit(b" ", 2)[1])
-    require_nonnegative_integer(epoch)
     entries = {}
     for record in _git(repo, ["ls-tree", "-rz", "--full-tree", commit]).split(b"\0"):
         if not record:
@@ -600,16 +657,19 @@ def source_snapshot(repo, commit, inherited):
             raise ValueError("unsafe source tree path")
         entries[name] = (mode, object_id)
     _unexpected_sources(repo, entries)
-    payload = "".join(f"{object_id}\n" for _, object_id in entries.values()).encode("ascii")
-    blobs = io.BytesIO(_git(repo, ["cat-file", "--batch"], payload))
+    objects = {commit: "commit"}
+    objects.update({oid: "blob" for _, oid in entries.values()})
+    blobs = read_git_objects(repo, objects)
+    # Read the selected object directly; tracked snapshots need no parent history.
+    header = blobs[commit].split(b"\n\n", 1)[0]
+    committers = [line for line in header.splitlines() if line.startswith(b"committer ")]
+    if len(committers) != 1 or not re.search(rb" [0-9]+ [+-][0-9]{4}$", committers[0]):
+        raise ValueError("invalid committed source timestamp")
+    epoch = int(committers[0].rsplit(b" ", 2)[1])
+    require_nonnegative_integer(epoch)
     files = {}
     for name, (mode, object_id) in entries.items():
-        header = blobs.readline().decode("ascii").strip().split()
-        if len(header) != 3 or header[0] != object_id or header[1] != "blob":
-            raise ValueError("unexpected committed source object")
-        expected = blobs.read(int(header[2]))
-        if blobs.read(1) != b"\n":
-            raise ValueError("incomplete committed source object")
+        expected = blobs[object_id]
         path = repo / name
         _check_source_parents(repo, path)
         try:
@@ -636,8 +696,6 @@ def source_snapshot(repo, commit, inherited):
             "permissions": stat.S_IMODE(information.st_mode),
             "sha256": sha256_bytes(actual),
         }
-    if blobs.read(1):
-        raise ValueError("extra committed source objects")
     return {"source_commit": commit, "source_date_epoch": epoch, "files": files}
 
 

@@ -26,7 +26,7 @@ sys.dont_write_bytecode = True
 # -I excludes both caller Python paths and this script directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (deterministic_json_bytes, load_json_bytes, read_bounded,
-                    read_json_file, sha256_bytes)
+                    read_json_file, require_nonnegative_integer, sha256_bytes)
 import preflight
 
 MAX_JSON = 1048576
@@ -264,26 +264,7 @@ def materialize_source(repo, revision, destination):
         entries.append((mode, kind, oid, name))
     objects = {revision: "commit", tree: "tree"}
     objects.update({oid: kind for _, kind, oid, _ in entries})
-    if len(objects) > MAX_MEMBERS:
-        raise ValueError("source object bound exceeded")
-    data = io.BytesIO(preflight._git(repo, ["cat-file", "--batch"],
-                                  "".join(oid + "\n" for oid in objects).encode("ascii")))
-    blobs = {}
-    total = 0
-    for oid, kind in objects.items():
-        header = data.readline().decode("ascii").strip().split()
-        if len(header) != 3 or header[:2] != [oid, kind]:
-            raise ValueError("source object disagreement")
-        size = int(header[2])
-        total += size
-        if size > MAX_FILE or total > MAX_EXPANDED:
-            raise ValueError("source object size bound exceeded")
-        content = data.read(size)
-        if len(content) != size or data.read(1) != b"\n":
-            raise ValueError("incomplete source object")
-        blobs[oid] = content
-    if data.read(1):
-        raise ValueError("extra source objects")
+    blobs = preflight.read_git_objects(repo, objects)
     for mode, _, oid, name in entries:
         if mode == "120000" and (name != "CLAUDE.md" or blobs[oid] != b"AGENTS.md"
                                  or not any(entry[3] == "AGENTS.md" and entry[1] == "blob" for entry in entries)):
@@ -766,11 +747,29 @@ def compare_and_publish(a, b, expected, output):
         raise ValueError("independent final JS bytes differ")
     inventory = _regular_bytes(Path(a) / "inventory.json", MAX_JSON)
     document = load_json_bytes(inventory, max_bytes=MAX_JSON)
-    modules = document.get("modules") if isinstance(document, dict) else None
-    if (not isinstance(modules, list) or sorted(record.get("filename", "") for record in modules) != expected
-            or any(record.get("id") != record.get("filename", "")[5:-3]
-                   or record.get("size") != len(measured[0][record["filename"]])
-                   or record.get("sha256") != sha256_bytes(measured[0][record["filename"]]) for record in modules)):
+    if (not isinstance(document, dict) or set(document) != {
+            "schema_version", "source_commit", "modules", "tools", "materials"}
+            or type(document["schema_version"]) is not int or document["schema_version"] != 1
+            or not isinstance(document["source_commit"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", document["source_commit"])
+            or any(not isinstance(document[field], list) for field in ("modules", "tools", "materials"))):
+        raise ValueError("invalid final inventory root")
+    modules = document["modules"]
+    for record in modules:
+        if (not isinstance(record, dict) or set(record) != {
+                "id", "filename", "size", "sha256", "contributions"}
+                or not isinstance(record["filename"], str) or record["filename"] not in measured[0]
+                or record["id"] != record["filename"][5:-3]
+                or not isinstance(record["contributions"], list)):
+            raise ValueError("invalid final inventory module")
+        try:
+            size = require_nonnegative_integer(record["size"])
+        except ValueError as error:
+            raise ValueError("invalid final inventory module size") from error
+        if (size != len(measured[0][record["filename"]])
+                or record["sha256"] != sha256_bytes(measured[0][record["filename"]])):
+            raise ValueError("final inventory does not match published A bytes")
+    if sorted(record["filename"] for record in modules) != expected:
         raise ValueError("final inventory does not match published A bytes")
     output = Path(output)
     if os.path.lexists(output):

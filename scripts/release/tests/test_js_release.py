@@ -73,6 +73,53 @@ class JsReleaseTests(unittest.TestCase):
             prepare.compare_and_publish(self.a, self.b, self.expected, output)
         self.assertFalse(output.exists())
 
+    def test_inventory_rejects_float_boolean_sizes_and_nonobject_modules(self):
+        original = json.loads((self.a / "inventory.json").read_bytes())
+        for size, payload in ((25.0, b"console.log('synthetic');"), (True, b"x")):
+            inventory = json.loads(json.dumps(original))
+            for module in inventory["modules"]:
+                module["size"] = size
+                module["sha256"] = hashlib.sha256(payload).hexdigest()
+                for workspace in (self.a, self.b):
+                    (workspace / "bundles" / module["filename"]).write_bytes(payload)
+            (self.a / "inventory.json").write_text(json.dumps(inventory))
+            output = self.root / ("published-boolean" if size is True else "published-float")
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(ValueError, "inventory"):
+                    prepare.compare_and_publish(self.a, self.b, self.expected, output)
+                self.assertFalse(output.exists())
+        for item in (None, True, "module", [], 1):
+            inventory = json.loads(json.dumps(original))
+            inventory["modules"][0] = item
+            (self.a / "inventory.json").write_text(json.dumps(inventory))
+            with self.subTest(item=item), self.assertRaisesRegex(ValueError, "inventory"):
+                prepare.compare_and_publish(self.a, self.b, self.expected, self.root / "malformed")
+
+    def test_inventory_rejects_nonclosed_root_and_module_fields(self):
+        original = json.loads((self.a / "inventory.json").read_bytes())
+        for change in ("schema", "commit", "extra", "missing", "module-extra", "module-missing", "contributions"):
+            inventory = json.loads(json.dumps(original))
+            if change == "schema":
+                inventory["schema_version"] = True
+            elif change == "commit":
+                inventory["source_commit"] = "HEAD"
+            elif change == "extra":
+                inventory["extra"] = True
+            elif change == "missing":
+                del inventory["materials"]
+            elif change == "module-extra":
+                inventory["modules"][0]["extra"] = True
+            elif change == "module-missing":
+                del inventory["modules"][0]["contributions"]
+            else:
+                inventory["modules"][0]["contributions"] = None
+            (self.a / "inventory.json").write_text(json.dumps(inventory))
+            output = self.root / change
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, "inventory"):
+                    prepare.compare_and_publish(self.a, self.b, self.expected, output)
+                self.assertFalse(output.exists())
+
     def test_missing_extra_symlink_and_empty_bundles_are_rejected(self):
         for change in ("missing", "extra", "symlink", "empty"):
             path = self.b / "bundles/tsjs-example.js"

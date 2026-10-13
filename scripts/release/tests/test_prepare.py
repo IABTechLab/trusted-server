@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 RELEASE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RELEASE))
@@ -184,6 +185,58 @@ class PreparationTests(unittest.TestCase):
         for rev, expected in (("HEAD", tree), (revision, "a" * 40), ("b" * 40, tree)):
             with self.subTest(rev=rev), self.assertRaises(ValueError):
                 prepare.verify_git_revision(repo, rev, expected)
+
+    def test_oversized_source_rejected_before_any_batch_body_request(self):
+        repo = self.root / "repository"
+        revision = source(repo, {"oversized.txt": b"x" * (prepare.MAX_FILE + 1)})
+        for operation in (lambda: prepare.materialize_source(repo, revision, self.root / "fresh"),
+                          lambda: prepare.source_check(repo, revision)):
+            with self.subTest(operation=operation), mock.patch.object(prepare.preflight, "_git", wraps=prepare.preflight._git) as observed:
+                with self.assertRaisesRegex(ValueError, "size bound"):
+                    operation()
+                self.assertFalse(any(call.args[1] == ["cat-file", "--batch"] for call in observed.call_args_list),
+                                 "should reject metadata before capturing any oversized batch body")
+
+    def test_git_object_reader_binds_bounded_metadata_to_selected_objects(self):
+        self.assertTrue(hasattr(prepare.preflight, "read_git_objects"), "should inspect bounded metadata before object bodies")
+        repo = self.root / "repository"
+        revision = source(repo, {"file": b"example"})
+        oid = git(repo, "rev-parse", revision + ":file")
+        self.assertEqual(prepare.preflight.read_git_objects(repo, {oid: "blob"})[oid], b"example")
+        for identities, limits in (({oid: "tree"}, {}), ({"f" * 40: "blob"}, {}),
+                                   ({oid: "blob"}, {"max_object": 6}),
+                                   ({oid: "blob", revision: "commit"}, {"max_total": 7}),
+                                   ({oid: "blob"}, {"max_members": 0}),
+                                   ({oid: "blob"}, {"max_object": True})):
+            with self.subTest(identities=identities, limits=limits), self.assertRaises(ValueError):
+                prepare.preflight.read_git_objects(repo, identities, **limits)
+
+    def test_git_metadata_malformed_pin_kind_and_size_fail_before_body(self):
+        self.assertTrue(hasattr(prepare.preflight, "read_git_objects"), "should provide checked Git metadata joins")
+        oid = "a" * 40
+        for response in (f"{'b' * 40} blob 1\n", f"{oid} tree 1\n", f"{oid} blob -1\n",
+                         f"{oid} blob True\n", f"{oid} blob 1.0\n", f"{oid} missing\n",
+                         f"{oid} blob 1\n{oid} blob 1\n", "x" * 65537):
+            with self.subTest(response=response[:80]), mock.patch.object(prepare.preflight, "_git", return_value=response.encode()) as observed:
+                with self.assertRaises(ValueError):
+                    prepare.preflight.read_git_objects(self.root, {oid: "blob"})
+                self.assertEqual(len(observed.call_args_list), 1, "should not request bodies after invalid metadata")
+
+    def test_git_metadata_batches_are_bounded_before_body_capture(self):
+        repo = self.root / "repository"
+        revision = source(repo, {f"file-{index}.txt": f"example-{index}".encode() for index in range(257)})
+        objects = {line.split()[2]: "blob" for line in git(repo, "ls-tree", "-r", revision).splitlines()}
+        with mock.patch.object(prepare.preflight, "_git", wraps=prepare.preflight._git) as observed:
+            actual = prepare.preflight.read_git_objects(repo, objects)
+        self.assertEqual(len(actual), 257)
+        calls = observed.call_args_list
+        self.assertEqual([call.args[1] for call in calls],
+                         [["cat-file", "--batch-check"], ["cat-file", "--batch-check"], ["cat-file", "--batch"]])
+        self.assertEqual([len(call.args[2].splitlines()) for call in calls[:2]], [256, 1])
+        with mock.patch.object(prepare.preflight, "_git", wraps=prepare.preflight._git) as observed:
+            with self.assertRaisesRegex(ValueError, "size bound"):
+                prepare.preflight.read_git_objects(repo, objects, max_total=1)
+            self.assertFalse(any(call.args[1] == ["cat-file", "--batch"] for call in observed.call_args_list))
 
     def test_git_materialization_ignores_export_filters_and_ambient_outputs(self):
         repo = self.root / "repository"
