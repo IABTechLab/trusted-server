@@ -271,15 +271,20 @@ function stableFile(file, consume) {
   try {
     const before = fs.fstatSync(descriptor);
     if (!before.isFile()) throw new Error(`Expected regular file: ${file}`);
-    const result = consume(descriptor, before.size);
+    const result = consume(descriptor, before.size, before.mode);
     const after = fs.fstatSync(descriptor);
     const current = fs.lstatSync(file);
     if (
       before.dev !== current.dev ||
       before.ino !== current.ino ||
       before.size !== after.size ||
+      before.size !== current.size ||
+      before.mode !== after.mode ||
+      before.mode !== current.mode ||
       before.mtimeMs !== after.mtimeMs ||
-      before.ctimeMs !== after.ctimeMs
+      before.mtimeMs !== current.mtimeMs ||
+      before.ctimeMs !== after.ctimeMs ||
+      before.ctimeMs !== current.ctimeMs
     )
       throw new Error(`File changed while measured: ${file}`);
     return result;
@@ -336,10 +341,8 @@ export function installedTreeHash(root, excludedRoots = new Set()) {
         digest.update(`${JSON.stringify([filename, 'directory'])}\n`);
         visit(file);
       } else if (stat.isFile()) {
-        digest.update(
-          `${JSON.stringify([filename, 'file', stat.size, Boolean(stat.mode & 0o111)])}\n`
-        );
-        stableFile(file, (descriptor, size) => {
+        stableFile(file, (descriptor, size, mode) => {
+          digest.update(`${JSON.stringify([filename, 'file', size, Boolean(mode & 0o111)])}\n`);
           const buffer = Buffer.alloc(64 * 1024);
           let count = 0;
           for (;;) {

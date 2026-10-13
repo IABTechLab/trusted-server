@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'vite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildAll } from '../build-all.mjs';
 import { moduleBuildOptions } from '../build-module-options.mjs';
 
@@ -966,4 +966,53 @@ describe('lifecycle output package ownership', () => {
       );
     }
   );
+});
+
+describe('installed tree mode measurement boundaries', () => {
+  it('hashes the executable mode observed on the opened descriptor', async () => {
+    const { installedTreeHash } = await import('../release-composition.mjs');
+    const root = fixture();
+    const file = path.join(root, 'example.js');
+    fs.writeFileSync(file, 'example bytes');
+    fs.chmodSync(file, 0o644);
+    const oldHash = installedTreeHash(root);
+    const open = fs.openSync;
+    let changed = false;
+    const boundary = vi.spyOn(fs, 'openSync').mockImplementation((...args) => {
+      if (args[0] === file && !changed) {
+        changed = true;
+        fs.chmodSync(file, 0o755);
+      }
+      return open(...args);
+    });
+    let observed;
+    try {
+      observed = installedTreeHash(root);
+    } finally {
+      boundary.mockRestore();
+    }
+    expect(changed).toBe(true);
+    expect(observed).not.toBe(oldHash);
+    expect(observed).toBe(installedTreeHash(root));
+  });
+
+  it('rejects a mode change between the final descriptor and pathname checks', async () => {
+    const { installedTreeHash } = await import('../release-composition.mjs');
+    const root = fixture();
+    const file = path.join(root, 'example.js');
+    fs.writeFileSync(file, 'example bytes');
+    fs.chmodSync(file, 0o644);
+    const lstat = fs.lstatSync;
+    let observations = 0;
+    const boundary = vi.spyOn(fs, 'lstatSync').mockImplementation((...args) => {
+      if (args[0] === file && ++observations === 2) fs.chmodSync(file, 0o755);
+      return lstat(...args);
+    });
+    try {
+      expect(() => installedTreeHash(root)).toThrow(/changed/i);
+      expect(observations).toBe(2);
+    } finally {
+      boundary.mockRestore();
+    }
+  });
 });
