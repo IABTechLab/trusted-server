@@ -4,7 +4,7 @@
 
 **Date:** 2026-10-09. **Review revision:** 2026-10-12.
 
-**Status:** Draft for maintainer review. Approval and merge of this specification precede an implementation PR. Requirements below describe proposed behavior, not an existing release pipeline. The [feasibility audit](2026-10-12-1235-release-attestation-feasibility.md) records measured prototypes, missing implementations and unresolved hosted/provider qualifications; document review alone is not feasibility proof.
+**Status:** Draft for maintainer review. As directed on 2026-10-13, this specification, its implementation plans and implementation share PR #1262 on `spec/1235-release-attestation`; no separate implementation PR is opened. Contract/code approval is required before merge and all selected qualification gates remain required before official release enablement. Requirements below describe proposed behavior, not an existing release pipeline. The [feasibility audit](2026-10-12-1235-release-attestation-feasibility.md) records measured prototypes, missing implementations and unresolved hosted/provider qualifications; document review alone is not feasibility proof.
 
 **Source baseline:** PR #1262 at `7f6056bf83eb96aa4167efca64d43280299fba73`. The implementation MUST reconcile [#1214](https://github.com/IABTechLab/trusted-server/pull/1214) (isolated JS builds) and [#1213](https://github.com/IABTechLab/trusted-server/pull/1213) (source-version headers) before release enablement; neither is assumed merged at this baseline.
 
@@ -394,7 +394,7 @@ Implementation changes MUST run appropriate target-matched tests/lints after eac
 
 ## Rollout
 
-1. Approve and merge this contract independently; implementation links the approved version. Reconcile #1214/#1213 and permission-config separation.
+1. Review this contract and its plans, then implement on the same `spec/1235-release-attestation` branch and PR #1262. Approve the contract/code together before merge; this explicitly replaces the separate-spec-PR delivery procedure for this work, without waiving qualification or release authorization. Reconcile #1214/#1213 and permission-config separation.
 2. Prototype Fastly A/B equality, shared JS output, SBOM native/host/JS fixtures and CLI compatibility baselines with throwaway recipes. Record feasibility and review any cohort change before production work; this step does not promise replay of nonexistent retained inputs.
 3. Implement reviewed release recipes/tools/cohort, JS inventory, composition generator, facts, validation, measurements, schema/policy, signing and immutable publication. Remove obsolete claims that configuration is baked into wasm from CI workflows, the integration-test setup action, adapter comments/tests and integration helpers, not just `test.yml`.
 4. Prepare governance/settings/tag rules, trusted gh/CLI bootstrap and documentation. Exercise publication and verification in a disposable public repository using policy fixtures for that repository; no production-policy override is added. Document/validate the manual verified-byte Fastly production route. Publish the first eligible four-artifact release after all its selected requirements pass.
@@ -404,7 +404,7 @@ Implementation changes MUST run appropriate target-matched tests/lints after eac
 
 ## Acceptance criteria
 
-- [ ] **AC-1:** Spec approved/merged independently; implementation links it and records the selected cohort/profiles before execution.
+- [ ] **AC-1:** Spec, plans and implementation reviewed/approved together in PR #1262; implementation records the selected cohort/profiles before release execution.
 - [ ] **AC-2:** Configuration independence, complete input inventory, selected variant and qualified CLI compatibility hold for every selected Build A.
 - [ ] **AC-3:** Fresh locked shared JS passes byte equality; Fastly A/B matches complete bytes; native measurements have honest terminal outcomes and cannot waive required failures.
 - [ ] **AC-4:** Per-artifact provenance/SPDX/bundles/index/checksums and composition coverage pass their exact evidence and schema checks.

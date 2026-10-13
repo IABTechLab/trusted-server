@@ -12,7 +12,7 @@
 
 ## Authority, baseline and scope
 
-Planning baseline: `44c5b5620bfb1f82e5b959ab5ba8ec69c7091e52`, inspected 2026-10-13. The governing [contract](../specs/2026-10-09-1235-release-attestation-design.md), [feasibility register](../specs/2026-10-12-1235-release-attestation-feasibility.md) and [index schema](../specs/schemas/release-index-v1.schema.json) remain drafts awaiting maintainer approval. This plan does not approve their implementation, qualify a release, or authorize live publication/deployment. Task 1 establishes that prerequisite; writing/reviewing this plan can proceed now.
+Planning baseline: `44c5b5620bfb1f82e5b959ab5ba8ec69c7091e52`, inspected 2026-10-13. The governing [contract](../specs/2026-10-09-1235-release-attestation-design.md), [feasibility register](../specs/2026-10-12-1235-release-attestation-feasibility.md) and [index schema](../specs/schemas/release-index-v1.schema.json) remain drafts awaiting maintainer approval. Delivery direction on 2026-10-13 is to develop/review the spec, plans and implementation together on `spec/1235-release-attestation` in PR #1262, with no new Trusted Server PR. The reviewed plan guides implementation here; maintainer contract/code approval remains required before merge, and the plan does not qualify a release or authorize live publication/deployment. Task 1 records this delivery contract and the unchanged qualification prerequisites.
 
 #1214 and #1213 are present at this baseline. Extend their merged private JS output/prebuilt interface and source-version mechanism; do not reimplement the historical audit snapshots. Source deployment currently delegates to EdgeZero and no release workflow/verifier exists.
 
@@ -34,7 +34,7 @@ Two linked plans keep independent work out of these closure criteria:
 
 ## Work breakdown and ownership
 
-Use successive focused PRs: (1) input/fact/JS guards, (2) qualified recipes and composition, (3) collection/signing/publication, (4) verifier/manual route/docs. Each depends on its predecessor; tag enablement waits for all four. Build scripts can be proved locally before production YAML exists. No intermediate PR may enable an incomplete release trigger.
+Use successive focused commit/review groups within PR #1262: (1) input/fact/JS guards, (2) qualified recipes and composition, (3) collection/signing/publication, (4) verifier/manual route/docs. Each depends on its predecessor; tag enablement waits for all four. No new Trusted Server implementation PR is created. Build scripts can be proved locally before production YAML exists. No intermediate PR may enable an incomplete release trigger.
 
 | File group                                                                     | Responsibility                                                                                           |
 | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
@@ -57,12 +57,12 @@ New files below are proposed, not existing APIs. Keep security parsing and opera
 
 **Files:** Modify this plan and the governing spec only for approved corrections; reference PR #1292's `docs/superpowers/specs/2026-10-12-863-cli-release-packaging-design.md` and `docs/superpowers/plans/2026-10-12-cli-release-packaging.md` after their owning branch is available.
 
-- [ ] Read the merged/current spec revision; record its commit and maintainer approval before executing implementation tasks.
+- [ ] Read the current spec revision; record its commit and the same-branch/same-PR delivery direction. Work through reviewed tasks in PR #1262; obtain maintainer contract/code approval before merge. Do not require a separate spec merge or open another implementation PR.
 - [ ] Record one publication owner, `.github/workflows/release.yml`, and one signing identity, same-revision `release-build.yml`. #1292 must not independently publish an overlapping immutable tag while #1235 assets are still pending.
 - [ ] Confirm the current four-artifact cohort and three CLI baselines. Initial #1235 delivery may precede packaging on a different new tag. Adding package records or ARM64 requires the linked plan's approved delta, never a covert schema expansion here.
 - [ ] Settle one strict producer control channel: `TRUSTED_SERVER__RELEASE_BUILD=1`, injected by trusted recipe after environment sanitation, recorded as an input, rejected if present with another value. This is a fact/input guard, not the prohibited parallel JS fallback mode. Name the checked prebuilt inventory input `TSJS_PREBUILT_INVENTORY`.
 - [ ] Confirm permission policy remains runtime-variable; conflicting #1045/#1084 code blocks release enablement. Record the owner and dependency rather than designing a new permission transport.
-- [ ] Review milestone exits with maintainers. Commit any approved documentation delta separately with `Clarify release implementation prerequisites`.
+- [ ] Review milestone exits with maintainers in PR #1262. Commit any approved documentation delta as a focused commit on this branch with `Clarify release implementation prerequisites`.
 
 **Exit:** An engineer can identify approved source, scope, producer controls and the single release authority; no unspecified cross-PR ownership decision remains.
 
@@ -324,7 +324,7 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 - [ ] Rehearse hosted source authorization, shared JS, Fastly A/B, all three native A/SBOMs, optional B terminal failures, actual exact-action signatures, immutable draft/publication and full consumer verification together. Toy/synthetic component proofs cannot replace this complete composition.
 - [ ] Recheck permission/config separation, governance/rules/bypass authority, bootstrap docs, actual platform evidence and live manual submission. Missing evidence blocks tag enablement; native B equality, packaging or upstream integration do not add hidden blockers.
 - [ ] Review against AC-1–AC-7, AC-9–AC-10; keep AC-8 separate. Use @superpowers:requesting-code-review and @superpowers:verification-before-completion. Maintainer approval precedes any production tag.
-- [ ] Commit validated documentation/evidence with `Record initial release qualification`; create implementation PRs through the repository PR creator only when their required checks pass.
+- [ ] Commit validated documentation/evidence with `Record initial release qualification`; update existing PR #1262 with implementation and validation evidence only when the required checks pass; never create a replacement implementation PR.
 
 ## Focused Rust test selection guard
 
@@ -413,7 +413,7 @@ A completed task means its described tests pass and reviewed code exists, not me
 
 ## Planning-only verification and handoff
 
-For these Markdown plans, validate formatting, links, shell syntax, requirement coverage, task dependencies and independent review. Do not claim that runtime tests verify implementation that has not been written. Preserve the current PR branch; the planning worktree is `/private/tmp/trusted-server-1235-plan-20261013`, branch `plan/1235-attested-release-implementation`.
+For these Markdown plans, validate formatting, links, shell syntax, requirement coverage, task dependencies and independent review. Do not claim that runtime tests verify implementation that has not been written. Continue in the main checkout `/Users/prk-jr/Desktop/opensource/rust/trusted-server`, branch `spec/1235-release-attestation`, and existing PR #1262. The temporary planning worktree/branch were used only to draft the plans; their commits have been incorporated into this branch.
 
 ## Review record
 
