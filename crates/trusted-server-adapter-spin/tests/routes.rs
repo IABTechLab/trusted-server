@@ -168,7 +168,7 @@ async fn admin_ec_route_without_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retired_admin_eids_route_still_requires_authentication() {
+async fn admin_eids_route_still_requires_authentication() {
     let req = request_builder()
         .method("GET")
         .uri("/_ts/admin/eids")
@@ -180,8 +180,8 @@ async fn retired_admin_eids_route_still_requires_authentication() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_admin_eids_route_returns_local_retirement_denial() {
-    // Retired routes must not forward admin credentials to publisher fallback.
+async fn authenticated_admin_eids_route_returns_diagnostic_locally() {
+    // The diagnostic is local and must not forward admin credentials to fallback.
     let req = request_builder()
         .method("GET")
         .uri("/_ts/admin/eids")
@@ -191,11 +191,7 @@ async fn authenticated_admin_eids_route_returns_local_retirement_denial() {
         .expect("should build request");
     let resp = route(test_router(), req).await;
 
-    assert_eq!(
-        resp.status().as_u16(),
-        410,
-        "/_ts/admin/eids should deny locally after authentication"
-    );
+    assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
         resp.headers()
             .get("cache-control")

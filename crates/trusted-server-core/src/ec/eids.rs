@@ -3,10 +3,17 @@
 //! Used by both `/_ts/api/v1/identify` and `/auction` to resolve source-domain
 //! keyed IDs from KV entries and convert them to `OpenRTB` EID structures.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use error_stack::{Report, ResultExt as _};
+
+use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
 use super::kv_types::KvEntry;
 use super::registry::PartnerRegistry;
+
+/// Maximum base64-encoded size of the diagnostic EID response header.
+pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
 
 /// A source-domain keyed ID resolved from a KV entry against the partner registry.
 ///
@@ -82,6 +89,45 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
             eid
         })
         .collect()
+}
+
+/// Encodes the final auction EIDs for diagnostics, trimming tail sources to fit.
+///
+/// Returns the encoded value and whether truncation was necessary. This header
+/// is diagnostic output, never an identity acquisition input.
+///
+/// # Errors
+///
+/// Returns an error if JSON serialization fails.
+pub fn encode_eids_header(eids: &[Eid]) -> Result<(String, bool), Report<TrustedServerError>> {
+    let try_encode = |size: usize| -> Result<String, Report<TrustedServerError>> {
+        let json = serde_json::to_vec(&eids[..size]).change_context(
+            TrustedServerError::Configuration {
+                message: "Failed to serialize eids header payload".to_owned(),
+            },
+        )?;
+        Ok(BASE64.encode(json))
+    };
+    let encoded = try_encode(eids.len())?;
+    if encoded.len() <= MAX_EIDS_HEADER_BYTES {
+        return Ok((encoded, false));
+    }
+    let mut lo = 0;
+    let mut hi = eids.len();
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if try_encode(mid)?.len() <= MAX_EIDS_HEADER_BYTES {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 && !eids.is_empty() {
+        log::warn!(
+            "No EIDs fit the diagnostic header byte limit; emitting an empty truncated header"
+        );
+    }
+    Ok((try_encode(lo)?, true))
 }
 
 #[cfg(test)]

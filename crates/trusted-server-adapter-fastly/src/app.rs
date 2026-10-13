@@ -24,7 +24,7 @@
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
 //! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
-//! | GET | `/_ts/admin/eids` | [`admin_eids_lookup_retired`] |
+//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -109,7 +109,7 @@ use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::COOKIE_SHAREDID;
 use trusted_server_core::ec::admin::{
-    admin_eids_lookup_retired, deny_admin_diagnostic_fallback, handle_admin_ec_lookup,
+    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
@@ -575,7 +575,7 @@ async fn execute_named(
                     let kv = crate::maybe_identity_graph(&state.settings);
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
                 }
-                NamedRouteHandler::AdminEidsLookup => Ok(admin_eids_lookup_retired()),
+                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
             })
             .unwrap_or_else(|error| http_error(&error));
@@ -2547,7 +2547,7 @@ mod tests {
 
         let response = route(&router, request);
 
-        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert!(
             response

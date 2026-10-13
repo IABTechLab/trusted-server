@@ -4,7 +4,7 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::json;
 
-use crate::auction::endpoints::resolve_auction_eids;
+use crate::auction::endpoints::{resolve_and_merge_auction_eids, resolve_auction_eids};
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::ec::EidSyncSource;
 use crate::ec::finalize::ec_finalize_response;
@@ -318,6 +318,71 @@ fn pending_capture_delivers_before_visibility_then_replays_and_acknowledges() {
 }
 
 #[test]
+fn restored_browser_cookie_cannot_strip_authenticated_pending_capture_metadata() {
+    let settings = settings();
+    let partners = partners(&settings);
+    let graph = graph();
+    let pending = entry();
+    let signed = cookie(&settings, vec![pending.clone()]);
+    let browser = base64::engine::general_purpose::STANDARD.encode(
+        serde_json::to_vec(&json!([{ "source": SOURCE, "uids": [{ "id": UID }] }]))
+            .expect("should encode browser cookie"),
+    );
+    let request = http::Request::builder()
+        .uri("https://publisher.example/")
+        .header(
+            header::COOKIE,
+            format!("ts-ec={}; ts-eids-s={signed}; ts-eids={browser}", id()),
+        )
+        .body(EdgeBody::empty())
+        .expect("should build request with both cookies");
+    let mut context = EcContext::read_from_request(&settings, &request, &noop_services())
+        .expect("should read both cookies");
+    context.consent_mut().jurisdiction = Jurisdiction::NonRegulated;
+    context.set_identity_handoff_supported(true);
+    context.set_eid_sync_source(EidSyncSource::Navigation);
+    context.set_kv_snapshot(graph.load_snapshot(&id()));
+    let mut response = response();
+    ec_finalize_response(
+        &settings,
+        &mut context,
+        Some(&graph),
+        &partners,
+        None,
+        &mut response,
+    );
+    assert!(
+        !graph
+            .get(&id())
+            .expect("should inspect before send")
+            .expect("should retain root")
+            .0
+            .ids
+            .contains_key(SOURCE),
+        "matching unsigned cookie must not persist an unknown-expiry browser record before trusted replay"
+    );
+    send(&mut response, &mut context, &graph, &partners);
+    let stored = graph
+        .get(&id())
+        .expect("should inspect after replay")
+        .expect("should retain root")
+        .0;
+    assert_eq!(
+        stored.ids[SOURCE].uid, UID,
+        "should persist captured UID after send"
+    );
+    assert_eq!(
+        stored.ids[SOURCE].writer.as_deref(),
+        Some("lockr"),
+        "should retain authenticated writer"
+    );
+    assert_eq!(
+        stored.ids[SOURCE].expires_at, pending.expires_at,
+        "should retain authenticated provider expiry"
+    );
+}
+
+#[test]
 fn matching_capture_retains_pending_deadline_and_missing_expiry_without_overriding_kv() {
     let settings = settings();
     let partners = partners(&settings);
@@ -429,13 +494,315 @@ fn matching_capture_retains_pending_deadline_and_missing_expiry_without_overridi
 }
 
 #[test]
-fn existing_records_including_expired_and_same_uid_refresh_block_replay() {
+fn expired_record_uses_live_handoff_without_replay_or_deadline_renewal() {
+    let settings = settings();
+    let partners = partners(&settings);
+    for stored_uid in [UID, "expired-different-uid"] {
+        let graph = graph_with_record(stored_uid, Some(1));
+        let before = graph.get(&id()).expect("should read expired record");
+        let value = cookie(&settings, vec![entry()]);
+        let mut context = context(&settings, Some(&value));
+        context.set_kv_snapshot(graph.load_snapshot(&id()));
+        context.set_eid_sync_source(EidSyncSource::Auction);
+        let client_eids = Some(to_eids(&[ResolvedPartnerId {
+            source_domain: SOURCE.to_owned(),
+            uid: stored_uid.to_owned(),
+            writer: None,
+            openrtb_atype: 1,
+        }]));
+        let eids = resolve_and_merge_auction_eids(
+            client_eids,
+            context.kv_snapshot(),
+            Some(&partners),
+            &context,
+        )
+        .expect("should supply authenticated capture instead of expired browser input");
+        assert_eq!(eids.len(), 1, "should emit only the valid capture source");
+        assert_eq!(eids[0].uids.len(), 1, "should omit expired browser input");
+        assert_eq!(eids[0].uids[0].id, UID, "should use the live captured UID");
+        assert_eq!(
+            eids[0].inserter.as_deref(),
+            Some("Lockr-For-Publishers"),
+            "should preserve authenticated capture provenance"
+        );
+        context.stage_browser_eid_updates(vec![PartnerIdUpdate::new(SOURCE, UID)]);
+        let mut response = response();
+        ec_finalize_response(
+            &settings,
+            &mut context,
+            Some(&graph),
+            &partners,
+            None,
+            &mut response,
+        );
+        let returned = handoff_header(&response)
+            .expect("should retain live fallback over an expired record")
+            .strip_prefix("ts-eids-s=")
+            .expect("should get cookie value")
+            .split(';')
+            .next()
+            .expect("should get token");
+        assert_eq!(
+            returned, value,
+            "should retain the original signed deadline"
+        );
+        assert!(
+            response.extensions().get::<IdentityEffects>().is_none(),
+            "an expired source must not stage persistence replay"
+        );
+        send(&mut response, &mut context, &graph, &partners);
+        assert_eq!(
+            graph.get(&id()).expect("should read after send"),
+            before,
+            "auction fallback must not replace stored UID, expiry, writer or revision"
+        );
+    }
+}
+
+#[test]
+fn capture_issues_handoff_over_expired_record_then_acknowledges_direct_write() {
+    let settings = settings();
+    let partners = partners(&settings);
+    for stored_uid in [UID, "expired-different-uid"] {
+        let graph = graph_with_record(stored_uid, Some(1));
+        let before = graph.get(&id()).expect("should read expired record");
+        let mut context = context(&settings, None);
+        context.set_kv_snapshot(graph.load_snapshot(&id()));
+        let mut response = response();
+        response
+            .extensions_mut()
+            .insert(captured_effect(&settings, &context, &partners));
+        ec_finalize_response(
+            &settings,
+            &mut context,
+            Some(&graph),
+            &partners,
+            None,
+            &mut response,
+        );
+        let value = handoff_header(&response)
+            .expect("should issue capture fallback over expired stored state")
+            .strip_prefix("ts-eids-s=")
+            .expect("should get cookie value")
+            .split(';')
+            .next()
+            .expect("should get token")
+            .to_owned();
+        let mut later = self::context(&settings, Some(&value));
+        later.set_kv_snapshot(graph.load_snapshot(&id()));
+        let eids = resolve_auction_eids(later.kv_snapshot(), Some(&partners), &later, Some(now()))
+            .expect("should resolve before capture persistence");
+        assert_eq!(
+            eids.len(),
+            1,
+            "should deliver capture before write visibility"
+        );
+        assert_eq!(eids[0].uids[0].id, UID, "should deliver the captured UID");
+        assert_eq!(
+            graph.get(&id()).expect("should read before send"),
+            before,
+            "should not persist capture before send"
+        );
+        send(&mut response, &mut context, &graph, &partners);
+        later.set_kv_snapshot(graph.load_snapshot(&id()));
+        assert!(
+            resolve_eids(&later, later.kv_snapshot(), &partners, Some(now())).is_empty(),
+            "usable stored capture must take precedence over the handoff"
+        );
+        let stored = graph
+            .get(&id())
+            .expect("should read direct capture")
+            .expect("should find root")
+            .0;
+        assert_eq!(stored.ids[SOURCE].uid, UID, "should persist direct capture");
+        assert!(
+            stored.ids[SOURCE].is_usable(Some(now())),
+            "direct capture should persist the refreshed expiry"
+        );
+        let mut acknowledged = self::response();
+        ec_finalize_response(
+            &settings,
+            &mut later,
+            Some(&graph),
+            &partners,
+            None,
+            &mut acknowledged,
+        );
+        assert!(
+            handoff_header(&acknowledged)
+                .expect("should clear persisted capture")
+                .contains("Max-Age=0"),
+            "should clear the acknowledged handoff"
+        );
+    }
+}
+
+#[test]
+fn expired_source_fallback_checks_expiry_boundary_and_current_policy() {
+    let settings = settings();
+    let partners = partners(&settings);
+    let timestamp = now();
+    let graph = graph_with_record("expired-different-uid", Some(timestamp));
+    for provider_expiry in [None, Some(timestamp + 30)] {
+        let mut pending = entry();
+        pending.expires_at = provider_expiry;
+        pending.deadline = timestamp + 30;
+        let value = cookie(&settings, vec![pending]);
+        let mut context = context(&settings, Some(&value));
+        context.set_kv_snapshot(graph.load_snapshot(&id()));
+        assert_eq!(
+            resolve_eids(&context, context.kv_snapshot(), &partners, Some(timestamp)).len(),
+            1,
+            "stored expiry is exclusive, including at the exact boundary"
+        );
+        assert!(
+            resolve_eids(
+                &context,
+                context.kv_snapshot(),
+                &partners,
+                Some(timestamp + 30)
+            )
+            .is_empty(),
+            "provider expiry and handoff deadline remain exclusive"
+        );
+        assert!(
+            resolve_eids(&context, context.kv_snapshot(), &partners, None).is_empty(),
+            "an unknown clock must not authorize fallback"
+        );
+        context.consent_mut().gpc = true;
+        assert!(
+            resolve_eids(&context, context.kv_snapshot(), &partners, Some(timestamp)).is_empty(),
+            "current request denial must block expired-source fallback"
+        );
+        context.consent_mut().gpc = false;
+        let mut blocked = settings.clone();
+        blocked.ec.partners[0].bidstream_enabled = false;
+        assert!(
+            resolve_eids(
+                &context,
+                context.kv_snapshot(),
+                &self::partners(&blocked),
+                Some(timestamp)
+            )
+            .is_empty(),
+            "bidstream-disabled sources must not use fallback"
+        );
+        blocked
+            .integrations
+            .insert_config(
+                "lockr",
+                &json!({"app_id":"synthetic", "capture_identity":false}),
+            )
+            .expect("should disable capture");
+        let mut disabled = self::context(&blocked, Some(&value));
+        disabled.set_kv_snapshot(graph.load_snapshot(&id()));
+        assert!(
+            resolve_eids(
+                &disabled,
+                disabled.kv_snapshot(),
+                &partners,
+                Some(timestamp)
+            )
+            .is_empty(),
+            "disabled capture must not authorize fallback"
+        );
+    }
+}
+
+#[test]
+fn same_uid_without_refreshed_expiry_cannot_bypass_known_expiry() {
+    let settings = settings();
+    let partners = partners(&settings);
+    let graph = graph_with_record(UID, Some(1));
+    let before = graph.get(&id()).expect("should read expired record");
+    let mut pending = entry();
+    pending.expires_at = None;
+    let value = cookie(&settings, vec![pending]);
+    let mut context = context(&settings, Some(&value));
+    context.set_kv_snapshot(graph.load_snapshot(&id()));
+    assert!(
+        resolve_eids(&context, context.kv_snapshot(), &partners, Some(now())).is_empty(),
+        "missing expiry must not revive a known-expired matching UID"
+    );
+    let mut response = response();
+    ec_finalize_response(
+        &settings,
+        &mut context,
+        Some(&graph),
+        &partners,
+        None,
+        &mut response,
+    );
+    assert!(
+        handoff_header(&response)
+            .expect("should clear unproven refresh")
+            .contains("Max-Age=0"),
+        "same-UID fallback needs a known refreshed expiry"
+    );
+    let mut fresh = self::context(&settings, None);
+    fresh.set_kv_snapshot(graph.load_snapshot(&id()));
+    let effects = stage_capture(
+        "lockr",
+        &[SOURCE],
+        IdentityObservation {
+            outcomes: vec![IdentityOutcome::Issued {
+                source: SOURCE.to_owned(),
+                uid: UID.to_owned(),
+                expires_at: None,
+            }],
+            consent: IdentityConsentSignals::default(),
+        },
+        &fresh,
+        &partners,
+        &settings,
+    )
+    .expect("should seal capture without expiry");
+    let mut response = self::response();
+    response.extensions_mut().insert(effects);
+    ec_finalize_response(
+        &settings,
+        &mut fresh,
+        Some(&graph),
+        &partners,
+        None,
+        &mut response,
+    );
+    assert!(
+        handoff_header(&response).is_none(),
+        "should not issue an unproven same-UID refresh"
+    );
+    send(&mut response, &mut fresh, &graph, &partners);
+    assert_eq!(
+        graph.get(&id()).expect("should read after capture"),
+        before,
+        "missing expiry must retain the expired stored record"
+    );
+}
+
+fn graph_with_record(uid: &str, expires_at: Option<u64>) -> KvIdentityGraph {
+    let graph = KvIdentityGraph::in_memory("handoff-existing-records");
+    let mut root = KvEntry::minimal(SOURCE, uid, now());
+    root.consent.ok = true;
+    let record = root.ids.get_mut(SOURCE).expect("should get fixture record");
+    record.expires_at = expires_at;
+    record.writer = Some("lockr".to_owned());
+    record.revision = Some("stored-revision".to_owned());
+    graph
+        .create(&id(), &root)
+        .expect("should seed existing record");
+    graph
+}
+
+#[test]
+fn usable_or_empty_records_block_handoff_and_all_existing_records_block_replay() {
     let settings = settings();
     let partners = partners(&settings);
     for (uid, expiry) in [
         ("newer-uid", Some(now() + 900)),
         (UID, Some(now() + 900)),
-        (UID, Some(1)),
+        (UID, None),
+        ("", Some(1)),
+        ("", None),
     ] {
         let graph = KvIdentityGraph::in_memory("handoff-existing-records");
         let mut root = KvEntry::minimal(SOURCE, uid, now());

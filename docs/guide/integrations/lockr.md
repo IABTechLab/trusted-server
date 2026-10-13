@@ -30,9 +30,10 @@ flowchart TD
     D --> E[Original response sent with optional authenticated handoff]
     E --> F[Eligible EC record updated after send on Fastly]
     E --> G[Later live-root request validates handoff]
-    G --> H[Absent source reaches auction and stages bounded retry]
+    G --> H[Absent or expired source gets valid capture for auction]
+    G --> J[Only absent sources stage bounded retry]
     F --> I[Later auctions read usable IDs from KV]
-    H --> I
+    J --> I
 ```
 
 ## Configuration
@@ -185,12 +186,16 @@ and original handoff deadline in an authenticated envelope. `Secure`,
 `HttpOnly`, and `SameSite=Lax` cookie flags do not replace signature checking.
 Provider expiry may shorten the deadline, and reads or retries never extend it.
 
-A later request can use an eligible ID5 handoff only when the registered source
-is absent from an existing live, consenting EC root. Current Lockr capture,
-source ownership, consent, expiry, and bidstream gates are checked again. Any
-existing record wins, including an expired, invalidated, or conflicting record.
-The handoff never creates or recovers a root, replaces a UID, extends stored
-expiry, or accelerates refresh of an existing source.
+A later request can use an eligible ID5 handoff when the registered source is
+absent or known-expired in an existing live, consenting EC root. Current Lockr
+capture, source ownership, consent, expiry, and bidstream gates are checked again.
+A usable stored record always wins. An expired record permits auction fallback
+from a valid capture, including the same UID with a known refreshed expiry or a
+different captured UID. Missing expiry cannot revive a matching known-expired UID.
+Empty or invalidated records still block fallback. The cookie keeps
+its original deadline and never changes the stored UID, expiry, writer or revision.
+Persistence replay remains absent-source-only; existing-source updates require
+direct capture. The handoff never creates or recovers a root.
 
 Eligibility uses the existing request-local KV snapshot. A stale live read can
 still miss a newer record or withdrawal at another POP; the handoff does not add
@@ -198,16 +203,19 @@ strong reads or instant cross-POP revocation. Current request consent still
 applies. Replay uses generation-checked writes and cannot overwrite that newer
 record or revive its tombstone.
 
-The same later request may stage one bounded fill-absent persistence attempt.
+If the source is absent, the same later request may stage one bounded fill-absent
+persistence attempt. An expired stored record allows auction fallback only, not
+persistence replay.
 Fastly runs it after sending the response. This retry is best-effort and needs a
 qualifying request before the original deadline. It has no durable queue or
 recursive provider call. A successful after-send write cannot clear the cookie
 already sent; a subsequent request reconciles and clears acknowledged entries.
 
-This feature does not restore the retired browser-written `ts-eids` cookie.
-`ts-eids-s` contains validated server capture only. It does not ingest late
-browser EIDs or restore the old diagnostic headers. Cookie-bearing responses
-are private/no-store, and auction-provider Cookie forwarding strips the handoff.
+The browser-written `ts-eids` cookie and auction EID diagnostics remain separate
+legacy paths; their retirement is deferred to another PR. `ts-eids-s` contains
+validated server capture only and does not ingest browser EIDs. Handoff-bearing
+responses are private/no-store, and auction-provider Cookie forwarding strips
+`ts-eids-s` while retaining legacy cookie handling.
 Only Fastly's admitted EC/KV requests support issuance and post-send replay;
 other adapters keep the feature inactive.
 
@@ -215,7 +223,7 @@ other adapters keep the feature inactive.
 
 `capture_global_withdrawal` remains `false` until Lockr confirms that a 2xx `revoke-consent` response with `"success": true` means global withdrawal for this EC identity. Only then may operators opt in: the normal finalizer expires `ts-ec` and the existing-key-only tombstone prevents later enrichment. Empty token arrays, network failures and other responses never imply withdrawal. Overlapping SDK calls have no provider sequence contract; CAS follows observation order.
 
-Use synthetic or sanitized source/count/status evidence for an approved test route. Verify unchanged proxy response, delayed KV read-back of UID/source/expiry/writer/revision without exporting values, later auction source presence, same-UID expiry extension, expired omission and confirmed opt-out/revoke. For handoff acceptance, also hold back KV visibility, verify absent-source auction delivery only after cookie installation, inject a failed post-send write, observe later best-effort repair and acknowledgement cleanup, then test expiry, consent denial, root read failure, EC rotation, ownership changes and key rotation. These are rollout gates, not completed acceptance. No live IDs, consent strings, credentials or query URLs belong in test records.
+Use synthetic or sanitized source/count/status evidence for an approved test route. Verify unchanged proxy response, delayed KV read-back of UID/source/expiry/writer/revision without exporting values, later auction source presence, same-UID expiry extension, expired omission and confirmed opt-out/revoke. For handoff acceptance, also hold back KV visibility, verify absent-source and expired-source auction delivery only after cookie installation, confirm expired-source fallback leaves KV metadata and the handoff deadline unchanged, inject a failed post-send write, observe later best-effort repair and acknowledgement cleanup, then test expiry, consent denial, root read failure, EC rotation, ownership changes and key rotation. These are rollout gates, not completed acceptance. No live IDs, consent strings, credentials or query URLs belong in test records.
 
 ## Best Practices
 
@@ -268,7 +276,7 @@ On an approved synthetic test route, first confirm the SDK request and original 
 
 ### Response timing
 
-The SDK call still waits for the upstream Lockr API response. Fastly runs eligible KV capture updates after sending that response; later auctions see a UID only after the write is visible. The SDK route uses `cache_ttl_seconds` for its own response. No separate Lockr fetch loop or refresh timeout is configured by capture.
+The SDK call still waits for the upstream Lockr API response. Fastly runs eligible KV capture updates after sending that response; later auctions can use a valid installed handoff for an absent or expired source before that write is visible. Usable stored IDs remain preferred. The SDK route uses `cache_ttl_seconds` for its own response. No separate Lockr fetch loop or refresh timeout is configured by capture.
 
 ### Optimization Tips
 
