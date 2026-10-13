@@ -168,6 +168,7 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 - [ ] Run both new unittest modules; expect missing recipe/inspection behavior.
 - [ ] Implement a closed interface: `build.sh --asset <fixed-id> --role A|B --source-commit <approved> --js-dir <absolute> --js-inventory <absolute> --materials <fresh-root> --output <fresh-root>`. Select package/target/features from reviewed source; JSON never supplies executable commands.
 - [ ] Implement checked A/B ambient profiles in the recipe and record them in `release-tools.json`: different external checkout roots, A umask 022/B umask 027, UTC versus a qualified alternate timezone, distinct qualified locale settings, different observed start times and A jobs 4/B jobs 2 within the qualified insensitive envelope. Vary execution user only where Task 8 proves support; otherwise record it unsupported without claiming it changed. Capture both ambient inputs and effective compiler values after sanitation/remapping; fixed internal locale/path/epoch values are normalized, not varied. No unreviewed caller overrides can choose profiles. Tests assert genuinely observed supported differences and reject dishonest/omitted records.
+- [ ] Apply Task 8's qualified OS/container denial profile in the actual production `build.sh`, not just the qualification prototype. Every production invocation must record a successful unconfined socket control and denied confined socket probe, then execute Cargo, compiler, proc-macro, build-script and native-tool children inside that same denied boundary. Preparation alone may fetch materials. A build-script/lifecycle download-attempt fixture must fail, and a missing or ineffective confinement proof rejects the output; `--frozen` is not the boundary.
 - [ ] Build explicit packages with `--release --frozen --message-format=json-render-diagnostics` after preparation. Keep `debug = 1`. Capture compiler/build-script output separately from diagnostic stderr; copy only final output after any reviewed transformations. Do not invoke Fastly source build/annotation. Never strip after evidence/signing.
 - [ ] Inspect ELF/Mach-O libraries and paths, run clean Linux startup fixtures and real ARM/Intel macOS startup outside checkout. With differing fictional operator config removed by preflight, require identical sanitized effective source/tool/build inputs for every artifact and reject embedded operator sentinels/config fallback. Require complete executable equality for Fastly; preserve native nonmatching outcomes as measurements rather than adding a native repeatability shipping gate. Separately show runtime configuration can change without rebuilding.
 - [ ] Before accepting each final Fastly A/B output, validate actual core-Wasm format with a pinned maintained validator and run a positive publisher-origin response/injection fixture through Viceroy using those exact final bytes. The fixture must not invoke Cargo/Fastly build or modify the wasm. Assert final hash unchanged, retain runtime outcome, and test non-wasm/component/wrong-ABI/health-only success rejection. These are required producer gates, separate from Task 8 throwaway qualification and later live deployment.
@@ -197,7 +198,7 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 
 **Create:** `scripts/release/collect-builds.py`, `tests/test_collection.py`.
 
-- [ ] Test stale/wrong-run/source transfers, reused A/B artifact IDs, transfer hash warning, traversal/duplicate ZIP members, missing A, changed inventory, missing supported B variation or dishonest normalized/unsupported claims, absent final-byte runtime proof, and a one-byte final wasm difference.
+- [ ] Test stale/wrong-run/source transfers, reused A/B artifact IDs, transfer hash warning, traversal/duplicate ZIP members, missing A, changed inventory, missing supported B variation or dishonest normalized/unsupported claims, absent final-byte runtime proof, missing/failed production socket controls or an unconfined build invocation, and a one-byte final wasm difference.
 - [ ] Run collection tests; expect missing validator.
 - [ ] Accept only expected upload-step outputs: IDs/archive digests mapped by trusted workflow dependencies to job/attempt/role/recipe. Re-download exact current-run artifacts and validate REST repository/run/source plus transfer bytes. Artifact API does not independently identify the producing job/attempt. Verify bounded declared ZIP members before extraction.
 - [ ] Match expected role-specific ambient profiles from the approved recipe against observed A/B records before signing. For mandatory Fastly A/B, all qualified supported dimensions must differ as selected; normalized values remain explicitly identified and omitted supported dimensions fail. Successful native comparisons use their selected observed profile and result binding, but a bounded native B failed/unavailable before environment setup records unavailable fields honestly and cannot be rejected for lacking observations it never produced. Add that exact nonblocking fixture; all native A qualification/composition remains mandatory. Verify final-byte core-format/publisher-request results for both Fastly outputs. Fresh-job identity alone cannot satisfy the variation or runtime contract.
@@ -231,6 +232,7 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 
 **Create:** `.github/workflows/release-build.yml`; extend workflow contract fixtures.
 
+- [ ] Test never-started/queued or scheduler-cancelled optional native B jobs as well as pre-step failure: the trusted collector must emit a bounded failed/unavailable measurement with absent observations represented honestly and no fabricated upload identity. Confirm the workflow cannot wait indefinitely or hide a mandatory A failure.
 - [ ] Test topology: shared JS A/B, separate fresh Fastly A/B, three mandatory native A jobs, bounded optional native B jobs, validated current-run collector and no signing credentials in executable/lifecycle jobs. Require job configurations to apply Task 9 role profiles and publish observed variation/runtime records; tests reject default-only A/B jobs or collectors that bypass these gates.
 - [ ] Run workflow tests; expect absent graph.
 - [ ] Call local reusable workflow at source revision. Build jobs are read-only. Collector uses Task 12 outputs; signing grants only contents-read/id-token-write/attestations-write, plus actions-read when needed. No artifact-metadata write for file attestations. Caller grants enough permissions for called signing jobs but its own build jobs explicitly narrow them.
@@ -253,15 +255,20 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 **Create:** CLI `src/release/mod.rs`, `error.rs`, `policy.rs`, `documents.rs`, `src/release/tests/mod.rs`, `src/release/tests/documents.rs`, `tests/fixtures/release/`.
 **Modify:** CLI `src/lib.rs`, `Cargo.toml` (host-only sha2/schema validator with justification).
 
+- [ ] Before the first filtered run, wire the host-only `mod release` in CLI `src/lib.rs`, the production child modules in `src/release/mod.rs`, `#[cfg(test)] mod tests` there, and `mod documents` in `src/release/tests/mod.rs`. Add the test cases before checking selection; Rust does not discover this directory automatically. Keep these internals private.
 - [ ] Test closed schema/kind/profile/action combinations, duplicate/deep/oversize JSON, self-selected policy, historical policy acceptance/retirement, altered approved-source policy bytes, allowlisted digest paired with the wrong source, unsupported tool and CLI-as-server substitution.
-- [ ] Run `cargo test -p trusted-server-cli --target aarch64-apple-darwin release::tests::documents`; expect absent modules/behavior.
+- [ ] Run `cargo test -p trusted-server-cli --target aarch64-apple-darwin release::tests::documents`; expect the intended missing implementation or assertion failure. When it compiles, use the nonzero-selection guard below before accepting red or green; a successful run selecting zero tests is a failure of this plan, not a pass.
 - [ ] Implement byte-first duplicate-rejecting parsers and the same schema/semantic fixtures as producer. Embed reviewed policy bytes; compute their SHA-256 externally at runtime. Policy contains no own digest. First bind producer-policy bytes to the independently approved source commit through the fixed official repository path `crates/trusted-server-cli/release-policy.json` (trusted source snapshot or bounded official source API acquisition from that exact commit); never obtain this authority from the release index or an arbitrary supplied path. Match its exact-byte digest/version, then accept only current policy bytes or the reviewed historical allowlist. For offline checks, independently transfer the approved source-policy snapshot alongside other trust inputs. Downloaded metadata never changes consumer policy.
-- [ ] Register these tests under `#[cfg(test)] mod tests` inside the private release module; process tests use public CLI dispatch rather than making internals public. Keep concrete release errors as Report<ReleaseError>; convert to the existing String dispatch boundary only at the command adapter. Do not introduce a new generic attestation crate or publisher types.
+- [ ] Keep the already registered tests active and require nonzero selected counts on every focused rerun; process tests use public CLI dispatch rather than making internals public. Keep concrete release errors as Report<ReleaseError>; convert to the existing String dispatch boundary only at the command adapter. Do not introduce a new generic attestation crate or publisher types.
 - [ ] Fix repository/owner IDs, supported combinations, exact gh/action contract and all R-BOUNDS limits. Re-run tests/clippy. Commit `Parse release evidence under embedded consumer policy`.
 
 ### Task 18: Implement the bounded isolated gh runner
 
 **Create:** CLI `src/release/gh.rs`, `src/release/tests/gh.rs`.
+
+**Modify:** CLI `src/release/mod.rs`, `src/release/tests/mod.rs`.
+
+- [ ] Register the new gh production modules and `mod gh` test module before the first focused run. Apply the nonzero-selection guard; missing module registration or zero matches must never report a passing security check.
 
 - [ ] Write fake-child tests for hangs/cancellation, simultaneous stdout/stderr saturation, malformed/truncated JSON, exit failure, multiple attestations, token precedence, host/config overrides and log redaction.
 - [ ] Run `cargo test -p trusted-server-cli --target aarch64-apple-darwin release::tests::gh`; expect absent runner.
@@ -273,6 +280,10 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 
 **Create:** CLI `src/release/evidence.rs`, `github.rs`, `artifact.rs`, `src/release/tests/verification.rs`.
 
+**Modify:** CLI `src/release/mod.rs`, `src/release/tests/mod.rs`.
+
+- [ ] Register the new evidence/github/artifact production modules and `mod verification` test module before the first focused run. Apply the nonzero-selection guard; missing module registration or zero matches must never report a passing security check.
+
 - [ ] Add a valid graph and independently altered edges for index, all provenance subjects, SPDX subject/document/root, JS prepared/retained records, policy/source/run/caller identities, signed names, REST lengths/immutability and tag object type.
 - [ ] Run verification tests; expect no implemented evidence graph.
 - [ ] Verify index provenance before trusting fields. Obtain only approved official GitHub host/repository data with explicit read-only credential and bounded responses. Validate lightweight source target, source approval, independently acquired fixed-path producer policy bytes at that commit, exact signed release names/digests and actual/index/REST sizes. Primitive gh success is insufficient.
@@ -283,8 +294,9 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 ### Task 20: Expose read-only CLI verification and bootstrap instructions
 
 **Create:** CLI `src/commands/release.rs`, `tests/release_cli.rs`, `src/release/offline.rs`, `src/release/tests/offline.rs`, `docs/guide/release-verification.md`.
-**Modify:** CLI `src/commands/mod.rs`, `src/run.rs`; `docs/guide/cli.md`, `.vitepress/config.mts`.
+**Modify:** CLI `src/commands/mod.rs`, `src/run.rs`, `src/release/mod.rs`, `src/release/tests/mod.rs`; `docs/guide/cli.md`, `.vitepress/config.mts`.
 
+- [ ] Register `mod offline` in both the private production and test roots before its first focused run. Register the public command module/dispatch before process tests; run `release::tests::offline` with the nonzero-selection guard in addition to the CLI process target.
 - [ ] Test the required parse path `ts release verify v1.2.0 --asset ts-aarch64-apple-darwin --expected-source-commit <approved-commit>`, invalid source/asset/unsupported offline-deploy flags and no provider/config/build hooks on all failure paths.
 - [ ] Run `cargo test -p trusted-server-cli --target aarch64-apple-darwin --test release_cli`; expect unknown command.
 - [ ] Add the command adapter to the reusable host verifier. The initial public surface stays the spec's verify/tag/asset/expected-source contract; any cache/export/output flag must be documented and reviewed, not smuggled into an implementation example.
@@ -313,6 +325,30 @@ Use `json.loads(..., object_pairs_hook=unique_object, parse_constant=reject_cons
 - [ ] Recheck permission/config separation, governance/rules/bypass authority, bootstrap docs, actual platform evidence and live manual submission. Missing evidence blocks tag enablement; native B equality, packaging or upstream integration do not add hidden blockers.
 - [ ] Review against AC-1–AC-7, AC-9–AC-10; keep AC-8 separate. Use @superpowers:requesting-code-review and @superpowers:verification-before-completion. Maintainer approval precedes any production tag.
 - [ ] Commit validated documentation/evidence with `Record initial release qualification`; create implementation PRs through the repository PR creator only when their required checks pass.
+
+## Focused Rust test selection guard
+
+Before accepting any filtered private-module run, require an actual selected test. Once the target compiles, repeat this guard for `documents`, `gh`, `verification` and `offline`; registration belongs to the preceding task step, not to a later implementation step. An intended compile failure while adding missing behavior can establish the first red state, but a zero-test successful command never can.
+
+```sh
+set -e
+RELEASE_HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
+RELEASE_TEST_FILTER=release::tests::documents
+RELEASE_TEST_LIST="$(mktemp)"
+trap 'rm -f "$RELEASE_TEST_LIST"' EXIT
+cargo test -p trusted-server-cli --target "$RELEASE_HOST_TARGET" \
+  "$RELEASE_TEST_FILTER" -- --list > "$RELEASE_TEST_LIST"
+python3 - "$RELEASE_TEST_LIST" <<'PY'
+import sys
+from pathlib import Path
+matches = [line for line in Path(sys.argv[1]).read_text().splitlines()
+           if line.endswith(": test")]
+if not matches:
+    raise SystemExit("Focused release test filter selected zero tests")
+print(f"Selected {len(matches)} release tests")
+PY
+cargo test -p trusted-server-cli --target "$RELEASE_HOST_TARGET" "$RELEASE_TEST_FILTER"
+```
 
 ## Full implementation verification commands
 
@@ -384,3 +420,5 @@ For these Markdown plans, validate formatting, links, shell syntax, requirement 
 On 2026-10-13, independent whole-package review approved these three plans after three passes; separate producer and consumer/upstream reviews informed the corrections. Findings resolved: required Fastly B variation enforcement, final-byte application qualification, mutable-publication recovery, lightweight tagging, native comparison/profile boundaries, all-action SHA pins, approved-source policy-byte binding, lifecycle network denial, and noncircular staging qualification with complete durable outcomes.
 
 This is planning-completeness approval, not maintainer spec approval or proof of implementation/hosted qualification. Document verification covers formatting/domain rules, relative references, shell/Python example syntax and all 29 requirement mappings.
+
+A subsequent fresh spec-to-plan review on 2026-10-13 found three execution-coverage gaps despite the earlier review: applying actual production network confinement, registering private Rust tests before filtered runs, and independently qualifying integrated production activation. All were corrected; the two fresh reviewers then reported clean primary and milestone alignment. The optional native scheduler-failure fixture was also strengthened. These reviews do not replace the future implementation and qualification gates.
