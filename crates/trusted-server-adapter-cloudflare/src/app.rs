@@ -283,7 +283,8 @@ fn build_state_with_registrations_and_services(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(PlatformIdentity::named("cloudflare"));
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
@@ -872,11 +873,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
             let attestation = make_handler(Arc::clone(&state), |s, _services, req| async move {
-                Ok(handle_prefix(
-                    &s.settings,
-                    &PlatformIdentity::named("cloudflare"),
-                    &req,
-                ))
+                Ok(handle_prefix(&s.settings, s.registry.platform(), &req))
             });
             for route in &routes {
                 for method in publisher_fallback_methods() {

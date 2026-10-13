@@ -67,10 +67,12 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
+use crate::html_processor::ServePass;
 use crate::http_util::{
     RequestInfo, is_navigation_request, remove_deployment_headers, serve_static_with_etag,
 };
 use crate::integrations::{IntegrationRegistry, IntegrationRequestState};
+use crate::middleware::{ResponseHeader, write_response_headers};
 use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -652,6 +654,9 @@ struct ProcessResponseParams<'a> {
 
 struct PublisherBodyProcessor {
     inner: Box<dyn StreamProcessor>,
+    /// What the serve middleware write on the response, taken by the
+    /// caller before the response leaves.
+    response_headers: Vec<ResponseHeader>,
 }
 
 impl PublisherBodyProcessor {
@@ -675,8 +680,9 @@ impl PublisherBodyProcessor {
             params.ad_slots_script.is_some(),
             is_html && params.dispatched_auction.is_some(),
         );
+        let mut response_headers = Vec::new();
         let inner: Box<dyn StreamProcessor> = if is_html {
-            Box::new(create_html_stream_processor(HtmlStreamProcessorParams {
+            let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
                 origin_host: &params.origin_host,
                 request_host: &params.request_host,
                 request_scheme: &params.request_scheme,
@@ -692,7 +698,9 @@ impl PublisherBodyProcessor {
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
-            })?)
+            })?;
+            response_headers = headers;
+            Box::new(processor)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
                 &params.origin_host,
@@ -709,7 +717,20 @@ impl PublisherBodyProcessor {
             ))
         };
 
-        Ok((Self { inner }, inline_seam_token))
+        Ok((
+            Self {
+                inner,
+                response_headers,
+            },
+            inline_seam_token,
+        ))
+    }
+}
+
+impl PublisherBodyProcessor {
+    /// The headers the serve middleware write on the response, once.
+    fn take_response_headers(&mut self) -> Vec<ResponseHeader> {
+        std::mem::take(&mut self.response_headers)
     }
 }
 
@@ -734,7 +755,7 @@ fn process_response_streaming<W: Write>(
     output: &mut W,
     params: &ProcessResponseParams,
     output_compression: Compression,
-) -> Result<(), Report<TrustedServerError>> {
+) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     let is_html = is_html_content_type(params.content_type);
     let is_rsc_flight =
         content_type_contains_ascii_case_insensitive(params.content_type, "text/x-component");
@@ -760,8 +781,9 @@ fn process_response_streaming<W: Write>(
     // gzip would reject bodies the identity, deflate and brotli paths accept.
     let max_pending_decoded_bytes = params.settings.publisher.max_buffered_body_bytes;
 
+    let mut response_headers = Vec::new();
     if is_html {
-        let processor = create_html_stream_processor(HtmlStreamProcessorParams {
+        let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
             origin_host: params.origin_host,
             request_host: params.request_host,
             request_scheme: params.request_scheme,
@@ -776,6 +798,7 @@ fn process_response_streaming<W: Write>(
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
             deferred_inline_marker: None,
         })?;
+        response_headers = headers;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
@@ -803,7 +826,7 @@ fn process_response_streaming<W: Write>(
             .process(body_as_reader(body)?, output)?;
     }
 
-    Ok(())
+    Ok(response_headers)
 }
 
 async fn process_response_streaming_async<W: Write>(
@@ -812,7 +835,7 @@ async fn process_response_streaming_async<W: Write>(
     params: &OwnedProcessResponseParams,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
-) -> Result<(), Report<TrustedServerError>> {
+) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     log::debug!(
         "process_response_streaming_async: content_type={}, content_encoding={}",
         params.content_type,
@@ -831,6 +854,7 @@ async fn process_response_streaming_async<W: Write>(
     // pending auction; `deferred_inline_seam_token` returns `None` for it.
     let (mut processor, inline_seam_token) =
         PublisherBodyProcessor::new(params, settings, integration_registry)?;
+    let response_headers = processor.take_response_headers();
     if inline_seam_token.is_some() {
         // A `debug_assert!` would be compiled out of the release wasm builds that
         // actually ship, which is exactly where an unresolved token would reach a
@@ -848,7 +872,8 @@ async fn process_response_streaming_async<W: Write>(
         output_compression,
         settings.publisher.max_buffered_body_bytes,
     )
-    .await
+    .await?;
+    Ok(response_headers)
 }
 
 /// Pull, decode, process, and encode the next chunk of a no-hold pipeline.
@@ -1501,7 +1526,7 @@ fn deferred_inline_seam_token(
 
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
-) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
+) -> Result<(impl StreamProcessor + use<>, Vec<ResponseHeader>), Report<TrustedServerError>> {
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor_with_middleware};
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
@@ -1557,9 +1582,9 @@ fn create_html_stream_processor(
         .map_err(|message| Report::new(TrustedServerError::Configuration { message }))
 }
 
-/// The processor that carries out the `[[serve]]` entry covering this request
-/// on a reader's copy that is assembled and not yet encoded, or `None` when
-/// no entry covers the request or its middleware have nothing to do.
+/// What the `[[serve]]` entry covering this request does to a reader's copy
+/// that is assembled and not yet encoded, and to the response, which is
+/// nothing when no entry covers the request.
 ///
 /// The origin host is read from the settings. A page served from the store
 /// keeps no record of it, and a serve middleware is told the same about a
@@ -1568,12 +1593,12 @@ fn reader_serve_processor(
     params: &OwnedProcessResponseParams,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
-) -> Result<Option<Box<dyn StreamProcessor>>, Report<TrustedServerError>> {
+) -> Result<ServePass, Report<TrustedServerError>> {
     use crate::html_processor::{ReaderDocument, create_serve_processor};
     use crate::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     if !is_html_content_type(&params.content_type) {
-        return Ok(None);
+        return Ok(ServePass::default());
     }
     let chain = integration_registry.middleware_chain(
         &settings.serve,
@@ -1588,6 +1613,7 @@ fn reader_serve_processor(
             request_host: &params.request_host,
             request_scheme: &params.request_scheme,
             origin_host: &origin_host,
+            platform: integration_registry.platform(),
             request_state: &params.request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
         },
@@ -1596,15 +1622,18 @@ fn reader_serve_processor(
 }
 
 /// Runs the `[[serve]]` entry covering this request over a reader's whole
-/// copy, assembled and not yet encoded.
+/// copy, assembled and not yet encoded, and writes its headers on the
+/// response.
 fn run_serve_pass(
     bytes: Vec<u8>,
     params: &OwnedProcessResponseParams,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    response: &mut Response<EdgeBody>,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    let Some(mut processor) = reader_serve_processor(params, settings, integration_registry)?
-    else {
+    let pass = reader_serve_processor(params, settings, integration_registry)?;
+    write_response_headers(response, pass.response_headers);
+    let Some(mut processor) = pass.processor else {
         return Ok(bytes);
     };
     processor
@@ -1927,7 +1956,7 @@ pub async fn buffer_publisher_response_async(
                 return Ok(response);
             }
             let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
-            stream_publisher_body_async(
+            let response_headers = stream_publisher_body_async(
                 body,
                 &mut output,
                 &mut params,
@@ -1937,6 +1966,7 @@ pub async fn buffer_publisher_response_async(
                 services,
             )
             .await?;
+            write_response_headers(&mut response, response_headers);
             // Authorized template cache transforms are emitted as identity by
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
@@ -2043,7 +2073,13 @@ pub async fn buffer_publisher_response_async(
             let bytes = if was_authorized {
                 // The [[serve]] entry runs here on a shared template, and
                 // inside the transform on a page that was never authorized.
-                let bytes = run_serve_pass(bytes, &params, settings, integration_registry)?;
+                let bytes = run_serve_pass(
+                    bytes,
+                    &params,
+                    settings,
+                    integration_registry,
+                    &mut response,
+                )?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
                 bytes
@@ -2093,7 +2129,13 @@ pub async fn buffer_publisher_response_async(
             assembled.extend_from_slice(head);
             assembled.extend_from_slice(seam.as_bytes());
             assembled.extend_from_slice(tail);
-            let assembled = run_serve_pass(assembled, &params, settings, integration_registry)?;
+            let assembled = run_serve_pass(
+                assembled,
+                &params,
+                settings,
+                integration_registry,
+                &mut response,
+            )?;
             let assembled = encode_complete_body(assembled, response_compression(&response))?;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
@@ -2579,8 +2621,9 @@ pub async fn publisher_response_into_streaming_response(
 
             // Planned before the lazy body is built, so a serve entry that
             // cannot run fails the response while it still can be failed.
-            let mut serve = match reader_serve_processor(&params, &settings, integration_registry) {
-                Ok(serve) => serve,
+            let serve_pass = match reader_serve_processor(&params, &settings, integration_registry)
+            {
+                Ok(serve_pass) => serve_pass,
                 Err(err) => {
                     if let Some(dispatched) = params.dispatched_auction.take() {
                         emit_abandoned_auction(
@@ -2594,6 +2637,8 @@ pub async fn publisher_response_into_streaming_response(
                     return Err(err);
                 }
             };
+            write_response_headers(&mut response, serve_pass.response_headers);
+            let mut serve = serve_pass.processor;
             let services = services.clone();
             let settings = Arc::clone(&settings);
             let orchestrator = Arc::clone(&orchestrator);
@@ -2728,6 +2773,7 @@ pub async fn publisher_response_into_streaming_response(
                         return Err(err);
                     }
                 };
+            write_response_headers(&mut response, processor.take_response_headers());
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
@@ -3049,7 +3095,7 @@ pub fn stream_publisher_body<W: Write>(
     params: &OwnedProcessResponseParams,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
-) -> Result<(), Report<TrustedServerError>> {
+) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     let permissions_script = permissions_script_for(params, settings);
     let borrowed = ProcessResponseParams {
         content_encoding: &params.content_encoding,
@@ -3105,7 +3151,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     integration_registry: &IntegrationRegistry,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
-) -> Result<(), Report<TrustedServerError>> {
+) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     let Some(dispatched) = params.dispatched_auction.take() else {
         if body.is_stream() {
             return process_response_streaming_async(
@@ -3160,35 +3206,36 @@ pub async fn stream_publisher_body_async<W: Write>(
         params.ad_slots_script.is_some(),
         true,
     );
-    let mut processor = match create_html_stream_processor(HtmlStreamProcessorParams {
-        origin_host: &params.origin_host,
-        request_host: &params.request_host,
-        request_scheme: &params.request_scheme,
-        request_path: &params.request_path,
-        settings,
-        integration_registry,
-        permissions_script: permissions_script_for(params, settings),
-        ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-        ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
-        request_state: params.request_state.clone(),
-        shared_template_authorized: params.template_cache_key.is_some(),
-        csp_nonce_observed: params.csp_nonce_observed.clone(),
-        deferred_inline_marker: inline_seam_token
-            .as_ref()
-            .map(|token| String::from_utf8_lossy(token).into_owned()),
-    }) {
-        Ok(processor) => processor,
-        Err(err) => {
-            emit_abandoned_auction(
-                services,
-                telemetry.observation,
-                dispatched,
-                "processor_init_error",
-            )
-            .await;
-            return Err(err);
-        }
-    };
+    let (mut processor, response_headers) =
+        match create_html_stream_processor(HtmlStreamProcessorParams {
+            origin_host: &params.origin_host,
+            request_host: &params.request_host,
+            request_scheme: &params.request_scheme,
+            request_path: &params.request_path,
+            settings,
+            integration_registry,
+            permissions_script: permissions_script_for(params, settings),
+            ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
+            ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
+            request_state: params.request_state.clone(),
+            shared_template_authorized: params.template_cache_key.is_some(),
+            csp_nonce_observed: params.csp_nonce_observed.clone(),
+            deferred_inline_marker: inline_seam_token
+                .as_ref()
+                .map(|token| String::from_utf8_lossy(token).into_owned()),
+        }) {
+            Ok(built) => built,
+            Err(err) => {
+                emit_abandoned_auction(
+                    services,
+                    telemetry.observation,
+                    dispatched,
+                    "processor_init_error",
+                )
+                .await;
+                return Err(err);
+            }
+        };
 
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -3216,7 +3263,8 @@ pub async fn stream_publisher_body_async<W: Write>(
             },
         },
     )
-    .await
+    .await?;
+    Ok(response_headers)
 }
 
 /// Builds the canonical ad server placeholder [`Request`] passed to the collect
@@ -9646,7 +9694,7 @@ mod tests {
                     "/",
                 )
             });
-            let mut processor =
+            let (mut processor, _) =
                 create_html_processor_with_middleware(config, &fetch, serve.as_ref())
                     .expect("should plan the document's middleware");
             let out = processor

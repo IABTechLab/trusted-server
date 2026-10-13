@@ -9,6 +9,7 @@ use http::{Method, Request, Response};
 use matchit::Router;
 use sha2::{Digest as _, Sha256};
 
+use crate::attestation::PlatformIdentity;
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
@@ -1435,6 +1436,9 @@ fn unnamed_middleware<'a>(
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
+    /// What the adapter reports about the platform the deployment runs on,
+    /// which a middleware is told about every document.
+    platform: Arc<PlatformIdentity>,
 }
 
 /// Refuses a name a section selects that no module in this deployment
@@ -1489,6 +1493,20 @@ fn check_section_selections(
 }
 
 impl IntegrationRegistry {
+    /// Tells the registry what the adapter reports about the platform, which
+    /// a middleware is told about every document.
+    #[must_use]
+    pub fn with_platform(mut self, platform: PlatformIdentity) -> Self {
+        self.platform = Arc::new(platform);
+        self
+    }
+
+    /// What the adapter reports about the platform the deployment runs on.
+    #[must_use]
+    pub fn platform(&self) -> &PlatformIdentity {
+        &self.platform
+    }
+
     /// Build a registry and auction plan from the provided settings for tests.
     ///
     /// Runtime adapters should compile one plan and pass it to
@@ -1817,6 +1835,7 @@ impl IntegrationRegistry {
         Ok(Self {
             inner: Arc::new(inner),
             plan: Some(plan),
+            platform: Arc::default(),
         })
     }
 
@@ -2341,6 +2360,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
             plan: None,
+            platform: Arc::default(),
         }
     }
 
@@ -2379,6 +2399,7 @@ impl IntegrationRegistry {
                 device_module: None,
             }),
             plan: None,
+            platform: Arc::default(),
         }
     }
 
@@ -2457,6 +2478,7 @@ impl IntegrationRegistry {
                 device_module: None,
             }),
             plan: None,
+            platform: Arc::default(),
         }
     }
 }
