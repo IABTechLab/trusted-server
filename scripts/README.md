@@ -3,30 +3,30 @@
 Run these scripts from the repository root. They fail on command errors unless
 their documented orchestration handles a probe deliberately.
 
-| Script                                    | Inputs and prerequisites                                            | Side effects and cleanup                                                                                                                                                  |
-| ----------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `batch-sync.sh`                           | Endpoint, bearer token, EC ID, partner UID; `curl` and Python       | Sends one authenticated batch-sync request. Its temporary response file is removed on exit.                                                                               |
-| `benchmark.sh`                            | A running server; `curl`, `bc`, and optionally `hey`                | May install `hey` through Homebrew. `--save` writes under `benchmark-results/`; it does not stop the server.                                                              |
-| `profile.sh`                              | Fastly CLI, Rust WASM target, `curl`; endpoint and request options  | Builds and starts the Fastly app, stops the owned process, and retains a profile under `benchmark-results/profiles/`. `--open` launches the local viewer.                 |
-| `generate-integration-viceroy-configs.sh` | Rust toolchain; optional origin port and artifact directory         | Builds the native generator and writes Viceroy config under `target/integration-test-artifacts/`; generated files persist.                                                |
-| `integration-tests.sh`                    | Docker, Viceroy, Rust WASM target, pinned Node                      | Builds WASM/native artifacts and two Docker images, generates Viceroy config, and runs native integration tests serially. Build products and images persist.              |
-| `integration-tests-browser.sh`            | The integration prerequisites plus npm and Playwright               | Installs package/browser dependencies, builds fixtures and images, runs both browser suites, and stops matching test containers on exit. Build and npm artifacts persist. |
-| `smoke-axum.sh`                           | `cargo`, `curl`, Python                                             | Uses an isolated temporary config/store and stub origin; stops owned processes and removes its workspace.                                                                 |
-| `smoke-fastly.sh`                         | Fastly CLI, `cargo`, `curl`, Python                                 | Uses an isolated Fastly project and application config; stops owned processes and removes its workspace.                                                                  |
-| `smoke-cloudflare.sh`                     | Pinned Wrangler, `cargo`, `curl`, `jq`, and Python                  | Uses isolated Wrangler manifests, KV state, ports, and logs; stops owned processes and removes its workspace.                                                             |
-| `smoke-spin.sh`                           | Spin CLI, `cargo`, `curl`, and Python                               | Uses an isolated Spin manifest and SQLite KV store; stops owned processes and removes its workspace.                                                                      |
-| `smoke-common.sh`                         | Sourced by the four smoke scripts                                   | Defines bounded port, process, config, secret, and response assertions. Do not invoke it as a standalone smoke.                                                           |
-| `async-html-finalization-local-test.sh`   | Python 3.11+, Rust, Node and selected runtime; Fastly Viceroy 0.19+ | Builds feature-gated fixtures, preserves compiler settings, retains diagnostics, and stops owned process groups on failure or SIGTERM.                                    |
-| `template-cache-local-test.sh`            | Viceroy, Node, OpenSSL, `curl`, `lsof`; optional ports and mode     | Builds local artifacts, generates certificates and fixtures in a temporary directory, stops owned servers, and removes the directory.                                     |
-| `test-cli.sh`                             | Rustup and the host toolchain; optional host triple                 | May install the selected Rust target, then runs native CLI and browser-audit tests. Cargo artifacts persist.                                                              |
+| Script                                    | Inputs and prerequisites                                           | Side effects and cleanup                                                                                                                                                  |
+| ----------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `batch-sync.sh`                           | Endpoint, bearer token, EC ID, partner UID; `curl` and Python      | Sends one authenticated batch-sync request. Its temporary response file is removed on exit.                                                                               |
+| `benchmark.sh`                            | A running server; `curl`, `bc`, and optionally `hey`               | May install `hey` through Homebrew. `--save` writes under `benchmark-results/`; it does not stop the server.                                                              |
+| `profile.sh`                              | Fastly CLI, Rust WASM target, `curl`; endpoint and request options | Builds and starts the Fastly app, stops the owned process, and retains a profile under `benchmark-results/profiles/`. `--open` launches the local viewer.                 |
+| `generate-integration-viceroy-configs.sh` | Rust toolchain; optional origin port and artifact directory        | Builds the native generator and writes Viceroy config under `target/integration-test-artifacts/`; generated files persist.                                                |
+| `integration-tests.sh`                    | Docker, Viceroy, Rust WASM target, pinned Node                     | Builds WASM/native artifacts and two Docker images, generates Viceroy config, and runs native integration tests serially. Build products and images persist.              |
+| `integration-tests-browser.sh`            | The integration prerequisites plus npm and Playwright              | Installs package/browser dependencies, builds fixtures and images, runs both browser suites, and stops matching test containers on exit. Build and npm artifacts persist. |
+| `smoke-axum.sh`                           | `cargo`, `curl`, Python                                            | Uses an isolated temporary config/store and stub origin; stops owned processes and removes its workspace.                                                                 |
+| `smoke-fastly.sh`                         | Fastly CLI, `cargo`, `curl`, Python                                | Uses an isolated Fastly project and application config; stops owned processes and removes its workspace.                                                                  |
+| `smoke-cloudflare.sh`                     | Pinned Wrangler, `cargo`, `curl`, `jq`, and Python                 | Uses isolated Wrangler manifests, KV state, ports, and logs; stops owned processes and removes its workspace.                                                             |
+| `smoke-spin.sh`                           | Spin CLI, `cargo`, `curl`, and Python                              | Uses an isolated Spin manifest and SQLite KV store; stops owned processes and removes its workspace.                                                                      |
+| `smoke-common.sh`                         | Sourced by the four smoke scripts                                  | Defines bounded port, process, config, secret, and response assertions. Do not invoke it as a standalone smoke.                                                           |
+| `async-html-finalization-local-test.sh`   | Rust, pinned Node and selected runtime; Fastly Viceroy 0.19+       | Builds feature-gated fixtures, preserves compiler settings, retains diagnostics, and stops owned process groups on failure or SIGTERM.                                    |
+| `template-cache-local-test.sh`            | Viceroy, Node, OpenSSL, `curl`, `lsof`; optional ports and mode    | Builds local artifacts, generates certificates and fixtures in a temporary directory, stops owned servers, and removes the directory.                                     |
+| `test-cli.sh`                             | Rustup and the host toolchain; optional host triple                | May install the selected Rust target, then runs native CLI and browser-audit tests. Cargo artifacts persist.                                                              |
 
 ## HTML EOF runtime checks
 
-Requires Python 3.11+, Rust, pinned Node and the selected runtime CLI. Run from the
+Requires Rust, pinned Node and the selected runtime CLI. Run from the
 repository root:
 
 ```bash
-python3 -m unittest discover -s scripts/fixtures -p 'test_async_html_finalization_runtime.py' -v
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime
 ./scripts/async-html-finalization-local-test.sh axum --auction
 ./scripts/async-html-finalization-local-test.sh cloudflare --release --auction
 ./scripts/async-html-finalization-local-test.sh spin --release --auction
@@ -45,7 +45,7 @@ The harness builds fresh feature-gated artifacts, checks generated timeout,
 permission and loopback configuration, preserves explicit compiler/profile settings
 and `CARGO_TARGET_DIR`, selects build targets itself, and stops owned process groups on failure or SIGTERM.
 Artifacts and diagnostics persist in the printed temporary directory for inspection.
-CI runs cleanup tests, Axum and isolated Fastly EOF controls. See the
+CI runs native Rust helper tests and lint, Axum and isolated Fastly EOF controls. See the
 [testing guide](../docs/guide/testing.md#html-eof-runtime-checks) for coverage details.
 
 The four adapter smoke contracts are documented in the

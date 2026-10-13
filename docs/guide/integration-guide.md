@@ -370,7 +370,7 @@ end; neighboring bytes alone cannot establish a marker's parsing context.
 
 A fictional HTTP processor is available only with `test-utils`. See
 [HTML EOF runtime checks](/guide/testing#html-eof-runtime-checks) for the runtime
-harness, Python/tooling prerequisites and CI coverage.
+harness, runtime/tooling prerequisites and CI coverage.
 
 ## Browser and script guards
 

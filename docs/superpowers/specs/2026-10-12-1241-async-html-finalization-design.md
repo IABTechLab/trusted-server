@@ -224,3 +224,17 @@ The fictional fixture demonstrates generic EOF HTTP I/O, not a production signin
 integration. Verification records identify checked source, real runtimes, hosted CI,
 expected skips and tooling limits separately. Historical evidence does not prove this
 revised implementation.
+
+## 11. Native Rust verification tooling
+
+Keep EOF runtime verification in the existing Rust integration-test crate. A
+feature-gated native test target owns its loopback origin, request-scoped monotonic
+events and external runtime process groups. An ignored test runs the selected
+adapter; normal helper tests need no adapter tools. The shell entry point selects
+the adapter/profile and invokes Cargo with the explicit native target.
+
+Preserve disabled/success/hung/auction controls on all four adapters and actual
+early-body delivery on Fastly. Validate typed, isolated configuration before use,
+retain diagnostics, preserve compiler/profile settings, and clean process groups
+on normal return, failure, SIGTERM and SIGINT. Use existing workspace dependencies
+only for tests. No added verification path requires Python.

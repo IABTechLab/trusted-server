@@ -46,13 +46,13 @@ in `crates/trusted-server-core/src/proxy.rs`.
 
 The EOF harness builds fresh `test-utils` artifacts, creates isolated configuration
 and runs disabled, successful, hung and enabled-auction controls against a loopback
-origin. It requires Python **3.11 or newer**, Rust and pinned Node. Compiler/profile
+origin. It uses the native Rust integration-test target and requires Rust and pinned Node. Compiler/profile
 settings and an explicit `CARGO_TARGET_DIR` are preserved; operator configuration and `CARGO_BUILD_TARGET` are
 not inherited because the harness selects native and adapter targets. Logs, bodies, headers and timing JSON remain in its printed temporary
 directory. Owned process groups are stopped on normal exit, failure and SIGTERM.
 
 ```bash
-python3 -m unittest discover -s scripts/fixtures -p 'test_async_html_finalization_runtime.py' -v
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime
 ./scripts/async-html-finalization-local-test.sh axum --auction
 ./scripts/async-html-finalization-local-test.sh cloudflare --release --auction
 ./scripts/async-html-finalization-local-test.sh spin --release --auction
@@ -70,9 +70,9 @@ cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy
 PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction
 ```
 
-The harness checks this prerequisite before building. Fastly additionally proves
+The harness checks this prerequisite before building adapter fixtures. Fastly additionally proves
 that an actual body byte arrives before a non-retaining EOF lookup completes.
-CI runs Axum, process-cleanup checks and an isolated Fastly EOF job. Workers/Spin
+CI runs Axum, native Rust helper tests and lint, and an isolated Fastly EOF job. Workers/Spin
 actual EOF timeout controls remain local commands; their target builds, native tests
 and shared parity controls run in CI. Hosted results are separate from local runs.
 
