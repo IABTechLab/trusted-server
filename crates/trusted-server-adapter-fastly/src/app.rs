@@ -314,7 +314,8 @@ pub(crate) fn build_state_with_registrations(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(fastly_platform_identity());
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
@@ -1463,7 +1464,7 @@ fn attestation_route_handler(
         Box::pin(async move {
             Ok(handle_prefix(
                 &state.settings,
-                &fastly_platform_identity(),
+                state.registry.platform(),
                 &ctx.into_request(),
             ))
         })

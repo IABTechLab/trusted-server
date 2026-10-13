@@ -13,13 +13,14 @@ use lol_html::{
     text,
 };
 
+use crate::attestation::PlatformIdentity;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry, IntegrationRequestState,
     ScriptRewriteAction,
 };
 use crate::middleware::{
     ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan, Prepared,
-    TextHandler,
+    ResponseHeader, TextHandler,
 };
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
@@ -262,6 +263,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 ///
 /// `serve` is `None` for a document that may be stored, whose serve chain
 /// runs on each reader's copy instead, through [`create_serve_processor`].
+/// The headers returned are what the serve chain writes on the response,
+/// none when `serve` is `None`.
 ///
 /// # Errors
 ///
@@ -274,13 +277,14 @@ pub fn create_html_processor_with_middleware(
     config: HtmlProcessorConfig,
     fetch: &MiddlewareChain,
     serve: Option<&MiddlewareChain>,
-) -> Result<impl StreamProcessor + use<>, String> {
+) -> Result<(impl StreamProcessor + use<>, Vec<ResponseHeader>), String> {
     let document_state = IntegrationDocumentState::default();
     let plan = fetch.plan(&MiddlewareContext {
         phase: fetch.phase(),
         request_host: &config.request_host,
         request_scheme: &config.request_scheme,
         origin_host: &config.origin_host,
+        platform: config.integrations.platform(),
         document_state: &document_state,
         max_buffered_script_bytes: config.max_buffered_body_bytes,
         prepared: &config.prepared,
@@ -292,16 +296,17 @@ pub fn create_html_processor_with_middleware(
                 request_host: &config.request_host,
                 request_scheme: &config.request_scheme,
                 origin_host: &config.origin_host,
+                platform: config.integrations.platform(),
                 request_state: &config.request_state,
                 max_buffered_script_bytes: config.max_buffered_body_bytes,
                 prepared: &config.prepared,
             },
         )?,
-        None => None,
+        None => ServePass::default(),
     };
     let mut processor = build_html_processor(config, plan);
-    processor.processors.extend(reader);
-    Ok(processor)
+    processor.processors.extend(reader.processor);
+    Ok((processor, reader.response_headers))
 }
 
 /// What a serve chain is told about the reader's copy it works on.
@@ -313,6 +318,8 @@ pub struct ReaderDocument<'a> {
     pub request_scheme: &'a str,
     /// Host the document was fetched from.
     pub origin_host: &'a str,
+    /// What the adapter reports about the platform the deployment runs on.
+    pub platform: &'a PlatformIdentity,
     /// What modules left on this reader's request for their page changes.
     pub request_state: &'a IntegrationRequestState,
     /// The most a middleware may hold of one script while it decides.
@@ -322,9 +329,8 @@ pub struct ReaderDocument<'a> {
     pub prepared: &'a Prepared,
 }
 
-/// A processor that carries out a serve chain alone, on one reader's copy of
-/// a document core has already rewritten, or `None` when the chain has
-/// nothing to do.
+/// What a serve chain does to one reader's copy of a document core has
+/// already rewritten, and to the reader's response.
 ///
 /// Nothing of core's own is written or rewritten a second time. Head markup
 /// goes straight before the script bundle's tag and markup for after the
@@ -337,25 +343,42 @@ pub struct ReaderDocument<'a> {
 pub fn create_serve_processor(
     chain: &MiddlewareChain,
     document: &ReaderDocument<'_>,
-) -> Result<Option<Box<dyn StreamProcessor>>, String> {
+) -> Result<ServePass, String> {
     if chain.is_empty() {
-        return Ok(None);
+        return Ok(ServePass::default());
     }
     let document_state = IntegrationDocumentState::default();
     document.request_state.seed(&document_state);
-    let plan = chain.plan(&MiddlewareContext {
+    let mut plan = chain.plan(&MiddlewareContext {
         phase: chain.phase(),
         request_host: document.request_host,
         request_scheme: document.request_scheme,
         origin_host: document.origin_host,
+        platform: document.platform,
         document_state: &document_state,
         max_buffered_script_bytes: document.max_buffered_script_bytes,
         prepared: document.prepared,
     })?;
-    if plan.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Box::new(build_serve_processor(plan))))
+    let response_headers = std::mem::take(&mut plan.response_headers);
+    let processor: Option<Box<dyn StreamProcessor>> = if plan.is_empty() {
+        None
+    } else {
+        Some(Box::new(build_serve_processor(plan)))
+    };
+    Ok(ServePass {
+        processor,
+        response_headers,
+    })
+}
+
+/// What a serve chain does to one reader's response.
+#[derive(Default)]
+pub struct ServePass {
+    /// The processor over the reader's copy, or `None` when the chain
+    /// leaves the document as it arrived.
+    pub processor: Option<Box<dyn StreamProcessor>>,
+    /// The headers the chain writes on the response.
+    pub response_headers: Vec<ResponseHeader>,
 }
 
 /// The tag of the script bundle, which core writes once at the start of
@@ -433,6 +456,8 @@ fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
         element_handlers,
         text_handlers,
         processors,
+        // The caller writes the plan's headers on the response.
+        response_headers: _,
     } = plan;
     let mut element_content_handlers: Vec<ContentHandler> = Vec::new();
     if !head_inserts.is_empty() || !after_bundle_inserts.is_empty() {
@@ -483,6 +508,9 @@ fn build_html_processor(
         element_handlers: middleware_element_handlers,
         text_handlers: middleware_text_handlers,
         processors: middleware_processors,
+        // A fetch plan writes no headers, which `MiddlewareChain::plan`
+        // refuses.
+        response_headers: _,
     } = plan;
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -899,6 +927,7 @@ pub mod test_support {
         );
         create_html_processor_with_middleware(config, &fetch, Some(&serve))
             .expect("should plan the page's middleware")
+            .0
     }
 
     /// The page a reader of `html` receives from a deployment running

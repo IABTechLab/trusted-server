@@ -138,17 +138,27 @@ pub struct PlatformIdentity {
     pub pop: String,
 }
 
+/// What a fact the platform did not report reads as.
+pub const UNKNOWN: &str = "unknown";
+
 impl PlatformIdentity {
     /// A platform that reports its name and nothing else.
     #[must_use]
     pub fn named(name: &str) -> Self {
         Self {
             name: name.to_owned(),
-            service_id: "unknown".to_owned(),
-            service_version: "unknown".to_owned(),
+            service_id: UNKNOWN.to_owned(),
+            service_version: UNKNOWN.to_owned(),
             staging: false,
-            pop: "unknown".to_owned(),
+            pop: UNKNOWN.to_owned(),
         }
+    }
+}
+
+impl Default for PlatformIdentity {
+    /// A platform nothing has been reported about.
+    fn default() -> Self {
+        Self::named(UNKNOWN)
     }
 }
 
@@ -159,6 +169,7 @@ struct Build {
     built_at: &'static str,
     commit: &'static str,
     run: &'static str,
+    tag: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -367,6 +378,7 @@ fn answer(
             built_at: crate::build_info::BUILT_AT,
             commit: crate::build_info::COMMIT,
             run: crate::build_info::BUILD_RUN,
+            tag: crate::build_info::BUILD_TAG,
         },
         nonce: nonce.as_deref(),
         issued_at: rfc3339(now),
@@ -1961,6 +1973,7 @@ mod tests {
         let evidence = &envelope["evidence"];
         assert_eq!(evidence["build"]["commit"], crate::build_info::COMMIT);
         assert_eq!(evidence["build"]["run"], crate::build_info::BUILD_RUN);
+        assert_eq!(evidence["build"]["tag"], crate::build_info::BUILD_TAG);
         assert_eq!(evidence["build"]["builtAt"], crate::build_info::BUILT_AT);
         assert_eq!(evidence["platform"]["name"], "example-platform");
         assert_eq!(evidence["platform"]["serviceId"], "svc-1");
