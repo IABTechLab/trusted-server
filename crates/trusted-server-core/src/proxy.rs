@@ -4358,6 +4358,43 @@ mod tests {
     }
 
     #[test]
+    fn proxy_request_redirect_limit_response_honors_stream_passthrough() {
+        let stub = Arc::new(StubHttpClient::new());
+        for _ in 0..5 {
+            stub.push_response_with_headers(
+                302,
+                b"<p>moved</p>".to_vec(),
+                vec![
+                    ("location", "https://redirect.example.com/next"),
+                    ("content-type", "text/html"),
+                ],
+            );
+        }
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example/");
+
+        let response = futures::executor::block_on(proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig::new("https://source.example.com/start")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_streaming(),
+            &services,
+        ))
+        .expect("should return the redirect once the limit is reached");
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html")),
+            "should pass the redirect-limit response through without the HTML rewrite"
+        );
+    }
+
+    #[test]
     fn proxy_request_head_redirect_stays_head_for_301_302_303() {
         for status in [301, 302, 303] {
             let stub = proxy_through_redirect(Method::HEAD, status);
