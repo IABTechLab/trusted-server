@@ -808,8 +808,13 @@ pub fn loading_caches_from(
     let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
     let mut caches = crate::platform::LoadingCaches::default();
     for (table, config) in settings.cache.loading_caches() {
-        let Some(written) = config.module.as_deref() else {
-            continue;
+        // A table naming no module takes the one loading cache module the
+        // build links, so answers are held without a line in the document.
+        // With none linked, or several, it holds nothing.
+        let written = match config.module.as_deref() {
+            Some(written) => written,
+            None if offered.len() == 1 => offered[0].0,
+            None => continue,
         };
         let Some((name, factory)) = offered.iter().find(|(name, _)| {
             *name == written || crate::module_name::short_form(LOADING_CACHE_TYPE, name) == written
@@ -923,12 +928,33 @@ mod loading_caches_from_tests {
     }
 
     #[test]
-    fn a_feature_selecting_nothing_keeps_nothing_whatever_is_offered() {
+    fn a_feature_selecting_nothing_takes_the_one_module_offered() {
         let caches = loading_caches_from(
             &settings_selecting(None),
             &[builder("first"), offering("loading-cache.one")],
         )
         .expect("no selection is not an error");
+
+        assert!(caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
+        assert!(!caches.is_empty());
+    }
+
+    #[test]
+    fn a_feature_selecting_nothing_keeps_nothing_when_two_are_offered() {
+        let caches = loading_caches_from(
+            &settings_selecting(None),
+            &[offering("loading-cache.one"), offering("loading-cache.two")],
+        )
+        .expect("no selection is not an error");
+
+        assert!(!caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
+        assert!(caches.is_empty());
+    }
+
+    #[test]
+    fn a_feature_selecting_nothing_keeps_nothing_when_none_is_offered() {
+        let caches = loading_caches_from(&settings_selecting(None), &[builder("first")])
+            .expect("no selection is not an error");
 
         assert!(!caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
         assert!(caches.is_empty());
