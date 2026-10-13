@@ -12955,7 +12955,7 @@ mod tests {
                 assert_eq!(
                     response
                         .headers()
-                        .get("x-ts-version")
+                        .get("x-ts-service-version")
                         .and_then(|value| value.to_str().ok()),
                     Some("52"),
                     "should write the version the platform reports on the {cache_status} response"
@@ -18874,11 +18874,18 @@ mod tests {
                 })
         }
 
-        fn version_header(response: &Response<EdgeBody>) -> Option<String> {
+        fn service_version_header(response: &Response<EdgeBody>) -> Option<String> {
+            response
+                .headers()
+                .get("x-ts-service-version")
+                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        }
+
+        fn git_version_header(response: &Response<EdgeBody>) -> Option<&str> {
             response
                 .headers()
                 .get("x-ts-version")
-                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+                .and_then(|value| value.to_str().ok())
         }
 
         /// A page from the origin, as the publisher path hands it to a
@@ -18927,9 +18934,14 @@ mod tests {
             let response = buffered(&settings, &registry).await;
 
             assert_eq!(
-                version_header(&response).as_deref(),
+                service_version_header(&response).as_deref(),
                 Some("52"),
                 "should write the version the platform reports on the buffered page"
+            );
+            assert_eq!(
+                git_version_header(&response),
+                crate::constants::TS_GIT_VERSION,
+                "should write the git version the build compiled in on the buffered page"
             );
         }
 
@@ -18954,7 +18966,7 @@ mod tests {
             .expect("should stream the page");
 
             assert_eq!(
-                version_header(&response).as_deref(),
+                service_version_header(&response).as_deref(),
                 Some("52"),
                 "should write the version the platform reports before the body streams"
             );
@@ -18968,9 +18980,14 @@ mod tests {
             let response = buffered(&settings, &registry).await;
 
             assert_eq!(
-                version_header(&response),
+                service_version_header(&response),
                 None,
                 "should write nothing where no entry names the middleware"
+            );
+            assert_eq!(
+                git_version_header(&response),
+                None,
+                "should write no git version where no entry names the middleware"
             );
         }
 
@@ -18983,7 +19000,7 @@ mod tests {
             let response = buffered(&settings, &registry).await;
 
             assert_eq!(
-                version_header(&response),
+                service_version_header(&response),
                 None,
                 "should write nothing for a version the platform did not report"
             );
