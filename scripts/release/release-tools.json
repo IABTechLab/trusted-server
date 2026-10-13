@@ -1,0 +1,345 @@
+{
+  "environments": [
+    {
+      "acquisition": null,
+      "id": "debian12-x86_64",
+      "image_sha256": null,
+      "qualification": "pending",
+      "sdk_sha256": null
+    },
+    {
+      "acquisition": null,
+      "id": "macos15-aarch64",
+      "image_sha256": null,
+      "qualification": "pending",
+      "sdk_sha256": null
+    },
+    {
+      "acquisition": null,
+      "id": "macos15-x86_64",
+      "image_sha256": null,
+      "qualification": "pending",
+      "sdk_sha256": null
+    },
+    {
+      "acquisition": null,
+      "id": "ubi9-x86_64",
+      "image_sha256": null,
+      "qualification": "pending",
+      "sdk_sha256": null
+    },
+    {
+      "acquisition": null,
+      "id": "ubuntu22.04-x86_64",
+      "image_sha256": null,
+      "qualification": "pending",
+      "sdk_sha256": null
+    }
+  ],
+  "recipes": [
+    {
+      "id": "trusted-server-fastly.wasm",
+      "qualification": "pending",
+      "script": "scripts/release/build.sh",
+      "settings": {
+        "aws_lc_target_selector": true,
+        "aws_lc_use_system": false,
+        "cargo_config": ".cargo/config.toml",
+        "cargo_home": "private-prepared",
+        "cargo_locked": true,
+        "fresh_target": true,
+        "network_boundary": "qualification-pending",
+        "npm_lifecycle": "reviewed-preparation-only",
+        "release_debug": 1,
+        "rust_toolchain": "1.95.0",
+        "sqlite_features": ["bundled"],
+        "sqlite_use_pkg_config": false,
+        "sysroot": "authenticated-sdk-required",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production"
+      },
+      "sha256": null
+    },
+    {
+      "id": "ts-aarch64-apple-darwin",
+      "qualification": "pending",
+      "script": "scripts/release/build.sh",
+      "settings": {
+        "aws_lc_target_selector": true,
+        "aws_lc_use_system": false,
+        "cargo_config": ".cargo/config.toml",
+        "cargo_home": "private-prepared",
+        "cargo_locked": true,
+        "fresh_target": true,
+        "network_boundary": "qualification-pending",
+        "npm_lifecycle": "reviewed-preparation-only",
+        "release_debug": 1,
+        "rust_toolchain": "1.95.0",
+        "sqlite_features": ["bundled"],
+        "sqlite_use_pkg_config": false,
+        "sysroot": "authenticated-sdk-required",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production"
+      },
+      "sha256": null
+    },
+    {
+      "id": "ts-x86_64-apple-darwin",
+      "qualification": "pending",
+      "script": "scripts/release/build.sh",
+      "settings": {
+        "aws_lc_target_selector": true,
+        "aws_lc_use_system": false,
+        "cargo_config": ".cargo/config.toml",
+        "cargo_home": "private-prepared",
+        "cargo_locked": true,
+        "fresh_target": true,
+        "network_boundary": "qualification-pending",
+        "npm_lifecycle": "reviewed-preparation-only",
+        "release_debug": 1,
+        "rust_toolchain": "1.95.0",
+        "sqlite_features": ["bundled"],
+        "sqlite_use_pkg_config": false,
+        "sysroot": "authenticated-sdk-required",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production"
+      },
+      "sha256": null
+    },
+    {
+      "id": "ts-x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "script": "scripts/release/build.sh",
+      "settings": {
+        "aws_lc_target_selector": true,
+        "aws_lc_use_system": false,
+        "cargo_config": ".cargo/config.toml",
+        "cargo_home": "private-prepared",
+        "cargo_locked": true,
+        "fresh_target": true,
+        "network_boundary": "qualification-pending",
+        "npm_lifecycle": "reviewed-preparation-only",
+        "release_debug": 1,
+        "rust_toolchain": "1.95.0",
+        "sqlite_features": ["bundled"],
+        "sqlite_use_pkg_config": false,
+        "sysroot": "authenticated-sdk-required",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production"
+      },
+      "sha256": null
+    },
+    {
+      "id": "tsjs",
+      "qualification": "pending",
+      "script": "scripts/release/prepare-js.mjs",
+      "settings": {
+        "aws_lc_target_selector": true,
+        "aws_lc_use_system": false,
+        "cargo_config": ".cargo/config.toml",
+        "cargo_home": "private-prepared",
+        "cargo_locked": true,
+        "fresh_target": true,
+        "network_boundary": "qualification-pending",
+        "npm_lifecycle": "reviewed-preparation-only",
+        "release_debug": 1,
+        "rust_toolchain": "1.95.0",
+        "sqlite_features": ["bundled"],
+        "sqlite_use_pkg_config": false,
+        "sysroot": "authenticated-sdk-required",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production"
+      },
+      "sha256": null
+    }
+  ],
+  "schema_version": 1,
+  "tools": [
+    {
+      "acquisition": null,
+      "name": "actions/attest:github-action",
+      "qualification": "pending",
+      "revision": "1e69f48acb82d1966a394da916b4c1698aa569d6",
+      "sha256": null,
+      "version": "4.2.2"
+    },
+    {
+      "acquisition": null,
+      "name": "fastly:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "15.1.0"
+    },
+    {
+      "acquisition": null,
+      "name": "fastly:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "15.1.0"
+    },
+    {
+      "acquisition": null,
+      "name": "fastly:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "15.1.0"
+    },
+    {
+      "acquisition": null,
+      "name": "gh:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "2.97.0"
+    },
+    {
+      "acquisition": null,
+      "name": "gh:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "2.97.0"
+    },
+    {
+      "acquisition": null,
+      "name": "gh:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "2.97.0"
+    },
+    {
+      "acquisition": null,
+      "name": "node:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "24.12.0"
+    },
+    {
+      "acquisition": null,
+      "name": "node:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "24.12.0"
+    },
+    {
+      "acquisition": null,
+      "name": "node:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "24.12.0"
+    },
+    {
+      "acquisition": null,
+      "name": "npm:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "11.6.2"
+    },
+    {
+      "acquisition": null,
+      "name": "npm:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "11.6.2"
+    },
+    {
+      "acquisition": null,
+      "name": "npm:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "11.6.2"
+    },
+    {
+      "acquisition": null,
+      "name": "rust:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "1.95.0"
+    },
+    {
+      "acquisition": null,
+      "name": "rust:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "1.95.0"
+    },
+    {
+      "acquisition": null,
+      "name": "rust:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "1.95.0"
+    },
+    {
+      "acquisition": null,
+      "name": "viceroy:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "0.17.0"
+    },
+    {
+      "acquisition": null,
+      "name": "viceroy:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "0.17.0"
+    },
+    {
+      "acquisition": null,
+      "name": "viceroy:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "0.17.0"
+    },
+    {
+      "acquisition": null,
+      "name": "wasmtime:aarch64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "44.0.1"
+    },
+    {
+      "acquisition": null,
+      "name": "wasmtime:x86_64-apple-darwin",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "44.0.1"
+    },
+    {
+      "acquisition": null,
+      "name": "wasmtime:x86_64-unknown-linux-gnu",
+      "qualification": "pending",
+      "revision": null,
+      "sha256": null,
+      "version": "44.0.1"
+    }
+  ]
+}

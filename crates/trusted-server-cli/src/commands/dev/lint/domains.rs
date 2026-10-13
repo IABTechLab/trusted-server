@@ -112,8 +112,11 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "iabtechlab.github.io",
     "iabeurope.github.io",
     // Specs (supply chain)
+    "actions.github.io",
     "in-toto.io",
     "rslstandard.org",
+    "slsa.dev",
+    "spdx.dev",
     // Specs (other)
     "webassembly.org",
     // Fastly docs
@@ -1366,6 +1369,51 @@ mod scan_line_tests {
             "//www.googletagmanager.com/gtm.js",
         ] {
             assert!(hosts(line).is_empty(), "should be clean: {line}");
+        }
+    }
+
+    #[test]
+    fn release_policy_standard_identifiers_pass_without_suppression() {
+        let policy = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/release-policy.json"));
+        for line in policy.lines() {
+            assert!(
+                hosts(line).is_empty(),
+                "should accept reviewed production policy identifiers: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_standard_hosts_reject_subdomains_and_lookalikes() {
+        let policy: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/release-policy.json"
+        )))
+        .expect("should parse the production release policy");
+        let predicates = policy["predicates"]
+            .as_object()
+            .expect("should provide fixed predicate identities");
+        for predicate in predicates.values() {
+            let identifier = predicate
+                .as_str()
+                .expect("should provide a string predicate identifier");
+            let authority = identifier
+                .strip_prefix("https://")
+                .expect("should use an HTTPS predicate identifier")
+                .split('/')
+                .next()
+                .expect("should contain the standard host");
+            for host in [
+                format!("subdomain.{authority}"),
+                format!("{authority}.unreviewed"),
+                format!("lookalike-{authority}"),
+            ] {
+                assert_eq!(
+                    hosts(&format!("https://{host}/example")),
+                    vec![host],
+                    "should reject unreviewed standard-host variants"
+                );
+            }
         }
     }
 
