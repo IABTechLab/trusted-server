@@ -136,6 +136,8 @@ pub(crate) fn apply_finalize_headers(
         HeaderValue::from_static(if geo_available { "true" } else { "false" }),
     );
 
+    trusted_server_core::version_header::apply_git_version_header(response);
+
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
     trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
