@@ -118,13 +118,24 @@ impl ConsentState {
     }
 }
 
-/// The four consent types Google requires for its own services.
+/// How long the tag waits for a consent management platform's update before
+/// it fires with the defaults, when no setting says otherwise.
+const DEFAULT_WAIT_FOR_UPDATE_MS: u32 = 500;
+
+const fn default_wait_for_update() -> u32 {
+    DEFAULT_WAIT_FOR_UPDATE_MS
+}
+
+/// The four consent types Google requires for its own services, how long the
+/// tag waits for a consent management platform before it fires with them,
+/// and the regions they apply to.
 ///
 /// All four default to denied. That is Google's own recommended starting
 /// point, and no Google identifier may be stored before a permission signal
 /// has been read.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_region_codes))]
 pub struct ConsentDefaults {
     /// Storage for advertising, such as cookies.
     #[serde(default)]
@@ -138,6 +149,53 @@ pub struct ConsentDefaults {
     /// Storage for analytics, such as cookies.
     #[serde(default)]
     pub analytics_storage: ConsentState,
+    /// How long, in milliseconds, the tag waits for a consent management
+    /// platform's update before it fires with these defaults, which Google's
+    /// consent guide asks for where a platform sets consent on the page. Zero
+    /// fires at once.
+    #[serde(default = "default_wait_for_update")]
+    #[validate(range(max = 60000, message = "must be at most 60000 milliseconds"))]
+    pub wait_for_update: u32,
+    /// The regions the defaults apply to, as ISO 3166-1 country codes or
+    /// ISO 3166-2 region codes such as `GB` or `US-CA`. Empty applies them
+    /// everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region: Vec<String>,
+}
+
+impl Default for ConsentDefaults {
+    fn default() -> Self {
+        Self {
+            ad_storage: ConsentState::default(),
+            ad_user_data: ConsentState::default(),
+            ad_personalization: ConsentState::default(),
+            analytics_storage: ConsentState::default(),
+            wait_for_update: DEFAULT_WAIT_FOR_UPDATE_MS,
+            region: Vec::new(),
+        }
+    }
+}
+
+/// Refuses a region that is not a country or region code, two capitals with
+/// an optional dash and one to three capitals or digits, so the snippet only
+/// ever carries codes.
+///
+/// # Errors
+///
+/// Returns a [`ValidationError`] naming the first region that is not a code.
+fn validate_region_codes(defaults: &ConsentDefaults) -> Result<(), ValidationError> {
+    static CODE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^[A-Z]{2}(-[A-Z0-9]{1,3})?$").expect("the region code pattern compiles")
+    });
+    if let Some(region) = defaults.region.iter().find(|code| !CODE.is_match(code)) {
+        let mut error = ValidationError::new("google_region_code");
+        error.message = Some(
+            format!("region `{region}` must be a country or region code such as GB or US-CA")
+                .into(),
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Configuration for the Google tag, the Tag Manager container and the
@@ -259,6 +317,17 @@ fn validate_adsense_client_id(value: &str) -> Result<(), ValidationError> {
 /// otherwise define them, and because it is written even when no tag is
 /// configured and AdSense alone reads it.
 fn consent_defaults_snippet(defaults: &ConsentDefaults) -> String {
+    // The regions are validated as codes, so the quotes cannot be escaped.
+    let region = if defaults.region.is_empty() {
+        String::new()
+    } else {
+        let codes: Vec<String> = defaults
+            .region
+            .iter()
+            .map(|code| format!("'{code}'"))
+            .collect();
+        format!(",\n    'region': [{}]", codes.join(", "))
+    };
     format!(
         "<script>\n  \
          window.dataLayer = window.dataLayer || [];\n  \
@@ -267,13 +336,15 @@ fn consent_defaults_snippet(defaults: &ConsentDefaults) -> String {
          'ad_storage': '{ad_storage}',\n    \
          'ad_user_data': '{ad_user_data}',\n    \
          'ad_personalization': '{ad_personalization}',\n    \
-         'analytics_storage': '{analytics_storage}'\n  \
+         'analytics_storage': '{analytics_storage}',\n    \
+         'wait_for_update': {wait_for_update}{region}\n  \
          }});\n\
          </script>",
         ad_storage = defaults.ad_storage.as_command_value(),
         ad_user_data = defaults.ad_user_data.as_command_value(),
         ad_personalization = defaults.ad_personalization.as_command_value(),
         analytics_storage = defaults.analytics_storage.as_command_value(),
+        wait_for_update = defaults.wait_for_update,
     )
 }
 
@@ -837,6 +908,62 @@ mod tests {
                 "{consent_type} should be denied until a signal has been read"
             );
         }
+    }
+
+    #[test]
+    fn the_tag_waits_for_the_platform_s_update_before_it_fires() {
+        // Arrange
+        let settings = settings_with_google(&json!({ "analytics_tag_id": TEST_TAG_ID }));
+
+        // Act
+        let written = head_inserts_for(&settings).join("");
+
+        // Assert
+        assert!(
+            written.contains("'wait_for_update': 500"),
+            "the defaults should tell the tag to wait for a platform's update: {written}"
+        );
+        assert!(
+            !written.contains("'region'"),
+            "defaults scoped to no region should name none: {written}"
+        );
+    }
+
+    #[test]
+    fn a_publisher_may_scope_the_defaults_to_regions_and_set_the_wait() {
+        // Arrange
+        let settings = settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "consent_defaults": { "wait_for_update": 2000, "region": ["GB", "US-CA"] },
+        }));
+
+        // Act
+        let written = head_inserts_for(&settings).join("");
+
+        // Assert
+        assert!(written.contains("'wait_for_update': 2000"), "{written}");
+        assert!(
+            written.contains("'region': ['GB', 'US-CA']"),
+            "the defaults should name the regions as Google's command does: {written}"
+        );
+    }
+
+    #[test]
+    fn a_region_that_is_not_a_code_is_refused_by_name() {
+        // Arrange
+        let settings = settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "consent_defaults": { "region": ["GB", "england"] },
+        }));
+
+        // Act
+        let refusal = refusal_for(&settings);
+
+        // Assert
+        assert!(
+            refusal.contains("england"),
+            "the refusal should name the region that is not a code: {refusal}"
+        );
     }
 
     #[test]

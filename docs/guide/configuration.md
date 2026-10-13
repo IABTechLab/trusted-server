@@ -955,6 +955,8 @@ Selects the module that gives the start of every name the browser holds for a pu
 
 Core's own module runs when nothing is selected, so a default deployment writes `ts-ec`, `ts-eids` and `ts-tester`. A module from a crate at `crates/prefix/<name>` is written `<name>` or `prefix.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the prefix modules it does run, and a module that names a value its call never carries is refused at startup rather than on a request.
 
+A prefix is chosen when a deployment starts. Selecting a module other than the one a deployment ran before orphans every name the browser holds under the old prefix, being each reader's Edge Cookie, resolved marker, EIDs and tester cookie, and every entry in a shared store under the old key prefix, being the identity-graph rows behind them, because nothing reads an old prefix. A change is a cutover the publisher plans, with every reader starting again, not a setting to move between builds.
+
 A public prefix carries no domain, because a browser keeps each site's names apart from every other site's. A server key prefix carries the publisher's domain with a single leading `www.` folded, so `www.example.com` and `example.com` share keys and `clients.example.com` and `public.example.com` do not, and the domain is the loaded settings' `publisher.domain`, never the request's `Host` header. The page's bundle tag tells the client script the public prefix, as `data-ts-public-prefix`, so the script names its own cookies after it and holds no copy.
 
 **Example**:
@@ -1086,9 +1088,9 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. Holding is opt-in. With `module` set in `[cache.robots-txt]`, a module's answer is held in the loading cache that module offers, briefly in the process and in the shared store outside it, so a module is asked once per refresh however many instances and requests want its rules, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+4. Holding is the normal case. A module's answer is held in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in the process and in the shared store outside it, so a module is asked once per refresh however many instances and requests want its rules, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all the file is `503` with `Retry-After`, never an empty file, which a crawler would read as permission to crawl everything.
-6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no `module` in `[cache.robots-txt]` no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
+6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
 7. The file is made by the `robots_txt` middleware, which runs on `text/plain` in the phase the entry places it in, prepares the file before the document is processed, and replaces the origin's `text/plain` file with it. Where the origin answers `404`, or `200` with a page, as a single-page application's catch-all does, the file is made on an empty document. Any other answer, such as a `401` from a staging site behind a login, is passed on as the origin gave it. The response takes the deployment's cache policy for the path, as every file does, so where the response is stored a module is asked only when the stored copy has ended, however soon its refresh is due. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
 
 **Which responses carry the header.** An adapter writes `X-Robots-Tag` last when it finalizes a response, replacing any tag already there, so neither an origin page nor `[response_headers]` can loosen it. That covers every route, the publisher fallback and the error path. A response sent before that step does not carry it. On every adapter but Fastly that is the `404` or `405` the router gives a request it does not route. On Fastly it is the two debug endpoints under `/_ts/debug` and a failure before the settings are read.
@@ -1734,8 +1736,10 @@ Each feature that holds answers this way selects the cache that holds them,
 by naming in its own `[cache.<name>]` table a module that offers a loading
 cache, with the module's short name or its name in full. A stock build links
 `loading-cache.51degrees`, from `crates/loading-cache/51degrees`, so
-`module = "51degrees"` selects it. A feature that names no module keeps no
-copy and makes each answer every time it is asked for, and a name that no
+`module = "51degrees"` selects it. A feature that names no module takes the
+one loading cache module the build links, so a stock build holds answers
+without a line in the document, and keeps no copy when the build links none
+or several, making each answer every time it is asked for. A name that no
 linked crate offers a cache from is refused when the service starts, with
 the names that could be written.
 
@@ -2030,12 +2034,14 @@ for the tag's parts and what the module keeps to.
 
 **Section**: `[tag.google-tag]`
 
-| Field                | Type   | Default  | Contract                                                                                               |
-| -------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------ |
-| `analytics_tag_id`   | String | Absent   | A `G-`, `GT-`, `GTM-`, `AW-`, `DC-`, `MC-` or `UA-` tag id                                             |
-| `container_id`       | String | Absent   | `GTM-` followed by 4 to 20 capitals or digits                                                          |
-| `adsense_client_id`  | String | Absent   | `ca-pub-` followed by sixteen digits                                                                   |
-| `consent_defaults.*` | String | `denied` | `ad_storage`, `ad_user_data`, `ad_personalization` and `analytics_storage`, each `denied` or `granted` |
+| Field                              | Type    | Default  | Contract                                                                                                                 |
+| ---------------------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `analytics_tag_id`                 | String  | Absent   | A `G-`, `GT-`, `GTM-`, `AW-`, `DC-`, `MC-` or `UA-` tag id                                                               |
+| `container_id`                     | String  | Absent   | `GTM-` followed by 4 to 20 capitals or digits                                                                            |
+| `adsense_client_id`                | String  | Absent   | `ca-pub-` followed by sixteen digits                                                                                     |
+| `consent_defaults.*`               | String  | `denied` | `ad_storage`, `ad_user_data`, `ad_personalization` and `analytics_storage`, each `denied` or `granted`                   |
+| `consent_defaults.wait_for_update` | Integer | `500`    | Milliseconds the tag waits for a consent management platform's update before it fires with the defaults, at most `60000` |
+| `consent_defaults.region`          | Array   | Absent   | Country or region codes the defaults apply to, such as `GB` or `US-CA`, everywhere when absent                           |
 
 At least one of the three ids is required, because a table naming none asks the module to write nothing. The module writes, in the head immediately before the script bundle's tag and so after whatever a `[[fetch]]` middleware wrote there, the consent mode defaults, then the container script, then the tag snippet, then the AdSense loader, each copied from Google's documentation, and Tag Manager's noscript iframe immediately after the opening body tag. Where the Tag Manager module serves the same tag or container, the loader names the first-party path. A page that also loads gtag.js for the configured tag has that loader removed; an inline configuration call in the page is left alone and still sends a second page view.
 
