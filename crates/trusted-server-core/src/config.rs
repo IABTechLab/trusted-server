@@ -357,6 +357,13 @@ pub fn validate_settings_for_deploy_with(
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
 
+    // A `[cache.<name>]` table is refused here as the cache build refuses it,
+    // so a misspelt name fails `ts config validate` and not the deployment's
+    // first request.
+    let builders: Vec<IntegrationBuilder> =
+        crate::integrations::all_builders(extra_integrations).collect();
+    crate::integrations::check_cache_tables(settings, &builders)?;
+
     // The plan is compiled with the builders the blocks are validated
     // against, so a `[demand]` or `[ad-server]` name one of them supplies
     // compiles here.
