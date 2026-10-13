@@ -44,6 +44,9 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/build-module-options.mjs",
+        "lib/release-composition.mjs",
+        "lib/vitest.config.ts",
         "lib/package.json",
         "lib/package-lock.json",
         "lib/tsconfig.json",

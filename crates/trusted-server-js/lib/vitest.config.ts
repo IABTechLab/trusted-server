@@ -2,7 +2,10 @@ import path from 'node:path';
 
 import { defineConfig } from 'vitest/config';
 
+import { releaseBuild } from './release-composition.mjs';
+
 export default defineConfig({
+  ...(releaseBuild() ? { envDir: false, mode: 'production' } : {}),
   resolve: {
     alias: {
       // prebid.js doesn't expose src/adapterManager.js via its package

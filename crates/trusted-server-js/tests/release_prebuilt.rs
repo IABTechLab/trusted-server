@@ -619,6 +619,16 @@ fn emits_rerun_directives_for_inventory_and_release_inputs() {
             "should watch {variable}"
         );
     }
+    for path in [
+        "lib/build-module-options.mjs",
+        "lib/release-composition.mjs",
+        "lib/vitest.config.ts",
+    ] {
+        assert!(
+            stdout.contains(&format!("cargo:rerun-if-changed={path}")),
+            "should watch JS build and test configuration input {path}"
+        );
+    }
     for path in [fixture.path("inventory.json"), fixture.path("bundles")] {
         assert!(
             stdout.contains(&format!("cargo:rerun-if-changed={}", path.display())),
