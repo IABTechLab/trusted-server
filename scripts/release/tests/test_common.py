@@ -233,6 +233,22 @@ class IdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "identity"):
                     common.require_unique_identities([record], ("name",))
 
+    def test_generator_fields_accept_distinct_identities(self):
+        result = common.require_unique_identities(
+            [{"name": "index.json"}, {"name": "statement.json"}],
+            iter(("name",)),
+        )
+        self.assertIsNone(
+            result, "should accept distinct identities with iterator fields"
+        )
+
+    def test_generator_fields_reject_duplicate_identities(self):
+        with self.assertRaisesRegex(ValueError, "duplicate identity"):
+            common.require_unique_identities(
+                [{"name": "index.json"}, {"name": "index.json"}],
+                iter(("name",)),
+            )
+
 
 class SerializationTests(unittest.TestCase):
     def test_deterministic_json_bytes_sorts_keys_and_uses_utf8(self):
@@ -255,6 +271,19 @@ class SerializationTests(unittest.TestCase):
     def test_serialization_rejects_nonstring_object_keys(self):
         with self.assertRaisesRegex(ValueError, "keys"):
             common.deterministic_json_bytes({1: "example"})
+
+    def test_serialization_reports_mixed_keys_as_value_errors(self):
+        for document in (
+            {"name": "example", 1: "example"},
+            {"items": [{"name": "example", 1: "example"}]},
+        ):
+            with self.subTest(document=document):
+                with self.assertRaisesRegex(ValueError, "JSON serialization"):
+                    common.deterministic_json_bytes(document)
+
+    def test_serialization_reports_unsupported_values_as_value_errors(self):
+        with self.assertRaisesRegex(ValueError, "JSON serialization"):
+            common.deterministic_json_bytes({"items": {"example"}})
 
     def test_serialization_rejects_nonstring_keys_inside_tuple_containers(self):
         for key in (1, True):

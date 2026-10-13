@@ -111,6 +111,7 @@ def require_unique_identities(records, fields):
     Identity values must be strings or integers; missing fields and compound
     values raise ValueError rather than participating in ambiguous matches.
     """
+    fields = tuple(fields)
     seen = set()
     for record in records:
         if not isinstance(record, dict) or any(field not in record for field in fields):
@@ -128,15 +129,19 @@ def deterministic_json_bytes(document):
 
     This is a producer encoding, not a canonicalization step for verification.
     Hash signed or downloaded documents using their original bytes instead.
-    Raise ValueError for nonfinite numbers, surrogate strings, or invalid keys.
+    Raise ValueError for unsupported values, nonfinite numbers, surrogate strings,
+    or invalid keys.
     """
-    text = json.dumps(
-        document,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    try:
+        text = json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except TypeError as error:
+        raise ValueError(f"invalid JSON serialization: {error}") from error
     _check_unicode(document)
     return (text + "\n").encode("utf-8")
 
