@@ -21,6 +21,7 @@ sys.dont_write_bytecode = True
 from common import deterministic_json_bytes, read_json_file, require_nonnegative_integer, sha256_bytes
 
 LIMIT = 1048576
+SOURCE_DIRECTORIES = ("src", "build_support", "tests", "benches", "examples")
 PLATFORMS = (
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -434,6 +435,15 @@ def _audit_configuration(repo, inherited):
         for filename in ("config", "config.toml"):
             if os.path.lexists(location / ".cargo" / filename):
                 raise ValueError("unreviewed ancestor/home Cargo configuration")
+    crate_locations = [repo / "crates", repo / "crates/trusted-server-js/lib"]
+    crate_locations.extend(path for path in repo.glob("crates/*") if path.is_dir())
+    for location in crate_locations:
+        configuration_directory = location / ".cargo"
+        if configuration_directory.is_symlink():
+            raise ValueError("unsupported nested Cargo configuration symlink")
+        for filename in ("config", "config.toml"):
+            if os.path.lexists(configuration_directory / filename):
+                raise ValueError("unsupported nested workspace Cargo configuration layer")
     if os.path.lexists(repo / ".cargo/config"):
         raise ValueError("unreviewed legacy Cargo configuration layer")
     selected = repo / ".cargo/config.toml"
@@ -455,11 +465,11 @@ def _audit_configuration(repo, inherited):
 
 
 def _source_roots(repo, entries):
-    roots = {".cargo", "scripts/release"}
+    roots = {".cargo", "scripts/release", "crates/trusted-server-js/lib/test"}
     for name in entries:
         parts = Path(name).parts
         if parts[0] == "crates":
-            for directory in ("src", "build_support"):
+            for directory in SOURCE_DIRECTORIES:
                 if directory in parts:
                     roots.add(str(Path(*parts[:parts.index(directory) + 1])))
     crates = repo / "crates"
@@ -470,7 +480,7 @@ def _source_roots(repo, entries):
             if crate.is_symlink():
                 raise ValueError("symlinked source crate")
             if crate.is_dir():
-                for directory in ("src", "build_support"):
+                for directory in SOURCE_DIRECTORIES:
                     if os.path.lexists(crate / directory):
                         roots.add(str((crate / directory).relative_to(repo)))
     return roots

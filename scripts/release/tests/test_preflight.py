@@ -13,6 +13,12 @@ from pathlib import Path
 
 RELEASE = Path(__file__).resolve().parents[1]
 ROOT = RELEASE.parents[1]
+DISCOVERED_TEST_SOURCES = (
+    "crates/trusted-server-js/lib/test/extra.test.ts",
+    "crates/example/tests/extra.rs",
+    "crates/example/benches/extra.rs",
+    "crates/example/examples/extra.rs",
+)
 sys.path.insert(0, str(RELEASE))
 if importlib.util.find_spec("preflight") is not None:
     import preflight
@@ -245,7 +251,7 @@ class SourceTests(unittest.TestCase):
             "AGENTS.md": "Example instructions\n",
             "Cargo.toml": "[profile.release]\ndebug = 1\n",
             ".cargo/config.toml": "[alias]\nexample = 'check'\n",
-            ".gitignore": "trusted-server.toml\n*.ignored\n",
+            ".gitignore": "trusted-server.toml\n*.ignored\nextra.test.ts\nextra.rs\n",
             "crates/example/src/lib.rs": "// Example source\n",
             "crates/trusted-server-core/build_support/example.rs": "// Example build support\n",
             "crates/trusted-server-js/lib/src/core/index.ts": "export const example = 1;\n",
@@ -329,6 +335,67 @@ class SourceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unexpected"):
                     preflight.source_snapshot(self.repo, self.commit, {})
                 unexpected.unlink()
+
+    def test_ignored_discovered_test_sources_are_rejected_before_execution(self):
+        for relative in DISCOVERED_TEST_SOURCES:
+            with self.subTest(relative=relative):
+                unexpected = self.repo / relative
+                unexpected.parent.mkdir(parents=True, exist_ok=True)
+                unexpected.write_text("// Example unexpected executable test source\n")
+                self.assertTrue(self.git("check-ignore", relative).strip(),
+                                "should exercise ignored executable test inputs")
+                with self.assertRaisesRegex(ValueError, "unexpected"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                unexpected.unlink()
+
+    def test_discovered_test_source_additions_are_rejected_after_execution(self):
+        before = preflight.source_snapshot(self.repo, self.commit, {})
+        for relative in DISCOVERED_TEST_SOURCES:
+            with self.subTest(relative=relative):
+                unexpected = self.repo / relative
+                unexpected.parent.mkdir(parents=True, exist_ok=True)
+                unexpected.write_text("// Example unexpected executable test source\n")
+                with self.assertRaisesRegex(ValueError, "unexpected"):
+                    preflight.assert_source_unchanged(self.repo, self.commit, before, {})
+                unexpected.unlink()
+
+    def test_discovered_test_source_directory_symlinks_are_rejected(self):
+        for relative in DISCOVERED_TEST_SOURCES:
+            with self.subTest(relative=relative):
+                directory = (self.repo / relative).parent
+                directory.parent.mkdir(parents=True, exist_ok=True)
+                directory.symlink_to(self.repo / "crates/example/src", target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                directory.unlink()
+
+    def test_nested_crate_cargo_configuration_layers_are_rejected(self):
+        for filename in ("config", "config.toml"):
+            with self.subTest(filename=filename):
+                directory = self.repo / "crates/example/.cargo"
+                directory.mkdir(parents=True, exist_ok=True)
+                config = directory / filename
+                config.write_text("[build]\nrustflags = ['--cfg=example']\n")
+                with self.assertRaisesRegex(ValueError, "Cargo"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                config.unlink()
+
+    def test_nested_crate_cargo_configuration_symlinks_are_rejected(self):
+        directory = self.repo / "crates/example/.cargo"
+        directory.symlink_to(self.repo / ".cargo", target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "Cargo|symlink"):
+            preflight.source_snapshot(self.repo, self.commit, {})
+
+    def test_download_and_output_directories_are_outside_source_roots(self):
+        before = preflight.source_snapshot(self.repo, self.commit, {})
+        for relative in (
+            "target/example.ignored", "crates/example/target/example.ignored",
+            "crates/trusted-server-js/lib/node_modules/example/example.ignored",
+        ):
+            destination = self.repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("Example generated or downloaded output\n")
+        preflight.assert_source_unchanged(self.repo, self.commit, before, {})
 
     def test_symlinked_source_parent_and_external_link_are_rejected(self):
         source_directory = self.repo / "crates/example/src"
