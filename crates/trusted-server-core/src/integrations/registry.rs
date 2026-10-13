@@ -1855,7 +1855,7 @@ impl IntegrationRegistry {
         // sections select.
         inner.middleware.push((
             crate::service_version::MODULE,
-            Arc::new(crate::service_version::ServiceVersion),
+            Arc::new(crate::service_version::ServiceVersion::default()),
         ));
         check_middleware(settings, &inner)?;
 

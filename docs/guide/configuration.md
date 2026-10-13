@@ -1042,9 +1042,9 @@ Custom headers may be overwritten by application logic. Standard headers (`Conte
 
 Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
-The Fastly adapter wrote `X-TS-Version`, the platform's version number of the service, on every response. It no longer does. The version is in the [attestation document](./attestation), under `platform.serviceVersion`, which is where a deployment is asked about itself.
+No adapter writes a version on a response. What the build was made from is in the [attestation document](./attestation), under `build`, and the platform's version number of the service under `platform.serviceVersion`, which is where a deployment is asked about itself.
 
-A deployment that wants the version on its pages names core's `service_version` middleware in the `[[serve]]` entry that covers them, after the module middleware the entry already names. The header is then written on every page the entry covers, with the version the adapter reports, and on nothing else. No section selects the middleware, and a deployment that does not name it sends nothing about the service on a page.
+A deployment that wants the versions on its pages names core's `service_version` middleware in the `[[serve]]` entry that covers them, after the module middleware the entry already names. The middleware runs on every page the entry covers, and on nothing else. It writes `X-TS-Version`, the git version the build compiled in from `TRUSTED_SERVER__GIT_VERSION` or local git, when the build knows one, and `X-TS-Service-Version`, the version the adapter reports for the service, when it reports one. No section selects the middleware, and a deployment that does not name it sends nothing about its versions on a page.
 
 ```toml
 [[serve]]
@@ -1914,7 +1914,7 @@ generated configuration places it in.
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
 | `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                         |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of the origin's file or where the origin has none, on `text/plain` alone                                                                           |
-| `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the platform's version number of the service, when the adapter reports one. Core supplies it, so no section selects it                                                                     |
+| `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it            |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type
