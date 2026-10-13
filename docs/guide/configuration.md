@@ -584,14 +584,15 @@ default and should only be enabled for intentional QA or troubleshooting flows.
 
 ### `[tester_cookie]`
 
-| Field     | Type    | Required | Description                                        |
-| --------- | ------- | -------- | -------------------------------------------------- |
-| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+| Field             | Type    | Required | Description                                                                  |
+| ----------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `enabled`         | Boolean | No       | Enables routes to set and clear `ts-tester` cookie                           |
+| `max_age_seconds` | Integer | No       | Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days (2592000) |
 
 When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
 
 ```http
-Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=<max_age_seconds>
 Cache-Control: no-store, private
 ```
 
@@ -715,6 +716,11 @@ KV store name only when consent should persist with the EC identity graph.
 | `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
 | `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
 | `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+
+In `proxy` mode Trusted Server does not decode the TC string, so it cannot
+confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
+browser-supplied EIDs are neither forwarded in bid requests nor written to the
+EC identity graph, and server-side pull sync is skipped.
 
 ```toml
 [consent]
@@ -1246,6 +1252,8 @@ Profile sets convert small request query controls into a closed set of Image Opt
 
 Profile values live under `[image_optimizer.profile_sets.<name>.profiles]` and use query-string syntax.
 
+Profile and profile-set names are trimmed. Names within the same map that become identical after trimming are rejected, even when their values match. Empty names continue to be discarded.
+
 ```toml
 [image_optimizer.profile_sets.default_images]
 base_params = "quality=70&resize-filter=bicubic"
@@ -1774,7 +1782,8 @@ unchanged.
 
 Persisting a resolved ID into the Edge Cookie identity graph additionally
 requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
-module's OpenRTB EID source.
+module's OpenRTB EID source, and, when a TCF signal is present, consent to
+TCF Purpose 1 and Purpose 4.
 
 `managed_user_ids` is an array of tables, so it cannot be set through a
 `TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves

@@ -201,7 +201,7 @@ pub struct AccessTelemetrySnapshot {
     /// Fastly POP code, or `unknown` when unavailable.
     pub pop: String,
     /// Fastly service version, matching `FASTLY_SERVICE_VERSION` and the
-    /// `x-ts-version` header, or `unknown` when unavailable.
+    /// `x-ts-fastly-version` header, or `unknown` when unavailable.
     pub ts_version: String,
     /// Two-letter geo country code, or `unknown` when no geo lookup
     /// resolved one.
