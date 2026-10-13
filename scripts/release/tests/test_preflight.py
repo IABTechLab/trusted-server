@@ -103,6 +103,31 @@ class ContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     preflight.validate_policy(changed)
 
+    def test_policy_accepts_independent_specification_spdx23_predicate(self):
+        specification = (ROOT / "docs/superpowers/specs/2026-10-09-1235-release-attestation-design.md").read_text()
+        expected = next(
+            line.split("--predicate-type ", 1)[1].split()[0]
+            for line in specification.splitlines()
+            if "--predicate-type " in line and "/Document/v2.3" in line
+        )
+        self.assertEqual(self.policy["predicates"]["sbom"], expected,
+                         "should match the independently specified SPDX 2.3 identity")
+        changed = copy.deepcopy(self.policy)
+        changed["predicates"]["sbom"] = expected
+        preflight.validate_policy(changed)
+
+    def test_policy_rejects_unversioned_spdx_predicate(self):
+        specification = (ROOT / "docs/superpowers/specs/2026-10-09-1235-release-attestation-design.md").read_text()
+        expected = next(
+            line.split("--predicate-type ", 1)[1].split()[0]
+            for line in specification.splitlines()
+            if "--predicate-type " in line and "/Document/v2.3" in line
+        )
+        changed = copy.deepcopy(self.policy)
+        changed["predicates"]["sbom"] = expected.removesuffix("/v2.3")
+        with self.assertRaises(ValueError):
+            preflight.validate_policy(changed)
+
     def test_rejects_wrong_types_unsorted_arrays_and_unknown_contract_fields(self):
         for document in (self.cohort, self.tools, self.policy):
             validate = (preflight.validate_cohort if document is self.cohort else

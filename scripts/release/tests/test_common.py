@@ -314,7 +314,7 @@ raise AssertionError('should reject a cyclic producer document')
 """
         try:
             result = subprocess.run(
-                [sys.executable, "-c", source, str(Path(common.__file__).parent)],
+                [sys.executable, "-B", "-c", source, str(Path(common.__file__).parent)],
                 capture_output=True, text=True, timeout=2, check=False,
             )
         except subprocess.TimeoutExpired:

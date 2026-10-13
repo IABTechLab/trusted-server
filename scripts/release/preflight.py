@@ -187,7 +187,7 @@ def fixed_policy():
         "predicates": {
             "provenance": "https://slsa.dev/provenance/v1",
             "build_type": "https://actions.github.io/buildtypes/workflow/v1",
-            "sbom": "https://spdx.dev/Document",
+            "sbom": "https://spdx.dev/Document/v2.3",
         },
         "tool_versions": {
             "gh": "2.97.0",

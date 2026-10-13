@@ -126,7 +126,7 @@
   "predicates": {
     "build_type": "https://actions.github.io/buildtypes/workflow/v1",
     "provenance": "https://slsa.dev/provenance/v1",
-    "sbom": "https://spdx.dev/Document"
+    "sbom": "https://spdx.dev/Document/v2.3"
   },
   "public_actions": ["readonly-verify"],
   "repository": "IABTechLab/trusted-server",
