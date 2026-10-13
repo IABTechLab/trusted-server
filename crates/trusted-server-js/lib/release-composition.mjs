@@ -528,6 +528,12 @@ export function validatePreparation(prepared, { installRoot, packages }) {
   }
   if (events.size !== expectedEvents.size)
     throw new Error('Missing expected lifecycle observations');
+  const packageRoots = packages
+    .map((material) => ({
+      id: material.id,
+      root: fs.realpathSync(path.join(installRoot, material.lock_path)),
+    }))
+    .sort((first, second) => second.root.length - first.root.length);
   for (const output of prepared.lifecycle_outputs) {
     fields(output, [
       'kind',
@@ -558,8 +564,13 @@ export function validatePreparation(prepared, { installRoot, packages }) {
       throw new Error('Lifecycle script digest mismatch');
     const file = path.join(installRoot, output.path);
     if (!inside(ownerRoot, file)) throw new Error('Lifecycle output owner mismatch');
-    if (!inside(fs.realpathSync(installRoot), fs.realpathSync(file)))
-      throw new Error('Lifecycle output escape');
+    const realFile = fs.realpathSync(file);
+    if (!inside(fs.realpathSync(installRoot), realFile)) throw new Error('Lifecycle output escape');
+    if (
+      !inside(fs.realpathSync(ownerRoot), realFile) ||
+      packageRoots.find(({ root }) => inside(root, realFile))?.id !== output.package_material_id
+    )
+      throw new Error('Lifecycle output owner mismatch');
     if (
       !events.has(JSON.stringify([output.package_material_id, output.event, output.script_sha256]))
     )

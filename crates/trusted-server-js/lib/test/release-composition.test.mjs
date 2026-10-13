@@ -885,3 +885,85 @@ describe('bounded regular-file readers', () => {
     expect(result.status).toBe(0);
   });
 });
+
+describe('lifecycle output package ownership', () => {
+  it.each(['nested-child', 'symlink-child'])(
+    'rejects a parent event claiming a %s package output',
+    async (variant) => {
+      const { installedMaterials, installedOrigins, validatePreparation } =
+        await import('../release-composition.mjs');
+      const root = fixture();
+      const parentKey = 'node_modules/example-parent';
+      const childKey =
+        variant === 'nested-child'
+          ? `${parentKey}/node_modules/example-child`
+          : 'node_modules/example-child';
+      for (const [key, name] of [
+        [parentKey, 'example-parent'],
+        [childKey, 'example-child'],
+      ]) {
+        const directory = path.join(root, key);
+        fs.mkdirSync(directory, { recursive: true });
+        fs.writeFileSync(
+          path.join(directory, 'package.json'),
+          JSON.stringify({
+            name,
+            version: '1.0.0',
+            ...(key === parentKey ? { scripts: { install: 'example install command' } } : {}),
+          })
+        );
+      }
+      const childOutput = path.join(root, childKey, 'output.js');
+      fs.writeFileSync(childOutput, 'fictional child output');
+      const integrity = `sha512-${Buffer.alloc(64).toString('base64')}`;
+      const fixtureLock = path.join(root, 'package-lock.json');
+      fs.writeFileSync(
+        fixtureLock,
+        JSON.stringify({
+          lockfileVersion: 3,
+          packages: {
+            [parentKey]: { version: '1.0.0', resolved: archiveSource, integrity },
+            [childKey]: { version: '1.0.0', resolved: archiveSource, integrity },
+          },
+        })
+      );
+      const packages = installedMaterials(installedOrigins({ repoRoot, lockFile: fixtureLock }));
+      const scriptHash = sha256('example install command');
+      const event = {
+        kind: 'lifecycle-event',
+        id: 'event:parent',
+        package_material_id: `npm:${parentKey}`,
+        event: 'install',
+        script_sha256: scriptHash,
+      };
+      let outputPath = `${childKey}/output.js`;
+      if (variant === 'symlink-child') {
+        // Exercise output validation independently of the prior tree measurement.
+        fs.symlinkSync(path.join(root, childKey), path.join(root, parentKey, 'linked'));
+        outputPath = `${parentKey}/linked/output.js`;
+      }
+      const prepared = {
+        schema_version: 1,
+        tools: [],
+        distributions: [],
+        packages,
+        lifecycle_events: [event],
+        lifecycle_outputs: [
+          {
+            kind: 'lifecycle-output',
+            id: 'output:parent',
+            package_material_id: event.package_material_id,
+            event: event.event,
+            script_sha256: scriptHash,
+            path: outputPath,
+            size: fs.statSync(childOutput).size,
+            sha256: sha256(fs.readFileSync(childOutput)),
+          },
+        ],
+      };
+      expect(() => validatePreparation(prepared, { installRoot: root, packages })).toThrow(
+        /owner|escape/i
+      );
+    }
+  );
+});
