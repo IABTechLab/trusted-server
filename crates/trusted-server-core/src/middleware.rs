@@ -34,8 +34,10 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+use crate::attestation::PlatformIdentity;
 use crate::integrations::{AttributeRewriteAction, IntegrationDocumentState, ScriptRewriteAction};
 use crate::streaming_processor::StreamProcessor;
 
@@ -128,6 +130,9 @@ pub struct MiddlewareContext<'a> {
     /// Host the document was fetched from, the same for a page served from
     /// the store as for one fetched for this request.
     pub origin_host: &'a str,
+    /// What the adapter reports about the platform the deployment runs on,
+    /// as the attestation evidence carries it.
+    pub platform: &'a PlatformIdentity,
     /// State shared by the middleware working on this document in this
     /// phase.
     pub document_state: &'a IntegrationDocumentState,
@@ -243,9 +248,19 @@ pub trait TextHandler {
     fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction;
 }
 
-/// What a middleware does to one document. A middleware may do several of
-/// these at once, and an action with nothing set leaves the document as it
-/// arrived.
+/// A header a middleware writes on the reader's response.
+pub type ResponseHeader = (HeaderName, HeaderValue);
+
+/// Writes `headers` on `response`, each replacing a header of the same name.
+pub fn write_response_headers<T>(response: &mut http::Response<T>, headers: Vec<ResponseHeader>) {
+    for (name, value) in headers {
+        response.headers_mut().insert(name, value);
+    }
+}
+
+/// What a middleware does to one document and its response. A middleware
+/// may do several of these at once, and an action with nothing set leaves
+/// the document as it arrived.
 #[derive(Default)]
 pub struct MiddlewareAction {
     /// Markup to write in `<head>` ahead of the script bundle, in the order
@@ -261,6 +276,11 @@ pub struct MiddlewareAction {
     pub text_handlers: Vec<Box<dyn TextHandler>>,
     /// A processor over the document the handlers left.
     pub stream: Option<Box<dyn StreamProcessor>>,
+    /// Headers to write on the reader's response, each replacing one of the
+    /// same name. Only a serve middleware may write one, because what a
+    /// fetch middleware leaves is stored for every reader and a header goes
+    /// on one reader's response.
+    pub response_headers: Vec<ResponseHeader>,
 }
 
 impl MiddlewareAction {
@@ -273,7 +293,7 @@ impl MiddlewareAction {
     /// Whether the action leaves the document as it arrived.
     #[must_use]
     pub fn is_pass(&self) -> bool {
-        self.is_stream_only() && self.stream.is_none()
+        self.is_stream_only() && self.stream.is_none() && self.response_headers.is_empty()
     }
 
     /// Whether the action decides nothing about HTML, so it can run on a
@@ -305,6 +325,11 @@ impl MiddlewareAction {
     }
 }
 
+/// The names of `headers`, for a debug view.
+fn header_names(headers: &[ResponseHeader]) -> Vec<&str> {
+    headers.iter().map(|(name, _)| name.as_str()).collect()
+}
+
 impl fmt::Debug for MiddlewareAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -317,6 +342,7 @@ impl fmt::Debug for MiddlewareAction {
             )
             .field("text_handlers", &selectors_of_text(&self.text_handlers))
             .field("stream", &self.stream.is_some())
+            .field("response_headers", &header_names(&self.response_headers))
             .finish()
     }
 }
@@ -673,12 +699,21 @@ impl MiddlewareChain {
                     self.media_type
                 ));
             }
+            if !action.response_headers.is_empty() && self.phase != MiddlewarePhase::Serve {
+                return Err(format!(
+                    "the {} middleware `{}` cannot run, because it writes a response header, \
+                     which only a serve middleware does",
+                    self.phase,
+                    middleware.middleware_id()
+                ));
+            }
             plan.head_inserts.extend(action.head_inserts);
             plan.after_bundle_inserts
                 .extend(action.after_bundle_inserts);
             plan.element_handlers.extend(action.element_handlers);
             plan.text_handlers.extend(action.text_handlers);
             plan.processors.extend(action.stream);
+            plan.response_headers.extend(action.response_headers);
         }
         Ok(plan)
     }
@@ -700,6 +735,9 @@ pub struct MiddlewarePlan {
     pub text_handlers: Vec<Box<dyn TextHandler>>,
     /// Stream processors, each handed what the one before it produced.
     pub processors: Vec<Box<dyn StreamProcessor>>,
+    /// Headers for the reader's response, in the order the middleware were
+    /// named, a later one replacing an earlier of the same name.
+    pub response_headers: Vec<ResponseHeader>,
 }
 
 impl MiddlewarePlan {
@@ -711,6 +749,7 @@ impl MiddlewarePlan {
             && self.element_handlers.is_empty()
             && self.text_handlers.is_empty()
             && self.processors.is_empty()
+            && self.response_headers.is_empty()
     }
 }
 
@@ -726,6 +765,7 @@ impl fmt::Debug for MiddlewarePlan {
             )
             .field("text_handlers", &selectors_of_text(&self.text_handlers))
             .field("processors", &self.processors.len())
+            .field("response_headers", &header_names(&self.response_headers))
             .finish()
     }
 }
@@ -733,23 +773,45 @@ impl fmt::Debug for MiddlewarePlan {
 /// What a module's own tests hand a middleware they call directly.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
+    use std::sync::OnceLock;
+
     use super::{MiddlewareContext, MiddlewarePhase};
+    use crate::attestation::PlatformIdentity;
     use crate::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
     use crate::integrations::IntegrationDocumentState;
 
+    /// The platform a test page is served from, which reports its name and
+    /// nothing else.
+    #[must_use]
+    pub fn platform() -> &'static PlatformIdentity {
+        static PLATFORM: OnceLock<PlatformIdentity> = OnceLock::new();
+        PLATFORM.get_or_init(|| PlatformIdentity::named("test-platform"))
+    }
+
     /// What a middleware is told in `phase` about a test page, fetched from
-    /// [`ORIGIN_HOST`] for a reader of [`REQUEST_HOST`] over HTTPS, with
-    /// `document_state` as the document's.
+    /// [`ORIGIN_HOST`] for a reader of [`REQUEST_HOST`] over HTTPS on
+    /// [`platform`], with `document_state` as the document's.
     #[must_use]
     pub fn context(
         phase: MiddlewarePhase,
         document_state: &IntegrationDocumentState,
     ) -> MiddlewareContext<'_> {
+        context_on(phase, document_state, platform())
+    }
+
+    /// As [`context`], on `platform`.
+    #[must_use]
+    pub fn context_on<'a>(
+        phase: MiddlewarePhase,
+        document_state: &'a IntegrationDocumentState,
+        platform: &'a PlatformIdentity,
+    ) -> MiddlewareContext<'a> {
         MiddlewareContext {
             phase,
             request_host: REQUEST_HOST,
             request_scheme: "https",
             origin_host: ORIGIN_HOST,
+            platform,
             document_state,
             max_buffered_script_bytes: 16 * 1024 * 1024,
         }
