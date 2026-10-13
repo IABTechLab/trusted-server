@@ -687,7 +687,7 @@ mod tests {
             request_state: crate::integrations::IntegrationRequestState::default(),
             permissions_script: None,
         };
-        let processor = create_html_processor_with_middleware(config, &chain, None)
+        let (processor, _) = create_html_processor_with_middleware(config, &chain, None)
             .expect("should plan the asset proxy's middleware");
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
