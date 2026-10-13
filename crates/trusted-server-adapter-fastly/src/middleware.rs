@@ -15,11 +15,12 @@ use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
-    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+    HEADER_X_TS_ENV, HEADER_X_TS_FASTLY_VERSION,
 };
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
 use trusted_server_core::settings::Settings;
+use trusted_server_core::version_header::apply_git_version_header;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 
@@ -41,7 +42,9 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 ///
 /// Headers are written in this order (last write wins):
 /// 1. Geo headers (or `X-Geo-Info-Available: false` when geo is unavailable)
-/// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
+/// 2. `X-TS-Version` from the compiled-in git version
+///    (`TRUSTED_SERVER__GIT_VERSION`), and `X-TS-Fastly-Version` from the
+///    `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Operator-configured `settings.response_headers` (can override any managed header)
 pub struct FinalizeResponseMiddleware {
@@ -149,7 +152,9 @@ pub(crate) fn geo_allowed_for_response(response: &Response) -> bool {
 ///
 /// Header write order (last write wins):
 /// 1. Geo headers (`x-geo-*`) — or `X-Geo-Info-Available: false` when absent
-/// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
+/// 2. `X-TS-Version` from the compiled-in git version
+///    (`TRUSTED_SERVER__GIT_VERSION`), and `X-TS-Fastly-Version` from the
+///    `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
 /// 4. Set-Cookie cache privacy — strip surrogate cache headers and downgrade
 ///    `Cache-Control` to `private, max-age=0` on cookie-bearing responses
@@ -170,13 +175,12 @@ pub(crate) fn apply_finalize_headers(
         );
     }
 
-    if let Ok(v) = std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        if let Ok(value) = HeaderValue::from_str(&v) {
-            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
-        } else {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
-        }
-    }
+    apply_git_version_header(response);
+
+    apply_fastly_version_header(
+        std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
+        response,
+    );
 
     if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
         response
@@ -207,6 +211,25 @@ pub(crate) use trusted_server_core::response_privacy::{
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Sets `X-TS-Fastly-Version` to `service_version`, or removes an inherited
+/// value when the version is unset or invalid, so it is never reported as ours.
+fn apply_fastly_version_header(service_version: Option<&str>, response: &mut Response) {
+    match service_version.map(HeaderValue::from_str) {
+        Some(Ok(value)) => {
+            response
+                .headers_mut()
+                .insert(HEADER_X_TS_FASTLY_VERSION, value);
+        }
+        Some(Err(_)) => {
+            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
+        }
+        None => {
+            response.headers_mut().remove(HEADER_X_TS_FASTLY_VERSION);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -825,5 +848,47 @@ mod tests {
             cookie_count, 2,
             "FinalizeResponseMiddleware must not drop duplicate Set-Cookie headers"
         );
+    }
+
+    #[test]
+    fn version_headers_split_git_and_fastly_versions() {
+        let settings = settings_with_response_headers(vec![]);
+        let mut response = empty_response();
+        response.headers_mut().insert(
+            HEADER_X_TS_FASTLY_VERSION,
+            HeaderValue::from_static("origin-value"),
+        );
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(
+            header("x-ts-version"),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should report the compiled-in git version as x-ts-version"
+        );
+        assert_eq!(
+            header("x-ts-fastly-version"),
+            std::env::var(ENV_FASTLY_SERVICE_VERSION).ok().as_deref(),
+            "should report FASTLY_SERVICE_VERSION as x-ts-fastly-version"
+        );
+    }
+
+    #[test]
+    fn fastly_version_header_removes_inherited_value_when_unknown() {
+        for service_version in [None, Some("bad\nvalue")] {
+            let mut response = empty_response();
+            response.headers_mut().insert(
+                HEADER_X_TS_FASTLY_VERSION,
+                HeaderValue::from_static("origin-value"),
+            );
+
+            apply_fastly_version_header(service_version, &mut response);
+
+            assert!(
+                response.headers().get(HEADER_X_TS_FASTLY_VERSION).is_none(),
+                "should remove an inherited x-ts-fastly-version for {service_version:?}"
+            );
+        }
     }
 }
