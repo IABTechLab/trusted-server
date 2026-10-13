@@ -730,21 +730,20 @@ fn middleware_stream_processors(
     Ok(processors)
 }
 
-/// Runs the preparation of the middleware the entries of `phases` select
-/// for `document`, each as its module with the request's services, keeping
-/// what they prepare in the document's [`Prepared`]. Each phase's
-/// preparations are handed a fresh document state, not the one the plan is
-/// handed, so anything a preparation writes there is dropped.
+/// Runs the preparation of the middleware the entries of each phase in
+/// `phases` select for `document`, each as its module with the context the
+/// phase is given, keeping what they prepare in the document's [`Prepared`].
+/// Each phase's preparations are handed a fresh document state, not the one
+/// the plan is handed, so anything a preparation writes there is dropped.
 ///
 /// # Errors
 ///
 /// The first refusal, which ends the request.
 async fn prepare_document(
     document: &TextResponse<'_>,
-    phases: &[MiddlewarePhase],
+    phases: &[(MiddlewarePhase, &ModuleContext<'_>)],
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
-    module_context: &ModuleContext<'_>,
 ) -> Result<(), Refusal> {
     use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
 
@@ -752,7 +751,7 @@ async fn prepare_document(
     if !is_dispatched_media_type(&media_type) {
         return Ok(());
     }
-    for phase in phases {
+    for (phase, module_context) in phases {
         let chain = integration_registry.middleware_chain(
             settings.phase_entries(*phase),
             *phase,
@@ -784,10 +783,11 @@ async fn prepare_document(
     Ok(())
 }
 
-/// The context the preparations of a document are called with. A document
-/// that may be stored is prepared in the fetch phase alone, and is handed
-/// the request's services and nothing of the reader, because what its
-/// preparations answer is stored with it.
+/// The context a phase's preparations of a document are called with. The
+/// fetch phase of a document that may be stored is handed the request's
+/// services and nothing of the reader, because what its preparations answer
+/// is stored with the document. Every other preparation, the serve phase's
+/// on every document included, is handed the reader's state.
 fn preparation_context<'r>(
     request: ModuleRequest<'r>,
     stored: bool,
@@ -800,6 +800,28 @@ fn preparation_context<'r>(
     } else {
         context.with_request_state(ec_context, services)
     }
+}
+
+/// The contexts the two phases of a fetched document are prepared with. The
+/// fetch phase's carries the services alone when the document may be stored,
+/// because what it answers is stored with the document, and the serve
+/// phase's carries the reader's state on every document, because what it
+/// answers is this reader's, so the reader a document is fetched for is
+/// prepared as every later reader of the stored copy is.
+fn preparation_contexts<'r>(
+    request_method: &'r Method,
+    request_host: &'r str,
+    request_scheme: &'r str,
+    request_path: &'r str,
+    stored: bool,
+    ec_context: &'r EcContext,
+    services: &'r RuntimeServices,
+) -> (ModuleContext<'r>, ModuleContext<'r>) {
+    let request = || ModuleRequest::new(request_method, request_host, request_scheme, request_path);
+    (
+        preparation_context(request(), stored, ec_context, services),
+        preparation_context(request(), false, ec_context, services),
+    )
 }
 
 /// The response a refusal answers the request with: its status,
@@ -5578,10 +5600,9 @@ pub async fn handle_publisher_request(
                     };
                     if let Err(refusal) = prepare_document(
                         &document,
-                        &[MiddlewarePhase::Serve],
+                        &[(MiddlewarePhase::Serve, &module_context)],
                         settings,
                         integration_registry,
-                        &module_context,
                     )
                     .await
                     {
@@ -5893,15 +5914,15 @@ pub async fn handle_publisher_request(
 
     let prepared = Arc::new(Prepared::default());
     if route == ResponseRoute::Stream {
-        let stored = template_cache_key.is_some();
-        let phases: &[MiddlewarePhase] = if stored {
-            &[MiddlewarePhase::Fetch]
-        } else {
-            &MiddlewarePhase::ALL
-        };
-        let module_request =
-            ModuleRequest::new(&request_method, request_host, request_scheme, &request_path);
-        let module_context = preparation_context(module_request, stored, ec_context, services);
+        let (fetch_context, serve_context) = preparation_contexts(
+            &request_method,
+            request_host,
+            request_scheme,
+            &request_path,
+            template_cache_key.is_some(),
+            ec_context,
+            services,
+        );
         let document = TextResponse {
             content_type: &content_type,
             request_path: &request_path,
@@ -5914,10 +5935,12 @@ pub async fn handle_publisher_request(
         };
         if let Err(refusal) = prepare_document(
             &document,
-            phases,
+            &[
+                (MiddlewarePhase::Fetch, &fetch_context),
+                (MiddlewarePhase::Serve, &serve_context),
+            ],
             settings,
             integration_registry,
-            &module_context,
         )
         .await
         {
@@ -21621,6 +21644,49 @@ mod tests {
             (false, false),
             "should hand a document that may be stored neither the reader's permissions nor              Edge Cookie"
         );
+    }
+
+    #[test]
+    fn the_serve_phase_of_a_document_that_may_be_stored_is_prepared_for_the_reader() {
+        use crate::module_context::{EdgeCookie, FromModuleContext};
+
+        let ec_context = EcContext::new_for_test(
+            Some(crate::ec::tests::CANONICAL_COOKIE_VALUE.to_owned()),
+            ConsentContext::default(),
+        )
+        .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
+        let services = noop_services();
+        let method = Method::GET;
+        let handed = |context: &ModuleContext<'_>| {
+            let call = context.call("testing.preparation", PermissionSet::none());
+            (
+                <&PermissionState>::from_module_context(&call).is_ok(),
+                EdgeCookie::from_module_context(&call).is_ok(),
+            )
+        };
+
+        for stored in [true, false] {
+            let (fetch, serve) = preparation_contexts(
+                &method,
+                "publisher.example",
+                "https",
+                "/article",
+                stored,
+                &ec_context,
+                &services,
+            );
+
+            assert_eq!(
+                handed(&fetch),
+                (!stored, !stored),
+                "the fetch phase should see the reader only when the document is not stored"
+            );
+            assert_eq!(
+                handed(&serve),
+                (true, true),
+                "the serve phase should see the reader whether or not the document is stored"
+            );
+        }
     }
 
     #[test]
