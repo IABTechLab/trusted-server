@@ -2976,11 +2976,15 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         completedSlots.forEach(consumeGptPublisherRefreshSuppression);
         recordPrebidRefreshForDiagnostics(completedSlots);
         if (targetingApplied) {
-          recordCompletedPrebidAuction(
-            completedAuctionId,
-            completedAuctionSlots,
-            completedAdUnitCodes
-          );
+          try {
+            recordCompletedPrebidAuction(
+              completedAuctionId,
+              completedAuctionSlots,
+              completedAdUnitCodes
+            );
+          } catch {
+            // Auction diagnostics must not suppress the publisher's GAM refresh.
+          }
         }
         // Preserve the publisher's original refresh form unless one losing
         // first-impression slot was filtered. A delayed bare call must also

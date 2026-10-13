@@ -12,7 +12,9 @@ use std::time::Duration;
 use http::{Extensions, HeaderName, HeaderValue, Response};
 use uuid::Uuid;
 
-use crate::cache_policy::{EDGE_CACHE_HEADER_NAMES, cache_control_headers_are_private_or_no_store};
+use crate::cache_policy::{
+    EDGE_CACHE_HEADER_NAMES, cache_control_headers_have_bare_private_or_no_store,
+};
 
 /// `Server-Timing` header name. Not present in the `http` crate's `header`
 /// module (unlike `CACHE_CONTROL` etc.), so declared locally following the
@@ -329,7 +331,9 @@ impl Default for RequestTimings {
 /// otherwise be omitted: this only gates emission, it does not touch
 /// `Cache-Control`. Emission is also suppressed when a recognized CDN or
 /// surrogate cache-control header is present, since it may allow shared
-/// caching despite a private `Cache-Control` value.
+/// caching despite a private `Cache-Control` value. Privacy requires a bare
+/// `private` or `no-store` directive; field-qualified `private="..."` protects
+/// only named headers and does not authorize request-specific timing emission.
 ///
 /// Generic over the response body type so every adapter's terminal layer can
 /// call the same emission logic regardless of which body type its HTTP stack
@@ -342,7 +346,7 @@ pub fn append_server_timing_if_private<B>(
     timings.mark_headers_ready();
 
     let headers = response.headers();
-    let conclusively_private = cache_control_headers_are_private_or_no_store(headers)
+    let conclusively_private = cache_control_headers_have_bare_private_or_no_store(headers)
         && !EDGE_CACHE_HEADER_NAMES
             .iter()
             .any(|name| headers.contains_key(*name));
@@ -835,6 +839,80 @@ mod tests {
             assert!(
                 response.headers().get("server-timing").is_none(),
                 "should suppress Server-Timing without private/no-store Cache-Control"
+            );
+        }
+    }
+
+    #[test]
+    fn append_server_timing_requires_a_bare_privacy_directive() {
+        for cache_control in [
+            "private=\"Set-Cookie\", max-age=600",
+            "public, s-maxage=600, private=\"Set-Cookie\"",
+            "private = \"Set-Cookie\"",
+            "private=Set-Cookie",
+            "private=\"cache-control, no-store\"",
+            "private=\"\"",
+            "private; extension",
+            "no-store=\"field\"",
+            "not-private, no-storey",
+            "ext=\"private,no-store\", max-age=600",
+            r#"ext="escaped\",private,no-store", max-age=600"#,
+        ] {
+            let mut response = Response::builder()
+                .header("cache-control", cache_control)
+                .header("server-timing", "upstream;dur=1.0")
+                .body(())
+                .expect("should build a response without whole-response privacy");
+            let timings = RequestTimings::new();
+
+            append_server_timing_if_private(&mut response, &timings, true);
+
+            assert_eq!(
+                response.headers().get_all("server-timing").iter().count(),
+                1,
+                "should not append timing for Cache-Control: {cache_control}"
+            );
+            assert_eq!(
+                response.headers()["server-timing"],
+                "upstream;dur=1.0",
+                "should preserve upstream timing"
+            );
+            assert_eq!(
+                response.headers()["cache-control"],
+                cache_control,
+                "should not rewrite the cache policy"
+            );
+            assert!(
+                timings.snapshot().time_elapsed_ms.is_some(),
+                "should freeze timing even when the policy suppresses emission"
+            );
+        }
+    }
+
+    #[test]
+    fn append_server_timing_accepts_bare_privacy_among_qualified_directives() {
+        for cache_control in [
+            "private",
+            " No-Store ",
+            "PRIVATE, max-age=60",
+            "private=\"Set-Cookie\", no-store",
+            "ext=\"private,no-store\", private",
+            r#"ext="escaped\",private,no-store", PRIVATE"#,
+        ] {
+            let mut response = Response::builder()
+                .header("cache-control", "private=\"Set-Cookie\"")
+                .body(())
+                .expect("should build a field-qualified response");
+            response.headers_mut().append(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_str(cache_control).expect("should build a cache-control value"),
+            );
+
+            append_server_timing_if_private(&mut response, &RequestTimings::new(), true);
+
+            assert!(
+                response.headers().get("server-timing").is_some(),
+                "should recognize whole-response privacy across all header values: {cache_control}"
             );
         }
     }

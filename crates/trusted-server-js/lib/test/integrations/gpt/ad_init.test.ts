@@ -292,6 +292,58 @@ describe('installTsAdInit', () => {
     try {
       const recordTrustedServerOpportunity = vi.fn();
       const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: '1.10',
+          hb_bidder: 'example-bidder',
+          hb_adid: 'example-fallback-ad',
+          hb_auction_id: 'example-fallback-auction',
+          adm: '<div>Fallback</div>',
+        },
+        recordTrustedServerOpportunity
+      );
+      const ts = (window as TestWindow).tsjs as TsjsApi;
+      ts.navGeneration = 1;
+      ts.auctionDiagnostics = { auctionDispatchedMs: 17, auctionResolvedMs: 93 };
+      registerPublisherFirstImpressionAuctions(ts, ['div-atf-sidebar']);
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      ts.adInit!();
+
+      expect(mockPubads.refresh).not.toHaveBeenCalled();
+      ts.auctionDiagnostics = { auctionDispatchedMs: 31, auctionResolvedMs: 144 };
+      vi.advanceTimersByTime(5001);
+
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+      expect(mockPubads.refresh).toHaveBeenCalledOnce();
+      expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledOnce();
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+        mockSlot,
+        'atf_sidebar_ad',
+        'renderable_candidate',
+        'example-fallback-auction',
+        [[300, 250]],
+        {
+          auctionType: 'trusted_server',
+          winner: { bidder: 'example-bidder', priceBucket: '1.10' },
+          serverTimings: { auctionDispatchedMs: 17, auctionResolvedMs: 93 },
+        }
+      );
+
+      vi.advanceTimersByTime(10_000);
+      expect(mockPubads.refresh).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps fallback delivery when the diagnostics recorder throws', async () => {
+    vi.useFakeTimers();
+    try {
+      const recordTrustedServerOpportunity = vi.fn(() => {
+        throw new Error('fallback diagnostics unavailable');
+      });
+      const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
         { hb_pb: '1.10', hb_adid: 'example-fallback-ad', adm: '<div>Fallback</div>' },
         recordTrustedServerOpportunity
       );
@@ -301,13 +353,11 @@ describe('installTsAdInit', () => {
       installTsAdInit();
       ts.adInit!();
 
-      expect(mockPubads.refresh).not.toHaveBeenCalled();
-      vi.advanceTimersByTime(5001);
-
+      expect(() => vi.advanceTimersByTime(5001)).not.toThrow();
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledOnce();
       expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
       expect(mockPubads.refresh).toHaveBeenCalledOnce();
       expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
-      expect(recordTrustedServerOpportunity).toHaveBeenCalledOnce();
 
       vi.advanceTimersByTime(10_000);
       expect(mockPubads.refresh).toHaveBeenCalledOnce();

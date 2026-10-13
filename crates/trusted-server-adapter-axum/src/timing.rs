@@ -76,7 +76,9 @@ where
     type Response = Response<AxumBody>;
 
     fn call(&mut self, mut req: Request<AxumBody>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        // Readiness belongs to the polled instance, not necessarily its clone.
+        let replacement = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, replacement);
 
         // Bypass installation and finalization for `/health`, regardless of method.
         // A preinstalled collector remains available to the inner service.
@@ -105,6 +107,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::{Ready, ready};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use axum::http::header::CACHE_CONTROL;
     use axum::http::{HeaderValue, StatusCode};
@@ -115,6 +121,83 @@ mod tests {
     use edgezero_core::http::response_builder;
     use edgezero_core::router::RouterService;
     use tower::{ServiceExt as _, service_fn};
+
+    struct ReadinessSensitiveService {
+        readied: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Clone for ReadinessSensitiveService {
+        fn clone(&self) -> Self {
+            Self {
+                readied: false,
+                calls: Arc::clone(&self.calls),
+            }
+        }
+    }
+
+    impl Service<Request<AxumBody>> for ReadinessSensitiveService {
+        type Response = Response<AxumBody>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.readied = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<AxumBody>) -> Self::Future {
+            assert!(
+                self.readied,
+                "should call the instance whose readiness permit was reserved"
+            );
+            self.readied = false;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(Response::builder()
+                .header(CACHE_CONTROL, "private")
+                .body(AxumBody::empty())
+                .expect("should build a private fixture response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn axum_calls_the_readied_instance_on_timed_and_health_paths() {
+        for path in ["/private", "/health"] {
+            for enabled in [true, false] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let inner = ReadinessSensitiveService {
+                    readied: false,
+                    calls: Arc::clone(&calls),
+                };
+                let mut service = TimingService::new(inner, enabled);
+
+                for expected_calls in 1..=2 {
+                    let request = Request::builder()
+                        .uri(path)
+                        .body(AxumBody::empty())
+                        .expect("should build a request for readiness testing");
+                    let response = service
+                        .ready()
+                        .await
+                        .expect("should reserve readiness")
+                        .call(request)
+                        .await
+                        .expect("should call the readied service");
+
+                    assert_eq!(
+                        calls.load(Ordering::Relaxed),
+                        expected_calls,
+                        "should forward each request exactly once"
+                    );
+                    assert_eq!(
+                        header(&response, "server-timing").is_some(),
+                        enabled && path != HEALTH_PATH,
+                        "should preserve the timing flag and health bypass"
+                    );
+                }
+            }
+        }
+    }
 
     /// Builds a private (`cache-control: private, no-store`) response for a
     /// handler under test.

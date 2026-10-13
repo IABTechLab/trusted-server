@@ -4393,6 +4393,67 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     return { originalRefresh, pubads };
   }
 
+  it.each(['onEvent registration', 'diagnostics recorder access'])(
+    'issues one GAM refresh when %s throws during auction diagnostics setup',
+    (failure) => {
+      vi.useFakeTimers();
+      mockOnEvent.mockReset();
+      try {
+        const code = `example-diagnostics-${failure.replaceAll(' ', '-')}`;
+        const slot = {
+          getSlotElementId: () => code,
+          getTargeting: () => [],
+          getSizes: () => [[300, 250]],
+          clearTargeting: vi.fn(),
+        };
+        const { originalRefresh, pubads } = installGpt([slot]);
+        const element = document.createElement('div');
+        element.id = code;
+        document.body.appendChild(element);
+        installPrebidNpm();
+        mockPbjs.setTargetingForGPTAsync = vi.fn();
+        let bidsBackHandler: ((...args: unknown[]) => void) | undefined;
+        mockRequestBids.mockImplementation((options) => {
+          bidsBackHandler = options.bidsBackHandler;
+        });
+        if (failure === 'onEvent registration') {
+          testWindow.tsjs = {
+            gptDiagnosticsRecorder: {
+              recordPrebidAuction: vi.fn(),
+            } as unknown as TsjsApi['gptDiagnosticsRecorder'],
+          };
+          mockOnEvent.mockImplementation(() => {
+            throw new Error('publisher onEvent failed');
+          });
+        } else {
+          testWindow.tsjs = {};
+          Object.defineProperty(testWindow.tsjs, 'gptDiagnosticsRecorder', {
+            configurable: true,
+            get: () => {
+              throw new Error('diagnostics recorder unavailable');
+            },
+          });
+        }
+
+        pubads.refresh([slot]);
+        expect(bidsBackHandler).toBeTypeOf('function');
+
+        bidsBackHandler!({}, false, 'example-diagnostics-auction');
+        if (failure === 'onEvent registration') {
+          expect(mockOnEvent).toHaveBeenCalledWith('bidWon', expect.any(Function));
+        }
+        vi.advanceTimersByTime(640);
+        bidsBackHandler!({}, false, 'example-diagnostics-auction');
+
+        expect(originalRefresh).toHaveBeenCalledOnce();
+        expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+      } finally {
+        mockOnEvent.mockReset();
+        vi.useRealTimers();
+      }
+    }
+  );
+
   function refreshAdUnitFromLastRequest():
     | (Record<string, unknown> & { code?: string; bids?: TestBid[] })
     | undefined {

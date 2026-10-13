@@ -1139,7 +1139,8 @@ function schedulePublisherFirstImpressionFallback(
   slot: AuctionSlot,
   bid: AuctionBidData,
   element: HTMLElement,
-  generation: number
+  generation: number,
+  auctionDiagnostics: AuctionDiagnosticsData | undefined
 ): void {
   if (!reservePublisherFirstImpressionFallback(ts, element)) return;
 
@@ -1212,13 +1213,25 @@ function schedulePublisherFirstImpressionFallback(
       if (tsOwned) (ts.prevGptSlots ??= []).push(gptSlot);
 
       try {
-        ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-          gptSlot,
-          slot.id,
-          trustedServerOpportunity(bid),
-          bid.hb_auction_id,
-          slot.formats
-        );
+        const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
+        if (auctionFacts) {
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            trustedServerOpportunity(bid),
+            bid.hb_auction_id,
+            slot.formats,
+            auctionFacts
+          );
+        } else {
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            trustedServerOpportunity(bid),
+            bid.hb_auction_id,
+            slot.formats
+          );
+        }
       } catch {
         // Diagnostics must not alter fallback delivery.
       }
@@ -1361,7 +1374,15 @@ export function installTsAdInit(): void {
         if (!firstImpression) {
           const claim = firstImpressionClaim(ts, el);
           if (claim?.owner === 'publisher') {
-            schedulePublisherFirstImpressionFallback(ts, g, slot, bid, el, generation);
+            schedulePublisherFirstImpressionFallback(
+              ts,
+              g,
+              slot,
+              bid,
+              el,
+              generation,
+              auctionDiagnostics
+            );
           }
           return;
         }
