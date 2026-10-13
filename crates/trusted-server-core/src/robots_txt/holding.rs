@@ -892,7 +892,10 @@ pub(crate) mod tests {
             .kv_store(Arc::new(crate::platform::UnavailableKvStore))
             .backend(Arc::new(crate::platform::test_support::NoopBackend))
             .http_client(Arc::new(StubHttpClient::new()))
-            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
             .value_cache(Arc::clone(&value_cache) as Arc<dyn crate::platform::PlatformValueCache>)
             .loading_caches(Arc::new(crate::platform::LoadingCaches::every(Arc::new(
                 MemoryLoadingCache::default(),

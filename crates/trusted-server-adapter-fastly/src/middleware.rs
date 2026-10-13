@@ -17,11 +17,12 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
+use trusted_server_core::evidence::BorrowedRequestInfo;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
 use trusted_server_core::integrations::IntegrationRegistry;
-use trusted_server_core::module_context::ModuleRequest;
-use trusted_server_core::platform::{ClientInfo, PlatformGeo, RuntimeServices};
+use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
+use trusted_server_core::platform::{ClientInfo, GeoModule, RuntimeServices};
 use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::settings::Settings;
 
@@ -50,7 +51,7 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 /// 4. Operator-configured `settings.response_headers` (can override any managed header)
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
-    geo: Arc<dyn PlatformGeo>,
+    geo: Arc<dyn GeoModule>,
     /// The services a geo module is given for the response-side lookup.
     /// Built once with the application and cloned per request with that
     /// request's client metadata applied.
@@ -65,7 +66,7 @@ impl FinalizeResponseMiddleware {
     /// geo lookup service, and the services graph handed to the geo module.
     pub fn new(
         settings: Arc<Settings>,
-        geo: Arc<dyn PlatformGeo>,
+        geo: Arc<dyn GeoModule>,
         services: RuntimeServices,
     ) -> Self {
         Self {
@@ -112,6 +113,20 @@ impl Middleware for FinalizeResponseMiddleware {
                 .with_prefixes(Prefixes::trusted_server(&self.settings)),
         };
 
+        // What the geo module's call carries, kept here because the request
+        // goes into the handler and does not come back.
+        let method = ctx.request().method().clone();
+        let uri = ctx.request().uri().clone();
+        let headers = ctx.request().headers().clone();
+        let scheme = uri.scheme_str().unwrap_or("https").to_owned();
+        let host = ctx
+            .request()
+            .headers()
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
             Err(e) => {
@@ -121,12 +136,25 @@ impl Middleware for FinalizeResponseMiddleware {
         };
 
         let geo_info = if geo_allowed_for_response(&response) {
-            let services = services.clone().with_client_info(ClientInfo {
+            let client_info = ClientInfo {
                 client_ip,
                 ..ClientInfo::default()
-            });
+            };
+            let services = services.clone().with_client_info(client_info.clone());
+            // The module is called as the device module is, with the request
+            // as evidence, so a module whose one service answers location
+            // and device can answer both from one call.
+            let address = client_ip.map(|ip| ip.to_string()).unwrap_or_default();
+            let evidence = BorrowedRequestInfo::new(&address, Some(&headers))
+                .with_request_target(uri.path(), uri.query().unwrap_or_default());
+            let context =
+                ModuleContext::new(ModuleRequest::new(&method, &host, &scheme, uri.path()))
+                    .with_evidence(&evidence)
+                    .with_settings(&self.settings)
+                    .with_services(&services)
+                    .with_client(&client_info);
             self.geo
-                .lookup(client_ip, &services)
+                .locate(context.call(self.geo.id(), self.geo.required_permissions()))
                 .await
                 .unwrap_or_else(|e| {
                     log::warn!("geo lookup failed: {e}");
@@ -624,9 +652,12 @@ mod tests {
         let lookups = Arc::new(Mutex::new(Vec::new()));
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(RecordingGeo {
-                lookups: Arc::clone(&lookups),
-            }),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "recording",
+                Arc::new(RecordingGeo {
+                    lookups: Arc::clone(&lookups),
+                }),
+            )),
             test_finalize_services(),
         );
         let mut ctx = empty_ctx();
@@ -661,9 +692,12 @@ mod tests {
         let lookups = Arc::new(Mutex::new(Vec::new()));
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(RecordingGeo {
-                lookups: Arc::clone(&lookups),
-            }),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "recording",
+                Arc::new(RecordingGeo {
+                    lookups: Arc::clone(&lookups),
+                }),
+            )),
             test_finalize_services(),
         );
         let mut ctx = empty_ctx();
@@ -697,9 +731,12 @@ mod tests {
         let lookups = Arc::new(Mutex::new(Vec::new()));
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(RecordingGeo {
-                lookups: Arc::clone(&lookups),
-            }),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "recording",
+                Arc::new(RecordingGeo {
+                    lookups: Arc::clone(&lookups),
+                }),
+            )),
             test_finalize_services(),
         );
         let mut ctx = empty_ctx();
@@ -728,7 +765,10 @@ mod tests {
         let settings = settings_with_response_headers(vec![]);
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(FixedGeo(None)),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "fixed",
+                Arc::new(FixedGeo(None)),
+            )),
             test_finalize_services(),
         );
         let handler =
@@ -754,7 +794,10 @@ mod tests {
         let settings = settings_with_response_headers(vec![]);
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(FixedGeo(None)),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "fixed",
+                Arc::new(FixedGeo(None)),
+            )),
             test_finalize_services(),
         );
         let handler =
@@ -780,7 +823,10 @@ mod tests {
         let settings = settings_with_response_headers(vec![]);
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(FixedGeo(None)),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "fixed",
+                Arc::new(FixedGeo(None)),
+            )),
             test_finalize_services(),
         );
         let handler = Arc::new(|_ctx: RequestContext| async move {
@@ -818,7 +864,10 @@ mod tests {
         let settings = settings_with_response_headers(vec![]);
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(PanicGeo),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "panic",
+                Arc::new(PanicGeo),
+            )),
             test_finalize_services(),
         );
         let handler = Arc::new(|_ctx: RequestContext| async move {
@@ -854,7 +903,10 @@ mod tests {
         let settings = settings_with_response_headers(vec![]);
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(FixedGeo(None)),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "fixed",
+                Arc::new(FixedGeo(None)),
+            )),
             test_finalize_services(),
         );
         let handler = Arc::new(|_ctx: RequestContext| async move {
@@ -901,7 +953,10 @@ mod tests {
     fn finalized(path: &str, settings: Settings) -> Response {
         let middleware = FinalizeResponseMiddleware::new(
             Arc::new(settings),
-            Arc::new(FixedGeo(None)),
+            Arc::new(trusted_server_core::platform::PlatformGeoModule::new(
+                "fixed",
+                Arc::new(FixedGeo(None)),
+            )),
             test_finalize_services(),
         );
         let handler = Arc::new(|_ctx: RequestContext| async move {

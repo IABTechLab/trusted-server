@@ -45,7 +45,7 @@ use trusted_server_core::middleware::{
 };
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformGeoModule,
     PlatformSecretStore, RuntimeServices, StoreId, StoreName,
     UnavailableHttpClient, UnavailableKvStore,
 };
@@ -185,7 +185,7 @@ pub fn runtime_services() -> RuntimeServices {
         .kv_store(Arc::new(UnavailableKvStore))
         .backend(Arc::new(FixtureBackend))
         .http_client(Arc::new(UnavailableHttpClient))
-        .geo(Arc::new(FixtureGeo))
+        .geo(Arc::new(PlatformGeoModule::new("fixture", Arc::new(FixtureGeo))))
         .client_info(ClientInfo::default())
         .build()
 }
@@ -402,26 +402,34 @@ this repository that leaves the declaration out.
 The build function returns an `IntegrationRegistration`, built with the
 builder every integration uses.
 
-| Declaration                                           | What it does                                                                                    |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                             |
-| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                            |
-| `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                           |
-| `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it |
-| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`                 |
-| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle                 |
-| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag             |
-| `.without_js()`                                       | Ships no browser script                                                                         |
-| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                         |
-| `.with_geo_module(name, ...)`                         | Offers a geo module that `[geo] module` may select by that name                                 |
-| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                           |
-| `.with_prefix_module(name, ...)`                      | Offers a prefix module that `[prefix] module` may select by that name                           |
-| `.with_robots_txt_contributor(name, ...)`             | Offers rules for `/robots.txt` that `[robots-txt] modules` may select by that name              |
+| Declaration                                           | What it does                                                                                                    |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                                             |
+| `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                                            |
+| `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                                           |
+| `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it                 |
+| `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`                                 |
+| `.with_deferred_js()`                                 | Serves the script as its own `<script defer>` tag instead of in the main bundle                                 |
+| `.with_standalone_js()`                               | Serves the script only on its own path, for an integration that injects its own tag                             |
+| `.without_js()`                                       | Ships no browser script                                                                                         |
+| `.with_ec_module(name, ...)`                          | Offers an Edge Cookie module that `[ec] module` may select by that name                                         |
+| `.with_geo_module(name, ...)`                         | Offers a geo module, called with the request as a device module is, that `[geo] module` may select by that name |
+| `.with_device_module(name, ...)`                      | Offers a device module that `[device] module` may select by that name                                           |
+| `.with_prefix_module(name, ...)`                      | Offers a prefix module that `[prefix] module` may select by that name                                           |
+| `.with_robots_txt_contributor(name, ...)`             | Offers rules for `/robots.txt` that `[robots-txt] modules` may select by that name                              |
 
 The three script delivery choices are exclusive and the last call wins.
 
 Each of the last four takes the module's name, which is the path under
 `crates/` of the crate the module lives in, as `module_name!()` gives it.
+
+A geo module is a `GeoModule`, called with the request's module call as a
+device module is, so it sees the request's evidence, the settings and the
+services, and a module whose one service answers location and device from
+the same request can answer both from one call. A module that resolves from
+the client address alone implements `PlatformGeo` and is offered through
+`PlatformGeoModule::new(name, module)`, which hands the platform lookup the
+address the call carries, as the example above does.
 `[ec] module`, `[geo] module` and `[device] module` read a written name the
 way a section does, as written or with the type folder (`edgecookie`, `geo`
 or `device`) in front, so a geo module from `crates/geo/example` is selected

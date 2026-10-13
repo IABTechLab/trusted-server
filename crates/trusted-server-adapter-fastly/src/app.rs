@@ -3149,7 +3149,12 @@ mod tests {
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::new(StreamingHttpClient))
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .geo(Arc::new(
+                trusted_server_core::platform::PlatformGeoModule::new(
+                    "platform",
+                    Arc::new(crate::platform::FastlyPlatformGeo),
+                ),
+            ))
             .client_info(ClientInfo::default())
             .build()
     }

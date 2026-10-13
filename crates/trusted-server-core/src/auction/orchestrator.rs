@@ -6803,7 +6803,10 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
-            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
             ))
@@ -6869,7 +6872,10 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
-            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
             ))
@@ -6929,7 +6935,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::clone(&backend) as Arc<_>)
                 .http_client(Arc::clone(&http) as Arc<_>)
-                .geo(Arc::new(crate::platform::test_support::NoopGeo))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(crate::platform::test_support::NoopGeo),
+                )))
                 .auction_telemetry_sink(Arc::new(
                     crate::auction::telemetry::NoopAuctionTelemetrySink,
                 ))
@@ -7017,7 +7026,10 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
-            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
             ))
@@ -7072,7 +7084,10 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
-            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
             .auction_telemetry_sink(Arc::new(
                 crate::auction::telemetry::NoopAuctionTelemetrySink,
             ))

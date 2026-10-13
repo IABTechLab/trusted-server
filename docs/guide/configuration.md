@@ -881,7 +881,7 @@ TRUSTED_SERVER__DEVICE__MODULE=builtin
 
 ## Geo Configuration
 
-Selects how a client IP is resolved into geolocation (country, region, coordinates), mirroring the Edge Cookie module selection. The resolved country also feeds the [permission model](/guide/permission-model).
+Selects the module that resolves the request into geolocation (country, region, coordinates), mirroring the Edge Cookie module selection. The module is called with the request as a device module is, so a module may resolve from more than the client address. The resolved country also feeds the [permission model](/guide/permission-model).
 
 ### `[geo]`
 

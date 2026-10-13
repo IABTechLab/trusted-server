@@ -635,6 +635,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                 settings,
                 &mut response,
                 client_ip,
+                kept.module_request(),
                 entry_point_finalize_services(settings, &app_state, kept.module_request()),
             ));
         } else {
@@ -644,6 +645,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                         &settings,
                         &mut response,
                         client_ip,
+                        kept.module_request(),
                         entry_point_finalize_services(&settings, &app_state, kept.module_request()),
                     ));
                 }
@@ -772,21 +774,30 @@ async fn apply_entry_point_finalize_headers(
     settings: &Settings,
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
+    request: ModuleRequest<'_>,
     services: RuntimeServices,
 ) {
     // Route through the [geo] module selector, so a deployment that opts
     // out of geolocation makes no host geo call on the entry-point finalize
-    // path either.
+    // path either. The module is called with the request's view and the
+    // client, as every geo call is; no headers survive to here.
     let geo = build_geo_module(settings, Arc::new(FastlyPlatformGeo));
     let geo_info = if geo_allowed_for_response(response) {
-        let services = services.with_client_info(ClientInfo {
+        let client_info = ClientInfo {
             client_ip,
             ..ClientInfo::default()
-        });
-        geo.lookup(client_ip, &services).await.unwrap_or_else(|e| {
-            log::warn!("entry-point geo lookup failed: {e}");
-            None
-        })
+        };
+        let services = services.with_client_info(client_info.clone());
+        let context = ModuleContext::new(request)
+            .with_settings(settings)
+            .with_services(&services)
+            .with_client(&client_info);
+        geo.locate(context.call(geo.id(), geo.required_permissions()))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("entry-point geo lookup failed: {e}");
+                None
+            })
     } else {
         None
     };

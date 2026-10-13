@@ -327,10 +327,28 @@ pub async fn handle_auction(
     }
     let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
 
-    // Look up geo for device info.
-    let geo = services
-        .geo()
-        .lookup(services.client_info().client_ip, services)
+    // Look up geo for device info, through the module call a page's request
+    // makes, so the geo module sees the request as it does on a page.
+    let address = services
+        .client_info()
+        .client_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let evidence = crate::evidence::BorrowedRequestInfo::new(&address, Some(http_req.headers()))
+        .with_request_target(
+            http_req.uri().path(),
+            http_req.uri().query().unwrap_or_default(),
+        );
+    let geo_context = crate::module_context::ModuleContext::new(
+        crate::module_context::ModuleRequest::of(&http_req, services.client_info()),
+    )
+    .with_evidence(&evidence)
+    .with_settings(settings)
+    .with_services(services)
+    .with_client(services.client_info());
+    let geo_module = services.geo();
+    let geo = geo_module
+        .locate(geo_context.call(geo_module.id(), geo_module.required_permissions()))
         .await
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
@@ -687,7 +705,10 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(NoopBackend))
             .http_client(Arc::new(NoopHttpClient))
-            .geo(Arc::new(NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(NoopGeo),
+            )))
             .auction_telemetry_sink(telemetry_sink)
             .client_info(ClientInfo::default())
             .build()
@@ -1028,7 +1049,10 @@ mod tests {
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::new(NoopBackend))
             .http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>)
-            .geo(Arc::new(NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(NoopGeo),
+            )))
             .client_info(ClientInfo::default())
             .build();
         let consent = ConsentContext {
