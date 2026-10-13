@@ -465,7 +465,7 @@ def _audit_configuration(repo, inherited):
 
 
 def _source_roots(repo, entries):
-    roots = {".cargo", "scripts/release", "crates/trusted-server-js/lib/test"}
+    roots = {".cargo", "scripts/release", "crates/trusted-server-js/lib"}
     for name in entries:
         parts = Path(name).parts
         if parts[0] == "crates":
@@ -495,6 +495,12 @@ def _check_source_parents(repo, path):
 
 
 def _unexpected_sources(repo, entries):
+    """Audit all JS validation sources, separating direct npm build materials.
+
+    Prepared node_modules contents require a separate material audit. Cargo's
+    exact empty npm-ci lock is coordination state; other lib files are sources.
+    """
+    library = repo / "crates/trusted-server-js/lib"
     for relative in sorted(_source_roots(repo, entries)):
         root = repo / relative
         _check_source_parents(repo, root)
@@ -506,6 +512,17 @@ def _unexpected_sources(repo, entries):
             for name in children + filenames:
                 path = Path(directory) / name
                 relative_path = str(path.relative_to(repo))
+                if path == library / "node_modules":
+                    if not stat.S_ISDIR(path.lstat().st_mode):
+                        raise ValueError("direct node_modules must be a regular directory")
+                    children.remove(name)
+                    continue
+                if path == library / ".tsjs-npm-ci.lock":
+                    information = path.lstat()
+                    if (not stat.S_ISREG(information.st_mode)
+                            or information.st_size != 0 or information.st_nlink != 1):
+                        raise ValueError(".tsjs-npm-ci.lock must be an empty single-link regular file")
+                    continue
                 if path.is_symlink() and relative_path not in entries:
                     raise ValueError("unexpected source symlink")
                 if not path.is_dir() and relative_path not in entries:

@@ -15,6 +15,8 @@ RELEASE = Path(__file__).resolve().parents[1]
 ROOT = RELEASE.parents[1]
 DISCOVERED_TEST_SOURCES = (
     "crates/trusted-server-js/lib/test/extra.test.ts",
+    "crates/trusted-server-js/lib/unreviewed/extra.test.ts",
+    "crates/trusted-server-js/lib/unreviewed/nested/extra.test.ts",
     "crates/example/tests/extra.rs",
     "crates/example/benches/extra.rs",
     "crates/example/examples/extra.rs",
@@ -344,9 +346,11 @@ class SourceTests(unittest.TestCase):
                 unexpected.write_text("// Example unexpected executable test source\n")
                 self.assertTrue(self.git("check-ignore", relative).strip(),
                                 "should exercise ignored executable test inputs")
-                with self.assertRaisesRegex(ValueError, "unexpected"):
-                    preflight.source_snapshot(self.repo, self.commit, {})
-                unexpected.unlink()
+                try:
+                    with self.assertRaisesRegex(ValueError, "unexpected"):
+                        preflight.source_snapshot(self.repo, self.commit, {})
+                finally:
+                    unexpected.unlink()
 
     def test_discovered_test_source_additions_are_rejected_after_execution(self):
         before = preflight.source_snapshot(self.repo, self.commit, {})
@@ -355,9 +359,11 @@ class SourceTests(unittest.TestCase):
                 unexpected = self.repo / relative
                 unexpected.parent.mkdir(parents=True, exist_ok=True)
                 unexpected.write_text("// Example unexpected executable test source\n")
-                with self.assertRaisesRegex(ValueError, "unexpected"):
-                    preflight.assert_source_unchanged(self.repo, self.commit, before, {})
-                unexpected.unlink()
+                try:
+                    with self.assertRaisesRegex(ValueError, "unexpected"):
+                        preflight.assert_source_unchanged(self.repo, self.commit, before, {})
+                finally:
+                    unexpected.unlink()
 
     def test_discovered_test_source_directory_symlinks_are_rejected(self):
         for relative in DISCOVERED_TEST_SOURCES:
@@ -365,9 +371,11 @@ class SourceTests(unittest.TestCase):
                 directory = (self.repo / relative).parent
                 directory.parent.mkdir(parents=True, exist_ok=True)
                 directory.symlink_to(self.repo / "crates/example/src", target_is_directory=True)
-                with self.assertRaisesRegex(ValueError, "symlink"):
-                    preflight.source_snapshot(self.repo, self.commit, {})
-                directory.unlink()
+                try:
+                    with self.assertRaisesRegex(ValueError, "symlink"):
+                        preflight.source_snapshot(self.repo, self.commit, {})
+                finally:
+                    directory.unlink()
 
     def test_nested_crate_cargo_configuration_layers_are_rejected(self):
         for filename in ("config", "config.toml"):
@@ -396,6 +404,100 @@ class SourceTests(unittest.TestCase):
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text("Example generated or downloaded output\n")
         preflight.assert_source_unchanged(self.repo, self.commit, before, {})
+
+    def test_entire_js_library_rejects_unreviewed_inputs_before_and_after_execution(self):
+        before = preflight.source_snapshot(self.repo, self.commit, {})
+        for relative in (
+            "example.ignored", "unreviewed/example.ignored",
+            "unreviewed/nested/example.ignored", "dist/example.ignored",
+            "coverage/example.ignored", "unreviewed/.tsjs-npm-ci.lock",
+        ):
+            with self.subTest(relative=relative):
+                unexpected = self.repo / "crates/trusted-server-js/lib" / relative
+                unexpected.parent.mkdir(parents=True, exist_ok=True)
+                unexpected.write_bytes(b"")
+                with self.assertRaisesRegex(ValueError, "unexpected"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                with self.assertRaisesRegex(ValueError, "unexpected"):
+                    preflight.assert_source_unchanged(self.repo, self.commit, before, {})
+                unexpected.unlink()
+
+    def test_nested_node_modules_are_inside_source_boundary(self):
+        for relative in (
+            "src/node_modules/example/example.ignored",
+            "unreviewed/node_modules/example/example.ignored",
+            "unreviewed/nested/node_modules/example/example.ignored",
+        ):
+            with self.subTest(relative=relative):
+                unexpected = self.repo / "crates/trusted-server-js/lib" / relative
+                unexpected.parent.mkdir(parents=True, exist_ok=True)
+                unexpected.write_text("Example unreviewed input\n")
+                with self.assertRaisesRegex(ValueError, "unexpected"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                unexpected.unlink()
+
+    def test_direct_node_modules_must_be_a_regular_directory(self):
+        modules = self.repo / "crates/trusted-server-js/lib/node_modules"
+        for kind in ("file", "link", "broken-link"):
+            with self.subTest(kind=kind):
+                modules.unlink(missing_ok=True)
+                if kind == "file":
+                    modules.write_text("Example unexpected input\n")
+                else:
+                    target = self.repo / ("crates/example/src" if kind == "link" else "absent")
+                    modules.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "node_modules"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                modules.unlink()
+
+    def test_generated_npm_material_and_empty_cargo_lock_preserve_source_snapshot(self):
+        before = preflight.source_snapshot(self.repo, self.commit, {})
+        library = self.repo / "crates/trusted-server-js/lib"
+        generated = library / "node_modules/example/nested/extra.test.ts"
+        generated.parent.mkdir(parents=True)
+        generated.write_text("// Example downloaded package code\n")
+        (library / "node_modules/example/linked.js").symlink_to("nested/extra.test.ts")
+        (library / ".tsjs-npm-ci.lock").touch()
+        preflight.assert_source_unchanged(self.repo, self.commit, before, {})
+        self.assertEqual(preflight.source_snapshot(self.repo, self.commit, {}), before,
+                         "should leave prepared npm materials outside the source snapshot")
+
+    def test_cargo_npm_lock_must_be_empty_regular_and_single_link(self):
+        library = self.repo / "crates/trusted-server-js/lib"
+        lock = library / ".tsjs-npm-ci.lock"
+        empty = Path(self.temporary.name) / "empty-lock"
+        empty.touch()
+        for kind in ("nonempty", "link", "broken-link", "hardlink", "directory"):
+            with self.subTest(kind=kind):
+                lock.unlink(missing_ok=True)
+                if kind == "nonempty":
+                    lock.write_text("Example unreviewed input\n")
+                elif kind in {"link", "broken-link"}:
+                    lock.symlink_to(empty if kind == "link" else empty.with_name("absent"))
+                elif kind == "hardlink":
+                    os.link(empty, lock)
+                else:
+                    lock.mkdir()
+                with self.assertRaisesRegex(ValueError, "npm-ci.lock"):
+                    preflight.source_snapshot(self.repo, self.commit, {})
+                if kind == "directory":
+                    lock.rmdir()
+                else:
+                    lock.unlink()
+
+    def test_committed_js_tests_outside_existing_roots_remain_supported(self):
+        relative = "crates/trusted-server-js/lib/reviewed/nested/example.spec.ts"
+        source = self.repo / relative
+        source.parent.mkdir(parents=True)
+        source.write_text("// Example reviewed test\n")
+        self.git("add", relative)
+        self.git("-c", "commit.gpgsign=false", "commit", "-qm", "Add example reviewed test")
+        self.commit = self.git("rev-parse", "HEAD").decode().strip()
+        snapshot = preflight.source_snapshot(self.repo, self.commit, {})
+        self.assertIn(relative, snapshot["files"], "should preserve tracked nested validation sources")
+        source.write_text("// Example mutated test\n")
+        with self.assertRaisesRegex(ValueError, "source bytes"):
+            preflight.assert_source_unchanged(self.repo, self.commit, snapshot, {})
 
     def test_symlinked_source_parent_and_external_link_are_rejected(self):
         source_directory = self.repo / "crates/example/src"
