@@ -2030,12 +2030,14 @@ for the tag's parts and what the module keeps to.
 
 **Section**: `[tag.google-tag]`
 
-| Field                | Type   | Default  | Contract                                                                                               |
-| -------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------ |
-| `analytics_tag_id`   | String | Absent   | A `G-`, `GT-`, `GTM-`, `AW-`, `DC-`, `MC-` or `UA-` tag id                                             |
-| `container_id`       | String | Absent   | `GTM-` followed by 4 to 20 capitals or digits                                                          |
-| `adsense_client_id`  | String | Absent   | `ca-pub-` followed by sixteen digits                                                                   |
-| `consent_defaults.*` | String | `denied` | `ad_storage`, `ad_user_data`, `ad_personalization` and `analytics_storage`, each `denied` or `granted` |
+| Field                              | Type    | Default  | Contract                                                                                                                 |
+| ---------------------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `analytics_tag_id`                 | String  | Absent   | A `G-`, `GT-`, `GTM-`, `AW-`, `DC-`, `MC-` or `UA-` tag id                                                               |
+| `container_id`                     | String  | Absent   | `GTM-` followed by 4 to 20 capitals or digits                                                                            |
+| `adsense_client_id`                | String  | Absent   | `ca-pub-` followed by sixteen digits                                                                                     |
+| `consent_defaults.*`               | String  | `denied` | `ad_storage`, `ad_user_data`, `ad_personalization` and `analytics_storage`, each `denied` or `granted`                   |
+| `consent_defaults.wait_for_update` | Integer | `500`    | Milliseconds the tag waits for a consent management platform's update before it fires with the defaults, at most `60000` |
+| `consent_defaults.region`          | Array   | Absent   | Country or region codes the defaults apply to, such as `GB` or `US-CA`, everywhere when absent                           |
 
 At least one of the three ids is required, because a table naming none asks the module to write nothing. The module writes, in the head immediately before the script bundle's tag and so after whatever a `[[fetch]]` middleware wrote there, the consent mode defaults, then the container script, then the tag snippet, then the AdSense loader, each copied from Google's documentation, and Tag Manager's noscript iframe immediately after the opening body tag. Where the Tag Manager module serves the same tag or container, the loader names the first-party path. A page that also loads gtag.js for the configured tag has that loader removed; an inline configuration call in the page is left alone and still sends a second page view.
 
