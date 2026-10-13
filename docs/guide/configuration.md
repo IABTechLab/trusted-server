@@ -1033,6 +1033,8 @@ Custom headers may be overwritten by application logic. Standard headers (`Conte
 
 Every adapter removes the three from a response before it finalizes it, unless this server answered a request for a path beneath `/_ts`, which is where a deployment is asked about itself. What the publisher's origin sends loses them beneath `/_ts` too. The removal comes before `[response_headers]` is applied, so a header of one of those names set there is still sent.
 
+The Fastly adapter wrote `X-TS-Version`, the platform's version number of the service, on every response. It no longer does. The version is in the [attestation document](./attestation), under `platform.serviceVersion`, which is where a deployment is asked about itself.
+
 ## robots.txt Configuration
 
 What `/robots.txt` answers. With no `[robots-txt]` section the publisher keeps their own file and `/robots.txt` reaches the origin like any other path.
