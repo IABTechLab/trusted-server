@@ -104,6 +104,7 @@ info "Building (debug wasm with the schedule compiled in, and the ts CLI)"
 TRUSTED_SERVER_ATTESTATION_KEYS="$WORK/schedule.tsv" \
   TRUSTED_SERVER_COMMIT="harness-commit" \
   TRUSTED_SERVER_BUILD_RUN="harness-run" \
+  TRUSTED_SERVER_BUILD_TAG="harness-tag" \
   SOURCE_DATE_EPOCH="$BUILD_EPOCH" \
   cargo build --package trusted-server-adapter-fastly --target wasm32-wasip1 >/dev/null
 # Copied aside, because the next build that is given no schedule writes the
@@ -276,6 +277,7 @@ check "the operator is the settings' own" "$(field operator)" "Harness Operator"
 check "the platform names itself" "$(field platform.name)" "fastly"
 check "the build reports the commit it was given" "$(field build.commit)" "harness-commit"
 check "the build reports the run it was given" "$(field build.run)" "harness-run"
+check "the build reports the tag it was given" "$(field build.tag)" "harness-tag"
 check "the build reports the time it was given" "$(field build.builtAt)" "$BUILD_TIME"
 ISSUED="$(field issuedAt)"
 AGE="$("$PYTHON" -c 'import datetime, sys; t = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc); print(int(abs((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()) < 300))' "$ISSUED" 2>/dev/null || echo 0)"
