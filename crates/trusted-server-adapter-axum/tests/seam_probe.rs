@@ -532,7 +532,9 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
         .err()
         .expect("startup should refuse the misspelt table");
 
-    let message = format!("{deploy:?}");
+    // The message alone: the debug form carries a backtrace where the
+    // runner asks for one, and the two are raised on different stacks.
+    let message = format!("{deploy}");
     assert!(
         message.contains("[cache.seam-probe-answres]"),
         "should name the table: {message}"
@@ -543,7 +545,7 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
     );
     assert_eq!(
         message,
-        format!("{startup:?}"),
+        format!("{startup}"),
         "the deploy check should refuse what startup refuses"
     );
 }
