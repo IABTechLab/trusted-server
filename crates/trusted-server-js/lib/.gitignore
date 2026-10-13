@@ -1,3 +1,6 @@
 # Auto-generated files
 src/generated-modules.ts
 src/integrations/prebid/.external-generated-*
+
+# Serializes `npm ci` across concurrent cargo build scripts
+.tsjs-npm-ci.lock
