@@ -13,6 +13,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::build_info::{BuildInfo, BuildVariant};
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -57,6 +58,17 @@ use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDi
 // no consumer in the default build.
 #[cfg(feature = "reusable-sandbox")]
 use crate::sandbox::RetirementCounters;
+
+/// Immutable facts compiled into the owning Fastly product.
+pub const BUILD_INFO: BuildInfo = BuildInfo::new(
+    env!("CARGO_PKG_VERSION"),
+    env!("TRUSTED_SERVER_BUILD_TARGET"),
+    if cfg!(feature = "reusable-sandbox") {
+        BuildVariant::ReusableSandbox
+    } else {
+        BuildVariant::Default
+    },
+);
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///

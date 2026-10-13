@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use edgezero_core::manifest::ManifestLoader;
-use git_version::{Candidates, is_usable, resolve_git_version};
+use git_version::{Candidates, is_usable, release_source, resolve_git_version};
 use sha2::{Digest as _, Sha256};
 
 /// Crate-relative build inputs that are both watched and hashed besides `src/`.
@@ -157,6 +157,21 @@ fn main() {
 /// Compiles the deployed git version in as `TRUSTED_SERVER__GIT_VERSION`.
 fn emit_git_version() {
     println!("cargo:rerun-if-env-changed={OVERRIDE_ENV}");
+
+    println!("cargo:rerun-if-env-changed=TRUSTED_SERVER__RELEASE_BUILD");
+    let control = env::var_os("TRUSTED_SERVER__RELEASE_BUILD");
+    let source = env::var_os(OVERRIDE_ENV);
+    match release_source(control.as_deref(), source.as_deref()) {
+        Ok(Some(commit)) => {
+            println!("cargo:rustc-env={OVERRIDE_ENV}={commit}");
+            return;
+        }
+        Ok(None) => {}
+        Err(message) => {
+            println!("cargo::error={message}");
+            std::process::exit(1);
+        }
+    }
 
     let override_value = std::env::var(OVERRIDE_ENV).ok();
     let resolved = match override_value.as_deref() {

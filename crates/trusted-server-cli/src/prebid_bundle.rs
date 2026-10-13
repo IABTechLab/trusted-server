@@ -627,17 +627,20 @@ fn find_js_lib_dir(start: &Path) -> CliResult<PathBuf> {
         }
     }
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest_dir
-        .join("../..")
-        .join("crates/trusted-server-js/lib");
-    if is_js_lib_dir(&candidate) {
-        return candidate.canonicalize().map_err(|error| {
-            report_error(format!(
-                "failed to resolve JS library directory {}: {error}",
-                candidate.display()
-            ))
-        });
+    #[cfg(not(trusted_server_release_build))]
+    {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let candidate = manifest_dir
+            .join("../..")
+            .join("crates/trusted-server-js/lib");
+        if is_js_lib_dir(&candidate) {
+            return candidate.canonicalize().map_err(|error| {
+                report_error(format!(
+                    "failed to resolve JS library directory {}: {error}",
+                    candidate.display()
+                ))
+            });
+        }
     }
 
     cli_error(

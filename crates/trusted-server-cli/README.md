@@ -22,6 +22,19 @@ two-platform command inventory and the
 [EdgeZero guide](../../docs/guide/edgezero.md) for configuration lifecycle and
 store semantics.
 
+`ts --version` reports the CLI package version and compiled source identity.
+Release builds set `TRUSTED_SERVER__RELEASE_BUILD=1` and require
+`TRUSTED_SERVER__GIT_VERSION` to contain exactly 40 lowercase hexadecimal commit
+characters. Any other present release control fails the build. Without that
+control, development builds retain tag, branch and abbreviated commit discovery.
+These compiled facts identify inputs; they do not establish release provenance.
+
+Help, version output and `ts config init` work outside a source checkout. Config
+initialization writes the embedded fictional example scaffold for the operator
+to configure. `ts prebid client` requires the repository's JavaScript sources and
+local build prerequisites. Release builds discover those resources from the
+current directory's ancestors and omit the developer checkout fallback.
+
 ## Experimental PBS commands
 
 `ts prebid server` manages local configuration inputs and a small set of AWS operations for self-hosted Prebid Server Go. It sits beside `ts prebid client`, which builds browser JavaScript, and remains separate from the existing Trusted Server `ts config` and `ts deploy` commands.
