@@ -71,10 +71,15 @@ fn write_build_time() {
     );
 }
 
-/// Bakes in the commit and the build run the builder names, as
-/// `TRUSTED_SERVER_COMMIT` and `TRUSTED_SERVER_BUILD_RUN`, or `unknown`.
+/// Bakes in the commit, the build run and the tag the builder names, as
+/// `TRUSTED_SERVER_COMMIT`, `TRUSTED_SERVER_BUILD_RUN` and
+/// `TRUSTED_SERVER_BUILD_TAG`, or `unknown`.
 fn write_build_identity() {
-    for name in ["TRUSTED_SERVER_COMMIT", "TRUSTED_SERVER_BUILD_RUN"] {
+    for name in [
+        "TRUSTED_SERVER_COMMIT",
+        "TRUSTED_SERVER_BUILD_RUN",
+        "TRUSTED_SERVER_BUILD_TAG",
+    ] {
         println!("cargo:rerun-if-env-changed={name}");
         let value = env::var(name)
             .ok()

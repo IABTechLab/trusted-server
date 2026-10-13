@@ -74,6 +74,7 @@ pub mod robots_txt;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
 pub mod secret_resolution;
+pub mod service_version;
 pub mod settings;
 pub mod settings_data;
 pub mod streaming_processor;
