@@ -224,10 +224,13 @@ Without the build input, or with an empty file, the schedule is empty and the
 endpoint answers 503. That is every build its builder names no schedule for,
 which the test `no_usable_key_in_force_answers_service_unavailable` pins.
 
-The build fields come from three more build inputs.
-`TRUSTED_SERVER_COMMIT` and `TRUSTED_SERVER_BUILD_RUN` become `build.commit`
-and `build.run`, or `unknown` when absent, and `SOURCE_DATE_EPOCH`, when set,
-gives `build.builtAt` in place of the time of the build.
+The build fields come from four more build inputs. `TRUSTED_SERVER_COMMIT`,
+`TRUSTED_SERVER_BUILD_RUN` and `TRUSTED_SERVER_BUILD_TAG` become
+`build.commit`, `build.run` and `build.tag`, or `unknown` when absent, and
+`SOURCE_DATE_EPOCH`, when set, gives `build.builtAt` in place of the time of
+the build. The tag is the release the build was made from, so a check that
+reads a deployment after a release compares what is running with the tag
+that was shipped.
 
 ## Formats
 
@@ -235,7 +238,7 @@ gives `build.builtAt` in place of the time of the build.
 
 This envelope shows the shape of an answer for a publisher at
 `publisher.example`, asked for with the nonce `Docs-Example_0929`. The
-payload, the signature, the service id, the commit and the run are
+payload, the signature, the service id, the commit, the run and the tag are
 placeholders.
 
 ```json
@@ -245,6 +248,7 @@ placeholders.
       "builtAt": "2026-09-29T09:18:54Z",
       "commit": "<the commit the build was made from>",
       "run": "<the build run>",
+      "tag": "<the tag the build was made from>",
       "version": "0.1.0"
     },
     "host": "publisher.example",
@@ -301,6 +305,7 @@ The payload holds these fields in this order.
 | `build.version`           | String  | The crate version                                                                                                                                                                         |
 | `build.builtAt`           | String  | RFC 3339, from `SOURCE_DATE_EPOCH` when set, otherwise the time of the build                                                                                                              |
 | `build.commit`            | String  | `TRUSTED_SERVER_COMMIT`, or `unknown`                                                                                                                                                     |
+| `build.tag`               | String  | `TRUSTED_SERVER_BUILD_TAG`, the release tag the build was made from, or `unknown`                                                                                                         |
 | `build.run`               | String  | `TRUSTED_SERVER_BUILD_RUN`, or `unknown`                                                                                                                                                  |
 | `nonce`                   | String  | The caller's nonce, present only when one was sent                                                                                                                                        |
 | `issuedAt`                | String  | The platform's clock, RFC 3339 in UTC to the second                                                                                                                                       |
