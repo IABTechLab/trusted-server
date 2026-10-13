@@ -104,13 +104,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/viceroy-eof/bin/viceroy
-          key: viceroy-eof-${{ runner.os }}-amd64-v0.19.0
+          key: viceroy-eof-${{ runner.os }}-amd64-v0.19.0-sha256-23b2af7d
 
       - name: Install isolated Viceroy 0.19 for backend timeout simulation
         if: steps.cache-eof-viceroy.outputs.cache-hit != 'true'
         shell: bash
         run: |
           curl -fsSL --retry 3 https://github.com/fastly/Viceroy/releases/download/v0.19.0/viceroy_v0.19.0_linux-amd64.tar.gz -o "$RUNNER_TEMP/viceroy-eof.tar.gz"
+          echo "23b2af7d8dce8f4a217716d6bd8b15c4f41494316a0d4e80f179ffb4b6c74744  $RUNNER_TEMP/viceroy-eof.tar.gz" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/viceroy-eof/bin"
           tar -xzf "$RUNNER_TEMP/viceroy-eof.tar.gz" -C "$RUNNER_TEMP/viceroy-eof/bin" viceroy
 

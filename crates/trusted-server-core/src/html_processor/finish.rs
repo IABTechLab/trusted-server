@@ -1476,6 +1476,47 @@ mod tests {
     }
 
     #[test]
+    fn async_eof_small_chunks_keep_a_bounded_marker_suffix() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "B",
+                stage("B", b"EN", Some(b"wrong"), &events, &calls),
+                true,
+                false,
+                64,
+            )],
+        );
+        chain.set_finish_marker(Some(b"TOKEN"));
+        for chunk in [b"xxxx".as_slice(), b"TO", b"K"] {
+            assert_eq!(
+                chain
+                    .process_chunk(chunk, false)
+                    .expect("should stream each small chunk"),
+                chunk,
+                "should preserve ordinary output"
+            );
+            assert!(
+                chain.stages[0].previous_suffix.len() <= 4,
+                "should bound marker history after every chunk"
+            );
+        }
+        assert_eq!(
+            chain.stages[0].previous_suffix, b"xTOK",
+            "should retain the trailing bytes across small chunks"
+        );
+        chain.begin_finish().expect("should finish the parser");
+        assert_eq!(
+            finish_marker_stage(&mut chain, 64),
+            b"EN",
+            "should reject removal of a marker completed after trimmed history"
+        );
+        assert_eq!(calls.get(), 1, "should evaluate the candidate once");
+    }
+
+    #[test]
     fn async_eof_single_byte_marker_rejects_creation_and_removal() {
         for (tail, replacement) in [
             (b"|".as_slice(), b"wrong".as_slice()),

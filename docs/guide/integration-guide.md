@@ -223,9 +223,9 @@ A non-retaining session can make a KV lookup at EOF and append a fixed footer:
 <!-- documentation-snippet:html-eof:start -->
 
 ```rust
-use std::io;
 use error_stack::Report;
 use futures::future::LocalBoxFuture;
+use std::io;
 use trusted_server_core::streaming_processor::StreamProcessor;
 use trusted_server_core::streaming_processor::finish::{
     StreamFinish, StreamFinishError, StreamFinishInput,
@@ -248,7 +248,11 @@ impl StreamProcessor for ExampleFooterProcessor {
         input: StreamFinishInput<'a>,
     ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
         Some(Box::pin(async move {
-            let enabled = input.services.kv_store().get_bytes("example:footer").await
+            let enabled = input
+                .services
+                .kv_store()
+                .get_bytes("example:footer")
+                .await
                 .map_err(|_| Report::new(StreamFinishError::Unavailable))?
                 .is_some();
             if !enabled {
@@ -268,7 +272,9 @@ The factory also returns `true` from `requires_async_finish()` and creates this
 session. Leave `buffer_output_until_eof()` at its default `false` for this append
 operation. KV must be available on the runtime; unavailable lookup falls back to
 the synchronous tail. Fastly consumers must use host operations with independently
-bounded latency; this generic KV interface does not provide a hard timeout.
+bounded latency and cap configurable transport timeouts with `input.deadline.remaining()`;
+this generic KV interface does not provide a hard timeout. Checking the remaining
+budget alone cannot interrupt a blocking KV call.
 
 Operators must explicitly accept the possible delivery cost:
 

@@ -41,9 +41,9 @@ its synchronous output, both false by default. Reject retention without async
 capability. Metadata and the created session's capability must agree; undeclared
 async work must never silently disappear through a synchronous driver.
 
-Remove the unmerged separate finalizer factory, session trait and registration list.
-Existing tests can use a test-only adapter to the one production processor lifecycle.
-No production compatibility API for the previous draft is required.
+Use one production processor lifecycle without a separate finalizer factory,
+session trait or registration list. Tests can use a test-only adapter to this
+lifecycle.
 
 Factory metadata is available before template lookup, without creating a session,
 reading HTML or polling a future. Every session uses the existing request-local

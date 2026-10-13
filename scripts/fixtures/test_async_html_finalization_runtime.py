@@ -143,7 +143,36 @@ class HarnessConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "timeout diagnostic"):
                     RUNTIME.measured_terminal_ms(adapter, "times out without a duration")
                 self.assertEqual(RUNTIME.measured_terminal_ms(adapter, "times out after 751 ms"), 751)
-        self.assertIsNone(RUNTIME.measured_terminal_ms("fastly", "retains input: unavailable"))
+        self.assertIsNone(RUNTIME.measured_terminal_ms("fastly", "retains input: unavailable", 0.749))
+
+    def test_fastly_transport_fallback_requires_measured_lookup_duration(self):
+        with self.assertRaisesRegex(RuntimeError, "lookup duration"):
+            RUNTIME.measured_terminal_ms("fastly", "retains input: unavailable")
+        for elapsed in [0.1, 3.0]:
+            with self.subTest(elapsed=elapsed), self.assertRaises(AssertionError):
+                RUNTIME.measured_terminal_ms("fastly", "retains input: unavailable", elapsed)
+
+    def test_eof_lookup_rejects_an_earlier_requests_eof(self):
+        lookup = {"event": "lookup_start", "time": 2.2}
+        for current_eof in [[], [{"event": "origin_eof", "time": 2.3}]]:
+            events = [{"event": "origin_eof", "time": 1.0}, lookup, *current_eof]
+            with self.subTest(events=events), self.assertRaisesRegex(AssertionError, "origin finishes"):
+                RUNTIME.lookup_for_request(events, 2.0, 3.0, True)
+
+    def test_eof_lookup_uses_only_the_current_request(self):
+        lookup = {"event": "lookup_start", "time": 2.2}
+        events = [
+            {"event": "origin_eof", "time": 1.0},
+            {"event": "lookup_start", "time": 1.1},
+            {"event": "origin_eof", "time": 2.1},
+            lookup,
+        ]
+        self.assertIs(RUNTIME.lookup_for_request(events, 2.0, 3.0, True), lookup)
+        self.assertIsNone(RUNTIME.lookup_for_request(events, 4.0, 5.0, False))
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            RUNTIME.lookup_for_request([*events, lookup], 2.0, 3.0, True)
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            RUNTIME.lookup_for_request(events, 2.0, 3.0, False)
 
 
 class CancellationTests(unittest.TestCase):

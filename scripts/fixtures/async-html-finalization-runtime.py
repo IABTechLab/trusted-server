@@ -163,11 +163,26 @@ def preflight_viceroy(env):
         raise RuntimeError(f"Viceroy >= 0.19.0 required for the Fastly hung-call control; found {output!r}")
 
 
-def measured_terminal_ms(adapter, diagnostic):
+def lookup_for_request(events, started, completed, enabled):
+    lookups = [event for event in events if event["event"] == "lookup_start"
+               and started <= event["time"] <= completed]
+    assert len(lookups) == int(enabled), "each request must issue exactly one enabled EOF lookup"
+    if not enabled:
+        return None
+    lookup = lookups[0]
+    assert any(event["event"] == "origin_eof" and started <= event["time"] <= lookup["time"]
+               for event in events), "EOF lookup must start after the origin finishes"
+    return lookup
+
+
+def measured_terminal_ms(adapter, diagnostic, lookup_elapsed=None):
     match = re.search(r"times out after (\d+) ms", diagnostic)
     if match is None:
         if adapter != "fastly":
             raise RuntimeError(f"missing measured cooperative timeout diagnostic for {adapter}")
+        if lookup_elapsed is None:
+            raise RuntimeError("missing measured lookup duration for the Fastly transport fallback")
+        assert 0.7 <= lookup_elapsed < 2.5, "blocking transport must finish within the terminal budget tolerance"
         return None
     terminal_ms = int(match.group(1))
     assert 700 <= terminal_ms < 2500, "terminal budget must exclude origin transfer"
@@ -377,15 +392,15 @@ def run(adapter, auction=False, release=False):
             if case != "disabled":
                 assert headers["Cache-Control"] == "no-store, private", "active EOF processing must prohibit shared caching"
             current_events = [json.loads(line) for line in (workspace / "events.jsonl").read_text().splitlines()]
-            lookups = [event for event in current_events if event["event"] == "lookup_start"]
-            lookup_elapsed = completed - lookups[-1]["time"] if case != "disabled" else None
+            lookup = lookup_for_request(current_events, started, completed, case != "disabled")
+            lookup_elapsed = completed - lookup["time"] if lookup is not None else None
             if case == "streaming":
                 completions = [event for event in current_events if event["event"] == "lookup_complete"]
                 assert completions, "streaming finish must complete real delayed I/O"
                 assert first_byte_at < completions[-1]["time"] - 0.05, "initial HTML bytes must reach the client while EOF I/O remains pending"
             terminal_ms = None
             if case == "hung":
-                terminal_ms = measured_terminal_ms(adapter, diagnostic)
+                terminal_ms = measured_terminal_ms(adapter, diagnostic, lookup_elapsed)
             (workspace / f"{case}.timing.json").write_text(json.dumps({"request_seconds": elapsed, "first_body_byte_seconds": first_byte_at - started, "terminal_ms": terminal_ms, "lookup_to_response_seconds": lookup_elapsed, "configured_budget_ms": 750, "cooperative_timer": adapter != "fastly"}))
             print(f"PASS {adapter} {case}: request={elapsed:.3f}s, {len(body)} bytes, chain_budget=750ms, terminal_ms={terminal_ms}, lookup_to_response={lookup_elapsed}, cooperative_timer={adapter != 'fastly'}", flush=True)
             stop(process)
@@ -394,7 +409,6 @@ def run(adapter, auction=False, release=False):
         assert len(starts) == 2 + int(auction) + int(adapter == "fastly"), "each enabled control must issue exactly one EOF lookup"
         assert all(event["complete"] and len(event["sha256"]) == 64 for event in starts), "every lookup must observe complete-document metadata"
         for event in starts:
-            assert any(previous["event"] == "origin_eof" and previous["time"] <= event["time"] for previous in events), "EOF lookup must start after the origin finishes"
             if adapter == "fastly":
                 assert 0 < event["transport_timeout_ms"] <= 750, "blocking host calls must use the remaining budget"
             else:

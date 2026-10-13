@@ -63,7 +63,17 @@
 - [x] Run `cargo fmt --all -- --check` and the integration crate format check, all eight target-matched Clippy aliases, all adapter test aliases and Fastly reuse, native core/digest gates, CLI/codegen, parity and exact integration CI selections.
 - [x] Run existing ESI/inline/purge controls, JS build/tests/format, docs lint/build/format and repository Markdown formatting.
 - [x] Record fresh four-runtime success, disabled, hung and auction results, including Fastly early-body-byte proof.
-      **Publication procedure:** Commit and push the existing branch, update draft PR #1290, and confirm remote head/status. Hosted CI results remain separate from local checks.
+
+### 6. Runtime evidence and regression assertions
+
+- [x] Correlate EOF and lookup events within each request; prove an earlier request's EOF cannot satisfy the check.
+- [x] Require measured lookup duration for Fastly transport fallback without assuming a cooperative timeout log.
+- [x] Assert disabled/failed parity has no finalized marker and failed output equals the disabled baseline; preserve the fixture's ordinary cache policy.
+- [x] Verify bounded marker history across multiple small chunks and EOF marker protection.
+- [x] Check the isolated Viceroy archive against its pinned SHA-256 before extraction; invalidate the earlier unchecked tool cache.
+- [x] Preserve the default-disabled permission example, format the Rust example and keep the spec independent of superseded drafts.
+
+**Publication:** After validation, commit and push to the existing draft PR. Confirm its remote head and report hosted CI separately from local results.
 
 ## Acceptance mapping
 

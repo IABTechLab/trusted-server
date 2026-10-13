@@ -1195,6 +1195,7 @@ impl PlatformHttpClient for TerminalFixtureOrigin {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
+    let mut disabled_output = None;
     for case in ["disabled", "failed", "success"] {
         let enabled = case != "disabled";
         let mut settings = test_settings();
@@ -1255,6 +1256,15 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
                     "no-store, private",
                     "{adapter} should prevent downstream caching"
                 );
+            } else {
+                assert_ne!(
+                    response
+                        .headers()
+                        .get("cache-control")
+                        .expect("should preserve the ordinary cache policy"),
+                    "no-store, private",
+                    "{adapter} should not apply EOF privacy to the inactive fixture"
+                );
             }
             let body = response
                 .into_body()
@@ -1269,6 +1279,21 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
                 }),
                 "{adapter} should select the correct EOF result for {case}"
             );
+            if case != "success" {
+                assert!(
+                    !String::from_utf8_lossy(&body).contains("EXAMPLE_FINALIZED"),
+                    "{adapter} should not emit a finalized marker for {case}"
+                );
+            }
+            if case == "failed" {
+                assert_eq!(
+                    &body,
+                    disabled_output
+                        .as_ref()
+                        .expect("should have the disabled baseline"),
+                    "{adapter} should preserve the exact baseline after failed EOF I/O"
+                );
+            }
             assert_eq!(
                 client.lookup_calls.load(Ordering::SeqCst),
                 usize::from(enabled),
@@ -1282,6 +1307,9 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
             } else {
                 expected = Some(body);
             }
+        }
+        if case == "disabled" {
+            disabled_output = expected;
         }
     }
 }
