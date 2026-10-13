@@ -4352,9 +4352,15 @@ impl Settings {
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        // The build script compiles the git version in through this variable,
+        // and cargo sets it on a test process too. It is not a setting.
+        let variables = std::env::vars()
+            .filter(|(name, _)| name != "TRUSTED_SERVER__GIT_VERSION")
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(variables));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
