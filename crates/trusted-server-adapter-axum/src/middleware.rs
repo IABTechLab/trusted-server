@@ -90,7 +90,8 @@ impl Middleware for FinalizeResponseMiddleware {
 /// Applies standard Trusted Server response headers to the given response.
 ///
 /// Unlike the Fastly variant, geo is always unavailable so `X-Geo-Info-Available: false`
-/// is unconditionally emitted. Fastly-specific headers are omitted.
+/// is unconditionally emitted, followed by the compiled-in `X-TS-Version`.
+/// Fastly-specific headers are omitted.
 /// Operator-configured `settings.response_headers` are applied last (with the
 /// shared cookie cache-privacy hardening) and can override any managed header.
 pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
@@ -98,6 +99,8 @@ pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Respons
         HEADER_X_GEO_INFO_AVAILABLE,
         HeaderValue::from_static("false"),
     );
+
+    trusted_server_core::version_header::apply_git_version_header(response);
 
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
