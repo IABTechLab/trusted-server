@@ -359,7 +359,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          cache-shared-key: cargo-lint-domains-${{ runner.os }}
+          # Restore `test-cli`'s cache read-only. This job never runs on main,
+          # so a key of its own is only ever saved in PR scope, where no other
+          # PR can restore it.
+          cache-shared-key: cargo-cli-${{ runner.os }}
+          cache-save-if: false
 
       # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
       - name: Lint URL hosts on lines added by this PR
