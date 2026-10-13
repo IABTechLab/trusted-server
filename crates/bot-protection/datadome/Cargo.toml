@@ -29,6 +29,7 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 validator = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
