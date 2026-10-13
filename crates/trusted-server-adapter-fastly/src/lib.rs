@@ -779,20 +779,17 @@ async fn apply_entry_point_finalize_headers(
 ) {
     // Route through the [geo] module selector, so a deployment that opts
     // out of geolocation makes no host geo call on the entry-point finalize
-    // path either. The module is called with the request's view and the
-    // client, as every geo call is; no headers survive to here.
+    // path either. The module is the host's own lookup or the disabled one,
+    // never one from the registry, and reads the address alone, so the call
+    // carries the request's view and the client and no headers, which do
+    // not survive to here.
     let geo = build_geo_module(settings, Arc::new(FastlyPlatformGeo));
     let geo_info = if geo_allowed_for_response(response) {
-        let client_info = ClientInfo {
+        let services = services.with_client_info(ClientInfo {
             client_ip,
             ..ClientInfo::default()
-        };
-        let services = services.with_client_info(client_info.clone());
-        let context = ModuleContext::new(request)
-            .with_settings(settings)
-            .with_services(&services)
-            .with_client(&client_info);
-        geo.locate(context.call(geo.id(), geo.required_permissions()))
+        });
+        geo.locate_request(request, None, Some(settings), &services)
             .await
             .unwrap_or_else(|e| {
                 log::warn!("entry-point geo lookup failed: {e}");

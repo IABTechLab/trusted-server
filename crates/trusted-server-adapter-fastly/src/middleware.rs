@@ -17,11 +17,10 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
-use trusted_server_core::evidence::BorrowedRequestInfo;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
 use trusted_server_core::integrations::IntegrationRegistry;
-use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
+use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::platform::{ClientInfo, GeoModule, RuntimeServices};
 use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::settings::Settings;
@@ -113,11 +112,12 @@ impl Middleware for FinalizeResponseMiddleware {
                 .with_prefixes(Prefixes::trusted_server(&self.settings)),
         };
 
-        // What the geo module's call carries, kept here because the request
-        // goes into the handler and does not come back.
+        // The request's view, kept here because the request goes into the
+        // handler and does not come back. The headers are not kept: the
+        // module on this path is the host's own lookup or the disabled one,
+        // chosen by `build_geo_module`, and reads the address alone.
         let method = ctx.request().method().clone();
         let uri = ctx.request().uri().clone();
-        let headers = ctx.request().headers().clone();
         let scheme = uri.scheme_str().unwrap_or("https").to_owned();
         let host = ctx
             .request()
@@ -140,21 +140,11 @@ impl Middleware for FinalizeResponseMiddleware {
                 client_ip,
                 ..ClientInfo::default()
             };
-            let services = services.clone().with_client_info(client_info.clone());
-            // The module is called as the device module is, with the request
-            // as evidence, so a module whose one service answers location
-            // and device can answer both from one call.
-            let address = client_ip.map(|ip| ip.to_string()).unwrap_or_default();
-            let evidence = BorrowedRequestInfo::new(&address, Some(&headers))
-                .with_request_target(uri.path(), uri.query().unwrap_or_default());
-            let context =
-                ModuleContext::new(ModuleRequest::new(&method, &host, &scheme, uri.path()))
-                    .with_evidence(&evidence)
-                    .with_settings(&self.settings)
-                    .with_services(&services)
-                    .with_client(&client_info);
+            let services = services.clone().with_client_info(client_info);
+            let request = ModuleRequest::new(&method, &host, &scheme, uri.path())
+                .with_query(uri.query().unwrap_or_default());
             self.geo
-                .locate(context.call(self.geo.id(), self.geo.required_permissions()))
+                .locate_request(request, None, Some(&self.settings), &services)
                 .await
                 .unwrap_or_else(|e| {
                     log::warn!("geo lookup failed: {e}");

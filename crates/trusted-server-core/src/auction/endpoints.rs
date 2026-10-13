@@ -329,26 +329,14 @@ pub async fn handle_auction(
 
     // Look up geo for device info, through the module call a page's request
     // makes, so the geo module sees the request as it does on a page.
-    let address = services
-        .client_info()
-        .client_ip
-        .map(|ip| ip.to_string())
-        .unwrap_or_default();
-    let evidence = crate::evidence::BorrowedRequestInfo::new(&address, Some(http_req.headers()))
-        .with_request_target(
-            http_req.uri().path(),
-            http_req.uri().query().unwrap_or_default(),
-        );
-    let geo_context = crate::module_context::ModuleContext::new(
-        crate::module_context::ModuleRequest::of(&http_req, services.client_info()),
-    )
-    .with_evidence(&evidence)
-    .with_settings(settings)
-    .with_services(services)
-    .with_client(services.client_info());
-    let geo_module = services.geo();
-    let geo = geo_module
-        .locate(geo_context.call(geo_module.id(), geo_module.required_permissions()))
+    let geo = services
+        .geo()
+        .locate_request(
+            crate::module_context::ModuleRequest::of(&http_req, services.client_info()),
+            Some(http_req.headers()),
+            Some(settings),
+            services,
+        )
         .await
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");

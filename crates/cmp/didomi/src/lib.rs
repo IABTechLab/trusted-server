@@ -461,36 +461,22 @@ impl DidomiIntegration {
         {
             // The geo module is called as every geo call is, with the
             // request as evidence, its services and its client.
-            let address = services
-                .client_info()
-                .client_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_default();
-            let evidence = trusted_server_core::evidence::BorrowedRequestInfo::new(
-                &address,
-                Some(&parts.headers),
-            )
-            .with_request_target(parts.uri.path(), parts.uri.query().unwrap_or_default());
             let host = parts
                 .headers
                 .get(header::HOST)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
             let scheme = parts.uri.scheme_str().unwrap_or("https");
-            let context = trusted_server_core::module_context::ModuleContext::new(
-                trusted_server_core::module_context::ModuleRequest::new(
-                    &parts.method,
-                    host,
-                    scheme,
-                    parts.uri.path(),
-                ),
+            let request = trusted_server_core::module_context::ModuleRequest::new(
+                &parts.method,
+                host,
+                scheme,
+                parts.uri.path(),
             )
-            .with_evidence(&evidence)
-            .with_services(services)
-            .with_client(services.client_info());
-            let module = services.geo();
-            let geo = match module
-                .locate(context.call(module.id(), module.required_permissions()))
+            .with_query(parts.uri.query().unwrap_or_default());
+            let geo = match services
+                .geo()
+                .locate_request(request, Some(&parts.headers), None, services)
                 .await
             {
                 Ok(Some(geo)) => match normalize_didomi_geo(&geo) {

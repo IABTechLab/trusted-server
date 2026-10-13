@@ -636,23 +636,14 @@ impl SeamProbeProxy {
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         // The geo module is called as every geo call is, with the request
         // as evidence, its services and its client.
-        let address = services
-            .client_info()
-            .client_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_default();
-        let evidence =
-            trusted_server_core::evidence::BorrowedRequestInfo::new(&address, Some(req.headers()))
-                .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
-        let context = trusted_server_core::module_context::ModuleContext::new(
-            trusted_server_core::module_context::ModuleRequest::of(&req, services.client_info()),
-        )
-        .with_evidence(&evidence)
-        .with_services(services)
-        .with_client(services.client_info());
-        let module = services.geo();
-        let country = match module
-            .locate(context.call(module.id(), module.required_permissions()))
+        let country = match services
+            .geo()
+            .locate_request(
+                ModuleRequest::of(&req, services.client_info()),
+                Some(req.headers()),
+                None,
+                services,
+            )
             .await
         {
             Ok(geo) => geo.map(|info| info.country),

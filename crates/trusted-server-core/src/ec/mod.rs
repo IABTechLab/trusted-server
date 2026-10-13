@@ -389,21 +389,14 @@ impl EcContext {
         // request's evidence, its settings and its services, so a module
         // that answers location and device from one service can answer both
         // from one call.
-        let address = services
-            .client_info()
-            .client_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_default();
-        let evidence = crate::evidence::BorrowedRequestInfo::new(&address, Some(req.headers()))
-            .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
-        let context = ModuleContext::new(ModuleRequest::of(req, services.client_info()))
-            .with_evidence(&evidence)
-            .with_settings(settings)
-            .with_services(services)
-            .with_client(services.client_info());
-        let geo = services.geo();
-        let lookup = geo
-            .locate(context.call(geo.id(), geo.required_permissions()))
+        let lookup = services
+            .geo()
+            .locate_request(
+                ModuleRequest::of(req, services.client_info()),
+                Some(req.headers()),
+                Some(settings),
+                services,
+            )
             .await;
         let geo_info = match &lookup {
             Ok(info) => info.clone(),
