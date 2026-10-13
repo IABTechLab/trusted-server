@@ -3260,6 +3260,8 @@ describe('prebid/installPrebidNpm', () => {
       } as unknown as RequestBidsArg);
 
       expect(document.cookie).toBe('');
+    });
+
     it('trims an oversized ts-eids cookie deterministically and logs which sources were dropped', () => {
       const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
       const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
