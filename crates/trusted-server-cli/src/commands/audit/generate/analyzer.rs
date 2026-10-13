@@ -12,7 +12,7 @@ use crate::commands::audit::generate::{
 use crate::error::{CliResult, report_error};
 
 static GTM_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]+\b").expect("should compile GTM regex"));
+    LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]{4,20}\b").expect("should compile GTM regex"));
 static GPT_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:googletag|gpt\.js|googletagservices|securepubads)\b")
         .expect("should compile GPT inline regex")
@@ -238,21 +238,21 @@ pub(crate) fn detect_integrations_from_inline_script(script: &str) -> Vec<(Strin
 }
 
 pub(crate) fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<String> {
-    for integration in &artifact.detected_integrations {
-        if integration.id == "google_tag_manager" && GTM_REGEX.is_match(&integration.evidence) {
-            return Some(integration.evidence.clone());
-        }
-    }
+    let evidence = artifact
+        .detected_integrations
+        .iter()
+        .filter(|integration| integration.id == "google_tag_manager")
+        .map(|integration| integration.evidence.as_str());
+    let asset_urls = artifact
+        .assets
+        .iter()
+        .filter(|asset| asset.integration.as_deref() == Some("google_tag_manager"))
+        .map(|asset| asset.url.as_str());
 
-    for asset in &artifact.assets {
-        if asset.integration.as_deref() == Some("google_tag_manager")
-            && let Some(matched) = GTM_REGEX.find(asset.url.as_str())
-        {
-            return Some(matched.as_str().to_string());
-        }
-    }
-
-    None
+    evidence
+        .chain(asset_urls)
+        .find_map(|text| GTM_REGEX.find(text))
+        .map(|matched| matched.as_str().to_string())
 }
 
 #[cfg(test)]
@@ -547,6 +547,129 @@ mod tests {
                 detect_integration_from_url(&parsed).as_deref(),
                 Some(expected),
                 "should detect {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_gtm_container_id_from_integration_evidence() {
+        for evidence in [
+            "GTM-ABC123",
+            "https://tags.example.com/gtm.js?id=GTM-ABC123",
+            "https://tags.example.com/gtm.js?id=GTM-ABC123&l=dataLayer",
+        ] {
+            let artifact = AuditArtifact {
+                audited_url: "https://example.com".to_string(),
+                page_title: None,
+                js_asset_count: 0,
+                third_party_asset_count: 0,
+                detected_integrations: vec![DetectedIntegration {
+                    id: "google_tag_manager".to_string(),
+                    evidence: evidence.to_string(),
+                }],
+                assets: Vec::new(),
+                warnings: Vec::new(),
+            };
+
+            assert_eq!(
+                extract_gtm_container_id(&artifact).as_deref(),
+                Some("GTM-ABC123"),
+                "should extract only the container ID from evidence {evidence}"
+            );
+        }
+    }
+
+    #[test]
+    fn gtm_container_id_respects_runtime_length() {
+        for (container_id, expected) in [
+            ("GTM-ABC", None),
+            ("GTM-AB12", Some("GTM-AB12")),
+            ("GTM-ABCDEFGHIJKLMNOPQRST", Some("GTM-ABCDEFGHIJKLMNOPQRST")),
+            ("GTM-ABCDEFGHIJKLMNOPQRSTU", None),
+        ] {
+            let script = format!("loadGtm('{container_id}');");
+            let matches = detect_integrations_from_inline_script(&script);
+            assert_eq!(
+                matches
+                    .iter()
+                    .find(|(integration, _)| integration == "google_tag_manager")
+                    .map(|(_, evidence)| evidence.as_str()),
+                expected,
+                "should enforce runtime ID length in inline detection for {container_id}"
+            );
+
+            let evidence = format!("https://tags.example.com/gtm.js?id={container_id}&l=dataLayer");
+            let mut artifact = AuditArtifact {
+                audited_url: "https://publisher.example.com".to_string(),
+                page_title: None,
+                js_asset_count: 0,
+                third_party_asset_count: 0,
+                detected_integrations: vec![DetectedIntegration {
+                    id: "google_tag_manager".to_string(),
+                    evidence: evidence.clone(),
+                }],
+                assets: Vec::new(),
+                warnings: Vec::new(),
+            };
+
+            assert_eq!(
+                extract_gtm_container_id(&artifact).as_deref(),
+                expected,
+                "should enforce runtime ID length in evidence for {container_id}"
+            );
+
+            artifact.detected_integrations.clear();
+            artifact.js_asset_count = 1;
+            artifact.third_party_asset_count = 1;
+            artifact.assets.push(AuditedAsset {
+                kind: "script".to_string(),
+                url: evidence,
+                host: "tags.example.com".to_string(),
+                party: AssetParty::ThirdParty,
+                integration: Some("google_tag_manager".to_string()),
+            });
+
+            assert_eq!(
+                extract_gtm_container_id(&artifact).as_deref(),
+                expected,
+                "should enforce runtime ID length in assets for {container_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_gtm_container_id_prefers_evidence_then_falls_back_to_assets() {
+        for (evidence, expected) in [
+            (
+                "https://tags.example.com/gtm.js?id=GTM-AAA111",
+                "GTM-AAA111",
+            ),
+            ("https://tags.example.com/gtag/js?id=G-ABC123", "GTM-BBB222"),
+            ("https://tags.example.com/gtm.js?id=GTM-ABC", "GTM-BBB222"),
+        ] {
+            let artifact = AuditArtifact {
+                audited_url: "https://publisher.example.com".to_string(),
+                page_title: None,
+                js_asset_count: 1,
+                third_party_asset_count: 1,
+                detected_integrations: vec![DetectedIntegration {
+                    id: "google_tag_manager".to_string(),
+                    evidence: evidence.to_string(),
+                }],
+                assets: vec![AuditedAsset {
+                    kind: "script".to_string(),
+                    url: "https://tags.example.com/gtm.js?id=GTM-BBB222".to_string(),
+                    host: "tags.example.com".to_string(),
+                    party: AssetParty::ThirdParty,
+                    integration: Some("google_tag_manager".to_string()),
+                }],
+                warnings: Vec::new(),
+            };
+
+            assert_eq!(
+                extract_gtm_container_id(&artifact).as_deref(),
+                Some(expected),
+                "should prefer valid evidence and retain the asset fallback for {evidence}"
             );
         }
     }
