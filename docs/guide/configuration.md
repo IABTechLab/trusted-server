@@ -80,6 +80,7 @@ publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 - `bot-protection.datadome.server_side_key_secret_name`, when protection is enabled
 - `bot-protection.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
 - `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
+- `publisher.origin_auth.access_key_id`, `secret_access_key`, and optional `session_token`, when `[publisher]` sets `origin_auth`
 
 Their values belong in the logical `trusted_server_secrets` store and are
 resolved only while an instance builds runtime settings. An adapter can map the

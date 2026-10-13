@@ -1768,7 +1768,7 @@ pub enum OriginQueryPolicy {
     Strip,
 }
 
-/// Authentication configuration for an asset origin.
+/// Authentication configuration for an asset origin or the publisher origin.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AssetOriginAuth {
@@ -9514,6 +9514,39 @@ source_domain = "partner.example.com"
                 .contains("proxy.asset_routes auth s3_sigv4 region must not be empty"),
             "the asset route refusal should keep its wording: {err:?}"
         );
+    }
+
+    #[test]
+    fn publisher_origin_auth_credentials_stay_out_of_debug_output() {
+        let canaries = [
+            "canary-origin-access",
+            "canary-origin-secret",
+            "canary-origin-session",
+        ];
+        let publisher = Publisher {
+            origin_auth: Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "test-region-1".to_owned(),
+                secret_store: None,
+                access_key_id: Redacted::new(canaries[0].to_owned()),
+                secret_access_key: Redacted::new(canaries[1].to_owned()),
+                session_token: Some(Redacted::new(canaries[2].to_owned())),
+                origin_query: None,
+            })),
+            ..Publisher::default()
+        };
+
+        let debug = format!("{publisher:?}");
+
+        assert!(
+            debug.contains("test-region-1"),
+            "should leave the region visible in debug output: {debug}"
+        );
+        for canary in canaries {
+            assert!(
+                !debug.contains(canary),
+                "should keep `{canary}` out of debug output"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,9 @@
 //! parameters. The caller must provide the final origin URL and `Host` header
 //! after any path rewrite or query-strip policy has run.
 //!
+//! The publisher origin signs its reads through this module too, when
+//! `[publisher]` sets `origin_auth`.
+//!
 //! Canonicalization follows the URL that will be sent to `S3`. Existing percent
 //! escapes in path and query components are preserved and normalized to upper
 //! case, while raw reserved bytes are encoded using `AWS` percent-encoding rules.
