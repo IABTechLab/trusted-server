@@ -15,10 +15,10 @@ use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 /// Formats the tester cookie `Set-Cookie` header value.
-fn format_tester_cookie(domain: &str) -> String {
+fn format_tester_cookie(domain: &str, max_age_seconds: u32) -> String {
     format!(
-        "{}=true; Domain={}; Path=/; Secure; SameSite=Lax",
-        COOKIE_TS_TESTER, domain,
+        "{}=true; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
+        COOKIE_TS_TESTER, domain, max_age_seconds,
     )
 }
 
@@ -34,7 +34,8 @@ fn format_clear_tester_cookie(domain: &str) -> String {
 ///
 /// Returns `404 Not Found` while `[tester_cookie].enabled` is false. When the
 /// feature is enabled, returns `204 No Content` with `Set-Cookie: ts-tester=true`
-/// scoped to `publisher.cookie_domain`.
+/// scoped to `publisher.cookie_domain` and persisted for
+/// `[tester_cookie].max_age_seconds` (30 days by default).
 ///
 /// # Errors
 ///
@@ -49,11 +50,13 @@ pub fn handle_set_tester(
         return Ok(response);
     }
 
-    let set_cookie =
-        HeaderValue::from_str(&format_tester_cookie(&settings.publisher.cookie_domain))
-            .change_context(TrustedServerError::InvalidHeaderValue {
-                message: "tester cookie contains invalid header value".to_string(),
-            })?;
+    let set_cookie = HeaderValue::from_str(&format_tester_cookie(
+        &settings.publisher.cookie_domain,
+        settings.tester_cookie.max_age_seconds,
+    ))
+    .change_context(TrustedServerError::InvalidHeaderValue {
+        message: "tester cookie contains invalid header value".to_string(),
+    })?;
 
     let mut response = Response::new(EdgeBody::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
@@ -138,8 +141,31 @@ mod tests {
             .to_str()
             .expect("should render set-cookie as utf-8");
         assert_eq!(
-            set_cookie, "ts-tester=true; Domain=.tester.example; Path=/; Secure; SameSite=Lax",
-            "tester cookie should use publisher.cookie_domain"
+            set_cookie,
+            "ts-tester=true; Domain=.tester.example; Path=/; Secure; SameSite=Lax; Max-Age=2592000",
+            "tester cookie should use publisher.cookie_domain and persist across browser restarts"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_uses_configured_max_age() {
+        let mut settings = create_test_settings();
+        settings.tester_cookie.enabled = true;
+        settings.tester_cookie.max_age_seconds = 3_600;
+        settings.publisher.cookie_domain = ".tester.example".to_string();
+
+        let response = handle_set_tester(&settings).expect("should build tester response");
+
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set tester cookie")
+            .to_str()
+            .expect("should render set-cookie as utf-8");
+        assert_eq!(
+            set_cookie,
+            "ts-tester=true; Domain=.tester.example; Path=/; Secure; SameSite=Lax; Max-Age=3600",
+            "tester cookie should use the configured max_age_seconds"
         );
     }
 
