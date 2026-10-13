@@ -448,6 +448,19 @@ is sent as it arrived, as before. When `origin_url` has a path, a request path
 with a `.` or `..` segment, in any percent-encoded spelling, is refused with
 `400` so no request reaches outside the folder.
 
+**Redirects**: When the origin answers with a redirect whose `Location` names
+the origin itself, the reader is sent to the same path, query and fragment on
+the scheme and host they asked for, so their browser stays on the deployment.
+An origin asked for `/news` that answers `Location:
+https://origin.publisher.com/news/` sends a reader of `www.publisher.com` to
+`https://www.publisher.com/news/`. The origin is named by the host in
+`origin_url`, with its port, or by `origin_host_header_override` where one is
+set. When `origin_url` has a path, a `Location` under that path comes back
+without it, and one outside it is left as the origin wrote it. A `Location`
+naming any other host, one that names no host (such as `/news/`), and the
+`Location` of a response that is not a redirect are also left as the origin
+wrote them.
+
 #### `origin_host_header_override`
 
 **Purpose**: Optional Host header to send to the publisher origin while still
@@ -457,6 +470,8 @@ connecting to the host in `origin_url`.
 
 - Connects, uses SNI, and checks certificates against `origin_url`
 - Sends the configured value as the outbound HTTP `Host` header
+- Is the name a redirect from the origin is compared with (see Redirects under
+  `origin_url`)
 - Useful when the origin endpoint expects a canonical publisher hostname
 
 **Format**: Hostname with optional port, without protocol, path, query, or fragment

@@ -44,7 +44,7 @@ The page that comes back is a publisher page like any other, so it is fetched, c
 
 **The origin path.** A path in `origin_url` is kept, and the request path is added after it with exactly one `/` between them, whichever side carries one. The request's query is kept. An `origin_url` with no path, or the path `/`, sends the request path as it arrived, which is what every existing document does. A query in `origin_url` is ignored, as it was.
 
-The publisher proxy builds the origin address in one place, `handle_publisher_request` in `publisher.rs`, and that address now comes from `publisher_origin_path_and_query`. The streamed page, the buffered page, the template cache key, a `HEAD` and every other method take the address built there. The publisher path follows no redirect and compares no `Location` against the origin, so there was nothing of that kind to change.
+The publisher proxy builds the origin address in one place, `handle_publisher_request` in `publisher.rs`, and that address now comes from `publisher_origin_path_and_query`. The streamed page, the buffered page, the template cache key, a `HEAD` and every other method take the address built there. The publisher path follows no redirect. A redirect the origin sends to itself has the origin path taken off its `Location`, as `2026-10-13-origin-redirect-design.md` sets out.
 
 **Signing.** `origin_auth` is the table an asset route's `auth` takes, read as the same type, with the same fields, defaults and secret store key references, and it signs through the same function, `apply_asset_origin_auth`. There is one signing path. The request is signed last, once its address and `Host` are final, and it is sent to the address that was signed, so the two cannot differ.
 
