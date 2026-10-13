@@ -241,6 +241,20 @@ describe('release collector boundaries', () => {
       expect(fs.readFileSync(path.join(root, 'out/tsjs-fixture.js'))).toEqual(expected);
       const config = (await import('../vitest.config.ts')).default;
       expect(config.envDir).toBe(false);
+      expect(config.mode).toBe('production');
+      expect(config.server.host).toBe('127.0.0.1');
+      const nativeImports = config.plugins.find(
+        (plugin) => plugin.name === 'release-test-node-builtins'
+      );
+      expect(nativeImports.resolveId('node:fs')).toEqual({ id: 'node:fs', external: true });
+      expect(nativeImports.resolveId('dlv')).toBeUndefined();
+      delete process.env.TRUSTED_SERVER__RELEASE_BUILD;
+      vi.resetModules();
+      const ordinary = (await import('../vitest.config.ts')).default;
+      expect(ordinary.server).toBeUndefined();
+      expect(ordinary.plugins).toBeUndefined();
+      expect(ordinary.envDir).toBeUndefined();
+      expect(ordinary.mode).toBeUndefined();
     } finally {
       if (oldRelease === undefined) delete process.env.TRUSTED_SERVER__RELEASE_BUILD;
       else process.env.TRUSTED_SERVER__RELEASE_BUILD = oldRelease;
@@ -251,7 +265,9 @@ describe('release collector boundaries', () => {
   it('rejects source symlink escape and unknown transform queries', async () => {
     const { installedOrigins } = await import('../release-composition.mjs');
     const root = fixture();
-    const external = fs.mkdtempSync('/private/tmp/tsjs-outside-');
+    const external = fs.mkdtempSync(
+      path.join(process.env.TMPDIR ?? '/private/tmp', 'tsjs-outside-')
+    );
     temporary.push(external);
     fs.writeFileSync(path.join(external, 'outside.ts'), 'export const example = 7;');
     const link = path.join(root, 'alias.ts');

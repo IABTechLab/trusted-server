@@ -119,10 +119,10 @@ def fixed_tools():
         })
     recipes.append({
         "id": "tsjs",
-        "script": "scripts/release/prepare-js.mjs",
+        "script": "scripts/release/build-js.sh",
         "sha256": None,
         "qualification": "pending",
-        "settings": recipe_settings(),
+        "settings": js_recipe_settings(),
     })
     return {
         "schema_version": 1,
@@ -152,6 +152,30 @@ def recipe_settings():
         "vite_env_loading": False,
         "vite_config_loading": False,
         "npm_lifecycle": "reviewed-preparation-only",
+    }
+
+
+def js_recipe_settings():
+    """Return only effective selectors executed by the independent JS recipe."""
+    return {
+        "fresh_source": "tracked-objects-only",
+        "fresh_installations": 2,
+        "fresh_private_npm_caches": True,
+        "npm_version": "11.6.2",
+        "node_version": "24.12.0",
+        "npm_offline": True,
+        "npm_include_dev": True,
+        "npm_audit": False,
+        "npm_fund": False,
+        "npm_lifecycle": "reviewed-observed-foreground",
+        "mandatory_tests": True,
+        "compare": "all-tracked-final-module-bytes",
+        "publish": "A-only-after-equality",
+        "network_boundary": "qualification-pending",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_mode": "production",
+        "vite_env_loading": False,
+        "vite_config_loading": False,
     }
 
 
@@ -556,7 +580,12 @@ def source_snapshot(repo, commit, inherited):
     _audit_configuration(repo, inherited)
     if _git(repo, ["cat-file", "-t", commit]).strip() != b"commit":
         raise ValueError("source revision must be an actual commit object")
-    epoch = int(_git(repo, ["show", "-s", "--format=%ct", commit]).strip())
+    # Read the selected object directly; tracked snapshots need no parent history.
+    header = _git(repo, ["cat-file", "commit", commit]).split(b"\n\n", 1)[0]
+    committers = [line for line in header.splitlines() if line.startswith(b"committer ")]
+    if len(committers) != 1 or not re.search(rb" [0-9]+ [+-][0-9]{4}$", committers[0]):
+        raise ValueError("invalid committed source timestamp")
+    epoch = int(committers[0].rsplit(b" ", 2)[1])
     require_nonnegative_integer(epoch)
     entries = {}
     for record in _git(repo, ["ls-tree", "-rz", "--full-tree", commit]).split(b"\0"):

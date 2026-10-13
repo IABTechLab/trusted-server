@@ -165,6 +165,7 @@ export async function collectJs({
     "vitest.config.ts",
   ].map((file) => `crates/trusted-server-js/lib/${file}`);
   sources.push("scripts/release/collect-js.mjs");
+  sources.push("scripts/release/build-js.sh", "scripts/release/prepare.py");
   const materials = [
     ...prepared.materials,
     ...sources.map((file) => ({
