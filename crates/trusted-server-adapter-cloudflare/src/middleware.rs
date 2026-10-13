@@ -111,8 +111,6 @@ pub(crate) fn apply_finalize_headers(
         HeaderValue::from_static(if geo_available { "true" } else { "false" }),
     );
 
-    trusted_server_core::version_header::apply_git_version_header(response);
-
     // Cloudflare is a real shared cache: cookie-bearing responses must stay
     // private and operator headers must not re-enable caching for uncacheable
     // per-user payloads.
