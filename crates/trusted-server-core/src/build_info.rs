@@ -9,6 +9,7 @@
 //! | [`BUILT_AT`] | `SOURCE_DATE_EPOCH`, in seconds | The time of the build |
 //! | [`COMMIT`] | `TRUSTED_SERVER_COMMIT` | `unknown` |
 //! | [`BUILD_RUN`] | `TRUSTED_SERVER_BUILD_RUN` | `unknown` |
+//! | [`BUILD_TAG`] | `TRUSTED_SERVER_BUILD_TAG` | `unknown` |
 //!
 //! Each is the builder's own report. Nothing here measures the binary.
 
@@ -23,6 +24,9 @@ pub const COMMIT: &str = env!("TRUSTED_SERVER_COMMIT");
 
 /// The build run that made this binary, or `unknown`.
 pub const BUILD_RUN: &str = env!("TRUSTED_SERVER_BUILD_RUN");
+
+/// The tag this build was made from, as the builder names it, or `unknown`.
+pub const BUILD_TAG: &str = env!("TRUSTED_SERVER_BUILD_TAG");
 
 /// The build script's date arithmetic, compiled here so a test can call it.
 #[cfg(test)]
@@ -45,8 +49,12 @@ mod tests {
     }
 
     #[test]
-    fn the_commit_and_the_run_are_never_empty() {
-        for (name, value) in [("commit", COMMIT), ("build run", BUILD_RUN)] {
+    fn the_commit_the_run_and_the_tag_are_never_empty() {
+        for (name, value) in [
+            ("commit", COMMIT),
+            ("build run", BUILD_RUN),
+            ("build tag", BUILD_TAG),
+        ] {
             assert!(
                 !value.is_empty() && !value.chars().any(char::is_control),
                 "the {name} should be the builder's value or `unknown`, got {value:?}"
