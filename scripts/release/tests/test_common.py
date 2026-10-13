@@ -256,6 +256,20 @@ class SerializationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "keys"):
             common.deterministic_json_bytes({1: "example"})
 
+    def test_serialization_rejects_nonstring_keys_inside_tuple_containers(self):
+        for key in (1, True):
+            for document in (({key: "example"},), {"items": (({key: "example"},),)}):
+                with self.subTest(key=key, document=document):
+                    with self.assertRaisesRegex(ValueError, "keys"):
+                        common.deterministic_json_bytes(document)
+
+    def test_serialization_accepts_valid_tuple_containers(self):
+        self.assertEqual(
+            common.deterministic_json_bytes(({"name": "example"},)),
+            b'[{"name":"example"}]\n',
+            "should serialize valid tuples using JSON array syntax",
+        )
+
     def test_serialization_rejects_cycles_promptly(self):
         source = """
 import sys

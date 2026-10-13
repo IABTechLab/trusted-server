@@ -199,7 +199,7 @@ def _check_unicode(document):
                 raise ValueError("JSON object keys must be strings")
             pending.extend(value.keys())
             pending.extend(value.values())
-        elif isinstance(value, list):
+        elif isinstance(value, (list, tuple)):
             pending.extend(value)
 
 
