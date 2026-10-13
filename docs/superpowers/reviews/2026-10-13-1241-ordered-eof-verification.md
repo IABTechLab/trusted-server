@@ -4,6 +4,8 @@
 
 **Branch:** `feat/1241-async-html-finalization`; draft PR #1290; issue #1241.
 
+**Published implementation:** `a533df267c149bb8295b23e5d5a1fb700c1b32eb`; PR remains draft.
+
 **Review baseline:** `3981d0222bf0767ba3c8de767d633018b0df4b58`.
 The newer remote merge from `main` was preserved before final verification.
 

@@ -119,10 +119,10 @@ Paths above are relative to `crates/trusted-server-core/src/` unless prefixed wi
 
 ## Task 9: Publish the reviewed revision
 
-- [ ] Verify clean intended diff, archive links, spec/plan/implementation alignment and fresh passing checks.
-- [ ] Commit using repository sentence-case conventions and push the existing feature branch.
-- [ ] Rewrite draft PR description around generic ordered EOF completion and operator permission; keep issue1241 as the target and keep draft status.
-- [ ] Confirm remote head/body and report any remaining maintainer decisions or pending hosted checks.
+- [x] Verify clean intended diff, archive links, spec/plan/implementation alignment and fresh passing checks.
+- [x] Commit using repository sentence-case conventions and push the existing feature branch.
+- [x] Rewrite draft PR description around generic ordered EOF completion and operator permission; keep issue1241 as the target and keep draft status.
+- [x] Confirm remote head/body and report any remaining maintainer decisions or pending hosted checks.
 
 ## Acceptance mapping
 
@@ -136,3 +136,10 @@ Paths above are relative to `crates/trusted-server-core/src/` unless prefixed wi
 | Auction/codec/partial/cache/privacy safeguards    | Task 6, Task 8 |
 | Honest adapter TTFB contract and consumer scope   | Task 7, Task 8 |
 | Reproducible verification and draft publication   | Tasks 8–9      |
+
+## Execution completion
+
+Implementation commit `a533df267c149bb8295b23e5d5a1fb700c1b32eb` was pushed and
+draft PR #1290 was updated and verified. The newer remote merge was preserved.
+All local verification passed; hosted CI results remain separate. This completion
+record changes documentation only. See the [verification report](../reviews/2026-10-13-1241-ordered-eof-verification.md).
