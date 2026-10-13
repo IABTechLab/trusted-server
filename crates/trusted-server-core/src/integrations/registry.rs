@@ -9,6 +9,7 @@ use http::{Method, Request, Response};
 use matchit::Router;
 use sha2::{Digest as _, Sha256};
 
+use crate::attestation::PlatformIdentity;
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
@@ -1520,7 +1521,9 @@ fn check_middleware(
 }
 
 /// The middleware no entry names in a phase it runs in, each with the
-/// integration that supplies it, in registration order.
+/// integration that supplies it, in registration order. Core's own
+/// middleware is offered to every deployment, so one that no entry names
+/// is not a module running for nothing, and is left out.
 fn unnamed_middleware<'a>(
     settings: &Settings,
     inner: &'a IntegrationRegistryInner,
@@ -1528,6 +1531,7 @@ fn unnamed_middleware<'a>(
     inner
         .middleware
         .iter()
+        .filter(|(integration, _)| *integration != crate::service_version::MODULE)
         .filter(|(_, middleware)| {
             let id = middleware.middleware_id();
             !middleware
@@ -1544,6 +1548,9 @@ fn unnamed_middleware<'a>(
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     plan: Option<Arc<AuctionPlan>>,
+    /// What the adapter reports about the platform the deployment runs on,
+    /// which a middleware is told about every document.
+    platform: Arc<PlatformIdentity>,
 }
 
 /// Refuses a name a section selects that no module in this deployment
@@ -1600,6 +1607,20 @@ fn check_section_selections(
 }
 
 impl IntegrationRegistry {
+    /// Tells the registry what the adapter reports about the platform, which
+    /// a middleware is told about every document.
+    #[must_use]
+    pub fn with_platform(mut self, platform: PlatformIdentity) -> Self {
+        self.platform = Arc::new(platform);
+        self
+    }
+
+    /// What the adapter reports about the platform the deployment runs on.
+    #[must_use]
+    pub fn platform(&self) -> &PlatformIdentity {
+        &self.platform
+    }
+
     /// Build a registry and auction plan from the provided settings for tests.
     ///
     /// Runtime adapters should compile one plan and pass it to
@@ -1991,11 +2012,18 @@ impl IntegrationRegistry {
                 )) as Arc<dyn Middleware>,
             ));
         }
+        // Core's own middleware, which an entry may name whatever the
+        // sections select.
+        inner.middleware.push((
+            crate::service_version::MODULE,
+            Arc::new(crate::service_version::ServiceVersion),
+        ));
         check_middleware(settings, &inner)?;
 
         Ok(Self {
             inner: Arc::new(inner),
             plan: Some(plan),
+            platform: Arc::default(),
         })
     }
 
@@ -2526,6 +2554,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
             plan: None,
+            platform: Arc::default(),
         }
     }
 
@@ -2567,6 +2596,7 @@ impl IntegrationRegistry {
                 prefix_module: SelectedPrefixModule::default(),
             }),
             plan: None,
+            platform: Arc::default(),
         }
     }
 
@@ -2648,6 +2678,7 @@ impl IntegrationRegistry {
                 prefix_module: SelectedPrefixModule::default(),
             }),
             plan: None,
+            platform: Arc::default(),
         }
     }
 }
@@ -3194,6 +3225,12 @@ pub(crate) mod test_support {
                 MiddlewareAction::pass()
             }
         }
+        /// The name of the serve middleware that writes a header on a text
+        /// response.
+        pub(crate) const TEXT_HEADER: &str = "testing.middleware-fixture.text-header";
+        /// The header the text header middleware writes, name and value.
+        pub(crate) const TEXT_HEADER_NAME: &str = "x-fixture-text";
+        pub(crate) const TEXT_HEADER_VALUE: &str = "served";
 
         /// The builder core's test build lists beside its own.
         pub(crate) const BUILDER: IntegrationBuilder =
@@ -3355,6 +3392,32 @@ pub(crate) mod test_support {
             }
         }
 
+        struct TextHeader;
+
+        impl Middleware for TextHeader {
+            fn middleware_id(&self) -> &'static str {
+                TEXT_HEADER
+            }
+
+            fn handles_media_type(&self, media_type: &str) -> bool {
+                media_type == TEXT_MEDIA_TYPE
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Serve]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    response_headers: vec![(
+                        http::HeaderName::from_static(TEXT_HEADER_NAME),
+                        http::HeaderValue::from_static(TEXT_HEADER_VALUE),
+                    )],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
         struct Broken;
 
         impl Middleware for Broken {
@@ -3397,6 +3460,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(Text))
                     .with_middleware(Arc::new(Preparing))
                     .with_middleware(Arc::new(Refusing))
+                    .with_middleware(Arc::new(TextHeader))
                     .build(),
             ))
         }
@@ -6654,8 +6718,10 @@ mod tests {
                 fixture::TEXT,
                 fixture::PREPARING,
                 fixture::REFUSING,
+                fixture::TEXT_HEADER,
+                crate::service_version::MODULE,
             ],
-            "should list the middleware the selected module supplies"
+            "should list the middleware the selected module supplies, and core's own after them"
         );
         assert_eq!(
             registry.middleware_in(MiddlewarePhase::Fetch),
@@ -6671,8 +6737,14 @@ mod tests {
         );
         assert_eq!(
             registry.middleware_in(MiddlewarePhase::Serve),
-            [fixture::READER, fixture::BROKEN_READER, fixture::PREPARING],
-            "should list the middleware that run in the serve phase"
+            [
+                fixture::READER,
+                fixture::BROKEN_READER,
+                fixture::PREPARING,
+                fixture::TEXT_HEADER,
+                crate::service_version::MODULE
+            ],
+            "should list the middleware that run in the serve phase, core's own last"
         );
         let chain_for = |media_type: &str, path: &str| {
             registry
@@ -6786,7 +6858,7 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
@@ -6794,7 +6866,9 @@ mod tests {
                 fixture::BROKEN_READER,
                 fixture::TEXT,
                 fixture::PREPARING,
-                fixture::REFUSING
+                fixture::REFUSING,
+                fixture::TEXT_HEADER,
+                crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
         );
@@ -6849,6 +6923,7 @@ mod tests {
                 fixture::TEXT,
                 fixture::PREPARING,
                 fixture::REFUSING,
+                fixture::TEXT_HEADER,
             ],
             "should list every middleware when there are no entries"
         );
@@ -6863,7 +6938,8 @@ mod tests {
                 fixture::BROKEN_READER,
                 fixture::TEXT,
                 fixture::PREPARING,
-                fixture::REFUSING
+                fixture::REFUSING,
+                fixture::TEXT_HEADER
             ],
             "should leave out a middleware any entry names"
         );
@@ -6933,7 +7009,8 @@ mod tests {
                 fixture::BROKEN_READER,
                 fixture::TEXT,
                 fixture::PREPARING,
-                fixture::REFUSING
+                fixture::REFUSING,
+                fixture::TEXT_HEADER
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

@@ -14,8 +14,7 @@ use edgezero_core::http::{HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
 use trusted_server_core::constants::{
-    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
-    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+    ENV_FASTLY_IS_STAGING, HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV,
 };
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
@@ -45,9 +44,8 @@ pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
 ///
 /// Headers are written in this order (last write wins):
 /// 1. Geo headers (or `X-Geo-Info-Available: false` when geo is unavailable)
-/// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
-/// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
-/// 4. Operator-configured `settings.response_headers` (can override any managed header)
+/// 2. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
+/// 3. Operator-configured `settings.response_headers` (can override any managed header)
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
     geo: Arc<dyn GeoModule>,
@@ -204,14 +202,13 @@ pub(crate) fn geo_allowed_for_response(response: &Response) -> bool {
 ///
 /// Header write order (last write wins):
 /// 1. Geo headers (`x-geo-*`) — or `X-Geo-Info-Available: false` when absent
-/// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
-/// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
-/// 4. Set-Cookie cache privacy — strip surrogate cache headers and downgrade
+/// 2. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
+/// 3. Set-Cookie cache privacy — strip surrogate cache headers and downgrade
 ///    `Cache-Control` to `private, max-age=0` on cookie-bearing responses
-/// 5. `settings.response_headers` — operator-configured overrides, except the
+/// 4. `settings.response_headers` — operator-configured overrides, except the
 ///    cache-controlling headers are skipped on uncacheable (`private`/`no-store`)
 ///    responses so operators cannot re-enable shared caching for per-user payloads
-/// 6. `X-Robots-Tag: noindex, nofollow` when `[robots-txt] modules` selects
+/// 5. `X-Robots-Tag: noindex, nofollow` when `[robots-txt] modules` selects
 ///    `refuse_all`
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
@@ -225,14 +222,6 @@ pub(crate) fn apply_finalize_headers(
             HEADER_X_GEO_INFO_AVAILABLE,
             HeaderValue::from_static("false"),
         );
-    }
-
-    if let Ok(v) = std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        if let Ok(value) = HeaderValue::from_str(&v) {
-            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
-        } else {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
-        }
     }
 
     if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
