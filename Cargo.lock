@@ -7038,6 +7038,7 @@ name = "trusted-server-integration-seam-probe"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "edgezero-core",
  "error-stack",
  "hex",

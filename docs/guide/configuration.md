@@ -1752,12 +1752,14 @@ the names that could be written.
 
 A module may declare caches of its own, named by the module, and a deployment
 selects a loading cache for each in its own `[cache.<name>]` table with the
-same four settings. The 51Degrees modules declare `cloud-answer`, the cache
-that holds each answer the 51Degrees cloud gives for one request's evidence,
-so `[cache.cloud-answer] module = "51degrees"` asks the cloud once however
-many requests carry the same evidence. A `[cache.<name>]` table naming a
-cache no linked module declares is refused when the deployment starts, and
-the message lists the names this build's modules declare.
+same four settings. A module from `crates/geo/example` whose service answers
+once for each request's evidence declares `example-answers`, the cache that
+holds those answers, so `[cache.example-answers] module = "51degrees"` asks
+the service once however many requests carry the same evidence. A name is
+the module's own: `robots-txt` and a name two modules declare are refused. A
+`[cache.<name>]` table naming a cache no linked module declares is refused by
+`ts config validate` and when the deployment starts, and the message lists
+the names this build's modules declare.
 
 ```toml
 [cache.robots-txt]

@@ -664,8 +664,10 @@ impl IntegrationBuilder {
 
     /// Declares the caches this builder's modules load through, by name,
     /// each selected in its own `[cache.<name>]` table the way core's own
-    /// are. A table naming a cache no builder declares is refused by
-    /// [`loading_caches_from`].
+    /// are. A name is the module's own, as `example-answers` is for a
+    /// module from `crates/geo/example`: core's `robots-txt` and a name
+    /// another builder declares are refused by [`declared_caches`], and a
+    /// table naming a cache no builder declares by [`check_cache_tables`].
     #[must_use]
     pub const fn with_cache_features(mut self, features: &'static [&'static str]) -> Self {
         self.cache_features = features;
@@ -824,37 +826,61 @@ pub(crate) fn all_builders(
     builders().iter().copied().chain(extra.iter().copied())
 }
 
-/// The loading cache each `[cache.<name>]` table selects, from the caches the
-/// builders a deployment links offer. A table that names no module keeps no
-/// copy, and a module's cache is made once however many tables select it.
+/// The caches a deployment may hold answers in, by name: core's own first,
+/// then the ones `builders` declare, in builder order.
 ///
 /// # Errors
 ///
-/// When a table names a module no linked builder offers a cache from, naming
-/// the table and the modules that do, and when a `[cache.<name>]` table names
-/// a cache no linked module declares, naming the ones they do.
-pub fn loading_caches_from(
+/// When a builder declares core's own `robots-txt`, or two builders declare
+/// one name, naming the builders, since the two would otherwise share one
+/// cache and its keys without a word.
+pub fn declared_caches(
+    builders: &[IntegrationBuilder],
+) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
+    let mut declared: Vec<(&'static str, &'static str)> =
+        vec![(crate::settings::ROBOTS_TXT_CACHE, "core")];
+    for builder in builders {
+        for name in builder.cache_features() {
+            if let Some((_, by)) = declared.iter().find(|(declared, _)| declared == name) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: if *by == "core" {
+                        format!(
+                            "`{}` declares the cache `{name}`, which is core's own. A module \
+                             names its caches under itself, as modules are named",
+                            builder.id()
+                        )
+                    } else {
+                        format!(
+                            "`{}` and `{by}` both declare the cache `{name}`, which would hold \
+                             both their answers under one set of keys. A module names its \
+                             caches under itself, as modules are named",
+                            builder.id()
+                        )
+                    },
+                }));
+            }
+            declared.push((name, builder.id()));
+        }
+    }
+    Ok(declared.into_iter().map(|(name, _)| name).collect())
+}
+
+/// Refuses a `[cache.<name>]` table naming a cache no linked module declares.
+/// Run when a deployment's settings are validated and again when its caches
+/// are made, so a misspelt table fails the deploy check and not the first
+/// request.
+///
+/// # Errors
+///
+/// When a table names an undeclared cache, naming the table and the caches
+/// this build's modules declare, or when the declarations themselves are
+/// refused, see [`declared_caches`].
+pub fn check_cache_tables(
     settings: &Settings,
     builders: &[IntegrationBuilder],
-) -> Result<Arc<crate::platform::LoadingCaches>, Report<TrustedServerError>> {
-    let offered: Vec<(&'static str, LoadingCacheFactory)> = builders
-        .iter()
-        .filter_map(|builder| {
-            builder
-                .loading_cache()
-                .map(|factory| (builder.id(), factory))
-        })
-        .collect();
-    let declared: Vec<&str> = std::iter::once(crate::settings::ROBOTS_TXT_CACHE)
-        .chain(
-            builders
-                .iter()
-                .flat_map(|builder| builder.cache_features().iter().copied()),
-        )
-        .collect();
-    let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
-    let mut caches = crate::platform::LoadingCaches::default();
-    for (table, config) in settings.cache.loading_caches() {
+) -> Result<(), Report<TrustedServerError>> {
+    let declared = declared_caches(builders)?;
+    for (table, _) in settings.cache.loading_caches() {
         if !declared.contains(&table) {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -864,6 +890,37 @@ pub fn loading_caches_from(
                 ),
             }));
         }
+    }
+    Ok(())
+}
+
+/// The loading cache each `[cache.<name>]` table selects, from the caches the
+/// builders a deployment links offer. A table that names no module keeps no
+/// copy, and a module's cache is made once however many tables select it.
+///
+/// # Errors
+///
+/// When a table names a module no linked builder offers a cache from, naming
+/// the table and the modules that do, and when a `[cache.<name>]` table names
+/// a cache no linked module declares, naming the ones they do, see
+/// [`check_cache_tables`].
+pub fn loading_caches_from(
+    settings: &Settings,
+    builders: &[IntegrationBuilder],
+) -> Result<Arc<crate::platform::LoadingCaches>, Report<TrustedServerError>> {
+    check_cache_tables(settings, builders)?;
+    let offered: Vec<(&'static str, LoadingCacheFactory)> = builders
+        .iter()
+        .filter_map(|builder| {
+            builder
+                .loading_cache()
+                .map(|factory| (builder.id(), factory))
+        })
+        .collect();
+    let declared = declared_caches(builders)?;
+    let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
+    let mut caches = crate::platform::LoadingCaches::default();
+    for (table, config) in settings.cache.loading_caches() {
         // A table naming no module takes the one loading cache module the
         // build links, so answers are held without a line in the document.
         // With none linked, or several, it holds nothing.
@@ -1070,6 +1127,60 @@ mod loading_caches_from_tests {
         let message = format!("{refused:?}");
         assert!(message.contains("[cache.answres]"), "{message}");
         assert!(message.contains("robots-txt, answers"), "{message}");
+    }
+
+    #[test]
+    fn the_deploy_check_refuses_the_table_the_cache_build_refuses() {
+        let settings = settings_declaring("answres", Some("one"));
+        let builders = [declaring("a_vendor"), offering("loading-cache.one")];
+
+        let refused = check_cache_tables(&settings, &builders)
+            .expect_err("the check refuses a misspelt cache name without making a cache");
+        let built = loading_caches_from(&settings, &builders).expect_err("as the build does");
+
+        assert_eq!(format!("{refused:?}"), format!("{built:?}"));
+        check_cache_tables(&settings_declaring("answers", Some("one")), &builders)
+            .expect("a declared cache passes the check");
+    }
+
+    #[test]
+    fn two_builders_declaring_one_cache_are_refused_naming_both() {
+        let refused = loading_caches_from(
+            &settings_selecting(None),
+            &[
+                declaring("a_vendor"),
+                declaring("another_vendor"),
+                offering("loading-cache.one"),
+            ],
+        )
+        .expect_err("two builders sharing a cache name are refused");
+
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("`another_vendor` and `a_vendor`"),
+            "{message}"
+        );
+        assert!(message.contains("`answers`"), "{message}");
+    }
+
+    #[test]
+    fn a_builder_declaring_core_s_own_cache_is_refused() {
+        let refused = loading_caches_from(
+            &settings_selecting(None),
+            &[
+                IntegrationBuilder::implementations("a_vendor", "a-crate")
+                    .with_cache_features(&[ROBOTS_TXT_CACHE]),
+                offering("loading-cache.one"),
+            ],
+        )
+        .expect_err("a builder declaring robots-txt is refused");
+
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("`a_vendor` declares the cache `robots-txt`"),
+            "{message}"
+        );
+        assert!(message.contains("core's own"), "{message}");
     }
 
     fn settings_selecting(module: Option<&str>) -> Settings {
