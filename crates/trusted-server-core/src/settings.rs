@@ -78,7 +78,13 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
-    /// Whole-chain HTML terminal budget in milliseconds; inert without a finalizer.
+    /// Explicit operator permission for asynchronous HTML EOF work.
+    ///
+    /// Defaults to false. Enabled work can delay response delivery, especially
+    /// on buffered adapters and processors retaining output until EOF.
+    #[serde(default)]
+    pub allow_async_html_finish: bool,
+    /// Whole-chain HTML EOF budget in milliseconds; inert without an async processor.
     #[serde(default = "default_html_finalization_timeout_ms")]
     #[validate(range(
         min = 1,
@@ -111,6 +117,7 @@ impl Default for Publisher {
             proxy_secret: Redacted::default(),
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         }
     }
 }
@@ -203,6 +210,7 @@ impl Publisher {
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
     ///     html_finalization_timeout_ms: 5000,
+    ///     allow_async_html_finish: false,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -3065,9 +3073,14 @@ impl Settings {
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        // Cargo supplies build metadata to test processes; it is not app config.
+        let settings_environment = std::env::vars()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("TRUSTED_SERVER__GIT_VERSION"))
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(settings_environment));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -6331,6 +6344,26 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn legacy_settings_loader_ignores_build_version_metadata() {
+        temp_env::with_var(
+            "TRUSTED_SERVER__GIT_VERSION",
+            Some("example-revision"),
+            || {
+                let settings = Settings::from_toml_and_env(&crate_test_settings_str())
+                    .expect("should keep build metadata outside application settings");
+                assert_eq!(
+                    settings.publisher.domain,
+                    Settings::from_toml(&crate_test_settings_str())
+                        .expect("should parse the control configuration")
+                        .publisher
+                        .domain,
+                    "should preserve configured publisher settings"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_override_env() {
         let toml_str = crate_test_settings_str();
 
@@ -6405,6 +6438,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -6417,6 +6451,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -6429,6 +6464,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -6441,6 +6477,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -6453,6 +6490,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -6465,6 +6503,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -6479,6 +6518,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -6494,6 +6534,7 @@ source_domain = "partner.example.com"
             proxy_secret: Redacted::new("test-secret".to_string()),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             html_finalization_timeout_ms: default_html_finalization_timeout_ms(),
+            allow_async_html_finish: false,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");

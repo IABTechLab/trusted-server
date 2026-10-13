@@ -24,25 +24,44 @@ use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
-struct HtmlWithStreamingProcessors {
+pub(crate) mod finish;
+
+use finish::HtmlProcessorStage;
+
+pub(crate) struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
-    processors: Vec<Box<dyn StreamProcessor>>,
+    stages: Vec<HtmlProcessorStage>,
+    finish_index: Option<usize>,
+    marker_length: usize,
 }
 
 impl StreamProcessor for HtmlWithStreamingProcessors {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
+        self.validate_capabilities()?;
+        if is_last && self.requires_async_finish() {
+            return Err(io::Error::other(
+                "HTML processors require asynchronous EOF completion",
+            ));
+        }
         let mut output = self.inner.process_chunk(chunk, is_last)?;
-        for processor in &mut self.processors {
-            output = processor.process_chunk(&output, is_last)?;
+        for stage in &mut self.stages {
+            output = stage.process(&output, is_last, self.marker_length)?;
         }
         Ok(output)
     }
 
     fn reset(&mut self) {
         self.inner.reset();
-        for processor in &mut self.processors {
-            processor.reset();
+        for stage in &mut self.stages {
+            stage.reset();
         }
+        self.finish_index = None;
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        self.stages
+            .iter()
+            .any(HtmlProcessorStage::requires_async_finish)
     }
 }
 
@@ -204,7 +223,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 pub(crate) fn create_html_processor_with_document_state(
     config: HtmlProcessorConfig,
     document_state: &IntegrationDocumentState,
-) -> impl StreamProcessor + use<> {
+) -> HtmlWithStreamingProcessors {
     let stream_processor_factories = config.integrations.html_stream_processor_factories();
 
     if config.suppress_datadome_client_side_tag {
@@ -719,14 +738,19 @@ pub(crate) fn create_html_processor_with_document_state(
         origin_host: config.origin_host.clone(),
         document_state: document_state.clone(),
     };
-    let processors = stream_processor_factories
+    let stages = stream_processor_factories
         .into_iter()
-        .map(|factory| factory.create(stream_context.clone()))
+        .map(|factory| {
+            HtmlProcessorStage::new(
+                factory.integration_id(),
+                factory.create(stream_context.clone()),
+                factory.requires_async_finish(),
+                factory.buffer_output_until_eof(),
+                config.max_buffered_body_bytes,
+            )
+        })
         .collect();
-    HtmlWithStreamingProcessors {
-        inner: Box::new(inner),
-        processors,
-    }
+    HtmlWithStreamingProcessors::from_stages(Box::new(inner), stages)
 }
 
 #[cfg(test)]
@@ -1560,22 +1584,34 @@ mod tests {
         let inner_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second_final_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut processor = HtmlWithStreamingProcessors {
-            inner: Box::new(DecoratingProcessor {
+        let mut processor = HtmlWithStreamingProcessors::from_stages(
+            Box::new(DecoratingProcessor {
                 prefix: b'I',
                 final_calls: Arc::clone(&inner_final_calls),
             }),
-            processors: vec![
-                Box::new(DecoratingProcessor {
-                    prefix: b'A',
-                    final_calls: Arc::clone(&first_final_calls),
-                }),
-                Box::new(DecoratingProcessor {
-                    prefix: b'B',
-                    final_calls: Arc::clone(&second_final_calls),
-                }),
+            vec![
+                HtmlProcessorStage::new(
+                    "A",
+                    Box::new(DecoratingProcessor {
+                        prefix: b'A',
+                        final_calls: Arc::clone(&first_final_calls),
+                    }),
+                    false,
+                    false,
+                    64,
+                ),
+                HtmlProcessorStage::new(
+                    "B",
+                    Box::new(DecoratingProcessor {
+                        prefix: b'B',
+                        final_calls: Arc::clone(&second_final_calls),
+                    }),
+                    false,
+                    false,
+                    64,
+                ),
             ],
-        };
+        );
 
         assert_eq!(
             processor

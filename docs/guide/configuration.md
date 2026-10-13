@@ -309,15 +309,16 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                          | Type    | Required | Description                                                                        |
-| ------------------------------ | ------- | -------- | ---------------------------------------------------------------------------------- |
-| `domain`                       | String  | Yes      | Publisher's apex domain name                                                       |
-| `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                             |
-| `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                |
-| `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                      |
-| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                     |
-| `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)        |
-| `html_finalization_timeout_ms` | Integer | No       | Whole terminal-chain budget after synchronous EOF (default 5000 ms; range 1–60000) |
+| Field                          | Type    | Required | Description                                                                          |
+| ------------------------------ | ------- | -------- | ------------------------------------------------------------------------------------ |
+| `domain`                       | String  | Yes      | Publisher's apex domain name                                                         |
+| `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                               |
+| `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
+| `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
+| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
+| `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
+| `allow_async_html_finish`      | Boolean | No       | Explicit permission for async HTML EOF work and its delivery cost (default false)    |
+| `html_finalization_timeout_ms` | Integer | No       | Shared optional EOF budget after decoder/parser EOF (default 5000 ms; range 1–60000) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -438,22 +439,33 @@ intentionally, and never put it in the TOML file or pushed app-config blob.
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
+#### `allow_async_html_finish`
+
+Explicit permission for integrations declaring asynchronous HTML processor completion.
+Defaults to `false`. An enabled integration requiring EOF I/O without permission is
+rejected with a configuration error; its requested work is not silently skipped.
+Permission alone does not change processing when no async factories are registered.
+
+Non-retaining processors can release ready HTML before EOF I/O on Fastly. A factory
+requesting output retention delays initial delivery until EOF or overflow. Axum,
+Workers and Spin currently buffer publisher responses, so enabled EOF I/O can add to
+TTFB there even without stage retention. Enable only when accepting that delivery cost.
+
 #### `html_finalization_timeout_ms`
 
-Optional whole-chain budget for registered asynchronous HTML finalizers, in
-milliseconds. The default is `5000`; accepted values are `1` through `60000`.
-The budget starts after decoding and synchronous HTML EOF and does not change the
-auction deadline. It has no effect without enabled finalizers. Axum, Workers, and
-Spin can cancel yielding work; Fastly consumers must bound their own blocking host
-calls. Timeout keeps the current transformed document and skips later finalizers.
+Shared budget for optional asynchronous processor EOF work in milliseconds. The default
+is `5000`; accepted values are `1` through `60000`. It begins after decoder/parser EOF
+and does not change the auction deadline. Timer expiry skips later optional I/O while
+still completing downstream synchronous EOF. Timeout retains the current un-emitted
+stage output; it cannot undo bytes already delivered or remote side effects.
 
-Enabled finalizers disable shared-template and downstream caching for processed
-HTML, including unchanged/error outcomes; raw-origin readthrough remains separate.
-HTML with status 206 or any `Content-Range` bypasses rewriting and terminal I/O,
-preserving its encoded bytes and range/framing metadata. Full error pages remain
-eligible and expose their status to the integration. See
-[Asynchronous HTML finalization](/guide/integration-guide#asynchronous-html-finalization)
-for consumer requirements and the cacheability contract needed for a future mode.
+The setting is inert without async processors. Axum, Workers and Spin can cancel
+yielding callbacks. Fastly consumers must independently bound blocking host calls.
+Opted-in processed HTML bypasses shared-template caching and uses private/no-store
+policy; raw-origin readthrough remains separate. Opted-in HTML with 206 or any
+`Content-Range` bypasses rewriting and EOF work while preserving encoded bytes and
+range/framing metadata. Full error HTML remains eligible and exposes actual status.
+See [Asynchronous HTML processor completion](/guide/integration-guide#asynchronous-html-processor-completion).
 
 #### `max_buffered_body_bytes`
 

@@ -203,129 +203,131 @@ Streaming support is an adapter capability. Request
 checked `supports_streaming_responses()`; unsupported adapters must reject
 the request instead of silently buffering it.
 
-## Asynchronous HTML finalization
+## Asynchronous HTML processor completion
 
-An integration that needs complete transformed HTML plus an outside lookup can
-register an `IntegrationHtmlFinalizerFactory` with `.with_html_finalizer(...)`.
-The factory creates one request-local `IntegrationHtmlFinalizer` session and
-receives the same `IntegrationDocumentState` as the synchronous HTML rewriters.
-Factory construction performs setup only; start I/O inside the returned future.
-The session and its future may be `?Send`.
+An integration can register an HTML stream processor that optionally awaits HTTP,
+KV or other request services after its synchronous EOF call. Use the existing
+`IntegrationHtmlStreamProcessorFactory` and `.with_html_stream_processor(...)`.
+Article signing is only one possible consumer; core implements the processor
+lifecycle, not a signing protocol or background job system.
 
-Core completes decoding and every synchronous processor, then awaits terminal
-sessions in registration order. Each session sees the previous committed HTML;
-its replacement does not pass through the parser again. The auction seam and
-encoder complete after the terminal phase. Existing `StreamProcessor` callbacks
-remain synchronous, and pages with no registered finalizers keep their existing
-streaming path.
+Factories declare `requires_async_finish()`. Sessions implement the matching
+`StreamProcessor::requires_async_finish()` and optional `async_finish(...)`.
+The default callback returns `None`, creating no future. Factory metadata is
+available before template lookup, so requested EOF work cannot be skipped by a
+processed cache hit. The factory and session share request-local
+`IntegrationDocumentState` with the existing parser hooks.
 
-`HtmlFinalizationInput` supplies the actual `response_status`, borrowed `html`, `services`, `deadline`, and a
-separate bounded `replacement` writer. Append a complete candidate and return
-`HtmlFinalization::Replace`, or return `Unchanged`. An error, timeout, invalid
-assembly marker count, or output limit violation discards the candidate and
-retains the current input. Ignoring an append error cannot commit partial output.
-An empty `Replace` intentionally emits an empty document. Callback panics propagate
-through the request and are not converted into optional-work failures. Preserve HTML structure,
-CSP, Next.js/RSC semantics, and the opaque parser markers; core checks marker
-multiplicity but does not parse or validate replacement structure.
+Operators must explicitly accept the possible delivery cost:
 
-Full 404/500 HTML remains eligible. A signing integration should inspect
-`response_status` and return `Unchanged` for statuses it does not sign. When
-finalizers are registered, HTML with status 206 or any `Content-Range` bypasses
-rewriting and terminal I/O while preserving encoded body bytes and range/framing
-metadata. Without registered finalizers, existing partial-response processing
-continues. Non-document fetches keep their range request semantics. Independent
-cookie and diagnostics privacy rules still apply.
-
-Each real consumer must test a winning auction after replacement: the marker is
-consumed once, and the bids script remains before the structural body end, outside
-scripts, comments, and attributes. Unchanged bytes beside a marker cannot establish
-its parsing context, so adjacent-byte checks are not a structural guarantee.
-
-The publisher's `html_finalization_timeout_ms` is one budget for the whole chain,
-starting after synchronous EOF. Use `deadline.remaining()` to bound outside calls.
-Axum, Workers, and Spin provide cooperative timers. Fastly provides no timer
-because host calls block; the consumer must set transport timeouts itself. Dropping
-a future releases its borrows and discards its candidate, but cannot undo a remote
-write or preempt work that does not yield. The deadline wins over a simultaneously
-ready callback. Avoid logging HTML, lookup URLs, or external response contents.
-The default backend first-byte timeout is 15 seconds; it is not a total-call
-deadline. Use the remaining budget for supported transport limits and verify the
-consumer's blocking-call behavior on Fastly before enabling it.
-
-Enabled finalizers retain transformed HTML up to `max_buffered_body_bytes` and use
-a separate candidate with the same cap. Collection overflow skips terminal I/O
-and resumes normal delivery with the retained prefix and remaining bytes. Existing
-input, decoder, and final output errors remain fatal. Enabled pages wait for EOF
-within the cap; oversized pages also delay first-byte delivery until the cap is
-crossed and ordinary streaming resumes.
-
-Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
-`publisher_response_into_streaming_response` to execute terminal callbacks.
-`stream_publisher_body` and the generic synchronous pipeline perform synchronous
-transformations only. Callers with a pending auction must use an async entry point
-to collect or abandon it; `stream_publisher_body` borrows the response parameters
-and leaves auction ownership with the caller, including on a partial-HTML bypass.
-On async entry points, client cancellation drops the callback and retains the
-existing auction guard's log warning; error paths that can await emit abandonment
-telemetry.
-
-Finalizer-enabled HTML bypasses shared-template reads, reservations, and stores and
-uses inline auction assembly. Raw-origin readthrough remains independent. Processed
-HTML receives `Cache-Control: no-store, private` even when a finalizer leaves it
-unchanged, fails, or is skipped after collection overflow. Document GETs strip the
-four conditional/range headers used by synthesized HTML. HEAD, bodiless responses,
-unsupported encodings, and non-HTML responses run no terminal callbacks.
-
-This first version therefore removes transformed-template and downstream HTML
-caching for enabled pages, including page-level signing. Raw-origin caching and
-an integration's own KV result cache can still reduce origin and lookup work.
-Cacheable finalization needs a separate contract for reader-neutral output,
-external-data/signing-key identity, expiry, invalidation, optional failure caching,
-and whether callbacks execute on hits; a user-independent flag alone is insufficient.
-
-Callers of `handle_publisher_request` provide the enabled integration registry in
-`AuctionDispatch::integration_registry` and use that same registry for response
-finalization. This metadata is required before a shared-template lookup can happen.
-It is a source-compatibility change for external `AuctionDispatch` struct literals:
-add the required field using the same request registry. An omitted or optional
-registry could incorrectly admit a cached document before finalization is known.
-
-A fictional HTTP consumer is available only through the existing `test-utils`
-feature. To verify real asynchronous I/O and timeout fallback on local runtimes:
-
-```bash
-./scripts/async-html-finalization-local-test.sh axum
-./scripts/async-html-finalization-local-test.sh cloudflare
-./scripts/async-html-finalization-local-test.sh spin
-./scripts/async-html-finalization-local-test.sh fastly
+```toml
+[publisher]
+allow_async_html_finish = true
+html_finalization_timeout_ms = 5000
 ```
 
-Each run builds a fresh feature-enabled artifact, generates temporary configuration
-and example secrets, and retains diagnostics in the printed temporary directory.
-It uses the installed runtime CLIs and, for Workers, the `worker-build` version
-matching the locked `worker` SDK and a compatible `wasm-bindgen` CLI. The default
-Cargo output is isolated in that directory; an explicit `CARGO_TARGET_DIR` permits
-sharing the local build cache. Every run invokes Cargo and builds its fixture Worker
-bundle into a fresh directory. Workers and Spin use opt-in adapter `test-utils`
-features for local diagnostic sinks.
+Permission defaults to false. Enabling an integration requiring async completion
+without permission produces a configuration error naming the integration and the
+setting. Work is not silently omitted. Permission alone, with no async factories,
+keeps ordinary processing unchanged.
 
-The repository pins Viceroy 0.17 for its normal test gate. Backend transport timeout
-simulation requires Viceroy 0.19 or later. Use an isolated newer executable in `PATH`
-for the Fastly hung-call case; do not interpret a hung test on 0.17 as evidence that
-Fastly production ignores the configured timeout.
+Chunk callbacks remain synchronous. At EOF, core validates/drains the decoder and
+finishes the HTML parser, sending ready bytes through downstream processors as
+ordinary chunks. It then completes each processor in registration order: synchronous
+EOF, optional awaited finish, accepted output passed downstream, then downstream EOF.
+The auction and encoder finish afterward. Ready bytes are released before optional
+I/O; a callback is never run inside a parser handler.
 
-Add `--release` for production-profile artifacts. Add `--auction` to run a separate
-enabled-auction control against a closed loopback
-bid endpoint. It verifies slot/bid fallback assembly and marker removal without
-external traffic. The auction telemetry clock now uses the platform-compatible
-`web_time::Instant`; the combined Workers control passes after this targeted
-correction. This does not verify every other clock path covered by #1240.
+`StreamFinishInput` supplies actual `response_status`, borrowed `output`, `services`,
+`deadline` and a separate bounded `replacement` writer. The output is the un-emitted
+synchronous tail of this stage. It is the complete retained output only when the
+factory explicitly requests `buffer_output_until_eof()`. Return `StreamFinish::Unchanged`
+to retain it, or write a complete candidate and return `Replace`. To append a tail,
+write the existing `output` followed by the new bytes. Empty replacement is intentional.
+The session and future may be non-`Send`; start I/O inside the returned future.
 
-CI runs the actual Axum harness with `--auction`, including delayed success,
-hung-call fallback, privacy, and auction assembly. It also checks process-group
-cleanup and retains runtime diagnostics on failure. The other runtime harnesses
-remain explicit local verification commands.
+Core buffers a stage's output only when its factory explicitly requests retention.
+The holder and replacement candidate each use `max_buffered_body_bytes` as their cap.
+On collection overflow, core releases prefix/crossing/later output exactly once and
+skips that stage's optional I/O, while still completing its synchronous EOF. It cannot
+bound arbitrary private allocations inside an integration. Streaming stages cannot
+replace bytes already delivered; EOF append does not imply safe insertion into an
+already emitted head or before an earlier body close.
+
+Callback errors, poisoned candidates, invalid assembly-marker multiplicity and timeout
+discard the candidate and retain current stage output. Previously accepted stages stay
+accepted. One absolute deadline covers every callback, starting after decoder/parser
+EOF. On expiry, core drops the callback, skips later optional I/O, and still completes
+all downstream synchronous EOF calls. Origin, parser, synchronous processing, codec and
+sink errors remain fatal. Callback panics propagate. Cancellation does not undo remote
+writes or guarantee that transport work is cancelled.
+
+Axum, Workers and Spin provide cooperative timers. Fastly has none because its host
+calls block; bound those calls with `deadline.remaining()` and transport timeouts.
+A timer cannot preempt CPU work or blocking host calls. Avoid logging HTML, lookup URLs
+or external response contents.
+
+The latency contract depends on the adapter and the stage:
+
+- Without async factories, delivery and auction timing keep their existing path.
+- On Fastly, a non-retaining stage releases ready HTML before optional EOF I/O; the
+  response can finish later.
+- A retaining stage delays first HTML delivery until EOF or overflow release.
+- Axum, Workers and Spin currently buffer publisher responses. Enabled EOF I/O can
+  add to TTFB there even without stage retention. This feature does not add streaming
+  support to those adapters.
+
+Use `stream_publisher_body_async`, `buffer_publisher_response_async`, or
+`publisher_response_into_streaming_response` for opted-in HTML. The synchronous
+pipeline and `stream_publisher_body` reject async processing before input/output
+effects. The raw partial-HTML copy path performs no callback; the synchronous helper
+leaves pending auction ownership with its caller, so pending auctions still require
+an async entry point. Async cancellation retains the auction guard's warning; error
+paths that can await emit abandonment telemetry.
+
+Opted-in HTML bypasses shared-template reads/reservations/stores and receives
+`Cache-Control: no-store, private`, including unchanged, failed and overflow-bypassed
+work. Raw-origin readthrough remains independent. Cacheable asynchronous output needs
+separate rules for output identity, external-data freshness, expiry, invalidation,
+failure caching and callback execution on hits.
+
+When async factories are registered, HTML with 206 or any `Content-Range` bypasses
+rewriting and EOF I/O while preserving encoded bytes, framing, validators and origin
+cache policy. Independent cookie/diagnostics privacy still applies. HEAD, bodiless,
+non-HTML and unsupported encodings run no callbacks. Complete error HTML is eligible;
+inspect `response_status` to decide whether the integration applies. Without async
+factories, existing partial-response handling continues.
+
+Callers of `handle_publisher_request` supply the same enabled registry in
+`AuctionDispatch::integration_registry` and response processing. This required field
+allows cache admission to see async capabilities before lookup.
+
+Replacement output passes through later stream processors, but is not parsed again.
+Preserve CSP, Next.js/RSC semantics and opaque assembly markers. Core checks marker
+multiplicity including split boundaries, not HTML structure. Each real consumer must
+verify winning-auction placement after its changes and preserve the structural body
+end; neighboring bytes alone cannot establish a marker's parsing context.
+
+A fictional HTTP processor is available only with `test-utils`:
+
+```bash
+./scripts/async-html-finalization-local-test.sh axum --auction
+./scripts/async-html-finalization-local-test.sh cloudflare --auction
+./scripts/async-html-finalization-local-test.sh spin --auction
+./scripts/async-html-finalization-local-test.sh fastly --auction
+```
+
+The harness builds fresh enabled artifacts, generates isolated example configuration,
+and checks disabled, successful, hung and auction controls. Fastly also runs a
+non-retaining processor and proves initial body bytes arrive while its delayed EOF
+lookup is pending. `--release` selects production-profile fixture artifacts. Diagnostics
+are retained in the printed temporary directory. An explicit `CARGO_TARGET_DIR` permits
+sharing the build cache. Workers requires tooling matching the locked SDK.
+
+Repository-pinned Viceroy 0.17 remains the normal WASI test runner. The Fastly hung-call
+transport simulation requires an isolated Viceroy 0.19 or newer; repository pins stay
+unchanged. CI runs actual Axum controls and real-process cleanup tests. The targeted
+auction telemetry clock correction remains separate from broader #1240 clock work.
 
 ## Browser and script guards
 

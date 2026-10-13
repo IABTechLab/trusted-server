@@ -18,6 +18,7 @@ pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
+#[cfg(test)]
 mod html_finalization;
 pub mod js_asset_proxy;
 pub mod lockr;
@@ -29,9 +30,10 @@ mod registry;
 pub mod sourcepoint;
 pub mod testlight;
 
+#[cfg(test)]
 pub use html_finalization::{
-    HtmlFinalization, HtmlFinalizationDeadline, HtmlFinalizationError, HtmlFinalizationInput,
-    HtmlReplacementWriter, IntegrationHtmlFinalizer, IntegrationHtmlFinalizerFactory,
+    HtmlFinalization, HtmlFinalizationError, HtmlFinalizationInput, HtmlReplacementWriter,
+    IntegrationHtmlFinalizer, IntegrationHtmlFinalizerFactory,
 };
 
 pub use registry::{

@@ -1,5 +1,9 @@
 # Asynchronous HTML finalization implementation review
 
+**Historical record:** This describes the buffered terminal implementation before the
+2026-10-13 ordered EOF revision. Its verification counts do not verify the revised
+implementation. See the current spec and plan for the active architecture.
+
 **Date:** 2026-10-12
 
 **Branch:** `feat/1241-async-html-finalization`
@@ -11,9 +15,9 @@ status metadata, a targeted telemetry clock correction, and actual-runtime CI. T
 Workers enabled-auction control now passes. See the linked hardening execution
 record for the latest verification; the original evidence below is historical.
 
-**Design:** [Optional asynchronous HTML document finalization](../specs/2026-10-12-1241-async-html-finalization-design.md)
+**Design:** [Optional asynchronous HTML document finalization](../archive/2026-10-12-1241-buffered-terminal-design.md)
 
-**Plan:** [Implementation and verification tasks](../plans/2026-10-12-1241-async-html-finalization.md)
+**Plan:** [Implementation and verification tasks](../archive/2026-10-12-1241-buffered-terminal-plan.md)
 
 **Review hardening:** [Fixes, retained design decisions, and renewed verification](../plans/2026-10-12-1241-review-hardening.md)
 

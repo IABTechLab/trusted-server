@@ -1,5 +1,9 @@
 # HTML finalization review hardening implementation plan
 
+**Historical record:** This describes the buffered terminal implementation before the
+2026-10-13 ordered EOF revision. Its verification counts do not verify the revised
+implementation. See the current spec and plan for the active architecture.
+
 > **For agentic workers:** Use superpowers:executing-plans for central implementation and independent review. Checkboxes record observed completion.
 
 **Goal:** Close the confirmed response-eligibility and maintenance gaps from the independent review of PR #1290.
@@ -11,7 +15,7 @@
 ## Reviewed design refinements
 
 The user authorized fixes after the read-only review. These refinements supplement
-the [existing design](../specs/2026-10-12-1241-async-html-finalization-design.md).
+the [existing design](../archive/2026-10-12-1241-buffered-terminal-design.md).
 
 - Terminal callbacks receive the actual response status. Full 404/500 HTML remains
   eligible; a signing consumer may return `Unchanged` for unwanted statuses.

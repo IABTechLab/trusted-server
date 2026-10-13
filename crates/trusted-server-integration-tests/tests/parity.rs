@@ -1192,6 +1192,7 @@ impl PlatformHttpClient for TerminalFixtureOrigin {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
     let mut settings = test_settings();
+    settings.publisher.allow_async_html_finish = true;
     settings.integrations.insert_config("html_finalization_fixture", &serde_json::json!({
         "enabled": true, "lookup_url": "https://lookup.example.com/success", "transport_timeout_ms": 1000,
     })).expect("should enable the fictional terminal consumer");

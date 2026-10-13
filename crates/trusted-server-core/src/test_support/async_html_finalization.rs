@@ -1,5 +1,6 @@
 //! Fictional terminal HTTP consumer, available only with `test-utils`.
 
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,11 +16,12 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    HtmlFinalization, HtmlFinalizationError, HtmlFinalizationInput, IntegrationHtmlFinalizer,
-    IntegrationHtmlFinalizerFactory, IntegrationHtmlStreamContext, IntegrationRegistration,
+    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationRegistration,
 };
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest};
 use crate::settings::{IntegrationConfig, Settings};
+use crate::streaming_processor::StreamProcessor;
+use crate::streaming_processor::finish::{StreamFinish, StreamFinishError, StreamFinishInput};
 
 pub(crate) const ID: &str = "html_finalization_fixture";
 const EOF_SENTINEL: &[u8] = b"<!--example-document-eof-->";
@@ -33,6 +35,8 @@ pub(crate) struct FixtureConfig {
     lookup_url: String,
     #[validate(range(min = 1, max = 60000))]
     transport_timeout_ms: u32,
+    #[serde(default)]
+    streaming: bool,
 }
 
 impl IntegrationConfig for FixtureConfig {
@@ -42,7 +46,14 @@ impl IntegrationConfig for FixtureConfig {
 }
 
 struct FixtureFactory(FixtureConfig);
-struct FixtureSession(FixtureConfig);
+struct FixtureSession {
+    config: FixtureConfig,
+    digest: Sha256,
+    bytes: usize,
+    tail: Vec<u8>,
+    saw_eof_sentinel: bool,
+    synchronous_eof: bool,
+}
 
 pub(crate) fn register(
     settings: &Settings,
@@ -53,47 +64,78 @@ pub(crate) fn register(
     Ok(Some(
         IntegrationRegistration::builder(ID)
             .without_js()
-            .with_html_finalizer(Arc::new(FixtureFactory(config)))
+            .with_html_stream_processor(Arc::new(FixtureFactory(config)))
             .build(),
     ))
 }
 
-impl IntegrationHtmlFinalizerFactory for FixtureFactory {
+impl IntegrationHtmlStreamProcessorFactory for FixtureFactory {
     fn integration_id(&self) -> &'static str {
         ID
     }
 
-    fn create(&self, _: IntegrationHtmlStreamContext) -> Box<dyn IntegrationHtmlFinalizer> {
-        Box::new(FixtureSession(self.0.clone()))
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+    fn buffer_output_until_eof(&self) -> bool {
+        !self.0.streaming
+    }
+
+    fn create(&self, _: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+        Box::new(FixtureSession {
+            config: self.0.clone(),
+            digest: Sha256::new(),
+            bytes: 0,
+            tail: Vec::new(),
+            saw_eof_sentinel: false,
+            synchronous_eof: false,
+        })
     }
 }
 
-impl IntegrationHtmlFinalizer for FixtureSession {
-    fn finalize<'a>(
+impl StreamProcessor for FixtureSession {
+    fn process_chunk(&mut self, chunk: &[u8], last: bool) -> io::Result<Vec<u8>> {
+        self.digest.update(chunk);
+        self.bytes = self
+            .bytes
+            .checked_add(chunk.len())
+            .ok_or_else(|| io::Error::other("Fixture byte count exceeds its range"))?;
+        let mut observed = std::mem::take(&mut self.tail);
+        observed.extend_from_slice(chunk);
+        self.saw_eof_sentinel |= observed
+            .windows(EOF_SENTINEL.len())
+            .any(|bytes| bytes == EOF_SENTINEL);
+        let keep = observed.len().min(EOF_SENTINEL.len() - 1);
+        self.tail
+            .extend_from_slice(&observed[observed.len() - keep..]);
+        self.synchronous_eof = last;
+        Ok(chunk.to_vec())
+    }
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn async_finish<'a>(
         &'a mut self,
-        input: HtmlFinalizationInput<'a>,
-    ) -> LocalBoxFuture<'a, Result<HtmlFinalization, Report<HtmlFinalizationError>>> {
-        Box::pin(async move {
-            if !input
-                .html
-                .windows(EOF_SENTINEL.len())
-                .any(|bytes| bytes == EOF_SENTINEL)
-            {
-                return Err(Report::new(HtmlFinalizationError::Rejected));
+        input: StreamFinishInput<'a>,
+    ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
+        Some(Box::pin(async move {
+            if !self.saw_eof_sentinel || !self.synchronous_eof {
+                return Err(Report::new(StreamFinishError::Rejected));
             }
             let url =
-                Url::parse(&self.0.lookup_url).change_context(HtmlFinalizationError::Rejected)?;
+                Url::parse(&self.config.lookup_url).change_context(StreamFinishError::Rejected)?;
             // Fastly cannot interrupt a blocking host call. Bound its transport
             // by the remaining chain budget; timer adapters deliberately test
             // cancellation against a longer transport timeout.
             let timeout = if input.deadline.has_cooperative_timer() {
-                Duration::from_millis(u64::from(self.0.transport_timeout_ms))
+                Duration::from_millis(u64::from(self.config.transport_timeout_ms))
             } else {
                 input
                     .deadline
                     .remaining()
                     .min(Duration::from_millis(u64::from(
-                        self.0.transport_timeout_ms,
+                        self.config.transport_timeout_ms,
                     )))
             };
             let backend = input
@@ -103,7 +145,7 @@ impl IntegrationHtmlFinalizer for FixtureSession {
                     scheme: url.scheme().to_string(),
                     host: url
                         .host_str()
-                        .ok_or_else(|| Report::new(HtmlFinalizationError::Rejected))?
+                        .ok_or_else(|| Report::new(StreamFinishError::Rejected))?
                         .to_string(),
                     port: url.port(),
                     host_header_override: None,
@@ -112,55 +154,62 @@ impl IntegrationHtmlFinalizer for FixtureSession {
                     between_bytes_timeout: timeout,
                     discriminator: Some(ID.to_string()),
                 })
-                .change_context(HtmlFinalizationError::Unavailable)?;
+                .change_context(StreamFinishError::Unavailable)?;
             let payload = serde_json::to_vec(&json!({
                 "complete": true,
-                "sha256": hex::encode(Sha256::digest(input.html)),
-                "bytes": input.html.len(),
+                "sha256": hex::encode(self.digest.clone().finalize()),
+                "bytes": self.bytes,
                 "transport_timeout_ms": timeout.as_millis(),
             }))
-            .change_context(HtmlFinalizationError::Rejected)?;
+            .change_context(StreamFinishError::Rejected)?;
             let request = request_builder()
                 .method(http::Method::POST)
                 .uri(
-                    self.0
+                    self.config
                         .lookup_url
                         .parse::<Uri>()
-                        .change_context(HtmlFinalizationError::Rejected)?,
+                        .change_context(StreamFinishError::Rejected)?,
                 )
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(payload))
-                .change_context(HtmlFinalizationError::Rejected)?;
+                .change_context(StreamFinishError::Rejected)?;
             let response = input
                 .services
                 .http_client()
                 .send(PlatformHttpRequest::new(request, backend).with_cache_bypass())
                 .await
-                .change_context(HtmlFinalizationError::Unavailable)?;
+                .change_context(StreamFinishError::Unavailable)?;
             if !response.response.status().is_success() {
-                return Err(Report::new(HtmlFinalizationError::Unavailable));
+                return Err(Report::new(StreamFinishError::Unavailable));
             }
             let reply = response
                 .response
                 .into_body()
                 .into_bytes_bounded(64)
                 .await
-                .change_context(HtmlFinalizationError::Rejected)?;
+                .change_context(StreamFinishError::Rejected)?;
             if reply.as_ref() != b"EXAMPLE_APPROVED" {
-                return Err(Report::new(HtmlFinalizationError::Rejected));
+                return Err(Report::new(StreamFinishError::Rejected));
+            }
+            if self.config.streaming {
+                input.replacement.append(input.output)?;
+                input
+                    .replacement
+                    .append(b"<!--example-async-eof-complete-->")?;
+                return Ok(StreamFinish::Replace);
             }
             let offset = input
-                .html
+                .output
                 .windows(ORIGINAL.len())
                 .position(|bytes| bytes == ORIGINAL)
-                .ok_or_else(|| Report::new(HtmlFinalizationError::Rejected))?;
-            input.replacement.append(&input.html[..offset])?;
+                .ok_or_else(|| Report::new(StreamFinishError::Rejected))?;
+            input.replacement.append(&input.output[..offset])?;
             input.replacement.append(REPLACEMENT)?;
             input
                 .replacement
-                .append(&input.html[offset + ORIGINAL.len()..])?;
-            Ok(HtmlFinalization::Replace)
-        })
+                .append(&input.output[offset + ORIGINAL.len()..])?;
+            Ok(StreamFinish::Replace)
+        }))
     }
 }
 
@@ -174,13 +223,14 @@ mod tests {
     fn fictional_consumer_registers_only_when_enabled_and_adds_no_browser_bundle() {
         for enabled in [false, true] {
             let mut settings = create_test_settings();
+            settings.publisher.allow_async_html_finish = true;
             settings.integrations.insert_config(ID, &json!({
                 "enabled": enabled, "lookup_url": "https://lookup.example.com/approve", "transport_timeout_ms": 1000,
             })).expect("should configure the fictional consumer");
             let registry =
                 IntegrationRegistry::new(&settings).expect("should build fixture metadata");
             assert_eq!(
-                registry.has_html_finalizers(),
+                registry.has_async_html_finish(),
                 enabled,
                 "should exclude disabled terminal capabilities"
             );

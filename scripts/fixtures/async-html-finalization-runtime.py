@@ -108,7 +108,9 @@ def run(adapter, auction=False, release=False):
             headers["Cookie"] = "euconsent-v2=" + base64.urlsafe_b64encode(bits).decode().rstrip("=")
         request = urllib.request.Request(f"http://127.0.0.1:{app_port}{path}", headers=headers)
         with urllib.request.urlopen(request, timeout=10) as response:
-            return response.read(), response.headers
+            first = response.read(1)
+            first_byte_at = time.monotonic()
+            return first + response.read(), response.headers, first_byte_at
 
     try:
         command(["cargo", "build", "-p", "trusted-server-cli", "--bin", "ts", "--locked"])
@@ -148,9 +150,9 @@ def run(adapter, auction=False, release=False):
                 '../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm', str(artifact)))
 
         baseline = None
-        cases = ["disabled", "success", "hung"] + (["auction"] if auction else [])
+        cases = ["disabled", "success", "hung"] + (["auction"] if auction else []) + (["streaming"] if adapter == "fastly" else [])
         for case in cases:
-            case_config = base_config
+            case_config = base_config.replace("[publisher]\n", f"[publisher]\nallow_async_html_finish = {str(case != 'disabled').lower()}\n", 1)
             if case == "auction":
                 # A closed loopback bid endpoint exercises transport failure and
                 # empty-bid assembly without sending traffic outside this host.
@@ -160,8 +162,8 @@ def run(adapter, auction=False, release=False):
                 case_config = case_config[:enabled] + case_config[enabled:].replace("enabled = false", "enabled = true", 1)
                 case_config = case_config.replace('endpoint = "https://prebid.example.com/openrtb2/auction"', f'endpoint = "https://127.0.0.1:{bid_port}/bid"', 1)
                 case_config += '\n[[creative_opportunities.slot]]\nid = "example-slot"\npage_patterns = ["/article"]\nformats = [{ width = 300, height = 250 }]\n'
-            lookup_case = "success" if case == "auction" else case
-            config.write_text(case_config + f'\n[integrations.html_finalization_fixture]\nenabled = {str(case != "disabled").lower()}\nlookup_url = "http://127.0.0.1:{origin_port}/{lookup_case}"\ntransport_timeout_ms = 30000\n')
+            lookup_case = "success" if case in ("auction", "streaming") else case
+            config.write_text(case_config + f'\n[integrations.html_finalization_fixture]\nenabled = {str(case != "disabled").lower()}\nlookup_url = "http://127.0.0.1:{origin_port}/{lookup_case}"\ntransport_timeout_ms = 30000\nstreaming = {str(case == "streaming").lower()}\n')
             # Axum's local JSON provides the same neutral app-config envelope
             # used by the other runtime bindings; no operator config is read.
             command([cli, "config", "push", "--adapter", "axum", "--local", "--manifest", str(workspace / "edgezero.toml"),
@@ -212,7 +214,7 @@ def run(adapter, auction=False, release=False):
                 raise RuntimeError(f"runtime did not become ready: {log.read_text()}")
             started = time.monotonic()
             try:
-                body, headers = get(f"/article?case={case}", case == "auction")
+                body, headers, first_byte_at = get(f"/article?case={case}", case == "auction")
             except urllib.error.HTTPError as error:
                 (workspace / f"{case}.error.body").write_bytes(error.read())
                 (workspace / f"{case}.headers").write_text(str(error.headers))
@@ -228,6 +230,8 @@ def run(adapter, auction=False, release=False):
             elif case == "success":
                 assert body == baseline.replace(b"EXAMPLE_UNSIGNED", b"EXAMPLE_FINALIZED"), "successful terminal output must match the exact expected rewrite"
                 assert elapsed >= 0.15, "success must actually await delayed lookup"
+            elif case == "streaming":
+                assert body == baseline + b"<!--example-async-eof-complete-->", "streaming EOF must append only after already delivered HTML"
             elif case == "auction":
                 assert b"EXAMPLE_FINALIZED" in body, "auction-enabled output must await finalization"
                 assert b"adSlots" in body and b"bids" in body, "auction control must reach slot and bid assembly"
@@ -238,24 +242,28 @@ def run(adapter, auction=False, release=False):
                 diagnostic = log.read_text()
                 if adapter == "spin":
                     diagnostic += "\n".join(path.read_text() for path in (workspace / "spin-logs").glob("*stderr*"))
-                assert "HTML finalizer html_finalization_fixture times out" in diagnostic or (adapter == "fastly" and "retains input: unavailable" in diagnostic), "missing controlled fallback diagnostic"
+                assert "HTML EOF processor html_finalization_fixture times out" in diagnostic or (adapter == "fastly" and "retains input: unavailable" in diagnostic), "missing controlled fallback diagnostic"
             if case != "disabled":
                 assert headers["Cache-Control"] == "no-store, private"
             current_events = [json.loads(line) for line in (workspace / "events.jsonl").read_text().splitlines()]
             lookups = [event for event in current_events if event["event"] == "lookup_start"]
             lookup_elapsed = completed - lookups[-1]["time"] if case != "disabled" else None
+            if case == "streaming":
+                completions = [event for event in current_events if event["event"] == "lookup_complete"]
+                assert completions, "streaming finish must complete real delayed I/O"
+                assert first_byte_at < completions[-1]["time"] - 0.05, "initial HTML bytes must reach the client while EOF I/O remains pending"
             terminal_ms = None
             if case == "hung":
                 measured = re.search(r"times out after (\d+) ms", diagnostic)
                 if measured:
                     terminal_ms = int(measured.group(1))
                     assert 700 <= terminal_ms < 2500, "terminal budget must exclude origin transfer"
-            (workspace / f"{case}.timing.json").write_text(json.dumps({"request_seconds": elapsed, "terminal_ms": terminal_ms, "lookup_to_response_seconds": lookup_elapsed, "configured_budget_ms": 750, "cooperative_timer": adapter != "fastly"}))
+            (workspace / f"{case}.timing.json").write_text(json.dumps({"request_seconds": elapsed, "first_body_byte_seconds": first_byte_at - started, "terminal_ms": terminal_ms, "lookup_to_response_seconds": lookup_elapsed, "configured_budget_ms": 750, "cooperative_timer": adapter != "fastly"}))
             print(f"PASS {adapter} {case}: request={elapsed:.3f}s, {len(body)} bytes, chain_budget=750ms, terminal_ms={terminal_ms}, lookup_to_response={lookup_elapsed}, cooperative_timer={adapter != 'fastly'}", flush=True)
             stop(process)
         events = [json.loads(line) for line in (workspace / "events.jsonl").read_text().splitlines()]
         starts = [event for event in events if event["event"] == "lookup_start"]
-        assert len(starts) == 2 + int(auction) and all(event["complete"] and len(event["sha256"]) == 64 for event in starts)
+        assert len(starts) == 2 + int(auction) + int(adapter == "fastly") and all(event["complete"] and len(event["sha256"]) == 64 for event in starts)
         for event in starts:
             assert any(previous["event"] == "origin_eof" and previous["time"] <= event["time"] for previous in events)
             if adapter == "fastly":
