@@ -1138,7 +1138,13 @@ mod loading_caches_from_tests {
             .expect_err("the check refuses a misspelt cache name without making a cache");
         let built = loading_caches_from(&settings, &builders).expect_err("as the build does");
 
-        assert_eq!(format!("{refused:?}"), format!("{built:?}"));
+        // The message alone: the debug form carries a backtrace where the
+        // runner asks for one, and the two are raised on different stacks.
+        assert_eq!(
+            format!("{refused}"),
+            format!("{built}"),
+            "the deploy check should refuse what the cache build refuses"
+        );
         check_cache_tables(&settings_declaring("answers", Some("one")), &builders)
             .expect("a declared cache passes the check");
     }
