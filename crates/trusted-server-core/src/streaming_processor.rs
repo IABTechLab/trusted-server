@@ -19,6 +19,8 @@
 //! streaming interface. See `crate::platform` module doc for the
 //! authoritative note.
 
+pub mod finish;
+
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Write};
 use std::rc::Rc;
@@ -28,8 +30,6 @@ use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
 use error_stack::{Report, ResultExt as _};
 use futures::future::LocalBoxFuture;
-
-pub mod finish;
 
 use finish::{StreamFinish, StreamFinishError, StreamFinishInput};
 use flate2::read::ZlibDecoder;

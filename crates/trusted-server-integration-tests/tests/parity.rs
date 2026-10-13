@@ -1129,6 +1129,7 @@ async fn adapter_buffers_nextjs_auction_output() {
 #[derive(Default)]
 struct TerminalFixtureOrigin {
     lookup_calls: AtomicUsize,
+    fail_lookup: bool,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1159,6 +1160,9 @@ impl PlatformHttpClient for TerminalFixtureOrigin {
                 "should send a complete digest"
             );
             self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_lookup {
+                return Err(Report::new(PlatformError::HttpClient));
+            }
             ("text/plain", "EXAMPLE_APPROVED")
         } else {
             (
@@ -1191,78 +1195,93 @@ impl PlatformHttpClient for TerminalFixtureOrigin {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
-    let mut settings = test_settings();
-    settings.publisher.allow_async_html_finish = true;
-    settings.integrations.insert_config("html_finalization_fixture", &serde_json::json!({
-        "enabled": true, "lookup_url": "https://lookup.example.com/success", "transport_timeout_ms": 1000,
+    for case in ["disabled", "failed", "success"] {
+        let enabled = case != "disabled";
+        let mut settings = test_settings();
+        settings.publisher.allow_async_html_finish = enabled;
+        settings.integrations.insert_config("html_finalization_fixture", &serde_json::json!({
+        "enabled": enabled, "lookup_url": format!("https://lookup.example.com/{case}"), "transport_timeout_ms": 1000,
     })).expect("should enable the fictional terminal consumer");
-    let client = Arc::new(TerminalFixtureOrigin::default());
-    let services = nextjs_auction::services_with_http_client(
-        Arc::clone(&client) as Arc<dyn PlatformHttpClient>
-    );
-    let routers = [
-        (
-            "Axum",
-            AxumApp::routes_with_settings_and_services(settings.clone(), services.clone()),
-        ),
-        (
-            "Cloudflare",
-            CloudflareApp::routes_with_settings_and_services(settings.clone(), services.clone()),
-        ),
-        (
-            "Spin",
-            SpinApp::routes_with_settings_and_services(settings, services),
-        ),
-    ];
-    let mut expected = None;
-    for (adapter, router) in routers {
-        client.lookup_calls.store(0, Ordering::SeqCst);
-        let request = request_builder()
-            .method("GET")
-            .uri("https://test-publisher.example.com/article")
-            .header("host", "test-publisher.example.com")
-            .header("accept", "text/html")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build an example navigation");
-        let response = router
-            .expect("should build fixture routes")
-            .oneshot(request)
-            .await
-            .expect("should serve finalized HTML");
-        assert_eq!(
-            response.status(),
-            200,
-            "{adapter} should preserve the origin status"
+        let client = Arc::new(TerminalFixtureOrigin {
+            lookup_calls: AtomicUsize::new(0),
+            fail_lookup: case == "failed",
+        });
+        let services = nextjs_auction::services_with_http_client(
+            Arc::clone(&client) as Arc<dyn PlatformHttpClient>
         );
-        assert_eq!(
-            response
-                .headers()
-                .get("cache-control")
-                .expect("should set terminal privacy"),
-            "no-store, private",
-            "{adapter} should prevent downstream caching"
-        );
-        let body = response
-            .into_body()
-            .into_bytes_bounded(1024 * 1024)
-            .await
-            .expect("should drain finalized HTML");
-        assert!(
-            String::from_utf8_lossy(&body).contains("EXAMPLE_FINALIZED"),
-            "{adapter} should await the yielding consumer"
-        );
-        assert_eq!(
-            client.lookup_calls.load(Ordering::SeqCst),
-            1,
-            "{adapter} should call the terminal lookup exactly once"
-        );
-        if let Some(expected) = &expected {
+        let routers = [
+            (
+                "Axum",
+                AxumApp::routes_with_settings_and_services(settings.clone(), services.clone()),
+            ),
+            (
+                "Cloudflare",
+                CloudflareApp::routes_with_settings_and_services(
+                    settings.clone(),
+                    services.clone(),
+                ),
+            ),
+            (
+                "Spin",
+                SpinApp::routes_with_settings_and_services(settings, services),
+            ),
+        ];
+        let mut expected = None;
+        for (adapter, router) in routers {
+            client.lookup_calls.store(0, Ordering::SeqCst);
+            let request = request_builder()
+                .method("GET")
+                .uri("https://test-publisher.example.com/article")
+                .header("host", "test-publisher.example.com")
+                .header("accept", "text/html")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build an example navigation");
+            let response = router
+                .expect("should build fixture routes")
+                .oneshot(request)
+                .await
+                .expect("should serve finalized HTML");
             assert_eq!(
-                &body, expected,
-                "{adapter} should produce identical terminal HTML"
+                response.status(),
+                200,
+                "{adapter} should preserve the origin status"
             );
-        } else {
-            expected = Some(body);
+            if enabled {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("cache-control")
+                        .expect("should set terminal privacy"),
+                    "no-store, private",
+                    "{adapter} should prevent downstream caching"
+                );
+            }
+            let body = response
+                .into_body()
+                .into_bytes_bounded(1024 * 1024)
+                .await
+                .expect("should drain finalized HTML");
+            assert!(
+                String::from_utf8_lossy(&body).contains(if case == "success" {
+                    "EXAMPLE_FINALIZED"
+                } else {
+                    "EXAMPLE_UNSIGNED"
+                }),
+                "{adapter} should select the correct EOF result for {case}"
+            );
+            assert_eq!(
+                client.lookup_calls.load(Ordering::SeqCst),
+                usize::from(enabled),
+                "{adapter} should call EOF lookup only for enabled work in {case}"
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &body, expected,
+                    "{adapter} should produce identical terminal HTML"
+                );
+            } else {
+                expected = Some(body);
+            }
         }
     }
 }

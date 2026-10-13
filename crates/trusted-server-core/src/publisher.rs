@@ -4195,7 +4195,15 @@ impl InlineBodyCloseSeam {
                 .checked_add(chunk.len())
                 .filter(|size| *size <= limit)
                 .ok_or_else(overflow)?;
-            self.buffered.reserve_exact(next - self.buffered.len());
+            if next > self.buffered.capacity() {
+                let capacity = self
+                    .buffered
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(next)
+                    .min(limit);
+                self.buffered.reserve_exact(capacity - self.buffered.len());
+            }
             self.buffered.extend_from_slice(chunk);
             return Ok(Vec::new());
         }
@@ -22879,6 +22887,11 @@ mod tests {
             Some("abandoned"),
             "should record fatal body abandonment"
         );
+        assert_eq!(
+            summaries[0].terminal_reason.as_deref(),
+            Some("auction_suffix_overflow"),
+            "should distinguish suffix bounds from encoder failures"
+        );
         assert!(
             params.dispatched_auction.is_none(),
             "should transfer auction ownership to the failing driver"
@@ -27463,6 +27476,38 @@ mod async_eof_seam_tests {
         assert!(
             seam.buffered.capacity() <= 4,
             "should not allocate the whole ready prefix in the holder"
+        );
+    }
+
+    #[test]
+    fn async_eof_seam_grows_suffix_amortized_without_exceeding_non_power_of_two_cap() {
+        let limit = 1031;
+        let mut seam = InlineBodyCloseSeam::new(b"TOKEN".to_vec());
+        seam.push_bounded(b"TOKEN", limit)
+            .expect("should locate the marker before collecting its suffix");
+        let mut capacity_changes = 0;
+        for _ in 0..limit {
+            let previous_capacity = seam.buffered.capacity();
+            assert!(
+                seam.push_bounded(b"x", limit)
+                    .expect("should retain the suffix within its cap")
+                    .is_empty(),
+                "should withhold suffix output until auction assembly"
+            );
+            capacity_changes += usize::from(seam.buffered.capacity() != previous_capacity);
+            assert!(
+                seam.buffered.capacity() <= limit,
+                "should cap allocation even when the byte cap is not a power of two"
+            );
+        }
+        assert!(
+            capacity_changes < 32,
+            "should avoid a capacity increase for every small suffix chunk"
+        );
+        assert_eq!(
+            seam.finish(),
+            vec![b'x'; limit],
+            "should retain the exact-cap suffix without losing bytes"
         );
     }
 

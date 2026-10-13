@@ -287,7 +287,7 @@ impl HtmlEofDriver {
                 if end < bytes.len() {
                     self.replay.push_front(bytes.slice(end..));
                 }
-                self.failure_reason = "stream_encode_error";
+                self.failure_reason = "auction_suffix_overflow";
                 let processed =
                     if let Some(seam) = self.hold.as_mut().and_then(|hold| hold.hold.as_mut()) {
                         seam.push_bounded(&chunk, self.limit).change_context(
@@ -299,6 +299,7 @@ impl HtmlEofDriver {
                     } else {
                         chunk.to_vec()
                     };
+                self.failure_reason = "stream_encode_error";
                 let encoded = self.encoder.encode_chunk(processed)?;
                 self.had_ready_bytes |= !encoded.is_empty();
                 return Ok(Some(HoldStepSegments {

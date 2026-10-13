@@ -1171,7 +1171,9 @@ impl IntegrationRegistry {
     /// Construct an isolated processor registry for regression tests.
     #[cfg(test)]
     #[must_use]
-    pub fn from_html_finalizers(factories: Vec<Arc<dyn IntegrationHtmlFinalizerFactory>>) -> Self {
+    pub(crate) fn from_html_finalizers(
+        factories: Vec<Arc<dyn IntegrationHtmlFinalizerFactory>>,
+    ) -> Self {
         Self::from_html_stream_processors(
             factories
                 .into_iter()

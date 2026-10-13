@@ -255,6 +255,8 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    // No cooperative timer is installed: Fastly host calls block. EOF consumers
+    // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
         .request()
         .extensions()

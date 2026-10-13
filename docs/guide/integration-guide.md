@@ -218,6 +218,58 @@ available before template lookup, so requested EOF work cannot be skipped by a
 processed cache hit. The factory and session share request-local
 `IntegrationDocumentState` with the existing parser hooks.
 
+A non-retaining session can make a KV lookup at EOF and append a fixed footer:
+
+<!-- documentation-snippet:html-eof:start -->
+
+```rust
+use std::io;
+use error_stack::Report;
+use futures::future::LocalBoxFuture;
+use trusted_server_core::streaming_processor::StreamProcessor;
+use trusted_server_core::streaming_processor::finish::{
+    StreamFinish, StreamFinishError, StreamFinishInput,
+};
+
+/// Append a fixed footer when an example KV key is present.
+pub struct ExampleFooterProcessor;
+
+impl StreamProcessor for ExampleFooterProcessor {
+    fn process_chunk(&mut self, bytes: &[u8], _is_last: bool) -> io::Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn async_finish<'a>(
+        &'a mut self,
+        input: StreamFinishInput<'a>,
+    ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
+        Some(Box::pin(async move {
+            let enabled = input.services.kv_store().get_bytes("example:footer").await
+                .map_err(|_| Report::new(StreamFinishError::Unavailable))?
+                .is_some();
+            if !enabled {
+                return Ok(StreamFinish::Unchanged);
+            }
+            input.replacement.append(input.output)?;
+            input.replacement.append(b"<!--example-footer-->")?;
+            Ok(StreamFinish::Replace)
+        }))
+    }
+}
+```
+
+<!-- documentation-snippet:html-eof:end -->
+
+The factory also returns `true` from `requires_async_finish()` and creates this
+session. Leave `buffer_output_until_eof()` at its default `false` for this append
+operation. KV must be available on the runtime; unavailable lookup falls back to
+the synchronous tail. Fastly consumers must use host operations with independently
+bounded latency; this generic KV interface does not provide a hard timeout.
+
 Operators must explicitly accept the possible delivery cost:
 
 ```toml
@@ -248,7 +300,8 @@ The session and future may be non-`Send`; start I/O inside the returned future.
 
 Core buffers a stage's output only when its factory explicitly requests retention.
 The holder and replacement candidate each use `max_buffered_body_bytes` as their cap.
-On collection overflow, core releases prefix/crossing/later output exactly once and
+These caps apply per holder; simultaneous holders and codec/adapter buffers can
+use more memory in total. On collection overflow, core releases prefix/crossing/later output exactly once and
 skips that stage's optional I/O, while still completing its synchronous EOF. It cannot
 bound arbitrary private allocations inside an integration. Streaming stages cannot
 replace bytes already delivered; EOF append does not imply safe insertion into an
@@ -270,8 +323,9 @@ or external response contents.
 The latency contract depends on the adapter and the stage:
 
 - Without async factories, delivery and auction timing keep their existing path.
-- On Fastly, a non-retaining stage releases ready HTML before optional EOF I/O; the
-  response can finish later.
+- On Fastly, a non-retaining stage releases ready HTML before optional EOF I/O.
+  With an auction seam, the body-close and following tail wait for all hooks before
+  auction assembly; initial bytes can arrive promptly while page completion waits.
 - A retaining stage delays first HTML delivery until EOF or overflow release.
 - Axum, Workers and Spin currently buffer publisher responses. Enabled EOF I/O can
   add to TTFB there even without stage retention. This feature does not add streaming
@@ -308,26 +362,9 @@ multiplicity including split boundaries, not HTML structure. Each real consumer 
 verify winning-auction placement after its changes and preserve the structural body
 end; neighboring bytes alone cannot establish a marker's parsing context.
 
-A fictional HTTP processor is available only with `test-utils`:
-
-```bash
-./scripts/async-html-finalization-local-test.sh axum --auction
-./scripts/async-html-finalization-local-test.sh cloudflare --auction
-./scripts/async-html-finalization-local-test.sh spin --auction
-./scripts/async-html-finalization-local-test.sh fastly --auction
-```
-
-The harness builds fresh enabled artifacts, generates isolated example configuration,
-and checks disabled, successful, hung and auction controls. Fastly also runs a
-non-retaining processor and proves initial body bytes arrive while its delayed EOF
-lookup is pending. `--release` selects production-profile fixture artifacts. Diagnostics
-are retained in the printed temporary directory. An explicit `CARGO_TARGET_DIR` permits
-sharing the build cache. Workers requires tooling matching the locked SDK.
-
-Repository-pinned Viceroy 0.17 remains the normal WASI test runner. The Fastly hung-call
-transport simulation requires an isolated Viceroy 0.19 or newer; repository pins stay
-unchanged. CI runs actual Axum controls and real-process cleanup tests. The targeted
-auction telemetry clock correction remains separate from broader #1240 clock work.
+A fictional HTTP processor is available only with `test-utils`. See
+[HTML EOF runtime checks](/guide/testing#html-eof-runtime-checks) for the runtime
+harness, Python/tooling prerequisites and CI coverage.
 
 ## Browser and script guards
 

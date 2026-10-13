@@ -48,11 +48,140 @@ def stop(process):
     process.wait(timeout=5)
 
 
+def build_environment(source):
+    allowed = {
+        "PATH", "RUSTUP_HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "TMPDIR",
+        "WASM_BINDGEN_BIN", "WASM_OPT_BIN", "ESBUILD_BIN", "CARGO_NET_OFFLINE",
+        "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_INCREMENTAL",
+        "RUSTC", "RUSTDOC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+        "TSJS_PREBUILT_DIR",
+    }
+    return {key: value for key, value in source.items()
+            if key != "CARGO_BUILD_TARGET"
+            and (key in allowed or key.startswith(("CARGO_PROFILE_", "CARGO_BUILD_", "CARGO_TARGET_")))}
+
+
+def checked_replace(text, old, new, description):
+    matches = text.count(old)
+    if matches != 1:
+        raise RuntimeError(f"expected one {description} template field, found {matches}")
+    return text.replace(old, new, 1)
+
+
+def toml_string(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def fixture_manifest(text, workspace):
+    manifest = tomllib.loads(text)
+    entry = manifest["app"]["entry"]
+    text = checked_replace(text, f"entry = {toml_string(entry)}",
+                           f"entry = {toml_string(ROOT / entry)}", "app entry")
+    for adapter, settings in manifest["adapters"].items():
+        settings = settings["adapter"]
+        crate = settings["crate"]
+        text = checked_replace(text, f"crate = {toml_string(crate)}",
+                               f"crate = {toml_string(ROOT / crate)}", f"{adapter} crate")
+        old = settings["manifest"]
+        path = workspace / f"{adapter}.toml" if adapter in ("fastly", "spin") else ROOT / old
+        text = checked_replace(text, f"manifest = {toml_string(old)}",
+                               f"manifest = {toml_string(path)}", f"{adapter} manifest")
+    return text
+
+
+def fixture_config(template, case, origin_port, bid_port=None):
+    permission = str(case != "disabled").lower()
+    publisher = tomllib.loads(template)["publisher"]
+    text = checked_replace(template, "[publisher]\n",
+                           "[publisher]\nhtml_finalization_timeout_ms = 750\n"
+                           f"allow_async_html_finish = {permission}\n", "publisher table")
+    table = text.index("[publisher]\n")
+    end = text.find("\n[", table + len("[publisher]\n"))
+    if end == -1:
+        end = len(text)
+    block = text[table:end]
+    for key, value in {
+        "domain": "127.0.0.1",
+        "cookie_domain": "127.0.0.1",
+        "origin_url": f"http://127.0.0.1:{origin_port}",
+    }.items():
+        block = checked_replace(block, f"\n{key} = {toml_string(publisher[key])}",
+                                f"\n{key} = {toml_string(value)}", f"publisher {key}")
+    text = text[:table] + block + text[end:]
+    if case == "auction":
+        table = text.index("[auction]\n")
+        end = text.find("\n[", table + len("[auction]\n"))
+        if end == -1:
+            end = len(text)
+        block = checked_replace(text[table:end], "enabled = false", "enabled = true", "auction enablement")
+        text = text[:table] + block + text[end:]
+        text = checked_replace(text, 'endpoint = "https://prebid.example.com/openrtb2/auction"',
+                               f'endpoint = "https://127.0.0.1:{bid_port}/bid"', "auction endpoint")
+        text += '\n[[creative_opportunities.slot]]\nid = "example-slot"\npage_patterns = ["/article"]\nformats = [{ width = 300, height = 250 }]\n'
+    lookup_case = "success" if case in ("auction", "streaming") else case
+    text += (f'\n[integrations.html_finalization_fixture]\nenabled = {permission}\n'
+             f'lookup_url = "http://127.0.0.1:{origin_port}/{lookup_case}"\n'
+             f'transport_timeout_ms = 30000\nstreaming = {str(case == "streaming").lower()}\n')
+    validate_fixture_config(text, case, origin_port, bid_port)
+    return text
+
+
+def validate_fixture_config(text, case, origin_port, bid_port=None):
+    config = tomllib.loads(text)
+    publisher = config["publisher"]
+    fixture = config["integrations"]["html_finalization_fixture"]
+    permission = case != "disabled"
+    lookup_case = "success" if case in ("auction", "streaming") else case
+    expected = [
+        (publisher.get("domain"), "127.0.0.1", "loopback publisher domain"),
+        (publisher.get("cookie_domain"), "127.0.0.1", "loopback cookie domain"),
+        (publisher.get("origin_url"), f"http://127.0.0.1:{origin_port}", "loopback origin"),
+        (publisher.get("html_finalization_timeout_ms"), 750, "EOF timeout"),
+        (publisher.get("allow_async_html_finish"), permission, "EOF permission"),
+        (fixture.get("enabled"), permission, "fixture enablement"),
+        (fixture.get("lookup_url"), f"http://127.0.0.1:{origin_port}/{lookup_case}", "loopback lookup"),
+        (fixture.get("transport_timeout_ms"), 30000, "fixture transport timeout"),
+        (fixture.get("streaming"), case == "streaming", "streaming control"),
+        (config["auction"].get("enabled"), case == "auction", "auction enablement"),
+    ]
+    for actual, required, description in expected:
+        if actual != required:
+            raise RuntimeError(f"invalid {description}: expected {required!r}, found {actual!r}")
+    if case == "auction":
+        providers = config["auction"].get("providers", {})
+        if not providers:
+            raise RuntimeError("auction control requires a loopback provider")
+        for provider in providers.values():
+            if provider.get("endpoint") != f"https://127.0.0.1:{bid_port}/bid":
+                raise RuntimeError("auction provider must use the controlled loopback endpoint")
+
+
+def preflight_viceroy(env):
+    output = subprocess.check_output(["viceroy", "--version"], env=env, text=True).strip()
+    match = re.search(r"\bviceroy (\d+)\.(\d+)\.(\d+)(?:\s|$)", output)
+    if not match or tuple(map(int, match.groups())) < (0, 19, 0):
+        raise RuntimeError(f"Viceroy >= 0.19.0 required for the Fastly hung-call control; found {output!r}")
+
+
+def measured_terminal_ms(adapter, diagnostic):
+    match = re.search(r"times out after (\d+) ms", diagnostic)
+    if match is None:
+        if adapter != "fastly":
+            raise RuntimeError(f"missing measured cooperative timeout diagnostic for {adapter}")
+        return None
+    terminal_ms = int(match.group(1))
+    assert 700 <= terminal_ms < 2500, "terminal budget must exclude origin transfer"
+    return terminal_ms
+
+
+def terminate_run(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 def run(adapter, auction=False, release=False):
     workspace = Path(tempfile.mkdtemp(prefix=f"trusted-server-finalize-{adapter}-"))
     print(f"Artifacts: {workspace}", flush=True)
-    allowed = {"PATH", "RUSTUP_HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "TMPDIR", "WASM_BINDGEN_BIN", "WASM_OPT_BIN", "ESBUILD_BIN", "CARGO_NET_OFFLINE"}
-    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env = build_environment(os.environ)
     target = Path(env.get("CARGO_TARGET_DIR", workspace / "target")).resolve()
     env["CARGO_TARGET_DIR"] = str(target)
     env["XDG_CONFIG_HOME"] = str(workspace / "cli-config")
@@ -68,6 +197,8 @@ def run(adapter, auction=False, release=False):
     for executable in required:
         if shutil.which(executable, path=env["PATH"]) is None:
             raise RuntimeError(f"required executable missing: {executable}")
+    if adapter == "fastly":
+        preflight_viceroy(env)
     if adapter == "cloudflare":
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
         expected = next(package["version"] for package in lock["package"] if package["name"] == "worker")
@@ -75,9 +206,14 @@ def run(adapter, auction=False, release=False):
         if actual != expected:
             raise RuntimeError(f"worker-build {expected} required for the locked worker SDK; found {actual}")
     processes = []
+    previous_sigterm = signal.signal(signal.SIGTERM, terminate_run)
 
     def command(args, cwd=ROOT, overrides=None):
-        subprocess.run(args, cwd=cwd, env=env | (overrides or {}), check=True)
+        process = subprocess.Popen(args, cwd=cwd, env=env | (overrides or {}), start_new_session=True)
+        processes.append(process)
+        status = process.wait()
+        if status != 0:
+            raise subprocess.CalledProcessError(status, args)
 
     def launch(args, log, cwd=workspace, runtime_env=None):
         output = log.open("w")
@@ -138,32 +274,24 @@ def run(adapter, auction=False, release=False):
                 "--port", str(origin_port), "--events", str(workspace / "events.jsonl")], workspace / "origin.log")
         config = workspace / "trusted-server.toml"
         command([cli, "config", "init", "--app-config", str(config)])
-        base_config = config.read_text().replace("[publisher]\n", "[publisher]\nhtml_finalization_timeout_ms = 750\n", 1)
-        manifest = (ROOT / "edgezero.toml").read_text().replace('= "crates/', f'= "{ROOT}/crates/')
-        manifest = manifest.replace('manifest = "fastly.toml"', f'manifest = "{workspace}/fastly.toml"')
-        manifest = manifest.replace(str(crate / "spin.toml"), str(workspace / "spin.toml"))
-        (workspace / "edgezero.toml").write_text(manifest)
+        base_config = config.read_text()
+        (workspace / "edgezero.toml").write_text(fixture_manifest((ROOT / "edgezero.toml").read_text(), workspace))
         fastly_base = 'manifest_version = 3\nname = "example-finalization"\nlanguage = "rust"\n[local_server]\n'
         (workspace / "fastly.toml").write_text(fastly_base)
         if adapter == "spin":
-            (workspace / "spin.toml").write_text((crate / "spin.toml").read_text().replace(
-                '../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm', str(artifact)))
+            spin_config = checked_replace((crate / "spin.toml").read_text(),
+                                          'source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"',
+                                          f"source = {toml_string(artifact)}", "Spin artifact")
+            (workspace / "spin.toml").write_text(spin_config)
 
         baseline = None
         cases = ["disabled", "success", "hung"] + (["auction"] if auction else []) + (["streaming"] if adapter == "fastly" else [])
         for case in cases:
-            case_config = base_config.replace("[publisher]\n", f"[publisher]\nallow_async_html_finish = {str(case != 'disabled').lower()}\n", 1)
-            if case == "auction":
-                # A closed loopback bid endpoint exercises transport failure and
-                # empty-bid assembly without sending traffic outside this host.
-                bid_port = free_port()
-                table = case_config.index("[auction]\n")
-                enabled = case_config.index("enabled = false", table)
-                case_config = case_config[:enabled] + case_config[enabled:].replace("enabled = false", "enabled = true", 1)
-                case_config = case_config.replace('endpoint = "https://prebid.example.com/openrtb2/auction"', f'endpoint = "https://127.0.0.1:{bid_port}/bid"', 1)
-                case_config += '\n[[creative_opportunities.slot]]\nid = "example-slot"\npage_patterns = ["/article"]\nformats = [{ width = 300, height = 250 }]\n'
-            lookup_case = "success" if case in ("auction", "streaming") else case
-            config.write_text(case_config + f'\n[integrations.html_finalization_fixture]\nenabled = {str(case != "disabled").lower()}\nlookup_url = "http://127.0.0.1:{origin_port}/{lookup_case}"\ntransport_timeout_ms = 30000\nstreaming = {str(case == "streaming").lower()}\n')
+            # A closed loopback bid endpoint exercises transport failure without
+            # sending auction requests outside this host.
+            bid_port = free_port() if case == "auction" else None
+            case_config = fixture_config(base_config, case, origin_port, bid_port)
+            config.write_text(case_config)
             # Axum's local JSON provides the same neutral app-config envelope
             # used by the other runtime bindings; no operator config is read.
             command([cli, "config", "push", "--adapter", "axum", "--local", "--manifest", str(workspace / "edgezero.toml"),
@@ -177,8 +305,11 @@ def run(adapter, auction=False, release=False):
                 runtime_env["PORT"] = str(app_port)
                 args = [str(artifact)]
             elif adapter == "cloudflare":
-                text = (crate / "wrangler.ci.toml").read_text().replace('main = "build/index.js"', f'main = "{artifact}"')
-                text = text.replace('TRUSTED_SERVER_CONFIG = "{}"', "TRUSTED_SERVER_CONFIG = '''" + json.dumps({"app_config": envelope}) + "'''")
+                text = checked_replace((crate / "wrangler.ci.toml").read_text(), 'main = "build/index.js"',
+                                       f"main = {toml_string(artifact)}", "Workers artifact")
+                text = checked_replace(text, 'TRUSTED_SERVER_CONFIG = "{}"',
+                                       "TRUSTED_SERVER_CONFIG = '''" + json.dumps({"app_config": envelope}) + "'''",
+                                       "Workers config binding")
                 text += "\n" + "\n".join(f'{key} = "{value}"' for key, value in SECRETS.items()) + "\n"
                 (workspace / "wrangler.toml").write_text(text)
                 args = ["wrangler", "dev", "--local", "--config", str(workspace / "wrangler.toml"),
@@ -225,7 +356,7 @@ def run(adapter, auction=False, release=False):
             (workspace / f"{case}.body").write_bytes(body)
             (workspace / f"{case}.headers").write_text(str(headers))
             if case == "disabled":
-                assert b"EXAMPLE_UNSIGNED" in body and b"EXAMPLE_FINALIZED" not in body
+                assert b"EXAMPLE_UNSIGNED" in body and b"EXAMPLE_FINALIZED" not in body, "disabled fixture must leave the original marker unchanged"
                 baseline = body
             elif case == "success":
                 assert body == baseline.replace(b"EXAMPLE_UNSIGNED", b"EXAMPLE_FINALIZED"), "successful terminal output must match the exact expected rewrite"
@@ -244,7 +375,7 @@ def run(adapter, auction=False, release=False):
                     diagnostic += "\n".join(path.read_text() for path in (workspace / "spin-logs").glob("*stderr*"))
                 assert "HTML EOF processor html_finalization_fixture times out" in diagnostic or (adapter == "fastly" and "retains input: unavailable" in diagnostic), "missing controlled fallback diagnostic"
             if case != "disabled":
-                assert headers["Cache-Control"] == "no-store, private"
+                assert headers["Cache-Control"] == "no-store, private", "active EOF processing must prohibit shared caching"
             current_events = [json.loads(line) for line in (workspace / "events.jsonl").read_text().splitlines()]
             lookups = [event for event in current_events if event["event"] == "lookup_start"]
             lookup_elapsed = completed - lookups[-1]["time"] if case != "disabled" else None
@@ -254,26 +385,29 @@ def run(adapter, auction=False, release=False):
                 assert first_byte_at < completions[-1]["time"] - 0.05, "initial HTML bytes must reach the client while EOF I/O remains pending"
             terminal_ms = None
             if case == "hung":
-                measured = re.search(r"times out after (\d+) ms", diagnostic)
-                if measured:
-                    terminal_ms = int(measured.group(1))
-                    assert 700 <= terminal_ms < 2500, "terminal budget must exclude origin transfer"
+                terminal_ms = measured_terminal_ms(adapter, diagnostic)
             (workspace / f"{case}.timing.json").write_text(json.dumps({"request_seconds": elapsed, "first_body_byte_seconds": first_byte_at - started, "terminal_ms": terminal_ms, "lookup_to_response_seconds": lookup_elapsed, "configured_budget_ms": 750, "cooperative_timer": adapter != "fastly"}))
             print(f"PASS {adapter} {case}: request={elapsed:.3f}s, {len(body)} bytes, chain_budget=750ms, terminal_ms={terminal_ms}, lookup_to_response={lookup_elapsed}, cooperative_timer={adapter != 'fastly'}", flush=True)
             stop(process)
         events = [json.loads(line) for line in (workspace / "events.jsonl").read_text().splitlines()]
         starts = [event for event in events if event["event"] == "lookup_start"]
-        assert len(starts) == 2 + int(auction) + int(adapter == "fastly") and all(event["complete"] and len(event["sha256"]) == 64 for event in starts)
+        assert len(starts) == 2 + int(auction) + int(adapter == "fastly"), "each enabled control must issue exactly one EOF lookup"
+        assert all(event["complete"] and len(event["sha256"]) == 64 for event in starts), "every lookup must observe complete-document metadata"
         for event in starts:
-            assert any(previous["event"] == "origin_eof" and previous["time"] <= event["time"] for previous in events)
+            assert any(previous["event"] == "origin_eof" and previous["time"] <= event["time"] for previous in events), "EOF lookup must start after the origin finishes"
             if adapter == "fastly":
                 assert 0 < event["transport_timeout_ms"] <= 750, "blocking host calls must use the remaining budget"
             else:
                 assert event["transport_timeout_ms"] == 30000, "SDK timer must release before the transport deadline"
-        assert any(event["event"] == "lookup_complete" and event["path"] == "/success" for event in events)
+        assert any(event["event"] == "lookup_complete" and event["path"] == "/success" for event in events), "success control must complete real lookup I/O"
     finally:
-        for process in reversed(processes):
-            stop(process)
+        # Finish owned-process cleanup even if another termination signal arrives.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            for process in reversed(processes):
+                stop(process)
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 

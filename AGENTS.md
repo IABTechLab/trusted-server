@@ -362,6 +362,9 @@ Every PR must pass:
 7. Docs format (`cd docs && npm run format`)
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
+10. HTML EOF harness cleanup (Python 3.11+): `python3 -m unittest discover -s scripts/fixtures -p 'test_async_html_finalization_runtime.py' -v`
+11. Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
+12. Actual Fastly EOF/auction controls with isolated Viceroy 0.19+: `PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction`; install with `cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy`. Ordinary tests retain pinned Viceroy 0.17. See `scripts/README.md` for retained diagnostics and other runtimes.
 
 ---
 

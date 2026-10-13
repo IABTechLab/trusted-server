@@ -1,11 +1,8 @@
 # Ordered asynchronous HTML processor completion
 
-**Issue:** #1241. **Revised:** 2026-10-13. **Status:** revised implementation and local verification complete; maintainer review pending.
-Verification is recorded in the [fresh execution report](../reviews/2026-10-13-1241-ordered-eof-verification.md).
+**Issue:** #1241. **Status:** draft implementation; review hardening and local verification complete.
 
-This supersedes the [buffered terminal design](../archive/2026-10-12-1241-buffered-terminal-design.md).
-The previous implementation's evidence belongs to that archived design. The current
-[implementation plan](../plans/2026-10-12-1241-async-html-finalization.md) covers this revision.
+The [implementation plan](../plans/2026-10-12-1241-async-html-finalization.md) maps this contract to implementation and verification. Fresh executed evidence is recorded in the draft PR.
 
 ## 1. Requirement and scope
 
@@ -101,6 +98,12 @@ output. Use `publisher.max_buffered_body_bytes` (existing 16 MiB default), check
 arithmetic and incremental allocation. At EOF, move the retained output into the
 fallback and lend a slice to the callback. Candidate storage has the same cap.
 
+These are per-holder limits, not an aggregate request-memory budget. Retained stage output,
+fallback/candidate, auction suffix, codec state and buffered adapter responses can coexist.
+Total memory may exceed this setting; integrations also own allocations core cannot bound.
+Candidates run one at a time and replay moves/slices selected output. Do not infer a fixed
+peak-memory multiplier or a total heap bound from the body-byte limit.
+
 Overflow permanently disables that stage's optional EOF I/O. Replay retained prefix,
 crossing chunk and later output exactly once through downstream stages, then finish
 its synchronous EOF normally. It does not authorize an oversized outer buffered
@@ -119,6 +122,9 @@ the ordinary output policy and skip that stage's optional I/O. Do not truncate i
 ## 6. Deadlines, failures and cancellation
 
 Retain `publisher.html_finalization_timeout_ms`: default 5000, valid 1–60000.
+The initial default follows the 5-second budget in the issue example; 60 seconds is
+a configuration ceiling. Neither value is a measured optimum or a response latency
+guarantee. Operators explicitly accept and tune this budget when enabling EOF work.
 One absolute budget begins after decoder/parser EOF and covers every optional finish.
 Share one timer across stages, initializing its delay with the remaining budget
 immediately before the first callback is polled. The deadline wins readiness ties. Check before polling
@@ -166,6 +172,9 @@ promise insertion into an earlier head or before an already emitted body end.
 
 Use active async factory metadata before the first processed-template lookup to skip
 shared-template reads, reservations and stores. Raw-origin readthrough is independent.
+This intentionally defers the issue's shared-template cold-miss storage behavior until
+maintainers accept an output identity, freshness and hit-execution policy. Keep the
+PR in draft and describe it as partial coverage of #1241 until that scope is accepted.
 Processed opted-in HTML uses `Cache-Control: no-store, private` even when work fails,
 returns unchanged, or is bypassed after overflow. Cacheable async output needs a
 separate identity, freshness, invalidation and hit-execution contract.

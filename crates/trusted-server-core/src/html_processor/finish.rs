@@ -11,7 +11,7 @@ use super::HtmlWithStreamingProcessors;
 use crate::platform::RuntimeServices;
 use crate::streaming_processor::StreamProcessor;
 use crate::streaming_processor::finish::{
-    StreamFinish, StreamFinishDeadline, StreamFinishInput, StreamOutputWriter,
+    StreamFinish, StreamFinishDeadline, StreamFinishError, StreamFinishInput, StreamOutputWriter,
 };
 
 pub(crate) struct HtmlProcessorStage {
@@ -162,11 +162,23 @@ async fn finish_output(
     fallback: Vec<u8>,
     context: &mut HtmlFinishContext<'_>,
 ) -> Vec<u8> {
-    if stage.skip_async
-        || !stage.async_capable
-        || fallback.len() > context.limit
-        || context.deadline.is_expired_at(Instant::now())
-    {
+    if stage.skip_async || !stage.async_capable {
+        return fallback;
+    }
+    if fallback.len() > context.limit {
+        log::warn!(
+            "HTML EOF processor {} skips optional I/O for {} bytes exceeding the {}-byte limit",
+            stage.integration_id,
+            fallback.len(),
+            context.limit
+        );
+        return fallback;
+    }
+    if context.deadline.is_expired_at(Instant::now()) {
+        log::debug!(
+            "HTML EOF processor {} skips optional I/O after deadline expiry",
+            stage.integration_id
+        );
         return fallback;
     }
     let mut candidate = StreamOutputWriter::new(context.limit);
@@ -214,11 +226,9 @@ async fn finish_output(
     }
     if let Some(Err(error)) = &result {
         let outcome = match error.current_context() {
-            crate::streaming_processor::finish::StreamFinishError::Unavailable => "unavailable",
-            crate::streaming_processor::finish::StreamFinishError::Rejected => "rejected",
-            crate::streaming_processor::finish::StreamFinishError::OutputLimitExceeded {
-                ..
-            } => "output_limit",
+            StreamFinishError::Unavailable => "unavailable",
+            StreamFinishError::Rejected => "rejected",
+            StreamFinishError::OutputLimitExceeded { .. } => "output_limit",
         };
         log::warn!(
             "HTML EOF processor {} retains input: {outcome}",
@@ -1045,6 +1055,9 @@ mod tests {
         Error,
         PoisonedReplacement,
         LateReplacement,
+        #[cfg(not(target_arch = "wasm32"))]
+        ElapsedReplacement,
+        EchoReplacement,
         EmptyReplacement,
         Replacement,
     }
@@ -1108,6 +1121,16 @@ mod tests {
                     LeafOutcome::LateReplacement => {
                         input.replacement.append(b"candidate")?;
                         input.deadline.mark_expired();
+                        Ok(StreamFinish::Replace)
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    LeafOutcome::ElapsedReplacement => {
+                        std::thread::sleep(input.deadline.remaining() + Duration::from_millis(5));
+                        input.replacement.append(b"candidate")?;
+                        Ok(StreamFinish::Replace)
+                    }
+                    LeafOutcome::EchoReplacement => {
+                        input.replacement.append(input.output)?;
                         Ok(StreamFinish::Replace)
                     }
                     LeafOutcome::EmptyReplacement => Ok(StreamFinish::Replace),
@@ -1343,6 +1366,259 @@ mod tests {
             "should finish later EOF once"
         );
         assert!(observation.dropped.get(), "should release callback borrows");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn async_eof_timerless_callback_elapsed_past_deadline_preserves_fallback() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let observation = LeafObservation::default();
+        let fallback = b"fallback".to_vec();
+        let fallback_pointer = fallback.as_ptr() as usize;
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "elapsed",
+                Box::new(LeafProbe {
+                    tail: fallback,
+                    outcome: LeafOutcome::ElapsedReplacement,
+                    observation: observation.clone(),
+                }),
+                true,
+                false,
+                64,
+            )],
+        );
+        chain.begin_finish().expect("should finish the parser");
+        let services = noop_services();
+        let deadline = StreamFinishDeadline::new(Duration::from_millis(100), false);
+        let mut timer = None;
+        let output = block_on(chain.finish_next(HtmlFinishContext {
+            response_status: StatusCode::OK,
+            services: &services,
+            deadline: &deadline,
+            timer: &mut timer,
+            limit: 64,
+            marker: None,
+        }))
+        .expect("should finish timerless work that completes late")
+        .expect("should retain synchronous output");
+        assert_eq!(
+            observation.calls.get(),
+            1,
+            "should exercise callback execution rather than pre-poll expiry"
+        );
+        assert!(
+            deadline.elapsed() >= Duration::from_millis(100),
+            "should cross the actual wall-clock deadline"
+        );
+        assert_eq!(output, b"fallback", "should reject the late replacement");
+        assert_eq!(
+            output.as_ptr() as usize,
+            fallback_pointer,
+            "should preserve the original fallback allocation"
+        );
+        assert!(observation.dropped.get(), "should release callback borrows");
+    }
+
+    #[test]
+    fn async_eof_oversized_streaming_fallback_skips_io_without_truncation_or_copy() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let observation = LeafObservation::default();
+        let fallback = vec![b'x'; 65];
+        let fallback_pointer = fallback.as_ptr() as usize;
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "oversized",
+                Box::new(LeafProbe {
+                    tail: fallback,
+                    outcome: LeafOutcome::Replacement,
+                    observation: observation.clone(),
+                }),
+                true,
+                false,
+                64,
+            )],
+        );
+        chain.begin_finish().expect("should finish the parser");
+        let services = noop_services();
+        let deadline = StreamFinishDeadline::new(Duration::from_secs(30), false);
+        let mut timer = None;
+        let output = block_on(chain.finish_next(HtmlFinishContext {
+            response_status: StatusCode::OK,
+            services: &services,
+            deadline: &deadline,
+            timer: &mut timer,
+            limit: 64,
+            marker: None,
+        }))
+        .expect("should deliver an oversized synchronous tail")
+        .expect("should return the complete tail");
+        assert_eq!(
+            output.as_slice(),
+            &[b'x'; 65],
+            "should not truncate fallback"
+        );
+        assert_eq!(
+            output.as_ptr() as usize,
+            fallback_pointer,
+            "should deliver the original allocation"
+        );
+        assert_eq!(observation.calls.get(), 0, "should skip optional I/O");
+        assert_eq!(
+            observation.eof_calls.get(),
+            1,
+            "should finish synchronous EOF once"
+        );
+    }
+
+    #[test]
+    fn async_eof_single_byte_marker_rejects_creation_and_removal() {
+        for (tail, replacement) in [
+            (b"|".as_slice(), b"wrong".as_slice()),
+            (b"tail".as_slice(), b"|".as_slice()),
+        ] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let calls = Rc::new(Cell::new(0));
+            let mut chain = HtmlWithStreamingProcessors::from_stages(
+                stage("parser", b"", None, &events, &calls),
+                vec![HtmlProcessorStage::new(
+                    "marker",
+                    stage("B", tail, Some(replacement), &events, &calls),
+                    true,
+                    false,
+                    64,
+                )],
+            );
+            chain.set_finish_marker(Some(b"|"));
+            assert_eq!(
+                chain
+                    .process_chunk(b"page|", false)
+                    .expect("should release ordinary output"),
+                b"page|",
+                "should preserve the already emitted marker"
+            );
+            chain.begin_finish().expect("should finish the parser");
+            let services = noop_services();
+            let deadline = StreamFinishDeadline::new(Duration::from_secs(30), false);
+            let mut timer = None;
+            let output = block_on(chain.finish_next(HtmlFinishContext {
+                response_status: StatusCode::OK,
+                services: &services,
+                deadline: &deadline,
+                timer: &mut timer,
+                limit: 64,
+                marker: Some(b"|"),
+            }))
+            .expect("should retain output after invalid marker replacement")
+            .expect("should return the fallback tail");
+            assert_eq!(
+                output, tail,
+                "should reject changing single-byte marker count"
+            );
+            assert_eq!(calls.get(), 1, "should evaluate optional output once");
+        }
+    }
+
+    #[test]
+    fn async_eof_duplicate_parser_finish_rejects_before_repeating_effects() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"parser-tail", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "B",
+                stage("B", b"tail", Some(b"candidate"), &events, &calls),
+                true,
+                false,
+                64,
+            )],
+        );
+        assert_eq!(
+            chain.begin_finish().expect("should finish the parser once"),
+            b"parser-tail",
+            "should release its tail once"
+        );
+        let original_events = events.borrow().clone();
+        chain
+            .begin_finish()
+            .expect_err("should reject a repeated parser EOF");
+        assert_eq!(
+            *events.borrow(),
+            original_events,
+            "should not repeat parser or downstream chunk effects"
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "should not start optional work at parser EOF"
+        );
+    }
+
+    #[test]
+    fn async_eof_exact_retention_and_replacement_cap_succeed_at_eof() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let observation = LeafObservation::default();
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "exact",
+                Box::new(LeafProbe {
+                    tail: b"tail".to_vec(),
+                    outcome: LeafOutcome::EchoReplacement,
+                    observation: observation.clone(),
+                }),
+                true,
+                true,
+                12,
+            )],
+        );
+        for chunk in [b"page", b"more"] {
+            assert!(
+                chain
+                    .process_chunk(chunk, false)
+                    .expect("should retain ordinary output")
+                    .is_empty(),
+                "should withhold output until EOF"
+            );
+        }
+        chain.begin_finish().expect("should finish the parser");
+        let services = noop_services();
+        let deadline = StreamFinishDeadline::new(Duration::from_secs(30), false);
+        let mut timer = None;
+        let output = block_on(chain.finish_next(HtmlFinishContext {
+            response_status: StatusCode::OK,
+            services: &services,
+            deadline: &deadline,
+            timer: &mut timer,
+            limit: 12,
+            marker: None,
+        }))
+        .expect("should accept exact-cap EOF completion")
+        .expect("should return retained output through its replacement");
+        assert_eq!(
+            output, b"pagemoretail",
+            "should include the whole retained output"
+        );
+        assert_eq!(
+            observation.calls.get(),
+            1,
+            "should not bypass exact-cap I/O"
+        );
+        assert_ne!(
+            output.as_ptr() as usize,
+            observation.fallback_pointer.get(),
+            "should commit the exact-cap replacement instead of retaining fallback"
+        );
+        assert_eq!(
+            observation.eof_calls.get(),
+            1,
+            "should finish synchronous EOF once"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

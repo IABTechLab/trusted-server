@@ -344,6 +344,8 @@ TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=true
+TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 ```
 
 ### Field Details
@@ -455,7 +457,9 @@ TTFB there even without stage retention. Enable only when accepting that deliver
 
 Shared budget for optional asynchronous processor EOF work in milliseconds. The default
 is `5000`; accepted values are `1` through `60000`. It begins after decoder/parser EOF
-and does not change the auction deadline. Timer expiry skips later optional I/O while
+and does not change the auction deadline. The initial 5-second default follows the
+issue example; 60 seconds is a configuration ceiling, not a recommended delivery
+latency or a measured optimum. Timer expiry skips later optional I/O while
 still completing downstream synchronous EOF. Timeout retains the current un-emitted
 stage output; it cannot undo bytes already delivered or remote side effects.
 
@@ -469,9 +473,11 @@ See [Asynchronous HTML processor completion](/guide/integration-guide#asynchrono
 
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on how much of a publisher origin body the rewrite
-pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
-and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
+**Purpose**: Limit individual publisher buffers and per-stream raw/decoded byte
+totals. This is not an aggregate request-memory budget. Async retention collectors,
+replacement candidates, auction suffixes, codec state and adapter response buffers
+can coexist; total memory may exceed this setting. Integration-owned allocations
+are outside the framework's bound.
 
 **Usage**:
 

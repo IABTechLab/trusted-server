@@ -8,31 +8,29 @@ use futures::future::LocalBoxFuture;
 
 use super::{IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory};
 use crate::streaming_processor::StreamProcessor;
-use crate::streaming_processor::finish::{StreamFinishDeadline, StreamFinishInput};
+use crate::streaming_processor::finish::StreamFinishInput;
 
-pub use crate::streaming_processor::finish::{
+pub(crate) use crate::streaming_processor::finish::{
     StreamFinish as HtmlFinalization, StreamFinishError as HtmlFinalizationError,
     StreamOutputWriter as HtmlReplacementWriter,
 };
 
-pub trait IntegrationHtmlFinalizerFactory: Send + Sync {
+pub(crate) trait IntegrationHtmlFinalizerFactory: Send + Sync {
     fn integration_id(&self) -> &'static str;
     fn create(&self, context: IntegrationHtmlStreamContext) -> Box<dyn IntegrationHtmlFinalizer>;
 }
 
-pub trait IntegrationHtmlFinalizer {
+pub(crate) trait IntegrationHtmlFinalizer {
     fn finalize<'a>(
         &'a mut self,
         input: HtmlFinalizationInput<'a>,
     ) -> LocalBoxFuture<'a, Result<HtmlFinalization, Report<HtmlFinalizationError>>>;
 }
 
-pub struct HtmlFinalizationInput<'a> {
+pub(crate) struct HtmlFinalizationInput<'a> {
     pub response_status: http::StatusCode,
     pub html: &'a [u8],
     pub replacement: &'a mut HtmlReplacementWriter,
-    pub services: &'a crate::platform::RuntimeServices,
-    pub deadline: &'a StreamFinishDeadline,
 }
 
 pub(super) struct TestFinishFactory(pub Arc<dyn IntegrationHtmlFinalizerFactory>);
@@ -68,8 +66,6 @@ impl StreamProcessor for TestFinishProcessor {
             response_status: input.response_status,
             html: input.output,
             replacement: input.replacement,
-            services: input.services,
-            deadline: input.deadline,
         }))
     }
 }

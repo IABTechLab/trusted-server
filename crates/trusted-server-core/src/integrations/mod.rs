@@ -31,9 +31,9 @@ pub mod sourcepoint;
 pub mod testlight;
 
 #[cfg(test)]
-pub use html_finalization::{
-    HtmlFinalization, HtmlFinalizationError, HtmlFinalizationInput, HtmlReplacementWriter,
-    IntegrationHtmlFinalizer, IntegrationHtmlFinalizerFactory,
+pub(crate) use html_finalization::{
+    HtmlFinalization, HtmlFinalizationError, HtmlFinalizationInput, IntegrationHtmlFinalizer,
+    IntegrationHtmlFinalizerFactory,
 };
 
 pub use registry::{

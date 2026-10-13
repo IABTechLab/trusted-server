@@ -1,4 +1,4 @@
-name: "Run Tests"
+name: 'Run Tests'
 
 permissions:
   contents: read
@@ -18,19 +18,19 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Viceroy version
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -71,6 +71,68 @@ jobs:
       - name: Run cache purge harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh purge
 
+  test-fastly-eof:
+    name: HTML EOF runtime (Fastly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned build tool versions
+        id: versions
+        shell: bash
+        run: |
+          echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.versions.outputs.rust }}
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache isolated EOF fixture Viceroy
+        id: cache-eof-viceroy
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/viceroy-eof/bin/viceroy
+          key: viceroy-eof-${{ runner.os }}-amd64-v0.19.0
+
+      - name: Install isolated Viceroy 0.19 for backend timeout simulation
+        if: steps.cache-eof-viceroy.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 https://github.com/fastly/Viceroy/releases/download/v0.19.0/viceroy_v0.19.0_linux-amd64.tar.gz -o "$RUNNER_TEMP/viceroy-eof.tar.gz"
+          mkdir -p "$RUNNER_TEMP/viceroy-eof/bin"
+          tar -xzf "$RUNNER_TEMP/viceroy-eof.tar.gz" -C "$RUNNER_TEMP/viceroy-eof/bin" viceroy
+
+      - name: Select isolated fixture runtime
+        shell: bash
+        run: echo "$RUNNER_TEMP/viceroy-eof/bin" >> "$GITHUB_PATH"
+
+      - name: Verify actual Fastly HTML EOF completion and auction assembly
+        timeout-minutes: 15
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/async-html-finalization-local-test.sh fastly --release --auction
+
+      - name: Upload EOF runtime diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastly-html-eof-diagnostics
+          path: ${{ runner.temp }}/trusted-server-finalize-fastly-*/
+          if-no-files-found: ignore
+
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
@@ -79,7 +141,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -158,7 +220,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
@@ -185,7 +247,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain (native + wasm32-wasip1)
@@ -210,7 +272,7 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -224,7 +286,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -255,14 +317,14 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-shared-key: cargo-cli-${{ runner.os }}
 
       - name: Read pinned Node.js version for CLI fixtures
@@ -329,14 +391,14 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies

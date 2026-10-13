@@ -582,10 +582,6 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .build()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 struct AxumTimer;
 
 impl trusted_server_core::platform::PlatformTimer for AxumTimer {
@@ -595,6 +591,10 @@ impl trusted_server_core::platform::PlatformTimer for AxumTimer {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
