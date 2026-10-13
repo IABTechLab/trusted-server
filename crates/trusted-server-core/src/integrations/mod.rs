@@ -840,6 +840,7 @@ pub fn declared_caches(
     let mut declared: Vec<(&'static str, &'static str)> = vec![
         (crate::settings::ROBOTS_TXT_CACHE, "core"),
         (crate::settings::ASSETS_CACHE, "core"),
+        (crate::settings::ASSETS_VARY_CACHE, "core"),
     ];
     for builder in builders {
         for name in builder.cache_features() {
@@ -1128,7 +1129,10 @@ mod loading_caches_from_tests {
 
         let message = format!("{refused:?}");
         assert!(message.contains("[cache.answres]"), "{message}");
-        assert!(message.contains("robots-txt, assets, answers"), "{message}");
+        assert!(
+            message.contains("robots-txt, assets, assets-vary, answers"),
+            "{message}"
+        );
     }
 
     #[test]

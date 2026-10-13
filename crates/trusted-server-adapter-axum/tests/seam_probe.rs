@@ -540,7 +540,7 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
         "should name the table: {message}"
     );
     assert!(
-        message.contains("robots-txt, assets, seam-probe-answers"),
+        message.contains("robots-txt, assets, assets-vary, seam-probe-answers"),
         "should list the caches this build declares: {message}"
     );
     assert_eq!(

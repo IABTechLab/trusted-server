@@ -3055,6 +3055,11 @@ pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
 /// origin sends, whose settings are `[cache.assets]`.
 pub const ASSETS_CACHE: &str = "assets";
 
+/// The name of the cache that holds each asset's record of what its
+/// responses vary on, selected by the same `[cache.assets]` table as the
+/// copies, so one line selects both.
+pub const ASSETS_VARY_CACHE: &str = "assets-vary";
+
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
 ///
@@ -3147,6 +3152,7 @@ impl CacheSettings {
         [
             (ROBOTS_TXT_CACHE, &self.robots_txt),
             (ASSETS_CACHE, &self.assets),
+            (ASSETS_VARY_CACHE, &self.assets),
         ]
         .into_iter()
         .chain(
@@ -7064,10 +7070,10 @@ module = \"none\"",
 
         let caches = settings.cache.loading_caches();
 
-        assert_eq!(caches.len(), 3);
-        assert_eq!(caches[2].0, "answers");
-        assert_eq!(caches[2].1.module.as_deref(), Some("51degrees"));
-        assert_eq!(caches[2].1.store_seconds, Some(3600));
+        assert_eq!(caches.len(), 4);
+        assert_eq!(caches[3].0, "answers");
+        assert_eq!(caches[3].1.module.as_deref(), Some("51degrees"));
+        assert_eq!(caches[3].1.store_seconds, Some(3600));
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(written["answers"]["module"], "51degrees");
     }
@@ -7094,8 +7100,9 @@ module = \"none\"",
             vec![
                 (super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt),
                 (super::ASSETS_CACHE, &settings.cache.assets),
+                (super::ASSETS_VARY_CACHE, &settings.cache.assets),
             ],
-            "should list core's own caches by name, robots.txt then assets"
+            "should list core's own caches by name, robots.txt then the two of assets"
         );
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(
