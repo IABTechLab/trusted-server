@@ -54,8 +54,8 @@ impl Middleware for SanitizeRequestMiddleware {
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
 /// Geo lookup is unavailable in the Axum dev server — `X-Geo-Info-Available: false`
-/// is always emitted. Fastly-specific headers (`X-TS-Version`, `X-TS-ENV`) are
-/// skipped because the corresponding env vars are not set in a local dev context.
+/// is always emitted. The Fastly adapter's `X-TS-ENV` is skipped because its
+/// env var is not set in a local dev context.
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
 /// outgoing response carries a consistent set of headers.
