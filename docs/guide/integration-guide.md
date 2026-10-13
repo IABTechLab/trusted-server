@@ -287,12 +287,13 @@ unchanged one through. `Refusal::service_unavailable` is the one for a
 source that cannot answer now. The preparations of one document run in the
 order the entry names the middleware, and the first refusal ends them.
 
-On a document that may be stored only the fetch phase is prepared, and its
-preparations are handed the request's services and nothing of the reader,
-because what they answer is stored with the document. The serve middleware
-of the reader it was fetched for then find nothing prepared. On a document
-that is not stored both phases are prepared, and on a copy read from the
-store the serve phase alone.
+On a document that may be stored the fetch phase's preparations are handed
+the request's services and nothing of the reader, because what they answer
+is stored with the document. The serve phase is prepared with the reader's
+state on every document, the one fetched for this reader as much as a copy
+read from the store, so what a serve middleware finds prepared never depends
+on whether its reader was the first. On a document that is not stored both
+phases are prepared with the reader's state.
 
 ## Proxy implementation rules
 
