@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use error_stack::Report;
 use regex::Regex;
 use serde::Deserialize;
+use web_time::Instant;
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{RuntimeServices, StoreName};
