@@ -28,6 +28,24 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SERVICE: &str = "s3";
 const TERMINATOR: &str = "aws4_request";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+/// Prefix of every header name in this signing scheme's namespace.
+const NAMESPACE_PREFIX: &str = "x-amz-";
+
+/// Removes every header in this signing scheme's namespace.
+///
+/// [`sign_headers`] replaces the few it writes. A caller that forwards a
+/// reader's headers removes the rest first, so no header the reader chose can
+/// change how the origin reads the signed request.
+pub(crate) fn remove_namespace_headers(headers: &mut HeaderMap) {
+    let names: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with(NAMESPACE_PREFIX))
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(&name);
+    }
+}
 
 /// `AWS` credentials used to sign an `S3` request.
 ///
