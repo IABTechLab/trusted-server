@@ -14,6 +14,14 @@ pub(crate) fn bundle_file_name(id: &str) -> String {
     format!("tsjs-{id}.js")
 }
 
+/// Whether the ID is an ASCII identifier safe in a file and generated Rust.
+pub(crate) fn safe_module_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 /// Return the module IDs `build-all.mjs` builds from `lib_src`.
 ///
 /// Mirrors the discovery in `build-all.mjs`: `core` plus every
@@ -51,6 +59,17 @@ pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String>
     let mut ids = Vec::with_capacity(integrations.len() + 1);
     ids.push(CORE_MODULE_ID.to_owned());
     ids.extend(integrations);
+    if ids.iter().any(|id| !safe_module_id(id)) {
+        return Err("module IDs must be safe ASCII identifiers".to_owned());
+    }
+    if ids
+        .iter()
+        .filter(|id| id.as_str() == CORE_MODULE_ID)
+        .count()
+        != 1
+    {
+        return Err("duplicate core module ID".to_owned());
+    }
     Ok(ids)
 }
 
@@ -71,12 +90,14 @@ pub(crate) fn scan_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> 
             .strip_prefix("tsjs-")
             .and_then(|stem| stem.strip_suffix(".js"))
         else {
-            continue;
+            return Err(format!("unexpected file in bundle directory: {file_name}"));
         };
-        let len = entry
-            .metadata()
-            .map_err(|err| format!("failed to read metadata for {file_name}: {err}"))?
-            .len();
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|err| format!("failed to read metadata for {file_name}: {err}"))?;
+        if !safe_module_id(id) || !metadata.is_file() {
+            return Err(format!("unsafe or nonregular bundle: {file_name}"));
+        }
+        let len = metadata.len();
         found.push((id.to_owned(), len));
     }
     Ok(found)
@@ -106,6 +127,10 @@ pub(crate) fn check_bundle_set(expected: &[String], found: &[(String, u64)]) -> 
     unexpected.sort_unstable();
 
     let mut problems = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    if found.iter().any(|(id, _)| !ids.insert(id)) {
+        problems.push("duplicate bundle IDs".to_owned());
+    }
     if !missing.is_empty() {
         problems.push(format!("missing bundles: {missing:?}"));
     }
