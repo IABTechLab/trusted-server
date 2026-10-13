@@ -55,6 +55,11 @@ flowchart TB
     E --> F[Emit one access row to Tinybird]
 ```
 
+Auction-wait duration measures collection only after at least one provider request
+started. When no provider launched, `auction_wait_ms` is null and
+`auction_wait_placement` is `none`; collection and summary emission still run.
+A measured wait under one millisecond is `0`, with its actual placement retained.
+
 Emission is best effort. Serialization, body-size, transport, and non-2xx failures
 are logged and the row is dropped without changing the delivered response. Access
 ingestion currently waits for Tinybird's reply after client delivery, unlike the

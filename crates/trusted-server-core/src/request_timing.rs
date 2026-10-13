@@ -149,6 +149,9 @@ impl RequestTimings {
     /// Records an auction wait duration under [`Phase::AuctionWait`] and
     /// stores its placement.
     ///
+    /// Callers record only when at least one provider request actually started.
+    /// A measured zero duration is retained; no-launch collection leaves the
+    /// duration and placement unset.
     /// Drops the sample silently on lock contention; a poisoned lock is recovered.
     pub fn record_auction_wait(&self, placement: AuctionWaitPlacement, dur: Duration) {
         let _ = self
@@ -748,6 +751,30 @@ mod tests {
             timings.snapshot().origin_ms.expect("should record on drop") >= 1,
             "should measure elapsed span time"
         );
+    }
+
+    #[test]
+    fn auction_wait_keeps_zero_duration_and_placement() {
+        for placement in [
+            AuctionWaitPlacement::PreHeader,
+            AuctionWaitPlacement::InStream,
+        ] {
+            let timings = RequestTimings::new();
+            timings.mark_auction_dispatched();
+            timings.record_auction_wait(placement, Duration::ZERO);
+
+            let snapshot = timings.snapshot();
+            assert_eq!(
+                snapshot.auction_wait_ms,
+                Some(0),
+                "should preserve a measured zero wait"
+            );
+            assert_eq!(
+                snapshot.auction_wait_placement,
+                Some(placement),
+                "should retain placement for a measured zero wait"
+            );
+        }
     }
 
     #[test]

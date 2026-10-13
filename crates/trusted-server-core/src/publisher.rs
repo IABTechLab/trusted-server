@@ -4357,11 +4357,11 @@ async fn collect_non_html_auction(
             &make_collect_context(settings, services, &placeholder),
         )
         .await;
-    params
-        .timings
-        .record_auction_wait(placement, wait_started.elapsed());
-    // Collection is a resolution milestone only when dispatch reached a provider.
+    // Wait and resolution are meaningful only for started provider work.
     if provider_launched {
+        params
+            .timings
+            .record_auction_wait(placement, wait_started.elapsed());
         params.timings.mark_auction_resolved();
     }
     let delivered_winner_slots = write_bids_to_state(
@@ -4428,9 +4428,9 @@ async fn collect_stream_auction(
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
-    timings.record_auction_wait(*placement, wait_started.elapsed());
-    // Collection is a resolution milestone only when dispatch reached a provider.
+    // Wait and resolution are meaningful only for started provider work.
     if provider_launched {
+        timings.record_auction_wait(*placement, wait_started.elapsed());
         timings.mark_auction_resolved();
     }
     log::info!(
@@ -11149,49 +11149,54 @@ mod tests {
                 crate::auction::compile_auction_plan(&settings)
                     .expect("should compile explicit-routing navigation plan"),
             );
-            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
-            let stub = Arc::new(StubHttpClient::new());
-            queue_shareable_html(&stub);
-            let sink = Arc::new(RecordingTelemetrySink::default());
-            let services = services_with_cache_and_telemetry(
-                Arc::clone(&stub),
-                Arc::new(MemoryTemplateCache::default()),
-                Arc::clone(&sink),
-            );
-            let mut request = navigation_request();
-            let timings = RequestTimings::new();
-            request.extensions_mut().insert(timings.handle().clone());
+            for finalizer in [Finalizer::Buffered, Finalizer::Streaming] {
+                let orchestrator = AuctionOrchestrator::from_plan(Arc::clone(&plan), None);
+                let stub = Arc::new(StubHttpClient::new());
+                queue_shareable_html(&stub);
+                let sink = Arc::new(RecordingTelemetrySink::default());
+                let services = services_with_cache_and_telemetry(
+                    Arc::clone(&stub),
+                    Arc::new(MemoryTemplateCache::default()),
+                    Arc::clone(&sink),
+                );
+                let mut request = navigation_request();
+                let timings = RequestTimings::new();
+                request.extensions_mut().insert(timings.handle().clone());
 
-            let response = run_with_orchestrator(
-                &settings,
-                &services,
-                request,
-                orchestrator,
-                Finalizer::Streaming,
-            )
-            .await;
-            let _ = body_of(response).await;
-            let summary = last_summary_row(&sink)
-                .expect("should emit a summary for the routing-only dispatch");
-            assert_eq!(summary.terminal_status.as_deref(), Some("completed"));
-            assert_eq!(
-                timings
-                    .snapshot()
-                    .auction_id
-                    .map(|id| id.to_string())
-                    .as_deref(),
-                Some(summary.auction_id.as_str()),
-                "should join the routing-only dispatch to its navigation summary"
-            );
-            let snapshot = timings.snapshot();
-            assert!(snapshot.auction_dispatched_ms.is_none());
-            assert!(snapshot.auction_resolved_ms.is_none());
-            assert!(snapshot.auction_committed_ms.is_none());
-            assert_eq!(
-                stub.recorded_request_uris(),
-                vec!["https://origin.test-publisher.com/article"],
-                "should send only the origin request for the explicit routing skip"
-            );
+                let response =
+                    run_with_orchestrator(&settings, &services, request, orchestrator, finalizer)
+                        .await;
+                let _ = body_of(response).await;
+                let summary = last_summary_row(&sink)
+                    .expect("should emit a summary for the routing-only dispatch");
+                assert_eq!(summary.terminal_status.as_deref(), Some("completed"));
+                assert_eq!(
+                    timings
+                        .snapshot()
+                        .auction_id
+                        .map(|id| id.to_string())
+                        .as_deref(),
+                    Some(summary.auction_id.as_str()),
+                    "should join the routing-only dispatch to its navigation summary"
+                );
+                let snapshot = timings.snapshot();
+                assert!(snapshot.auction_dispatched_ms.is_none());
+                assert!(snapshot.auction_resolved_ms.is_none());
+                assert!(snapshot.auction_committed_ms.is_none());
+                assert_eq!(
+                    snapshot.auction_wait_ms, None,
+                    "should omit wait without a provider launch"
+                );
+                assert_eq!(
+                    snapshot.auction_wait_placement, None,
+                    "should omit placement without a provider launch"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris(),
+                    vec!["https://origin.test-publisher.com/article"],
+                    "should send only the origin request for the explicit routing skip"
+                );
+            }
         }
 
         #[tokio::test]
@@ -22448,25 +22453,46 @@ mod tests {
         let streamed = streamed_timings.snapshot();
         assert!(streamed.auction_resolved_ms.is_none());
         assert!(streamed.auction_committed_ms.is_none());
+        assert_eq!(
+            streamed.auction_wait_ms, None,
+            "should leave empty stream collection untimed"
+        );
+        assert_eq!(
+            streamed.auction_wait_placement, None,
+            "should omit empty stream wait placement"
+        );
 
-        let mut params = make_stream_params(&settings, "");
-        params.timings = RequestTimings::new();
-        let buffered_timings = params.timings.clone();
-        futures::executor::block_on(collect_non_html_auction(
-            DispatchedAuction::empty_for_test(request, 10),
-            AuctionTelemetryCarry {
-                observation: None,
-                auction_request: None,
-            },
-            &params,
-            &orchestrator,
-            &services,
-            &settings,
+        for placement in [
             AuctionWaitPlacement::PreHeader,
-        ));
-        let buffered = buffered_timings.snapshot();
-        assert!(buffered.auction_resolved_ms.is_none());
-        assert!(buffered.auction_committed_ms.is_none());
+            AuctionWaitPlacement::InStream,
+        ] {
+            let mut params = make_stream_params(&settings, "");
+            params.timings = RequestTimings::new();
+            let buffered_timings = params.timings.clone();
+            futures::executor::block_on(collect_non_html_auction(
+                DispatchedAuction::empty_for_test(request.clone(), 10),
+                AuctionTelemetryCarry {
+                    observation: None,
+                    auction_request: None,
+                },
+                &params,
+                &orchestrator,
+                &services,
+                &settings,
+                placement,
+            ));
+            let buffered = buffered_timings.snapshot();
+            assert!(buffered.auction_resolved_ms.is_none());
+            assert!(buffered.auction_committed_ms.is_none());
+            assert_eq!(
+                buffered.auction_wait_ms, None,
+                "should leave empty non-HTML collection untimed"
+            );
+            assert_eq!(
+                buffered.auction_wait_placement, None,
+                "should omit empty non-HTML wait placement"
+            );
+        }
     }
 
     #[test]
