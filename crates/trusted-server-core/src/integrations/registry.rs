@@ -1412,7 +1412,9 @@ fn check_middleware(
 }
 
 /// The middleware no entry names in a phase it runs in, each with the
-/// integration that supplies it, in registration order.
+/// integration that supplies it, in registration order. Core's own
+/// middleware is offered to every deployment, so one that no entry names
+/// is not a module running for nothing, and is left out.
 fn unnamed_middleware<'a>(
     settings: &Settings,
     inner: &'a IntegrationRegistryInner,
@@ -1420,6 +1422,7 @@ fn unnamed_middleware<'a>(
     inner
         .middleware
         .iter()
+        .filter(|(integration, _)| *integration != crate::service_version::MODULE)
         .filter(|(_, middleware)| {
             let id = middleware.middleware_id();
             !middleware
@@ -1829,6 +1832,12 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.geo_module = geo_module;
+        // Core's own middleware, which an entry may name whatever the
+        // sections select.
+        inner.middleware.push((
+            crate::service_version::MODULE,
+            Arc::new(crate::service_version::ServiceVersion),
+        ));
         check_middleware(settings, &inner)?;
         check_robots_txt_selection(settings, &inner)?;
 
@@ -6000,8 +6009,9 @@ mod tests {
                 fixture::BROKEN,
                 fixture::READER,
                 fixture::BROKEN_READER,
+                crate::service_version::MODULE,
             ],
-            "should list the middleware the selected module supplies"
+            "should list the middleware the selected module supplies, and core's own after them"
         );
         assert_eq!(
             registry.middleware_in(MiddlewarePhase::Fetch),
@@ -6010,8 +6020,12 @@ mod tests {
         );
         assert_eq!(
             registry.middleware_in(MiddlewarePhase::Serve),
-            [fixture::READER, fixture::BROKEN_READER],
-            "should list the middleware that run in the serve phase"
+            [
+                fixture::READER,
+                fixture::BROKEN_READER,
+                crate::service_version::MODULE
+            ],
+            "should list the middleware that run in the serve phase, core's own last"
         );
         let chain_for = |media_type: &str, path: &str| {
             registry
@@ -6058,12 +6072,13 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
                 fixture::READER,
-                fixture::BROKEN_READER
+                fixture::BROKEN_READER,
+                crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
         );

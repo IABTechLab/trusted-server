@@ -1035,6 +1035,14 @@ Every adapter removes the three from a response before it finalizes it, unless t
 
 The Fastly adapter wrote `X-TS-Version`, the platform's version number of the service, on every response. It no longer does. The version is in the [attestation document](./attestation), under `platform.serviceVersion`, which is where a deployment is asked about itself.
 
+A deployment that wants the version on its pages names core's `service_version` middleware in the `[[serve]]` entry that covers them, after the module middleware the entry already names. The header is then written on every page the entry covers, with the version the adapter reports, and on nothing else. No section selects the middleware, and a deployment that does not name it sends nothing about the service on a page.
+
+```toml
+[[serve]]
+media_type = "text/html"
+middleware = ["service_version"]
+```
+
 ## robots.txt Configuration
 
 What `/robots.txt` answers. With no `[robots-txt]` section the publisher keeps their own file and `/robots.txt` reaches the origin like any other path.
@@ -1736,6 +1744,7 @@ the names in and the order `trusted-server.example.toml` shows them in.
 | `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                          |
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                       |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                         |
+| `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the platform's version number of the service, when the adapter reports one. Core supplies it, so no section selects it                                                                     |
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type

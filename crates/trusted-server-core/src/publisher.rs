@@ -12235,6 +12235,102 @@ mod tests {
             }
         }
 
+        /// As [`run`], with the finalizer's registry on a platform reporting
+        /// `version` for its service, so a stored page's serve middleware are
+        /// told it.
+        async fn run_on_a_platform_reporting(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+            version: &str,
+        ) -> Response<EdgeBody> {
+            let orchestrator = Arc::new(AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(settings),
+            ));
+            let registry = IntegrationRegistry::new(settings)
+                .expect("should create integration registry")
+                .with_platform(crate::attestation::PlatformIdentity {
+                    service_version: version.to_owned(),
+                    ..crate::attestation::PlatformIdentity::named("example-platform")
+                });
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let publisher_response = handle_publisher_request(
+                AppContext {
+                    settings,
+                    integration_registry: &registry,
+                },
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            finalize_test_publisher_response(
+                publisher_response,
+                settings,
+                services,
+                &registry,
+                orchestrator,
+                Finalizer::Streaming,
+            )
+            .await
+        }
+
+        /// A stored page's serve middleware write their headers on each
+        /// reader's response, on the fill and on the hit, and are told the
+        /// platform the registry carries.
+        #[tokio::test]
+        async fn a_stored_page_s_serve_middleware_write_their_headers_on_each_reader_s_response() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut settings = settings_with_mode("esi");
+            settings.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: None,
+                    middleware: vec![crate::service_version::MODULE.to_owned()],
+                }]);
+            let settings = Arc::new(settings);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            for cache_status in ["miss-stored", "hit"] {
+                let response =
+                    run_on_a_platform_reporting(&settings, &services, navigation_request(), "52")
+                        .await;
+
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(HEADER_X_TS_TEMPLATE_CACHE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_status),
+                    "the page should be stored first and then served from the store"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-ts-version")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("52"),
+                    "should write the version the platform reports on the {cache_status} response"
+                );
+                let _ = body_of(response).await;
+            }
+        }
+
         #[tokio::test]
         async fn a_second_request_is_served_from_the_cache_without_touching_the_origin() {
             let stub = Arc::new(StubHttpClient::new());
@@ -18071,6 +18167,146 @@ mod tests {
                     "publisher response without matched slots should preserve {header_name}"
                 );
             }
+        }
+
+        fn settings_naming_the_service_version() -> Settings {
+            let mut settings = settings_without_creative_opportunities();
+            settings.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: None,
+                    middleware: vec![crate::service_version::MODULE.to_owned()],
+                }]);
+            settings
+        }
+
+        /// The registry of `settings` on a platform reporting `version` for
+        /// its service.
+        fn registry_on_a_platform_reporting(
+            settings: &Settings,
+            version: &str,
+        ) -> IntegrationRegistry {
+            IntegrationRegistry::new(settings)
+                .expect("should create integration registry")
+                .with_platform(crate::attestation::PlatformIdentity {
+                    service_version: version.to_owned(),
+                    ..crate::attestation::PlatformIdentity::named("example-platform")
+                })
+        }
+
+        fn version_header(response: &Response<EdgeBody>) -> Option<String> {
+            response
+                .headers()
+                .get("x-ts-version")
+                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        }
+
+        /// A page from the origin, as the publisher path hands it to a
+        /// finalizer, with the services it was fetched through.
+        async fn origin_page(settings: &Settings) -> (PublisherResponse, RuntimeServices) {
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let response = run_with_slots(
+                settings,
+                &services,
+                &[article_slot()],
+                conditional_navigation_request(),
+            )
+            .await;
+            (response, services)
+        }
+
+        async fn buffered(
+            settings: &Settings,
+            registry: &IntegrationRegistry,
+        ) -> Response<EdgeBody> {
+            let (response, services) = origin_page(settings).await;
+            let orchestrator = AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(settings),
+            );
+            buffer_publisher_response_async(
+                response,
+                &Method::GET,
+                settings,
+                registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("should buffer the page")
+        }
+
+        #[tokio::test]
+        async fn the_service_version_middleware_writes_the_header_on_a_buffered_page() {
+            let settings = settings_naming_the_service_version();
+            let registry = registry_on_a_platform_reporting(&settings, "52");
+
+            let response = buffered(&settings, &registry).await;
+
+            assert_eq!(
+                version_header(&response).as_deref(),
+                Some("52"),
+                "should write the version the platform reports on the buffered page"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_service_version_middleware_writes_the_header_on_a_streamed_page() {
+            let settings = settings_naming_the_service_version();
+            let registry = registry_on_a_platform_reporting(&settings, "52");
+            let (response, services) = origin_page(&settings).await;
+            let orchestrator = Arc::new(AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(&settings),
+            ));
+
+            let response = publisher_response_into_streaming_response(
+                response,
+                &Method::GET,
+                Arc::new(settings),
+                &registry,
+                orchestrator,
+                services,
+            )
+            .await
+            .expect("should stream the page");
+
+            assert_eq!(
+                version_header(&response).as_deref(),
+                Some("52"),
+                "should write the version the platform reports before the body streams"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_page_no_serve_entry_names_the_middleware_on_carries_no_version() {
+            let settings = settings_without_creative_opportunities();
+            let registry = registry_on_a_platform_reporting(&settings, "52");
+
+            let response = buffered(&settings, &registry).await;
+
+            assert_eq!(
+                version_header(&response),
+                None,
+                "should write nothing where no entry names the middleware"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_platform_reporting_no_version_writes_no_header() {
+            let settings = settings_naming_the_service_version();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+            let response = buffered(&settings, &registry).await;
+
+            assert_eq!(
+                version_header(&response),
+                None,
+                "should write nothing for a version the platform did not report"
+            );
         }
 
         #[tokio::test]
