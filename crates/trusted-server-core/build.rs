@@ -199,6 +199,10 @@ fn write_attestation_keys() {
 ///
 /// `SOURCE_DATE_EPOCH` is honored where it is set, so a reproducible build
 /// stays reproducible rather than differing only by this string.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a build script runs on the host, where the std clock is sound"
+)]
 fn write_build_time() {
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     let seconds = env::var("SOURCE_DATE_EPOCH")
