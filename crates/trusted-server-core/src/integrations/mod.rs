@@ -341,6 +341,10 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             id: "gpt_diagnostics",
             build: gpt_diagnostics::register,
         },
+        IntegrationBuilder {
+            id: id5::ID5_INTEGRATION_ID,
+            build: id5::register,
+        },
     ]
 }
 

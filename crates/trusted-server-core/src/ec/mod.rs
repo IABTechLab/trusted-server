@@ -335,12 +335,13 @@ impl EcContext {
             .map(generation::normalize_ip);
 
         // Build consent context from request-local cookies, headers, and geo.
-        let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
+        let mut consent = consent_mod::build_consent_context(&ConsentPipelineInput {
             jar: parsed.jar.as_ref(),
             req,
             config: &settings.consent,
             geo: geo_info,
         });
+        crate::integrations::id5::apply_demo_consent(settings, parsed.jar.as_ref(), &mut consent);
 
         log::info!(
             "EC context: present={}, cookie_present={}, consent_allowed={}, jurisdiction={}",

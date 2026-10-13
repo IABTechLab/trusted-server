@@ -19,9 +19,11 @@
 //! `cache_control.max_age_sec` and marks when the next refresh is due.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, header};
@@ -29,12 +31,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use validator::Validate;
 
-use crate::consent::ConsentContext;
-use crate::constants::{COOKIE_TS_EIDS_S, COOKIE_TS_ID5_FRESH, COOKIE_TS_ID5_SIGNATURE};
+use crate::consent::jurisdiction::Jurisdiction;
+use crate::consent::{ConsentContext, ConsentSource};
+use crate::constants::{
+    COOKIE_TS_DEMO_CONSENT, COOKIE_TS_EIDS_S, COOKIE_TS_ID5_FRESH, COOKIE_TS_ID5_SIGNATURE,
+};
 use crate::cookies::extract_cookie_value;
 use crate::ec::prebid_eids::{is_valid_eid_uid, parse_prebid_eids_cookie};
 use crate::error::TrustedServerError;
-use crate::integrations::{collect_response_bounded, ensure_integration_backend_with_timeout};
+use crate::integrations::{
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
+    collect_response_bounded, ensure_integration_backend_with_timeout,
+};
 use crate::openrtb::{Eid, Uid};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -93,6 +101,11 @@ pub struct Id5Config {
     #[serde(default = "default_refresh_seconds")]
     #[validate(range(min = 300, max = 86400))]
     pub refresh_seconds: u32,
+    /// Demo only: injects a Trusted Server consent banner on every page until
+    /// the visitor answers, and treats an accepted browser as consented
+    /// regardless of location or CMP signals. Never enable on production traffic.
+    #[serde(default)]
+    pub demo_consent_banner: bool,
     /// Lifetime of the ID and signature cookies, in seconds.
     #[serde(default = "default_cookie_max_age_seconds")]
     #[validate(range(min = 3600, max = 2_592_000))]
@@ -103,6 +116,81 @@ impl IntegrationConfig for Id5Config {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
+}
+
+const DEMO_CONSENT_GRANTED: &str = "granted";
+
+/// Banner shown until the visitor answers. Built with DOM calls only, so it
+/// works under CSPs that forbid `innerHTML` string assignment.
+const DEMO_CONSENT_BANNER_SCRIPT: &str = r#"<script>(function(){var n="ts-demo-consent";if(document.cookie.split("; ").some(function(c){return c.indexOf(n+"=")===0})){return}function answer(v){document.cookie=n+"="+v+"; path=/; max-age=86400; secure; samesite=lax";location.reload()}function button(label,value,primary){var b=document.createElement("button");b.type="button";b.textContent=label;b.style.cssText="margin:0 8px 0 0;padding:8px 16px;border:0;border-radius:4px;cursor:pointer;font:inherit;"+(primary?"background:#2563eb;color:#fff":"background:#e5e7eb;color:#111");b.addEventListener("click",function(){answer(value)});return b}function show(){if(document.getElementById(n)){return}var d=document.createElement("div");d.id=n;d.setAttribute("role","dialog");d.setAttribute("aria-label","Trusted Server demo consent");d.style.cssText="position:fixed;left:16px;right:16px;bottom:16px;z-index:2147483647;max-width:560px;margin:0 auto;padding:16px;background:#111827;color:#fff;font:14px/1.45 system-ui,sans-serif;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,.45)";var p=document.createElement("p");p.style.cssText="margin:0 0 12px";p.textContent="Trusted Server demo: allow identity (Edge Cookie and ID5) in this browser?";d.appendChild(p);d.appendChild(button("Accept","granted",true));d.appendChild(button("Decline","denied",false));document.body.appendChild(d)}if(document.body){show()}else{document.addEventListener("DOMContentLoaded",show)}})();</script>"#;
+
+/// Registers the demo consent banner when `demo_consent_banner` is enabled.
+///
+/// The ID5 fetch itself runs from `/auction` and needs no registration.
+///
+/// # Errors
+///
+/// Returns an error when `[integrations.id5]` cannot be parsed.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<Id5Config>(ID5_INTEGRATION_ID)? else {
+        return Ok(None);
+    };
+    if !config.demo_consent_banner {
+        return Ok(None);
+    }
+    log::warn!("ID5: demo consent banner enabled; never enable it on production traffic");
+    Ok(Some(
+        IntegrationRegistration::builder(ID5_INTEGRATION_ID)
+            .with_head_injector(Arc::new(DemoConsentBanner))
+            .without_js()
+            .build(),
+    ))
+}
+
+struct DemoConsentBanner;
+
+impl IntegrationHeadInjector for DemoConsentBanner {
+    fn integration_id(&self) -> &'static str {
+        ID5_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![DEMO_CONSENT_BANNER_SCRIPT.to_owned()]
+    }
+}
+
+/// Treats a browser that accepted the demo banner as consented.
+///
+/// Applies only when `demo_consent_banner` is enabled and the request carries
+/// `ts-demo-consent=granted`. The consent context is replaced with a
+/// non-regulated one, so stale or restrictive CMP strings in the browser do not
+/// block the Edge Cookie, the ID5 fetch or EID forwarding during the demo.
+pub(crate) fn apply_demo_consent(
+    settings: &Settings,
+    jar: Option<&CookieJar>,
+    consent: &mut ConsentContext,
+) {
+    let granted = jar
+        .and_then(|jar| jar.get(COOKIE_TS_DEMO_CONSENT))
+        .is_some_and(|cookie| cookie.value() == DEMO_CONSENT_GRANTED);
+    if !granted {
+        return;
+    }
+    let enabled = matches!(
+        settings.integration_config::<Id5Config>(ID5_INTEGRATION_ID),
+        Ok(Some(config)) if config.demo_consent_banner
+    );
+    if !enabled {
+        return;
+    }
+    log::warn!("ID5 demo: banner accepted, treating this request as consented");
+    *consent = ConsentContext {
+        jurisdiction: Jurisdiction::NonRegulated,
+        source: ConsentSource::PolicyDefault,
+        ..ConsentContext::default()
+    };
 }
 
 fn default_endpoint() -> String {
@@ -584,6 +672,7 @@ mod tests {
             timeout_ms: 300,
             provider: None,
             refresh_seconds: default_refresh_seconds(),
+            demo_consent_banner: false,
             cookie_max_age_seconds: default_cookie_max_age_seconds(),
         }
     }
@@ -969,6 +1058,112 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("ts-id5-sig=;") && c.contains("Max-Age=0")),
             "should expire the signature: {cookies:?}"
+        );
+    }
+
+    fn settings_with_demo_banner(enabled: bool) -> Settings {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                ID5_INTEGRATION_ID,
+                &json!({"enabled": true, "partner": 173, "demo_consent_banner": enabled}),
+            )
+            .expect("should insert ID5 config");
+        settings
+    }
+
+    fn restrictive_us_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpc: true,
+            raw_tc_string: Some("CPsynthetic".to_owned()),
+            ..ConsentContext::default()
+        }
+    }
+
+    fn jar(cookie: &str) -> CookieJar {
+        crate::cookies::parse_cookies_to_jar(cookie)
+    }
+
+    #[test]
+    fn demo_consent_overrides_restrictive_signals_when_accepted() {
+        let settings = settings_with_demo_banner(true);
+        let mut consent = restrictive_us_consent();
+        assert!(
+            !crate::ec::consent::ec_consent_granted(&consent),
+            "fixture should start without EC consent"
+        );
+
+        apply_demo_consent(
+            &settings,
+            Some(&jar("ts-demo-consent=granted")),
+            &mut consent,
+        );
+
+        assert!(
+            crate::ec::consent::ec_consent_granted(&consent),
+            "an accepted demo banner should allow EC"
+        );
+        assert!(
+            crate::consent::consent_allows_server_side_auction(&consent),
+            "an accepted demo banner should allow the server-side auction"
+        );
+        assert!(
+            consent.raw_tc_string.is_none(),
+            "should drop the stale TCF string so EIDs are not stripped"
+        );
+    }
+
+    #[test]
+    fn demo_consent_leaves_consent_alone_when_declined_absent_or_disabled() {
+        let cases = [
+            (
+                settings_with_demo_banner(true),
+                Some("ts-demo-consent=denied"),
+            ),
+            (settings_with_demo_banner(true), None),
+            (
+                settings_with_demo_banner(false),
+                Some("ts-demo-consent=granted"),
+            ),
+            (create_test_settings(), Some("ts-demo-consent=granted")),
+        ];
+        for (settings, cookie) in cases {
+            let mut consent = restrictive_us_consent();
+            let cookie_jar = cookie.map(jar);
+
+            apply_demo_consent(&settings, cookie_jar.as_ref(), &mut consent);
+
+            assert!(
+                !crate::ec::consent::ec_consent_granted(&consent),
+                "should keep normal consent rules for {cookie:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn demo_banner_registers_only_when_enabled() {
+        assert!(
+            register(&settings_with_demo_banner(false))
+                .expect("should parse config")
+                .is_none(),
+            "should not register the banner when disabled"
+        );
+        let registration = register(&settings_with_demo_banner(true))
+            .expect("should parse config")
+            .expect("should register the banner when enabled");
+
+        assert_eq!(
+            registration.head_injectors.len(),
+            1,
+            "should inject one banner"
+        );
+        assert!(registration.js_disabled, "should not ship a JS bundle");
+        assert!(
+            DEMO_CONSENT_BANNER_SCRIPT.contains("ts-demo-consent")
+                && !DEMO_CONSENT_BANNER_SCRIPT.contains("innerHTML"),
+            "banner should write the demo cookie without innerHTML"
         );
     }
 }

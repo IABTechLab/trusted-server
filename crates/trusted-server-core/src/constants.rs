@@ -14,6 +14,9 @@ pub const COOKIE_TS_EIDS_S: &str = "ts-eids-s";
 pub const COOKIE_TS_ID5_SIGNATURE: &str = "ts-id5-sig";
 /// Present while the last ID5 fetch is fresh; expiry means a refresh is due.
 pub const COOKIE_TS_ID5_FRESH: &str = "ts-id5-fresh";
+/// Answer from the ID5 demo consent banner (`granted` or `denied`). Read only
+/// when `[integrations.id5] demo_consent_banner` is enabled.
+pub const COOKIE_TS_DEMO_CONSENT: &str = "ts-demo-consent";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 

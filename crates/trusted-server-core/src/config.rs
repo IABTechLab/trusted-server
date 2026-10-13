@@ -51,6 +51,7 @@ const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "datadome",
     "gpt",
     "gpt_diagnostics",
+    crate::integrations::id5::ID5_INTEGRATION_ID,
     JS_ASSET_PROXY_INTEGRATION_ID,
 ];
 
