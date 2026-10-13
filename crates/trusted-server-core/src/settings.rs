@@ -3032,6 +3032,10 @@ pub struct CacheSettings {
         skip_serializing_if = "LoadingCacheConfig::is_default"
     )]
     pub robots_txt: LoadingCacheConfig,
+    /// How long the copies of the assets the publisher's origin sends last,
+    /// `[cache.assets]`.
+    #[serde(default, skip_serializing_if = "LoadingCacheConfig::is_default")]
+    pub assets: LoadingCacheConfig,
     /// The caches modules declare and load through, each in its own
     /// `[cache.<name>]` table with the same settings as `[cache.robots-txt]`.
     /// A name no linked module declares is refused when the deployment's
@@ -3046,6 +3050,10 @@ pub const MAX_LOADING_CACHE_SECONDS: u32 = 365 * 24 * 60 * 60;
 /// The name of the cache that holds each robots.txt module's answer, whose
 /// settings are `[cache.robots-txt]`.
 pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
+
+/// The name of the cache that holds the copies of the assets the publisher's
+/// origin sends, whose settings are `[cache.assets]`.
+pub const ASSETS_CACHE: &str = "assets";
 
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
@@ -3136,13 +3144,17 @@ impl CacheSettings {
     /// modules declare, in name order.
     #[must_use]
     pub fn loading_caches(&self) -> Vec<(&str, &LoadingCacheConfig)> {
-        std::iter::once((ROBOTS_TXT_CACHE, &self.robots_txt))
-            .chain(
-                self.declared
-                    .iter()
-                    .map(|(name, config)| (name.as_str(), config)),
-            )
-            .collect()
+        [
+            (ROBOTS_TXT_CACHE, &self.robots_txt),
+            (ASSETS_CACHE, &self.assets),
+        ]
+        .into_iter()
+        .chain(
+            self.declared
+                .iter()
+                .map(|(name, config)| (name.as_str(), config)),
+        )
+        .collect()
     }
 
     fn normalize(&mut self) {
@@ -7052,10 +7064,10 @@ module = \"none\"",
 
         let caches = settings.cache.loading_caches();
 
-        assert_eq!(caches.len(), 2);
-        assert_eq!(caches[1].0, "answers");
-        assert_eq!(caches[1].1.module.as_deref(), Some("51degrees"));
-        assert_eq!(caches[1].1.store_seconds, Some(3600));
+        assert_eq!(caches.len(), 3);
+        assert_eq!(caches[2].0, "answers");
+        assert_eq!(caches[2].1.module.as_deref(), Some("51degrees"));
+        assert_eq!(caches[2].1.store_seconds, Some(3600));
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(written["answers"]["module"], "51degrees");
     }
@@ -7079,8 +7091,11 @@ module = \"none\"",
         assert!(!settings.cache.robots_txt.is_default());
         assert_eq!(
             settings.cache.loading_caches(),
-            vec![(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
-            "should list the robots.txt cache by its name"
+            vec![
+                (super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt),
+                (super::ASSETS_CACHE, &settings.cache.assets),
+            ],
+            "should list core's own caches by name, robots.txt then assets"
         );
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(

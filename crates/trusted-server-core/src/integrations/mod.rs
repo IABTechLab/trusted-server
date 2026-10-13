@@ -831,14 +831,16 @@ pub(crate) fn all_builders(
 ///
 /// # Errors
 ///
-/// When a builder declares core's own `robots-txt`, or two builders declare
+/// When a builder declares one of core's own caches, or two builders declare
 /// one name, naming the builders, since the two would otherwise share one
 /// cache and its keys without a word.
 pub fn declared_caches(
     builders: &[IntegrationBuilder],
 ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
-    let mut declared: Vec<(&'static str, &'static str)> =
-        vec![(crate::settings::ROBOTS_TXT_CACHE, "core")];
+    let mut declared: Vec<(&'static str, &'static str)> = vec![
+        (crate::settings::ROBOTS_TXT_CACHE, "core"),
+        (crate::settings::ASSETS_CACHE, "core"),
+    ];
     for builder in builders {
         for name in builder.cache_features() {
             if let Some((_, by)) = declared.iter().find(|(declared, _)| declared == name) {
@@ -1126,7 +1128,7 @@ mod loading_caches_from_tests {
 
         let message = format!("{refused:?}");
         assert!(message.contains("[cache.answres]"), "{message}");
-        assert!(message.contains("robots-txt, answers"), "{message}");
+        assert!(message.contains("robots-txt, assets, answers"), "{message}");
     }
 
     #[test]
