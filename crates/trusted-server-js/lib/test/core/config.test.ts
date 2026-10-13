@@ -1,9 +1,16 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+const LOG_LEVEL_KEY = Symbol.for('trusted-server.logLevel');
+const sharedGlobal = globalThis as typeof globalThis & { [LOG_LEVEL_KEY]?: unknown };
 
 describe('config', () => {
-  beforeEach(async () => {
-    // reset module state between tests
-    await vi.resetModules();
+  beforeEach(() => {
+    delete sharedGlobal[LOG_LEVEL_KEY];
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    delete sharedGlobal[LOG_LEVEL_KEY];
   });
 
   it('sets and gets config, controls log level', async () => {
