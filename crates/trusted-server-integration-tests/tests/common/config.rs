@@ -60,14 +60,18 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
 
 /// Builds a Cloudflare config binding with server-side auctions enabled.
 ///
-/// The fixture's providers are removed so the enabled auction completes
-/// through the orchestrator and telemetry without any outbound provider call.
+/// The fixture's demand modules and bidder routes are removed so the enabled
+/// auction completes through the orchestrator and telemetry without any
+/// outbound call, and so Cloudflare, which runs one demand source at a time,
+/// accepts it at startup.
 pub fn cloudflare_auction_config_json(origin_port: u16) -> TestResult<String> {
     let envelope = app_config_envelope(origin_port, |table| {
         let auction = table_mut(table, "auction")?;
         auction.insert("enabled".to_string(), toml::Value::Boolean(true));
-        auction.remove("providers");
         auction.remove("bidders");
+        let mut demand = toml::Table::new();
+        demand.insert("modules".to_string(), toml::Value::Array(Vec::new()));
+        table.insert("demand".to_string(), toml::Value::Table(demand));
         Ok(())
     })?;
     cloudflare_binding_json(&serde_json::json!({ CONFIG_BLOB_KEY: envelope }))
