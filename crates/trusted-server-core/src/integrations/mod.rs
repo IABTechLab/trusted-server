@@ -893,6 +893,28 @@ pub fn loading_caches_from(
         };
         caches.insert(table, cache);
     }
+    // A declared cache with no table at all takes the one loading cache
+    // module the build links, as a table naming no module does, so a stock
+    // build holds a module's answers without a line in the document.
+    if let [(_, factory)] = offered.as_slice() {
+        let tabled: Vec<&str> = settings
+            .cache
+            .loading_caches()
+            .into_iter()
+            .map(|(table, _)| table)
+            .collect();
+        let mut default = None;
+        for name in declared.iter().filter(|name| !tabled.contains(name)) {
+            let cache = default
+                .get_or_insert_with(|| {
+                    made.iter()
+                        .find(|(made_name, _)| *made_name == offered[0].0)
+                        .map_or_else(factory, |(_, cache)| Arc::clone(cache))
+                })
+                .clone();
+            caches.insert(name, cache);
+        }
+    }
     Ok(Arc::new(caches))
 }
 
@@ -1007,6 +1029,34 @@ mod loading_caches_from_tests {
             caches.for_feature(ROBOTS_TXT_CACHE).keeps_values(),
             "core's own table, naming no module, takes the one module offered"
         );
+    }
+
+    #[test]
+    fn a_declared_cache_with_no_table_takes_the_one_module_offered() {
+        let caches = loading_caches_from(
+            &settings_selecting(None),
+            &[declaring("a_vendor"), offering("loading-cache.one")],
+        )
+        .expect("no table is not an error");
+
+        assert!(caches.for_feature("answers").keeps_values());
+        assert!(caches.for_feature(ROBOTS_TXT_CACHE).keeps_values());
+    }
+
+    #[test]
+    fn a_declared_cache_with_no_table_keeps_nothing_when_two_are_offered() {
+        let caches = loading_caches_from(
+            &settings_selecting(None),
+            &[
+                declaring("a_vendor"),
+                offering("loading-cache.one"),
+                offering("loading-cache.two"),
+            ],
+        )
+        .expect("no table is not an error");
+
+        assert!(!caches.for_feature("answers").keeps_values());
+        assert!(caches.is_empty());
     }
 
     #[test]
