@@ -215,7 +215,8 @@ fn build_state_with_registrations_and_services(
     let plan = Arc::new(compile_auction_plan_with(&settings, integrations)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan))?;
-    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?;
+    let registry = IntegrationRegistry::with_plan_and_registrations(&settings, plan, integrations)?
+        .with_platform(PlatformIdentity::named("spin"));
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
@@ -1110,7 +1111,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 async move {
                     Ok::<Response, EdgeError>(handle_prefix(
                         &s.settings,
-                        &PlatformIdentity::named("spin"),
+                        s.registry.platform(),
                         &ctx.into_request(),
                     ))
                 }

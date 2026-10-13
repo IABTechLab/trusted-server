@@ -67,6 +67,7 @@ fn reader(request_state: &IntegrationRequestState) -> ReaderDocument<'_> {
         request_host: REQUEST_HOST,
         request_scheme: "https",
         origin_host: ORIGIN_HOST,
+        platform: test_support::platform(),
         request_state,
         max_buffered_script_bytes: 16 * 1024 * 1024,
         prepared: super::test_support::nothing_prepared(),
@@ -84,6 +85,7 @@ fn served_with(
 ) -> String {
     let Some(mut processor) = create_serve_processor(chain, &reader(request_state))
         .expect("should plan the reader's middleware")
+        .processor
     else {
         return html.to_owned();
     };
@@ -105,6 +107,17 @@ fn served_with(
 
 fn served(chain: &MiddlewareChain, html: &str) -> String {
     served_with(chain, &IntegrationRequestState::default(), html, 8192)
+}
+
+/// A middleware that writes one header on the reader's response.
+fn header(id: &'static str, name: &'static str, value: &'static str) -> Arc<dyn Middleware> {
+    middleware(id, move |_| MiddlewareAction {
+        response_headers: vec![(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        )],
+        ..MiddlewareAction::pass()
+    })
 }
 
 /// A middleware that writes `markup` at the start of `<head>`.
@@ -186,7 +199,7 @@ fn page_with(
     html: &str,
     chunk_size: usize,
 ) -> String {
-    let processor = create_html_processor_with_middleware(config, chain, None)
+    let (processor, _) = create_html_processor_with_middleware(config, chain, None)
         .expect("should plan the document's middleware");
     let mut pipeline = StreamingPipeline::new(
         PipelineConfig {
@@ -417,6 +430,30 @@ fn a_chain_on_another_media_type_runs_a_stream_processor_alone() {
         .expect("a stream processor runs on any media type");
     assert_eq!(plan.processors.len(), 1);
     assert!(plan.head_inserts.is_empty());
+}
+
+#[test]
+fn a_serve_chain_on_another_media_type_may_write_a_header() {
+    let document_state = IntegrationDocumentState::default();
+    let context = super::test_support::context(MiddlewarePhase::Serve, &document_state);
+
+    let plan = MiddlewareChain::new(
+        MiddlewarePhase::Serve,
+        "text/plain",
+        vec![header("example.version", "x-example", "1")],
+    )
+    .plan(&context)
+    .expect("a header is not a decision about HTML");
+
+    assert_eq!(
+        plan.response_headers.len(),
+        1,
+        "should keep the header for the response"
+    );
+    assert!(
+        plan.processors.is_empty() && plan.head_inserts.is_empty(),
+        "should change nothing in the body"
+    );
 }
 
 /// A stream processor that adds `text` at the end of a body.
@@ -1103,6 +1140,106 @@ fn a_selector_that_does_not_parse_refuses_the_document_naming_the_middleware() {
 }
 
 #[test]
+fn a_fetch_middleware_that_writes_a_response_header_is_refused() {
+    let chain = chain_of(vec![header("example.version", "x-example", "1")]);
+
+    let message = create_html_processor_with_middleware(config(), &chain, None)
+        .err()
+        .expect("should refuse to plan the document");
+
+    assert!(
+        message.contains("the fetch middleware `example.version` cannot run")
+            && message.contains("writes a response header"),
+        "should name the middleware and the reason: {message}"
+    );
+}
+
+#[test]
+fn a_serve_middleware_s_headers_are_written_on_the_reader_s_response() {
+    let chain = serve_chain_of(vec![
+        header("example.a", "x-example", "a"),
+        header("example.b", "x-example", "b"),
+        header("example.c", "x-other", "c"),
+    ]);
+
+    let pass = create_serve_processor(&chain, &reader(&IntegrationRequestState::default()))
+        .expect("should plan the reader's middleware");
+    let mut response = http::Response::new(());
+    write_response_headers(&mut response, pass.response_headers);
+
+    assert!(
+        pass.processor.is_none(),
+        "should leave the document as it arrived"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-example")
+            .map(HeaderValue::as_bytes),
+        Some(b"b".as_slice()),
+        "a later middleware's header should replace an earlier one's"
+    );
+    assert_eq!(
+        response.headers().get("x-other").map(HeaderValue::as_bytes),
+        Some(b"c".as_slice()),
+        "should write a header no other middleware wrote"
+    );
+}
+
+#[test]
+fn the_inline_path_hands_back_the_serve_chain_s_headers() {
+    let serve = serve_chain_of(vec![header("example.version", "x-example", "1")]);
+
+    let (_, headers) =
+        create_html_processor_with_middleware(config(), &chain_of(Vec::new()), Some(&serve))
+            .expect("should plan the document");
+
+    assert_eq!(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect::<Vec<_>>(),
+        [("x-example", b"1".as_slice())],
+        "should hand back the serve chain's headers for the response"
+    );
+}
+
+#[test]
+fn an_action_with_only_a_header_is_not_a_pass() {
+    let action = MiddlewareAction {
+        response_headers: vec![(
+            HeaderName::from_static("x-example"),
+            HeaderValue::from_static("1"),
+        )],
+        ..MiddlewareAction::pass()
+    };
+
+    assert!(!action.is_pass(), "a header is a change to the response");
+    assert!(MiddlewareAction::pass().is_pass());
+}
+
+#[test]
+fn a_middleware_is_told_the_platform_the_deployment_runs_on() {
+    let platform = PlatformIdentity {
+        service_version: "39".to_owned(),
+        ..PlatformIdentity::named("example-platform")
+    };
+    let document_state = IntegrationDocumentState::default();
+
+    let context = test_support::context_on(MiddlewarePhase::Serve, &document_state, &platform);
+
+    assert_eq!(context.platform.name, "example-platform");
+    assert_eq!(context.platform.service_version, "39");
+    assert_eq!(
+        test_support::context(MiddlewarePhase::Serve, &document_state)
+            .platform
+            .name,
+        "test-platform",
+        "a test context should name the test platform"
+    );
+}
+
+#[test]
 fn a_chain_reports_its_phase_and_the_names_in_the_order_they_run() {
     let chain = chain_of(vec![
         head("example.b", "<meta name=\"b\">"),
@@ -1285,7 +1422,10 @@ fn a_serve_chain_with_nothing_to_do_makes_no_processor() {
 
     let none = create_serve_processor(&serve_chain_of(Vec::new()), &reader(&state))
         .expect("should plan an empty chain");
-    assert!(none.is_none(), "should make no processor for no middleware");
+    assert!(
+        none.processor.is_none(),
+        "should make no processor for no middleware"
+    );
 
     let passes = serve_chain_of(vec![middleware("example.pass", |_| {
         MiddlewareAction::pass()
@@ -1293,7 +1433,7 @@ fn a_serve_chain_with_nothing_to_do_makes_no_processor() {
     let none =
         create_serve_processor(&passes, &reader(&state)).expect("should plan a chain that passes");
     assert!(
-        none.is_none(),
+        none.processor.is_none(),
         "should make no processor where every middleware leaves the page alone"
     );
 }
@@ -1335,7 +1475,7 @@ fn on_a_page_that_is_not_stored_the_serve_chain_follows_the_fetch_chain_on_the_o
     // Read whole, and then seven bytes at a time, so the second rewriter is
     // fed the first one's output in pieces.
     for chunk_size in [8192, 7] {
-        let processor = create_html_processor_with_middleware(config(), &fetch, Some(&serve))
+        let (processor, _) = create_html_processor_with_middleware(config(), &fetch, Some(&serve))
             .expect("should plan both chains");
         let mut pipeline = StreamingPipeline::new(
             PipelineConfig {
