@@ -17,8 +17,8 @@ use crate::error::TrustedServerError;
 /// Cookie names carrying privacy consent signals.
 ///
 /// Used by [`strip_cookies`] to remove consent signals from a `Cookie` header
-/// before forwarding requests to partners that receive consent through the
-/// `OpenRTB` body instead.
+/// before forwarding requests to partners that receive consent in the request
+/// body instead.
 pub const CONSENT_COOKIE_NAMES: &[&str] = &[
     COOKIE_EUCONSENT_V2,
     COOKIE_GPP,

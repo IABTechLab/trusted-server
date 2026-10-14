@@ -90,19 +90,18 @@ pub struct UserInfo {
     pub id: Option<String>,
     /// Decoded consent context for this request.
     ///
-    /// Carries both raw consent strings (for `OpenRTB` forwarding) and decoded
-    /// structured data (for TS-level enforcement and observability).
+    /// Carries both raw consent strings, for a demand source to forward, and
+    /// decoded structured data, for enforcement and observability here.
     /// Skipped during serde since it is populated at runtime from request
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
-    /// Extended User IDs parsed from the [`crate::constants::COOKIE_EIDS`] cookie.
+    /// The identifiers the request may carry, from the browser's body, the
+    /// [`crate::constants::COOKIE_EIDS`] cookie and the identity graph.
     ///
-    /// Raw (un-gated) values from the browser; consent gating via
-    /// [`crate::consent::gate_eids_by_consent`] is applied centrally in the
-    /// endpoint handlers (the auction and page-bids paths) before any EID
-    /// reaches a bid request — the provider layer just forwards already-gated
-    /// EIDs.
+    /// Gated by the resolved permissions in the endpoint handlers (the auction
+    /// and page-bids paths) before any reaches a demand source, which forwards
+    /// what it is given.
     #[serde(skip)]
     pub eids: Option<Vec<crate::ec::eids::Eid>>,
 }
@@ -421,17 +420,16 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
-    /// `OpenRTB` bid identifier — the `id` of the bid object itself.
+    /// The identifier of the bid itself, as the demand source returned it.
     ///
     /// Distinct from [`ad_id`](Self::ad_id): unique per bid instance rather
-    /// than a creative identifier. Always present per the `OpenRTB` spec, so it
-    /// is the last-resort `hb_adid` source for bidders that return neither a
-    /// Prebid Cache UUID nor `adid`.
+    /// than a creative identifier, so it is the last-resort `hb_adid` source
+    /// for bidders that return neither a Prebid Cache UUID nor an ad id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bid_id: Option<String>,
     /// Ad ID from the bidder.
     pub ad_id: Option<String>,
-    /// Optional `OpenRTB` creative identifier.
+    /// The creative identifier, where the demand source returned one.
     pub creative_id: Option<String>,
     /// Typed browser renderer capability.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -491,7 +489,8 @@ impl From<&AuctionResponse> for ProviderSummary {
     }
 }
 
-/// `OpenRTB` response metadata for the orchestrator.
+/// The orchestrator's summary of the auction, written into the response
+/// the auction endpoint returns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorExt {
     pub strategy: String,

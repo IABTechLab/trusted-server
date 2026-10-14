@@ -27,12 +27,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use validator::Validate;
 
-use trusted_server_core::auction::context::{ContextQueryParams, build_url_with_context_params};
-use trusted_server_core::auction::demand::AdServerImplementation;
-use trusted_server_core::auction::openrtb::{
+use trusted_server_core::auction::admission::{
     BidDimensionIndex, BidRejectionReason, build_bid_dimension_index_from_slots,
     parse_optional_bid_dimension, resolve_bid_dimensions,
 };
+use trusted_server_core::auction::context::{ContextQueryParams, build_url_with_context_params};
+use trusted_server_core::auction::demand::AdServerImplementation;
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
