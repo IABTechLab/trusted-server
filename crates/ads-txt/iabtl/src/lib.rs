@@ -25,6 +25,14 @@ const SELLERS_INTEGRATION_ID: &str = "ads_txt_sellers";
 /// table `[ads-txt.iabtl]`.
 pub const MODULE: &str = "ads-txt.iabtl";
 
+/// The change to the file the module supplies, as an entry on the file's path names it.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] =
+    &[trusted_server_core::integrations::SuppliedMiddleware::on(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Fetch,
+        MEDIA_TYPE,
+    )];
+
 /// The media type an `ads.txt` is served as, and the one the middleware
 /// works on.
 pub const MEDIA_TYPE: &str = "text/plain";
@@ -205,6 +213,7 @@ pub fn builder() -> IntegrationBuilder {
         validate,
     )
     .with_module_name(MODULE)
+    .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// The lines written at the end of the file, as the middleware adds them.
@@ -540,5 +549,19 @@ mod tests {
         assert!(sellers.handles_media_type(MEDIA_TYPE));
         assert!(!sellers.handles_media_type("text/html"));
         assert_eq!(sellers.phases(), [MiddlewarePhase::Fetch]);
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/sellers.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[super::builder()],
+            super::builder().id(),
+        );
     }
 }

@@ -6551,7 +6551,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trusted-server-ad-server-mock"
+name = "trusted-server-ad-server-iabtl"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -6601,13 +6601,13 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "trusted-server-core",
- "trusted-server-integration-seam-probe",
  "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-testing-iabtl",
 ]
 
 [[package]]
@@ -6661,13 +6661,13 @@ dependencies = [
  "trusted-server-core",
  "trusted-server-device-fastly",
  "trusted-server-geo-fastly",
- "trusted-server-integration-seam-probe",
  "trusted-server-modules",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-testing-iabtl",
  "urlencoding",
 ]
 
@@ -6701,7 +6701,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trusted-server-ads-txt-sellers"
+name = "trusted-server-ads-txt-iabtl"
 version = "0.1.0"
 dependencies = [
  "error-stack",
@@ -7036,25 +7036,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trusted-server-integration-seam-probe"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "edgezero-core",
- "error-stack",
- "hex",
- "http",
- "log",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "trusted-server-core",
- "validator",
-]
-
-[[package]]
 name = "trusted-server-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -7118,9 +7099,9 @@ dependencies = [
  "http",
  "serde_json",
  "tokio",
- "trusted-server-ad-server-mock",
+ "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
- "trusted-server-ads-txt-sellers",
+ "trusted-server-ads-txt-iabtl",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -7223,6 +7204,25 @@ dependencies = [
  "trusted-server-core",
  "trusted-server-framework-nextjs",
  "url",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-testing-iabtl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "hex",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "trusted-server-core",
  "validator",
 ]
 

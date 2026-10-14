@@ -45,7 +45,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::integrations::{
     AttributeRewriteAction, CarriedJsModule, IntegrationBuilder, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration, ScriptRewriteAction,
+    IntegrationProxy, IntegrationRegistration, ScriptRewriteAction, SuppliedMiddleware,
 };
 use trusted_server_core::middleware::{
     AttributeRewrite, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, TextHandler,
@@ -822,6 +822,15 @@ pub fn prepare_request(
 ///
 /// assert_eq!(builder().id(), SEAM_PROBE_ID);
 /// ```
+/// The page changes the probe supplies, as an entry names them. Made once,
+/// because the names come from the crate's folder at run time.
+static SUPPLIED_MIDDLEWARE: LazyLock<[SuppliedMiddleware; 2]> = LazyLock::new(|| {
+    [
+        SuppliedMiddleware::on_html(module_name(), MiddlewarePhase::Fetch),
+        SuppliedMiddleware::on_html(reader_middleware_name(), MiddlewarePhase::Serve),
+    ]
+});
+
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(SEAM_PROBE_ID, SEAM_PROBE_SOURCE, register, validate)
@@ -830,6 +839,7 @@ pub fn builder() -> IntegrationBuilder {
         .with_demand(&SEAM_PROBE_DEMAND)
         .with_adserver(&SEAM_PROBE_ADSERVER)
         .with_cache_features(&[SEAM_PROBE_ANSWERS_CACHE])
+        .with_middleware(SUPPLIED_MIDDLEWARE.as_slice())
 }
 
 /// The cache the probe declares and loads its answers through, selected in
@@ -1435,6 +1445,18 @@ mod tests {
             request.extensions().get::<SeamProbePrepared>(),
             Some(&SeamProbePrepared { runs: 2 }),
             "should count both runs"
+        );
+    }
+
+    /// The builder describes the two middleware the registration supplies,
+    /// so a tool that writes a configuration places what the probe registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_probe_registers() {
+        let settings = settings_with_probe("country = \"NZ\"");
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[builder()],
+            SEAM_PROBE_ID,
         );
     }
 }
