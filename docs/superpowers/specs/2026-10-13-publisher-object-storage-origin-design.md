@@ -1,10 +1,11 @@
 # Design Spec: A publisher's site served from a folder of object storage
 
-**Status:** Proposed, 2026-10-13. Implemented on a working branch of the fork, with no pull request raised yet.
+**Status:** Proposed, 2026-10-13. Raised as draft pull request jwrosewell/trusted-server#31, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-page-middleware-design.md`, `2026-10-12-middleware-creates-a-missing-file-design.md`, `2026-04-28-multi-backend-asset-proxy-design.md`
-**Related PRs:** none yet
-**Last updated:** 2026-10-13
+**Related PRs:** jwrosewell/trusted-server#31
+**Issues:** IABTechLab/trusted-server#1329
+**Last updated:** 2026-10-14
 
 > **Why this spec exists.** A publisher whose site is static files in object storage can only be served by an asset route, and an asset route skips the page pipeline, so none of the publisher's `[[fetch]]` or `[[serve]]` middleware runs on its pages.
 
