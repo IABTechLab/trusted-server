@@ -7,6 +7,8 @@ import platform
 import importlib.util
 import sys
 import subprocess
+import signal
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -294,6 +296,41 @@ class FinalSnapshotTests(unittest.TestCase):
                 recipe.fresh_root(Path(directory).resolve() / "material -Dexample")
 
 class BoundedBoundaryProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup uses POSIX semantics")
+    def test_timeout_kills_child_holding_pipes_after_leader_exits(self):
+        from boundaries import bounded_process
+        with tempfile.TemporaryDirectory() as directory:
+            identity = Path(directory) / "fixture-pids"
+            script = "import os,subprocess,sys;from pathlib import Path;child=subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(30)']);Path(sys.argv[1]).write_text(str(os.getpid())+' '+str(child.pid))"
+            leader = child = None
+            def alive(pid):
+                try:
+                    os.kill(pid, 0)
+                    return True
+                except ProcessLookupError:
+                    return False
+            try:
+                started = time.monotonic()
+                with self.assertRaisesRegex(ValueError, "timeout"):
+                    bounded_process([sys.executable, "-I", "-B", "-c", script, str(identity)], {}, timeout=0.5)
+                self.assertLess(time.monotonic() - started, 3, "timeout should remain bounded")
+                leader, child = map(int, identity.read_text().split())
+                self.assertFalse(alive(leader), "direct child should be reaped")
+                deadline = time.monotonic() + 2
+                while alive(child) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(alive(child), "descendant holding pipes should terminate with its process group")
+            finally:
+                if identity.exists() and child is None:
+                    leader, child = map(int, identity.read_text().split())
+                if child is not None and alive(child):
+                    self.assertEqual(os.getpgid(child), leader, "cleanup should target only this fixture's process group")
+                    os.killpg(leader, signal.SIGKILL)
+                    deadline = time.monotonic() + 5
+                    while alive(child) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(alive(child), "fixture cleanup should leave no descendant running")
+
     def test_control_and_cleanup_capture_stop_live_output_overflow(self):
         sys.path.insert(0, str(RELEASE / "qualification"))
         from boundaries import bounded_process

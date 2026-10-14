@@ -73,8 +73,10 @@ def bounded_process(argv, environment, *, timeout=30, maximum=65536):
         process.wait(timeout=max(0.001, deadline - time.monotonic()))
         return subprocess.CompletedProcess(argv, process.returncode, bytes(outputs[0]), bytes(outputs[1]))
     finally:
-        if process.poll() is None:
+        try:
             os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait(timeout=5)
         selector.close()
         process.stdout.close()
