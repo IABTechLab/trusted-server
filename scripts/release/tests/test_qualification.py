@@ -358,6 +358,59 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             qualify.validate_observation(self.result)
 
+    def test_successful_socket_controls_must_complete_the_intended_operation(self):
+        for phase, index, wrong_phase in (("unconfined", 0, "exchange"),
+                                           ("unconfined", 2, "bind"),
+                                           ("unconfined", 4, "connect"),
+                                           ("unconfined", 24, "bind"),
+                                           ("confined", 24, "bind")):
+            with self.subTest(phase=phase, index=index, wrong_phase=wrong_phase):
+                changed = copy.deepcopy(self.result)
+                changed["recipe"][phase][index]["phase"] = wrong_phase
+                with self.assertRaisesRegex(ValueError, "operation|exchange"):
+                    qualify.validate_observation(changed)
+
+    def test_tcp_send_denial_can_record_an_earlier_actual_client_phase(self):
+        for phase in ("socket", "connect", "send"):
+            with self.subTest(phase=phase):
+                changed = copy.deepcopy(self.result)
+                changed["recipe"]["confined"][4]["phase"] = phase
+                qualify.validate_observation(changed)
+
+    def test_major_debian_and_zero_suffixed_glibc_preserve_numeric_floors(self):
+        result = copy.deepcopy(self.result)
+        result["host"].update(environment_id="gnu-builder-x86_64", kind="oci-builder",
+                              architecture="x86_64", kernel_architecture="x86_64",
+                              os_version="9.6", runner_image_version=None,
+                              oci_index_sha256="a" * 64, oci_manifest_sha256="a" * 64,
+                              glibc_version="2.34.0")
+        result["sdk"]["kind"] = "gnu-sysroot"
+        result["recipe"].update(id="ts-x86_64-unknown-linux-gnu", deployment_target=None,
+                                glibc_symbols=["GLIBC_2.34.0"])
+        result["runtime"] = [dict(self.result["runtime"][0], environment_id=identity,
+                                  architecture="x86_64", os_version=version)
+                             for identity, version in (("ubi9-x86_64", "9.6"),
+                                                       ("ubuntu22.04-x86_64", "22.04"),
+                                                       ("debian12-x86_64", "12"))]
+        for version in ("2.34", "2.34.0"):
+            with self.subTest(valid_glibc=version):
+                changed = copy.deepcopy(result)
+                changed["host"]["glibc_version"] = version
+                changed["recipe"]["glibc_symbols"] = [f"GLIBC_{version}"]
+                qualify.validate_observation(changed)
+        for value in ("2.34.1", "2.35.0", "unknown", "2.34vendor"):
+            with self.subTest(glibc=value):
+                changed = copy.deepcopy(result)
+                changed["host"]["glibc_version"] = value
+                with self.assertRaises(ValueError):
+                    qualify.validate_observation(changed)
+        for value in ("11", "13", "12vendor"):
+            with self.subTest(debian=value):
+                changed = copy.deepcopy(result)
+                changed["runtime"][-1]["os_version"] = value
+                with self.assertRaises(ValueError):
+                    qualify.validate_observation(changed)
+
     def test_rejects_integral_floats_for_integer_identities_and_statuses(self):
         for selector in ("schema", "attempt", "depth", "errno", "compile", "runtime"):
             with self.subTest(selector=selector):

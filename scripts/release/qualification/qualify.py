@@ -50,9 +50,12 @@ RUST_CLOSURE = ("scripts/release/build.sh", "scripts/release/inspect-native.py",
 
 
 def _version(value):
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", value):
         raise ValueError("unknown or nonnumeric compatibility version")
-    return tuple(map(int, value.split(".")))
+    components = list(map(int, value.split(".")))
+    while len(components) > 1 and components[-1] == 0:
+        components.pop()
+    return tuple(components)
 
 
 def validate_catalog(tools):
@@ -159,6 +162,8 @@ def validate_socket_pair(positive, confined):
             if ((observation["outcome"] == "allowed" and observation["errno"] != 0)
                     or (observation["outcome"] != "allowed" and observation["errno"] == 0)):
                 raise ValueError("socket outcome contradicts actual errno")
+            if observation["outcome"] == "allowed" and observation["phase"] != observation["operation"]:
+                raise ValueError("successful socket observation must complete its intended operation")
         if probe["family"] == "unix":
             if any(p["outcome"] != "allowed" or p["errno"] != 0 for p in (probe, control)):
                 raise ValueError("private Unix IPC must succeed")
