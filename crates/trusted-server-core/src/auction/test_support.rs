@@ -12,7 +12,7 @@ use super::AuctionContext;
 use crate::auction::types::{
     AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, PublisherInfo, UserInfo,
 };
-use crate::consent::ConsentContext;
+use crate::consent::{ConsentContext, SignalRecord, SignalStatus};
 use crate::geo::GeoInfo;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::{RuntimeServices, test_support::noop_services};
@@ -87,15 +87,22 @@ pub fn canonical_parity_auction_request() -> AuctionRequest {
         },
         user: UserInfo {
             id: Some("fictional-user".to_string()),
-            consent: Some(ConsentContext {
-                gdpr_applies: true,
-                raw_tc_string: Some("fictional-tcf".to_string()),
-                raw_us_privacy: Some("1YNN".to_string()),
-                raw_gpp_string: Some("fictional-gpp".to_string()),
-                gpp_section_ids: Some(vec![2, 6]),
-                raw_ac_string: Some("fictional-ac".to_string()),
-                ..Default::default()
-            }),
+            consent: Some(
+                ConsentContext::default()
+                    .with_record(
+                        SignalRecord::new("tcf", SignalStatus::Decoded)
+                            .with_value("fictional-tcf")
+                            .with_applies(true),
+                    )
+                    .with_record(
+                        SignalRecord::new("us_privacy", SignalStatus::Decoded).with_value("1YNN"),
+                    )
+                    .with_record(
+                        SignalRecord::new("gpp", SignalStatus::Decoded)
+                            .with_value("fictional-gpp")
+                            .with_sections(vec![2, 6]),
+                    ),
+            ),
             eids: Some(vec![Eid {
                 source: "identity.example".to_string(),
                 uids: vec![Uid {
@@ -596,7 +603,6 @@ pub(crate) mod demand_fixture {
                 imp_tagid: true,
                 site_ref: true,
                 precise_geo: true,
-                additional_consent: true,
                 unsigned_request_identity: true,
                 consumes_bidder_params: true,
                 regs: RegsPolicy::Jurisdiction,

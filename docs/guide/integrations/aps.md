@@ -54,9 +54,9 @@ rendering_mode = "trusted_server"
 # inventory_page_origin = "https://www.inventory.example.com"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```

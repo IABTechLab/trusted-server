@@ -18,9 +18,8 @@ on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API.
   post-processing, provider, and browser-module capabilities.
 - `ec` owns edge-cookie generation, consent decisions, identity graph access,
   and partner synchronization.
-- `html_processor`, `host_rewrite`, `streaming_processor`, and `rsc_flight`
-  transform eligible publisher responses without corrupting non-HTML or RSC
-  payloads.
+- `html_processor`, `host_rewrite`, and `streaming_processor` transform
+  eligible publisher responses without corrupting non-HTML payloads.
 - `proxy`, `creative`, `image_optimizer`, and `asset_routes` implement bounded
   first-party asset and creative handling.
 - `auth`, `request_signing`, `key_manager`, and `jwk` implement authentication

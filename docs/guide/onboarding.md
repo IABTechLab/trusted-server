@@ -85,7 +85,6 @@ See [Architecture](/guide/architecture) for component boundaries and
 | `crates/trusted-server-core/src/consent/`      | Consent extraction, decoding, and enforcement                    |
 | `crates/trusted-server-core/src/integrations/` | Integration registry and the builder a module registers with     |
 | `crates/<type>/<vendor>/`                      | One module each: a page integration or an auction implementation |
-| `crates/trusted-server-modules/`               | The modules a stock build ships, in the order their hooks run    |
 | `crates/trusted-server-js/lib/src/`            | Browser-side TypeScript and integration modules                  |
 | `crates/trusted-server-adapter-*`              | Fastly, Axum, Cloudflare, and Spin runtime entry points          |
 | `crates/trusted-server-cli/`                   | Native `ts` operator CLI                                         |

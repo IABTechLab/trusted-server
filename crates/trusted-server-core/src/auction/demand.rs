@@ -69,8 +69,6 @@ pub struct DemandFieldPolicy {
     pub site_ref: bool,
     /// Send precise latitude and longitude with the coarse geo.
     pub precise_geo: bool,
-    /// Send Google Additional Consent as `user.ext.ConsentedProvidersSettings`.
-    pub additional_consent: bool,
     /// The longest primary `Accept-Language` tag sent, or `None` for no limit.
     pub language_max_bytes: Option<usize>,
     /// How `regs` is derived from consent.

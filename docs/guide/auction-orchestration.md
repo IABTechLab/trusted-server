@@ -81,7 +81,7 @@ sequenceDiagram
     Orch->>Orch: Detect strategy<br/>ad server? parallel_adserver : parallel_only
     deactivate TS
 
-    Note over Orch: Strategy determined by config:<br/>[ad-server]<br/>module = "mock" → parallel_adserver<br/>No [ad-server] → parallel_only
+    Note over Orch: Strategy determined by config:<br/>[ad-server]<br/>module = "iabtl" → parallel_adserver<br/>No [ad-server] → parallel_only
   end
 
   %% === Parallel Provider Execution ===
@@ -237,7 +237,7 @@ Three demand implementations ship in this repository:
 Each `[demand.<name>]` table is one instance of the shared OpenRTB path.
 Several tables may name the same implementation or endpoint and stay distinct
 through their names, which is what the optional `implementation` line is for.
-The `ad-server.mock` ad server is selected the same way, by
+The `ad-server.iabtl` ad server is selected the same way, by
 `[ad-server] module`, and supplies an ad server implementation rather than a
 demand one. See [Configuration Rules](/guide/configuration-rules) for the
 syntax every type shares.
@@ -312,9 +312,9 @@ account_id = "example-aps-account"
 module = "pbs_main"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -456,9 +456,9 @@ An external decision service that receives decoded-price demand responses and pe
 
 ```toml
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 price_floor = 0.50
@@ -741,9 +741,9 @@ allow_script_creatives = false
 module = "pbs_main"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
