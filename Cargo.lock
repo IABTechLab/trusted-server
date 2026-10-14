@@ -7111,6 +7111,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-middleware-51degrees"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-loading-cache-51degrees",
+ "trusted-server-shared-51degrees",
+ "url",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-modules"
 version = "0.1.0"
 dependencies = [
@@ -7135,6 +7153,7 @@ dependencies = [
  "trusted-server-framework-nextjs",
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
+ "trusted-server-middleware-51degrees",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-testlight",
@@ -7190,6 +7209,26 @@ name = "trusted-server-permission-signal-us-privacy"
 version = "0.1.0"
 dependencies = [
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-shared-51degrees"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-loading-cache-51degrees",
+ "url",
+ "validator",
 ]
 
 [[package]]
