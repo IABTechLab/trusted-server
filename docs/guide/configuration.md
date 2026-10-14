@@ -2087,7 +2087,7 @@ refuses startup too, as does a section that selects nothing, so a table left
 behind after a module is switched off is caught rather than sitting unread.
 
 `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and
-`ad-server.mock` supply demand and ad server implementations only. They are
+`ad-server.iabtl` supply demand and ad server implementations only. They are
 not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
 `[ad-server.<name>]`. `loading-cache.51degrees` supplies a loading cache,
@@ -2837,9 +2837,9 @@ allow_script_creatives = false
 module = "pbs_main"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -2888,8 +2888,8 @@ applies floors locally. With one configured, normalized demand responses are
 sent to it, and Trusted Server falls back to local ranking when the ad server
 cannot run.
 
-The one implementation this repository ships is `ad-server.mock`, written
-`mock` in `[ad-server]`, for
+The one implementation this repository ships is `ad-server.iabtl`, written
+`iabtl` in `[ad-server]`, for
 development and testing.
 
 | Setting                | Required | Default | Description                                                         |
@@ -2901,13 +2901,13 @@ development and testing.
 
 ```toml
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
-[ad-server.mock.context_query_params]
+[ad-server.iabtl.context_query_params]
 example_segments = "segments"
 ```
 

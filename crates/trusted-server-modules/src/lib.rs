@@ -47,7 +47,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_auction_protocol_openrtb::builder(),
         trusted_server_auction_prebid_server::builder(),
         trusted_server_auction_aps::builder(),
-        trusted_server_ad_server_mock::builder(),
+        trusted_server_ad_server_iabtl::builder(),
         // The loading cache a stock build caches with, offered whatever the
         // settings say, which no section selects either.
         trusted_server_loading_cache_51degrees::builder(),
@@ -502,7 +502,7 @@ middleware = [\"robots_txt\"]
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",
-                "ad-server.mock",
+                "ad-server.iabtl",
                 "loading-cache.51degrees",
             ],
             "should offer the stock modules in the order their hooks run"
@@ -784,7 +784,7 @@ middleware = [\"robots_txt\"]
         use std::collections::{BTreeMap, HashMap};
         use std::sync::Arc;
 
-        use trusted_server_ad_server_mock::{AdServerMockProvider, AdServerMockSettings};
+        use trusted_server_ad_server_iabtl::{AdServerMockProvider, AdServerMockSettings};
         use trusted_server_core::auction::orchestrator::AuctionOrchestrator;
         use trusted_server_core::auction::types::{
             AdFormat, AdSlot, AuctionContext, AuctionRequest, MediaType, PublisherInfo, UserInfo,

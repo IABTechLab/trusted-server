@@ -592,16 +592,16 @@ module = "pbs_main"
 
 # The ad server that picks the auction winner. With no [ad-server] selection the
 # highest bid wins. The only implementation this repository ships is
-# ad-server.mock, for development and testing, written here as mock because
+# ad-server.iabtl, for development and testing, written here as iabtl because
 # its type is this section's.
 # [ad-server]
-# module = "mock"
+# module = "iabtl"
 #
-# [ad-server.mock]
+# [ad-server.iabtl]
 # endpoint = "https://adserver.example.com/decide"
 # timeout_ms = 1000
 # Map auction context keys to decision-URL query params:
-# [ad-server.mock.context_query_params]
+# [ad-server.iabtl.context_query_params]
 # example_segments = "segments"
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
