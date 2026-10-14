@@ -7135,6 +7135,7 @@ dependencies = [
  "trusted-server-framework-nextjs",
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
+ "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-testlight",
@@ -7190,6 +7191,25 @@ name = "trusted-server-permission-signal-us-privacy"
 version = "0.1.0"
 dependencies = [
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-shared-aws"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "hex",
+ "hmac",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "trusted-server-core",
+ "url",
 ]
 
 [[package]]

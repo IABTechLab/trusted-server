@@ -21,6 +21,7 @@ members = [
     "crates/cmp/inmobi",
     "crates/ads-txt/sellers",
     "crates/loading-cache/51degrees",
+    "crates/shared/aws",
     "crates/tag/google-tag",
     "crates/tag/google-tag-manager",
     "crates/testing/testlight",
@@ -170,6 +171,7 @@ trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
 trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-sellers = { path = "crates/ads-txt/sellers" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
+trusted-server-shared-aws = { path = "crates/shared/aws" }
 trusted-server-tag-google-tag = { path = "crates/tag/google-tag" }
 trusted-server-tag-google-tag-manager = { path = "crates/tag/google-tag-manager" }
 trusted-server-testing-testlight = { path = "crates/testing/testlight" }

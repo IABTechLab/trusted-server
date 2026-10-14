@@ -21,6 +21,7 @@ use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
 use crate::module_context::{ModuleCall, ModuleContext, ModuleRequest, ResolvedRequest};
+use crate::origin_auth::OriginSigners;
 use crate::platform::{DisabledGeo, GeoModule, PlatformGeoModule, RuntimeServices};
 use crate::prefix::{PrefixModule, Prefixes, SelectedPrefixModule};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
@@ -964,6 +965,8 @@ struct IntegrationRegistryInner {
     prefix_module: SelectedPrefixModule,
     // The source modules the running registrations supply, each with its name.
     source_modules: Vec<(&'static str, Arc<dyn SourceFactory>)>,
+    // The origin signers the builders offer, which a source's `auth` names.
+    origin_signers: OriginSigners,
     // The publisher's source and each asset route's, in route order, built
     // from the settings. `None` for a registry built without settings.
     sources: Option<BuiltSources>,
@@ -1011,6 +1014,7 @@ impl Default for IntegrationRegistryInner {
             prefix_modules: Vec::new(),
             prefix_module: SelectedPrefixModule::default(),
             source_modules: Vec::new(),
+            origin_signers: OriginSigners::default(),
             sources: None,
         }
     }
@@ -1671,11 +1675,12 @@ fn check_section_selections(
 
 /// The source `selection` names, built from its table, where `setting` names
 /// the table in a refusal. Core's `origin` is always on offer, beside the
-/// sources the registrations supply.
+/// sources the registrations supply, and signs through `signers`.
 fn build_source(
     selection: &crate::provider_table::SectionModules,
     setting: &str,
     offered: &[(&'static str, Arc<dyn SourceFactory>)],
+    signers: &OriginSigners,
 ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
     let (written, table) = crate::source::selected(selection, setting)?;
     let table_setting = format!("{setting}.{written}");
@@ -1699,7 +1704,7 @@ fn build_source(
         }));
     };
     if found == crate::source::ORIGIN_MODULE {
-        return crate::source::OriginFactory.build(&table, &table_setting);
+        return crate::source::OriginFactory::new(signers.clone()).build(&table, &table_setting);
     }
     let factory = offered
         .iter()
@@ -1717,13 +1722,19 @@ fn build_source(
 fn build_sources(
     settings: &Settings,
     offered: &[(&'static str, Arc<dyn SourceFactory>)],
+    signers: &OriginSigners,
 ) -> Result<BuiltSources, Report<TrustedServerError>> {
-    let publisher = build_source(&settings.source, crate::source::SOURCE_SECTION, offered)?;
+    let publisher = build_source(
+        &settings.source,
+        crate::source::SOURCE_SECTION,
+        offered,
+        signers,
+    )?;
     let routes = settings
         .proxy
         .asset_routes
         .iter()
-        .map(|route| build_source(&route.source, &route.source_setting(), offered))
+        .map(|route| build_source(&route.source, &route.source_setting(), offered, signers))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BuiltSources { publisher, routes })
 }
@@ -1743,7 +1754,12 @@ impl IntegrationRegistry {
     ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
         match &self.inner.sources {
             Some(sources) => Ok(Arc::clone(&sources.publisher)),
-            None => build_source(&settings.source, crate::source::SOURCE_SECTION, &[]),
+            None => build_source(
+                &settings.source,
+                crate::source::SOURCE_SECTION,
+                &[],
+                &OriginSigners::default(),
+            ),
         }
     }
 
@@ -1771,7 +1787,12 @@ impl IntegrationRegistry {
                 message: format!("there is no asset route at {index}"),
             })
         })?;
-        build_source(&route.source, &route.source_setting(), &[])
+        build_source(
+            &route.source,
+            &route.source_setting(),
+            &[],
+            &OriginSigners::default(),
+        )
     }
 
     /// Tells the registry what the adapter reports about the platform, which
@@ -1895,6 +1916,12 @@ impl IntegrationRegistry {
                 ),
             }));
         }
+
+        // Which signers a source's `auth` can name is known from the builders
+        // alone, so two offering one name are refused before anything runs.
+        inner.origin_signers = OriginSigners::offered_by(
+            &crate::integrations::all_builders(extra).collect::<Vec<_>>(),
+        )?;
 
         for builder in crate::integrations::all_builders(extra) {
             if let Some((_, first_source)) =
@@ -2170,7 +2197,11 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.prefix_module = resolve_prefix_module(settings, &inner)?;
-        inner.sources = Some(build_sources(settings, &inner.source_modules)?);
+        inner.sources = Some(build_sources(
+            settings,
+            &inner.source_modules,
+            &inner.origin_signers,
+        )?);
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
@@ -2783,6 +2814,7 @@ impl IntegrationRegistry {
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
+                origin_signers: OriginSigners::default(),
                 sources: None,
             }),
             plan: None,
@@ -2867,6 +2899,7 @@ impl IntegrationRegistry {
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
+                origin_signers: OriginSigners::default(),
                 sources: None,
             }),
             plan: None,

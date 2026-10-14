@@ -12,6 +12,7 @@ use url::Url;
 use crate::auction::AuctionPlan;
 use crate::auction::demand::{AdServerImplementation, DemandImplementation};
 use crate::error::TrustedServerError;
+use crate::origin_auth::OriginSignerModule;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
@@ -426,6 +427,7 @@ pub struct IntegrationBuilder {
     loading_cache: Option<LoadingCacheFactory>,
     shared: Option<&'static str>,
     cache_features: &'static [&'static str],
+    origin_signer: Option<&'static OriginSignerModule>,
 }
 
 /// Gives the loading cache a module supplies, see
@@ -473,6 +475,7 @@ impl IntegrationBuilder {
             loading_cache: None,
             shared: None,
             cache_features: &[],
+            origin_signer: None,
         }
     }
 
@@ -503,6 +506,7 @@ impl IntegrationBuilder {
             loading_cache: None,
             shared: None,
             cache_features: &[],
+            origin_signer: None,
         }
     }
 
@@ -678,6 +682,24 @@ impl IntegrationBuilder {
     #[must_use]
     pub const fn cache_features(&self) -> &'static [&'static str] {
         self.cache_features
+    }
+
+    /// Offers the origin signer this crate supplies, which a source's `auth`
+    /// table selects with `type = "<name>"`, see [`crate::origin_auth`].
+    ///
+    /// The offer is not a selection. The signer is built where a source
+    /// names it, and its secret settings are looked up as the settings load
+    /// whatever the sections select.
+    #[must_use]
+    pub const fn with_origin_signer(mut self, signer: &'static OriginSignerModule) -> Self {
+        self.origin_signer = Some(signer);
+        self
+    }
+
+    /// The origin signer this builder offers, when it offers one.
+    #[must_use]
+    pub const fn origin_signer(&self) -> Option<&'static OriginSignerModule> {
+        self.origin_signer
     }
 
     /// The loading cache this builder offers, when it offers one.

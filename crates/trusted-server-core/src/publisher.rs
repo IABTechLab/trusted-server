@@ -91,7 +91,7 @@ use crate::response_privacy::{
 };
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::{
-    AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS, AssetOriginAuth,
+    AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS,
     AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
 };
 use crate::source::{SourceLocation, SourceRequest};
@@ -3911,20 +3911,19 @@ const READER_HEADERS_NOT_SIGNED: [header::HeaderName; 10] = [
     header::RANGE,
 ];
 
-/// Signs a publisher origin request in place with `[publisher]`'s
-/// `origin_auth`, once the reader's headers a signed read must not carry are
-/// removed.
+/// Signs a publisher origin request in place with the source's signing, once
+/// the reader's headers a signed read must not carry are removed.
 ///
 /// The request is sent to the address that was signed, the target as a parsed
 /// URL, so the signature and the request line agree byte for byte.
 fn sign_publisher_origin_request(
     req: &mut Request<EdgeBody>,
-    auth: &AssetOriginAuth,
+    auth: &crate::origin_auth::OriginSigning,
 ) -> Result<(), Report<TrustedServerError>> {
     for name in READER_HEADERS_NOT_SIGNED {
         req.headers_mut().remove(name);
     }
-    crate::proxy::remove_origin_auth_namespace_headers(req.headers_mut(), auth);
+    auth.remove_namespace_headers(req.headers_mut());
     let target =
         url::Url::parse(&req.uri().to_string()).change_context(TrustedServerError::Proxy {
             message: "invalid publisher origin uri".to_string(),
@@ -3936,7 +3935,7 @@ fn sign_publisher_origin_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
     let method = req.method().clone();
-    crate::proxy::apply_asset_origin_auth(&method, &target, req.headers_mut(), auth)
+    auth.sign(&method, &target, req.headers_mut())
 }
 
 /// Build a minimal [`AuctionContext`] for the collect phase.
@@ -24090,30 +24089,36 @@ mod tests {
         );
     }
 
-    /// The publisher origin request as `origin_url`'s path, `directory_index`
-    /// and `origin_auth` shape it, for an origin such as object storage.
+    /// The publisher origin request as the source's `url` path,
+    /// `directory_index` and `auth` shape it, for an origin such as object
+    /// storage.
     mod object_storage_origin_tests {
         use super::*;
+        use crate::integrations::IntegrationRegistry;
+        use crate::origin_auth::{OriginAuth, fixture};
         use crate::platform::PlatformHttpClient;
-        use crate::redacted::Redacted;
-        use crate::s3_sigv4::{S3Credentials, sign_headers};
-        use crate::settings::{OriginQueryPolicy, S3SigV4AuthConfig};
+        use crate::settings::OriginQueryPolicy;
 
         const STORAGE_URL: &str = "https://storage.example.com/bucket/site";
-        const REGION: &str = "test-region-1";
-        const ACCESS_KEY_ID: &str = "TESTACCESSKEYID";
-        const SECRET_ACCESS_KEY: &str = "test-secret-access-key";
+        const SIGNING_KEY: &str = "resolved-origin-key";
         const READER_AUTHORIZATION: &str = "Bearer reader-token";
 
-        fn signing_auth(origin_query: Option<OriginQueryPolicy>) -> AssetOriginAuth {
-            AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: REGION.to_owned(),
-                secret_store: None,
-                access_key_id: Redacted::new(ACCESS_KEY_ID.to_owned()),
-                secret_access_key: Redacted::new(SECRET_ACCESS_KEY.to_owned()),
-                session_token: None,
-                origin_query,
-            })
+        fn signing_auth(origin_query: Option<OriginQueryPolicy>) -> OriginAuth {
+            fixture::auth("site")
+                .with_setting("key_name", SIGNING_KEY)
+                .with_origin_query(origin_query)
+        }
+
+        /// Runs the publisher proxy with the fixture signer on offer, as a
+        /// deployment whose build links a signer does.
+        async fn run_signed_publisher_proxy(
+            settings: &Settings,
+            services: &RuntimeServices,
+            req: HttpRequest<EdgeBody>,
+        ) -> PublisherResponse {
+            let registry = IntegrationRegistry::with_registrations(settings, &[fixture::builder()])
+                .expect("should build the registry offering the fixture signer");
+            run_publisher_proxy_with(settings, &registry, services, req).await
         }
 
         fn reader_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
@@ -24142,7 +24147,7 @@ mod tests {
                 .header(header::IF_UNMODIFIED_SINCE, "Tue, 01 Sep 2026 00:00:00 GMT")
                 .header(header::IF_RANGE, "\"reader-etag\"")
                 .header(header::RANGE, "bytes=0-99")
-                .header("x-amz-meta-reader", "reader-chosen")
+                .header("x-fixture-reader", "reader-chosen")
                 .header(header::USER_AGENT, "reader-agent")
                 .body(EdgeBody::empty())
                 .expect("should build reader request")
@@ -24188,48 +24193,11 @@ mod tests {
                 host, "storage.example.com",
                 "should sign for the origin host"
             );
-            let signed_at = sent_header(sent, "x-amz-date").expect("should send the signing time");
             assert_eq!(
                 sent_header(sent, "authorization"),
-                Some(expected_authorization(method, &uris[0], host, signed_at).as_str()),
+                Some(fixture::expected_authorization(SIGNING_KEY, method, &uris[0], host).as_str()),
                 "should sign exactly the address and host that were sent"
             );
-        }
-
-        /// The `Authorization` the signer gives `method` on `uri` with `host` at
-        /// the moment the signed request records.
-        fn expected_authorization(
-            method: &Method,
-            uri: &str,
-            host: &str,
-            signed_at: &str,
-        ) -> String {
-            let signed_at = chrono::NaiveDateTime::parse_from_str(signed_at, "%Y%m%dT%H%M%SZ")
-                .expect("should read the signing time")
-                .and_utc();
-            let mut headers = http::HeaderMap::new();
-            headers.insert(
-                header::HOST,
-                HeaderValue::from_str(host).expect("should build host header"),
-            );
-            sign_headers(
-                method,
-                &url::Url::parse(uri).expect("should parse sent address"),
-                &mut headers,
-                REGION,
-                &S3Credentials {
-                    access_key_id: ACCESS_KEY_ID.to_owned(),
-                    secret_access_key: Redacted::new(SECRET_ACCESS_KEY.to_owned()),
-                    session_token: None,
-                },
-                SystemTime::from(signed_at),
-            )
-            .expect("should sign the expected request");
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .expect("should produce an Authorization header")
-                .to_owned()
         }
 
         pub(super) fn response_status(response: &PublisherResponse) -> StatusCode {
@@ -24443,7 +24411,7 @@ mod tests {
             let stub = stub_with_responses(1);
             let services = services_for(&stub);
 
-            let _ = run_publisher_proxy(
+            let _ = run_signed_publisher_proxy(
                 &settings,
                 &services,
                 reader_request_with_private_headers(
@@ -24512,7 +24480,7 @@ mod tests {
                 "should not send the reader's Range"
             );
             assert_eq!(
-                sent_header(sent, "x-amz-meta-reader"),
+                sent_header(sent, "x-fixture-reader"),
                 None,
                 "should not send a header the reader set in the signing namespace"
             );
@@ -24534,7 +24502,7 @@ mod tests {
             let stub = stub_with_responses(1);
             let services = services_for(&stub);
 
-            let _ = run_publisher_proxy(
+            let _ = run_signed_publisher_proxy(
                 &settings,
                 &services,
                 reader_request(Method::HEAD, "https://publisher.example/page"),
@@ -24555,7 +24523,7 @@ mod tests {
             let stub = stub_with_responses(1);
             let services = services_for(&stub);
 
-            let _ = run_publisher_proxy(
+            let _ = run_signed_publisher_proxy(
                 &settings,
                 &services,
                 reader_request(Method::GET, "https://publisher.example/page?utm=1"),
@@ -24581,7 +24549,7 @@ mod tests {
                 let stub = stub_with_responses(1);
                 let services = services_for(&stub);
 
-                let response = run_publisher_proxy(
+                let response = run_signed_publisher_proxy(
                     &settings,
                     &services,
                     reader_request(method.clone(), "https://publisher.example/page"),
