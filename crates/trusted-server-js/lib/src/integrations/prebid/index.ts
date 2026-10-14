@@ -321,7 +321,7 @@ function managedUserIdEntry(managed: InjectedManagedUserId): PrebidUserIdConfigE
  * Drops managed User ID entries that address a submodule an earlier entry
  * already claimed.
  *
- * `ts prebid bundle` rejects such a pair, but an operator running a prebuilt
+ * `ts prebid client` rejects such a pair, but an operator running a prebuilt
  * external bundle never invokes it, and core's duplicate check compares names
  * rather than the submodules they resolve to. Prebid registers one submodule
  * for a module's name and each of its aliases and reads only the first matching
@@ -2610,7 +2610,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
             'Prebid bundle. Add its exact Prebid module stem to ' +
             '[integrations.prebid.bundle.modules].bidder in trusted-server.toml and ' +
-            'rebuild it with `ts prebid bundle`.'
+            'rebuild it with `ts prebid client`.'
         );
       }
     }
@@ -2915,25 +2915,63 @@ function clearPrebidEidsCookie(): void {
   document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
 }
 
+/**
+ * Trims an EID payload so its base64-encoded cookie fits `MAX_EID_COOKIE_BYTES`,
+ * dropping UIDs then whole sources from the tail. `/auction` requests still
+ * forward the untrimmed set in the request body (see `buildAdRequest`); this
+ * cap only bounds what the `ts-eids` cookie carries for routes without a body
+ * (e.g. `GET /_ts/page-bids`) and for backend ingestion at response finalize.
+ */
 function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
-  let payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
+  const payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
+  const droppedSources = new Set<string>();
+  const trimmedSources = new Set<string>();
 
   while (payload.length > 0) {
     const encoded = btoa(JSON.stringify(payload));
     if (encoded.length <= MAX_EID_COOKIE_BYTES) {
+      logTrimmedEidSources(droppedSources, trimmedSources);
       return payload;
     }
 
     const last = payload[payload.length - 1];
     if (last && last.uids.length > 1) {
       last.uids = last.uids.slice(0, last.uids.length - 1);
+      trimmedSources.add(last.source);
       continue;
     }
 
-    payload = payload.slice(0, payload.length - 1);
+    const dropped = payload.pop();
+    if (dropped) {
+      droppedSources.add(dropped.source);
+      // A source trimmed and then dropped is reported once, as dropped.
+      trimmedSources.delete(dropped.source);
+    }
   }
 
+  logTrimmedEidSources(droppedSources, trimmedSources);
   return undefined;
+}
+
+/**
+ * Logs which EID sources `fitAuctionEidsToCookie` had to drop or trim UIDs
+ * from, if any. Debug level: `/auction` sends the untrimmed set in the request
+ * body, so a trimmed cookie is expected steady state rather than a warning.
+ */
+function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<string>): void {
+  if (droppedSources.size === 0 && trimmedSources.size === 0) {
+    return;
+  }
+  const parts: string[] = [];
+  if (droppedSources.size > 0) {
+    parts.push(`dropped sources: ${[...droppedSources].join(', ')}`);
+  }
+  if (trimmedSources.size > 0) {
+    parts.push(`trimmed uids from sources: ${[...trimmedSources].join(', ')}`);
+  }
+  log.debug(
+    `[tsjs-prebid] ts-eids cookie exceeded ${MAX_EID_COOKIE_BYTES} bytes; ${parts.join('; ')}`
+  );
 }
 
 /**
