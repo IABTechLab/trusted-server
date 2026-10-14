@@ -313,6 +313,33 @@ fn names_lists_each_middleware_once_in_the_order_first_written() {
 }
 
 #[test]
+fn for_path_names_every_entry_covering_the_path_whatever_its_media_type() {
+    let mut text = entry(Some("/news/"), &["example.text", "example.a"]);
+    text.media_type = "text/plain".to_owned();
+    let entries = PhaseEntries::new(vec![
+        entry(Some("/news/"), &["example.a", "example.b"]),
+        text,
+        entry(Some("/sport/"), &["example.sport"]),
+        entry(None, &["example.b", "example.all"]),
+    ]);
+
+    assert_eq!(
+        entries.for_path("/news/today"),
+        ["example.a", "example.b", "example.text", "example.all"],
+        "should name each middleware once, in entry order, from every entry covering the path"
+    );
+    assert_eq!(
+        entries.for_path("/weather/"),
+        ["example.b", "example.all"],
+        "should leave out an entry whose path does not cover the request"
+    );
+    assert!(
+        PhaseEntries::default().for_path("/").is_empty(),
+        "should name nothing when there are no entries"
+    );
+}
+
+#[test]
 fn entries_from_the_longest_path_to_every_path_are_accepted() {
     PhaseEntries::new(vec![
         entry(Some("/news/sport/"), &["example.a"]),
