@@ -6668,7 +6668,6 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
- "urlencoding",
 ]
 
 [[package]]
@@ -6707,6 +6706,22 @@ dependencies = [
  "error-stack",
  "serde",
  "trusted-server-core",
+ "validator",
+]
+
+[[package]]
+name = "trusted-server-analytics-tinybird"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "urlencoding",
  "validator",
 ]
 
@@ -7121,6 +7136,7 @@ dependencies = [
  "trusted-server-ad-server-mock",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-sellers",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",

@@ -42,6 +42,8 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_sellers::builder(),
+        // The analytics module `[analytics]` selects, which changes no page.
+        trusted_server_analytics_tinybird::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -499,6 +501,7 @@ middleware = [\"robots_txt\"]
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.sellers",
+                "analytics.tinybird",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

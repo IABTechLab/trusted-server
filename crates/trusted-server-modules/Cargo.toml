@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 trusted-server-ad-server-mock = { workspace = true }
 trusted-server-ad-tag-google = { workspace = true }
+trusted-server-analytics-tinybird = { workspace = true }
 trusted-server-auction-aps = { workspace = true }
 trusted-server-auction-prebid = { workspace = true }
 trusted-server-auction-prebid-server = { workspace = true }

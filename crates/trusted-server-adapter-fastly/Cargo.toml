@@ -42,7 +42,6 @@ trusted-server-permission-signal-tcf = { workspace = true }
 trusted-server-permission-signal-us-privacy = { workspace = true }
 trusted-server-device-fastly = { workspace = true }
 trusted-server-geo-fastly = { workspace = true }
-urlencoding = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

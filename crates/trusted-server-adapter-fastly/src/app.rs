@@ -342,7 +342,11 @@ pub(crate) fn build_state_with_registrations(
             &shipped_signal_modules(),
         )?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
+    // The sink `[analytics] module` selected, or core's no-op sink.
+    let auction_telemetry_sink = registry.analytics_module().unwrap_or_else(|| {
+        Arc::new(trusted_server_core::auction::NoopAuctionTelemetrySink)
+            as Arc<dyn AuctionTelemetrySink>
+    });
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
