@@ -3743,12 +3743,6 @@ fn publisher_origin_path_and_query<'a>(
     Cow::Owned(built)
 }
 
-/// Most percent-decoding rounds applied when looking for a dot segment.
-///
-/// Bounds the work a `%25`-chained path can force, as the closed-path check
-/// does.
-const MAX_DOT_SEGMENT_DECODE_ROUNDS: usize = 4;
-
 /// Returns the status a publisher origin request is refused with before it is
 /// sent, or `None` when it may be sent.
 ///
@@ -3775,20 +3769,11 @@ fn refused_origin_request(
 /// separator, and a path still changing after the last round counts as having
 /// one.
 fn path_has_dot_segment(path: &str) -> bool {
-    let is_dot = |segment: &str| segment == "." || segment == "..";
-    let mut current = path.to_owned();
-    for _ in 0..=MAX_DOT_SEGMENT_DECODE_ROUNDS {
-        if current.split(['/', '\\']).any(is_dot) {
-            return true;
-        }
-        let decoded =
-            String::from_utf8_lossy(&urlencoding::decode_binary(current.as_bytes())).into_owned();
-        if decoded == current {
-            return false;
-        }
-        current = decoded;
-    }
-    true
+    crate::closed_paths::matches_any_decoding(path, |current| {
+        current
+            .split(['/', '\\'])
+            .any(|segment| segment == "." || segment == "..")
+    })
 }
 
 /// The plain-text answer to a publisher origin request refused before it is
