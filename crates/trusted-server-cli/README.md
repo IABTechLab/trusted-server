@@ -22,7 +22,10 @@ two-platform command inventory and the
 [EdgeZero guide](../../docs/guide/edgezero.md) for configuration lifecycle and
 store semantics.
 
-`ts --version` reports the CLI package version and compiled source identity.
+`ts --version` labels four compiled facts:
+`ts package=<pkg> source=<identity> target=<triple> variant=default`.
+The external release tag belongs to the signed release index and is distinct
+from the owning Cargo package version.
 Release builds set `TRUSTED_SERVER__RELEASE_BUILD=1` and require
 `TRUSTED_SERVER__GIT_VERSION` to contain exactly 40 lowercase hexadecimal commit
 characters. Any other present release control fails the build. Without that
