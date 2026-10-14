@@ -47,9 +47,19 @@ auction_token_secret = "tinybird_auction_append_token"
 
 **What changes for an operator.** Nothing in the document above. Three refusals move from where the settings load to where the module runs: a table missing its host or token, a key the table does not know, and a reserved setting turned on are refused when the registry is built and by `ts config validate`, naming the table and the setting. A `[tinybird]` table at the top level is still refused, as the section of a module type nothing reads, rather than with directions to the new place, because the directions named the vendor in core.
 
-### 2.2 Later rows
+### 2.2 The platform declares the header it reads a shared cache policy from
 
-The cache header names, the store names, the fingerprint class and the key format follow in the same series, each with its own section here as it lands.
+Core wrote a shared cache policy in one of four headers it named itself, two of them one platform's own, and stripped all four from every response it made private. It now knows the two headers every platform may read, `Surrogate-Control` from the Edge Architecture Specification and `CDN-Cache-Control` from RFC 9213, and asks the running platform for the rest.
+
+**The interface.** An adapter declares the headers its platform reads a shared cache policy from with `platform::declare_platform_cache_headers`, once, as it builds its state. `cache_policy::edge_cache_header_names` lists the two core reads and then the declared ones, and that list is what core strips from a response it makes private, skips among an operator's response headers on an uncacheable response, and treats as a policy it does not read when it decides whether an origin page may be kept. The header an adapter writes the policy in is `EdgeCacheHeader::Platform(name)`, beside `SurrogateControl`, `CdnCacheControl`, the `s-maxage` fallback and none.
+
+**What each adapter declares.** The Fastly adapter declares `fastly-surrogate-control` and writes `Surrogate-Control`. The Cloudflare adapter declares `cloudflare-cdn-cache-control` and writes it. The Axum and Spin adapters declare nothing and keep the `s-maxage` fallback.
+
+**What changes for an operator.** Nothing. Each platform's responses carry the headers they carried, and a header the platform reads still comes off every private response, because the adapter that serves on that platform declared it.
+
+### 2.3 Later rows
+
+The store names, the fingerprint class and the key format follow in the same series, each with its own section here as it lands.
 
 ## 3. What is not in this change
 
@@ -58,6 +68,7 @@ The cache header names, the store names, the fingerprint class and the key forma
 
 ## 4. Tests
 
+- A declared platform header is stripped with the standard ones by the cache policy and by the response privacy guard, is not restored by an operator header, and a policy is written in the platform's own header when the adapter asks for it. A name declared twice is listed once.
 - The module's crate tests its sink (one Events API request per batch, no wait, the row limit, an empty batch sends nothing), its table (the host, the token, the reserved settings, the bounds, an unknown key, the deprecated fields, the documented block in the example configuration) and its selection (the short and the full name, no section, a table the section does not select, the old top-level table, a name the build does not have, the token's key name at deploy).
 - Core tests the kind: a selected module that supplies no analytics module is refused naming it, a section selecting two names is refused, and no section resolves no sink.
 - The stock list offers the module in hook order, and the stock module tests prove it refuses a setting it does not know.

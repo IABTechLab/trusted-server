@@ -296,10 +296,18 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
 /// adapter, or when the auction orchestrator or the integration registry fail
 /// to initialize, which includes two builders claiming the same integration
 /// id.
+/// The second header Compute reads a shared cache policy from, beside
+/// `Surrogate-Control`, which core strips from every response it makes
+/// private.
+pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
+
 pub(crate) fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::platform::declare_platform_cache_headers(&[
+        FASTLY_SURROGATE_CONTROL_HEADER,
+    ]);
     warn_if_certificate_check_disabled(&settings);
 
     // The modules a stock build ships come first and the deployment's own

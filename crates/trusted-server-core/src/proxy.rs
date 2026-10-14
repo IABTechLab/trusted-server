@@ -5788,7 +5788,7 @@ mod tests {
                     .get("surrogate-control")
                     .and_then(|value| value.to_str().ok()),
                 Some("max-age=31536000"),
-                "Fastly finalization should render Surrogate-Control"
+                "finalization should render Surrogate-Control"
             );
         });
     }
@@ -5800,7 +5800,6 @@ mod tests {
                 .header(header::CACHE_CONTROL, cache_control)
                 .header("surrogate-control", "max-age=31536000")
                 .header("cdn-cache-control", "max-age=31536000")
-                .header("cloudflare-cdn-cache-control", "max-age=31536000")
                 .body(EdgeBody::empty())
                 .expect("should build asset response");
 
@@ -5818,13 +5817,9 @@ mod tests {
                 "final privacy directive should veto normalized cache policy"
             );
             assert!(
-                [
-                    "surrogate-control",
-                    "cdn-cache-control",
-                    "cloudflare-cdn-cache-control",
-                ]
-                .iter()
-                .all(|name| !response.headers().contains_key(*name)),
+                ["surrogate-control", "cdn-cache-control"]
+                    .iter()
+                    .all(|name| !response.headers().contains_key(*name)),
                 "final privacy directive should remove every edge-cache header"
             );
         }

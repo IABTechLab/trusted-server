@@ -270,11 +270,16 @@ fn build_state_with_services(
     build_state_with_registrations_and_services(settings, &[], services)
 }
 
+/// The header Workers reads a shared cache policy from, which core writes
+/// the policy in and strips from every response it makes private.
+pub const CDN_CACHE_CONTROL_HEADER: &str = "cloudflare-cdn-cache-control";
+
 fn build_state_with_registrations_and_services(
     settings: Settings,
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::platform::declare_platform_cache_headers(&[CDN_CACHE_CONTROL_HEADER]);
     // The modules a stock build ships come first and the deployment's own
     // follow, which is the order their hooks run in.
     let integrations = trusted_server_modules::builders_with(integrations);
@@ -696,7 +701,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 handle_tsjs_dynamic(
                     &req,
                     &state.registry,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                    EdgeCacheHeader::Platform(CDN_CACHE_CONTROL_HEADER),
                 )
             } else if state.registry.has_route(&method, &path) {
                 // A module route is handed what was resolved for its request,
@@ -747,7 +752,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                    EdgeCacheHeader::Platform(CDN_CACHE_CONTROL_HEADER),
                 )
                 .await
                 {

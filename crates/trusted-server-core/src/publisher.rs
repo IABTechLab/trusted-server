@@ -7506,10 +7506,10 @@ fn parse_delta_seconds(value: &str) -> Result<u64, TemplateCacheBypassReason> {
         .map_err(|_| TemplateCacheBypassReason::MalformedCachePolicy)
 }
 
-/// Parse the Fastly-specific freshness policy used by template cache's hosting platform.
+/// Parse the `Surrogate-Control` freshness policy the template cache's hosting
+/// platform reads.
 ///
-/// Fastly documents `max-age`, `stale-while-revalidate`, and `stale-if-error` for
-/// `Surrogate-Control`. Template cache uses only `max-age` as fresh lifetime; the stale windows
+/// The header carries `max-age`, `stale-while-revalidate`, and `stale-if-error`. Template cache uses only `max-age` as fresh lifetime; the stale windows
 /// are validated so malformed policy cannot hide beside a valid max age, but Core
 /// Cache assembly does not serve stale templates under either extension.
 ///
@@ -7652,8 +7652,9 @@ fn origin_shared_ttl_at(
             })
             .transpose()?,
     };
-    // Fastly gives Surrogate-Control precedence for its edge cache. Standard
-    // restrictive directives were still parsed above and remain hard refusals.
+    // A platform reading Surrogate-Control gives it precedence for its edge
+    // cache. Standard restrictive directives were still parsed above and
+    // remain hard refusals.
     let freshness = surrogate_control_freshness(headers)?
         .or(standard_freshness)
         .ok_or(TemplateCacheBypassReason::NoPositiveFreshness)?;
@@ -7714,13 +7715,14 @@ fn origin_response_may_be_kept(
     if headers.contains_key(header::SET_COOKIE) {
         return Err(TemplateCacheBypassReason::OriginSetCookie);
     }
-    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
-    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
-    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
-    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
-        .iter()
-        .filter(|name| **name != "surrogate-control")
-        .any(|name| headers.contains_key(*name))
+    // Core Cache has no HTTP semantics. The Surrogate-Control subset
+    // `origin_shared_ttl` parses is read; a policy in any other shared cache
+    // header, the platform's own included, is a bypass rather than a guess
+    // at its grammar or precedence.
+    if crate::cache_policy::edge_cache_header_names()
+        .into_iter()
+        .filter(|name| *name != crate::cache_policy::HEADER_SURROGATE_CONTROL_NAME)
+        .any(|name| headers.contains_key(name))
     {
         return Err(TemplateCacheBypassReason::OriginNotShareable);
     }
@@ -18372,7 +18374,7 @@ mod tests {
 
         #[test]
         fn cdn_specific_cache_policy_cannot_be_overridden_by_public_cache_control() {
-            for name in crate::cache_policy::EDGE_CACHE_HEADER_NAMES {
+            for name in crate::cache_policy::edge_cache_header_names() {
                 let mut split = shareable();
                 split.insert(
                     header::HeaderName::from_static(name),
@@ -18397,9 +18399,9 @@ mod tests {
 
         #[test]
         fn unsupported_vendor_freshness_does_not_authorize_template_cache() {
-            for name in crate::cache_policy::EDGE_CACHE_HEADER_NAMES
-                .iter()
-                .filter(|name| **name != "surrogate-control")
+            for name in crate::cache_policy::edge_cache_header_names()
+                .into_iter()
+                .filter(|name| *name != "surrogate-control")
             {
                 let mut split = shareable();
                 split.insert(
@@ -19301,7 +19303,7 @@ mod tests {
                 .get("surrogate-control")
                 .and_then(|value| value.to_str().ok()),
             Some("max-age=31536000"),
-            "matched publisher asset should receive Fastly edge policy"
+            "matched publisher asset should receive the edge policy"
         );
     }
 
@@ -19722,9 +19724,7 @@ mod tests {
                     ("etag", ORIGIN_ETAG),
                     ("last-modified", ORIGIN_LAST_MODIFIED),
                     ("surrogate-control", "max-age=300"),
-                    ("fastly-surrogate-control", "max-age=300"),
                     ("cdn-cache-control", "max-age=300"),
-                    ("cloudflare-cdn-cache-control", "max-age=300"),
                 ],
             );
         }
@@ -20060,9 +20060,7 @@ mod tests {
                 header::ETAG,
                 header::LAST_MODIFIED,
                 header::HeaderName::from_static("surrogate-control"),
-                header::HeaderName::from_static("fastly-surrogate-control"),
                 header::HeaderName::from_static("cdn-cache-control"),
-                header::HeaderName::from_static("cloudflare-cdn-cache-control"),
             ] {
                 assert!(
                     !response_head.headers.contains_key(&header_name),
@@ -20168,15 +20166,7 @@ mod tests {
                     "max-age=300",
                 ),
                 (
-                    header::HeaderName::from_static("fastly-surrogate-control"),
-                    "max-age=300",
-                ),
-                (
                     header::HeaderName::from_static("cdn-cache-control"),
-                    "max-age=300",
-                ),
-                (
-                    header::HeaderName::from_static("cloudflare-cdn-cache-control"),
                     "max-age=300",
                 ),
             ] {
@@ -20418,15 +20408,7 @@ mod tests {
                     "max-age=300",
                 ),
                 (
-                    header::HeaderName::from_static("fastly-surrogate-control"),
-                    "max-age=300",
-                ),
-                (
                     header::HeaderName::from_static("cdn-cache-control"),
-                    "max-age=300",
-                ),
-                (
-                    header::HeaderName::from_static("cloudflare-cdn-cache-control"),
                     "max-age=300",
                 ),
             ] {
@@ -20537,15 +20519,7 @@ mod tests {
                         "max-age=300",
                     ),
                     (
-                        header::HeaderName::from_static("fastly-surrogate-control"),
-                        "max-age=300",
-                    ),
-                    (
                         header::HeaderName::from_static("cdn-cache-control"),
-                        "max-age=300",
-                    ),
-                    (
-                        header::HeaderName::from_static("cloudflare-cdn-cache-control"),
                         "max-age=300",
                     ),
                 ] {
@@ -20774,7 +20748,6 @@ mod tests {
                     ("etag", ORIGIN_ETAG),
                     ("last-modified", ORIGIN_LAST_MODIFIED),
                     ("surrogate-control", "max-age=300"),
-                    ("fastly-surrogate-control", "max-age=300"),
                 ];
                 if let Some(content_type) = content_type {
                     origin_headers.push(("content-type", content_type));
@@ -20829,7 +20802,6 @@ mod tests {
                     header::ETAG,
                     header::LAST_MODIFIED,
                     header::HeaderName::from_static("surrogate-control"),
-                    header::HeaderName::from_static("fastly-surrogate-control"),
                 ] {
                     assert!(
                         !response.headers().contains_key(&header_name),
@@ -20924,7 +20896,6 @@ mod tests {
                     ("etag", ORIGIN_ETAG),
                     ("last-modified", ORIGIN_LAST_MODIFIED),
                     ("surrogate-control", "max-age=300"),
-                    ("fastly-surrogate-control", "max-age=300"),
                 ],
             );
             let services = build_services_with_http_client(
@@ -20962,10 +20933,6 @@ mod tests {
                 (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
                 (
                     header::HeaderName::from_static("surrogate-control"),
-                    "max-age=300",
-                ),
-                (
-                    header::HeaderName::from_static("fastly-surrogate-control"),
                     "max-age=300",
                 ),
             ] {
@@ -21411,8 +21378,6 @@ mod tests {
             .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, "public, max-age=600")
             .header("surrogate-control", "max-age=600")
-            .header("fastly-surrogate-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
             .header(header::ETAG, "\"origin-tag\"")
             .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
@@ -21437,17 +21402,6 @@ mod tests {
         assert!(
             response.headers().get("surrogate-control").is_none(),
             "personalized HTML should not retain Surrogate-Control"
-        );
-        assert!(
-            response.headers().get("fastly-surrogate-control").is_none(),
-            "personalized HTML should not retain Fastly-Surrogate-Control"
-        );
-        assert!(
-            response
-                .headers()
-                .get("cloudflare-cdn-cache-control")
-                .is_none(),
-            "personalized HTML should not retain Cloudflare-CDN-Cache-Control"
         );
         assert!(
             response.headers().get("cdn-cache-control").is_none(),
@@ -21527,8 +21481,6 @@ mod tests {
             .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, "public, max-age=600")
             .header("surrogate-control", "max-age=600")
-            .header("fastly-surrogate-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
             .header(header::ETAG, "\"origin-tag\"")
             .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
@@ -21550,12 +21502,7 @@ mod tests {
             Some("no-store, private"),
             "a personalized response should be private and non-storable"
         );
-        for header_name in [
-            "surrogate-control",
-            "fastly-surrogate-control",
-            "cloudflare-cdn-cache-control",
-            "cdn-cache-control",
-        ] {
+        for header_name in ["surrogate-control", "cdn-cache-control"] {
             assert!(
                 response.headers().get(header_name).is_none(),
                 "a personalized response should not retain {header_name}"
@@ -22819,12 +22766,12 @@ mod tests {
                 .get("surrogate-control")
                 .and_then(|value| value.to_str().ok()),
             Some("max-age=31536000"),
-            "matching content-versioned bundle should set the Fastly edge TTL"
+            "matching content-versioned bundle should set the edge TTL"
         );
     }
 
     #[test]
-    fn tsjs_dynamic_uses_cloudflare_edge_header_when_selected() {
+    fn tsjs_dynamic_uses_the_platform_edge_header_when_selected() {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -22838,21 +22785,21 @@ mod tests {
         let response = handle_tsjs_dynamic(
             &request,
             &registry,
-            EdgeCacheHeader::CloudflareCdnCacheControl,
+            EdgeCacheHeader::Platform("example-cdn-cache-control"),
         )
         .expect("should handle tsjs request");
 
         assert_eq!(
             response
                 .headers()
-                .get("cloudflare-cdn-cache-control")
+                .get("example-cdn-cache-control")
                 .and_then(|value| value.to_str().ok()),
             Some("max-age=31536000"),
-            "Cloudflare requests should use its edge cache header"
+            "the platform's own edge cache header should carry the policy"
         );
         assert!(
             response.headers().get("surrogate-control").is_none(),
-            "Cloudflare requests should not emit Fastly's edge cache header"
+            "no other edge cache header should be written"
         );
     }
 
@@ -24050,7 +23997,7 @@ mod tests {
                 .get("surrogate-control")
                 .and_then(|value| value.to_str().ok()),
             Some("max-age=300, stale-while-revalidate=60, stale-if-error=86400"),
-            "mismatched hash should retain the short Fastly edge TTL"
+            "mismatched hash should retain the short edge TTL"
         );
     }
 
