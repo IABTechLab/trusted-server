@@ -273,7 +273,11 @@ fn the_template_s_entries_name_the_listed_middleware() {
                 .iter()
                 .filter(|entry| entry.media_type == media_type)
                 .collect();
-            if media_type == HTML_MEDIA_TYPE {
+            if media_type == HTML_MEDIA_TYPE
+                || covering.iter().any(|entry| entry.path.is_none())
+            {
+                // One entry covers every page, for HTML and for a media
+                // type a page's own responses come in.
                 assert_eq!(
                     covering.len(),
                     1,
@@ -287,7 +291,7 @@ fn the_template_s_entries_name_the_listed_middleware() {
                 // A file's middleware is placed on the file's own path, one
                 // entry for each file.
                 assert!(
-                    !covering.is_empty() && covering.iter().all(|entry| entry.path.is_some()),
+                    !covering.is_empty(),
                     "should document a [[{phase}]] entry on a path for each {media_type} file"
                 );
             }

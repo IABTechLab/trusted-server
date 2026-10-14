@@ -397,6 +397,15 @@ pull_sync_concurrency = 3
 #   "ad-tag.google",
 # ]
 
+# A navigation in the Next.js App Router is answered with a React Server
+# Components Flight response, text/x-component, and the framework module's
+# second middleware moves the origin's address in one where this entry names
+# it. Without the entry a Flight response passes through as the origin sent
+# it. Remove the entry with the module.
+# [[fetch]]
+# media_type = "text/x-component"
+# middleware = ["framework.nextjs.flight"]
+
 # [[serve]]
 # media_type = "text/html"
 # middleware = ["tag.google-tag", "bot-protection.datadome.tag", "ad-tag.google.diagnostics", "service_version"]
