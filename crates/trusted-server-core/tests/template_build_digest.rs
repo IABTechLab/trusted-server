@@ -24,12 +24,18 @@ impl SourceTree {
         let core = root.path().join("crates/trusted-server-core");
         fs::create_dir_all(core.join("src/integrations"))
             .expect("should create source directories");
+        fs::create_dir_all(core.join("build_support"))
+            .expect("should create build support directory");
         let mut files = vec![
             ("Cargo.toml", "workspace manifest"),
             ("Cargo.lock", "locked dependencies"),
             ("edgezero.toml", "app manifest"),
             ("crates/trusted-server-core/Cargo.toml", "core manifest"),
             ("crates/trusted-server-core/build.rs", "build script"),
+            (
+                "crates/trusted-server-core/build_support/git_version.rs",
+                "git version resolver",
+            ),
             ("crates/trusted-server-core/src/lib.rs", "mod integrations;"),
             (
                 "crates/trusted-server-core/src/integrations/gpt.rs",
@@ -132,6 +138,7 @@ fn every_source_and_build_input_changes_the_digest() {
         "edgezero.toml",
         "crates/trusted-server-core/Cargo.toml",
         "crates/trusted-server-core/build.rs",
+        "crates/trusted-server-core/build_support/git_version.rs",
         "crates/trusted-server-core/src/lib.rs",
         "crates/trusted-server-core/src/integrations/gpt.rs",
         "crates/trusted-server-core/src/integrations/gpt_bootstrap.js",
