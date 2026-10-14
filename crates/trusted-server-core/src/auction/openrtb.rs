@@ -16,12 +16,12 @@ use super::profile::{
 use super::routing::{
     PrebidTransportHeaders, ProviderAuctionInput, ProviderSlotInput, RoutedAuction,
 };
-use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
+use super::types::{AdFormat, AdSlot, AuctionResponse, Bid, MediaType, VideoBid, VideoPlacement};
 use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
-    RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
+    RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, Video, to_openrtb_i32,
 };
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
@@ -37,6 +37,8 @@ pub(crate) enum BidRejectionReason {
     UnrequestedImpression,
     DimensionMismatch,
     AmbiguousDimensions,
+    UnsupportedMediaType,
+    AmbiguousMediaType,
 }
 
 impl BidRejectionReason {
@@ -46,6 +48,8 @@ impl BidRejectionReason {
             Self::UnrequestedImpression => "unrequested_impression",
             Self::DimensionMismatch => "dimension_mismatch",
             Self::AmbiguousDimensions => "ambiguous_dimensions",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::AmbiguousMediaType => "ambiguous_media_type",
         }
     }
 }
@@ -112,6 +116,7 @@ pub(crate) struct SlotBidDimensions {
     by_width: BTreeMap<u32, DimensionMatch>,
     by_height: BTreeMap<u32, DimensionMatch>,
     unqualified: Option<DimensionMatch>,
+    video: Option<((u32, u32), VideoPlacement)>,
 }
 
 impl SlotBidDimensions {
@@ -121,7 +126,10 @@ impl SlotBidDimensions {
         let mut by_height = BTreeMap::new();
         let mut unqualified: Option<DimensionMatch> = None;
 
-        for format in formats {
+        for format in formats
+            .iter()
+            .filter(|format| format.media_type == MediaType::Banner)
+        {
             let dimensions = (format.width, format.height);
             if !exact.insert(dimensions) {
                 continue;
@@ -145,6 +153,7 @@ impl SlotBidDimensions {
             by_width,
             by_height,
             unqualified,
+            video: None,
         }
     }
 }
@@ -165,9 +174,19 @@ pub(crate) fn build_bid_dimension_index_from_slots<'a>(
 ) -> BidDimensionIndex {
     let mut index = BidDimensionIndex::new();
     for slot in slots {
-        index
-            .entry(slot.id.clone())
-            .or_insert_with(|| SlotBidDimensions::from_formats(slot.formats.as_slice()));
+        index.entry(slot.id.clone()).or_insert_with(|| {
+            let mut dimensions = SlotBidDimensions::from_formats(slot.formats.as_slice());
+            dimensions.video = slot
+                .video
+                .as_ref()
+                .zip(
+                    slot.formats
+                        .iter()
+                        .find(|format| format.media_type == MediaType::Video),
+                )
+                .map(|(placement, format)| ((format.width, format.height), placement.clone()));
+            dimensions
+        });
     }
     index
 }
@@ -233,6 +252,116 @@ pub(crate) fn resolve_bid_dimensions(
             .unqualified
             .ok_or(BidRejectionReason::DimensionMismatch)?
             .resolve(),
+    }
+}
+
+/// Media-aware admission facts shared by standard and PBS profiles.
+pub(crate) struct AdmittedBidMedia {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) video: Option<VideoBid>,
+}
+
+/// Admit only media offered to the provider, preserving banner dimension rules.
+pub(crate) fn resolve_bid_media(
+    value: &Value,
+    slot_id: &str,
+    dimensions_by_slot: &BidDimensionIndex,
+) -> Result<AdmittedBidMedia, BidRejectionReason> {
+    let requested = dimensions_by_slot
+        .get(slot_id)
+        .ok_or(BidRejectionReason::UnrequestedImpression)?;
+    let declared = value
+        .get("mtype")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|value| matches!(value, 1 | 2))
+                .ok_or(BidRejectionReason::UnsupportedMediaType)
+        })
+        .transpose()?;
+    let prebid_type = value
+        .pointer("/ext/prebid/type")
+        .map(|value| match value.as_str() {
+            Some("banner") => Ok(1),
+            Some("video") => Ok(2),
+            _ => Err(BidRejectionReason::UnsupportedMediaType),
+        })
+        .transpose()?;
+    if declared
+        .zip(prebid_type)
+        .is_some_and(|(declared, prebid)| declared != prebid)
+    {
+        return Err(BidRejectionReason::UnsupportedMediaType);
+    }
+    let media_type = match declared.or(prebid_type) {
+        Some(value) => value,
+        None if requested.video.is_some() && requested.exact.is_empty() => 2,
+        None if requested.video.is_none() && !requested.exact.is_empty() => 1,
+        None => return Err(BidRejectionReason::AmbiguousMediaType),
+    };
+    let width = parse_optional_bid_dimension(value, "w")?;
+    let height = parse_optional_bid_dimension(value, "h")?;
+    if media_type == 1 {
+        if requested.exact.is_empty() {
+            return Err(BidRejectionReason::UnsupportedMediaType);
+        }
+        let (width, height) = resolve_bid_dimensions(dimensions_by_slot, slot_id, width, height)?;
+        return Ok(AdmittedBidMedia {
+            width,
+            height,
+            video: None,
+        });
+    }
+    let ((player_width, player_height), placement) = requested
+        .video
+        .as_ref()
+        .ok_or(BidRejectionReason::UnsupportedMediaType)?;
+    value
+        .get("adm")
+        .and_then(Value::as_str)
+        .filter(|creative| !creative.trim().is_empty() && creative.len() <= 1024 * 1024)
+        .ok_or(BidRejectionReason::InvalidBid)?;
+    // Creative dimensions are not constrained to the player's display size.
+    let creative_width = width;
+    let creative_height = height;
+    let width = width.unwrap_or(*player_width);
+    let height = height.unwrap_or(*player_height);
+    if !i32::try_from(width).is_ok_and(|value| value > 0)
+        || !i32::try_from(height).is_ok_and(|value| value > 0)
+    {
+        return Err(BidRejectionReason::InvalidBid);
+    }
+    let protocol = optional_video_integer(value, "protocol")?;
+    if protocol.is_some_and(|value| !placement.protocols.contains(&value)) {
+        return Err(BidRejectionReason::UnsupportedMediaType);
+    }
+    let duration = optional_video_integer(value, "dur")?;
+    if duration.is_some_and(|value| {
+        value < placement.minduration || value > placement.maxduration || value <= 0
+    }) {
+        return Err(BidRejectionReason::InvalidBid);
+    }
+    Ok(AdmittedBidMedia {
+        width,
+        height,
+        video: Some(VideoBid {
+            protocol,
+            duration,
+            width: creative_width,
+            height: creative_height,
+        }),
+    })
+}
+
+fn optional_video_integer(value: &Value, key: &str) -> Result<Option<i32>, BidRejectionReason> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(Some)
+            .ok_or(BidRejectionReason::InvalidBid),
     }
 }
 
@@ -440,6 +569,7 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
         .slot()
         .formats
         .iter()
+        .filter(|format| format.media_type == MediaType::Banner)
         .filter_map(|format| {
             Some(Format {
                 w: to_openrtb_i32(format.width, "format.w", "routed slot"),
@@ -449,18 +579,49 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
             .filter(|value| value.w.is_some() && value.h.is_some())
         })
         .collect::<Vec<_>>();
-    let first_width = formats.first()?.w;
-    let first_height = formats.first()?.h;
     let aps_banner = matches!(policy, ProfilePolicy::Aps(_));
+    let banner = formats.first().map(|first| Banner {
+        w: aps_banner.then_some(first.w).flatten(),
+        h: aps_banner.then_some(first.h).flatten(),
+        topframe: aps_banner.then_some(false),
+        format: formats.clone(),
+        ..Default::default()
+    });
+    let video = if aps_banner {
+        None
+    } else {
+        slot.slot()
+            .video
+            .as_ref()
+            .zip(
+                slot.slot()
+                    .formats
+                    .iter()
+                    .find(|format| format.media_type == MediaType::Video),
+            )
+            .map(|(placement, format)| Video {
+                mimes: placement.mimes.clone(),
+                protocols: placement.protocols.clone(),
+                minduration: Some(placement.minduration),
+                maxduration: Some(placement.maxduration),
+                plcmt: Some(placement.plcmt),
+                linearity: Some(1),
+                w: to_openrtb_i32(format.width, "video.w", "routed slot"),
+                h: to_openrtb_i32(format.height, "video.h", "routed slot"),
+                api: placement.api.clone(),
+                playbackmethod: placement.playbackmethod.clone(),
+                startdelay: placement.startdelay,
+                skip: placement.skip.map(|value| value == 1),
+                ..Default::default()
+            })
+    };
+    if banner.is_none() && video.is_none() {
+        return None;
+    }
     Some(Imp {
         id: Some(slot.slot().id.clone()),
-        banner: Some(Banner {
-            format: formats,
-            w: aps_banner.then_some(first_width).flatten(),
-            h: aps_banner.then_some(first_height).flatten(),
-            topframe: aps_banner.then_some(false),
-            ..Default::default()
-        }),
+        banner,
+        video,
         tagid: matches!(policy, ProfilePolicy::Prebid(_)).then(|| slot.slot().id.clone()),
         bidfloor: slot.slot().floor_price,
         bidfloorcur: slot
@@ -489,7 +650,7 @@ fn apply_prebid(
     _routed: &RoutedAuction,
     plan: &PrebidProfilePlan,
 ) -> Result<(), Report<TrustedServerError>> {
-    // Routing admits only slots with positive banner dimensions that fit in i32,
+    // Routing admits supported slots with positive dimensions that fit in i32,
     // so build_imp produces one impression per routed slot, in the same order.
     debug_assert_eq!(
         request.imp.len(),
@@ -835,9 +996,7 @@ fn extract_standard_bid(
         .filter(|slot_id| !slot_id.is_empty())
         .ok_or(BidRejectionReason::InvalidBid)?
         .to_string();
-    let width = parse_optional_bid_dimension(value, "w")?;
-    let height = parse_optional_bid_dimension(value, "h")?;
-    let (width, height) = resolve_bid_dimensions(dimensions_by_slot, &slot_id, width, height)?;
+    let media = resolve_bid_media(value, &slot_id, dimensions_by_slot)?;
     let price = value
         .get("price")
         .and_then(Value::as_f64)
@@ -850,6 +1009,7 @@ fn extract_standard_bid(
         .map(str::to_string)
         .ok_or(BidRejectionReason::InvalidBid)?;
     Ok(Bid {
+        video: media.video,
         slot_id,
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),
@@ -866,8 +1026,8 @@ fn extract_standard_bid(
             }),
         bidder: returned_seat.unwrap_or("unknown").to_string(),
         returned_seat: returned_seat.map(str::to_string),
-        width,
-        height,
+        width: media.width,
+        height: media.height,
         nurl: value
             .get("nurl")
             .and_then(Value::as_str)

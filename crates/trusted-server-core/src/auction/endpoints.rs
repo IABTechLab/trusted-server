@@ -643,6 +643,126 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn video_api_round_trip_selects_compatible_vast_from_standard_and_pbs() {
+        futures::executor::block_on(async {
+            for profile in ["standard", "prebid-server"] {
+                let mut settings = create_test_settings();
+                settings.publisher.domain = "publisher.example.com".to_string();
+                settings.request_signing = None;
+                settings.auction.enabled = true;
+                settings.auction.mediator = None;
+                settings.auction.sanitize_creatives = true;
+                settings.auction.rewrite_creatives = true;
+                settings.auction.providers.clear();
+                settings.auction.providers.insert(
+                    "video-provider".parse().expect("should parse provider ID"),
+                    crate::auction::plan::ProviderConfig {
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: profile.to_string(),
+                        endpoint: "https://bidder.example.com/openrtb".to_string(),
+                        timeout_ms: None,
+                        routing: if profile == "prebid-server" {
+                            crate::auction::plan::RoutingMode::Explicit
+                        } else {
+                            crate::auction::plan::RoutingMode::AllEligible
+                        },
+                        notifications: crate::auction::plan::NotificationConfig::default(),
+                        profile_config: json!({}),
+                    },
+                );
+                let plan = Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile video plan"),
+                );
+                let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+                let http = Arc::new(StubHttpClient::new());
+                let vast = " \n<VAST version=\"4.0\"><Ad id=\"example\"><InLine><AdSystem>Example</AdSystem><AdTitle>Example video</AdTitle><Impression><![CDATA[https://track.example.com/i?a=1&b=2]]></Impression><Creatives><Creative><Linear><Duration>00:00:15</Duration><MediaFiles><MediaFile delivery=\"progressive\" type=\"video/mp4\" width=\"640\" height=\"360\"><![CDATA[https://cdn.example.com/video.mp4]]></MediaFile></MediaFiles></Linear></Creative></Creatives></InLine></Ad></VAST>\n";
+                http.push_response(200, serde_json::to_vec(&json!({"seatbid":[{"seat":"example-seat","bid":[
+                    {"id":"lower-video","impid":"example-video","price":1.0,"mtype":2,"adm":vast,"protocol":7,"dur":15},
+                    {"id":"winning-video","impid":"example-video","price":2.0,"mtype":2,"adm":vast,"protocol":7,"dur":15},
+                    {"id":"incompatible-banner","impid":"example-video","price":20.0,"mtype":1,"adm":"<div/>"}
+                ]}]})).expect("should serialize bidder response"));
+                let services = crate::platform::test_support::build_services_with_http_client(
+                    Arc::clone(&http) as Arc<_>,
+                );
+                let request = Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://publisher.example.com/auction")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(EdgeBody::from(
+                        serde_json::to_vec(&json!({"adUnits":[{
+                            "code":"example-video", "mediaTypes":{"video":{
+                                "context":"instream","playerSize":[640,360],
+                                "mimes":["video/mp4","application/vnd.apple.mpegurl","application/x-mpegURL","application/dash+xml"],
+                                "protocols":[7,8],"minduration":0,"maxduration":30,"plcmt":1
+                            }}
+                        }]}))
+                        .expect("should serialize client video input"),
+                    ))
+                    .expect("should build the API request");
+                let mut ec = make_ec_context(Jurisdiction::NonRegulated, None);
+                let response = handle_auction(
+                    &settings,
+                    &orchestrator,
+                    None,
+                    None,
+                    &mut ec,
+                    &services,
+                    request,
+                )
+                .await
+                .expect("should complete the video API auction");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "should return the video result"
+                );
+                let returned: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should read API response"),
+                )
+                .expect("should parse API JSON");
+                let bid = &returned["seatbid"][0]["bid"][0];
+                assert_eq!(
+                    bid["id"], "winning-video",
+                    "should select the highest compatible bid"
+                );
+                assert_eq!(bid["mtype"], 2, "should identify the player handoff");
+                assert_eq!(
+                    bid["adm"], vast,
+                    "should preserve VAST despite enabled HTML processing"
+                );
+                assert_eq!(bid["protocol"], 7, "should retain VAST protocol");
+                assert_eq!(bid["dur"], 15, "should retain duration");
+                assert!(
+                    bid.get("w").is_none() && bid.get("h").is_none(),
+                    "should not present player dimensions as declared creative dimensions"
+                );
+                let dispatched: serde_json::Value =
+                    serde_json::from_slice(&http.recorded_request_bodies()[0])
+                        .expect("should parse captured provider inventory");
+                assert!(
+                    dispatched["imp"][0].get("banner").is_none(),
+                    "should avoid banner substitution"
+                );
+                assert_eq!(
+                    dispatched["imp"][0]["video"]["w"], 640,
+                    "should forward player requirements"
+                );
+                if profile == "prebid-server" {
+                    assert_eq!(
+                        dispatched["imp"][0]["ext"]["prebid"]["storedrequest"]["id"],
+                        "example-video",
+                        "should retain PBS stored-request routing"
+                    );
+                }
+            }
+        });
+    }
+
     #[derive(Default)]
     struct RecordingTelemetrySink {
         batches: Mutex<Vec<AuctionEventBatch>>,

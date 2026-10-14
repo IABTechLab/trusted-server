@@ -40,6 +40,9 @@ pub struct AdSlot {
     pub id: String,
     /// Media types and formats supported
     pub formats: Vec<AdFormat>,
+    /// Validated player requirements for API video inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoPlacement>,
     /// Floor price if any
     pub floor_price: Option<f64>,
     /// Slot-specific targeting
@@ -54,6 +57,77 @@ pub struct AdFormat {
     pub media_type: MediaType,
     pub width: u32,
     pub height: u32,
+}
+
+/// Player requirements forwarded to an `OpenRTB` video impression.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoPlacement {
+    /// Supported video media MIME types.
+    pub mimes: Vec<String>,
+    /// Supported VAST protocol codes.
+    pub protocols: Vec<i32>,
+    /// Minimum creative duration in seconds.
+    pub minduration: i32,
+    /// Maximum creative duration in seconds.
+    pub maxduration: i32,
+    /// Explicit modern IAB placement classification.
+    pub plcmt: i32,
+    /// Player API framework codes.
+    #[serde(default)]
+    pub api: Vec<i32>,
+    /// Player playback method codes.
+    #[serde(default)]
+    pub playbackmethod: Vec<i32>,
+    /// Start delay in seconds, or the IAB mid-roll/post-roll sentinel.
+    pub startdelay: Option<i32>,
+    /// Whether the player accepts skippable ads, encoded as zero or one.
+    pub skip: Option<i32>,
+}
+
+impl VideoPlacement {
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.mimes.is_empty()
+            && self.mimes.iter().all(|value| {
+                value.parse::<mime::Mime>().is_ok_and(|value| {
+                    value.type_() == mime::VIDEO
+                        || matches!(
+                            value.essence_str(),
+                            "application/vnd.apple.mpegurl"
+                                | "application/x-mpegurl"
+                                | "application/dash+xml"
+                        )
+                })
+            })
+            && !self.protocols.is_empty()
+            && self
+                .protocols
+                .iter()
+                .all(|value| matches!(value, 1..=8 | 11..=16))
+            && self.minduration >= 0
+            && self.maxduration > 0
+            && self.minduration <= self.maxduration
+            && matches!(self.plcmt, 1 | 2)
+            && self.api.iter().all(|value| matches!(value, 1..=9))
+            && self
+                .playbackmethod
+                .iter()
+                .all(|value| matches!(value, 1..=6))
+            && self.startdelay.is_none_or(|value| value >= -2)
+            && self.skip.is_none_or(|value| matches!(value, 0 | 1))
+    }
+}
+
+/// Video response facts retained for the caller's player.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoBid {
+    /// Declared VAST protocol, when supplied by the provider.
+    pub protocol: Option<i32>,
+    /// Declared creative duration in seconds, when supplied by the provider.
+    pub duration: Option<i32>,
+    /// Actual creative width, when supplied by the provider.
+    pub width: Option<u32>,
+    /// Actual creative height, when supplied by the provider.
+    pub height: Option<u32>,
 }
 
 /// Media type enumeration.
@@ -238,6 +312,9 @@ impl BidRenderer {
 /// Individual bid from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bid {
+    /// Video identity and response facts. Absent for existing banner bids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoBid>,
     /// Slot this bid is for
     pub slot_id: String,
     /// Bid price in CPM.
@@ -413,6 +490,7 @@ mod tests {
 
     fn make_bid(bidder: &str) -> Bid {
         Bid {
+            video: None,
             slot_id: "slot-1".to_owned(),
             price: Some(1.0),
             currency: "USD".to_owned(),
@@ -560,6 +638,7 @@ mod tests {
     #[test]
     fn bid_with_cache_fields_round_trips_through_json() {
         let bid = Bid {
+            video: None,
             slot_id: "atf".to_string(),
             price: Some(1.50),
             currency: "USD".to_string(),
@@ -667,6 +746,7 @@ mod tests {
     #[test]
     fn bid_has_ad_id_field() {
         let bid = Bid {
+            video: None,
             slot_id: "s".to_string(),
             price: Some(1.0),
             currency: "USD".to_string(),

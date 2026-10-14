@@ -437,7 +437,7 @@ Full OpenRTB protocol conversion:
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
 - Injects EC ID into bid requests for user recognition
-- Supports banner formats (video and native are currently not emitted by the Prebid provider)
+- Supports banner formats and [direct API instream video](../auction-orchestration.md#use-the-direct-auction-api-for-instream-video). Native formats are not emitted.
 
 ### EC ID Injection
 

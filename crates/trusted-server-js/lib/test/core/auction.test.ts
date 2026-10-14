@@ -183,6 +183,24 @@ describe('auction/buildAdRequest', () => {
 });
 
 describe('auction/parseAuctionResponse', () => {
+  it('keeps video API responses out of banner rendering while preserving banner siblings', () => {
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'example-server',
+          bid: [
+            { impid: 'video', mtype: 2, adm: '<VAST/>', price: 10 },
+            { impid: 'native', mtype: 4, adm: '{}', price: 10 },
+            { impid: 'malformed', mtype: 'video', adm: '<VAST/>', price: 10 },
+            { impid: 'banner', mtype: 1, adm: '<div>Banner</div>', price: 2 },
+            { impid: 'legacy', adm: '<div>Legacy</div>', price: 1 },
+          ],
+        },
+      ],
+    });
+    expect(bids.map((bid) => bid.impid)).toEqual(['banner', 'legacy']);
+  });
+
   it('parses a standard OpenRTB seatbid response', () => {
     const body = {
       seatbid: [

@@ -724,6 +724,7 @@ fn planned_aps_parse_bid(
         });
 
     Ok(Bid {
+        video: None,
         slot_id: slot_id.to_string(),
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),
@@ -1426,6 +1427,7 @@ impl ApsAuctionProvider {
             });
 
         Ok(Bid {
+            video: None,
             slot_id: slot_id.to_string(),
             price: Some(price),
             currency: DEFAULT_CURRENCY.to_string(),
@@ -1998,6 +2000,7 @@ mod tests {
         AuctionRequest {
             id: "fictional-auction".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "fictional-slot".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,

@@ -294,6 +294,7 @@ struct ProviderInputBuilder {
     provider_id: ProviderId,
     timeout_ms: u32,
     is_prebid: bool,
+    supports_video: bool,
     routing: RoutingMode,
     slots: Vec<ProviderSlotInput>,
 }
@@ -345,6 +346,7 @@ pub(crate) fn route_auction_with_trusted_routes(
             provider_id: provider.id.clone(),
             timeout_ms: provider.timeout_ms,
             is_prebid: provider.profile.is_prebid_server(),
+            supports_video: provider.profile.supports_video(),
             routing: provider.routing,
             slots: Vec::new(),
         })
@@ -356,7 +358,7 @@ pub(crate) fn route_auction_with_trusted_routes(
         .collect::<BTreeMap<_, _>>();
 
     for (slot_index, slot) in slots.into_iter().enumerate() {
-        let Some(common_slot) = eligible_banner_slot(&slot) else {
+        let Some(common_slot) = eligible_slot(&slot, true) else {
             continue;
         };
         let demand = normalize_slot_demand(&slot.bidders, &mut diagnostics);
@@ -393,8 +395,11 @@ pub(crate) fn route_auction_with_trusted_routes(
             if !include {
                 continue;
             }
+            let Some(provider_slot) = eligible_slot(&common_slot, builder.supports_video) else {
+                continue;
+            };
             builder.slots.push(ProviderSlotInput {
-                slot: common_slot.clone(),
+                slot: provider_slot,
                 bidder_params,
                 prebid_zone: builder
                     .is_prebid
@@ -432,12 +437,24 @@ pub(crate) fn route_auction_with_trusted_routes(
     }
 }
 
-fn eligible_banner_slot(slot: &AdSlot) -> Option<AdSlot> {
+fn eligible_slot(slot: &AdSlot, supports_video: bool) -> Option<AdSlot> {
+    let video_eligible = supports_video
+        && slot
+            .video
+            .as_ref()
+            .is_some_and(super::types::VideoPlacement::is_valid)
+        && slot
+            .formats
+            .iter()
+            .filter(|format| format.media_type == MediaType::Video)
+            .count()
+            == 1;
     let formats = slot
         .formats
         .iter()
         .filter(|format| {
-            format.media_type == MediaType::Banner
+            (format.media_type == MediaType::Banner
+                || (video_eligible && format.media_type == MediaType::Video))
                 && i32::try_from(format.width).is_ok_and(|width| width > 0)
                 && i32::try_from(format.height).is_ok_and(|height| height > 0)
         })
@@ -447,6 +464,11 @@ fn eligible_banner_slot(slot: &AdSlot) -> Option<AdSlot> {
         return None;
     }
     Some(AdSlot {
+        video: formats
+            .iter()
+            .any(|format| format.media_type == MediaType::Video)
+            .then(|| slot.video.clone())
+            .flatten(),
         id: slot.id.clone(),
         formats,
         floor_price: slot.floor_price,
@@ -660,6 +682,7 @@ mod tests {
 
     fn slot(bidders: HashMap<String, Value>) -> AdSlot {
         AdSlot {
+            video: None,
             id: "slot-1".to_string(),
             formats: vec![AdFormat {
                 media_type: MediaType::Banner,

@@ -8,7 +8,8 @@ pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
 pub type OpenRtbBid = trusted_server_openrtb::Bid;
 
 pub use trusted_server_openrtb::{
-    Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt, User,
+    Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt,
+    User, Video,
 };
 
 /// Convert a `u32` value to `i32` for `OpenRTB` fields, logging a warning and
