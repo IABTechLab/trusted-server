@@ -46,19 +46,25 @@ pub const EXACT_HOSTS: &[&str] = &[
     "sdk.privacy-center.org",
     // sourcepoint
     "cdn.privacy-mgmt.com",
+    "cdn-eu.privacy-mgmt.com",
     // lockr
     "aim.loc.kr",
     "identity.loc.kr",
     // datadome
     "js.datadome.co",
     "api-js.datadome.co",
+    "api-fastly.datadome.co",
     // aps / Amazon
     "aax.amazon-adsystem.com",
     "aax-events.amazon-adsystem.com",
+    "client.aps.amazon-adsystem.com",
+    "web.ads.aps.amazon-adsystem.com",
     // permutive
     "api.permutive.com",
     "secure-signals.permutive.app",
     "cdn.permutive.com",
+    "events.permutive.app",
+    "sync.permutive.com",
     // Google Tag Manager / Analytics
     "www.googletagmanager.com",
     "www.google-analytics.com",
@@ -70,6 +76,13 @@ pub const EXACT_HOSTS: &[&str] = &[
     "cdn.prebid.org",
     // Fastly platform
     "api.fastly.com",
+    // inmobi: the Choice consent prompt script and its CDN
+    "cmp.inmobi.com",
+    "cdn.inmobi.com",
+    // ad-tag.google: the AdSense loader
+    "pagead2.googlesyndication.com",
+    // permission-signal.mtm: the Model Terms document
+    "m4ow.uk",
 ];
 
 /// Hosts where exact match AND any subdomain (`*.host`) is allowed.
@@ -116,6 +129,8 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "rslstandard.org",
     // Specs (other)
     "webassembly.org",
+    // IETF RFCs
+    "www.rfc-editor.org",
     // Fastly docs
     "www.fastly.com",
     "developer.fastly.com",
@@ -125,6 +140,8 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     // Vendor docs
     "docs.datadome.co",
     "docs.prebid.org",
+    "support.google.com",
+    "developers.google.com",
     // Tooling docs
     "vitepress.dev",
     "playwright.dev",
@@ -1555,6 +1572,15 @@ fn path_is_scanned(rel_path: &str) -> bool {
     {
         return false;
     }
+    // A module crate's own fixtures, the page its middleware is tested on
+    // and the page it records: exactly crates/<type>/<vendor>/src/fixtures/.
+    if components.len() > 5
+        && components[0] == "crates"
+        && components[3] == "src"
+        && components[4] == "fixtures"
+    {
+        return false;
+    }
 
     let basename = components.last().copied().unwrap_or("");
     // Excluded lockfiles (exact basename). Name comparisons below are
@@ -2588,6 +2614,9 @@ mod path_is_scanned_tests {
             "crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx",
             "crates/integration-tests/fixtures/frameworks/nextjs/Dockerfile",
             "crates/integration-tests/fixtures/frameworks/wordpress/Dockerfile",
+            "crates/cmp/inmobi/src/lib.rs",
+            "crates/cmp/inmobi/fixtures/page.html",
+            "crates/trusted-server-cli/src/fixtures/page.html",
             "README.md",
             "CHANGELOG.md",
             "CONTRIBUTING.md",
@@ -2607,6 +2636,8 @@ mod path_is_scanned_tests {
         for p in [
             "crates/trusted-server-core/src/integrations/nextjs/fixtures/inlined-data-escaped.html",
             "crates/trusted-server-core/src/integrations/google_tag_manager/fixtures/captured.html",
+            "crates/cmp/inmobi/src/fixtures/page-change.input.html",
+            "crates/testing/testlight/src/fixtures/page-change.settings.toml",
             "node_modules/foo.js",
             ".worktrees/x/y.rs",
             ".claude/worktrees/x/y.rs",
