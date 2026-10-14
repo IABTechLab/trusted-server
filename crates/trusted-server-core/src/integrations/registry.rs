@@ -18,6 +18,7 @@ use crate::ec::identifiers::IdentifierModule;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
+use crate::evidence::OwnedRequestInfo;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
@@ -2317,6 +2318,16 @@ impl IntegrationRegistry {
             .collect()
     }
 
+    /// Whether a registered middleware moves the origin's address itself in
+    /// a body of `media_type`, so core leaves the addresses in such a body
+    /// alone, see [`Middleware::moves_origin_address`].
+    #[must_use]
+    pub fn middleware_moves_origin_address(&self, media_type: &str) -> bool {
+        self.inner.middleware.iter().any(|(_, middleware)| {
+            middleware.moves_origin_address() && middleware.handles_media_type(media_type)
+        })
+    }
+
     /// The middleware the first entry covering a response selects, in the
     /// order they run, for a response of `media_type` to a request for `path`.
     /// A response no entry covers gives an empty chain.
@@ -2526,10 +2537,25 @@ impl IntegrationRegistry {
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
             // The route takes the request, so the context holds a copy of
-            // what it resolved to, beside what was resolved for it.
+            // what it resolved to and of its evidence, beside what was
+            // resolved for it. The evidence is read as the permission path
+            // reads it, after the caller's EC header is gone.
             let resolved = ResolvedRequest::of(&req, services.client_info());
+            let evidence = OwnedRequestInfo::new(
+                services
+                    .client_info()
+                    .client_ip
+                    .map(crate::ec::generation::normalize_ip)
+                    .unwrap_or_default(),
+                req.headers().clone(),
+            )
+            .with_request_target(
+                req.uri().path().to_owned(),
+                req.uri().query().unwrap_or_default().to_owned(),
+            );
             let context = ModuleContext::new(resolved.view())
                 .with_settings(settings)
+                .with_evidence(&evidence)
                 .with_request_state(ec_context, services);
             Some(
                 proxy
@@ -3379,6 +3405,14 @@ pub(crate) mod test_support {
         pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
         /// The line the text middleware adds at the end of a text body.
         pub(crate) const TEXT_LINE: &str = "# added by the middleware fixture\n";
+        /// The name of the fetch middleware that moves the origin's address
+        /// itself, on a media type of its own.
+        pub(crate) const FRAMED: &str = "testing.middleware-fixture.framed";
+        /// The media type the framed middleware works on, whose body core
+        /// leaves to it.
+        pub(crate) const FRAMED_MEDIA_TYPE: &str = "text/x-fixture-rows";
+        /// The line the framed middleware adds at the end of a body.
+        pub(crate) const FRAMED_LINE: &str = "# framed by the middleware fixture\n";
         /// The name of the fetch middleware that prepares.
         pub(crate) const PREPARING: &str = "testing.middleware-fixture.preparing";
         /// The name of the fetch middleware that refuses every request.
@@ -3684,8 +3718,8 @@ pub(crate) mod test_support {
             }
         }
 
-        /// Passes a text body through and adds a line at its end.
-        struct AppendLine;
+        /// Passes a text body through and adds the line at its end.
+        struct AppendLine(&'static str);
 
         impl crate::streaming_processor::StreamProcessor for AppendLine {
             fn process_chunk(
@@ -3695,7 +3729,7 @@ pub(crate) mod test_support {
             ) -> Result<Vec<u8>, std::io::Error> {
                 let mut output = chunk.to_vec();
                 if is_last {
-                    output.extend_from_slice(TEXT_LINE.as_bytes());
+                    output.extend_from_slice(self.0.as_bytes());
                 }
                 Ok(output)
             }
@@ -3718,7 +3752,7 @@ pub(crate) mod test_support {
 
             fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
                 MiddlewareAction {
-                    stream: Some(Box::new(AppendLine)),
+                    stream: Some(Box::new(AppendLine(TEXT_LINE))),
                     ..MiddlewareAction::pass()
                 }
             }
@@ -3745,6 +3779,36 @@ pub(crate) mod test_support {
                         http::HeaderName::from_static(TEXT_HEADER_NAME),
                         http::HeaderValue::from_static(TEXT_HEADER_VALUE),
                     )],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        /// Says it moves the origin's address itself, on its own media type,
+        /// and then leaves the body as it came with a line added, so a test
+        /// sees what core left to it.
+        struct Framed;
+
+        impl Middleware for Framed {
+            fn middleware_id(&self) -> &'static str {
+                FRAMED
+            }
+
+            fn handles_media_type(&self, media_type: &str) -> bool {
+                media_type == FRAMED_MEDIA_TYPE
+            }
+
+            fn moves_origin_address(&self) -> bool {
+                true
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    stream: Some(Box::new(AppendLine(FRAMED_LINE))),
                     ..MiddlewareAction::pass()
                 }
             }
@@ -3798,6 +3862,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(TextHeader))
                     .with_middleware(Arc::new(Locating))
                     .with_middleware(Arc::new(Labeled { text: labeled }))
+                    .with_middleware(Arc::new(Framed))
                     .build(),
             ))
         }
@@ -4900,6 +4965,105 @@ mod tests {
             answer(PermissionSet::none()),
             "test-publisher.com storage=true id=none",
             "and one declaring nothing still sees the permissions but not the identifier"
+        );
+    }
+
+    /// A route that answers with the request evidence its module call
+    /// handed it.
+    struct EvidenceReadingRoute;
+
+    impl EvidenceReadingRoute {
+        fn report(
+            &self,
+            _req: Request<EdgeBody>,
+            evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let body = format!(
+                "ip={} path={} query={} session={} ec={}",
+                evidence.client_ip(),
+                evidence.path(),
+                evidence.query(),
+                evidence.cookie("session").unwrap_or("none"),
+                evidence.header("x-ts-ec").unwrap_or("none"),
+            );
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(body))
+                .expect("should build the response"))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for EvidenceReadingRoute {
+        fn integration_name(&self) -> &'static str {
+            "evidence"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post("/integrations/test/evidence")]
+        }
+
+        async fn handle(
+            &self,
+            call: ModuleCall<'_>,
+            req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            call.inject_with(self, req, Self::report)?
+        }
+    }
+
+    /// A route is handed its request's evidence, being the client address,
+    /// the headers and the address it was asked at, without the caller's EC
+    /// header, so a route that reads the request as evidence can answer.
+    #[test]
+    fn a_route_is_handed_its_requests_evidence() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::POST,
+            "/integrations/test/evidence",
+            (
+                Arc::new(EvidenceReadingRoute) as Arc<dyn IntegrationProxy>,
+                "evidence",
+            ),
+        )]);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/integrations/test/evidence?from=page")
+            .header(header::HOST, "test-publisher.com")
+            .header(header::COOKIE, "session=abc")
+            .header(HEADER_X_TS_EC.clone(), "caller-supplied")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let services =
+            crate::platform::test_support::noop_services_with_client_ip(std::net::IpAddr::from([
+                203, 0, 113, 7,
+            ]));
+
+        let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::POST,
+            path: "/integrations/test/evidence",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
+            req,
+        }))
+        .expect("should find the route")
+        .expect("a route reading the evidence should answer");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("the answer is text");
+
+        assert_eq!(
+            body,
+            "ip=203.0.113.7 path=/integrations/test/evidence query=from=page session=abc ec=none"
         );
     }
 
@@ -7200,6 +7364,7 @@ mod tests {
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
                 fixture::LABELED,
+                fixture::FRAMED,
                 crate::service_version::MODULE,
             ],
             "should list the middleware the selected module supplies, and core's own after them"
@@ -7213,7 +7378,8 @@ mod tests {
                 fixture::TEXT,
                 fixture::PREPARING,
                 fixture::REFUSING,
-                fixture::LABELED
+                fixture::LABELED,
+                fixture::FRAMED
             ],
             "should list the middleware that run in the fetch phase"
         );
@@ -7243,6 +7409,30 @@ mod tests {
         assert!(
             chain_for("text/css", "/news/site.css").is_empty(),
             "should run nothing on a media type no entry covers"
+        );
+    }
+
+    #[test]
+    fn a_registered_middleware_that_moves_the_address_itself_says_so_for_its_media_type() {
+        let registry = IntegrationRegistry::new(&fixture_settings_with_entries(Vec::new()))
+            .expect("should build a registry");
+
+        assert!(
+            registry.middleware_moves_origin_address(fixture::FRAMED_MEDIA_TYPE),
+            "should leave the framed media type to the middleware, which no entry names"
+        );
+        assert!(
+            !registry.middleware_moves_origin_address(fixture::TEXT_MEDIA_TYPE)
+                && !registry.middleware_moves_origin_address(HTML_MEDIA_TYPE),
+            "should move the addresses in a body of every other media type"
+        );
+
+        let unselected =
+            IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
+                .expect("should build a registry without the fixture");
+        assert!(
+            !unselected.middleware_moves_origin_address(fixture::FRAMED_MEDIA_TYPE),
+            "should move the addresses where no selected module's middleware claims the body"
         );
     }
 
@@ -7372,7 +7562,7 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
@@ -7384,6 +7574,7 @@ mod tests {
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
                 fixture::LABELED,
+                fixture::FRAMED,
                 crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
@@ -7563,6 +7754,7 @@ mod tests {
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
                 fixture::LABELED,
+                fixture::FRAMED,
             ],
             "should list every middleware when there are no entries"
         );
@@ -7580,7 +7772,8 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
-                fixture::LABELED
+                fixture::LABELED,
+                fixture::FRAMED
             ],
             "should leave out a middleware any entry names"
         );
@@ -7653,7 +7846,8 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
-                fixture::LABELED
+                fixture::LABELED,
+                fixture::FRAMED
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

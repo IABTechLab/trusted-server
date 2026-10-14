@@ -327,7 +327,7 @@ pub const MIDDLEWARE_TYPE: &str = "middleware";
 
 /// The `[middleware]` section, one `[middleware.<name>]` table for each
 /// middleware that has settings of its own, written with the middleware's
-/// full name, so `[middleware.51degrees.hide]` is the `51degrees.hide`
+/// full name, so `[middleware.example.cleanup]` is the `example.cleanup`
 /// middleware's table. A table holds values and arrays. A table within one
 /// is the table of the longer name it spells and never a setting, so a
 /// middleware never sees another's settings. Core reads none of a table. A
@@ -352,8 +352,8 @@ impl MiddlewareTables {
     }
 
     /// Every name a table stands at, the ones on the way to a deeper table
-    /// included, so `[middleware.51degrees.hide]` gives `51degrees` and
-    /// `51degrees.hide`.
+    /// included, so `[middleware.example.cleanup]` gives `example` and
+    /// `example.cleanup`.
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         fn walk(prefix: &str, table: &serde_json::Map<String, JsonValue>, names: &mut Vec<String>) {
