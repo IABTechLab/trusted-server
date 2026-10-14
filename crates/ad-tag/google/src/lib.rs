@@ -1567,10 +1567,13 @@ mod tests {
         });
         let inserts = integration.head_markup();
 
-        assert_eq!(inserts.len(), 3, "should add one head insert for the loader");
         assert_eq!(
-            inserts[2],
-            r#"<script async src="/integrations/gpt/script"></script>"#,
+            inserts.len(),
+            3,
+            "should add one head insert for the loader"
+        );
+        assert_eq!(
+            inserts[2], r#"<script async src="/integrations/gpt/script"></script>"#,
             "should ask for the loader on this module's own route"
         );
     }
@@ -1584,7 +1587,11 @@ mod tests {
         });
         let inserts = integration.head_markup();
 
-        assert_eq!(inserts.len(), 4, "should add the loader after every other insert");
+        assert_eq!(
+            inserts.len(),
+            4,
+            "should add the loader after every other insert"
+        );
         assert!(
             inserts[3].starts_with("<script async src="),
             "should write the loader tag after the slim-Prebid address, got: {}",
@@ -1597,7 +1604,9 @@ mod tests {
         let inserts = GptIntegration::new(test_config()).head_markup();
 
         assert!(
-            inserts.iter().all(|s| !s.contains("/integrations/gpt/script")),
+            inserts
+                .iter()
+                .all(|s| !s.contains("/integrations/gpt/script")),
             "should write no loader tag unless asked, got: {inserts:?}"
         );
     }
