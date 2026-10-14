@@ -14,9 +14,11 @@ use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
 use crate::ec::device::DeviceModule;
+use crate::ec::identifiers::IdentifierModule;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
+use crate::evidence::OwnedRequestInfo;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
@@ -688,6 +690,13 @@ pub struct IntegrationRegistration {
     /// Declaring one does not make it serve anything, because a source is only
     /// built where `[source]` or an asset route's `source` table names it.
     pub source_module: Option<(&'static str, Arc<dyn SourceFactory>)>,
+    /// Identifier module this registration supplies, see
+    /// [`crate::ec::identifiers`].
+    ///
+    /// No section selects one. Core asks every running registration's module
+    /// on every request, so declaring one runs it wherever the registration
+    /// itself runs.
+    pub identifier_module: Option<Arc<dyn IdentifierModule>>,
 }
 
 impl IntegrationRegistration {
@@ -720,6 +729,7 @@ impl IntegrationRegistrationBuilder {
                 prefix_module: None,
                 robots_txt_contributor: None,
                 source_module: None,
+                identifier_module: None,
             },
         }
     }
@@ -823,6 +833,15 @@ impl IntegrationRegistrationBuilder {
         factory: Arc<dyn SourceFactory>,
     ) -> Self {
         self.registration.source_module = Some((name, factory));
+        self
+    }
+
+    /// Declare the identifier module this registration supplies, which core
+    /// asks for the identifiers it learned on every request the registration
+    /// runs for, see [`crate::ec::identifiers`].
+    #[must_use]
+    pub fn with_identifier_module(mut self, module: Arc<dyn IdentifierModule>) -> Self {
+        self.registration.identifier_module = Some(module);
         self
     }
 
@@ -967,6 +986,10 @@ struct IntegrationRegistryInner {
     // The publisher's source and each asset route's, in route order, built
     // from the settings. `None` for a registry built without settings.
     sources: Option<BuiltSources>,
+    // The identifier modules the running registrations supply, in
+    // registration order, which core asks on every request. Shared, so a
+    // request's services take a reference count rather than a copy.
+    identifier_modules: Arc<[Arc<dyn IdentifierModule>]>,
 }
 
 /// The sources a deployment's settings name, built once.
@@ -1012,6 +1035,7 @@ impl Default for IntegrationRegistryInner {
             prefix_module: SelectedPrefixModule::default(),
             source_modules: Vec::new(),
             sources: None,
+            identifier_modules: Arc::default(),
         }
     }
 }
@@ -1474,6 +1498,52 @@ pub struct ProxyDispatchInput<'a> {
 /// # Errors
 ///
 /// Naming the module or the entry at fault.
+/// Refuses a registration that supplies a middleware its builder describes
+/// in a phase the middleware does not run in, or for a media type it does
+/// not work on, so a configuration written from the description runs. A
+/// described middleware the registration leaves out is allowed, because a
+/// module may supply one only where its settings call for it.
+fn check_described_middleware(
+    builder: &crate::integrations::IntegrationBuilder,
+    registration: &IntegrationRegistration,
+) -> Result<(), Report<TrustedServerError>> {
+    let refuse = |message: String| Report::new(TrustedServerError::Configuration { message });
+    for described in builder.middleware() {
+        let Some(middleware) = registration
+            .middleware
+            .iter()
+            .find(|middleware| middleware.middleware_id() == described.name)
+        else {
+            continue;
+        };
+        if !middleware.phases().contains(&described.phase) {
+            let phases: Vec<String> = middleware
+                .phases()
+                .iter()
+                .map(|phase| format!("[[{phase}]]"))
+                .collect();
+            return Err(refuse(format!(
+                "module `{}` describes its middleware `{}` as named in a [[{}]] entry, and the \
+                 middleware it supplies runs in {}",
+                builder.id(),
+                described.name,
+                described.phase,
+                phases.join(" and ")
+            )));
+        }
+        if !middleware.handles_media_type(described.media_type) {
+            return Err(refuse(format!(
+                "module `{}` describes its middleware `{}` as working on `{}`, and the \
+                 middleware it supplies does not",
+                builder.id(),
+                described.name,
+                described.media_type
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn check_middleware(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1942,6 +2012,7 @@ impl IntegrationRegistry {
                     builder.id(),
                     "integration builder ID should match registration ID"
                 );
+                check_described_middleware(&builder, &registration)?;
                 plan_registrations.push(registration);
             }
 
@@ -1976,6 +2047,7 @@ impl IntegrationRegistry {
                     builder.id(),
                     "integration builder ID should match registration ID"
                 );
+                check_described_middleware(&builder, &registration)?;
                 registrations.push(registration);
             }
         }
@@ -1990,6 +2062,7 @@ impl IntegrationRegistry {
         // The geo, Edge Cookie and device module names taken so far, with the
         // integration that supplies each.
         let mut claimed = Vec::new();
+        let mut identifier_modules = Vec::new();
         for registration in plan_registrations.into_iter().chain(registrations) {
             inner
                 .running_integration_ids
@@ -2112,6 +2185,15 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "source", name, registration.integration_id)?;
                 inner.source_modules.push((name, factory));
             }
+            if let Some(module) = registration.identifier_module {
+                claim_module_name(
+                    &mut claimed,
+                    "identifier",
+                    module.id(),
+                    registration.integration_id,
+                )?;
+                identifier_modules.push(module);
+            }
             if let Some((name, contributor)) = registration.robots_txt_contributor {
                 claim_module_name(
                     &mut claimed,
@@ -2171,6 +2253,7 @@ impl IntegrationRegistry {
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.prefix_module = resolve_prefix_module(settings, &inner)?;
         inner.sources = Some(build_sources(settings, &inner.source_modules)?);
+        inner.identifier_modules = Arc::from(identifier_modules);
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
@@ -2236,6 +2319,14 @@ impl IntegrationRegistry {
         &self.inner.prefix_module
     }
 
+    /// The identifier modules the running registrations supply, in
+    /// registration order, which core asks on every request. Shared, so a
+    /// request's services take a reference count rather than a copy.
+    #[must_use]
+    pub fn identifier_modules(&self) -> Arc<[Arc<dyn IdentifierModule>]> {
+        Arc::clone(&self.inner.identifier_modules)
+    }
+
     /// The prefixes of the publisher `request` was resolved to under
     /// `settings`, from the selected prefix module.
     ///
@@ -2273,6 +2364,16 @@ impl IntegrationRegistry {
             .filter(|(_, middleware)| middleware.phases().contains(&phase))
             .map(|(_, middleware)| middleware.middleware_id())
             .collect()
+    }
+
+    /// Whether a registered middleware moves the origin's address itself in
+    /// a body of `media_type`, so core leaves the addresses in such a body
+    /// alone, see [`Middleware::moves_origin_address`].
+    #[must_use]
+    pub fn middleware_moves_origin_address(&self, media_type: &str) -> bool {
+        self.inner.middleware.iter().any(|(_, middleware)| {
+            middleware.moves_origin_address() && middleware.handles_media_type(media_type)
+        })
     }
 
     /// The middleware the first entry covering a response selects, in the
@@ -2484,10 +2585,25 @@ impl IntegrationRegistry {
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
             // The route takes the request, so the context holds a copy of
-            // what it resolved to, beside what was resolved for it.
+            // what it resolved to and of its evidence, beside what was
+            // resolved for it. The evidence is read as the permission path
+            // reads it, after the caller's EC header is gone.
             let resolved = ResolvedRequest::of(&req, services.client_info());
+            let evidence = OwnedRequestInfo::new(
+                services
+                    .client_info()
+                    .client_ip
+                    .map(crate::ec::generation::normalize_ip)
+                    .unwrap_or_default(),
+                req.headers().clone(),
+            )
+            .with_request_target(
+                req.uri().path().to_owned(),
+                req.uri().query().unwrap_or_default().to_owned(),
+            );
             let context = ModuleContext::new(resolved.view())
                 .with_settings(settings)
+                .with_evidence(&evidence)
                 .with_request_state(ec_context, services);
             Some(
                 proxy
@@ -2784,6 +2900,7 @@ impl IntegrationRegistry {
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
                 sources: None,
+                identifier_modules: Arc::default(),
             }),
             plan: None,
             platform: Arc::default(),
@@ -2868,6 +2985,7 @@ impl IntegrationRegistry {
                 prefix_module: SelectedPrefixModule::default(),
                 source_modules: Vec::new(),
                 sources: None,
+                identifier_modules: Arc::default(),
             }),
             plan: None,
             platform: Arc::default(),
@@ -3335,6 +3453,14 @@ pub(crate) mod test_support {
         pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
         /// The line the text middleware adds at the end of a text body.
         pub(crate) const TEXT_LINE: &str = "# added by the middleware fixture\n";
+        /// The name of the fetch middleware that moves the origin's address
+        /// itself, on a media type of its own.
+        pub(crate) const FRAMED: &str = "testing.middleware-fixture.framed";
+        /// The media type the framed middleware works on, whose body core
+        /// leaves to it.
+        pub(crate) const FRAMED_MEDIA_TYPE: &str = "text/x-fixture-rows";
+        /// The line the framed middleware adds at the end of a body.
+        pub(crate) const FRAMED_LINE: &str = "# framed by the middleware fixture\n";
         /// The name of the fetch middleware that prepares.
         pub(crate) const PREPARING: &str = "testing.middleware-fixture.preparing";
         /// The name of the fetch middleware that refuses every request.
@@ -3640,8 +3766,8 @@ pub(crate) mod test_support {
             }
         }
 
-        /// Passes a text body through and adds a line at its end.
-        struct AppendLine;
+        /// Passes a text body through and adds the line at its end.
+        struct AppendLine(&'static str);
 
         impl crate::streaming_processor::StreamProcessor for AppendLine {
             fn process_chunk(
@@ -3651,7 +3777,7 @@ pub(crate) mod test_support {
             ) -> Result<Vec<u8>, std::io::Error> {
                 let mut output = chunk.to_vec();
                 if is_last {
-                    output.extend_from_slice(TEXT_LINE.as_bytes());
+                    output.extend_from_slice(self.0.as_bytes());
                 }
                 Ok(output)
             }
@@ -3674,7 +3800,7 @@ pub(crate) mod test_support {
 
             fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
                 MiddlewareAction {
-                    stream: Some(Box::new(AppendLine)),
+                    stream: Some(Box::new(AppendLine(TEXT_LINE))),
                     ..MiddlewareAction::pass()
                 }
             }
@@ -3701,6 +3827,36 @@ pub(crate) mod test_support {
                         http::HeaderName::from_static(TEXT_HEADER_NAME),
                         http::HeaderValue::from_static(TEXT_HEADER_VALUE),
                     )],
+                    ..MiddlewareAction::pass()
+                }
+            }
+        }
+
+        /// Says it moves the origin's address itself, on its own media type,
+        /// and then leaves the body as it came with a line added, so a test
+        /// sees what core left to it.
+        struct Framed;
+
+        impl Middleware for Framed {
+            fn middleware_id(&self) -> &'static str {
+                FRAMED
+            }
+
+            fn handles_media_type(&self, media_type: &str) -> bool {
+                media_type == FRAMED_MEDIA_TYPE
+            }
+
+            fn moves_origin_address(&self) -> bool {
+                true
+            }
+
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction {
+                    stream: Some(Box::new(AppendLine(FRAMED_LINE))),
                     ..MiddlewareAction::pass()
                 }
             }
@@ -3754,6 +3910,7 @@ pub(crate) mod test_support {
                     .with_middleware(Arc::new(TextHeader))
                     .with_middleware(Arc::new(Locating))
                     .with_middleware(Arc::new(Labeled { text: labeled }))
+                    .with_middleware(Arc::new(Framed))
                     .build(),
             ))
         }
@@ -4856,6 +5013,105 @@ mod tests {
             answer(PermissionSet::none()),
             "test-publisher.com storage=true id=none",
             "and one declaring nothing still sees the permissions but not the identifier"
+        );
+    }
+
+    /// A route that answers with the request evidence its module call
+    /// handed it.
+    struct EvidenceReadingRoute;
+
+    impl EvidenceReadingRoute {
+        fn report(
+            &self,
+            _req: Request<EdgeBody>,
+            evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let body = format!(
+                "ip={} path={} query={} session={} ec={}",
+                evidence.client_ip(),
+                evidence.path(),
+                evidence.query(),
+                evidence.cookie("session").unwrap_or("none"),
+                evidence.header("x-ts-ec").unwrap_or("none"),
+            );
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(body))
+                .expect("should build the response"))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for EvidenceReadingRoute {
+        fn integration_name(&self) -> &'static str {
+            "evidence"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post("/integrations/test/evidence")]
+        }
+
+        async fn handle(
+            &self,
+            call: ModuleCall<'_>,
+            req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            call.inject_with(self, req, Self::report)?
+        }
+    }
+
+    /// A route is handed its request's evidence, being the client address,
+    /// the headers and the address it was asked at, without the caller's EC
+    /// header, so a route that reads the request as evidence can answer.
+    #[test]
+    fn a_route_is_handed_its_requests_evidence() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::POST,
+            "/integrations/test/evidence",
+            (
+                Arc::new(EvidenceReadingRoute) as Arc<dyn IntegrationProxy>,
+                "evidence",
+            ),
+        )]);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/integrations/test/evidence?from=page")
+            .header(header::HOST, "test-publisher.com")
+            .header(header::COOKIE, "session=abc")
+            .header(HEADER_X_TS_EC.clone(), "caller-supplied")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let services =
+            crate::platform::test_support::noop_services_with_client_ip(std::net::IpAddr::from([
+                203, 0, 113, 7,
+            ]));
+
+        let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::POST,
+            path: "/integrations/test/evidence",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
+            req,
+        }))
+        .expect("should find the route")
+        .expect("a route reading the evidence should answer");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("the answer is text");
+
+        assert_eq!(
+            body,
+            "ip=203.0.113.7 path=/integrations/test/evidence query=from=page session=abc ec=none"
         );
     }
 
@@ -6975,6 +7231,148 @@ mod tests {
         );
     }
 
+    /// An identifier module that learns nothing, running under the name it
+    /// was built with.
+    #[derive(Debug)]
+    struct IdleIdentifiers(&'static str);
+
+    impl crate::ec::identifiers::IdentifierModule for IdleIdentifiers {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+
+        fn identifiers(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Vec<crate::ec::eids::Eid>, crate::module_context::Withheld> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The names the two identifier test modules run under.
+    const IDENTIFIER_PROBE_MODULE: &str = "testing.identifier-probe";
+    const IDENTIFIER_SECOND_MODULE: &str = "testing.identifier-second";
+
+    fn identifier_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("identifier-probe")
+                .with_identifier_module(Arc::new(IdleIdentifiers(IDENTIFIER_PROBE_MODULE)))
+                .build(),
+        ))
+    }
+
+    fn identifier_second_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("identifier-second")
+                .with_identifier_module(Arc::new(IdleIdentifiers(IDENTIFIER_SECOND_MODULE)))
+                .build(),
+        ))
+    }
+
+    /// A second registration declaring its identifier module under the
+    /// first's name.
+    fn identifier_same_name_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("identifier-second")
+                .with_identifier_module(Arc::new(IdleIdentifiers(IDENTIFIER_PROBE_MODULE)))
+                .build(),
+        ))
+    }
+
+    fn identifier_probe_builder() -> crate::integrations::IntegrationBuilder {
+        crate::integrations::IntegrationBuilder::new(
+            "identifier-probe",
+            "seam-probe",
+            identifier_probe_registration,
+            validate_nothing,
+        )
+        .with_module_name(IDENTIFIER_PROBE_MODULE)
+    }
+
+    /// No section selects an identifier module. Every running registration's
+    /// is handed out, in registration order, for core to ask on each request.
+    #[test]
+    fn identifier_modules_are_handed_out_in_registration_order() {
+        let mut settings = settings_naming(IDENTIFIER_PROBE_MODULE);
+        settings.select_module("testing", IDENTIFIER_SECOND_MODULE);
+        let extra = [
+            identifier_probe_builder(),
+            crate::integrations::IntegrationBuilder::new(
+                "identifier-second",
+                "seam-probe",
+                identifier_second_registration,
+                validate_nothing,
+            )
+            .with_module_name(IDENTIFIER_SECOND_MODULE),
+        ];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with two identifier modules");
+
+        let ids: Vec<_> = registry
+            .identifier_modules()
+            .iter()
+            .map(|module| module.id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![IDENTIFIER_PROBE_MODULE, IDENTIFIER_SECOND_MODULE],
+            "should hand out every running registration's module in order"
+        );
+    }
+
+    /// A registration a section does not select runs nothing, its identifier
+    /// module included.
+    #[test]
+    fn an_unselected_registration_offers_no_identifier_module() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry =
+            IntegrationRegistry::with_registrations(&settings, &[identifier_probe_builder()])
+                .expect("should build a registry without the probe selected");
+
+        assert!(
+            registry.identifier_modules().is_empty(),
+            "an unselected registration's identifier module should not be asked"
+        );
+    }
+
+    /// Two registrations declaring an identifier module under one name would
+    /// leave a log unable to say which answered, so the pair is refused.
+    #[test]
+    fn two_registrations_declaring_one_identifier_module_name_are_refused() {
+        let mut settings = settings_naming(IDENTIFIER_PROBE_MODULE);
+        settings.select_module("testing", IDENTIFIER_SECOND_MODULE);
+        let extra = [
+            identifier_probe_builder(),
+            crate::integrations::IntegrationBuilder::new(
+                "identifier-second",
+                "seam-probe",
+                identifier_same_name_registration,
+                validate_nothing,
+            )
+            .with_module_name(IDENTIFIER_SECOND_MODULE),
+        ];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should refuse one identifier module name declared twice");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("the identifier module `testing.identifier-probe` is declared twice")
+                && message.contains("`identifier-probe`")
+                && message.contains("`identifier-second`"),
+            "error should name the module and both integrations: {message}"
+        );
+    }
+
     fn html_entry(path: Option<&str>, names: &[&str]) -> PhaseEntry {
         PhaseEntry {
             media_type: HTML_MEDIA_TYPE.to_owned(),
@@ -7014,6 +7412,7 @@ mod tests {
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
                 fixture::LABELED,
+                fixture::FRAMED,
                 crate::service_version::MODULE,
             ],
             "should list the middleware the selected module supplies, and core's own after them"
@@ -7027,7 +7426,8 @@ mod tests {
                 fixture::TEXT,
                 fixture::PREPARING,
                 fixture::REFUSING,
-                fixture::LABELED
+                fixture::LABELED,
+                fixture::FRAMED
             ],
             "should list the middleware that run in the fetch phase"
         );
@@ -7057,6 +7457,30 @@ mod tests {
         assert!(
             chain_for("text/css", "/news/site.css").is_empty(),
             "should run nothing on a media type no entry covers"
+        );
+    }
+
+    #[test]
+    fn a_registered_middleware_that_moves_the_address_itself_says_so_for_its_media_type() {
+        let registry = IntegrationRegistry::new(&fixture_settings_with_entries(Vec::new()))
+            .expect("should build a registry");
+
+        assert!(
+            registry.middleware_moves_origin_address(fixture::FRAMED_MEDIA_TYPE),
+            "should leave the framed media type to the middleware, which no entry names"
+        );
+        assert!(
+            !registry.middleware_moves_origin_address(fixture::TEXT_MEDIA_TYPE)
+                && !registry.middleware_moves_origin_address(HTML_MEDIA_TYPE),
+            "should move the addresses in a body of every other media type"
+        );
+
+        let unselected =
+            IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
+                .expect("should build a registry without the fixture");
+        assert!(
+            !unselected.middleware_moves_origin_address(fixture::FRAMED_MEDIA_TYPE),
+            "should move the addresses where no selected module's middleware claims the body"
         );
     }
 
@@ -7158,6 +7582,77 @@ mod tests {
         }
     }
 
+    /// A builder's description of its middleware is checked against what it
+    /// registers, so a configuration written from the description runs.
+    #[test]
+    fn a_description_the_registration_contradicts_is_refused() {
+        use crate::integrations::{IntegrationBuilder, SuppliedMiddleware};
+
+        const NAME: &str = "testing.described";
+        struct FetchOnly;
+        impl Middleware for FetchOnly {
+            fn middleware_id(&self) -> &'static str {
+                NAME
+            }
+            fn phases(&self) -> &[MiddlewarePhase] {
+                &[MiddlewarePhase::Fetch]
+            }
+            fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+                MiddlewareAction::pass()
+            }
+        }
+        fn register(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("described")
+                    .with_middleware(Arc::new(FetchOnly))
+                    .build(),
+            ))
+        }
+        const WRONG_PHASE: &[SuppliedMiddleware] =
+            &[SuppliedMiddleware::on_html(NAME, MiddlewarePhase::Serve)];
+        const WRONG_MEDIA_TYPE: &[SuppliedMiddleware] = &[SuppliedMiddleware::on(
+            NAME,
+            MiddlewarePhase::Fetch,
+            "text/plain",
+        )];
+        const RIGHT: &[SuppliedMiddleware] =
+            &[SuppliedMiddleware::on_html(NAME, MiddlewarePhase::Fetch)];
+        let builder = |described| {
+            IntegrationBuilder::new("described", "described-crate", register, validate_nothing)
+                .with_module_name(NAME)
+                .with_middleware(described)
+        };
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.select_module("testing", NAME);
+
+        for (described, expected) in [
+            (
+                WRONG_PHASE,
+                "module `described` describes its middleware `testing.described` as named in a \
+                 [[serve]] entry, and the middleware it supplies runs in [[fetch]]",
+            ),
+            (
+                WRONG_MEDIA_TYPE,
+                "module `described` describes its middleware `testing.described` as working on \
+                 `text/plain`, and the middleware it supplies does not",
+            ),
+        ] {
+            let error = IntegrationRegistry::with_registrations(&settings, &[builder(described)])
+                .err()
+                .expect("should refuse a description the registration contradicts");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "should name the module, the middleware and the difference: {message}"
+            );
+        }
+        IntegrationRegistry::with_registrations(&settings, &[builder(RIGHT)])
+            .expect("should accept a description the registration bears out");
+    }
+
     #[test]
     fn a_module_no_section_selects_supplies_no_middleware() {
         let settings = crate::test_support::tests::create_test_settings();
@@ -7186,7 +7681,7 @@ mod tests {
             message.contains(
                 "[[fetch]] entry 2 names `testing.nothing`, which no module that runs supplies"
             ) && message.contains(&format!(
-                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
+                "[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]",
                 fixture::HEAD,
                 fixture::LINKS,
                 fixture::BROKEN,
@@ -7198,6 +7693,7 @@ mod tests {
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
                 fixture::LABELED,
+                fixture::FRAMED,
                 crate::service_version::MODULE
             )),
             "should name the entry and list what could be named: {message}"
@@ -7377,6 +7873,7 @@ mod tests {
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
                 fixture::LABELED,
+                fixture::FRAMED,
             ],
             "should list every middleware when there are no entries"
         );
@@ -7394,7 +7891,8 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
-                fixture::LABELED
+                fixture::LABELED,
+                fixture::FRAMED
             ],
             "should leave out a middleware any entry names"
         );
@@ -7467,7 +7965,8 @@ mod tests {
                 fixture::REFUSING,
                 fixture::TEXT_HEADER,
                 fixture::LOCATING,
-                fixture::LABELED
+                fixture::LABELED,
+                fixture::FRAMED
             ],
             "should count a middleware as named only by an entry of a phase it runs in"
         );

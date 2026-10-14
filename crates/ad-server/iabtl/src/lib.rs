@@ -1,4 +1,4 @@
-//! The demonstration ad server implementation, `ad-server.mock`.
+//! The demonstration ad server implementation, `ad-server.iabtl`.
 //!
 //! It calls mocktioneer's decision endpoint, which picks the winning bid by
 //! price, so a deployment can exercise the ad server seam without a real ad
@@ -49,8 +49,8 @@ use trusted_server_core::platform::{PlatformHttpRequest, PlatformResponse, Runti
 // ============================================================================
 
 /// The name this implementation is selected by, its module path, which
-/// `[ad-server]` shortens to `mock`. It also serves as its builder's id.
-pub const MODULE: &str = "ad-server.mock";
+/// `[ad-server]` shortens to `iabtl`. It also serves as its builder's id.
+pub const MODULE: &str = "ad-server.iabtl";
 
 /// The demonstration ad server implementation.
 pub static ADSERVER: AdServerImplementation = AdServerImplementation { id: MODULE, build };
@@ -106,7 +106,7 @@ pub struct AdServerMockSettings {
     /// to the ad server decision endpoint without hard-coding integration knowledge.
     ///
     /// ```toml
-    /// [ad-server.mock.context_query_params]
+    /// [ad-server.iabtl.context_query_params]
     /// permutive_segments = "permutive"
     /// ```
     #[serde(default)]
@@ -270,14 +270,14 @@ impl AdServerMockProvider {
             json!(null)
         };
 
-        // Build consent summary from ConsentContext
+        // The consent summary, each string asked of the crate for its scheme.
         let consent_json = request.user.consent.as_ref().map(|ctx| {
             json!({
-                "gdpr": if ctx.gdpr_applies { 1 } else { 0 },
-                "consent": ctx.raw_tc_string,
-                "us_privacy": ctx.raw_us_privacy,
-                "gpp": ctx.raw_gpp_string,
-                "gpp_sid": ctx.gpp_section_ids,
+                "gdpr": u8::from(trusted_server_permission_signal_tcf::applies(ctx)),
+                "consent": trusted_server_permission_signal_tcf::tc_string(ctx),
+                "us_privacy": trusted_server_permission_signal_us_privacy::us_privacy_string(ctx),
+                "gpp": trusted_server_permission_signal_gpp::gpp_string(ctx),
+                "gpp_sid": trusted_server_permission_signal_gpp::section_ids(ctx),
             })
         });
 
@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn test_adserver_request_includes_consent() {
-        use trusted_server_core::consent::ConsentContext;
+        use trusted_server_core::consent::{ConsentContext, SignalRecord, SignalStatus};
 
         let config = AdServerMockSettings {
             endpoint: "http://localhost:6767/mediate".to_string(),
@@ -1281,14 +1281,32 @@ mod tests {
         let provider = AdServerMockProvider::new("adserver_mock", config);
 
         let mut request = create_test_auction_request();
-        request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOEFEAyO".to_string()),
-            gdpr_applies: true,
-            raw_us_privacy: Some("1YNN".to_string()),
-            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
-            gpp_section_ids: Some(vec![2, 6]),
-            ..Default::default()
-        });
+        request.user.consent = Some(
+            ConsentContext::default()
+                .with_record(
+                    SignalRecord::new(
+                        trusted_server_permission_signal_tcf::SCHEME,
+                        SignalStatus::Decoded,
+                    )
+                    .with_value("BOEFEAyO")
+                    .with_applies(true),
+                )
+                .with_record(
+                    SignalRecord::new(
+                        trusted_server_permission_signal_us_privacy::SCHEME,
+                        SignalStatus::Decoded,
+                    )
+                    .with_value("1YNN"),
+                )
+                .with_record(
+                    SignalRecord::new(
+                        trusted_server_permission_signal_gpp::SCHEME,
+                        SignalStatus::Decoded,
+                    )
+                    .with_value("DBACNYA~CPXxRfAPXxRfA")
+                    .with_sections(vec![2, 6]),
+                ),
+        );
 
         let adserver_req = provider
             .build_adserver_request(&request, &[])

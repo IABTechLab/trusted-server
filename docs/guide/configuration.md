@@ -1144,29 +1144,28 @@ The country and region permission rules are defined in a human-editable permissi
 ## Consent Configuration
 
 `[consent]` controls request-local interpretation and forwarding of privacy
-signals. It does not create a second consent database. Set `consent_store` to a
-KV store name only when consent should persist with the EC identity graph.
+signals. It does not create a second consent database. The core reads `mode`,
+and every other key is read by the permission signal module for the scheme it
+concerns, so a key no linked module reads is kept as written and not refused.
 
 ### `[consent]`
 
-| Field                                          | Type           | Default                     | Contract                                                    |
-| ---------------------------------------------- | -------------- | --------------------------- | ----------------------------------------------------------- |
-| `mode`                                         | String         | `"interpreter"`             | `interpreter` decodes signals; `proxy` forwards raw strings |
-| `check_expiration`                             | Boolean        | `true`                      | Check TCF timestamps                                        |
-| `max_consent_age_days`                         | Integer        | `395`                       | Clamped to `1..=3650`                                       |
-| `consent_store`                                | String or null | `null`                      | Optional KV store for EC-linked consent persistence         |
-| `gdpr.applies_in`                              | Array[String]  | EU/EEA and UK codes         | Observability only; does not synthesize consent             |
-| `us_states.privacy_states`                     | Array[String]  | Checked built-in state list | Jurisdictions with active comprehensive privacy laws        |
-| `us_privacy_defaults.notice_given`             | Boolean        | `true`                      | Publisher policy used for GPC-only requests                 |
-| `us_privacy_defaults.lspa_covered`             | Boolean        | `false`                     | Publisher LSPA posture                                      |
-| `us_privacy_defaults.gpc_implies_optout`       | Boolean        | `true`                      | Treat `Sec-GPC: 1` as sale opt-out                          |
-| `conflict_resolution.mode`                     | String         | `"restrictive"`             | `restrictive`, `newest`, or `permissive`                    |
-| `conflict_resolution.freshness_threshold_days` | Integer        | `30`                        | Age difference required by `newest`                         |
+| Field                                          | Type    | Default         | Read by      | Contract                                                       |
+| ---------------------------------------------- | ------- | --------------- | ------------ | -------------------------------------------------------------- |
+| `mode`                                         | String  | `"interpreter"` | every module | `interpreter` decodes signals; `proxy` leaves them as received |
+| `check_expiration`                             | Boolean | `true`          | `tcf`        | Expire a record older than `max_consent_age_days`              |
+| `max_consent_age_days`                         | Integer | `395`           | `tcf`        | Clamped to `1..=3650`                                          |
+| `us_privacy_defaults.notice_given`             | Boolean | `true`          | `us-privacy` | Publisher policy used for a string constructed from `Sec-GPC`  |
+| `us_privacy_defaults.lspa_covered`             | Boolean | `false`         | `us-privacy` | Publisher LSPA posture                                         |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean | `true`          | `us-privacy` | Treat `Sec-GPC: 1` in a US state as a sale opt-out             |
+| `conflict_resolution.mode`                     | String  | `"restrictive"` | `tcf`        | `restrictive`, `newest`, or `permissive`                       |
+| `conflict_resolution.freshness_threshold_days` | Integer | `30`            | `tcf`        | Age difference required by `newest`                            |
 
-In `proxy` mode Trusted Server does not decode the TC string, so it cannot
-confirm TCF Purpose 1 + 4. When a TC cookie is present, it fails closed:
-browser-supplied EIDs are neither forwarded in bid requests nor written to the
-EC identity graph, and server-side pull sync is skipped.
+In `proxy` mode no module decodes its string, so a string that arrived is a
+preference the module cannot see and fails closed on the permissions its
+scheme covers, and no module vouches for it, so it is not forwarded in a bid
+request. Browser-supplied EIDs are neither forwarded nor written to the EC
+identity graph, and server-side pull sync is skipped.
 
 ```toml
 [consent]
@@ -1178,10 +1177,6 @@ max_consent_age_days = 395
 mode = "restrictive"
 freshness_threshold_days = 30
 ```
-
-`applies_in` and `privacy_states` are policy inputs. Review them against the
-publisher's operating jurisdictions instead of assuming the built-in lists are
-legal advice.
 
 ## Response Headers
 
@@ -1296,11 +1291,11 @@ it passes through untouched.
 
 ### `[ads-txt]`
 
-| Field     | Type          | Required | Description                                                                       |
-| --------- | ------------- | -------- | --------------------------------------------------------------------------------- |
-| `modules` | Array[String] | Yes      | What adds lines to the file. `sellers` writes the lines `[ads-txt.sellers]` gives |
+| Field     | Type          | Required | Description                                                                   |
+| --------- | ------------- | -------- | ----------------------------------------------------------------------------- |
+| `modules` | Array[String] | Yes      | What adds lines to the file. `iabtl` writes the lines `[ads-txt.iabtl]` gives |
 
-### `[ads-txt.sellers]`
+### `[ads-txt.iabtl]`
 
 | Field   | Type          | Required | Description                                                                                                                                                         |
 | ------- | ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1321,15 +1316,15 @@ document that selects the module but names it in no `[[fetch]]` entry for
 
 ```toml
 [ads-txt]
-modules = ["sellers"]
+modules = ["iabtl"]
 
-[ads-txt.sellers]
+[ads-txt.iabtl]
 lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0", "CONTACT=ads@publisher.example"]
 
 [[fetch]]
 media_type = "text/plain"
 path = "/ads.txt"
-middleware = ["ads-txt.sellers"]
+middleware = ["ads-txt.iabtl"]
 ```
 
 ## Shared Settings
@@ -2087,7 +2082,7 @@ refuses startup too, as does a section that selects nothing, so a table left
 behind after a module is switched off is caught rather than sitting unread.
 
 `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps` and
-`ad-server.mock` supply demand and ad server implementations only. They are
+`ad-server.iabtl` supply demand and ad server implementations only. They are
 not page integrations, so a section that names one refuses startup like any
 name no module supplies. Their settings live in `[demand.<name>]` and
 `[ad-server.<name>]`. `loading-cache.51degrees` supplies a loading cache,
@@ -2164,24 +2159,27 @@ do. An entry carries none and switches nothing on.
 
 ### Entries for a media type other than HTML
 
-An entry covers `text/html`, another `text/` type other than
-`text/x-component`, `application/javascript` or `application/json`, written
-as a bare `type/subtype` in lower case with no parameters. A response is
-matched by the type and subtype of its `Content-Type`, without the
-parameters, so `text/plain; charset=utf-8` takes the entry for
-`text/plain`. Anything else, an image or a length prefixed stream among
-them, passes through untouched and no entry can cover it. So does a
-response that declares a charset other than UTF-8.
+An entry covers `text/html`, another `text/` type, `application/javascript`
+or `application/json`, written as a bare `type/subtype` in lower case with
+no parameters. A response is matched by the type and subtype of its
+`Content-Type`, without the parameters, so `text/plain; charset=utf-8` takes
+the entry for `text/plain`. Anything else, an image among them, passes
+through untouched and no entry can cover it. So does a response that
+declares a charset other than UTF-8.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
 refused when the registry is built, with the entry and the middleware named.
 On a media type other than HTML a middleware changes the body as a stream,
 after core has moved the origin's addresses in it, in the order the entry
-names them. Head markup and the element and text handlers are decisions
-about HTML, and a middleware that makes one there is refused by name. The
-template cache stores HTML alone, so the fetch entry's middleware and then
-the serve entry's run on each response as it is fetched.
+names them. A middleware may say that it moves the origin's addresses
+itself, for a format whose rows count their bytes, and core then leaves the
+addresses in a body of that media type to it whether or not an entry names
+it, so with no entry such a body passes through as the origin sent it. Head
+markup and the element and text handlers are decisions about HTML, and a
+middleware that makes one there is refused by name. The template cache
+stores HTML alone, so the fetch entry's middleware and then the serve
+entry's run on each response as it is fetched.
 
 **A file the origin does not have.** When the origin answers `404 Not Found`
 for a path under the `path` of a `[[fetch]]` entry for a media type other
@@ -2215,6 +2213,7 @@ generated configuration places it in.
 | `js_asset_proxy`              | `[[fetch]]` | Points each configured script at its first-party path and removes one that is blocked. It is asked about an address as the middleware named before it left it, so name it ahead of one that moves the same script                                                           |
 | `testing.testlight`           | `[[fetch]]` | Points a `src` or `href` that names `testlight.js` at the shim, when `rewrite_scripts` is set                                                                                                                                                                               |
 | `framework.nextjs`            | `[[fetch]]` | Moves the origin's address to the publisher's in the data Next.js writes into a page, being the `__NEXT_DATA__` script and the React Server Components payload scripts                                                                                                      |
+| `framework.nextjs.flight`     | `[[fetch]]` | Moves the origin's address to the publisher's in a React Server Components Flight response and writes each length prefixed row's length again, on `text/x-component` alone. It moves the addresses itself, so core leaves a Flight response as sent where no entry names it |
 | `audience.permutive`          | `[[fetch]]` | Points a `src` or `href` that is the Permutive SDK's address at `/integrations/permutive/sdk`, when `rewrite_sdk` is set                                                                                                                                                    |
 | `identity.lockr`              | `[[fetch]]` | Points a `src` or `href` that is the lockr SDK's address at `/integrations/lockr/sdk`, when `rewrite_sdk` is set                                                                                                                                                            |
 | `cmp.didomi`                  | `[[fetch]]` | Writes `window.__tsjs_didomi` into the head, which hands the browser module the path Didomi is served under                                                                                                                                                                 |
@@ -2226,7 +2225,7 @@ generated configuration places it in.
 | `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                                                                                    |
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head, the loader tag after it when `write_loader` is set, and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                            |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                   |
-| `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                   |
+| `ads-txt.iabtl`               | `[[fetch]]` | Writes the lines `[ads-txt.iabtl]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                     |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of the origin's file or where the origin has none, on `text/plain` alone                                                                                                                                     |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                      |
 
@@ -2837,9 +2836,9 @@ allow_script_creatives = false
 module = "pbs_main"
 
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 ```
@@ -2888,8 +2887,8 @@ applies floors locally. With one configured, normalized demand responses are
 sent to it, and Trusted Server falls back to local ranking when the ad server
 cannot run.
 
-The one implementation this repository ships is `ad-server.mock`, written
-`mock` in `[ad-server]`, for
+The one implementation this repository ships is `ad-server.iabtl`, written
+`iabtl` in `[ad-server]`, for
 development and testing.
 
 | Setting                | Required | Default | Description                                                         |
@@ -2901,13 +2900,13 @@ development and testing.
 
 ```toml
 [ad-server]
-module = "mock"
+module = "iabtl"
 
-[ad-server.mock]
+[ad-server.iabtl]
 endpoint = "https://adserver.example.com/decide"
 timeout_ms = 500
 
-[ad-server.mock.context_query_params]
+[ad-server.iabtl.context_query_params]
 example_segments = "segments"
 ```
 
@@ -3234,8 +3233,9 @@ The optional cookie lists control both template lookup and storage:
 Cookie names match exactly and case-sensitively: `session` and `Session` are
 different names. Use nonempty ASCII HTTP token names; whitespace, `;`, `=`, and
 non-ASCII characters are invalid. Configuration rejects invalid names, duplicates
-within a list, overlap between lists, and TS identity cookies (`ts-ec`, `ts-eids`,
-`sharedId`) in the key list. Identity cookies may be listed for bypass. Wildcards,
+within a list, overlap between lists, and identity cookies in the key list, being
+any cookie under the public prefix (such as `ts-ec`) and `sharedId`. Identity
+cookies may be listed for bypass. Wildcards,
 prefixes, and regular expressions are not supported. With either list nonempty, parsing of all
 `Cookie` fields after existing request preparation bypasses duplicate key-cookie names,
 invalid names, and malformed key-cookie values. When independence is `true`,

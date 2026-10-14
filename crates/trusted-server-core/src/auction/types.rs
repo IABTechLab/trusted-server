@@ -96,8 +96,8 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
-    /// The identifiers the request may carry, from the browser's body, the
-    /// [`crate::constants::COOKIE_EIDS`] cookie and the identity graph.
+    /// Extended User IDs the request carried, from its body or from an
+    /// identifier module.
     ///
     /// Gated by the resolved permissions in the endpoint handlers (the auction
     /// and page-bids paths) before any reaches a demand source, which forwards

@@ -29,6 +29,8 @@
 //! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
+//! - [`identifiers`]: the identifier module interface, and the sync of what
+//!   a module learned into the identity graph
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
 //! - [`pull_sync`] — Background pull-sync dispatcher for organic routes
 
@@ -41,13 +43,13 @@ pub mod device;
 pub mod eids;
 pub mod finalize;
 pub mod generation;
+pub mod identifiers;
 pub mod identify;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
 pub mod module;
 pub mod partner;
-pub mod prebid_eids;
 pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
@@ -73,13 +75,12 @@ pub fn log_id(ec_id: &str) -> String {
 
 use std::sync::Arc;
 
-use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::Request;
 
 use crate::consent::jurisdiction::Jurisdiction;
-use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
+use crate::consent::{self as consent_mod, ConsentContext};
 use crate::constants::{COOKIE_EC, COOKIE_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
@@ -196,8 +197,6 @@ struct RequestEc {
     cookie_ec: Option<String>,
     /// Pull-sync completeness marker, if present.
     pull_sync_marker: Option<String>,
-    /// The parsed cookie jar (retained for consent pipeline input).
-    jar: Option<CookieJar>,
 }
 
 /// Parses EC identity from request cookies in a single pass.
@@ -224,7 +223,6 @@ fn parse_ec_from_request(
     Ok(RequestEc {
         cookie_ec,
         pull_sync_marker,
-        jar,
     })
 }
 
@@ -318,11 +316,17 @@ pub struct EcContext {
     /// and writes, from the request's services.
     public_prefix: PublicPrefix,
     /// EIDs the route resolved from the current request: the `/auction` JSON
-    /// body, or the `ts-eids` cookie when the body carried none. Carried to
-    /// response finalization so KV ingestion can use the full set the client
-    /// sent instead of being limited to whatever fits in the size-capped
-    /// `ts-eids` cookie.
+    /// body, or what the identifier modules learned when the body carried
+    /// none. Carried to response finalization so KV ingestion can use the
+    /// full set the client sent instead of being limited to whatever fits in
+    /// a module's size-capped cookie.
     client_eids: Option<Vec<Eid>>,
+    /// Identifiers the identifier modules learned for the request, asked
+    /// once when the state was read, where the request's evidence is in
+    /// hand. Carried to response finalization, which offers them to the
+    /// identity graph, and to the auction, which forwards them when the
+    /// request body carries none.
+    module_eids: Vec<Eid>,
     /// Browser-carried proof of recent pull-partner completeness.
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
@@ -480,28 +484,9 @@ impl EcContext {
             .client_ip
             .map(generation::normalize_ip);
 
-        // Build consent context from request-local cookies, headers, and geo.
-        // Jurisdiction detection follows the permission model's fallback: with
-        // no location resolved the policy's declared jurisdiction stands in, so
-        // a deployment that declared one is not treated as unknown, while a
-        // failed lookup stays unknown so the consent gates fail closed
-        // alongside the requires-signal floor.
-        let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
-            jar: parsed.jar.as_ref(),
-            req,
-            config: &settings.consent,
-            geo: geo_info,
-            default_jurisdiction: consent::default_jurisdiction(geo_status),
-        });
-
-        // Assemble the permission state once, here, through the permission
-        // model, building the country/region baseline amended by what the
-        // signal modules the adapter selected say about the request.
-        // Downstream consumers read the stored result via
-        // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
-        // re-deriving it. The modules see the request as evidence, the same
-        // abstraction the Edge Cookie and device modules read, so a scheme
-        // core has never heard of can read its own signal from it.
+        // The modules see the request as evidence, the same abstraction the
+        // Edge Cookie and device modules read, so a scheme core has never
+        // heard of can read its own signal from it.
         let evidence = crate::evidence::BorrowedRequestInfo::new(
             client_ip.as_deref().unwrap_or_default(),
             Some(req.headers()),
@@ -509,18 +494,50 @@ impl EcContext {
         .with_request_target(req.uri().path(), req.uri().query().unwrap_or_default());
         let mut module_context = ModuleContext::new(ModuleRequest::of(req, services.client_info()))
             .with_evidence(&evidence)
-            .with_consent(&consent)
             .with_settings(settings)
             .with_services(services)
             .with_client(services.client_info());
         if let Some(geo) = geo_info {
             module_context = module_context.with_geo(geo, services.geo().required_permissions());
         }
+
+        // Read the consent once, each signal module reading its own scheme.
+        // Jurisdiction detection follows the permission model's fallback: with
+        // no location resolved the policy's declared jurisdiction stands in, so
+        // a deployment that declared one is not treated as unknown, while a
+        // failed lookup stays unknown so the consent gates fail closed
+        // alongside the requires-signal floor.
+        let consent = consent_mod::read_consent(
+            &module_context,
+            services.permission_signal_modules(),
+            consent_mod::request_jurisdiction(geo_info, consent::default_jurisdiction(geo_status)),
+        );
+
+        // Assemble the permission state once, here, through the permission
+        // model, building the country/region baseline amended by what the
+        // signal modules the adapter selected say about the request.
+        // Downstream consumers read the stored result via
+        // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
+        // re-deriving it.
+        let module_context = module_context.with_consent(&consent);
         let permissions = consent::assemble_permissions(
             &module_context,
             geo_status,
             services.permission_signal_modules(),
         );
+        // Ask the identifier modules once, here, where the request's evidence
+        // is in hand, and carry the answer to finalization and the auction,
+        // which run after routing has consumed the request. With no Edge
+        // Cookie module nothing can hold or forward an identifier, so none
+        // are asked.
+        let module_eids = if selected_module.is_some() {
+            identifiers::learn(
+                &module_context.with_permissions(&permissions),
+                services.identifier_modules(),
+            )
+        } else {
+            Vec::new()
+        };
         // A signal no module vouched for goes no further. The module for
         // its scheme has already decided what its absence means, so what is
         // forwarded is exactly what the permissions were built from.
@@ -559,6 +576,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: services.public_prefix().clone(),
             client_eids: None,
+            module_eids,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
         })
@@ -1033,6 +1051,18 @@ impl EcContext {
         self.client_eids.as_deref()
     }
 
+    /// The identifiers the identifier modules learned for the request.
+    #[must_use]
+    pub fn module_eids(&self) -> &[Eid] {
+        &self.module_eids
+    }
+
+    /// States what the identifier modules learned, in place of asking them.
+    #[cfg(test)]
+    pub(crate) fn set_module_eids_for_test(&mut self, eids: Vec<Eid>) {
+        self.module_eids = eids;
+    }
+
     /// Validates a browser completeness marker against the active EC and partner set.
     pub(crate) fn validate_pull_sync_marker(
         &mut self,
@@ -1103,10 +1133,9 @@ impl EcContext {
     /// storage, scoped to the jurisdiction's storage baseline.
     ///
     /// Answered by the signal modules at construction and recorded on the
-    /// permission state, see [`PermissionState::storage_withdrawn`]. Of the
-    /// schemes that ship, only a TCF record refusing storage withdraws, and
-    /// only where the storage baseline is not `granted`. Suppression (the
-    /// permission merely not set) is reported by
+    /// permission state, see [`PermissionState::storage_withdrawn`]. A module
+    /// withdraws only where the storage baseline is not `granted`.
+    /// Suppression (the permission merely not set) is reported by
     /// [`ec_allowed`](Self::ec_allowed) being `false` instead.
     #[must_use]
     pub fn storage_withdrawn(&self) -> bool {
@@ -1194,7 +1223,7 @@ impl EcContext {
         consent: ConsentContext,
         ec_allowed: bool,
     ) -> Self {
-        let permissions = permissions_for_test(ec_allowed);
+        let permissions = permissions_for_test(ec_allowed, &consent.jurisdiction);
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -1214,6 +1243,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: PublicPrefix::default(),
             client_eids: None,
+            module_eids: Vec::new(),
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -1230,7 +1260,7 @@ impl EcContext {
     #[must_use]
     pub fn new_for_test_withdrawn(ec_value: Option<String>, consent: ConsentContext) -> Self {
         let mut context = Self::new_for_test_gated(ec_value, consent, false);
-        context.permissions = PermissionState::default().with_storage_withdrawn(true);
+        context.permissions = context.permissions.clone().with_storage_withdrawn(true);
         context
     }
 
@@ -1242,6 +1272,7 @@ impl EcContext {
         consent: ConsentContext,
         client_ip: Option<String>,
     ) -> Self {
+        let permissions = permissions_for_test(true, &consent.jurisdiction);
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -1249,7 +1280,7 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed: true,
-            permissions: permissions_for_test(true),
+            permissions,
             client_ip,
             geo_info: None,
             device_signals: None,
@@ -1261,6 +1292,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: PublicPrefix::default(),
             client_eids: None,
+            module_eids: Vec::new(),
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -1278,6 +1310,7 @@ impl EcContext {
         consent: ConsentContext,
         ec_allowed: bool,
     ) -> Self {
+        let permissions = permissions_for_test(ec_allowed, &consent.jurisdiction);
         Self {
             ec_value,
             cookie_ec_value,
@@ -1285,7 +1318,7 @@ impl EcContext {
             ec_generated,
             consent,
             ec_allowed,
-            permissions: permissions_for_test(ec_allowed),
+            permissions,
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -1297,6 +1330,7 @@ impl EcContext {
             recovery_eligible: false,
             public_prefix: PublicPrefix::default(),
             client_eids: None,
+            module_eids: Vec::new(),
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -1315,10 +1349,11 @@ impl EcContext {
     /// storage, as assembly records it when a signal module answers so.
     ///
     /// Core links no module, so a core test cannot derive the withdrawal
-    /// from a consent record the way a deployment does through the TCF
+    /// from a consent record the way a deployment does through a signal
     /// module. It states the answer instead and tests what finalization does
-    /// with it. That a TCF refusal produces this answer is proved where the
-    /// modules are linked, in the Axum adapter's `permission_signals` test.
+    /// with it. That a record refusing storage produces this answer is proved
+    /// where the modules are linked, in the Axum adapter's
+    /// `permission_signals` test.
     #[cfg(test)]
     #[must_use]
     pub fn with_storage_withdrawn_for_test(mut self, withdrawn: bool) -> Self {
@@ -1330,16 +1365,24 @@ impl EcContext {
 /// The permissions a test context stands in for: storage and personalised-ad
 /// selection when the gate is open, none when it is closed.
 #[cfg(test)]
-fn permissions_for_test(ec_allowed: bool) -> PermissionState {
+/// The permission state a test context stands on: the Edge Cookie pair when
+/// the gate is open, and basic ad selection wherever the jurisdiction's
+/// baseline grants it outright, which is what the server-side auction gate
+/// reads.
+fn permissions_for_test(ec_allowed: bool, jurisdiction: &Jurisdiction) -> PermissionState {
+    let mut set = crate::permissions::PermissionSet::none();
     if ec_allowed {
-        PermissionState::new(
-            [Permission::StoreOnDevice, Permission::SelectPersonalisedAds]
-                .into_iter()
-                .collect(),
-        )
-    } else {
-        PermissionState::default()
+        set = set
+            .with(Permission::StoreOnDevice)
+            .with(Permission::SelectPersonalisedAds);
     }
+    if matches!(
+        jurisdiction,
+        Jurisdiction::NonRegulated | Jurisdiction::UsState(_)
+    ) {
+        set = set.with(Permission::SelectBasicAds);
+    }
+    PermissionState::new(set)
 }
 
 /// Returns the current Unix timestamp in seconds, falling back to zero on clock failure.
@@ -1385,7 +1428,7 @@ pub(crate) fn std_system_time_now() -> std::time::SystemTime {
 pub(crate) mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
-    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::consent::types::ConsentContext;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{
         EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
@@ -1456,11 +1499,7 @@ pub(crate) mod tests {
     }
 
     fn granting_consent() -> ConsentContext {
-        ConsentContext {
-            jurisdiction: Jurisdiction::NonRegulated,
-            source: ConsentSource::Cookie,
-            ..Default::default()
-        }
+        ConsentContext::new(Jurisdiction::NonRegulated)
     }
 
     #[tokio::test]
@@ -2392,7 +2431,6 @@ pub(crate) mod tests {
                 Some(&graph),
                 &registry::PartnerRegistry::empty(),
                 None,
-                None,
                 &mut response,
                 &noop_services(),
             )
@@ -2454,7 +2492,6 @@ pub(crate) mod tests {
             Some(&graph),
             &registry::PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2498,7 +2535,6 @@ pub(crate) mod tests {
             ec,
             Some(graph),
             &registry::PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2593,7 +2629,6 @@ pub(crate) mod tests {
             &mut ec,
             Some(&graph),
             &registry::PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),

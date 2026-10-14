@@ -40,7 +40,7 @@ use trusted_server_auction_protocol_openrtb::wire::ToExt;
 #[cfg(test)]
 use trusted_server_auction_protocol_openrtb::wire::{
     Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, User,
-    UserExt, to_openrtb_i32,
+    UserExt, format_eids, to_openrtb_i32,
 };
 use trusted_server_core::auction::demand::{
     CompiledDemand, DemandImplementation, DemandResponse, DemandTimeoutDefault,
@@ -1209,15 +1209,18 @@ impl ApsAuctionProvider {
 
     fn build_regs(consent: Option<&trusted_server_core::consent::ConsentContext>) -> Option<Regs> {
         let consent = consent?;
+        let applies = trusted_server_permission_signal_tcf::applies(consent);
         let ext = RegsExt {
-            gdpr: Some(u8::from(consent.gdpr_applies)),
-            us_privacy: consent.raw_us_privacy.clone(),
-            gpp: consent.raw_gpp_string.clone(),
-            gpp_sid: consent.gpp_section_ids.clone(),
+            gdpr: Some(u8::from(applies)),
+            us_privacy: trusted_server_permission_signal_us_privacy::us_privacy_string(consent)
+                .map(str::to_owned),
+            gpp: trusted_server_permission_signal_gpp::gpp_string(consent).map(str::to_owned),
+            gpp_sid: trusted_server_permission_signal_gpp::section_ids(consent)
+                .map(<[u16]>::to_vec),
         };
         Some(Regs {
             coppa: None,
-            gdpr: Some(consent.gdpr_applies),
+            gdpr: Some(applies),
             us_privacy: ext.us_privacy.clone(),
             gpp: ext.gpp.clone(),
             gpp_sid: ext
@@ -1332,14 +1335,16 @@ impl ApsAuctionProvider {
             .collect();
 
         let consent = request.user.consent.as_ref();
-        let raw_tc = consent.and_then(|value| value.raw_tc_string.clone());
+        let raw_tc = consent
+            .and_then(trusted_server_permission_signal_tcf::tc_string)
+            .map(str::to_owned);
         let user = Some(User {
             id: request.user.id.clone(),
             consent: raw_tc.clone(),
             ext: UserExt {
                 consent: raw_tc,
                 consented_providers_settings: None,
-                eids: request.user.eids.clone(),
+                eids: request.user.eids.as_deref().map(format_eids),
             }
             .to_ext(),
             ..Default::default()
@@ -3856,45 +3861,42 @@ mod engine_tests {
 
     #[test]
     fn consent_fields_keep_an_empty_admitted_context() {
-        use trusted_server_core::consent::ConsentContext;
         use trusted_server_core::consent::jurisdiction::Jurisdiction;
+        use trusted_server_core::consent::{ConsentContext, SignalRecord, SignalStatus};
+        use trusted_server_permission_signal_gpc as gpc;
+        use trusted_server_permission_signal_gpp as gpp;
+        use trusted_server_permission_signal_tcf as tcf;
+        use trusted_server_permission_signal_us_privacy as us_privacy;
 
+        let applying = SignalRecord::new(tcf::SCHEME, SignalStatus::Decoded)
+            .with_value("tc-string")
+            .with_applies(true);
         let cases = [
             ("empty", ConsentContext::default()),
             (
                 "gdpr",
-                ConsentContext {
-                    gdpr_applies: true,
-                    raw_tc_string: Some("tc-string".to_string()),
-                    jurisdiction: Jurisdiction::Gdpr,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::Gdpr).with_record(applying),
             ),
             (
                 "unknown-gpc",
-                ConsentContext {
-                    gpc: true,
-                    jurisdiction: Jurisdiction::Unknown,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::Unknown).with_record(gpc::record()),
             ),
             (
                 "nonregulated-gpc",
-                ConsentContext {
-                    gpc: true,
-                    jurisdiction: Jurisdiction::NonRegulated,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::NonRegulated).with_record(gpc::record()),
             ),
             (
                 "usp-gpp",
-                ConsentContext {
-                    raw_us_privacy: Some("1YNN".to_string()),
-                    raw_gpp_string: Some("gpp-string".to_string()),
-                    gpp_section_ids: Some(vec![7, 8]),
-                    jurisdiction: Jurisdiction::NonRegulated,
-                    ..Default::default()
-                },
+                ConsentContext::new(Jurisdiction::NonRegulated)
+                    .with_record(
+                        SignalRecord::new(us_privacy::SCHEME, SignalStatus::Decoded)
+                            .with_value("1YNN"),
+                    )
+                    .with_record(
+                        SignalRecord::new(gpp::SCHEME, SignalStatus::Decoded)
+                            .with_value("gpp-string")
+                            .with_sections(vec![7, 8]),
+                    ),
             ),
         ];
         for (name, consent) in cases {
@@ -3911,7 +3913,7 @@ mod engine_tests {
                 .expect("APS should preserve empty admitted context");
             assert_eq!(
                 regs["gdpr"],
-                serde_json::json!(u8::from(consent.gdpr_applies)),
+                serde_json::json!(u8::from(tcf::applies(&consent))),
                 "{name}"
             );
             assert!(

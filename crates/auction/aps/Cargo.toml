@@ -24,6 +24,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-auction-protocol-openrtb = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-permission-signal-gpp = { workspace = true }
+trusted-server-permission-signal-tcf = { workspace = true }
+trusted-server-permission-signal-us-privacy = { workspace = true }
 url = { workspace = true }
 validator = { workspace = true }
 
@@ -32,6 +35,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 trusted-server-auction-protocol-openrtb = { workspace = true, features = ["test-utils"] }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
+trusted-server-permission-signal-gpc = { workspace = true }
 
 # The visible owner of this vendor crate, the way Prebid.js requires a named
 # maintainer of every adapter. Amazon has not yet adopted this crate, so the

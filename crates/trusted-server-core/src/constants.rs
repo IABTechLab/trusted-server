@@ -12,9 +12,6 @@ pub const COOKIE_EC_RESOLVED: &str = "ecr";
 
 /// Short-lived signed proof that the current EC row has every pull-partner UID.
 pub const COOKIE_EC_PULL_COMPLETE: &str = "ec-pull-complete";
-/// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
-/// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
-pub const COOKIE_EIDS: &str = "eids";
 /// The cookie the tester routes set and clear.
 pub const COOKIE_TESTER: &str = "tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
@@ -150,15 +147,6 @@ const fn join_internal_headers() -> [&'static str; INTERNAL_HEADER_COUNT] {
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.
 pub const INTERNAL_HEADERS: &[&str] = &join_internal_headers();
-
-// Consent-related cookie names
-pub const COOKIE_EUCONSENT_V2: &str = "euconsent-v2";
-pub const COOKIE_GPP: &str = "__gpp";
-pub const COOKIE_GPP_SID: &str = "__gpp_sid";
-pub const COOKIE_US_PRIVACY: &str = "us_privacy";
-
-// Consent-related header names
-pub const HEADER_SEC_GPC: HeaderName = HeaderName::from_static("sec-gpc");
 
 #[cfg(test)]
 mod tests {

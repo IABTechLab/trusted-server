@@ -22,15 +22,13 @@ use trusted_server_core::auction::test_support::{
 use trusted_server_core::auction::types::{
     AdFormat, AdSlot, AuctionResponse, BidStatus, MediaType,
 };
-use trusted_server_core::consent::ConsentContext;
 use trusted_server_core::consent::jurisdiction::Jurisdiction;
+use trusted_server_core::consent::{ConsentContext, SignalRecord, SignalStatus};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::PlatformResponse;
 use trusted_server_core::request_signing::{RequestSigner, SigningParams};
 
-use crate::demand::{
-    DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RegsPolicy, RequestExtensions,
-};
+use crate::demand::{DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RequestExtensions};
 use crate::request::build_request;
 use crate::response::extract_standard_response;
 use crate::wire::BidRequest;
@@ -106,7 +104,6 @@ mod fixture {
                 imp_tagid: true,
                 site_ref: true,
                 precise_geo: true,
-                additional_consent: true,
                 unsigned_request_identity: true,
                 consumes_bidder_params: true,
                 regs: RegsPolicy::Jurisdiction,
@@ -308,42 +305,35 @@ fn response(status: u16, body: Vec<u8>) -> PlatformResponse {
 
 #[test]
 fn consent_matrix_holds_under_each_implementation() {
+    let applying = SignalRecord::new("tcf", SignalStatus::Decoded)
+        .with_value("tc-string")
+        .with_applies(true);
+    let browser_setting = SignalRecord::new("gpc", SignalStatus::Decoded).with_value("1");
     let cases = [
         ("empty", ConsentContext::default()),
         (
             "gdpr",
-            ConsentContext {
-                gdpr_applies: true,
-                raw_tc_string: Some("tc-string".to_string()),
-                jurisdiction: Jurisdiction::Gdpr,
-                ..Default::default()
-            },
+            ConsentContext::new(Jurisdiction::Gdpr).with_record(applying),
         ),
         (
             "unknown-gpc",
-            ConsentContext {
-                gpc: true,
-                jurisdiction: Jurisdiction::Unknown,
-                ..Default::default()
-            },
+            ConsentContext::new(Jurisdiction::Unknown).with_record(browser_setting.clone()),
         ),
         (
             "nonregulated-gpc",
-            ConsentContext {
-                gpc: true,
-                jurisdiction: Jurisdiction::NonRegulated,
-                ..Default::default()
-            },
+            ConsentContext::new(Jurisdiction::NonRegulated).with_record(browser_setting),
         ),
         (
             "usp-gpp",
-            ConsentContext {
-                raw_us_privacy: Some("1YNN".to_string()),
-                raw_gpp_string: Some("gpp-string".to_string()),
-                gpp_section_ids: Some(vec![7, 8]),
-                jurisdiction: Jurisdiction::NonRegulated,
-                ..Default::default()
-            },
+            ConsentContext::new(Jurisdiction::NonRegulated)
+                .with_record(
+                    SignalRecord::new("us_privacy", SignalStatus::Decoded).with_value("1YNN"),
+                )
+                .with_record(
+                    SignalRecord::new("gpp", SignalStatus::Decoded)
+                        .with_value("gpp-string")
+                        .with_sections(vec![7, 8]),
+                ),
         ),
     ];
     for (name, consent) in cases {
@@ -364,8 +354,8 @@ fn consent_matrix_holds_under_each_implementation() {
                 let regs = regs.expect("should emit actionable regs");
                 let expected_gdpr = match consent.jurisdiction {
                     Jurisdiction::Gdpr => Some(true),
-                    Jurisdiction::Unknown if !consent.gdpr_applies => None,
-                    _ => Some(consent.gdpr_applies),
+                    Jurisdiction::Unknown if !consent.applies() => None,
+                    _ => Some(consent.applies()),
                 };
                 assert_eq!(
                     regs.get("gdpr"),

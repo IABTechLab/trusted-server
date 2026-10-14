@@ -56,6 +56,14 @@ const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 /// The name this module is selected by, in `[tag]`.
 pub const MODULE: &str = "tag.google-tag-manager";
 
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] = &[
+    trusted_server_core::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Fetch,
+    ),
+];
+
 /// The builder a deployment hands to an adapter, which the registry runs when
 /// a section selects [`MODULE`].
 #[must_use]
@@ -67,6 +75,7 @@ pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
         validate,
     )
     .with_module_name(MODULE)
+    .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 /// Host serving the GA beacon endpoints the `/collect` paths are pinned to.
@@ -4050,6 +4059,20 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[super::builder()],
+            super::builder().id(),
         );
     }
 }

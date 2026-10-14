@@ -27,6 +27,19 @@ const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 /// The name this module is selected by, in `[framework]`.
 pub const MODULE: &str = "framework.nextjs";
 
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] = &[
+    trusted_server_core::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Fetch,
+    ),
+    trusted_server_core::integrations::SuppliedMiddleware::on(
+        flight::FLIGHT_MIDDLEWARE,
+        trusted_server_core::middleware::MiddlewarePhase::Fetch,
+        flight::FLIGHT_MEDIA_TYPE,
+    ),
+];
+
 /// The builder a deployment hands to an adapter, which the registry runs when
 /// a section selects [`MODULE`].
 #[must_use]
@@ -38,14 +51,17 @@ pub fn builder() -> trusted_server_core::integrations::IntegrationBuilder {
         validate,
     )
     .with_module_name(MODULE)
+    .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
+mod flight;
 mod rsc;
 mod rsc_placeholders;
 mod rsc_stream;
 mod script_rewriter;
 mod shared;
 
+pub use flight::{FLIGHT_MEDIA_TYPE, FLIGHT_MIDDLEWARE};
 pub use rsc::rewrite_rsc_scripts_combined;
 
 use rsc_placeholders::{NextJsRscPlaceholderRewriter, RscPlaceholderText};
@@ -131,6 +147,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
             .with_middleware(Arc::new(page_change))
+            .with_middleware(Arc::new(flight::Flight))
             .build(),
     ))
 }
@@ -192,6 +209,7 @@ mod tests {
         create_page_processor, place_on_every_page,
     };
     use trusted_server_core::integrations::IntegrationRegistry;
+    use trusted_server_core::middleware::{HTML_MEDIA_TYPE, PhaseEntries, PhaseEntry};
     use trusted_server_core::streaming_processor::{
         Compression, PipelineConfig, StreamingPipeline,
     };
@@ -202,6 +220,20 @@ mod tests {
     fn settings_placing_the_module() -> Settings {
         let mut settings = create_test_settings();
         place_on_every_page(&mut settings, MiddlewarePhase::Fetch, &[MODULE]);
+        settings
+    }
+
+    /// Test settings that select the module and place its HTML middleware on
+    /// every page.
+    fn settings_selecting_and_placing_the_module() -> Settings {
+        let mut settings = settings_placing_the_module();
+        settings
+            .insert_module_config(
+                "framework",
+                MODULE,
+                &json!({"rewrite_attributes": ["href", "link", "url"]}),
+            )
+            .expect("should select the nextjs integration");
         settings
     }
 
@@ -1007,6 +1039,95 @@ mod tests {
         );
     }
 
+    /// The Flight middleware is registered with the module, in the fetch
+    /// phase, and tells core to leave a Flight response's addresses to it
+    /// whether or not an entry names it.
+    #[test]
+    fn the_flight_middleware_is_registered_with_the_module() {
+        let settings = settings_selecting_and_placing_the_module();
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .expect("should create registry");
+
+        assert!(
+            registry
+                .middleware_in(MiddlewarePhase::Fetch)
+                .contains(&FLIGHT_MIDDLEWARE),
+            "should register the Flight middleware for the fetch phase"
+        );
+        assert!(
+            registry.middleware_moves_origin_address(FLIGHT_MEDIA_TYPE),
+            "core should leave a Flight response's addresses to the module"
+        );
+        assert!(
+            !registry.middleware_moves_origin_address(HTML_MEDIA_TYPE)
+                && !registry.middleware_moves_origin_address("text/plain"),
+            "core should move the addresses in every other body"
+        );
+    }
+
+    /// A Flight response takes the entry for its media type, and runs
+    /// nothing where no entry covers it.
+    #[test]
+    fn a_flight_response_takes_the_entry_naming_the_flight_middleware() {
+        let fetch = |entries: Vec<PhaseEntry>| {
+            let mut settings = settings_selecting_and_placing_the_module();
+            settings.fetch = PhaseEntries::new(entries);
+            settings
+        };
+        let html = PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![MODULE.to_owned()],
+        };
+        let flight = PhaseEntry {
+            media_type: FLIGHT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![FLIGHT_MIDDLEWARE.to_owned()],
+        };
+        let chain_for = |settings: &Settings| {
+            IntegrationRegistry::with_registrations(settings, &[builder()])
+                .expect("should create registry")
+                .middleware_chain(
+                    settings.phase_entries(MiddlewarePhase::Fetch),
+                    MiddlewarePhase::Fetch,
+                    FLIGHT_MEDIA_TYPE,
+                    "/news",
+                )
+                .ids()
+        };
+
+        assert_eq!(
+            chain_for(&fetch(vec![html.clone(), flight])),
+            [FLIGHT_MIDDLEWARE],
+            "should run the Flight middleware on a Flight response its entry covers"
+        );
+        assert!(
+            chain_for(&fetch(vec![html])).is_empty(),
+            "should run nothing on a Flight response no entry covers"
+        );
+    }
+
+    #[test]
+    fn an_entry_for_html_naming_the_flight_middleware_is_refused() {
+        let mut settings = settings_selecting_and_placing_the_module();
+        settings.fetch = PhaseEntries::new(vec![PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![MODULE.to_owned(), FLIGHT_MIDDLEWARE.to_owned()],
+        }]);
+
+        let error = IntegrationRegistry::with_registrations(&settings, &[builder()])
+            .err()
+            .expect("should refuse the entry");
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(FLIGHT_MIDDLEWARE)
+                && message.contains("does not work on that media type"),
+            "should name the middleware and say it does not work on HTML: {message}"
+        );
+    }
+
     #[test]
     fn output_overflow_restores_an_in_progress_script_at_every_split() {
         use trusted_server_core::streaming_processor::StreamProcessor as _;
@@ -1069,6 +1190,20 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[super::builder()],
+            super::builder().id(),
         );
     }
 }
