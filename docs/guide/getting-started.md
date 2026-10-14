@@ -214,7 +214,8 @@ the active version's links instead and activates a version whose logical links
 are missing.
 
 ```bash
-EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+TRUSTED_SERVER__GIT_VERSION=v1.3.0 \
+  EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
   ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 ```
 
@@ -222,6 +223,15 @@ See [the Fastly guide](/guide/fastly#upgrading-from-edgezero-v0-0-8) when
 upgrading a service that was deployed before logical store links, and
 [the CLI guide](/guide/cli#lifecycle-commands) for where `<release-root>`
 comes from.
+
+The build compiles `TRUSTED_SERVER__GIT_VERSION` into the binary and reports it
+in the `x-ts-version` response header, so the variable must be set for the
+build the deploy runs, not just for the activation step. The Fastly service
+version is in `x-ts-fastly-version`. Without the variable, a build reports the
+checked-out tag, else the branch, else the first 6 characters of the commit,
+and a build outside a git checkout omits the header. The value is public on
+every response, so pass a neutral value such as the commit hash when a branch
+name is sensitive.
 
 ## Next Steps
 
