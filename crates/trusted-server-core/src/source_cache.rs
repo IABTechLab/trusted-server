@@ -5,15 +5,15 @@
 //! an address records the request headers its `Vary` names, and that record is
 //! held in the loading cache like any other value. A later request for the
 //! address reads the record and is served the copy kept under its own values
-//! for those headers, as RFC 9111 section 4.1 describes, together with what
-//! the publisher's rule adds for inputs the source varies on without saying
-//! so.
+//! for those headers, as RFC 9111 section 4.1 describes.
 //!
 //! Requests for an address no record covers share one load. The request that
 //! leads it fetches the source and writes its copy under its own values before
 //! the record is published, so a waiting request with the same values is
 //! served that copy, and one with other values loads its own, sharing that
-//! load with every request waiting on the same values.
+//! load with every request waiting on the same values. The request whose fetch
+//! ran is served what it fetched, whatever the cache kept, so no request
+//! fetches the source twice.
 //!
 //! A response whose `Vary` is `*`, names `Cookie`, or cannot be read can be
 //! served to no other request, so its record says no copy is kept, and every
@@ -21,7 +21,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,6 +31,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::platform::{
     CacheSpec, LoadError, LoadedValue, Loader, RuntimeServices, ServerKeyPrefix, StoreKey,
+    hash_length_prefixed as push,
 };
 
 /// What a source's response says it varies on, read from its `Vary`.
@@ -185,11 +186,6 @@ impl SourceAddress {
 /// to the source, so they give different digests, as do repeated values in a
 /// different order.
 fn variant(names: &[String], headers: &HeaderMap, declared: Option<&str>) -> String {
-    fn push(hasher: &mut Sha256, part: &[u8]) {
-        hasher.update((part.len() as u64).to_be_bytes());
-        hasher.update(part);
-    }
-
     let mut hasher = Sha256::new();
     push(&mut hasher, b"torque-variant-v1");
     push(&mut hasher, &(names.len() as u64).to_be_bytes());
@@ -271,6 +267,21 @@ pub struct Lookup<'a> {
     pub not_shareable: &'a Bytes,
 }
 
+/// Where a load leaves the copy its own fetch made, for the request whose
+/// fetch it was.
+type Own = Arc<Mutex<Option<Bytes>>>;
+
+fn keep_own(own: &Own, copy: &Bytes) {
+    *own.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(copy.clone());
+}
+
+fn take_own(own: &Own) -> Option<Bytes> {
+    own.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 /// What a lookup found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
@@ -287,20 +298,22 @@ pub enum Found {
 }
 
 /// The copy for `lookup`'s request, from the record and copy caches or from
-/// `fetch`.
+/// `fetch`. When this request's own fetch ran, it is served what that fetch
+/// made, even when the cache keeps it for nobody.
 ///
 /// # Errors
 ///
 /// The error of a fetch this request ran or waited on. Every request waiting
 /// on that fetch receives it, and nothing is kept.
 pub async fn get_or_fetch(lookup: &Lookup<'_>, fetch: Fetch) -> Result<Found, LoadError> {
+    let own = Own::default();
     let record_key = lookup.address.record_key(lookup.cache);
     let record = lookup
         .services
         .load_cached(
             &lookup.cache.records,
             &record_key,
-            record_loader(lookup, Arc::clone(&fetch)),
+            record_loader(lookup, Arc::clone(&fetch), Arc::clone(&own)),
         )
         .await?;
     let Some(record) = AddressRecord::decode(&record) else {
@@ -320,16 +333,22 @@ pub async fn get_or_fetch(lookup: &Lookup<'_>, fetch: Fetch) -> Result<Found, Lo
         lookup.cache,
         &variant(&names, lookup.headers, lookup.declared),
     );
+    if let Some(value) = take_own(&own) {
+        return Ok(Found::Copy {
+            value,
+            key: copy_key,
+        });
+    }
     let value = lookup
         .services
         .load_cached(
             &lookup.cache.copies,
             &copy_key,
-            copy_loader(lookup, names, fetch),
+            copy_loader(lookup, names, fetch, Arc::clone(&own)),
         )
         .await?;
     Ok(Found::Copy {
-        value,
+        value: take_own(&own).unwrap_or(value),
         key: copy_key,
     })
 }
@@ -337,7 +356,7 @@ pub async fn get_or_fetch(lookup: &Lookup<'_>, fetch: Fetch) -> Result<Found, Lo
 /// The record's load, which fetches the source and records what its response
 /// varies on. The fetching request's copy is written under its own values
 /// first, so every request waiting on the record finds it.
-fn record_loader(lookup: &Lookup<'_>, fetch: Fetch) -> Loader {
+fn record_loader(lookup: &Lookup<'_>, fetch: Fetch, own: Own) -> Loader {
     let services = lookup.services.clone();
     let cache = lookup.cache.clone();
     let address = lookup.address.clone();
@@ -346,6 +365,7 @@ fn record_loader(lookup: &Lookup<'_>, fetch: Fetch) -> Loader {
     Box::new(move || {
         Box::pin(async move {
             let fetched = fetch().await?;
+            keep_own(&own, &fetched.copy);
             let SourceVary::Headers(names) = fetched.vary else {
                 return Ok(LoadedValue::new(AddressRecord::NoCopies.encode())
                     .with_lifetime(fetched.lifetime));
@@ -372,9 +392,10 @@ fn record_loader(lookup: &Lookup<'_>, fetch: Fetch) -> Loader {
 /// A copy's load, which fetches the source for this request's values.
 ///
 /// A response that no longer varies on what the record names cannot be kept
-/// under a key the record made, so no request is served it, and the record is
-/// dropped so the next request learns what the source varies on now.
-fn copy_loader(lookup: &Lookup<'_>, names: Vec<String>, fetch: Fetch) -> Loader {
+/// under a key the record made, so only the request that fetched it is served
+/// it, and the record is dropped so the next request learns what the source
+/// varies on now.
+fn copy_loader(lookup: &Lookup<'_>, names: Vec<String>, fetch: Fetch, own: Own) -> Loader {
     let services = lookup.services.clone();
     let cache = lookup.cache.clone();
     let address = lookup.address.clone();
@@ -382,6 +403,7 @@ fn copy_loader(lookup: &Lookup<'_>, names: Vec<String>, fetch: Fetch) -> Loader 
     Box::new(move || {
         Box::pin(async move {
             let fetched = fetch().await?;
+            keep_own(&own, &fetched.copy);
             if fetched.vary != SourceVary::Headers(names) {
                 log::debug!(
                     "source_cache: the source no longer varies as its record says, so the \
@@ -400,76 +422,18 @@ fn copy_loader(lookup: &Lookup<'_>, names: Vec<String>, fetch: Fetch) -> Loader 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use http::HeaderValue;
 
     use super::*;
     use crate::platform::{
-        CacheLifetimes, ClientInfo, PlatformLoadingCache,
-        test_support::{NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend, StubHttpClient},
+        CacheLifetimes,
+        test_support::{MemoryLoadingCache, StubHttpClient, build_services_with_http_client},
     };
 
-    /// A loading cache that keeps every value with a lifetime under its key
-    /// and runs each load in its caller.
-    #[derive(Default)]
-    struct MemoryCache {
-        values: Mutex<HashMap<String, Bytes>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformLoadingCache for MemoryCache {
-        async fn get_or_load(
-            &self,
-            _services: &RuntimeServices,
-            _spec: &CacheSpec,
-            key: &StoreKey,
-            load: Loader,
-        ) -> Result<Bytes, LoadError> {
-            let key = key.to_string();
-            let held = self
-                .values
-                .lock()
-                .expect("should lock the values")
-                .get(&key)
-                .cloned();
-            if let Some(value) = held {
-                return Ok(value);
-            }
-            let loaded = load().await?;
-            if loaded.lifetime.is_none_or(|lifetime| !lifetime.is_zero()) {
-                self.values
-                    .lock()
-                    .expect("should lock the values")
-                    .insert(key, loaded.bytes.clone());
-            }
-            Ok(loaded.bytes)
-        }
-
-        async fn remove(&self, _services: &RuntimeServices, _spec: &CacheSpec, key: &StoreKey) {
-            self.values
-                .lock()
-                .expect("should lock the values")
-                .remove(&key.to_string());
-        }
-    }
-
-    fn services(cache: Arc<MemoryCache>) -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(StubBackend))
-            .http_client(Arc::new(StubHttpClient::new()))
-            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
-                "noop",
-                Arc::new(NoopGeo),
-            )))
-            .client_info(ClientInfo::default())
-            .loading_caches(Arc::new(crate::platform::LoadingCaches::every(cache)))
-            .build()
+    fn services(cache: Arc<MemoryLoadingCache>) -> RuntimeServices {
+        build_services_with_http_client(Arc::new(StubHttpClient::new())).with_loading_cache(cache)
     }
 
     fn spec(name: &'static str) -> CacheSpec {
@@ -646,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_response_records_its_vary_and_each_value_gets_its_own_copy() {
-        let memory = Arc::new(MemoryCache::default());
+        let memory = Arc::new(MemoryLoadingCache::default());
         let services = services(Arc::clone(&memory));
         let fetches = Arc::new(AtomicUsize::new(0));
         let vary = SourceVary::Headers(vec!["x-edition".to_owned()]);
@@ -677,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_response_that_allows_no_copies_has_every_request_fetch_its_own() {
-        let memory = Arc::new(MemoryCache::default());
+        let memory = Arc::new(MemoryLoadingCache::default());
         let services = services(Arc::clone(&memory));
         let fetches = Arc::new(AtomicUsize::new(0));
         let request = headers(&[("x-edition", "red")]);
@@ -701,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_that_changes_its_vary_has_its_record_dropped() {
-        let memory = Arc::new(MemoryCache::default());
+        let memory = Arc::new(MemoryLoadingCache::default());
         let services = services(Arc::clone(&memory));
         let fetches = Arc::new(AtomicUsize::new(0));
         let red = headers(&[("x-edition", "red")]);
@@ -732,16 +696,21 @@ mod tests {
 
         assert_eq!(
             copy(changed),
-            Some(Bytes::from_static(b"not shareable")),
-            "a copy made under another Vary is served to nobody"
+            Some(Bytes::from("edition blue")),
+            "the request that fetched a copy made under another Vary is served it"
         );
-        let keys: Vec<String> = memory
-            .values
-            .lock()
-            .expect("should lock the values")
-            .keys()
-            .cloned()
-            .collect();
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "that request fetches the source once"
+        );
+        let keys = memory.keys();
+        assert!(
+            keys.iter()
+                .filter_map(|key| memory.held(key))
+                .all(|(value, _)| value != "edition blue"),
+            "no other request is served that copy"
+        );
         assert!(
             keys.iter().all(|key| !key.contains("/test-vary/")),
             "the record is dropped so the next request learns the new Vary: {keys:?}"
@@ -750,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_publishers_rule_separates_copies_the_source_does_not() {
-        let memory = Arc::new(MemoryCache::default());
+        let memory = Arc::new(MemoryLoadingCache::default());
         let services = services(Arc::clone(&memory));
         let fetches = Arc::new(AtomicUsize::new(0));
         let request = HeaderMap::new();

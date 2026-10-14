@@ -1772,7 +1772,8 @@ anything but a `200`, HTML, a response carrying `Set-Cookie`, one whose policy
 says `private`, `no-store` or `no-cache` or gives no lifetime, one that varies
 on `*` or on `Cookie`, one larger than a megabyte, an answer the platform's
 image optimizer makes, and the answer to a request carrying `Authorization`, a
-conditional header or a range. A response that may not be shared is served to
+conditional header, a range, or a `Cache-Control` of `no-cache`, `no-store`,
+`min-fresh` or a nonzero `max-age`. A response that may not be shared is served to
 the request whose load fetched it from that one fetch.
 
 | Table                | Field                | Default            | Range         | Description                                                                     |
