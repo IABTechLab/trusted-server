@@ -3,11 +3,10 @@
 //! The regime comes from the request's location, resolved through the same
 //! place tree in `permissions.yaml` that decides the permission baseline, so
 //! one file states the policy for both. The detected jurisdiction never causes
-//! consent to be synthesized (see proposal Key Decision #3), but it is not
-//! only observability either: the server-side auction gate
-//! (`consent_allows_server_side_auction`) fails closed on a GDPR or unknown
-//! jurisdiction, and a US state jurisdiction is what lets a GPC header be
-//! turned into a US Privacy string.
+//! consent to be synthesized by core, and it is not only observability
+//! either, because the permission signal modules read it, and a module for a
+//! US state scheme reads a US state jurisdiction before it acts on a browser
+//! setting.
 
 use core::fmt;
 

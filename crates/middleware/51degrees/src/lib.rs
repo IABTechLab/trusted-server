@@ -31,7 +31,7 @@ use trusted_server_core::evidence::{BorrowedRequestInfo, RequestInfo};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationDocumentState, IntegrationRegistration,
     IntegrationRequestFilter, IntegrationRequestState, ModuleSecretSetting, RequestFilterDecision,
-    RequestFilterEffects, RequestFilterInput,
+    RequestFilterEffects, RequestFilterInput, SuppliedMiddleware,
 };
 use trusted_server_core::middleware::{
     HTML_MEDIA_TYPE, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
@@ -77,6 +77,10 @@ fn always_in_use(_table: &serde_json::Map<String, serde_json::Value>) -> bool {
 /// and sizes in `[cache.51degrees-answers]`.
 const CACHE_FEATURES: &[&str] = &[CACHE];
 
+/// The page change the module supplies, as a `[[serve]]` entry names it.
+const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] =
+    &[SuppliedMiddleware::on_html(MODULE, MiddlewarePhase::Serve)];
+
 /// The builder a deployment installs to offer this middleware, which
 /// `[shared.51degrees]` runs.
 #[must_use]
@@ -85,6 +89,7 @@ pub fn builder() -> IntegrationBuilder {
         .with_shared_settings(config::vendor())
         .with_secret_settings(SECRET_SETTINGS)
         .with_cache_features(CACHE_FEATURES)
+        .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// Registers the client hints middleware and its request filter when
@@ -1220,6 +1225,15 @@ mod tests {
         assert!(
             registration.js_disabled,
             "the headers and the tag are the whole client side"
+        );
+    }
+
+    #[test]
+    fn the_description_is_what_the_shared_table_registers() {
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings_with(""),
+            &stock_builders(),
+            BUILDER_ID,
         );
     }
 

@@ -4,8 +4,8 @@
 /// A numeric `:port` immediately after the host is treated as part of a standalone authority and
 /// is preserved when rewriting the host.
 ///
-/// This is used by both HTML (`__next_f` payloads) and Flight (`text/x-component`) rewriting to
-/// avoid corrupting unrelated hostnames.
+/// Used where an address is written as a bare host, in a page's data and in a
+/// text response, so an unrelated hostname is left alone.
 #[must_use]
 pub fn rewrite_bare_host_at_boundaries(
     text: &str,

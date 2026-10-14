@@ -32,6 +32,14 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 /// The name this module is selected by, in `[ad-tag]`.
 pub const MODULE: &str = "ad-tag.google.diagnostics";
 
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] = &[
+    trusted_server_core::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Serve,
+    ),
+];
+
 /// The builder a deployment hands to an adapter, which the registry runs when
 /// a section selects [`MODULE`].
 #[must_use]
@@ -46,6 +54,7 @@ pub fn builder() -> IntegrationBuilder {
     .with_request_preparer(prepare_request_hook)
     .with_response_finalizer(finalize_response_hook)
     .with_auction_token()
+    .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// Reserved activation query parameter.
@@ -943,6 +952,20 @@ mod tests {
             !processed.contains("__tsjs_gpt_diagnostics_active")
                 && !processed.contains("tsjs-gpt_diagnostics.min.js"),
             "should write nothing into a document diagnostics is not active for: {processed}"
+        );
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[crate::builder(), super::builder()],
+            super::builder().id(),
         );
     }
 }

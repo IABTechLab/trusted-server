@@ -69,12 +69,11 @@ pub struct KvEntry {
 /// Consent state within a KV entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvConsent {
-    /// Raw TCF v2 consent string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tcf: Option<String>,
-    /// Raw GPP consent string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gpp: Option<String>,
+    /// The signals the identifier was created under, keyed by scheme, each as
+    /// it was received. Only a signal a configured module vouched for is
+    /// written.
+    #[serde(flatten)]
+    pub signals: BTreeMap<String, String>,
     /// `true` for a live entry, `false` for a withdrawal tombstone.
     pub ok: bool,
     /// Unix timestamp (seconds) of last consent state change.
@@ -290,8 +289,15 @@ impl KvEntry {
             v: SCHEMA_VERSION,
             created: now,
             consent: KvConsent {
-                tcf: consent.raw_tc_string.clone(),
-                gpp: consent.raw_gpp_string.clone(),
+                signals: consent
+                    .records
+                    .iter()
+                    .filter_map(|record| {
+                        record
+                            .value()
+                            .map(|value| (record.scheme().to_owned(), value.to_owned()))
+                    })
+                    .collect(),
                 ok: true,
                 updated: now,
             },
@@ -320,8 +326,7 @@ impl KvEntry {
             v: SCHEMA_VERSION,
             created: now,
             consent: KvConsent {
-                tcf: None,
-                gpp: None,
+                signals: BTreeMap::new(),
                 ok: true,
                 updated: now,
             },
@@ -352,8 +357,7 @@ impl KvEntry {
             v: SCHEMA_VERSION,
             created: now,
             consent: KvConsent {
-                tcf: None,
-                gpp: None,
+                signals: BTreeMap::new(),
                 ok: false,
                 updated: now,
             },
@@ -472,11 +476,16 @@ mod tests {
     use super::*;
 
     fn sample_consent_context() -> ConsentContext {
-        ConsentContext {
-            raw_tc_string: Some("CP_test_tc_string".to_owned()),
-            raw_gpp_string: Some("DBA_test_gpp".to_owned()),
-            ..ConsentContext::default()
-        }
+        use crate::consent::{SignalRecord, SignalStatus};
+
+        ConsentContext::default()
+            .with_record(
+                SignalRecord::new("scheme-a", SignalStatus::Decoded).with_value("signal-a"),
+            )
+            .with_record(
+                SignalRecord::new("scheme-b", SignalStatus::Decoded).with_value("signal-b"),
+            )
+            .with_record(SignalRecord::new("unvouched", SignalStatus::Unreadable))
     }
 
     fn sample_geo_info() -> GeoInfo {
@@ -511,10 +520,25 @@ mod tests {
         assert_eq!(deserialized.v, SCHEMA_VERSION);
         assert_eq!(deserialized.created, 1_741_824_000);
         assert_eq!(
-            deserialized.consent.tcf.as_deref(),
-            Some("CP_test_tc_string")
+            deserialized
+                .consent
+                .signals
+                .get("scheme-a")
+                .map(String::as_str),
+            Some("signal-a")
         );
-        assert_eq!(deserialized.consent.gpp.as_deref(), Some("DBA_test_gpp"));
+        assert_eq!(
+            deserialized
+                .consent
+                .signals
+                .get("scheme-b")
+                .map(String::as_str),
+            Some("signal-b")
+        );
+        assert!(
+            !deserialized.consent.signals.contains_key("unvouched"),
+            "a record carrying no string is not written"
+        );
         assert!(deserialized.consent.ok, "should be a live entry");
         assert_eq!(deserialized.geo.country, "US");
         assert_eq!(deserialized.geo.region.as_deref(), Some("CA"));
@@ -549,7 +573,7 @@ mod tests {
             "pub_properties": {
                 "origin_domain": "example.com",
                 "seen_domains": {
-                    "example.com": { "first": 1000, "last": 1200, "visits": 3 }
+                    "example.com": { "scheme-a": 1000, "last": 1200, "visits": 3 }
                 }
             },
             "network": {
@@ -589,7 +613,7 @@ mod tests {
         assert!(
             !reserialized.contains("last_seen")
                 && !reserialized.contains("synced")
-                && !reserialized.contains("first")
+                && !reserialized.contains("scheme-a")
                 && !reserialized.contains("last")
                 && !reserialized.contains("cluster_checked")
                 && !reserialized.contains("visits"),
@@ -909,16 +933,39 @@ mod tests {
     }
 
     #[test]
-    fn none_consent_fields_omitted_from_json() {
+    fn a_record_with_no_signals_writes_only_its_state() {
         let entry = KvEntry::tombstone(1000);
-        let json = serde_json::to_string(&entry).expect("should serialize");
-        assert!(
-            !json.contains("\"tcf\""),
-            "None tcf should be omitted from JSON"
+        let json: serde_json::Value = serde_json::to_value(&entry).expect("should serialize");
+        assert_eq!(
+            json["consent"],
+            serde_json::json!({ "ok": false, "updated": 1000 }),
+            "no signal keys are written for a record carrying none"
         );
-        assert!(
-            !json.contains("\"gpp\""),
-            "None gpp should be omitted from JSON"
+    }
+
+    #[test]
+    fn signals_are_written_beside_the_state_under_their_scheme() {
+        let consent = sample_consent_context();
+        let entry = KvEntry::new(&consent, None, 1000, "example.com");
+        let json: serde_json::Value = serde_json::to_value(&entry).expect("should serialize");
+        assert_eq!(
+            json["consent"],
+            serde_json::json!({
+                "scheme-a": "signal-a",
+                "scheme-b": "signal-b",
+                "ok": true,
+                "updated": 1000
+            })
+        );
+        let read: KvConsent = serde_json::from_value(serde_json::json!({
+            "scheme-a": "signal-a",
+            "ok": true,
+            "updated": 1000
+        }))
+        .expect("should read a record written by an earlier build");
+        assert_eq!(
+            read.signals.get("scheme-a").map(String::as_str),
+            Some("signal-a")
         );
     }
 
