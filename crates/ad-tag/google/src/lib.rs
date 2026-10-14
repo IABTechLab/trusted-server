@@ -130,6 +130,16 @@ pub struct GptConfig {
     /// Override via env var: `TRUSTED_SERVER__AD-TAG__GOOGLE__SLIM_PREBID_URL`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slim_prebid_url: Option<String>,
+
+    /// Whether the loader tag is written into the head, for a page that
+    /// carries none of its own. The tag asks for the loader on this module's
+    /// own route, so it is served first party like the rest of the script
+    /// chain. Off by default, because a page that already carries the loader
+    /// would otherwise load it twice.
+    ///
+    /// Override via env var: `TRUSTED_SERVER__AD-TAG__GOOGLE__WRITE_LOADER`
+    #[serde(default)]
+    pub write_loader: bool,
 }
 
 impl IntegrationConfig for GptConfig {}
@@ -579,6 +589,14 @@ impl GptIntegration {
             ));
         }
 
+        // Last, after the shim and the bootstrap it relies on, and fetched
+        // from this module's route so the whole chain stays first party.
+        if self.config.write_loader {
+            scripts.push(format!(
+                "<script async src=\"{ROUTE_PREFIX}/script\"></script>"
+            ));
+        }
+
         scripts
     }
 
@@ -630,6 +648,7 @@ mod tests {
             cache_ttl_seconds: 3600,
             rewrite_script: true,
             slim_prebid_url: None,
+            write_loader: false,
         }
     }
 
@@ -1537,6 +1556,49 @@ mod tests {
                 .iter()
                 .all(|s| !s.contains("__tsjs_slim_prebid_url")),
             "should not emit slim-Prebid URL tag when not configured"
+        );
+    }
+
+    #[test]
+    fn head_inserts_write_the_loader_tag_when_asked() {
+        let integration = GptIntegration::new(GptConfig {
+            write_loader: true,
+            ..test_config()
+        });
+        let inserts = integration.head_markup();
+
+        assert_eq!(inserts.len(), 3, "should add one head insert for the loader");
+        assert_eq!(
+            inserts[2],
+            r#"<script async src="/integrations/gpt/script"></script>"#,
+            "should ask for the loader on this module's own route"
+        );
+    }
+
+    #[test]
+    fn head_inserts_write_the_loader_tag_last() {
+        let integration = GptIntegration::new(GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/tsjs-prebid.min.js".to_string()),
+            write_loader: true,
+            ..test_config()
+        });
+        let inserts = integration.head_markup();
+
+        assert_eq!(inserts.len(), 4, "should add the loader after every other insert");
+        assert!(
+            inserts[3].starts_with("<script async src="),
+            "should write the loader tag after the slim-Prebid address, got: {}",
+            inserts[3]
+        );
+    }
+
+    #[test]
+    fn head_inserts_write_no_loader_tag_by_default() {
+        let inserts = GptIntegration::new(test_config()).head_markup();
+
+        assert!(
+            inserts.iter().all(|s| !s.contains("/integrations/gpt/script")),
+            "should write no loader tag unless asked, got: {inserts:?}"
         );
     }
 
