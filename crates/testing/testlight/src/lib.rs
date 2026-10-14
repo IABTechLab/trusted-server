@@ -635,6 +635,9 @@ mod tests {
         </head><body></body></html>"#;
 
         let mut settings = Settings::default();
+        settings.set_origin_source(&trusted_server_core::source::OriginSettings::new(
+            "https://origin.example.com",
+        ));
         let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
         settings
             .insert_module_config(

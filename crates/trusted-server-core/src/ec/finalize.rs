@@ -13,21 +13,22 @@ use crate::settings::Settings;
 
 use super::EcContext;
 use super::cookies::{expire_ec_cookie, expire_ec_resolved_marker, set_ec_cookie};
+use super::identifiers::collect_eid_updates;
 use super::kv::{
     CreateIfAbsentOutcome, EidCookieSyncOutcome, KvIdentityGraph, PartnerIdUpdate,
     apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
 use super::module::{apply_module_response_headers, module_kv_key};
-use super::prebid_eids::collect_eid_updates;
 use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
 use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies the resolved permission state, cookie reconciliation, Prebid EID
-/// ingestion, and cookie writes for new EC generation.
+/// Applies the resolved permission state, cookie reconciliation, the
+/// ingestion of the identifiers the request carried, and cookie writes for
+/// new EC generation.
 ///
 /// When the request carries an explicit withdrawal signal (a storage opt-out or
 /// a record refusing storage) and the client presented a cookie, the browser
@@ -37,21 +38,19 @@ use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 /// leaves an already-issued cookie intact. There is no separate consent KV
 /// store to clean up.
 ///
-/// `eids_cookie` should be the raw value of the EIDs cookie extracted
-/// from the request *before* routing consumes it.
+/// The identifiers the request carried come from `ec_context`, which holds
+/// what the identifier modules learned when the state was read and what the
+/// route captured from the request body. `sharedid_cookie` should be the raw
+/// value of the `sharedId` cookie extracted from the request *before* routing
+/// consumes it.
 ///
 /// `services` are the request's runtime services, handed to the selected Edge
 /// Cookie module when an orphaned identifier is replaced.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "orphan recovery asks the selected module for a replacement identifier, which needs the request's services on top of the finalize inputs"
-)]
 pub async fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
-    eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
     services: &crate::platform::RuntimeServices,
@@ -119,7 +118,7 @@ pub async fn ec_finalize_response(
             let collected = source
                 .map(|_| {
                     collect_eid_updates(
-                        eids_cookie,
+                        ec_context.module_eids(),
                         sharedid_cookie,
                         ec_context.client_eids(),
                         registry,
@@ -181,7 +180,7 @@ pub async fn ec_finalize_response(
 
         let updates = gate_eid_updates_by_permissions(
             collect_eid_updates(
-                eids_cookie,
+                ec_context.module_eids(),
                 sharedid_cookie,
                 ec_context.client_eids(),
                 registry,
@@ -295,8 +294,8 @@ fn reconcile_pull_sync_marker(
 /// applies to the outbound `/auction` bid request, answered here by
 /// [`EcContext::ec_sharing_allowed`]. Without this, a reader who withheld the
 /// personalised-ad permission would have partner UIDs stripped from the bid
-/// request but still written to the identity graph from the `ts-eids` and
-/// `sharedId` cookies or the `/auction` request body.
+/// request but still written to the identity graph from what the identifier
+/// modules learned, the `sharedId` cookie or the `/auction` request body.
 fn gate_eid_updates_by_permissions(
     updates: Vec<super::kv::PartnerIdUpdate>,
     ec_context: &EcContext,
@@ -617,8 +616,6 @@ mod tests {
     use crate::platform::test_support::noop_services;
     use http::HeaderValue;
 
-    use base64::Engine as _;
-
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
@@ -875,7 +872,6 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -931,7 +927,6 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -986,7 +981,6 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1036,7 +1030,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -1093,7 +1086,6 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1131,7 +1123,6 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1168,7 +1159,6 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1204,7 +1194,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -1247,7 +1236,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -1313,7 +1301,6 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1369,7 +1356,6 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1414,7 +1400,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
             &noop_services(),
@@ -1460,7 +1445,6 @@ mod tests {
                 &mut ec_context,
                 Some(&graph),
                 &registry,
-                None,
                 Some(cookie_id),
                 &mut response,
                 &noop_services(),
@@ -1511,7 +1495,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("generated-cookie-id"),
             &mut response,
             &noop_services(),
@@ -1658,7 +1641,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
             &noop_services(),
@@ -1679,11 +1661,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
-        // Regression test for #1184: the `ts-eids` cookie only carries what
-        // the browser could fit under its size cap, but `/auction` also
-        // hands finalization the full EID set from the request body via
-        // `EcContext::set_client_eids`. That full set must land in KV even
-        // when the cookie alone would have dropped a configured partner.
+        // A module's cookie only carries what the browser could fit under
+        // its size cap, but `/auction` also hands finalization the full EID
+        // set from the request body via `EcContext::set_client_eids`. That
+        // full set must land in KV even when what the module learned alone
+        // would have dropped a configured partner.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("cleid1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1704,14 +1686,16 @@ mod tests {
             false,
         );
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie;
-        // `liveramp.com` was dropped by the browser's size cap.
-        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!([
-                {"source": "id5-sync.com", "uids": [{"id": "ID5_from_cookie", "atype": 1}]}
-            ]))
-            .expect("should serialize test cookie payload"),
-        );
+        // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie the
+        // module read; `liveramp.com` was dropped by the browser's size cap.
+        ec_context.set_module_eids_for_test(vec![Eid {
+            source: "id5-sync.com".to_owned(),
+            uids: vec![Uid {
+                id: "ID5_from_cookie".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
         ec_context.set_client_eids(vec![
             Eid {
                 source: "id5-sync.com".to_owned(),
@@ -1739,7 +1723,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            Some(&eids_cookie),
             None,
             &mut response,
             &noop_services(),
@@ -1813,7 +1796,6 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -1854,7 +1836,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
             &noop_services(),
@@ -1900,7 +1881,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -1949,7 +1929,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2008,7 +1987,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2163,7 +2141,6 @@ mod tests {
                 Some(&graph),
                 &PartnerRegistry::empty(),
                 None,
-                None,
                 &mut response,
                 &noop_services(),
             )
@@ -2211,7 +2188,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2273,7 +2249,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2306,7 +2281,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2330,7 +2304,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2374,7 +2347,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2454,7 +2426,6 @@ mod tests {
                 Some(&graph),
                 &PartnerRegistry::empty(),
                 None,
-                None,
                 &mut response,
                 &noop_services(),
             )
@@ -2503,7 +2474,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2548,7 +2518,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
             &noop_services(),
@@ -2653,7 +2622,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2772,7 +2740,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2827,7 +2794,6 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2863,7 +2829,6 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -2936,7 +2901,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2965,7 +2929,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -2992,7 +2955,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -3022,7 +2984,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -3071,7 +3032,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -3132,7 +3092,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -3169,7 +3128,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut repeated_response,
             &noop_services(),
@@ -3218,7 +3176,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
@@ -3288,7 +3245,6 @@ mod tests {
             None,
             &registry,
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -3324,7 +3280,6 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
             &noop_services(),
         )
@@ -3355,7 +3310,6 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
             &noop_services(),
