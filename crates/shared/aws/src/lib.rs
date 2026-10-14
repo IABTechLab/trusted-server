@@ -312,6 +312,18 @@ mod tests {
         IntegrationRegistry::with_registrations(settings, &[builder()])
     }
 
+    /// The refusal a registry build ended in, or a panic saying `expected`
+    /// when it built.
+    fn refused(
+        result: Result<IntegrationRegistry, Report<TrustedServerError>>,
+        expected: &str,
+    ) -> Report<TrustedServerError> {
+        match result {
+            Err(err) => err,
+            Ok(_) => panic!("{expected}"),
+        }
+    }
+
     #[test]
     fn the_publisher_source_signs_through_the_signer_the_auth_names() {
         let settings = settings_signing_the_origin(auth(Some(OriginQueryPolicy::Strip)));
@@ -458,7 +470,7 @@ mod tests {
             ),
         ] {
             let settings = settings_signing_the_origin(table.clone());
-            let err = registry(&settings).expect_err("should refuse the table at startup");
+            let err = refused(registry(&settings), "should refuse the table at startup");
             assert!(
                 format!("{err:?}").contains(at_startup),
                 "{table:?} should be refused saying `{at_startup}`: {err:?}"
@@ -483,7 +495,7 @@ mod tests {
         );
         settings.proxy.asset_routes.push(route);
 
-        let err = registry(&settings).expect_err("should refuse the route's table");
+        let err = refused(registry(&settings), "should refuse the route's table");
         assert!(
             format!("{err:?}").contains(
                 "[proxy.asset_routes /assets/ source.origin.auth] s3_sigv4 region must not be empty"
@@ -496,8 +508,10 @@ mod tests {
     fn the_signer_is_refused_where_the_build_does_not_offer_it() {
         let settings = settings_signing_the_origin(auth(None));
 
-        let err = IntegrationRegistry::with_registrations(&settings, &[])
-            .expect_err("should refuse a signer nothing offers");
+        let err = refused(
+            IntegrationRegistry::with_registrations(&settings, &[]),
+            "should refuse a signer nothing offers",
+        );
         assert!(
             format!("{err:?}").contains(
                 "[source.origin.auth] type `s3_sigv4` names an origin signer this deployment does not offer"
