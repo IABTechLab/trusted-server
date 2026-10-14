@@ -3743,6 +3743,44 @@ fn publisher_origin_path_and_query<'a>(
     Cow::Owned(built)
 }
 
+/// Writes on `response` the headers each serve middleware an entry names for
+/// `request_path` sets, see
+/// [`Middleware::response_headers`](crate::middleware::Middleware::response_headers).
+fn write_serve_middleware_headers(
+    response: &mut Response<EdgeBody>,
+    reader: &crate::html_processor::ReaderDocument<'_>,
+    request_path: &str,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) {
+    let middleware = integration_registry
+        .middleware_for_path(settings.phase_entries(MiddlewarePhase::Serve), request_path);
+    if middleware.is_empty() {
+        return;
+    }
+    let document_state = IntegrationDocumentState::default();
+    reader.request_state.seed(&document_state);
+    let context = crate::middleware::MiddlewareContext {
+        phase: MiddlewarePhase::Serve,
+        request_host: reader.request_host,
+        request_scheme: reader.request_scheme,
+        origin_host: reader.origin_host,
+        platform: reader.platform,
+        document_state: &document_state,
+        max_buffered_script_bytes: reader.max_buffered_script_bytes,
+        prepared: reader.prepared,
+    };
+    let view = crate::middleware::ResponseView {
+        status: response.status(),
+        headers: response.headers(),
+    };
+    let headers = middleware
+        .iter()
+        .flat_map(|middleware| middleware.response_headers(&context, &view))
+        .collect();
+    write_response_headers(response, headers);
+}
+
 /// Returns the `Location` that keeps a reader on the address they asked for
 /// when the origin redirects to itself, or `None` to leave the header as the
 /// origin wrote it.
@@ -6195,38 +6233,6 @@ pub async fn handle_publisher_request(
         response.headers_mut().insert(header::LOCATION, value);
     }
 
-    // Every serve middleware an entry names for this path is asked for the
-    // headers it sets on this response, whatever the response is, so a
-    // redirect with no body reaches a middleware that rewrites its Location.
-    let header_middleware = integration_registry.middleware_for_path(
-        settings.phase_entries(MiddlewarePhase::Serve),
-        &request_path,
-    );
-    if !header_middleware.is_empty() {
-        let document_state = IntegrationDocumentState::default();
-        request_state.seed(&document_state);
-        let prepared = Prepared::default();
-        let context = crate::middleware::MiddlewareContext {
-            phase: MiddlewarePhase::Serve,
-            request_host,
-            request_scheme,
-            origin_host: &origin_host,
-            platform: integration_registry.platform(),
-            document_state: &document_state,
-            max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
-            prepared: &prepared,
-        };
-        let view = crate::middleware::ResponseView {
-            status: response.status(),
-            headers: response.headers(),
-        };
-        let mut headers = Vec::new();
-        for middleware in &header_middleware {
-            headers.extend(middleware.response_headers(&context, &view));
-        }
-        write_response_headers(&mut response, headers);
-    }
-
     // A file the origin does not have is made, see `PhaseEntries::making`. An
     // origin page where the robots.txt middleware is placed is no file either.
     if (request_method == Method::GET || request_method == Method::HEAD)
@@ -6241,6 +6247,20 @@ pub async fn handle_publisher_request(
         );
         response = empty_document(&entry.media_type)?;
     }
+
+    // Every serve middleware an entry names for this path is asked for the
+    // headers it sets on the response that is sent, whatever it is, so a
+    // redirect with no body reaches a middleware that rewrites its Location.
+    let header_prepared = Prepared::default();
+    let header_reader = crate::html_processor::ReaderDocument {
+        request_host,
+        request_scheme,
+        origin_host: &origin_host,
+        platform: integration_registry.platform(),
+        request_state: &request_state,
+        max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+        prepared: &header_prepared,
+    };
 
     if should_run_ad_stack && response.status() == StatusCode::NOT_MODIFIED {
         if let Some(dispatched) = dispatched_auction.take() {
@@ -6262,9 +6282,23 @@ pub async fn handle_publisher_request(
             .change_context(TrustedServerError::Proxy {
                 message: "failed to build unexpected origin 304 response".to_string(),
             })?;
+        write_serve_middleware_headers(
+            &mut response,
+            &header_reader,
+            &request_path,
+            settings,
+            integration_registry,
+        );
         enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
+    write_serve_middleware_headers(
+        &mut response,
+        &header_reader,
+        &request_path,
+        settings,
+        integration_registry,
+    );
 
     let template_cache_policy = TemplateCachePolicy::from_settings(settings);
     let gate_content_type = response
@@ -6476,6 +6510,13 @@ pub async fn handle_publisher_request(
                 .await;
             }
             let mut response = refusal_response(&refusal)?;
+            write_serve_middleware_headers(
+                &mut response,
+                &header_reader,
+                &request_path,
+                settings,
+                integration_registry,
+            );
             enforce_terminal_private_cache_privacy(&mut response);
             return Ok(PublisherResponse::Buffered(response));
         }
@@ -20555,6 +20596,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_502_for_an_unexpected_origin_304_carries_a_serve_middlewares_headers() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_dispatching_provider();
+            settings.select_module("testing", fixture::MODULE);
+            settings.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: None,
+                    middleware: vec![fixture::LOCATING.to_owned()],
+                }]);
+            let mut orchestrator = AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(&settings),
+            );
+            orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"unused provider response".to_vec());
+            stub.push_response_with_headers(304, Vec::new(), vec![("etag", ORIGIN_ETAG)]);
+            let services = services_with_telemetry(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            );
+
+            let response = run_with_orchestrator(
+                &settings,
+                &services,
+                &orchestrator,
+                &[article_slot()],
+                conditional_navigation_request(),
+            )
+            .await;
+
+            let PublisherResponse::Buffered(response) = response else {
+                panic!("unexpected origin 304 should return a buffered response")
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(fixture::SHOWN_STATUS_NAME)
+                    .and_then(|value| value.to_str().ok()),
+                Some("502"),
+                "should set the middleware's headers on the 502, which is what is sent"
+            );
+        }
+
+        #[tokio::test]
         async fn inactive_ad_stack_304_uses_short_browser_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
@@ -23232,6 +23320,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_made_file_carries_the_headers_a_serve_middleware_sets() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let mut settings =
+            settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        settings.serve = PhaseEntries::new(vec![PhaseEntry {
+            media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::LOCATING.to_owned()],
+        }]);
+
+        let proxied = proxy_with(settings, Method::GET, "/ads.txt", 404).await;
+        let response = response_of(proxied.response);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(fixture::SHOWN_STATUS_NAME)
+                .and_then(|value| value.to_str().ok()),
+            Some("200"),
+            "should set the middleware's headers on the made file, which is what is sent"
+        );
+    }
+
+    #[tokio::test]
     async fn an_html_entry_with_a_path_makes_no_missing_page() {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;
         use crate::middleware::HTML_MEDIA_TYPE;
@@ -23842,7 +23956,7 @@ mod tests {
                 .to_owned()
         }
 
-        fn response_status(response: &PublisherResponse) -> StatusCode {
+        pub(super) fn response_status(response: &PublisherResponse) -> StatusCode {
             match response {
                 PublisherResponse::Buffered(response)
                 | PublisherResponse::PassThrough { response, .. }
@@ -24351,6 +24465,7 @@ mod tests {
     /// A redirect the origin sends to itself, named for the reader on every
     /// route the publisher proxy returns an origin response through.
     mod origin_redirect_tests {
+        use super::object_storage_origin_tests::response_status;
         use super::*;
         use crate::platform::PlatformHttpClient;
 
@@ -25153,15 +25268,6 @@ mod tests {
                 None,
                 "should add no `Location` the origin did not send"
             );
-        }
-
-        fn response_status(response: &PublisherResponse) -> StatusCode {
-            match response {
-                PublisherResponse::Buffered(response)
-                | PublisherResponse::PassThrough { response, .. }
-                | PublisherResponse::Stream { response, .. }
-                | PublisherResponse::AssembleTemplate { response, .. } => response.status(),
-            }
         }
     }
 
