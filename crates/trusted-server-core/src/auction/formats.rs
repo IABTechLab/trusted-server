@@ -197,8 +197,8 @@ fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String
 ///
 /// # Errors
 ///
-/// Returns an error if the request contains invalid banner sizes
-/// (must be `[width, height]`).
+/// Returns an error for malformed banner sizes, invalid video player requirements,
+/// duplicate ad-unit codes in a video auction, or video with configured mediation.
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
@@ -395,7 +395,8 @@ pub(crate) struct OpenRtbResponseConversion {
 /// [`AuctionConfig::rewrite_creatives`], default-on); with both disabled the
 /// creative ships exactly as the bidder returned it, subject to the 1 MiB
 /// per-creative cap. Typed renderers are serialized in the response extension
-/// instead of entering that pipeline at all.
+/// instead of entering that pipeline at all. Video VAST is returned unchanged,
+/// subject to the same size cap, for validation and playback by the caller.
 ///
 /// [`AuctionConfig::sanitize_creatives`]: crate::auction_config_types::AuctionConfig::sanitize_creatives
 /// [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
@@ -560,7 +561,11 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 video.height.and_then(|value| i32::try_from(value).ok())
             }),
             adomain: bid.adomain.clone().unwrap_or_default(),
-            mtype: bid.video.as_ref().map(|_| 2),
+            mtype: Some(if bid.video.is_some() { 2 } else { 1 }),
+            apis: bid
+                .video
+                .as_ref()
+                .map_or_else(Vec::new, |video| video.apis.clone()),
             protocol: bid.video.as_ref().and_then(|video| video.protocol),
             dur: bid.video.as_ref().and_then(|video| video.duration),
             nurl: bid.video.as_ref().and_then(|_| bid.nurl.clone()),
@@ -1230,6 +1235,7 @@ mod tests {
         let vast = " \n<VAST version=\"4.0\"><Ad><InLine><Impression><![CDATA[https://track.example.com/i?a=1&b=${AUCTION_PRICE}]]></Impression><Creatives></Creatives></InLine></Ad></VAST>\n";
         let mut bid = make_bid("div-gpt-top", "example-server", Some(2.0));
         bid.video = Some(crate::auction::types::VideoBid {
+            apis: vec![7],
             protocol: Some(7),
             duration: Some(15),
             width: Some(1920),
@@ -1256,6 +1262,24 @@ mod tests {
         assert_eq!(
             delivered["nurl"], "https://notify.example.com/win?p=${AUCTION_PRICE}",
             "should retain lifecycle notifications for the caller"
+        );
+    }
+
+    #[test]
+    fn video_mixed_inventory_retains_banner_winner_identity() {
+        let mut value = video_wire_value();
+        value["adUnits"][0]["mediaTypes"]["banner"] = json!({"sizes": [[300, 250]]});
+        let body = serde_json::from_value(value).expect("should parse mixed inventory");
+        let settings = make_settings();
+        let request = convert_body_to_auction_request(&body, &settings);
+        let bid = make_bid("example-video", "example-server", Some(2.0));
+        let returned = response_json(
+            convert_to_openrtb_response(&make_result(bid), &settings, &request, true)
+                .expect("should serialize the banner winner"),
+        );
+        assert_eq!(
+            returned["seatbid"][0]["bid"][0]["mtype"], 1,
+            "should identify banner markup for a caller offering both media types"
         );
     }
 

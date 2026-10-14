@@ -1820,6 +1820,101 @@ fn video_response_requires_unambiguous_media_and_inline_markup() {
 }
 
 #[test]
+fn video_response_checks_and_retains_declared_player_apis() {
+    let (_, routed) =
+        routed_with_request("standard", json!({}), video_request_fixture(false), None);
+    let input = &routed.inputs()[0];
+    for declaration in [
+        json!({"api": 1}),
+        json!({"apis": [1]}),
+        json!({"apis": [7, 1]}),
+        json!({"apis": [7], "api": 1}),
+        json!({"apis": "7"}),
+        json!({"apis": ["7"]}),
+        json!({"apis": [7.5]}),
+        json!({"apis": [4294967296_u64]}),
+        json!({"apis": [0]}),
+        json!({"api": "7"}),
+    ] {
+        let mut bid = json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>"});
+        bid.as_object_mut()
+            .expect("should find the bid object")
+            .extend(
+                declaration
+                    .as_object()
+                    .expect("should find API fields")
+                    .clone(),
+            );
+        let parsed = extract_standard_response(
+            "fictional-provider",
+            input,
+            &json!({"seatbid":[{"bid":[bid]}]}),
+            0,
+        );
+        assert!(
+            parsed.bids.is_empty(),
+            "should reject incompatible or malformed APIs: {declaration}"
+        );
+    }
+    for (declaration, expected) in [
+        (json!({"apis": [7]}), vec![7]),
+        (json!({"api": 7}), vec![7]),
+        (json!({"apis": [7], "api": 7}), vec![7]),
+        (json!({"apis": []}), vec![]),
+        (json!({"apis": null, "api": null}), vec![]),
+        (json!({}), vec![]),
+    ] {
+        let mut bid = json!({"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>"});
+        bid.as_object_mut()
+            .expect("should find the bid object")
+            .extend(
+                declaration
+                    .as_object()
+                    .expect("should find API fields")
+                    .clone(),
+            );
+        let parsed = extract_standard_response(
+            "fictional-provider",
+            input,
+            &json!({"seatbid":[{"bid":[bid]}]}),
+            0,
+        );
+        assert_eq!(
+            parsed.bids.len(),
+            1,
+            "should accept supported or omitted APIs: {declaration}"
+        );
+        assert_eq!(
+            parsed.bids[0]
+                .video
+                .as_ref()
+                .expect("should mark video")
+                .apis,
+            expected,
+            "should retain normalized API declarations"
+        );
+    }
+    let mut no_api_request = video_request_fixture(false);
+    no_api_request.slots[0]
+        .video
+        .as_mut()
+        .expect("should find player requirements")
+        .api
+        .clear();
+    let (_, routed) = routed_with_request("standard", json!({}), no_api_request, None);
+    let parsed = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid":[{"bid":[{"impid":"fictional-slot","price":2.0,"mtype":2,"adm":"<VAST/>","apis":[7]}]}]}),
+        0,
+    );
+    assert!(
+        parsed.bids.is_empty(),
+        "should not assume support for an unoffered API"
+    );
+}
+
+#[test]
 fn video_provider_round_trip_uses_active_standard_and_pbs_parsers() {
     futures::executor::block_on(async {
         for profile in ["standard", "prebid-server"] {

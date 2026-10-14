@@ -332,6 +332,7 @@ pub(crate) fn resolve_bid_media(
     {
         return Err(BidRejectionReason::InvalidBid);
     }
+    let apis = admitted_video_apis(value, placement)?;
     let protocol = optional_video_integer(value, "protocol")?;
     if protocol.is_some_and(|value| !placement.protocols.contains(&value)) {
         return Err(BidRejectionReason::UnsupportedMediaType);
@@ -346,12 +347,43 @@ pub(crate) fn resolve_bid_media(
         width,
         height,
         video: Some(VideoBid {
+            apis,
             protocol,
             duration,
             width: creative_width,
             height: creative_height,
         }),
     })
+}
+
+fn admitted_video_apis(
+    value: &Value,
+    placement: &VideoPlacement,
+) -> Result<Vec<i32>, BidRejectionReason> {
+    let mut apis = match value.get("apis") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or(BidRejectionReason::InvalidBid)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(BidRejectionReason::InvalidBid),
+    };
+    // Preserve legacy declarations too; a second field cannot hide an API
+    // the player did not offer. Return the normalized OpenRTB 2.6 array.
+    if let Some(api) = optional_video_integer(value, "api")?
+        && !apis.contains(&api)
+    {
+        apis.push(api);
+    }
+    if apis.iter().any(|api| !placement.api.contains(api)) {
+        return Err(BidRejectionReason::UnsupportedMediaType);
+    }
+    Ok(apis)
 }
 
 fn optional_video_integer(value: &Value, key: &str) -> Result<Option<i32>, BidRejectionReason> {

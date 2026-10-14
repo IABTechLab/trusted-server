@@ -120,6 +120,9 @@ impl VideoPlacement {
 /// Video response facts retained for the caller's player.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoBid {
+    /// Declared markup APIs, including any legacy single API declaration.
+    #[serde(default)]
+    pub apis: Vec<i32>,
     /// Declared VAST protocol, when supplied by the provider.
     pub protocol: Option<i32>,
     /// Declared creative duration in seconds, when supplied by the provider.

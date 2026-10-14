@@ -83,11 +83,10 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 ///
 /// ## Response
 ///
-/// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
-/// `adm` field after mandatory server-side sanitization. First-party resource
-/// and click URL rewriting plus creative TSJS injection are enabled by default;
-/// setting [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
-/// to `false` skips only that rewrite pass.
+/// Returns an `OpenRTB 2.x` response with an explicit `mtype` for each bid.
+/// Banner HTML in `adm` follows the configured sanitization and rewriting
+/// policy. Video `adm` carries inline VAST unchanged for the caller's player;
+/// it does not enter HTML processing. Both paths enforce the creative size cap.
 ///
 /// ## Scroll, refresh, and SPA navigation
 ///
@@ -680,7 +679,9 @@ mod tests {
                 let vast = " \n<VAST version=\"4.0\"><Ad id=\"example\"><InLine><AdSystem>Example</AdSystem><AdTitle>Example video</AdTitle><Impression><![CDATA[https://track.example.com/i?a=1&b=2]]></Impression><Creatives><Creative><Linear><Duration>00:00:15</Duration><MediaFiles><MediaFile delivery=\"progressive\" type=\"video/mp4\" width=\"640\" height=\"360\"><![CDATA[https://cdn.example.com/video.mp4]]></MediaFile></MediaFiles></Linear></Creative></Creatives></InLine></Ad></VAST>\n";
                 http.push_response(200, serde_json::to_vec(&json!({"seatbid":[{"seat":"example-seat","bid":[
                     {"id":"lower-video","impid":"example-video","price":1.0,"mtype":2,"adm":vast,"protocol":7,"dur":15},
-                    {"id":"winning-video","impid":"example-video","price":2.0,"mtype":2,"adm":vast,"protocol":7,"dur":15},
+                    {"id":"winning-video","impid":"example-video","price":2.0,"mtype":2,"adm":vast,"protocol":7,"dur":15,"apis":[7]},
+                    {"id":"unsupported-legacy-api","impid":"example-video","price":40.0,"mtype":2,"adm":vast,"api":1},
+                    {"id":"unsupported-player-api","impid":"example-video","price":30.0,"mtype":2,"adm":vast,"apis":[1]},
                     {"id":"incompatible-banner","impid":"example-video","price":20.0,"mtype":1,"adm":"<div/>"}
                 ]}]})).expect("should serialize bidder response"));
                 let services = crate::platform::test_support::build_services_with_http_client(
@@ -695,7 +696,7 @@ mod tests {
                             "code":"example-video", "mediaTypes":{"video":{
                                 "context":"instream","playerSize":[640,360],
                                 "mimes":["video/mp4","application/vnd.apple.mpegurl","application/x-mpegURL","application/dash+xml"],
-                                "protocols":[7,8],"minduration":0,"maxduration":30,"plcmt":1
+                                "protocols":[7,8],"minduration":0,"maxduration":30,"plcmt":1,"api":[7]
                             }}
                         }]}))
                         .expect("should serialize client video input"),
@@ -737,6 +738,11 @@ mod tests {
                 );
                 assert_eq!(bid["protocol"], 7, "should retain VAST protocol");
                 assert_eq!(bid["dur"], 15, "should retain duration");
+                assert_eq!(
+                    bid["apis"],
+                    json!([7]),
+                    "should retain supported player APIs"
+                );
                 assert!(
                     bid.get("w").is_none() && bid.get("h").is_none(),
                     "should not present player dimensions as declared creative dimensions"

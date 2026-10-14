@@ -69,13 +69,21 @@ contain separate banner and video units. Standard and PBS profiles receive the
 offered video requirements in `imp.video`. APS receives eligible banner
 inventory and skips video-only impressions. A mixed-media response must declare
 its media through `mtype` or the PBS `ext.prebid.type` field. Omitted media type
-is inferred only for an impression offering one supported type.
+is inferred only for an impression offering one supported type. The API returns
+explicit `mtype: 1` for banner winners and `mtype: 2` for video winners, including
+mixed impressions.
 
 A returned video bid has `mtype: 2` and nonempty inline VAST in `adm`. The API
 preserves the VAST string, including whitespace, CDATA, tracking URLs and
 auction macros, through response serialization even when HTML creative
 sanitization and rewriting are enabled. Optional response `protocol` and `dur`
-are checked against the requested requirements and retained. Creative video
+are checked against the requested requirements and retained. This API also
+requires every declared response `apis` or legacy `api` framework to appear in
+the requested player `api` list; an omitted player list offers no frameworks.
+Malformed or unsupported declarations are rejected before winner selection.
+Accepted declarations are returned in `apis`, with legacy `api` normalized into
+that array. Missing response declarations do not infer any framework support,
+and the caller still validates the actual VAST. Creative video
 sizes can differ from the player's dimensions. Missing creative dimensions use
 the requested player dimensions for internal delivery metadata.
 
