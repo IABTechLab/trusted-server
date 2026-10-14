@@ -41,7 +41,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
-        trusted_server_ads_txt_sellers::builder(),
+        trusted_server_ads_txt_iabtl::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -103,7 +103,7 @@ pub struct StockMiddleware {
 pub fn middleware() -> Vec<StockMiddleware> {
     use MiddlewarePhase::{Fetch, Serve};
     use trusted_server_ad_tag_google as google;
-    use trusted_server_ads_txt_sellers as ads_txt_sellers;
+    use trusted_server_ads_txt_iabtl as ads_txt_sellers;
     use trusted_server_auction_prebid as prebid;
     use trusted_server_audience_permutive as permutive;
     use trusted_server_bot_protection_datadome as datadome;
@@ -216,7 +216,7 @@ mod tests {
         include_str!("../../tag/google-tag-manager/src/fixtures/page-change.settings.toml"),
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
         include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
-        include_str!("../../ads-txt/sellers/src/fixtures/sellers.settings.toml"),
+        include_str!("../../ads-txt/iabtl/src/fixtures/sellers.settings.toml"),
     ];
 
     #[test]
@@ -498,7 +498,7 @@ middleware = [\"robots_txt\"]
                 "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
-                "ads-txt.sellers",
+                "ads-txt.iabtl",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

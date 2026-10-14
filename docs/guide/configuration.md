@@ -1296,11 +1296,11 @@ it passes through untouched.
 
 ### `[ads-txt]`
 
-| Field     | Type          | Required | Description                                                                       |
-| --------- | ------------- | -------- | --------------------------------------------------------------------------------- |
-| `modules` | Array[String] | Yes      | What adds lines to the file. `sellers` writes the lines `[ads-txt.sellers]` gives |
+| Field     | Type          | Required | Description                                                                   |
+| --------- | ------------- | -------- | ----------------------------------------------------------------------------- |
+| `modules` | Array[String] | Yes      | What adds lines to the file. `iabtl` writes the lines `[ads-txt.iabtl]` gives |
 
-### `[ads-txt.sellers]`
+### `[ads-txt.iabtl]`
 
 | Field   | Type          | Required | Description                                                                                                                                                         |
 | ------- | ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1321,15 +1321,15 @@ document that selects the module but names it in no `[[fetch]]` entry for
 
 ```toml
 [ads-txt]
-modules = ["sellers"]
+modules = ["iabtl"]
 
-[ads-txt.sellers]
+[ads-txt.iabtl]
 lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0", "CONTACT=ads@publisher.example"]
 
 [[fetch]]
 media_type = "text/plain"
 path = "/ads.txt"
-middleware = ["ads-txt.sellers"]
+middleware = ["ads-txt.iabtl"]
 ```
 
 ## Shared Settings
@@ -2226,7 +2226,7 @@ generated configuration places it in.
 | `bot-protection.datadome.tag` | `[[serve]]` | Writes DataDome's client tag into the head, unless the request filter marked the request, `inject_client_side_tag` is off or no `client_side_key` is set                                                                                                                    |
 | `ad-tag.google`               | `[[fetch]]` | Writes the `tsjs.adInit` bootstrap into the head, the loader tag after it when `write_loader` is set, and, when `rewrite_script` is set, points a `src` or `href` that is the GPT script's address at `/integrations/gpt/script`                                            |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                   |
-| `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                   |
+| `ads-txt.iabtl`               | `[[fetch]]` | Writes the lines `[ads-txt.iabtl]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                     |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of the origin's file or where the origin has none, on `text/plain` alone                                                                                                                                     |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                      |
 

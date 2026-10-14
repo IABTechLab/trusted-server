@@ -245,15 +245,15 @@ pull_sync_concurrency = 3
 # for text/plain on the file's path names the middleware. Each line is a data
 # record or a variable of the ads.txt grammar, checked as the settings load.
 # [ads-txt]
-# modules = ["sellers"]
+# modules = ["iabtl"]
 
-# [ads-txt.sellers]
+# [ads-txt.iabtl]
 # lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0"]
 
 # [[fetch]]
 # media_type = "text/plain"
 # path = "/ads.txt"
-# middleware = ["ads-txt.sellers"]
+# middleware = ["ads-txt.iabtl"]
 
 # The robots.txt the [robots-txt] section describes, made by core's own
 # middleware where this entry names it. The file replaces the origin's own

@@ -22,8 +22,8 @@ const SELLERS_INTEGRATION_ID: &str = "ads_txt_sellers";
 
 /// The name `[ads-txt] modules` selects the module by and a `[[fetch]]` entry
 /// names its middleware by, from this crate's folder. Its settings are the
-/// table `[ads-txt.sellers]`.
-pub const MODULE: &str = "ads-txt.sellers";
+/// table `[ads-txt.iabtl]`.
+pub const MODULE: &str = "ads-txt.iabtl";
 
 /// The media type an `ads.txt` is served as, and the one the middleware
 /// works on.
@@ -120,7 +120,7 @@ fn check_line(line: &str) -> Result<(), String> {
 fn validate_lines(config: &SellersConfig) -> Result<(), Report<TrustedServerError>> {
     if config.lines.is_empty() {
         return Err(Report::new(TrustedServerError::Settings {
-            message: "`lines` in [ads-txt.sellers] is empty, so the module would add nothing. \
+            message: "`lines` in [ads-txt.iabtl] is empty, so the module would add nothing. \
                       Give the lines to add, or do not select the module"
                 .to_owned(),
         }));
@@ -129,7 +129,7 @@ fn validate_lines(config: &SellersConfig) -> Result<(), Report<TrustedServerErro
         if let Err(problem) = check_line(line) {
             return Err(Report::new(TrustedServerError::Settings {
                 message: format!(
-                    "`lines` in [ads-txt.sellers], line {}, `{}`, {problem}",
+                    "`lines` in [ads-txt.iabtl], line {}, `{}`, {problem}",
                     index + 1,
                     line.trim()
                 ),
@@ -150,7 +150,7 @@ fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError
     }
     Err(Report::new(TrustedServerError::Settings {
         message: format!(
-            "[ads-txt] selects `sellers`, but no [[fetch]] entry for `{MEDIA_TYPE}` names \
+            "[ads-txt] selects `iabtl`, but no [[fetch]] entry for `{MEDIA_TYPE}` names \
              `{MODULE}`, so the lines would never be written. Add an entry with media_type = \
              `{MEDIA_TYPE}`, path = `/ads.txt` and the middleware. The path is a prefix, so \
              the entry covers every path that starts with `/ads.txt`"
@@ -291,9 +291,9 @@ mod tests {
     fn settings_with(lines: &[&str]) -> Settings {
         let quoted: Vec<String> = lines.iter().map(|line| format!("\"{line}\"")).collect();
         page_settings(&format!(
-            "[ads-txt]\nmodules = [\"sellers\"]\n\n[ads-txt.sellers]\nlines = [{}]\n\n\
+            "[ads-txt]\nmodules = [\"iabtl\"]\n\n[ads-txt.iabtl]\nlines = [{}]\n\n\
              [[fetch]]\nmedia_type = \"text/plain\"\npath = \"/ads.txt\"\n\
-             middleware = [\"ads-txt.sellers\"]\n",
+             middleware = [\"ads-txt.iabtl\"]\n",
             quoted.join(", ")
         ))
     }
@@ -388,13 +388,13 @@ mod tests {
     #[test]
     fn a_document_naming_the_module_in_no_entry_is_refused() {
         let settings = page_settings(&format!(
-            "[ads-txt]\nmodules = [\"sellers\"]\n\n[ads-txt.sellers]\nlines = [\"{RECORD}\"]\n"
+            "[ads-txt]\nmodules = [\"iabtl\"]\n\n[ads-txt.iabtl]\nlines = [\"{RECORD}\"]\n"
         ));
 
         let refused = validate(&settings).expect_err("should refuse a module no entry places");
         assert!(
             format!("{refused:?}")
-                .contains("no [[fetch]] entry for `text/plain` names `ads-txt.sellers`"),
+                .contains("no [[fetch]] entry for `text/plain` names `ads-txt.iabtl`"),
             "{refused:?}"
         );
         assert!(register(&settings).is_err());
@@ -432,7 +432,7 @@ mod tests {
                     .current_context()
                     .to_string();
                 assert!(
-                    message.contains("`lines` in [ads-txt.sellers], line 2")
+                    message.contains("`lines` in [ads-txt.iabtl], line 2")
                         && message.contains(reason),
                     "{call} should say {reason:?} of {line:?}, and said {message:?}"
                 );
