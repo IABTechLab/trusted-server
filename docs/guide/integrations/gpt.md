@@ -59,6 +59,7 @@ gam_attribution_enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
+write_loader = false
 ```
 
 ### Configuration Options
@@ -69,6 +70,7 @@ rewrite_script = true
 | `script_url`              | string  | No       | `https://securepubads.g.doubleclick.net/tag/js/gpt.js` | URL for the GPT bootstrap script                                  |
 | `cache_ttl_seconds`       | integer | No       | `3600`                                                 | Cache TTL for proxied scripts (60--86400s)                        |
 | `rewrite_script`          | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML                        |
+| `write_loader`            | boolean | No       | `false`                                                | Write the loader tag into the head, for a page that carries none  |
 
 The environment override
 `TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED` works only when
