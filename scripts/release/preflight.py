@@ -102,20 +102,34 @@ def fixed_tools():
                 "acquisition": None,
                 "qualification": "pending",
             })
-    environments = [{
-        "id": identity,
-        "image_sha256": None,
-        "sdk_sha256": None,
-        "acquisition": None,
-        "qualification": "pending",
-    } for identity in (
-        "debian12-x86_64", "macos15-aarch64", "macos15-x86_64",
-        "ubi9-x86_64", "ubuntu22.04-x86_64",
-    )]
+    # Hosted image versions are platform observations, never VM byte hashes.
+    environments = []
+    for identity in ("debian12-x86_64", "gnu-builder-x86_64", "macos15-aarch64",
+                     "macos15-x86_64", "ubi9-x86_64", "ubuntu22.04-x86_64"):
+        mac = identity.startswith("macos")
+        builder = identity == "gnu-builder-x86_64"
+        environment = {
+            "id": identity,
+            "kind": "github-hosted-macos" if mac else "oci-builder" if builder else "oci-runtime",
+            "role": "compilation" if mac or builder else "compatibility-runtime",
+            "acquisition": None,
+            "qualification": "pending",
+        }
+        if mac:
+            environment.update(runner_label="macos-15" if identity.endswith("aarch64")
+                               else "macos-15-intel", runner_image_version=None, sdk_sha256=None)
+        else:
+            environment.update(image_reference=None, oci_index_sha256=None, oci_manifest_sha256=None)
+            if builder:
+                environment.update(sdk_sha256=None, glibc_maximum="2.34")
+        environments.append(environment)
     recipes = []
     for artifact in fixed_artifacts():
         recipes.append({
             "id": artifact["name"],
+            "environment_id": "macos15-aarch64" if artifact["target"] == "aarch64-apple-darwin"
+                              else "macos15-x86_64" if artifact["target"] == "x86_64-apple-darwin"
+                              else "gnu-builder-x86_64",
             "script": "scripts/release/build.sh",
             "sha256": None,
             "qualification": "pending",
@@ -123,6 +137,7 @@ def fixed_tools():
         })
     recipes.append({
         "id": "tsjs",
+        "environment_id": "gnu-builder-x86_64",
         "script": "scripts/release/build-js.sh",
         "sha256": None,
         "qualification": "pending",
@@ -294,7 +309,7 @@ def validate_tools(tools, *, require_qualified=False):
     # Digest strings alone do not confer qualification. Task 8 owns evidence.
     for section, digest_fields in (
         ("tools", ("sha256",)),
-        ("environments", ("image_sha256", "sdk_sha256")),
+        ("environments", ("oci_index_sha256", "oci_manifest_sha256", "sdk_sha256")),
         ("recipes", ("sha256",)),
     ):
         records = tools.get(section) if isinstance(tools, dict) else None
@@ -304,6 +319,8 @@ def validate_tools(tools, *, require_qualified=False):
             if not isinstance(record, dict):
                 raise ValueError(f"tools.{section}: expected record")
             for field in digest_fields:
+                if field not in wanted:
+                    continue
                 digest = record.get(field)
                 if digest is not None and (
                     not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)

@@ -1,0 +1,51 @@
+# Inert proposal: this file is deliberately outside .github/workflows.
+# Register only in a separately authorized disposable mirror after Task 9 and
+# independently authenticated candidate acquisitions are reviewed.
+name: Disposable release environment qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: disposable-release-qualification
+  cancel-in-progress: false
+jobs:
+  qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            environment: gnu-builder-x86_64
+          - runner: macos-15
+            environment: macos15-aarch64
+          - runner: macos-15-intel
+            environment: macos15-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12.6'
+      - name: Refuse incomplete shared recipes and staging acquisitions
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/qualification-logs"
+          python -I -B scripts/release/qualification/qualify.py check-ready > "$RUNNER_TEMP/qualification-logs/readiness.log" 2>&1
+      - name: Retain diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-${{ matrix.environment }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-logs/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

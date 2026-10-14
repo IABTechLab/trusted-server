@@ -3,41 +3,69 @@
     {
       "acquisition": null,
       "id": "debian12-x86_64",
-      "image_sha256": null,
+      "image_reference": null,
+      "kind": "oci-runtime",
+      "oci_index_sha256": null,
+      "oci_manifest_sha256": null,
       "qualification": "pending",
+      "role": "compatibility-runtime"
+    },
+    {
+      "acquisition": null,
+      "glibc_maximum": "2.34",
+      "id": "gnu-builder-x86_64",
+      "image_reference": null,
+      "kind": "oci-builder",
+      "oci_index_sha256": null,
+      "oci_manifest_sha256": null,
+      "qualification": "pending",
+      "role": "compilation",
       "sdk_sha256": null
     },
     {
       "acquisition": null,
       "id": "macos15-aarch64",
-      "image_sha256": null,
+      "kind": "github-hosted-macos",
       "qualification": "pending",
+      "role": "compilation",
+      "runner_image_version": null,
+      "runner_label": "macos-15",
       "sdk_sha256": null
     },
     {
       "acquisition": null,
       "id": "macos15-x86_64",
-      "image_sha256": null,
+      "kind": "github-hosted-macos",
       "qualification": "pending",
+      "role": "compilation",
+      "runner_image_version": null,
+      "runner_label": "macos-15-intel",
       "sdk_sha256": null
     },
     {
       "acquisition": null,
       "id": "ubi9-x86_64",
-      "image_sha256": null,
+      "image_reference": null,
+      "kind": "oci-runtime",
+      "oci_index_sha256": null,
+      "oci_manifest_sha256": null,
       "qualification": "pending",
-      "sdk_sha256": null
+      "role": "compatibility-runtime"
     },
     {
       "acquisition": null,
       "id": "ubuntu22.04-x86_64",
-      "image_sha256": null,
+      "image_reference": null,
+      "kind": "oci-runtime",
+      "oci_index_sha256": null,
+      "oci_manifest_sha256": null,
       "qualification": "pending",
-      "sdk_sha256": null
+      "role": "compatibility-runtime"
     }
   ],
   "recipes": [
     {
+      "environment_id": "gnu-builder-x86_64",
       "id": "trusted-server-fastly.wasm",
       "qualification": "pending",
       "script": "scripts/release/build.sh",
@@ -52,7 +80,9 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "rust_toolchain": "1.95.0",
-        "sqlite_features": ["bundled"],
+        "sqlite_features": [
+          "bundled"
+        ],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -63,6 +93,7 @@
       "sha256": null
     },
     {
+      "environment_id": "macos15-aarch64",
       "id": "ts-aarch64-apple-darwin",
       "qualification": "pending",
       "script": "scripts/release/build.sh",
@@ -77,7 +108,9 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "rust_toolchain": "1.95.0",
-        "sqlite_features": ["bundled"],
+        "sqlite_features": [
+          "bundled"
+        ],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -88,6 +121,7 @@
       "sha256": null
     },
     {
+      "environment_id": "macos15-x86_64",
       "id": "ts-x86_64-apple-darwin",
       "qualification": "pending",
       "script": "scripts/release/build.sh",
@@ -102,7 +136,9 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "rust_toolchain": "1.95.0",
-        "sqlite_features": ["bundled"],
+        "sqlite_features": [
+          "bundled"
+        ],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -113,6 +149,7 @@
       "sha256": null
     },
     {
+      "environment_id": "gnu-builder-x86_64",
       "id": "ts-x86_64-unknown-linux-gnu",
       "qualification": "pending",
       "script": "scripts/release/build.sh",
@@ -127,7 +164,9 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "rust_toolchain": "1.95.0",
-        "sqlite_features": ["bundled"],
+        "sqlite_features": [
+          "bundled"
+        ],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -138,6 +177,7 @@
       "sha256": null
     },
     {
+      "environment_id": "gnu-builder-x86_64",
       "id": "tsjs",
       "qualification": "pending",
       "script": "scripts/release/build-js.sh",
