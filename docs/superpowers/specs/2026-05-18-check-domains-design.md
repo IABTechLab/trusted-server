@@ -543,7 +543,6 @@ fenced code blocks.
 - `.worktrees/`, `.claude/worktrees/`
 - The linter's own files, whose allowlist constants, doc comments,
   fixtures, and worked examples name disallowed hosts on purpose:
-
   - `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
   - `crates/trusted-server-cli/tests/lint_domains_cli.rs`
   - this design spec,
@@ -1904,7 +1903,6 @@ the question.
 1.  **`gix` API entry points — RESOLVED.** The Phase 2 feasibility
     spike (`crates/trusted-server-cli/tests/spike_gix_*.rs`) pinned
     the following gix 0.83 entry points:
-
     - **Repo / objects:** `gix::open`, `gix::init`,
       `Repository::write_blob`, `Repository::find_object` (→
       `Object { data: Vec<u8>, .. }`), `Repository::find_tree`,
