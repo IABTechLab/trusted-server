@@ -63,6 +63,7 @@ def macos_profile(private_root, readonly, *, immutable=()):
     boundary.private_root, boundary.readonly = root, reads
     profile = boundary.command([])[2]
     quoted = deterministic_json_bytes(str(root)).decode().strip()
+    protected_ancestors = set()
     for path in immutable:
         path = Path(path)
         resolved = path.resolve(strict=True)
@@ -71,6 +72,14 @@ def macos_profile(private_root, readonly, *, immutable=()):
         predicate = "subpath" if resolved.is_dir() else "literal"
         quoted_path = deterministic_json_bytes(str(resolved)).decode().strip()
         profile += f"(deny file-write* ({predicate} {quoted_path}))"
+        protected_ancestors.update(parent for parent in resolved.parents if parent.is_relative_to(root))
+    # Path-based write denial must remain attached to the same source pathname.
+    # Deny unlink/rename of its ancestors while permitting writes to their private
+    # node_modules/output children. Broad ancestor file-write denial would block
+    # the required private installations as well.
+    for ancestor in sorted(protected_ancestors):
+        quoted_ancestor = deterministic_json_bytes(str(ancestor)).decode().strip()
+        profile += f"(deny file-write-unlink (literal {quoted_ancestor}))"
     return (profile + "(allow system-socket (socket-domain AF_UNIX))"
             + f"(allow network-bind network-inbound (local unix-socket (subpath {quoted})))"
             + f"(allow network-outbound (remote unix-socket (subpath {quoted})))")

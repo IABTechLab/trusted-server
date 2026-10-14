@@ -480,6 +480,66 @@ class QualificationTests(unittest.TestCase):
             self.assertIn(f'(deny file-write* (subpath "{objects}"))', profile)
 
     @unittest.skipUnless(os.environ.get("TS_RELEASE_BOUNDARY_TESTS") == "1" and sys.platform == "darwin",
+                         "explicit actual macOS ancestor alias protection probe")
+    def test_actual_immutable_ancestors_deny_rename_removal_and_hardlink_aliases(self):
+        import boundaries
+        with tempfile.TemporaryDirectory(prefix="ts-q-") as directory:
+            root = Path(directory).resolve()
+            source = root / "crates/source"
+            source.mkdir(parents=True)
+            manifest = source / "Cargo.toml"
+            manifest.write_text("fixture\n")
+            objects = source / "git/objects"
+            objects.mkdir(parents=True)
+            (source / "node_modules").mkdir()
+            (source / "output").mkdir()
+            python = Path(sys.executable).resolve()
+            boundary = boundaries.MacBoundary(root, [python.parents[1], Path("/usr/lib"),
+                                                       Path("/System/Library")], immutable=[manifest, objects])
+            script = """import errno, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+source = root / 'crates/source'
+for ancestor in (root / 'crates', source, source / 'git'):
+    moved = root / 'moved'
+    try:
+        ancestor.rename(moved)
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM):
+            raise
+    else:
+        manifest = moved / ('source/Cargo.toml' if ancestor == root / 'crates' else 'Cargo.toml')
+        if manifest.is_file():
+            manifest.write_text('mutation-via-ancestor-alias')
+        moved.rename(ancestor)
+        sys.exit('immutable ancestor rename was permitted')
+    try:
+        ancestor.rmdir()
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM):
+            raise
+    else:
+        sys.exit('immutable ancestor removal was permitted')
+try:
+    os.link(source / 'Cargo.toml', root / 'hardlink-alias')
+except OSError as error:
+    if error.errno not in (errno.EACCES, errno.EPERM):
+        raise
+else:
+    sys.exit('immutable hard-link alias was permitted')
+(source / 'node_modules/generated').write_text('private-install-output')
+(source / 'output/generated').write_text('private-build-output')
+"""
+            result = subprocess.run(boundary.command([str(python), "-I", "-B", "-c", script, str(root)]),
+                                    env={"HOME": str(root), "TMPDIR": str(root)}, stdin=subprocess.DEVNULL,
+                                    capture_output=True, close_fds=True, timeout=30, check=False)
+            self.assertEqual(result.returncode, 0,
+                             "should deny ancestor aliases/removal and permit private writes: "
+                             + result.stderr.decode())
+            self.assertEqual(manifest.read_text(), "fixture\n", "should retain original tracked source")
+            self.assertEqual((source / "node_modules/generated").read_text(), "private-install-output")
+            self.assertEqual((source / "output/generated").read_text(), "private-build-output")
+
+    @unittest.skipUnless(os.environ.get("TS_RELEASE_BOUNDARY_TESTS") == "1" and sys.platform == "darwin",
                          "explicit actual local macOS immutable source probe")
     def test_actual_source_writes_denied_while_node_modules_writes_allowed(self):
         import boundaries

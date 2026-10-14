@@ -118,8 +118,11 @@ does not replace Task 7's independent JS boundary or qualify hosted recipes.
 
 The candidate macOS profile can mark actual tracked source files and Git-object
 directories inside the private root immutable, while leaving node_modules and
-output writes available. This separation is locally exercised with actual deny
-and success controls; the full recipe must pass its reviewed tracked-object set.
+output writes available. It also denies unlink/rename of their ancestors so a
+writable ancestor cannot move a protected file outside its literal deny rule.
+This separation is locally exercised with actual ancestor rename/removal,
+hard-link, source-write and private-output controls; the full recipe must pass
+its reviewed tracked-object set.
 
 Both boundaries require actual positive then confined TCP and UDP bind/connect/
 send probes for IPv4/IPv6, loopback/documentation-address destinations, across
