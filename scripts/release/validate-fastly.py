@@ -120,6 +120,9 @@ def publisher_response(status, body, headers):
     path = match[1].decode("ascii")
     if not re.fullmatch(r"/static/tsjs=tsjs-unified\.min\.js\?v=[a-f0-9]{64}", path):
         raise ValueError("publisher script injection path mismatch")
+    injected = re.search(re.escape(selected[0]) + rb"\s*</script\s*>", body, re.I)
+    if injected is None or body[:injected.start()] + body[injected.end():] != HTML:
+        raise ValueError("publisher response must preserve complete HTML origin fixture")
     return path
 
 

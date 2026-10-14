@@ -45,7 +45,7 @@ SHARED_CLOSURE = (
     "crates/trusted-server-cli/Cargo.toml", "crates/trusted-server-core/Cargo.toml",
     "crates/trusted-server-js/Cargo.toml", "crates/trusted-server-adapter-fastly/Cargo.toml",
 )
-RUST_CLOSURE = ("edgezero.toml", "crates/trusted-server-core/src/integrations/registry.rs",
+RUST_CLOSURE = ("trusted-server.example.toml", "edgezero.toml", "crates/trusted-server-core/src/integrations/registry.rs",
                 "scripts/release/build.sh", "scripts/release/inspect-native.py",
                 "scripts/release/validate-fastly.py", "scripts/release/rust_recipe.py",
                 "crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml",

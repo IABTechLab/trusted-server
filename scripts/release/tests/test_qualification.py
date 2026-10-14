@@ -80,7 +80,7 @@ def observation():
 class RuntimeClosureTests(unittest.TestCase):
     def test_runtime_gate_source_inputs_change_candidate_fingerprint(self):
         tools = json.loads((RELEASE / "release-tools.json").read_text())
-        for changed in ("edgezero.toml", "crates/trusted-server-core/src/integrations/registry.rs"):
+        for changed in ("trusted-server.example.toml", "edgezero.toml", "crates/trusted-server-core/src/integrations/registry.rs"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 for name in (*qualify.SHARED_CLOSURE, *qualify.RUST_CLOSURE):

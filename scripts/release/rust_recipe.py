@@ -526,6 +526,10 @@ def candidate_selection(asset, commit):
         required_tools.update({"wasmtime", "viceroy"})
     if set(selected["tools"]) != required_tools:
         raise ValueError("candidate acquisition tool closure incomplete")
+    if environment_id == "gnu-builder-x86_64":
+        from boundaries import DOCKER_EXECUTABLE
+        if selected["tools"]["docker"]["path"] != DOCKER_EXECUTABLE:
+            raise ValueError("candidate must bind the actual source-owned Docker executable")
     for name, tool in selected["tools"].items():
         if not isinstance(tool, dict) or set(tool) != {"path", "sha256", "acquisition_sha256"}:
             raise ValueError("candidate acquisition tool binding incomplete")
@@ -580,6 +584,13 @@ def vendor_configuration(lock_bytes, vendor):
     if tomllib.loads(data.decode()) != configuration:
         raise ValueError("source-owned Cargo configuration encoding mismatch")
     return data
+
+
+def write_vendor_configuration(lock_bytes, vendor, configuration, boundary):
+    """Write source-owned Cargo replacement paths in the execution namespace."""
+    from boundaries import LinuxBoundary
+    directory = boundary.map_path(vendor) if isinstance(boundary, LinuxBoundary) else str(vendor)
+    Path(configuration).write_bytes(vendor_configuration(lock_bytes, directory))
 
 
 def compare_final_bytes(a, b, artifact):
@@ -651,6 +662,56 @@ def _compile_environment(selection, workspace, artifact, request, snapshot, jobs
     return environment, tools
 
 
+def native_cli_contract(source, commit):
+    """Bind native CLI version and embedded fictional scaffold to prepared source."""
+    preflight._commit_id(commit)
+    source = Path(source)
+    workspace = tomllib.loads(prepare._regular_bytes(source / "Cargo.toml", 1048576).decode())
+    package = tomllib.loads(prepare._regular_bytes(source / "crates/trusted-server-cli/Cargo.toml", 1048576).decode())["package"]
+    if package.get("name") != "trusted-server-cli":
+        raise ValueError("native CLI owning package mismatch")
+    version = package.get("version")
+    if version == {"workspace": True}:
+        version = workspace["workspace"]["package"]["version"]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?", version):
+        raise ValueError("native CLI source package version invalid")
+    scaffold = prepare._regular_bytes(source / "trusted-server.example.toml", 1048576)
+    if not scaffold or not tomllib.loads(scaffold.decode()):
+        raise ValueError("native CLI source scaffold missing")
+    return {"package_version": version, "source_commit": commit, "scaffold": scaffold,
+            "version_stdout": ("ts " + version + " (" + commit + ")\n").encode()}
+
+
+def native_cli_outcomes(contract, help_output, version, initialization, scaffold):
+    """Require actual help, full source/version binding and exact generated config."""
+    if b"Usage: ts" not in help_output:
+        raise ValueError("native CLI help startup missing")
+    if version != contract["version_stdout"]:
+        raise ValueError("native CLI version/source binding mismatch")
+    if not re.fullmatch(rb"Initialized config at [^\r\n]+/trusted-server\.toml\n", initialization):
+        raise ValueError("native CLI config initialization outcome missing")
+    if scaffold != contract["scaffold"]:
+        raise ValueError("native CLI generated scaffold missing or differs from prepared source")
+    return {"help": {"exit_code": 0, "stdout_sha256": sha256_bytes(help_output)},
+            "version": {"exit_code": 0, "stdout_sha256": sha256_bytes(version),
+                        "package_version": contract["package_version"], "source_commit": contract["source_commit"]},
+            "config_init": {"exit_code": 0, "stdout_sha256": sha256_bytes(initialization),
+                            "scaffold_sha256": sha256_bytes(scaffold), "scaffold_size": len(scaffold)}}
+
+
+def native_cli_probe(executable, runtime, contract, environment, log_root):
+    """Run fixed native commands outside checkout with fresh writable config state."""
+    generated = runtime / "output"
+    generated.mkdir(mode=0o700)
+    configuration = generated / "trusted-server.toml"
+    help_output, _ = capture([str(executable), "--help"], environment, generated, log_root / "help", timeout=30, maximum=65536)
+    version, _ = capture([str(executable), "--version"], environment, generated, log_root / "version", timeout=30, maximum=65536)
+    initialized, _ = capture([str(executable), "config", "init", "--app-config", str(configuration)],
+                             environment, generated, log_root / "config-init", timeout=30, maximum=65536)
+    scaffold = prepare._regular_bytes(configuration, 1048576)
+    return native_cli_outcomes(contract, help_output, version, initialized, scaffold)
+
+
 def native_runtime_identity(output, identity):
     """Parse actual selected GNU OS/architecture and positive CLI help output."""
     expected = {"ubi9-x86_64": ("rhel", r"9(?:\.[0-9]+)*"),
@@ -692,6 +753,7 @@ def _native_startup(final, artifact, selection, workspace, environment):
     executable.chmod(0o755)
     before = sha256_bytes(prepare._regular_bytes(executable, 536870912))
     observations = []
+    contract = native_cli_contract(workspace / "source", selection["source_commit"])
     if artifact["target"].endswith("apple-darwin"):
         import platform
         if sys.platform != "darwin" or platform.mac_ver()[0].split(".")[0] != "15":
@@ -702,10 +764,11 @@ def _native_startup(final, artifact, selection, workspace, environment):
         translated = subprocess.run(["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"], capture_output=True, timeout=10, check=False)
         if translated.stdout.strip() == b"1":
             raise ValueError("translated native startup forbidden")
-        output, _ = capture([str(executable), "--help"], {"HOME": str(runtime), "TMPDIR": str(runtime), "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}, runtime, runtime / "startup", timeout=30)
+        commands = native_cli_probe(executable, runtime, contract,
+            {"HOME": str(runtime), "TMPDIR": str(runtime), "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}, runtime)
         observations.append({"environment_id": selection["environment_id"], "os_version": platform.mac_ver()[0],
                              "architecture": architecture, "executable_sha256": before,
-                             "stdout_sha256": sha256_bytes(output)})
+                             "stdout_sha256": commands["help"]["stdout_sha256"], "commands": commands})
     else:
         expected = {"ubi9-x86_64", "ubuntu22.04-x86_64", "debian12-x86_64"}
         if not isinstance(selection["runtime"], dict) or set(selection["runtime"]) != expected:
@@ -716,16 +779,31 @@ def _native_startup(final, artifact, selection, workspace, environment):
             from boundaries import LinuxBoundary
             control = workspace / ("native-control-" + identity)
             control.mkdir(mode=0o755)
+            generated = control / "output"
+            generated.mkdir(mode=0o777)
+            generated.chmod(0o777)
             boundary = LinuxBoundary(control, [runtime], image)
-            runtime_environment = {"HOME": "/work", "TMPDIR": "/work", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
-            driver = 'cat /etc/os-release && printf "\\nTS_RELEASE_ARCH\\n" && uname -m && printf "TS_RELEASE_HELP\\n" && "$1" --help'
-            argv = boundary.command(["/bin/sh", "-c", driver, "release-runtime", str(executable)],
-                                    environment=runtime_environment, cwd=runtime)
+            runtime_environment = {"HOME": "/work/output", "TMPDIR": "/work/output", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+            driver = ('umask 022; cat /etc/os-release && printf "\\nTS_RELEASE_ARCH\\n" && uname -m '
+                      '&& printf "TS_RELEASE_HELP\\n" && "$1" --help '
+                      '&& printf "TS_RELEASE_VERSION\\n" && "$1" --version '
+                      '&& printf "TS_RELEASE_INIT\\n" && "$1" config init --app-config "$2" '
+                      '&& printf "TS_RELEASE_SCAFFOLD\\n" && test -f "$2" && test ! -L "$2" && cat "$2"')
+            argv = boundary.command(["/bin/sh", "-c", driver, "release-runtime", str(executable), "/work/output/trusted-server.toml"],
+                                    environment=runtime_environment, cwd=generated)
             output, _ = capture(argv, {"HOME": str(control), "LANG": "C", "LC_ALL": "C"},
                                 runtime, runtime / identity, timeout=60, maximum=65536, boundary=boundary)
-            details = native_runtime_identity(output, identity)
+            try:
+                help_and_identity, remaining = output.split(b"TS_RELEASE_VERSION\n")
+                version, remaining = remaining.split(b"TS_RELEASE_INIT\n")
+                initialized, scaffold = remaining.split(b"TS_RELEASE_SCAFFOLD\n")
+                help_output = help_and_identity.split(b"\nTS_RELEASE_HELP\n")[1]
+            except (ValueError, IndexError) as error:
+                raise ValueError("native runtime missing help/version/config-init evidence") from error
+            details = native_runtime_identity(help_and_identity, identity)
+            commands = native_cli_outcomes(contract, help_output, version, initialized, scaffold)
             observations.append({"environment_id": identity, "image": image, "executable_sha256": before,
-                                 "stdout_sha256": sha256_bytes(output), **details})
+                                 "stdout_sha256": sha256_bytes(output), "commands": commands, **details})
     if sha256_bytes(prepare._regular_bytes(executable, 536870912)) != before or sha256_bytes(prepare._regular_bytes(final, 536870912)) != before:
         raise ValueError("native final bytes changed during clean startup")
     if any(not record["stdout_sha256"] or record["stdout_sha256"] == sha256_bytes(b"") for record in observations):
@@ -972,7 +1050,7 @@ def _build_recipe(request, selection):
     for original in originals.values():
         prepare._authenticated_bytes(original.path, original.integrity, "sha256", prepare.MAX_ARCHIVE)
     configuration = workspace / "cargo-release.toml"
-    configuration.write_bytes(vendor_configuration(lock_bytes, vendor))
+    configuration.touch()
     download_fixture = prepare_download_fixture(workspace)
     evidence_logs = workspace / "accepted-final" / "logs"
     evidence_logs.mkdir(mode=0o755)
@@ -983,6 +1061,7 @@ def _build_recipe(request, selection):
     vendor_digest = tree_digest(vendor)
     boundary = (MacBoundary(workspace, readonly, immutable=immutable) if artifact["target"].endswith("apple-darwin")
                 else LinuxBoundary(workspace, readonly, selection["image"], immutable=immutable, python=tools["python"], execution_umask=int(role["umask"], 8)))
+    write_vendor_configuration(lock_bytes, vendor, configuration, boundary)
     controls = probe_controls(boundary, workspace, tools["python"])
     validate_socket_pair(controls["unconfined"], controls["confined"])
     (workspace / "boundary-controls.json").write_bytes(deterministic_json_bytes(controls))

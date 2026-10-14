@@ -166,6 +166,29 @@ class ProductionPathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate acquisition"):
             recipe.candidate_selection("ts-x86_64-unknown-linux-gnu", "a" * 40)
 
+    def test_recipe_vendor_config_matches_actual_boundary_namespace(self):
+        import tomllib
+        sys.path.insert(0, str(RELEASE / "qualification"))
+        from boundaries import LinuxBoundary, MacBoundary
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            vendor = root / "vendor"
+            vendor.mkdir()
+            configuration = root / "cargo-release.toml"
+            configuration.touch()
+            linux = LinuxBoundary(root, [], "example/builder@sha256:" + "a" * 64, immutable=[vendor, configuration])
+            lock = b'version=4\n[[package]]\nname="example"\nversion="1.0"\n'
+            recipe.write_vendor_configuration(lock, vendor, configuration, linux)
+            configured = tomllib.loads(configuration.read_text())["source"]["release-vendor"]["directory"]
+            self.assertEqual(configured, "/work/vendor")
+            argv = linux.command(["/selected/cargo", "build", "--config", str(configuration)])
+            self.assertEqual(argv[-1], "/work/cargo-release.toml")
+            self.assertIn(f"type=bind,src={vendor},dst={configured},readonly", argv)
+            if sys.platform == "darwin":
+                mac = MacBoundary(root, [], immutable=[vendor, configuration])
+                recipe.write_vendor_configuration(lock, vendor, configuration, mac)
+                self.assertEqual(tomllib.loads(configuration.read_text())["source"]["release-vendor"]["directory"], str(vendor))
+
     def test_generated_config_is_source_owned_not_cargo_stdout(self):
         lock = b'version=4\n[[package]]\nname="example"\nversion="1.0"\nsource="' + recipe.CARGO_REGISTRY_SOURCE.encode() + b'"\nchecksum="' + b'a' * 64 + b'"\n'
         data = recipe.vendor_configuration(lock, Path("/private/vendor"))
@@ -277,6 +300,44 @@ class BoundedBoundaryProcessTests(unittest.TestCase):
             bounded_process([sys.executable, "-I", "-c", "import sys,time;sys.stdout.write('x'*100000);sys.stdout.flush();time.sleep(30)"], {}, maximum=1024, timeout=5)
 
 
+def native_fixture_source(root):
+    source = root / "source"
+    manifest = source / "crates/trusted-server-cli/Cargo.toml"
+    manifest.parent.mkdir(parents=True)
+    (source / "Cargo.toml").write_text('[workspace.package]\nversion="1.2.3"\n')
+    manifest.write_text('[package]\nname="trusted-server-cli"\nversion={workspace=true}\n')
+    scaffold = b'[publisher]\ndomain="publisher.example.com"\n'
+    (source / "trusted-server.example.toml").write_bytes(scaffold)
+    return source, scaffold
+
+
+class NativeCommandContractTests(unittest.TestCase):
+    def test_source_owned_version_and_exact_embedded_scaffold_are_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, scaffold = native_fixture_source(Path(directory))
+            contract = recipe.native_cli_contract(source, "a" * 40)
+            version = b"ts 1.2.3 (" + b"a" * 40 + b")\n"
+            help_output = b"Trusted Server CLI\nUsage: ts <COMMAND>\n"
+            initialized = b"Initialized config at /work/output/trusted-server.toml\n"
+            result = recipe.native_cli_outcomes(contract, help_output, version, initialized, scaffold)
+            self.assertEqual(set(result), {"help", "version", "config_init"})
+            self.assertTrue(all(command["exit_code"] == 0 for command in result.values()))
+            damaged = ((help_output, b"", initialized, scaffold),
+                       (help_output, version.replace(b"a" * 40, b"b" * 40), initialized, scaffold),
+                       (help_output, version.replace(b"1.2.3", b"1.2.4"), initialized, scaffold),
+                       (help_output, version, b"", scaffold),
+                       (help_output, version, initialized, b""),
+                       (help_output, version, initialized, scaffold.replace(b"publisher", b"other")))
+            for outputs in damaged:
+                with self.subTest(outputs=outputs), self.assertRaisesRegex(ValueError, "native.*version|native.*scaffold|native.*config"):
+                    recipe.native_cli_outcomes(contract, *outputs)
+            with self.assertRaisesRegex(ValueError, "source"):
+                recipe.native_cli_contract(source, "unknown")
+            (source / "trusted-server.example.toml").unlink()
+            with self.assertRaises((ValueError, OSError)):
+                recipe.native_cli_contract(source, "a" * 40)
+
+
 class LinuxLifecycleTests(unittest.TestCase):
     def test_map_path_does_not_rewrite_sibling_prefix(self):
         sys.path.insert(0, str(RELEASE / "qualification"))
@@ -316,6 +377,7 @@ class LinuxLifecycleTests(unittest.TestCase):
             self.assertEqual(argv[:5], prefix)
             self.assertEqual(boundary.cleanup_command(argv)[:5], prefix)
             self.assertEqual((root / "docker-config/config.json").read_bytes(), b"{}\n")
+            self.assertIn(f"type=bind,src={root / 'docker-config'},dst=/work/docker-config,readonly", argv)
 
     def test_native_container_startup_uses_same_closed_cleanup_lifecycle(self):
         from unittest import mock
@@ -323,16 +385,19 @@ class LinuxLifecycleTests(unittest.TestCase):
             root = Path(directory).resolve()
             final = root / "final"
             final.write_bytes(b"example native fixture")
-            selection = {"runtime": {name: "example/runtime@sha256:" + "a" * 64 for name in ("ubi9-x86_64", "ubuntu22.04-x86_64", "debian12-x86_64")}}
-            outputs = [(b'ID=debian\nVERSION_ID="12"\nTS_RELEASE_ARCH\nx86_64\nTS_RELEASE_HELP\nUsage: ts\n', b""),
-                       (b'ID=rhel\nVERSION_ID="9.7"\nTS_RELEASE_ARCH\nx86_64\nTS_RELEASE_HELP\nUsage: ts\n', b""),
-                       (b'ID=ubuntu\nVERSION_ID="22.04"\nTS_RELEASE_ARCH\nx86_64\nTS_RELEASE_HELP\nUsage: ts\n', b"")]
+            _, scaffold = native_fixture_source(root)
+            selection = {"source_commit": "a" * 40, "runtime": {name: "example/runtime@sha256:" + "a" * 64 for name in ("ubi9-x86_64", "ubuntu22.04-x86_64", "debian12-x86_64")}}
+            commands = b'Usage: ts\nTS_RELEASE_VERSION\nts 1.2.3 (' + b'a' * 40 + b')\nTS_RELEASE_INIT\nInitialized config at /work/output/trusted-server.toml\nTS_RELEASE_SCAFFOLD\n' + scaffold
+            outputs = [(b'ID=debian\nVERSION_ID="12"\nTS_RELEASE_ARCH\nx86_64\nTS_RELEASE_HELP\n' + commands, b""),
+                       (b'ID=rhel\nVERSION_ID="9.7"\nTS_RELEASE_ARCH\nx86_64\nTS_RELEASE_HELP\n' + commands, b""),
+                       (b'ID=ubuntu\nVERSION_ID="22.04"\nTS_RELEASE_ARCH\nx86_64\nTS_RELEASE_HELP\n' + commands, b"")]
             with mock.patch.object(recipe, "capture", side_effect=outputs) as captured:
                 observed = recipe._native_startup(final, recipe.artifact_selection("ts-x86_64-unknown-linux-gnu"), selection, root, {})
             self.assertEqual(observed["runtime"][0]["os_version"], "12")
             self.assertEqual(observed["runtime"][0]["architecture"], "x86_64")
             self.assertEqual(observed["runtime"][0]["executable_sha256"], recipe.sha256_bytes(final.read_bytes()))
             self.assertEqual(captured.call_count, 3)
+            self.assertEqual(set(observed["runtime"][0]["commands"]), {"help", "version", "config_init"})
             for call in captured.call_args_list:
                 self.assertIn("--name", call.args[0])
                 self.assertIn("--config", call.args[0])
@@ -413,6 +478,15 @@ class SourceContextTests(unittest.TestCase):
             recipe.executing_source_context("a" * 40)
         with self.assertRaisesRegex(ValueError, "source commit"):
             recipe.candidate_selection("trusted-server-fastly.wasm", {"approved": True, "commit": "a" * 40})
+
+    def test_acquisition_cannot_attest_a_different_docker_executable(self):
+        from unittest import mock
+        names = {"python", "git", "cargo", "rustc", "cc", "cxx", "linker", "ar", "cmake", "shell", "docker"}
+        policy = {key: None for key in ("environment_id", "tools", "readonly", "trees", "tool_trees", "archive_pool", "cargo_seed", "rustup", "sdk", "variation", "image", "runtime")}
+        policy.update(environment_id="gnu-builder-x86_64", tools={name: {"path": "/example/selected-tool", "sha256": "a" * 64, "acquisition_sha256": "b" * 64} for name in names})
+        with mock.patch.dict(recipe.CANDIDATE_ACQUISITIONS, {"gnu-builder-x86_64": policy}):
+            with self.assertRaisesRegex(ValueError, "actual.*Docker|Docker.*executable"):
+                recipe.candidate_selection("ts-x86_64-unknown-linux-gnu", "a" * 40)
 
     def test_acquisition_policy_cannot_select_an_alternate_checkout(self):
         from unittest import mock

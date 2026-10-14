@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 RELEASE = Path(__file__).resolve().parents[1]
+DOCKER_EXECUTABLE = "/usr/bin/docker"
 sys.path.insert(0, str(RELEASE))
 
 from common import deterministic_json_bytes, load_json_bytes, sha256_bytes
@@ -157,9 +158,9 @@ class LinuxBoundary:
         self.docker_config = self.private_root / "docker-config"
         self.docker_config.mkdir(mode=0o755)
         (self.docker_config / "config.json").write_bytes(b"{}\n")
-        self.docker_prefix = ["/usr/bin/docker", "--host", "unix:///var/run/docker.sock",
+        self.docker_prefix = [DOCKER_EXECUTABLE, "--host", "unix:///var/run/docker.sock",
                               "--config", str(self.docker_config)]
-        self.immutable = []
+        self.immutable = [self.docker_config]
         for path in immutable:
             path = Path(path)
             resolved = path.resolve(strict=True)

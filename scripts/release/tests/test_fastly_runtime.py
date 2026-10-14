@@ -60,8 +60,26 @@ class AbiFramingTests(unittest.TestCase):
 
     def test_positive_full_publisher_fixture_extracts_script(self):
         path = b"/static/tsjs=tsjs-unified.min.js?v=" + b"a" * 64
-        html = b'<html><head><script src="' + path + b'" id="trustedserver-js"></script></head><body>release-origin-example</body></html>'
+        injection = b'<script src="' + path + b'" id="trustedserver-js"></script>'
+        html = fastly.HTML.replace(b"<head>", b"<head>" + injection)
         self.assertEqual(fastly.publisher_response(200, html, {"content-type": "text/html"}), path.decode())
+
+class CompletePublisherTests(unittest.TestCase):
+    def test_truncation_of_each_origin_document_region_is_rejected(self):
+        injection = b'<script src="/static/tsjs=tsjs-unified.min.js?v=' + b'a' * 64 + b'" id="trustedserver-js"></script>'
+        complete = fastly.HTML.replace(b"<head>", b"<head>" + injection)
+        damaged = (injection + b'release-origin-example</body></html>',
+                   complete.replace(b'<!doctype html>', b''),
+                   complete.replace(b'<html>', b''),
+                   complete.replace(b'<head>', b''),
+                   complete.replace(b'<title>Release fixture</title>', b''),
+                   complete.replace(b'<body>', b''),
+                   complete.replace(b'</html>', b''),
+                   complete.replace(b'Release fixture', b'Changed example'),
+                   complete.replace(b'</head>', b''))
+        for body in damaged:
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, "complete HTML|origin fixture"):
+                fastly.publisher_response(200, body, {"content-type": "text/html"})
 
 class ExactJavascriptTests(unittest.TestCase):
     def test_unrelated_javascript_success_is_rejected(self):
