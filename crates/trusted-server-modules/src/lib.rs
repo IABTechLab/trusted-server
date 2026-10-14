@@ -42,6 +42,8 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_sellers::builder(),
+        // Run by `[shared.51degrees]` rather than selected by a section.
+        trusted_server_middleware_51degrees::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -115,6 +117,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_core::service_version;
     use trusted_server_framework_nextjs as nextjs;
     use trusted_server_identity_lockr as lockr;
+    use trusted_server_middleware_51degrees as fiftyone_degrees;
     use trusted_server_tag_google_tag as google_tag;
     use trusted_server_tag_google_tag_manager as google_tag_manager;
     use trusted_server_testing_testlight as testlight;
@@ -156,6 +159,11 @@ pub fn middleware() -> Vec<StockMiddleware> {
             media_type: ads_txt_sellers::MEDIA_TYPE,
             name: ads_txt_sellers::MODULE,
         },
+        row(
+            fiftyone_degrees::builder().id(),
+            Serve,
+            fiftyone_degrees::MODULE,
+        ),
         // Core makes the file `[robots-txt]` describes under the module's
         // own name, on the file's path alone.
         StockMiddleware {
@@ -217,6 +225,7 @@ mod tests {
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
         include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
         include_str!("../../ads-txt/sellers/src/fixtures/sellers.settings.toml"),
+        include_str!("../../middleware/51degrees/src/fixtures/page-change.settings.toml"),
     ];
 
     #[test]
@@ -499,6 +508,7 @@ middleware = [\"robots_txt\"]
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.sellers",
+                "51degrees",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",
@@ -643,12 +653,14 @@ middleware = [\"robots_txt\"]
 
     /// Every stock page module refuses a setting it does not know, so a
     /// misspelt key in its table fails deploy validation naming the table and
-    /// the key, where it would otherwise be ignored.
+    /// the key, where it would otherwise be ignored. A module a vendor's
+    /// shared table runs is held to the same for that table.
     #[test]
     fn every_stock_module_rejects_a_setting_it_does_not_know() {
         use serde_json::json;
         use trusted_server_core::config::validate_settings_for_deploy_with;
         use trusted_server_core::module_name::short_form;
+        use trusted_server_core::settings::SHARED_TYPE;
         use trusted_server_core::test_support::tests::create_test_settings;
 
         let stock = builders();
@@ -656,25 +668,31 @@ middleware = [\"robots_txt\"]
             .iter()
             .filter(|builder| builder.supplies_integration())
         {
-            let name = builder
-                .module_name()
-                .expect("every stock page module names itself");
-            let section = builder
-                .section()
-                .expect("every stock page module has a section");
             let mut settings = create_test_settings();
-            settings
-                .insert_module_config(section, name, &json!({ "no_such_setting": true }))
-                .expect("should insert the planted table");
+            let (name, table) = if let Some(vendor) = builder.shared_settings() {
+                settings.shared =
+                    serde_json::from_value(json!({ vendor: { "no_such_setting": true } }))
+                        .expect("should plant the shared table");
+                (builder.id(), format!("[{SHARED_TYPE}.{vendor}]"))
+            } else {
+                let name = builder
+                    .module_name()
+                    .expect("every stock page module names itself");
+                let section = builder
+                    .section()
+                    .expect("every stock page module has a section");
+                settings
+                    .insert_module_config(section, name, &json!({ "no_such_setting": true }))
+                    .expect("should insert the planted table");
+                (name, format!("[{section}.{}]", short_form(section, name)))
+            };
 
             let error = match validate_settings_for_deploy_with(&settings, &stock) {
                 Ok(()) => panic!("`{name}` should refuse a setting it does not know"),
                 Err(error) => format!("{error:?}"),
             };
-            let written = short_form(section, name);
             assert!(
-                error.contains(&format!("[{section}.{written}]"))
-                    && error.contains("no_such_setting"),
+                error.contains(&table) && error.contains("no_such_setting"),
                 "`{name}` should name its table and the unknown setting: {error}"
             );
         }
