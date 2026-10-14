@@ -8448,7 +8448,7 @@ const ASSET_NOT_SHAREABLE_LIFETIME: Duration = Duration::from_secs(60);
 /// lifetimes `[cache.assets]` sets. An asset's load awaits the origin rather
 /// than blocking a thread, so a host that can run work on its own may run it
 /// apart from the request that started it.
-fn asset_cache(settings: &Settings) -> SourceCache {
+pub(crate) fn asset_cache(settings: &Settings) -> SourceCache {
     let lifetimes = settings.cache.assets.lifetimes(ASSET_DEFAULT_LIFETIMES);
     let spec = |name, memory_entries| crate::platform::CacheSpec {
         name,
@@ -8465,7 +8465,7 @@ fn asset_cache(settings: &Settings) -> SourceCache {
 /// The address one asset's copies are held under, made of the publisher's
 /// prefix the request's services carry, so two publishers never share one,
 /// and the asset's own key.
-fn asset_address(
+pub(crate) fn asset_address(
     services: &RuntimeServices,
     key: &crate::asset_cache::AssetCacheKey,
 ) -> SourceAddress {
@@ -8545,7 +8545,7 @@ fn asset_cache_ttl(
 }
 
 /// Seconds since the Unix epoch, from the wasm-safe clock.
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     crate::ec::std_system_time_now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
@@ -8565,13 +8565,13 @@ static NEXT_LOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// served, so that request is served from the one fetch rather than a
 /// second one. The slot lives as long as the request's `HandBack`, so a load
 /// that outlives its request hands back nothing.
-struct HandBack {
-    id: u64,
+pub(crate) struct HandBack {
+    pub(crate) id: u64,
     slot: std::rc::Rc<HandBackSlot>,
 }
 
 impl HandBack {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let id = NEXT_LOAD.fetch_add(1, Ordering::Relaxed);
         let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
         HANDED_BACK.with(|handed| {
@@ -8582,7 +8582,7 @@ impl HandBack {
         Self { id, slot }
     }
 
-    fn take(&self) -> Option<Response<EdgeBody>> {
+    pub(crate) fn take(&self) -> Option<Response<EdgeBody>> {
         self.slot.borrow_mut().take()
     }
 }
@@ -8604,16 +8604,16 @@ fn hand_back(id: u64, response: Response<EdgeBody>) {
 
 /// What a load owns to fetch one asset, because it may outlive the request
 /// that started it.
-struct AssetLoad {
-    services: RuntimeServices,
+pub(crate) struct AssetLoad {
+    pub(crate) services: RuntimeServices,
     /// The origin request, already prepared for the origin. Only a `GET` is
     /// kept, which carries no body.
-    uri: http::Uri,
-    headers: http::HeaderMap,
-    backend_name: String,
-    stream_response: bool,
+    pub(crate) uri: http::Uri,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) backend_name: String,
+    pub(crate) stream_response: bool,
     /// The longest a copy may be kept, whatever the origin asks.
-    max_lifetime: Duration,
+    pub(crate) max_lifetime: Duration,
 }
 
 /// What one fetch of an asset made.
@@ -8632,7 +8632,7 @@ struct AssetLoaded {
 /// [`AssetEntry::NotShareable`](crate::asset_cache::AssetEntry::NotShareable)
 /// for [`ASSET_NOT_SHAREABLE_LIFETIME`], and handed back to the request whose
 /// load fetched it through `hand_back_id`, see [`HandBack`].
-fn asset_fetch(load: Arc<AssetLoad>, hand_back_id: u64) -> crate::source_cache::Fetch {
+pub(crate) fn asset_fetch(load: Arc<AssetLoad>, hand_back_id: u64) -> crate::source_cache::Fetch {
     Arc::new(move || {
         let load = Arc::clone(&load);
         Box::pin(async move {
@@ -8767,98 +8767,16 @@ async fn load_asset(
 #[cfg(test)]
 mod tests {
     mod asset_cache_tests {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-
         use super::*;
+        use crate::platform::ClientInfo;
         use crate::platform::test_support::{
-            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend, StubHttpClient,
+            LifetimeRecordingCache, NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+            StubHttpClient,
         };
-        use crate::platform::{ClientInfo, PlatformLoadingCache};
-
-        /// A loading cache that keeps every value with its lifetime under its
-        /// key and runs each load in its caller.
-        #[derive(Default)]
-        struct MemoryLoadingCache {
-            values: Mutex<HashMap<String, bytes::Bytes>>,
-            lifetimes: Mutex<HashMap<String, Duration>>,
-        }
-
-        impl MemoryLoadingCache {
-            /// The lifetimes of the kept copies, leaving out the records and
-            /// the marks of what may not be shared.
-            fn copy_lifetimes(&self) -> Vec<Duration> {
-                let values = self.values.lock().expect("should lock the values");
-                self.lifetimes
-                    .lock()
-                    .expect("should lock the lifetimes")
-                    .iter()
-                    .filter(|(key, _)| {
-                        key.contains(&format!("/{}/", crate::settings::ASSETS_CACHE))
-                    })
-                    .filter(|(key, _)| {
-                        values.get(*key).is_some_and(|value| {
-                            matches!(
-                                crate::asset_cache::AssetEntry::decode(value),
-                                Ok(crate::asset_cache::AssetEntry::Copy(_))
-                            )
-                        })
-                    })
-                    .map(|(_, lifetime)| *lifetime)
-                    .collect()
-            }
-        }
-
-        #[async_trait::async_trait(?Send)]
-        impl PlatformLoadingCache for MemoryLoadingCache {
-            async fn get_or_load(
-                &self,
-                _services: &RuntimeServices,
-                _spec: &crate::platform::CacheSpec,
-                key: &crate::platform::StoreKey,
-                load: crate::platform::Loader,
-            ) -> Result<bytes::Bytes, crate::platform::LoadError> {
-                let key = key.to_string();
-                let held = self
-                    .values
-                    .lock()
-                    .expect("should lock the values")
-                    .get(&key)
-                    .cloned();
-                if let Some(value) = held {
-                    return Ok(value);
-                }
-                let loaded = load().await?;
-                let lifetime = loaded.lifetime.unwrap_or(Duration::MAX);
-                if !lifetime.is_zero() {
-                    self.values
-                        .lock()
-                        .expect("should lock the values")
-                        .insert(key.clone(), loaded.bytes.clone());
-                    self.lifetimes
-                        .lock()
-                        .expect("should lock the lifetimes")
-                        .insert(key, lifetime);
-                }
-                Ok(loaded.bytes)
-            }
-
-            async fn remove(
-                &self,
-                _services: &RuntimeServices,
-                _spec: &crate::platform::CacheSpec,
-                key: &crate::platform::StoreKey,
-            ) {
-                self.values
-                    .lock()
-                    .expect("should lock the values")
-                    .remove(&key.to_string());
-            }
-        }
 
         fn services(
             stub: &Arc<StubHttpClient>,
-            cache: &Arc<MemoryLoadingCache>,
+            cache: &Arc<LifetimeRecordingCache>,
         ) -> RuntimeServices {
             RuntimeServices::builder()
                 .config_store(Arc::new(NoopConfigStore))
@@ -8954,7 +8872,7 @@ mod tests {
         #[tokio::test]
         async fn an_image_is_kept_as_the_origin_sent_it() {
             let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryLoadingCache::default());
+            let cache = Arc::new(LifetimeRecordingCache::default());
             let services = services(&stub, &cache);
             let settings = settings();
             let image = [0x89_u8, b'P', b'N', b'G', 0, 1, 2, 3];
@@ -8981,7 +8899,7 @@ mod tests {
         #[tokio::test]
         async fn a_stylesheet_is_served_from_one_fetch_with_its_age() {
             let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryLoadingCache::default());
+            let cache = Arc::new(LifetimeRecordingCache::default());
             let services = services(&stub, &cache);
             let settings = settings();
             queue(
@@ -9022,7 +8940,7 @@ mod tests {
                 ("public, max-age=300, no-store", None, false),
             ] {
                 let stub = Arc::new(StubHttpClient::new());
-                let cache = Arc::new(MemoryLoadingCache::default());
+                let cache = Arc::new(LifetimeRecordingCache::default());
                 let services = services(&stub, &cache);
                 let settings = settings();
                 for _ in 0..2 {
@@ -9054,7 +8972,7 @@ mod tests {
                 ("public, s-maxage=600, max-age=30", 600),
             ] {
                 let stub = Arc::new(StubHttpClient::new());
-                let cache = Arc::new(MemoryLoadingCache::default());
+                let cache = Arc::new(LifetimeRecordingCache::default());
                 let services = services(&stub, &cache);
                 queue(
                     &stub,
@@ -9081,7 +8999,7 @@ mod tests {
         #[tokio::test]
         async fn a_header_the_origin_varies_on_separates_kept_copies() {
             let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryLoadingCache::default());
+            let cache = Arc::new(LifetimeRecordingCache::default());
             let services = services(&stub, &cache);
             let settings = settings();
             for edition in ["red", "blue"] {
@@ -9119,7 +9037,7 @@ mod tests {
         #[tokio::test]
         async fn a_request_carrying_authorization_is_fetched_for_itself() {
             let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryLoadingCache::default());
+            let cache = Arc::new(LifetimeRecordingCache::default());
             let services = services(&stub, &cache);
             let settings = settings();
             for _ in 0..2 {
@@ -9148,7 +9066,7 @@ mod tests {
         #[tokio::test]
         async fn a_page_navigation_never_reads_an_asset_copy() {
             let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryLoadingCache::default());
+            let cache = Arc::new(LifetimeRecordingCache::default());
             let services = services(&stub, &cache);
             let settings = settings();
             for _ in 0..2 {
