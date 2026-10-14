@@ -3593,7 +3593,11 @@ Which part of a path names a publisher is the deployment's decision.
   carry it, in their links for example, puts it back with a serve phase
   middleware of its own.
 - A page stored for an addressed request is keyed by the host and the
-  continuing path, so `ts cache purge --page` takes that address.
+  continuing path, so `ts cache purge --page` takes that address. Purging it
+  also purges the page at the same continuing path of every other publisher on
+  the host.
+- Publishers on one host share the host's cookies unless the deployment's
+  prefix module names them apart.
 - A selector without `{host}` reads its one blob and the values are ignored.
   The Axum, Cloudflare and Spin adapters take the hook through
   `TrustedServerApp::routes_with_addressing` and ignore the values in the same
