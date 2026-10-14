@@ -26,10 +26,10 @@ pieces interact are easy to miss in code review. A design problem caught in a
 spec costs an afternoon. Caught in code review, it costs a rewrite.
 
 So every pull request that adds a feature needs a written spec, worked out with
-an AI coding agent and then reviewed with one over several rounds. We know this
-is more work before you write any code. It pays off. Reviewers check your code
-against a design everyone has already agreed on, and you are much less likely
-to be asked to start over.
+an AI coding agent and then reviewed with one over at least two rounds. We know
+this is more work before you write any code. It pays off. Reviewers check your
+code against a design everyone has already agreed on, and you are much less
+likely to be asked to start over.
 
 ### What counts as a feature
 
