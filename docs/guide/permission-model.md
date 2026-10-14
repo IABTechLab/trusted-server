@@ -34,7 +34,7 @@ That matters for reading the rest of this guide. When a module declares the
 permissions its data use requires, it is naming a Data Use from that taxonomy,
 so an operator or an auditor can check the declaration against the taxonomy
 rather than against our interpretation of it. What a deployment decides about a
-signal, whether a TCF record answers and what an opt-out takes away, is recorded
+signal, which schemes' records answer and what an opt-out takes away, is recorded
 in `permissions.yaml` alongside the rules. What a scheme's own signal means, such
 as which TCF purpose grants which Data Use, belongs to that scheme's
 [permission signal module](./permission-signals) and is tested there.
