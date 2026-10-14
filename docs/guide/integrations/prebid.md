@@ -861,7 +861,8 @@ page or auction. When available, the opaque value follows the standard path:
    an EC/KV partner configured with `source_domain = "liveramp.com"`, when that
    partner UID is not already stored.
 5. The browser also persists the opaque value in the bounded `ts-eids` cookie,
-   which lets requests without an EID body, such as `GET /_ts/page-bids` and
+   which this module reads and hands to core as the identifiers the request
+   carries, so requests without an EID body, such as `GET /_ts/page-bids` and
    page navigations, ingest it.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
@@ -950,9 +951,9 @@ Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions
 2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
 3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
 4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
-5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
+5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading what this module learned from the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
 
-The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same permission rule as bidstream forwarding: the storage and personalised-ad permissions must both be set.
+The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. This module owns the cookie, its two shapes and its size limit, and hands core what it holds through the identifier module interface, `trusted_server_core::ec::identifiers::IdentifierModule`, which core asks once per request when it reads the Edge Cookie state. Core names the cookie nowhere. Identity-graph EID writes follow the same permission rule as bidstream forwarding: the storage and personalised-ad permissions must both be set.
 
 This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
 
