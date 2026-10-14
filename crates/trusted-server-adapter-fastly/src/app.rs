@@ -164,7 +164,7 @@ use crate::platform::{
 ///
 /// [`Self::from_env`] takes the key from the service's `__KEY` selector as it
 /// is written. A selector that names a blob for each host is resolved for the
-/// request before anything is built, by `stores_for_request` in the entry
+/// request before anything is built, by `address_request` in the entry
 /// point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeStoreConfig {
