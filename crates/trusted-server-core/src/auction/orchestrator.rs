@@ -6207,8 +6207,12 @@ mod tests {
         }
         let specs = backend.specs.lock().expect("should lock specs");
         assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].first_byte_timeout, Duration::from_millis(750));
-        assert_eq!(specs[1].first_byte_timeout, Duration::from_millis(750));
+        assert_eq!(
+            specs[0].first_byte_timeout,
+            Duration::from_millis(777),
+            "the test backend keeps the exact bounded budget as its transport timer"
+        );
+        assert_eq!(specs[1].first_byte_timeout, Duration::from_millis(777));
         assert_ne!(specs[0].discriminator, specs[1].discriminator);
     }
 
