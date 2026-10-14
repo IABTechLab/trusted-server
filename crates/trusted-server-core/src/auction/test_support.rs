@@ -13,8 +13,8 @@ use crate::auction::types::{
     AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, PublisherInfo, UserInfo,
 };
 use crate::consent::ConsentContext;
+use crate::ec::eids::{Eid, Uid};
 use crate::geo::GeoInfo;
-use crate::openrtb::{Eid, Uid};
 use crate::platform::{RuntimeServices, test_support::noop_services};
 use crate::settings::Settings;
 

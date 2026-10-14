@@ -606,7 +606,7 @@ mod tests {
     use crate::auction::routing::route_auction;
     use crate::auction::test_support::{demand_table, plan_config};
     use crate::auction::types::{AuctionResponse, Bid, BidRenderer, BidStatus};
-    use crate::openrtb::{Eid, Uid};
+    use crate::ec::eids::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
     use http::Method;

@@ -4204,25 +4204,25 @@ assume_single_jurisdiction = true
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
-            trusted_server_core::openrtb::Eid {
+            trusted_server_core::ec::eids::Eid {
                 source: "liveramp.com".to_owned(),
-                uids: vec![trusted_server_core::openrtb::Uid {
+                uids: vec![trusted_server_core::ec::eids::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
             },
-            trusted_server_core::openrtb::Eid {
+            trusted_server_core::ec::eids::Eid {
                 source: "id5-sync.com".to_owned(),
-                uids: vec![trusted_server_core::openrtb::Uid {
+                uids: vec![trusted_server_core::ec::eids::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
             },
-            trusted_server_core::openrtb::Eid {
+            trusted_server_core::ec::eids::Eid {
                 source: "google.com".to_owned(),
-                uids: vec![trusted_server_core::openrtb::Uid {
+                uids: vec![trusted_server_core::ec::eids::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,

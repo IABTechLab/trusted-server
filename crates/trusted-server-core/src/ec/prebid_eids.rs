@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use crate::openrtb::{Eid, Uid};
+use crate::ec::eids::{Eid, Uid};
 
 use super::kv::PartnerIdUpdate;
 use super::kv_types::MAX_UID_LENGTH;

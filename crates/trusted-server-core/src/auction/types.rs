@@ -104,7 +104,7 @@ pub struct UserInfo {
     /// reaches a bid request — the provider layer just forwards already-gated
     /// EIDs.
     #[serde(skip)]
-    pub eids: Option<Vec<crate::openrtb::Eid>>,
+    pub eids: Option<Vec<crate::ec::eids::Eid>>,
 }
 
 /// Device information from request.

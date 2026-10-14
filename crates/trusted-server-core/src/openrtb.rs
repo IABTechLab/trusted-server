@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 
 use crate::auction::types::{BidRenderer, OrchestratorExt};
+use crate::ec::eids::Eid;
 
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
@@ -62,30 +62,6 @@ pub struct ConsentedProvidersSettings {
     /// The AC string value (e.g. `"2~2628.2316.3119~dv."`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consented_providers: Option<String>,
-}
-
-/// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Eid {
-    /// Identity provider domain (e.g. `"id5-sync.com"`).
-    pub source: String,
-    /// One or more user IDs from this provider.
-    pub uids: Vec<Uid>,
-}
-
-/// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Uid {
-    /// The identifier value.
-    pub id: String,
-    /// `OpenRTB` agent type, including vendor-specific values such as PAIR's `571187`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub atype: Option<i32>,
-    /// Provider-specific extension data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
 }
 
 /// Prebid-compatible `regs.ext` consent fields.
@@ -346,49 +322,6 @@ mod tests {
         assert!(
             serialized.get("consent").is_none(),
             "consent should be omitted when None"
-        );
-    }
-
-    #[test]
-    fn eid_serializes_correctly() {
-        let eid = Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
-                id: "ID5-abc123".to_owned(),
-                atype: Some(1),
-                ext: None,
-            }],
-        };
-
-        let serialized = serde_json::to_value(&eid).expect("should serialize");
-        assert_eq!(serialized["source"], "id5-sync.com", "source should match");
-        assert_eq!(
-            serialized["uids"][0]["id"], "ID5-abc123",
-            "uid id should match"
-        );
-        assert_eq!(serialized["uids"][0]["atype"], 1, "atype should be 1");
-        assert!(
-            serialized["uids"][0].get("ext").is_none(),
-            "ext should be omitted when None"
-        );
-    }
-
-    #[test]
-    fn eid_serializes_vendor_specific_atype() {
-        let eid = Eid {
-            source: "google.com".to_owned(),
-            uids: vec![Uid {
-                id: "pair-id".to_owned(),
-                atype: Some(571187),
-                ext: None,
-            }],
-        };
-
-        let serialized = serde_json::to_value(&eid).expect("should serialize");
-
-        assert_eq!(
-            serialized["uids"][0]["atype"], 571187,
-            "should preserve PAIR's vendor-specific atype"
         );
     }
 }
