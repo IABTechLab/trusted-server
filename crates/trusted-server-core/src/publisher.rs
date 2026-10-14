@@ -3814,11 +3814,6 @@ fn origin_refusal_response(
 }
 
 /// Reader headers a signed publisher origin request never carries.
-///
-/// The first three are the reader's credentials and the fourth their browsing
-/// context, none of which belongs in a read made with the publisher's own
-/// credentials. The rest ask for a conditional or partial answer, where a
-/// signed read asks for the whole object.
 const READER_HEADERS_NOT_SIGNED: [header::HeaderName; 10] = [
     header::COOKIE,
     header::AUTHORIZATION,
