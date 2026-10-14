@@ -1,7 +1,64 @@
+//! The Flight response the App Router answers a navigation with, as a fetch
+//! middleware on `text/x-component`.
+//!
+//! A client side navigation fetches a React Server Components Flight stream,
+//! the row format the `__next_f` scripts carry inside a page, here with no
+//! script wrapper and no string escaping. The rows are:
+//! - `<hexId>:<json>\n`, JSON ended by a newline
+//! - `<hexId>:<Tag><data>\n`, tagged, ended by a newline
+//! - `<hexId>:T<hexLen>,<bytes>`, tagged `T`, length delimited, no newline
+//!
+//! A `T` row's length is the byte length of its content, so moving an address
+//! inside it changes the length and the header is written again with the new
+//! one. Core's plain replacement would leave the old length, which is why the
+//! middleware moves the addresses itself and core leaves the body to it.
+
 use std::io;
 
-use crate::host_rewrite::rewrite_bare_host_at_boundaries;
-use crate::streaming_processor::StreamProcessor;
+use trusted_server_core::host_rewrite::rewrite_bare_host_at_boundaries;
+use trusted_server_core::middleware::{
+    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+};
+use trusted_server_core::streaming_processor::StreamProcessor;
+
+/// The name a `[[fetch]]` entry for [`FLIGHT_MEDIA_TYPE`] writes.
+pub const FLIGHT_MIDDLEWARE: &str = "framework.nextjs.flight";
+
+/// The media type of a Flight response, which the middleware works on.
+pub const FLIGHT_MEDIA_TYPE: &str = "text/x-component";
+
+/// Moves the origin's address to the publisher's in a Flight response, on
+/// the responses a `[[fetch]]` entry names [`FLIGHT_MIDDLEWARE`] for.
+pub(crate) struct Flight;
+
+impl Middleware for Flight {
+    fn middleware_id(&self) -> &'static str {
+        FLIGHT_MIDDLEWARE
+    }
+
+    fn handles_media_type(&self, media_type: &str) -> bool {
+        media_type == FLIGHT_MEDIA_TYPE
+    }
+
+    fn moves_origin_address(&self) -> bool {
+        true
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            stream: Some(Box::new(RscFlightUrlRewriter::new(
+                context.origin_host,
+                context.request_host,
+                context.request_scheme,
+            ))),
+            ..MiddlewareAction::pass()
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowState {
@@ -12,27 +69,18 @@ enum RowState {
     ChunkByLength,
 }
 
-/// Rewrites URLs inside a React Server Components (RSC) Flight stream.
+/// Rewrites the addresses inside a Flight stream row by row, writing a `T`
+/// row's length again after its content changes.
 ///
-/// Next.js (App Router) uses `react-server-dom-webpack` ("Flight") for navigation responses
-/// and for inlined `__next_f` data. The wire format is a sequence of rows:
-/// - `<hexId>:<json>\n` (JSON terminated by `\n`)
-/// - `<hexId>:<Tag><data>\n` (tagged, terminated by `\n`)
-/// - `<hexId>:T<hexLen>,<bytes...>` (tagged by `T`, length-delimited, **no trailing newline**)
-///
-/// For `T` rows, the length prefix is the UTF-8 byte length of the content bytes. If we rewrite
-/// URLs inside the content, we must recompute the length and rewrite the header.
-///
-/// ## Limitations
-///
-/// This rewriter performs simple string replacement and does NOT handle JSON escape sequences.
-/// URLs like `\/\/origin.example.com` (JSON-escaped slashes) will not be rewritten. This is
-/// acceptable because Flight responses from client-side navigation typically contain plain URLs,
-/// not doubly-escaped JSON-in-JS content. For inlined `__next_f` data in HTML (which can have
-/// escape sequences), the HTML post-processor in `crates/framework/nextjs` handles those cases.
-pub struct RscFlightUrlRewriter {
+/// The replacement is the plain one core makes in any other text: the
+/// origin's `https://` and `http://` addresses to the publisher's, then
+/// protocol relative ones, then the bare host at hostname boundaries. It does
+/// not read JSON escapes, so `\/\/origin.example.com` is left alone, which a
+/// navigation response does not carry. The escaped form inside a page's
+/// `__next_f` scripts is handled by the HTML middleware.
+pub(crate) struct RscFlightUrlRewriter {
     origin_url: String,
-    origin_http_url: Option<String>,
+    origin_http_url: String,
     origin_host: String,
     origin_protocol_relative: String,
     request_url: String,
@@ -50,28 +98,15 @@ pub struct RscFlightUrlRewriter {
 
 impl RscFlightUrlRewriter {
     #[must_use]
-    pub fn new(
-        origin_host: &str,
-        origin_url: &str,
-        request_host: &str,
-        request_scheme: &str,
-    ) -> Self {
-        let request_url = format!("{request_scheme}://{request_host}");
-        let origin_protocol_relative = format!("//{origin_host}");
-        let request_protocol_relative = format!("//{request_host}");
-
-        let origin_http_url = origin_url
-            .strip_prefix("https://")
-            .map(|rest| format!("http://{rest}"));
-
+    pub(crate) fn new(origin_host: &str, request_host: &str, request_scheme: &str) -> Self {
         Self {
-            origin_url: origin_url.to_owned(),
-            origin_http_url,
+            origin_url: format!("https://{origin_host}"),
+            origin_http_url: format!("http://{origin_host}"),
             origin_host: origin_host.to_owned(),
-            origin_protocol_relative,
-            request_url,
+            origin_protocol_relative: format!("//{origin_host}"),
+            request_url: format!("{request_scheme}://{request_host}"),
             request_host: request_host.to_owned(),
-            request_protocol_relative,
+            request_protocol_relative: format!("//{request_host}"),
             state: RowState::Id,
             row_id: Vec::new(),
             row_tag: None,
@@ -97,21 +132,12 @@ impl RscFlightUrlRewriter {
             return bytes.to_vec();
         };
 
-        if !text.contains(&self.origin_host) && !text.contains(&self.origin_url) {
-            if let Some(http_url) = &self.origin_http_url {
-                if !text.contains(http_url) {
-                    return bytes.to_vec();
-                }
-            } else {
-                return bytes.to_vec();
-            }
+        if !text.contains(&self.origin_host) {
+            return bytes.to_vec();
         }
 
-        // Keep replacement semantics consistent with `create_url_replacer`.
         let mut rewritten = text.replace(&self.origin_url, &self.request_url);
-        if let Some(http_url) = &self.origin_http_url {
-            rewritten = rewritten.replace(http_url, &self.request_url);
-        }
+        rewritten = rewritten.replace(&self.origin_http_url, &self.request_url);
         rewritten = rewritten.replace(
             &self.origin_protocol_relative,
             &self.request_protocol_relative,
@@ -137,7 +163,8 @@ impl RscFlightUrlRewriter {
 
     fn finalize_length_row(&mut self, out: &mut Vec<u8>) {
         let Some(tag) = self.row_tag else {
-            // Should never happen for length-delimited rows; fall back to passthrough.
+            // A length delimited row always has a tag, so this passes the
+            // bytes through as they came.
             out.extend_from_slice(&self.raw_header);
             out.extend_from_slice(&self.row_content);
             self.reset_row();
@@ -155,7 +182,7 @@ impl RscFlightUrlRewriter {
             out.push(b',');
             out.extend_from_slice(&rewritten);
         } else {
-            // Length-delimited row type we don't transform (e.g., future/binary Flight types).
+            // A length delimited row of another tag is not text to rewrite.
             out.extend_from_slice(format!("{:x}", self.declared_length).as_bytes());
             out.push(b',');
             out.extend_from_slice(&self.row_content);
@@ -206,7 +233,7 @@ impl StreamProcessor for RscFlightUrlRewriter {
                         self.raw_header.push(b);
                         self.state = RowState::ChunkByNewline;
                     } else {
-                        // Not a recognized tag; treat as first byte of a JSON row.
+                        // Not a tag, so the first byte of a JSON row.
                         self.row_tag = None;
                         self.row_content.push(b);
                         self.state = RowState::ChunkByNewline;
@@ -237,7 +264,7 @@ impl StreamProcessor for RscFlightUrlRewriter {
                     };
                     let end = i + pos;
                     self.row_content.extend_from_slice(&chunk[i..end]);
-                    i = end + 1; // Skip '\n'
+                    i = end + 1;
                     self.finalize_newline_row(&mut out);
                 }
                 RowState::ChunkByLength => {
@@ -268,6 +295,13 @@ impl StreamProcessor for RscFlightUrlRewriter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use trusted_server_core::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
+    use trusted_server_core::integrations::IntegrationDocumentState;
+    use trusted_server_core::middleware::test_support::context;
+    use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewareChain};
+
     use super::*;
 
     fn run_rewriter(
@@ -294,22 +328,31 @@ mod tests {
         output
     }
 
+    fn rewriter() -> RscFlightUrlRewriter {
+        RscFlightUrlRewriter::new("origin.example.com", "proxy.example.com", "https")
+    }
+
     #[test]
     fn rewrites_newline_rows() {
         let input = b"0:[\"https://origin.example.com/page\"]\n";
 
-        let mut rewriter = RscFlightUrlRewriter::new(
-            "origin.example.com",
-            "https://origin.example.com",
-            "proxy.example.com",
-            "https",
-        );
-
-        let output = run_rewriter(&mut rewriter, input, 8);
+        let output = run_rewriter(&mut rewriter(), input, 8);
         let output_str = String::from_utf8(output).expect("should be valid UTF-8");
         assert_eq!(
             output_str, "0:[\"https://proxy.example.com/page\"]\n",
             "Output should rewrite URLs in newline rows"
+        );
+    }
+
+    #[test]
+    fn rewrites_the_http_address_to_the_request_scheme() {
+        let input = b"0:[\"http://origin.example.com/page\",\"//origin.example.com/a\"]\n";
+
+        let output = run_rewriter(&mut rewriter(), input, 8192);
+        let output_str = String::from_utf8(output).expect("should be valid UTF-8");
+        assert_eq!(
+            output_str, "0:[\"https://proxy.example.com/page\",\"//proxy.example.com/a\"]\n",
+            "should move an http address to the request's scheme and a protocol relative one as it is"
         );
     }
 
@@ -319,14 +362,7 @@ mod tests {
         let json_row = "2:[\"ok\"]\n";
         let input = format!("1:T{:x},{}{}", t_content.len(), t_content, json_row);
 
-        let mut rewriter = RscFlightUrlRewriter::new(
-            "origin.example.com",
-            "https://origin.example.com",
-            "proxy.example.com",
-            "https",
-        );
-
-        let output = run_rewriter(&mut rewriter, input.as_bytes(), 7);
+        let output = run_rewriter(&mut rewriter(), input.as_bytes(), 7);
         let output_str = String::from_utf8(output).expect("should be valid UTF-8");
 
         let rewritten_t_content = r#"{"url":"https://proxy.example.com/page"}"#;
@@ -348,15 +384,8 @@ mod tests {
         let t_content = r#"{"url":"https://origin.example.com/page"}"#;
         let input = format!("1:T{:x},{}", t_content.len(), t_content);
 
-        let mut rewriter = RscFlightUrlRewriter::new(
-            "origin.example.com",
-            "https://origin.example.com",
-            "proxy.example.com",
-            "https",
-        );
-
         // Split such that the header ends before the comma and content begins in a later chunk.
-        let output = run_rewriter(&mut rewriter, input.as_bytes(), 3);
+        let output = run_rewriter(&mut rewriter(), input.as_bytes(), 3);
         let output_str = String::from_utf8(output).expect("should be valid UTF-8");
 
         let rewritten_t_content = r#"{"url":"https://proxy.example.com/page"}"#;
@@ -372,20 +401,77 @@ mod tests {
     fn bare_host_rewrite_respects_hostname_boundaries() {
         let input = b"0:[\"cdn.origin.example.com\",\"notorigin.example.com\",\"origin.example.com.uk\",\"origin.example.com/news\",\"origin.example.com\"]\n";
 
-        let mut rewriter = RscFlightUrlRewriter::new(
-            "origin.example.com",
-            "https://origin.example.com",
-            "proxy.example.com",
-            "https",
-        );
-
-        let output = run_rewriter(&mut rewriter, input, 5);
+        let output = run_rewriter(&mut rewriter(), input, 5);
         let output_str = String::from_utf8(output).expect("should be valid UTF-8");
 
         assert_eq!(
             output_str,
             "0:[\"cdn.origin.example.com\",\"notorigin.example.com\",\"origin.example.com.uk\",\"proxy.example.com/news\",\"proxy.example.com\"]\n",
             "Output should only rewrite bare host occurrences"
+        );
+    }
+
+    #[test]
+    fn the_middleware_runs_on_flight_alone_in_the_fetch_phase_and_moves_the_address_itself() {
+        let middleware = Flight;
+
+        assert_eq!(middleware.middleware_id(), FLIGHT_MIDDLEWARE);
+        assert!(
+            middleware.handles_media_type(FLIGHT_MEDIA_TYPE),
+            "should work on a Flight response"
+        );
+        assert!(
+            !middleware.handles_media_type(HTML_MEDIA_TYPE)
+                && !middleware.handles_media_type("text/plain"),
+            "should work on no other media type"
+        );
+        assert!(
+            middleware.moves_origin_address(),
+            "should tell core to leave the origin's address to it"
+        );
+        assert_eq!(middleware.phases(), &[MiddlewarePhase::Fetch]);
+    }
+
+    #[test]
+    fn the_middleware_s_plan_rewrites_a_flight_response_with_its_lengths() {
+        let chain = MiddlewareChain::new(
+            MiddlewarePhase::Fetch,
+            FLIGHT_MEDIA_TYPE,
+            vec![Arc::new(Flight) as Arc<dyn Middleware>],
+        );
+        let state = IntegrationDocumentState::default();
+        let mut plan = chain
+            .plan(&context(MiddlewarePhase::Fetch, &state))
+            .expect("should plan a stream processor alone");
+        assert_eq!(
+            plan.processors.len(),
+            1,
+            "should carry one stream processor and nothing about HTML: {plan:?}"
+        );
+        let t_content = format!(r#"{{"url":"https://{ORIGIN_HOST}/page"}}"#);
+        let input = format!(
+            "1:T{:x},{t_content}2:[\"//{ORIGIN_HOST}/a\"]\n",
+            t_content.len()
+        );
+
+        let mut processor = plan.processors.remove(0);
+        let mut output = processor
+            .process_chunk(input.as_bytes(), false)
+            .expect("should process the stream");
+        output.extend(
+            processor
+                .process_chunk(&[], true)
+                .expect("should finish the stream"),
+        );
+
+        let rewritten = format!(r#"{{"url":"https://{REQUEST_HOST}/page"}}"#);
+        assert_eq!(
+            String::from_utf8(output).expect("should be valid UTF-8"),
+            format!(
+                "1:T{:x},{rewritten}2:[\"//{REQUEST_HOST}/a\"]\n",
+                rewritten.len()
+            ),
+            "should move the origin's address and write the T row's length again"
         );
     }
 }
