@@ -23670,6 +23670,25 @@ mod tests {
                 .map(|(_, value)| value.as_str())
         }
 
+        /// Asserts the one origin request `stub` recorded is signed as `method`
+        /// for exactly the address and `Host` it was sent with.
+        fn assert_signed(stub: &StubHttpClient, method: &Method) {
+            let uris = stub.recorded_request_uris();
+            let recorded = stub.recorded_request_headers();
+            let sent = recorded.first().expect("should send one origin request");
+            let host = sent_header(sent, "host").expect("should send a Host header");
+            assert_eq!(
+                host, "storage.example.com",
+                "should sign for the origin host"
+            );
+            let signed_at = sent_header(sent, "x-amz-date").expect("should send the signing time");
+            assert_eq!(
+                sent_header(sent, "authorization"),
+                Some(expected_authorization(method, &uris[0], host, signed_at).as_str()),
+                "should sign exactly the address and host that were sent"
+            );
+        }
+
         /// The `Authorization` the signer gives `method` on `uri` with `host` at
         /// the moment the signed request records.
         fn expected_authorization(
@@ -23987,17 +24006,7 @@ mod tests {
                 Some("reader-agent"),
                 "should still send headers a signed read may carry"
             );
-            let host = sent_header(sent, "host").expect("should send a Host header");
-            assert_eq!(
-                host, "storage.example.com",
-                "should sign for the origin host"
-            );
-            let signed_at = sent_header(sent, "x-amz-date").expect("should send the signing time");
-            assert_eq!(
-                sent_header(sent, "authorization"),
-                Some(expected_authorization(&Method::GET, &uris[0], host, signed_at).as_str()),
-                "should sign exactly the address and host that were sent"
-            );
+            assert_signed(&stub, &Method::GET);
         }
 
         #[tokio::test]
@@ -24016,16 +24025,7 @@ mod tests {
             .await;
 
             assert_eq!(stub.recorded_request_methods(), vec!["HEAD"]);
-            let uris = stub.recorded_request_uris();
-            let recorded = stub.recorded_request_headers();
-            let sent = recorded.first().expect("should send one origin request");
-            let host = sent_header(sent, "host").expect("should send a Host header");
-            let signed_at = sent_header(sent, "x-amz-date").expect("should send the signing time");
-            assert_eq!(
-                sent_header(sent, "authorization"),
-                Some(expected_authorization(&Method::HEAD, &uris[0], host, signed_at).as_str()),
-                "should sign the HEAD as a HEAD"
-            );
+            assert_signed(&stub, &Method::HEAD);
         }
 
         #[tokio::test]
@@ -24049,15 +24049,7 @@ mod tests {
                 vec!["https://storage.example.com/bucket/site/page"],
                 "should leave the reader's query off the signed read"
             );
-            let recorded = stub.recorded_request_headers();
-            let sent = recorded.first().expect("should send one origin request");
-            let host = sent_header(sent, "host").expect("should send a Host header");
-            let signed_at = sent_header(sent, "x-amz-date").expect("should send the signing time");
-            assert_eq!(
-                sent_header(sent, "authorization"),
-                Some(expected_authorization(&Method::GET, &uris[0], host, signed_at).as_str()),
-                "should sign the address without the query"
-            );
+            assert_signed(&stub, &Method::GET);
         }
 
         #[tokio::test]
