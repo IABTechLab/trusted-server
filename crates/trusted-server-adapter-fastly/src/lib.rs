@@ -109,27 +109,9 @@ fn stores_for_request(
     let resolved = config_selection::resolve_key(&stores.config_key, host, |key| {
         config_selection::blob_exists(stores.config_store_name.as_ref(), key)
     });
-    match resolved {
-        Ok(config_key) => Ok(RuntimeStoreConfig {
-            config_key,
-            ..stores
-        }),
-        Err(refusal) => {
-            let named = host.unwrap_or_default();
-            match &refusal {
-                config_selection::Refusal::NoConfigForHost => log::warn!(
-                    "no app-config blob for host {named:?} under key selector `{}`",
-                    stores.config_key
-                ),
-                config_selection::Refusal::StoreUnavailable(reason) => {
-                    log::error!(
-                        "cannot tell whether host {named:?} has an app-config blob: {reason}"
-                    );
-                }
-            }
-            Err(refusal)
-        }
-    }
+    stores_with_key(stores, resolved, || {
+        format!("host {:?}", host.unwrap_or_default())
+    })
 }
 
 /// Chooses the app-config blob from the selector values a request addressing
@@ -150,23 +132,40 @@ fn stores_for_address(
         config_selection::resolve_addressed_key(&stores.config_key, selector_values, |key| {
             config_selection::blob_exists(stores.config_store_name.as_ref(), key)
         });
+    stores_with_key(stores, resolved, || {
+        format!(
+            "any of the {} selector value(s) the request addressing named",
+            selector_values.len()
+        )
+    })
+}
+
+/// The stores with the resolved key, or the refusal, logged with what
+/// `subject` says the request was addressed by.
+///
+/// # Errors
+///
+/// Returns the refusal `resolved` carries.
+fn stores_with_key(
+    stores: RuntimeStoreConfig,
+    resolved: Result<String, config_selection::Refusal>,
+    subject: impl FnOnce() -> String,
+) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
     match resolved {
         Ok(config_key) => Ok(RuntimeStoreConfig {
             config_key,
             ..stores
         }),
         Err(refusal) => {
+            let subject = subject();
             match &refusal {
                 config_selection::Refusal::NoConfigForHost => log::warn!(
-                    "no app-config blob for any of the {} selector value(s) the request \
-                     addressing named under key selector `{}`",
-                    selector_values.len(),
+                    "no app-config blob for {subject} under key selector `{}`",
                     stores.config_key
                 ),
-                config_selection::Refusal::StoreUnavailable(reason) => log::error!(
-                    "cannot tell whether a selector value the request addressing named has \
-                     an app-config blob: {reason}"
-                ),
+                config_selection::Refusal::StoreUnavailable(reason) => {
+                    log::error!("cannot tell whether {subject} has an app-config blob: {reason}");
+                }
             }
             Err(refusal)
         }
@@ -266,6 +265,30 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     None
 }
 
+/// A debug probe answered before the application is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugProbe {
+    /// The sandbox counters snapshot.
+    #[cfg(feature = "reusable-sandbox")]
+    SandboxMetrics,
+    /// The TLS and JA4 signals the request arrived with.
+    Ja4,
+}
+
+/// The debug probe `req` asks for, read from the path it continues with, so
+/// a probe is found at the path the request addressing gives.
+fn debug_probe(req: &FastlyRequest) -> Option<DebugProbe> {
+    if req.get_method() != FastlyMethod::GET {
+        return None;
+    }
+    match req.get_path() {
+        #[cfg(feature = "reusable-sandbox")]
+        sandbox::SANDBOX_METRICS_PATH => Some(DebugProbe::SandboxMetrics),
+        "/_ts/debug/ja4" => Some(DebugProbe::Ja4),
+        _ => None,
+    }
+}
+
 /// Runs the Fastly Compute program with the integrations a deployment offers.
 ///
 /// The builders are composed with the ones this adapter ships rather than
@@ -291,17 +314,9 @@ pub fn run_with(integrations: Vec<IntegrationBuilder>) {
 /// Runs the Fastly Compute program with the integrations a deployment offers
 /// and the request addressing it supplies.
 ///
-/// The addressing is asked about each request before its app-config blob is
-/// chosen, and is recorded before any request is served, as the builders
-/// are. A request it addresses by host is served as [`run_with`] serves it.
-/// For one it names selector values, each value in turn takes the place of
-/// the host in a `__KEY` selector that carries `{host}`, and the first whose
-/// blob exists is read. A miss on every value is answered `421`, never from
-/// a key the addressing did not name. A selector without `{host}` reads its
-/// one blob and the values are ignored. Either way the request continues at
-/// the path the addressing gives, with its query kept, and carries the
-/// prefix it removed as a [`RemovedPathPrefix`] extension. `/health` is
-/// answered before the addressing is asked.
+/// The addressing is asked about each request after `/health` and before its
+/// app-config blob is chosen. A request it addresses by host is served as
+/// [`run_with`] serves it.
 ///
 /// ```no_run
 /// use std::sync::Arc;
@@ -589,8 +604,9 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Short-circuit the sandbox counters probe before app construction. It must
     // not build the application: polling it would otherwise increment the very
     // build counter it reports.
+    let probe = debug_probe(&req);
     #[cfg(feature = "reusable-sandbox")]
-    if req.get_method() == FastlyMethod::GET && req.get_path() == sandbox::SANDBOX_METRICS_PATH {
+    if probe == Some(DebugProbe::SandboxMetrics) {
         match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if sandbox::metrics_enabled(&settings) => {
                 sandbox_metrics_response(sandbox, ordinal).send_to_client();
@@ -611,7 +627,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+    if probe == Some(DebugProbe::Ja4) {
         match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
@@ -1318,6 +1334,7 @@ mod tests {
     use edgezero_core::http::response_builder;
     use fastly::mime;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::test_support::addressing::NamesSelectorValues;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -1585,34 +1602,6 @@ mod tests {
         );
     }
 
-    /// A request addressing that names `values` for every request and
-    /// continues `/<segment>/<rest>` at `/<rest>`, as a deployment serving
-    /// publishers under a path of their own would.
-    struct NamesSelectorValues(&'static [&'static str]);
-
-    impl RequestAddressing for NamesSelectorValues {
-        fn address(&self, _host: Option<&str>, path: &str) -> Addressing {
-            let rest = path.strip_prefix('/').unwrap_or(path);
-            let (segment, tail) = rest.split_once('/').unwrap_or((rest, ""));
-            let address = RequestAddress::new(
-                self.0.iter().map(|value| (*value).to_owned()).collect(),
-                format!("/{tail}"),
-                format!("/{segment}"),
-            )
-            .expect("should name a valid continuing path");
-            Addressing::Addressed(address)
-        }
-    }
-
-    /// A request addressing that leaves every request to its host.
-    struct AnswersByHost;
-
-    impl RequestAddressing for AnswersByHost {
-        fn address(&self, _host: Option<&str>, _path: &str) -> Addressing {
-            Addressing::ByHost
-        }
-    }
-
     /// A request for a page under a publisher's path on `host`.
     fn addressed_page(host: &str) -> FastlyRequest {
         let mut req = FastlyRequest::get(format!(
@@ -1661,7 +1650,7 @@ mod tests {
 
     #[test]
     fn an_addressing_answering_by_host_leaves_selection_and_path_as_today() {
-        assert_addressed_as_by_host(&AnswersByHost);
+        assert_addressed_as_by_host(&ByHostAddressing);
     }
 
     #[test]
@@ -1792,6 +1781,66 @@ mod tests {
             "/publisher.example/news/today",
             "a refused request should keep its path"
         );
+    }
+
+    /// `path` on `front.example` after the addressing that removes its first
+    /// segment, with the blob the addressing chose.
+    fn probe_addressed_at(path: &str) -> (FastlyRequest, RuntimeStoreConfig) {
+        let mut req = FastlyRequest::get(format!("https://front.example{path}"));
+        req.set_header(header::HOST.as_str(), "front.example");
+        let (stores, _) = address_request(
+            &NamesSelectorValues(&["publisher.example"]),
+            stores_with_selector("trusted_server_config"),
+            &mut req,
+        )
+        .expect("should serve the addressed request");
+        (req, stores)
+    }
+
+    #[test]
+    fn the_ja4_probe_is_found_at_the_path_the_addressing_gives() {
+        let (req, stores) = probe_addressed_at("/publisher.example/_ts/debug/ja4");
+
+        assert_eq!(
+            debug_probe(&req),
+            Some(DebugProbe::Ja4),
+            "the JA4 probe should answer under the publisher's path"
+        );
+        assert_eq!(
+            stores,
+            stores_with_selector("trusted_server_config"),
+            "the probe should read the blob the addressing chose"
+        );
+
+        let (unaddressed, _) = probe_addressed_at("/_ts/debug/ja4");
+        assert_eq!(
+            debug_probe(&unaddressed),
+            None,
+            "the probe should read the path the request continues with, not the one it arrived at"
+        );
+    }
+
+    #[cfg(feature = "reusable-sandbox")]
+    #[test]
+    fn the_counters_probe_is_found_at_the_path_the_addressing_gives() {
+        let (req, _) = probe_addressed_at(&format!(
+            "/publisher.example{}",
+            sandbox::SANDBOX_METRICS_PATH
+        ));
+
+        assert_eq!(
+            debug_probe(&req),
+            Some(DebugProbe::SandboxMetrics),
+            "the counters probe should answer under the publisher's path"
+        );
+    }
+
+    #[test]
+    fn a_debug_probe_is_answered_only_to_a_get() {
+        let mut req = FastlyRequest::post("https://front.example/_ts/debug/ja4");
+        req.set_header(header::HOST.as_str(), "front.example");
+
+        assert_eq!(debug_probe(&req), None, "a POST should not reach the probe");
     }
 
     #[test]
