@@ -2,19 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::constants::{COOKIE_EC, COOKIE_EIDS, COOKIE_SHAREDID};
+use crate::constants::COOKIE_SHAREDID;
 use crate::platform::TemplateCookieValue;
 use crate::prefix::PublicPrefix;
 
-/// The identity cookies a template key must never be built from, under
-/// `public`, the request's public prefix, being the Edge Cookie, the EIDs
-/// cookie and `sharedId`.
-pub(crate) fn identity_cookies(public: &PublicPrefix) -> [String; 3] {
-    [
-        public.cookie_name(COOKIE_EC),
-        public.cookie_name(COOKIE_EIDS),
-        COOKIE_SHAREDID.to_owned(),
-    ]
+/// Whether `name` is an identity cookie a template key must never be built
+/// from, under `public`, the request's public prefix. Every cookie under the
+/// prefix is one reader's own state, the Edge Cookie and a module's
+/// identifier cookie among them, and `sharedId` is one too.
+pub(crate) fn is_identity_cookie(public: &PublicPrefix, name: &str) -> bool {
+    public.owns_cookie_name(name.as_bytes()) || name == COOKIE_SHAREDID
 }
 
 /// Whether the request can share a template and its explicit cookie dimensions.
@@ -31,12 +28,12 @@ pub(crate) enum TemplateCookieDecision {
 /// Returns an error naming the field and cookie when a name is invalid or repeated,
 /// or when the key list names an identity cookie under core's own prefix. A
 /// deployment's own prefix is checked on each request, see
-/// [`identity_cookies`].
+/// [`is_identity_cookie`].
 pub(crate) fn validate_cookie_names(
     key_names: &[String],
     bypass_names: &[String],
 ) -> Result<(), String> {
-    let identity = identity_cookies(&PublicPrefix::default());
+    let public = PublicPrefix::default();
     let mut seen = HashSet::new();
     for (field, names) in [
         ("template_cache_key_cookies", key_names),
@@ -46,7 +43,7 @@ pub(crate) fn validate_cookie_names(
             if !is_cookie_name(name.as_bytes()) {
                 return Err(format!("{field} contains invalid cookie name `{name}`"));
             }
-            if field == "template_cache_key_cookies" && identity.contains(name) {
+            if field == "template_cache_key_cookies" && is_identity_cookie(&public, name) {
                 return Err(format!(
                     "{field} must not key on Trusted Server identity cookie `{name}`"
                 ));
@@ -245,7 +242,13 @@ mod tests {
 
     #[test]
     fn template_cookie_policy_rejects_identity_keys_but_allows_bypass() {
-        for name in identity_cookies(&PublicPrefix::default()) {
+        let public = PublicPrefix::default();
+        for name in [
+            public.cookie_name(crate::constants::COOKIE_EC),
+            public.cookie_name(crate::constants::COOKIE_EC_RESOLVED),
+            public.cookie_name("a-module-cookie"),
+            COOKIE_SHAREDID.to_owned(),
+        ] {
             let name = name.as_str();
             let error = validate_cookie_names(&names(&[name]), &[])
                 .expect_err("should reject identity cookie keys");

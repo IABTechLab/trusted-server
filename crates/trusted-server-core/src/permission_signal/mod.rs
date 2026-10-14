@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use error_stack::Report;
 
-use crate::consent::ConsentContext;
+use crate::consent::{ConsentContext, SignalRecord};
 use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
 use crate::module_context::{ModuleCall, ModuleContext};
@@ -201,6 +201,20 @@ pub trait PermissionSignalModule: Send + Sync {
     /// permissions are resolved, so a declaration here passes nothing yet.
     fn required_permissions(&self) -> PermissionSet {
         PermissionSet::none()
+    }
+
+    /// Reads this module's signal from the request, once, before any
+    /// permission is asked, and reports it as a [`SignalRecord`].
+    ///
+    /// The record is what this module and every other reader of the request
+    /// see as the signal, so a scheme reads its string from the evidence,
+    /// decodes it here, and reads the record back in [`signal`](Self::signal)
+    /// rather than decoding again. The call carries the evidence, the
+    /// settings and a consent context holding the request's jurisdiction and
+    /// no records yet. `None` says the request carried nothing of this scheme
+    /// and the module has nothing to say without one.
+    fn read(&self, _call: ModuleCall<'_>) -> Option<SignalRecord> {
+        None
     }
 
     /// How this module would amend `permission` for this request.

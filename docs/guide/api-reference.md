@@ -525,7 +525,7 @@ curl 'https://edge.example.com/_ts/page-bids?path=%2Fnews&format=json' \
 
 ## Edge Cookie Endpoints
 
-Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no runtime partner-registration endpoint and the legacy browser pixel sync endpoint has been removed; browser-resolved IDs are ingested through Prebid EID cookies.
+Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no runtime partner-registration endpoint and the legacy browser pixel sync endpoint has been removed; browser-resolved IDs are ingested through the identifier modules a build links, such as the Prebid module reading its `ts-eids` cookie.
 
 ---
 
@@ -1110,7 +1110,7 @@ predicates below, `named` means a section selects the integration's module.
 
 | Integration          | Registration predicate                                              | HTTP routes                                       |
 | -------------------- | ------------------------------------------------------------------- | ------------------------------------------------- |
-| `adserver_mock`      | `[ad-server] module = "mock"`                                       | None                                              |
+| `adserver_mock`      | `[ad-server] module = "iabtl"`                                      | None                                              |
 | `aps`                | `demand implementation=auction.aps;rendering_mode=publisher_native` | None                                              |
 | `aps`                | `demand implementation=auction.aps;rendering_mode=trusted_server`   | `GET /integrations/aps/renderer`                  |
 | `creative`           | `always`                                                            | None                                              |

@@ -27,7 +27,6 @@ use std::time::{Duration, SystemTime};
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
-use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
@@ -56,8 +55,8 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::{COOKIE_EIDS, COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
+use crate::consent::{gate_eids_by_permissions, permissions_allow_server_side_auction};
+use crate::constants::{COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -89,7 +88,6 @@ use crate::response_privacy::{
     apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
     enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
 };
-use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::{
     AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS,
     AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
@@ -693,7 +691,10 @@ struct TextResponse<'a> {
 /// headers the serve entry's middleware write on the response, or none
 /// when its media type is not one a middleware runs on, its charset is not
 /// UTF-8 or no entry covers it. Both phases run here because the template
-/// cache stores HTML alone.
+/// cache stores HTML alone. The pass also says whether a registered
+/// middleware moves the origin's address in a body of this media type
+/// itself, which holds whatever the charset and whether or not an entry
+/// names that middleware.
 ///
 /// # Errors
 ///
@@ -709,10 +710,16 @@ fn middleware_stream_processors(
     };
 
     let media_type = media_type_of(response.content_type);
-    if !is_dispatched_media_type(&media_type)
-        || !is_utf8_or_undeclared_charset(response.content_type)
-    {
+    if !is_dispatched_media_type(&media_type) {
         return Ok(TextPass::default());
+    }
+    let addresses_left_to_middleware =
+        integration_registry.middleware_moves_origin_address(&media_type);
+    if !is_utf8_or_undeclared_charset(response.content_type) {
+        return Ok(TextPass {
+            addresses_left_to_middleware,
+            ..TextPass::default()
+        });
     }
     let mut processors = Vec::new();
     let mut response_headers = Vec::new();
@@ -748,15 +755,49 @@ fn middleware_stream_processors(
     Ok(TextPass {
         processors,
         response_headers,
+        addresses_left_to_middleware,
     })
 }
 
 /// What the entries covering a text response do to it: the processors over
-/// its body and the headers the serve entry's middleware write.
+/// its body, the headers the serve entry's middleware write, and whether
+/// the origin's address in the body is left to a middleware.
 #[derive(Default)]
 struct TextPass {
     processors: Vec<Box<dyn StreamProcessor>>,
     response_headers: Vec<ResponseHeader>,
+    /// Whether a registered middleware moves the origin's address in the
+    /// body itself, so core's plain replacement does not run on it.
+    addresses_left_to_middleware: bool,
+}
+
+impl TextPass {
+    /// The processor over the body, being core's move of the origin's
+    /// address unless a middleware moves it itself, and then the entries'
+    /// processors, with the headers the serve entry's middleware write.
+    fn into_processor(
+        self,
+        origin_host: &str,
+        origin_url: &str,
+        request_host: &str,
+        request_scheme: &str,
+    ) -> (WithStreamProcessors, Vec<ResponseHeader>) {
+        let inner = (!self.addresses_left_to_middleware).then(|| {
+            Box::new(create_url_replacer(
+                origin_host,
+                origin_url,
+                request_host,
+                request_scheme,
+            )) as Box<dyn StreamProcessor>
+        });
+        (
+            WithStreamProcessors {
+                inner,
+                processors: self.processors,
+            },
+            self.response_headers,
+        )
+    }
 }
 
 /// Runs the preparation of the middleware the entries of each phase in
@@ -871,16 +912,20 @@ fn refusal_response(refusal: &Refusal) -> Result<Response<EdgeBody>, Report<Trus
         })
 }
 
-/// A processor followed by the ones the entries add, each handed what the
+/// Core's move of the origin's address, where no middleware moves it
+/// itself, followed by the processors the entries add, each handed what the
 /// one before produced.
 struct WithStreamProcessors {
-    inner: Box<dyn StreamProcessor>,
+    inner: Option<Box<dyn StreamProcessor>>,
     processors: Vec<Box<dyn StreamProcessor>>,
 }
 
 impl StreamProcessor for WithStreamProcessors {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
-        let mut output = self.inner.process_chunk(chunk, is_last)?;
+        let mut output = match &mut self.inner {
+            Some(inner) => inner.process_chunk(chunk, is_last)?,
+            None => chunk.to_vec(),
+        };
         for processor in &mut self.processors {
             output = processor.process_chunk(&output, is_last)?;
         }
@@ -888,7 +933,9 @@ impl StreamProcessor for WithStreamProcessors {
     }
 
     fn reset(&mut self) {
-        self.inner.reset();
+        if let Some(inner) = &mut self.inner {
+            inner.reset();
+        }
         for processor in &mut self.processors {
             processor.reset();
         }
@@ -908,16 +955,14 @@ impl PublisherBodyProcessor {
         integration_registry: &IntegrationRegistry,
     ) -> Result<(Self, Option<Vec<u8>>), Report<TrustedServerError>> {
         let is_html = is_html_content_type(&params.content_type);
-        let is_rsc_flight =
-            content_type_contains_ascii_case_insensitive(&params.content_type, "text/x-component");
         let inline_seam_token = deferred_inline_seam_token(
             settings,
             params.template_cache_key.is_some(),
             params.ad_slots_script.is_some(),
             is_html && params.dispatched_auction.is_some(),
         );
-        let mut response_headers = Vec::new();
-        let inner: Box<dyn StreamProcessor> = if is_html {
+        let (inner, response_headers): (Box<dyn StreamProcessor>, Vec<ResponseHeader>) = if is_html
+        {
             let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
                 origin_host: &params.origin_host,
                 request_host: &params.request_host,
@@ -937,17 +982,9 @@ impl PublisherBodyProcessor {
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
             })?;
-            response_headers = headers;
-            Box::new(processor)
-        } else if is_rsc_flight {
-            Box::new(RscFlightUrlRewriter::new(
-                &params.origin_host,
-                &params.origin_url,
-                &params.request_host,
-                &params.request_scheme,
-            ))
+            (Box::new(processor), headers)
         } else {
-            let pass = middleware_stream_processors(
+            let (processor, headers) = middleware_stream_processors(
                 &TextResponse {
                     content_type: &params.content_type,
                     request_path: &params.request_path,
@@ -960,17 +997,14 @@ impl PublisherBodyProcessor {
                 },
                 settings,
                 integration_registry,
-            )?;
-            response_headers = pass.response_headers;
-            Box::new(WithStreamProcessors {
-                inner: Box::new(create_url_replacer(
-                    &params.origin_host,
-                    &params.origin_url,
-                    &params.request_host,
-                    &params.request_scheme,
-                )),
-                processors: pass.processors,
-            })
+            )?
+            .into_processor(
+                &params.origin_host,
+                &params.origin_url,
+                &params.request_host,
+                &params.request_scheme,
+            );
+            (Box::new(processor), headers)
         };
 
         Ok((
@@ -998,10 +1032,10 @@ impl StreamProcessor for PublisherBodyProcessor {
 
 /// Process response body through the streaming pipeline.
 ///
-/// Selects the appropriate processor based on content type (HTML rewriter,
-/// RSC Flight rewriter, or URL replacer) and pipes chunks from `body`
-/// through it into `output`. The caller decides what `output` is — a
-/// `Vec<u8>` for buffered responses, or a `StreamingBody` for streaming.
+/// Selects the processor by content type, the HTML rewriter or the text
+/// pass of the entries' middleware, and pipes chunks from `body` through it
+/// into `output`. The caller decides what `output` is, a `Vec<u8>` for
+/// buffered responses or a `StreamingBody` for streaming.
 ///
 /// # Errors
 ///
@@ -1013,14 +1047,11 @@ fn process_response_streaming<W: Write>(
     output_compression: Compression,
 ) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     let is_html = is_html_content_type(params.content_type);
-    let is_rsc_flight =
-        content_type_contains_ascii_case_insensitive(params.content_type, "text/x-component");
     log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
+        "process_response_streaming: content_type={}, content_encoding={}, is_html={}",
         params.content_type,
         params.content_encoding,
-        is_html,
-        is_rsc_flight
+        is_html
     );
 
     let compression = Compression::from_content_encoding(params.content_encoding);
@@ -1037,8 +1068,7 @@ fn process_response_streaming<W: Write>(
     // gzip would reject bodies the identity, deflate and brotli paths accept.
     let max_pending_decoded_bytes = params.settings.publisher.max_buffered_body_bytes;
 
-    let mut response_headers = Vec::new();
-    if is_html {
+    let response_headers = if is_html {
         let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
             origin_host: params.origin_host,
             request_host: params.request_host,
@@ -1056,24 +1086,12 @@ fn process_response_streaming<W: Write>(
             public_prefix: params.public_prefix,
             deferred_inline_marker: None,
         })?;
-        response_headers = headers;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
-    } else if is_rsc_flight {
-        // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
-        // corrupt the stream by changing byte lengths without updating the prefixes.
-        let processor = RscFlightUrlRewriter::new(
-            params.origin_host,
-            params.origin_url,
-            params.request_host,
-            params.request_scheme,
-        );
-        StreamingPipeline::new(config, processor)
-            .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
-            .process(body_as_reader(body)?, output)?;
+        headers
     } else {
-        let pass = middleware_stream_processors(
+        let (processor, headers) = middleware_stream_processors(
             &TextResponse {
                 content_type: params.content_type,
                 request_path: params.request_path,
@@ -1086,21 +1104,18 @@ fn process_response_streaming<W: Write>(
             },
             params.settings,
             params.integration_registry,
-        )?;
-        response_headers = pass.response_headers;
-        let processor = WithStreamProcessors {
-            inner: Box::new(create_url_replacer(
-                params.origin_host,
-                params.origin_url,
-                params.request_host,
-                params.request_scheme,
-            )),
-            processors: pass.processors,
-        };
+        )?
+        .into_processor(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
-    }
+        headers
+    };
 
     Ok(response_headers)
 }
@@ -3654,7 +3669,7 @@ struct EcSnapshotPreloadInput {
     has_kv: bool,
     marker_valid: bool,
     auction_needs_row: bool,
-    eid_cookie_may_need_persistence: bool,
+    eids_may_need_persistence: bool,
     privacy_needs_row: bool,
 }
 
@@ -3662,7 +3677,7 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
     let eligible = input.is_navigation && input.is_get && input.has_ec_id && input.has_kv;
     let marker_can_skip = input.marker_valid
         && !input.auction_needs_row
-        && !input.eid_cookie_may_need_persistence
+        && !input.eids_may_need_persistence
         && !input.privacy_needs_row;
     eligible && !marker_can_skip
 }
@@ -5401,10 +5416,10 @@ pub async fn handle_publisher_request(
         Vec::new()
     };
 
-    // Fail closed for GDPR-relevant traffic: GDPR/unknown jurisdictions and
-    // requests carrying an EU TCF signal require effective TCF Purpose 1
-    // (storage/access) before firing. Known non-GDPR jurisdictions are free.
-    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
+    // Fail closed where the resolved permissions do not set basic ad
+    // selection, which under a baseline that requires a signal means no
+    // module granted it.
+    let consent_allows_auction = permissions_allow_server_side_auction(ec_context.permissions());
 
     let should_run_ad_stack = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: is_get,
@@ -5483,9 +5498,9 @@ pub async fn handle_publisher_request(
         });
     // A key cookie naming one of this request's own identity cookies would
     // make the template one reader's, so such a request shares none.
-    let identity =
-        crate::cookies::template_cache_policy::identity_cookies(services.public_prefix());
-    let keys_an_identity = key_cookie_names.iter().any(|name| identity.contains(name));
+    let keys_an_identity = key_cookie_names.iter().any(|name| {
+        crate::cookies::template_cache_policy::is_identity_cookie(services.public_prefix(), name)
+    });
     let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
         req.headers(),
         key_cookie_names,
@@ -5682,11 +5697,10 @@ pub async fn handle_publisher_request(
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
-    let eid_cookie_may_need_persistence = cookie_jar.as_ref().is_some_and(|jar| {
-        jar.get(&services.public_prefix().cookie_name(COOKIE_EIDS))
-            .is_some()
-            || jar.get(COOKIE_SHAREDID).is_some()
-    });
+    let eids_may_need_persistence = !ec_context.module_eids().is_empty()
+        || cookie_jar
+            .as_ref()
+            .is_some_and(|jar| jar.get(COOKIE_SHAREDID).is_some());
     // This decision also gates the concurrent origin send below. A marker skip
     // cannot currently delay the origin behind an auction because marker
     // validation requires a non-empty registry, and every such auction sets
@@ -5701,7 +5715,7 @@ pub async fn handle_publisher_request(
             && auction
                 .registry
                 .is_some_and(|registry| !registry.is_empty()),
-        eid_cookie_may_need_persistence,
+        eids_may_need_persistence,
         privacy_needs_row: ec_context.storage_withdrawn(),
     });
     let mut pending_origin = None;
@@ -5808,7 +5822,6 @@ pub async fn handle_publisher_request(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
                     ec_id,
                     kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
@@ -6592,7 +6605,6 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
 /// helper within the project's 7-argument cap.
 struct AuctionEidTargeting<'a> {
-    cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
@@ -6613,12 +6625,8 @@ fn apply_auction_eids_and_device(
     auction_request: &mut AuctionRequest,
     targeting: &AuctionEidTargeting<'_>,
 ) {
-    let ts_eids_value = targeting
-        .cookie_jar
-        .and_then(|j| j.get(&targeting.services.public_prefix().cookie_name(COOKIE_EIDS)))
-        .map(|c| c.value().to_owned());
     let client_eids = if targeting.ec_id.is_some() {
-        resolve_client_auction_eids(None, ts_eids_value.as_deref())
+        resolve_client_auction_eids(None, targeting.ec_context.module_eids())
     } else {
         None
     };
@@ -8186,11 +8194,9 @@ pub async fn handle_page_bids(
         .map(str::to_owned);
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
-    let cookie_jar = handle_request_cookies(&req)?;
 
-    // Same fail-closed jurisdiction-aware gate the publisher navigation path
-    // uses — relies on the adapter's geo-aware EC context.
-    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
+    // Same fail-closed permission gate the publisher navigation path uses.
+    let consent_allows_auction = permissions_allow_server_side_auction(ec_context.permissions());
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -8266,9 +8272,9 @@ pub async fn handle_page_bids(
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
-            // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests `ts-eids`/`sharedId` updates
-            // from this read instead of paying for a second lookup.
+            // finalization, which runs on an EC context the adapter owns
+            // after this handler returns, ingests the request's identifier
+            // updates from this read instead of paying for a second lookup.
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
             }
@@ -8283,7 +8289,6 @@ pub async fn handle_page_bids(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
                     ec_id: ec_id.as_deref(),
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
@@ -9444,7 +9449,7 @@ mod tests {
             has_kv: true,
             marker_valid: false,
             auction_needs_row: false,
-            eid_cookie_may_need_persistence: false,
+            eids_may_need_persistence: false,
             privacy_needs_row: false,
         };
         assert!(should_preload_ec_snapshot(&baseline));
@@ -9475,7 +9480,7 @@ mod tests {
             has_kv: true,
             marker_valid: true,
             auction_needs_row: false,
-            eid_cookie_may_need_persistence: false,
+            eids_may_need_persistence: false,
             privacy_needs_row: false,
         };
         assert!(!should_preload_ec_snapshot(&marker_only));
@@ -9484,7 +9489,7 @@ mod tests {
             ..marker_only
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
-            eid_cookie_may_need_persistence: true,
+            eids_may_need_persistence: true,
             ..marker_only
         }));
         assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
@@ -10005,11 +10010,16 @@ mod tests {
             .then(scheduling_slot)
             .into_iter()
             .collect::<Vec<_>>();
-        let mut request = navigation_request();
+        let request = navigation_request();
         if has_eid_cookie {
-            request
-                .headers_mut()
-                .insert(header::COOKIE, HeaderValue::from_static("ts-eids=present"));
+            ec_context.set_module_eids_for_test(vec![crate::openrtb::Eid {
+                source: "ssp.example.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "present".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            }]);
         }
 
         let integration_registry = test_registry(&settings);
@@ -17186,7 +17196,6 @@ mod tests {
                                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::UsState(
                                     "CA".to_owned(),
                                 ),
-                                gpc: true,
                                 ..Default::default()
                             },
                         )
@@ -17243,7 +17252,6 @@ mod tests {
                         &mut ec_context,
                         Some(&graph),
                         &partners,
-                        None,
                         None,
                         &mut response,
                         &services,
@@ -23052,6 +23060,114 @@ mod tests {
                 fixture::TEXT_LINE
             ),
             "should move the origin's address and then run the entry's middleware"
+        );
+    }
+
+    /// A body whose registered middleware moves the origin's address itself
+    /// is handed to that middleware as the origin sent it, so core's plain
+    /// replacement cannot break its rows.
+    #[test]
+    fn a_body_whose_middleware_moves_the_address_itself_is_handed_to_it_as_sent() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::FRAMED_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::FRAMED.to_owned()],
+        }]);
+        let body = "See https://origin.example.com/more\n";
+
+        let output = text_body_through_the_publisher(&settings, fixture::FRAMED_MEDIA_TYPE, body);
+
+        assert_eq!(
+            output,
+            format!("{body}{}", fixture::FRAMED_LINE),
+            "should leave the origin's address to the middleware and run it"
+        );
+    }
+
+    /// With no entry naming that middleware, the body passes through as the
+    /// origin sent it, neither core nor the middleware touching it.
+    #[test]
+    fn a_body_whose_middleware_moves_the_address_itself_passes_through_with_no_entry() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(Vec::new());
+        let body = "See https://origin.example.com/more\n";
+
+        let output = text_body_through_the_publisher(&settings, fixture::FRAMED_MEDIA_TYPE, body);
+
+        assert_eq!(
+            output, body,
+            "should pass the body through as the origin sent it"
+        );
+    }
+
+    /// The same through the response path a streamed body takes, which
+    /// builds its processor apart from the buffered path's.
+    #[tokio::test]
+    async fn a_streamed_body_whose_middleware_moves_the_address_itself_is_handed_to_it_as_sent() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+        use crate::platform::test_support::noop_services;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::FRAMED_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::FRAMED.to_owned()],
+        }]);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        );
+        let services = noop_services();
+        let mut params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
+            csp_nonce_observed: None,
+            prepared: Arc::new(Prepared::default()),
+            template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            request_path: "/a.txt".to_owned(),
+            content_type: fixture::FRAMED_MEDIA_TYPE.to_string(),
+            permissions_json: String::new(),
+            ad_slots_script: None,
+            ad_bids_state: AdBidsState::default(),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+            request_state: IntegrationRequestState::default(),
+        };
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"See https://origin.example.com/"),
+            bytes::Bytes::from_static(b"more\n"),
+        ]));
+        let mut output = Vec::new();
+
+        stream_publisher_body_async(
+            body,
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should stream a text body");
+
+        assert_eq!(
+            String::from_utf8(output).expect("text"),
+            format!(
+                "See https://origin.example.com/more\n{}",
+                fixture::FRAMED_LINE
+            ),
+            "should leave the origin's address to the middleware on the streamed path too"
         );
     }
 
@@ -30175,8 +30291,8 @@ mod tests {
                 .expect("should be json")
         }
 
-        /// Builds an [`EcContext`] whose consent context permits the server-side
-        /// auction (known non-GDPR jurisdiction, no EU TCF signal).
+        /// Builds an [`EcContext`] whose permissions permit the server-side
+        /// auction (a jurisdiction whose baseline grants basic ad selection).
         fn consent_allowing_ec_context() -> EcContext {
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -31749,7 +31865,6 @@ mod tests {
                     &mut ec_context,
                     Some(&graph),
                     &PartnerRegistry::empty(),
-                    None,
                     None,
                     &mut response,
                     &crate::platform::test_support::noop_services(),
