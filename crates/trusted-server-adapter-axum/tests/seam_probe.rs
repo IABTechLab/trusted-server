@@ -2,7 +2,7 @@
 //! `trusted-server-core`.
 //!
 //! Every capability the seam exposes is registered here by
-//! `trusted-server-integration-seam-probe`, a fixture crate core knows nothing
+//! `trusted-server-testing-iabtl`, a fixture crate core knows nothing
 //! about, and asserted through the Axum adapter's real router. Each test
 //! turns on an observable outcome (the bytes served, the JSON a route
 //! returns, the error a startup or deploy check produces) rather than on a
@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Request};
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use error_stack::Report;
 use tower::{Service as _, ServiceExt as _};
-use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::app::{TrustedServerApp, module_builders_with};
 use trusted_server_core::auction::compile_auction_plan;
 use trusted_server_core::config::validate_settings_for_deploy_with;
 use trusted_server_core::error::TrustedServerError;
@@ -32,7 +32,7 @@ use trusted_server_core::platform::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
-use trusted_server_integration_seam_probe as seam_probe;
+use trusted_server_testing_iabtl as seam_probe;
 
 /// Largest response body these tests read, ample for the served script.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -83,9 +83,9 @@ assume_single_jurisdiction = true
 /// assertions expect.
 const PROBE_BLOCK: &str = r#"
             [testing]
-            modules = ["seam-probe"]
+            modules = ["iabtl"]
 
-            [testing.seam-probe]
+            [testing.iabtl]
             country = "ZZ"
 "#;
 
@@ -228,7 +228,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     let settings = settings_with(&format!(
         r#"
             [geo]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
             {PROBE_BLOCK}
         "#
     ));
@@ -261,14 +261,14 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     );
 }
 
-/// `[shared.seam-probe]` runs the builder the probe shares, whose route
+/// `[shared.iabtl]` runs the builder the probe shares, whose route
 /// answers the table's marker. Without the table the builder is not built,
 /// and the table with no builder reading it is refused at startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vendors_shared_table_runs_its_builder() {
     let mut with = service_with(
         settings_with(&format!(
-            "[shared.seam-probe]\nmarker = \"from the shared table\"\n{PROBE_BLOCK}"
+            "[shared.iabtl]\nmarker = \"from the shared table\"\n{PROBE_BLOCK}"
         )),
         &[seam_probe::builder(), seam_probe::shared_builder()],
     );
@@ -292,13 +292,13 @@ async fn a_vendors_shared_table_runs_its_builder() {
     );
 
     let refused = TrustedServerApp::routes_with_registrations(
-        settings_with("[shared.seam-probe]\nmarker = \"x\"\n"),
+        settings_with("[shared.iabtl]\nmarker = \"x\"\n"),
         &[seam_probe::builder()],
     )
     .err()
     .expect("nothing reads the table");
     assert!(
-        format!("{refused:?}").contains("[shared.seam-probe] is read by no module"),
+        format!("{refused:?}").contains("[shared.iabtl] is read by no module"),
         "{refused:?}"
     );
 }
@@ -357,7 +357,7 @@ fn robots_txt_selection_naming_a_module_that_is_not_running_fails_at_startup() {
     let settings = settings_with(
         r#"
             [robots-txt]
-            modules = ["testing.seam-probe"]
+            modules = ["testing.iabtl"]
 
             [[fetch]]
             media_type = "text/plain"
@@ -372,7 +372,7 @@ fn robots_txt_selection_naming_a_module_that_is_not_running_fails_at_startup() {
     let message = format!("{error:?}");
 
     assert!(
-        message.contains("`[robots-txt] modules` names `testing.seam-probe`"),
+        message.contains("`[robots-txt] modules` names `testing.iabtl`"),
         "should name the selection: {message}"
     );
     assert!(
@@ -441,9 +441,9 @@ fn deploy_validation_rejects_a_violation_of_the_modules_own_rule() {
     let settings = settings_with(
         r#"
             [testing]
-            modules = ["seam-probe"]
+            modules = ["iabtl"]
 
-            [testing.seam-probe]
+            [testing.iabtl]
             country = "ZZZ"
         "#,
     );
@@ -480,7 +480,7 @@ async fn report_with(settings: Settings, integrations: &[IntegrationBuilder]) ->
     serde_json::from_str(&body).expect("the report route should return JSON")
 }
 
-/// `[cache.seam-probe-answers]` selects the loading cache the probe's answers
+/// `[cache.iabtl-answers]` selects the loading cache the probe's answers
 /// are held in, the way `[cache.robots-txt]` selects core's. Left out, the
 /// cache takes the one loading cache module the build links, and this build
 /// links two, the stock one and the probe's, so it keeps nothing until the
@@ -490,8 +490,8 @@ async fn report_with(settings: Settings, integrations: &[IntegrationBuilder]) ->
 async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
     let named = settings_with(&format!(
         r#"
-            [cache.seam-probe-answers]
-            module = "seam-probe"
+            [cache.iabtl-answers]
+            module = "iabtl"
             {PROBE_BLOCK}
         "#
     ));
@@ -524,14 +524,16 @@ async fn a_cache_the_probe_declares_is_selected_in_its_own_table() {
 async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_startup() {
     let settings = settings_with(&format!(
         r#"
-            [cache.seam-probe-answres]
-            module = "seam-probe"
+            [cache.iabtl-answres]
+            module = "iabtl"
             {PROBE_BLOCK}
         "#
     ));
     let both = [seam_probe::builder(), seam_probe::loading_cache_builder()];
 
-    let deploy = validate_settings_for_deploy_with(&settings, &both)
+    // The deploy check reads the builders startup links, the adapter's own
+    // and the deployment's after them.
+    let deploy = validate_settings_for_deploy_with(&settings, &module_builders_with(&both))
         .expect_err("the deploy check should refuse the misspelt table");
     let startup = TrustedServerApp::routes_with_registrations(settings, &both)
         .err()
@@ -541,11 +543,11 @@ async fn a_cache_table_no_module_declares_is_refused_by_the_deploy_check_and_at_
     // runner asks for one, and the two are raised on different stacks.
     let message = format!("{deploy}");
     assert!(
-        message.contains("[cache.seam-probe-answres]"),
+        message.contains("[cache.iabtl-answres]"),
         "should name the table: {message}"
     );
     assert!(
-        message.contains("robots-txt, assets, assets-vary, seam-probe-answers"),
+        message.contains("robots-txt, assets, assets-vary, 51degrees-answers, iabtl-answers"),
         "should list the caches this build declares: {message}"
     );
     assert_eq!(
@@ -566,12 +568,12 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
     let settings = settings_with(
         r#"
             [geo]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
 
             [testing]
-            modules = ["seam-probe"]
+            modules = ["iabtl"]
 
-            [testing.seam-probe]
+            [testing.iabtl]
             country = "ZZ"
             declares_geo = false
         "#,
@@ -583,7 +585,7 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
 
     let message = error.to_string();
     assert!(
-        message.contains("`[geo] module` names `testing.seam-probe`")
+        message.contains("`[geo] module` names `testing.iabtl`")
             && message.contains("is selected and supplies no geo module"),
         "should name the module and the missing capability: {message}"
     );
@@ -603,7 +605,7 @@ fn fetch_entry_naming_a_modules_middleware_starts_the_adapter() {
             [[fetch]]
             media_type = "text/html"
             path = "/news/"
-            middleware = ["testing.seam-probe"]
+            middleware = ["testing.iabtl"]
             "#
         ))
     };
@@ -665,7 +667,7 @@ fn serve_entry_starts_the_adapter_only_with_a_middleware_of_that_phase() {
 
     let message = error.to_string();
     assert!(
-        message.contains("[[serve]] entry 1 names `testing.seam-probe`")
+        message.contains("[[serve]] entry 1 names `testing.iabtl`")
             && message.contains("does not run in that phase. It runs in [[fetch]]"),
         "should say which phase the middleware runs in: {message}"
     );
@@ -679,7 +681,7 @@ fn fetch_entry_naming_the_middleware_of_an_unselected_module_fails_at_startup() 
         r#"
             [[fetch]]
             media_type = "text/html"
-            middleware = ["testing.seam-probe"]
+            middleware = ["testing.iabtl"]
         "#,
     );
 
@@ -689,8 +691,8 @@ fn fetch_entry_naming_the_middleware_of_an_unselected_module_fails_at_startup() 
 
     let message = error.to_string();
     assert!(
-        message.contains("[[fetch]] entry 1 names `testing.seam-probe`")
-            && message.contains("`testing.seam-probe` is a module no section selects"),
+        message.contains("[[fetch]] entry 1 names `testing.iabtl`")
+            && message.contains("`testing.iabtl` is a module no section selects"),
         "should name the entry and say why the middleware is not running: {message}"
     );
 }
@@ -752,7 +754,7 @@ const PROBE_DEMAND_BLOCK: &str = r#"
             modules = ["probe"]
 
             [demand.probe]
-            implementation = "testing.seam-probe"
+            implementation = "testing.iabtl"
             endpoint = "https://demand.example/openrtb2/auction"
 "#;
 
@@ -778,13 +780,13 @@ fn demand_source_a_module_supplies_is_known_only_with_its_builder() {
         .expect("should refuse a demand source no builder in the deployment supplies");
     let message = error.to_string();
     assert!(
-        message.contains("[demand] `probe` uses implementation `testing.seam-probe`"),
+        message.contains("[demand] `probe` uses implementation `testing.iabtl`"),
         "should name the demand source and the implementation nothing supplies: {message}"
     );
     let error = validate_settings_for_deploy_with(&settings_with(PROBE_DEMAND_BLOCK), &[])
         .expect_err("should refuse the probe's demand source without the probe's builder");
     assert!(
-        error.to_string().contains("testing.seam-probe"),
+        error.to_string().contains("testing.iabtl"),
         "should name the implementation nothing supplies: {error}"
     );
 }
@@ -796,7 +798,7 @@ const PROBE_ADSERVER_BLOCK: &str = r#"
             module = "probe"
 
             [ad-server.probe]
-            implementation = "testing.seam-probe"
+            implementation = "testing.iabtl"
 "#;
 
 /// The adapter compiles the auction plan with the builders it is given, so an
@@ -820,7 +822,7 @@ fn ad_server_a_module_supplies_starts_the_adapter_only_with_its_builder() {
             .expect("should refuse an ad server no builder in the deployment supplies");
     let message = error.to_string();
     assert!(
-        message.contains("[ad-server] `probe` uses implementation `testing.seam-probe`"),
+        message.contains("[ad-server] `probe` uses implementation `testing.iabtl`"),
         "should name the ad server and the implementation nothing supplies: {message}"
     );
 }
@@ -837,7 +839,7 @@ fn deploy_validation_accepts_a_modules_ad_server_only_with_its_builder() {
     let error = validate_settings_for_deploy_with(&settings, &[])
         .expect_err("should refuse the probe's ad server without the probe's builder");
     assert!(
-        error.to_string().contains("testing.seam-probe"),
+        error.to_string().contains("testing.iabtl"),
         "should name the implementation nothing supplies: {error}"
     );
 }
@@ -890,7 +892,7 @@ fn ec_selector_naming_a_module_resolves_the_edge_cookie_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
         "#,
     );
 
@@ -898,7 +900,7 @@ fn ec_selector_naming_a_module_resolves_the_edge_cookie_module_it_declares() {
 
     let module = registry
         .ec_module()
-        .expect("`[ec] module = \"testing.seam-probe\"` should resolve the module's module");
+        .expect("`[ec] module = \"testing.iabtl\"` should resolve the module's module");
 
     assert_eq!(
         module.id(),
@@ -918,7 +920,7 @@ fn ec_selector_naming_a_label_resolves_the_module_its_block_names() {
             module = "probe"
 
             [ec.probe]
-            implementation = "testing.seam-probe"
+            implementation = "testing.iabtl"
         "#,
     );
 
@@ -951,7 +953,7 @@ fn ec_selector_naming_a_module_starts_the_adapter() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
         "#,
     );
 
@@ -971,7 +973,7 @@ fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [device]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
         "#,
     );
 
@@ -979,7 +981,7 @@ fn device_selector_naming_a_module_resolves_the_device_module_it_declares() {
 
     let module = registry
         .device_module()
-        .expect("`[device] module = \"testing.seam-probe\"` should resolve the module's module");
+        .expect("`[device] module = \"testing.iabtl\"` should resolve the module's module");
 
     assert_eq!(
         module.id(),
@@ -995,7 +997,7 @@ fn prefix_selector_naming_a_module_resolves_the_prefix_module_it_declares() {
     let settings = settings_selecting_module(
         r#"
             [prefix]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
         "#,
     );
 
@@ -1016,7 +1018,7 @@ async fn a_requests_services_carry_the_selected_modules_prefixes() {
     let settings = settings_with(&format!(
         r#"
             [prefix]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
             {PROBE_BLOCK}
         "#
     ));
@@ -1047,13 +1049,13 @@ async fn the_resolved_device_module_answers_a_confidence_and_the_devices_attribu
     let settings = settings_selecting_module(
         r#"
             [device]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
         "#,
     );
     let registry = registry_with_probe(&settings);
     let module = registry
         .device_module()
-        .expect("`[device] module = \"testing.seam-probe\"` should resolve the module's module");
+        .expect("`[device] module = \"testing.iabtl\"` should resolve the module's module");
     let request = ModuleRequest::new(
         &axum::http::Method::GET,
         "www.publisher.example",
@@ -1101,7 +1103,7 @@ async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
     let settings = settings_selecting_module(
         r#"
             [ec]
-            module = "testing.seam-probe"
+            module = "testing.iabtl"
         "#,
     );
 
@@ -1109,7 +1111,7 @@ async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
 
     let module = registry
         .ec_module()
-        .expect("`[ec] module = \"testing.seam-probe\"` should resolve the module's module");
+        .expect("`[ec] module = \"testing.iabtl\"` should resolve the module's module");
 
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
     let services = stub_services();

@@ -11,6 +11,7 @@ use clap::Args;
 use edgezero_core::app_config::{self, AppConfigLoadOptions};
 use edgezero_core::manifest::ManifestLoader;
 use trusted_server_core::config::TrustedServerAppConfig;
+use trusted_server_core::integrations::IntegrationBuilder;
 use trusted_server_core::settings::Settings;
 
 /// Shared local app-config flags accepted by every config/audit ad-template command.
@@ -27,13 +28,53 @@ pub struct AppConfigArgs {
     pub no_env: bool,
 }
 
-/// Registers the modules a stock build ships with deploy validation.
+/// The module builders the `ts` tool links, in the order their request
+/// hooks run, which is the order the adapters link them in. The tool
+/// validates a deployment's settings against each module's own rules and
+/// writes a configuration from what each module says of itself.
+#[must_use]
+pub fn linked_builders() -> Vec<IntegrationBuilder> {
+    vec![
+        // Prebid registers from the auction plan, and what it registers runs
+        // ahead of the modules below.
+        trusted_server_auction_prebid::builder(),
+        trusted_server_testing_testlight::builder(),
+        trusted_server_framework_nextjs::builder(),
+        trusted_server_audience_permutive::builder(),
+        trusted_server_identity_lockr::builder(),
+        trusted_server_cmp_didomi::builder(),
+        trusted_server_cmp_inmobi::builder(),
+        trusted_server_cmp_sourcepoint::builder(),
+        trusted_server_cmp_osano::builder(),
+        trusted_server_tag_google_tag::builder(),
+        trusted_server_tag_google_tag_manager::builder(),
+        trusted_server_bot_protection_datadome::builder(),
+        trusted_server_ad_tag_google::builder(),
+        trusted_server_ad_tag_google::diagnostics::builder(),
+        trusted_server_ads_txt_iabtl::builder(),
+        // Run by `[shared.51degrees]` rather than selected by a section.
+        trusted_server_middleware_51degrees::builder(),
+        // The analytics module `[analytics]` selects, which changes no page.
+        trusted_server_analytics_tinybird::builder(),
+        // Implementations `[demand]` and `[ad-server]` can name, which no
+        // section selects.
+        trusted_server_auction_protocol_openrtb::builder(),
+        trusted_server_auction_prebid_server::builder(),
+        trusted_server_auction_aps::builder(),
+        trusted_server_ad_server_iabtl::builder(),
+        // The loading cache a stock build caches with, offered whatever the
+        // settings say, which no section selects either.
+        trusted_server_loading_cache_51degrees::builder(),
+    ]
+}
+
+/// Registers the modules the tool links with deploy validation.
 ///
 /// [`TrustedServerAppConfig`] validates through a trait that takes no
 /// arguments, so every path that validates settings calls this first. The
 /// first call wins and a later one changes nothing.
-pub(crate) fn register_stock_modules() {
-    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
+pub(crate) fn register_linked_modules() {
+    trusted_server_core::config::register_deploy_integrations(linked_builders());
 }
 
 /// Effective settings plus the resolved app-config path they were loaded from.
@@ -117,7 +158,7 @@ fn load_settings_with_env_overlay(
 
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = env_overlay;
-    register_stock_modules();
+    register_linked_modules();
     let app_config = app_config::deserialize_app_config_with_options::<TrustedServerAppConfig>(
         &app_config_path,
         &app_name,

@@ -16,6 +16,8 @@ mod tls;
 mod url_guard;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub use app_config::linked_builders;
+#[cfg(not(target_arch = "wasm32"))]
 pub use run::{RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
