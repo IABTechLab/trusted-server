@@ -6198,6 +6198,38 @@ pub async fn handle_publisher_request(
         response.headers_mut().insert(header::LOCATION, value);
     }
 
+    // Every serve middleware an entry names for this path is asked for the
+    // headers it sets on this response, whatever the response is, so a
+    // redirect with no body reaches a middleware that rewrites its Location.
+    let header_middleware = integration_registry.middleware_for_path(
+        settings.phase_entries(MiddlewarePhase::Serve),
+        &request_path,
+    );
+    if !header_middleware.is_empty() {
+        let document_state = IntegrationDocumentState::default();
+        request_state.seed(&document_state);
+        let prepared = Prepared::default();
+        let context = crate::middleware::MiddlewareContext {
+            phase: MiddlewarePhase::Serve,
+            request_host,
+            request_scheme,
+            origin_host: &origin_host,
+            platform: integration_registry.platform(),
+            document_state: &document_state,
+            max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
+            prepared: &prepared,
+        };
+        let view = crate::middleware::ResponseView {
+            status: response.status(),
+            headers: response.headers(),
+        };
+        let mut headers = Vec::new();
+        for middleware in &header_middleware {
+            headers.extend(middleware.response_headers(&context, &view));
+        }
+        write_response_headers(&mut response, headers);
+    }
+
     // A file the origin does not have is made, see `PhaseEntries::making`. An
     // origin page where the robots.txt middleware is placed is no file either.
     if (request_method == Method::GET || request_method == Method::HEAD)
@@ -25022,6 +25054,72 @@ mod tests {
                     "should leave the `Location` of a {status} as the origin wrote it"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn a_serve_middleware_named_for_the_path_sets_a_redirects_location() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            let mut settings = settings_with_origin(ORIGIN_URL);
+            settings
+                .insert_module_config(
+                    "testing",
+                    fixture::MODULE,
+                    &serde_json::json!({ "label": "locating" }),
+                )
+                .expect("should select the middleware stand-in");
+            settings.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: None,
+                    middleware: vec![fixture::LOCATING.to_owned()],
+                }]);
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                302,
+                vec![("location", "/uk")],
+            )
+            .await;
+            assert_eq!(
+                location(&response),
+                Some("/fixture/uk"),
+                "should hand a bodiless redirect to the middleware and keep the header it set"
+            );
+
+            let (response, _) = proxied(
+                &settings,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                301,
+                vec![("location", "https://somewhere.else/news/")],
+            )
+            .await;
+            assert_eq!(
+                location(&response),
+                Some("https://somewhere.else/news/"),
+                "should leave a Location the middleware does not set"
+            );
+
+            let mut elsewhere = settings.clone();
+            elsewhere.serve =
+                crate::middleware::PhaseEntries::new(vec![crate::middleware::PhaseEntry {
+                    media_type: crate::middleware::HTML_MEDIA_TYPE.to_owned(),
+                    path: Some("/other/".to_owned()),
+                    middleware: vec![fixture::LOCATING.to_owned()],
+                }]);
+            let (response, _) = proxied(
+                &elsewhere,
+                reader_request(Method::GET, "https://publisher.example/news", "https"),
+                302,
+                vec![("location", "/uk")],
+            )
+            .await;
+            assert_eq!(
+                location(&response),
+                Some("/uk"),
+                "should not ask a middleware whose entry covers another path"
+            );
         }
 
         #[tokio::test]

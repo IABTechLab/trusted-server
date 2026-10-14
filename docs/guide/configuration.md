@@ -1993,6 +1993,13 @@ alone. Entries are therefore written from the longest path to the entry with
 no path, and a folder is written with its closing slash, because `/news` also
 begins `/newsletter`.
 
+A serve middleware may set response headers as well as change the page. For
+that it is asked about every response the publisher path sends for a request
+path its entry covers, whatever the response's media type and whether or not
+it has a body, with the response's status and headers in hand, so a redirect
+reaches a middleware that rewrites its `Location`. A header it sets replaces
+one of the same name.
+
 ```toml
 [[fetch]]
 media_type = "text/html"
