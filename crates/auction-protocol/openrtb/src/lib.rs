@@ -1,8 +1,16 @@
-//! The plain `OpenRTB` 2.6 demand implementation, `auction-protocol.openrtb`.
+//! `OpenRTB` 2.6 as an auction protocol, and the plain demand implementation
+//! that speaks it, `auction-protocol.openrtb`.
 //!
-//! A standards-compliant exchange needs no code of its own. It takes the
-//! shared request baseline, adds the static extensions its table sets, and has
-//! its response read the ordinary `OpenRTB` way.
+//! Core routes each demand source the slots, the publisher, the permission
+//! state and the identifiers, and takes bids back. This crate turns that into
+//! an `OpenRTB` bid request and reads an `OpenRTB` bid response, through
+//! [`demand::OpenRtbDriver`], which runs any [`demand::OpenRtbDemand`] through
+//! core's seam. A demand implementation that speaks `OpenRTB` depends on this
+//! crate and decides only what [`demand::OpenRtbDemand`] exposes.
+//!
+//! The plain implementation is for a standards-compliant exchange that needs
+//! no code of its own. It takes the shared request, adds the static
+//! extensions its table sets, and has its response read the ordinary way.
 
 #![cfg_attr(
     test,
@@ -16,6 +24,21 @@
     )
 )]
 
+pub mod demand;
+pub mod request;
+pub mod response;
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc,
+    reason = "test helpers, offered to other crates' tests under the test-utils feature"
+)]
+pub mod test_support;
+pub mod wire;
+
+#[cfg(test)]
+mod tests;
+
 use core::any::Any;
 use std::sync::Arc;
 
@@ -25,14 +48,18 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use trusted_server_core::auction::demand::{
-    CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy, DemandImplementation,
-    DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, RequestExtensions,
-    accept_endpoint,
+    CompiledDemand, DemandImplementation, DemandResponse, DemandTimeoutDefault,
+    ProviderAuctionInput, accept_endpoint,
 };
-use trusted_server_core::auction::openrtb::parse_openrtb_response;
 use trusted_server_core::auction::types::AuctionResponse;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::PlatformResponse;
+
+use crate::demand::{
+    CONSERVATIVE_LANGUAGE_MAX_BYTES, DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RegsPolicy,
+    RequestExtensions,
+};
+use crate::response::parse_openrtb_response;
 
 /// The name an `implementation` line gives this implementation, its module
 /// path, which also serves as its builder's id.
@@ -77,7 +104,7 @@ impl StaticExtension {
 
 /// One compiled plain `OpenRTB` demand source.
 #[derive(Debug, Clone, Default)]
-pub struct OpenRtbDemand {
+pub struct PlainDemand {
     /// Static request-level extension fields.
     pub request_ext: StaticExtension,
     /// Static impression-level extension fields.
@@ -86,7 +113,7 @@ pub struct OpenRtbDemand {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct OpenRtbSettings {
+struct PlainSettings {
     #[serde(default)]
     request_ext: Option<Value>,
     #[serde(default)]
@@ -96,16 +123,16 @@ struct OpenRtbSettings {
 fn compile(
     settings: &Map<String, Value>,
 ) -> Result<Arc<dyn CompiledDemand>, Report<TrustedServerError>> {
-    let settings = OpenRtbSettings::deserialize(Value::Object(settings.clone()))
+    let settings = PlainSettings::deserialize(Value::Object(settings.clone()))
         .map_err(|error| configuration_error(format!("invalid `{MODULE}` settings: {error}")))?;
-    Ok(Arc::new(OpenRtbDemand {
+    Ok(Arc::new(OpenRtbDriver::new(PlainDemand {
         request_ext: validate_static_extension("request_ext", settings.request_ext)?,
         imp_ext: validate_static_extension("imp_ext", settings.imp_ext)?,
-    }))
+    })))
 }
 
 #[async_trait(?Send)]
-impl CompiledDemand for OpenRtbDemand {
+impl OpenRtbDemand for PlainDemand {
     fn field_policy(&self) -> DemandFieldPolicy {
         DemandFieldPolicy {
             language_max_bytes: Some(CONSERVATIVE_LANGUAGE_MAX_BYTES),
@@ -216,7 +243,7 @@ fn reject_reserved_fields(
     object: &Map<String, Value>,
 ) -> Result<(), Report<TrustedServerError>> {
     let reserved: &[&str] = match field {
-        "request_ext" => &["trusted_server"],
+        "request_ext" => &[crate::request::TRUSTED_SERVER_EXT_KEY],
         _ => &[],
     };
     if let Some(key) = reserved.iter().find(|key| object.contains_key(**key)) {
@@ -228,18 +255,19 @@ fn reject_reserved_fields(
 }
 
 #[cfg(test)]
-mod tests {
+mod plain_tests {
     use serde_json::{Map, Value, json};
     use trusted_server_core::auction::plan::AuctionPlan;
     use trusted_server_core::auction::test_support::{
-        build_for_first_source, canonical_parity_auction_request, demand_table,
-        deterministic_signer, golden_inbound_request, golden_plan_config, plan_config_with,
+        canonical_parity_auction_request, demand_table, deterministic_signer,
+        golden_inbound_request, golden_plan_config, plan_config_with,
     };
     use trusted_server_core::error::TrustedServerError;
-    use trusted_server_core::openrtb::OpenRtbRequest;
     use trusted_server_core::request_signing::RequestSigner;
 
-    use super::{MODULE, OpenRtbDemand, builder};
+    use super::{MODULE, PlainDemand, builder};
+    use crate::test_support::build_for_first_source;
+    use crate::wire::BidRequest;
 
     /// One `[demand.<name>]` table running this implementation.
     fn table() -> Map<String, Value> {
@@ -253,9 +281,9 @@ mod tests {
         AuctionPlan::compile(plan_config_with(vec![("one", table)], &[builder()]))
     }
 
-    /// The request core's driver builds for one source running this
+    /// The request the driver builds for one source running this
     /// implementation with `settings`, signed when `signer` is given.
-    fn build(settings: Value, signer: Option<&RequestSigner>) -> OpenRtbRequest {
+    fn build(settings: Value, signer: Option<&RequestSigner>) -> BidRequest {
         let plan = AuctionPlan::compile(golden_plan_config(MODULE, settings, true, &[builder()]))
             .expect("should compile plan");
         build_for_first_source(
@@ -297,8 +325,8 @@ mod tests {
         let openrtb = plan.providers()[0]
             .demand
             .as_any()
-            .downcast_ref::<OpenRtbDemand>()
-            .expect("should compile the OpenRTB implementation");
+            .downcast_ref::<PlainDemand>()
+            .expect("should compile the plain implementation");
         assert_eq!(
             openrtb.request_ext.as_object()["fictional_account"],
             "example"

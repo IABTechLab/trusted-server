@@ -12,10 +12,10 @@ use crate::platform::{PlatformPendingRequest, RuntimeServices};
 
 #[cfg(test)]
 use super::config::AuctionConfig;
-use super::openrtb::unused_bidder_params_count;
 use super::plan::AuctionPlan;
 use super::provider::{
-    AuctionProvider, GenericOpenRtbProvider, ProviderParseState, ProviderRequestOutcome,
+    AuctionProvider, ProviderParseState, ProviderRequestOutcome, RoutedDemandProvider,
+    unused_bidder_params_count,
 };
 #[cfg(test)]
 use super::routing::RoutedAuction;
@@ -308,7 +308,7 @@ pub struct AuctionOrchestrator {
     enabled: bool,
     plan_backed: bool,
     plan: Arc<AuctionPlan>,
-    planned_providers: Vec<Arc<GenericOpenRtbProvider>>,
+    planned_providers: Vec<Arc<RoutedDemandProvider>>,
     adserver: Option<Arc<dyn AuctionProvider>>,
     #[cfg(test)]
     config: AuctionConfig,
@@ -320,12 +320,12 @@ pub struct AuctionOrchestrator {
 #[cfg(test)]
 pub(crate) struct AuctionOrchestratorHarness {
     plan: Arc<AuctionPlan>,
-    providers: Vec<Arc<GenericOpenRtbProvider>>,
+    providers: Vec<Arc<RoutedDemandProvider>>,
     adserver: Option<Arc<dyn AuctionProvider>>,
 }
 
 struct PlannedLaunchState {
-    provider: Arc<GenericOpenRtbProvider>,
+    provider: Arc<RoutedDemandProvider>,
     started_at: Instant,
     parse_state: Option<ProviderParseState>,
 }
@@ -345,7 +345,7 @@ impl AuctionOrchestratorHarness {
             .providers()
             .iter()
             .cloned()
-            .map(GenericOpenRtbProvider::new)
+            .map(RoutedDemandProvider::new)
             .map(Arc::new)
             .collect();
         Self {
@@ -808,7 +808,7 @@ impl AuctionOrchestrator {
             .providers()
             .iter()
             .cloned()
-            .map(GenericOpenRtbProvider::new)
+            .map(RoutedDemandProvider::new)
             .map(Arc::new)
             .collect();
         Self {
@@ -2587,9 +2587,7 @@ mod tests {
     use crate::auction::config::AuctionConfig;
     use crate::auction::orchestrator::DispatchAuctionOutcome;
     use crate::auction::plan::{AuctionPlan, AuctionPlanConfig, NotificationConfig, RoutingMode};
-    use crate::auction::provider::{
-        AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome,
-    };
+    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome, RoutedDemandProvider};
     use crate::auction::routing::{RoutingDiagnostics, route_auction};
     use crate::auction::test_support::{create_test_auction_context, demand_table, plan_config};
     use crate::auction::types::{
@@ -5585,10 +5583,10 @@ mod tests {
             http.push_response(
                 200,
                 serde_json::to_vec(&serde_json::json!({
-                    "seatbid": [{"seat": "provider-seat", "bid": [{
-                        "id": "provider-bid", "impid": "fictional-slot", "price": 2.0,
-                        "adm": "<div>provider</div>", "w": 300, "h": 250
-                    }]}]
+                    "bids": [{
+                        "seat": "provider-seat", "id": "provider-bid", "slot": "fictional-slot", "price": 2.0,
+                        "creative": "<div>provider</div>", "w": 300, "h": 250
+                    }]
                 }))
                 .expect("should serialize provider response"),
             );
@@ -5672,10 +5670,10 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "provider-seat", "bid": [{
-                    "id": "provider", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "<div>provider</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "provider-seat", "id": "provider", "slot": "fictional-slot", "price": 2.0,
+                    "creative": "<div>provider</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize provider response"),
         );
@@ -5732,10 +5730,10 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "provider-seat", "bid": [{
-                    "id": "provider", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "<div>provider</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "provider-seat", "id": "provider", "slot": "fictional-slot", "price": 2.0,
+                    "creative": "<div>provider</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize provider response"),
         );
@@ -5797,10 +5795,10 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "provider-seat", "bid": [{
-                    "id": "provider", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "<div>provider</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "provider-seat", "id": "provider", "slot": "fictional-slot", "price": 2.0,
+                    "creative": "<div>provider</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize provider response"),
         );
@@ -5854,16 +5852,16 @@ mod tests {
                 http.push_response(
                     200,
                     serde_json::to_vec(&serde_json::json!({
-                        "seatbid":[{"seat":"example-seat","bid":[
+                        "bids": [
                             {
-                                "id":format!("bid-{index}"), "impid":format!("inline-{index}"),
-                                "price":2.0, "adm":"<div>example</div>", "w":300, "h":250
+                                "seat": "example-seat", "id":format!("bid-{index}"), "slot":format!("inline-{index}"),
+                                "price":2.0, "creative":"<div>example</div>", "w":300, "h":250
                             },
                             {
-                                "id":format!("omitted-{index}"), "impid":"fictional-slot",
-                                "price":3.0, "adm":"<div>omitted</div>", "w":300, "h":250
+                                "seat": "example-seat", "id":format!("omitted-{index}"), "slot":"fictional-slot",
+                                "price":3.0, "creative":"<div>omitted</div>", "w":300, "h":250
                             }
-                        ]}]
+                        ]
                     }))
                     .expect("should serialize the upstream response"),
                 );
@@ -5968,9 +5966,9 @@ mod tests {
             let all_eligible_wire: serde_json::Value = serde_json::from_slice(&bodies[0])
                 .expect("should parse the all-eligible source's wire request");
             assert_eq!(
-                all_eligible_wire["imp"]
+                all_eligible_wire["slots"]
                     .as_array()
-                    .expect("should have impressions")
+                    .expect("should have slots")
                     .len(),
                 2 + inline_providers
             );
@@ -5995,14 +5993,11 @@ mod tests {
                 let wire: serde_json::Value = serde_json::from_slice(&bodies[index + 1])
                     .expect("should parse the source's wire request");
                 assert_eq!(
-                    wire["imp"]
-                        .as_array()
-                        .expect("should have impressions")
-                        .len(),
+                    wire["slots"].as_array().expect("should have slots").len(),
                     1
                 );
-                assert_eq!(wire["imp"][0]["id"], format!("inline-{index}"));
-                let fixture = &wire["imp"][0]["ext"]["fixture"];
+                assert_eq!(wire["slots"][0]["id"], format!("inline-{index}"));
+                let fixture = &wire["slots"][0]["ext"]["fixture"];
                 assert!(fixture.get("stored").is_none());
                 let bidder = if index == 0 { "alpha" } else { "beta" };
                 assert_eq!(
@@ -6053,7 +6048,7 @@ mod tests {
             (
                 &standard_plan,
                 200,
-                br#"{"seatbid":[]}"#.to_vec(),
+                br#"{"bids":[]}"#.to_vec(),
                 BidStatus::NoBid,
             ),
             (&fixture_plan, 204, b"{}".to_vec(), BidStatus::NoBid),
@@ -6062,7 +6057,7 @@ mod tests {
             (
                 &fixture_plan,
                 200,
-                br#"{"seatbid":[]}"#.to_vec(),
+                br#"{"bids":[]}"#.to_vec(),
                 BidStatus::NoBid,
             ),
         ];
@@ -6074,7 +6069,7 @@ mod tests {
                 plan,
                 None,
             );
-            let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
+            let provider = RoutedDemandProvider::new(plan.providers()[0].clone());
             let state = provider.parse_state_for_test(routed.inputs()[0].clone());
             let response = PlatformResponse::new(
                 edgezero_core::http::response_builder()
@@ -6112,20 +6107,20 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "fictional-seat-a", "bid": [{
-                    "id": "bid-a", "impid": "fictional-slot", "price": 1.25,
-                    "adm": "<div>a</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "fictional-seat-a", "id": "bid-a", "slot": "fictional-slot", "price": 1.25,
+                    "creative": "<div>a</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize response a"),
         );
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "fictional-seat-b", "bid": [{
-                    "id": "bid-b", "impid": "fictional-slot", "price": 2.5,
-                    "adm": "<div>b</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "fictional-seat-b", "id": "bid-b", "slot": "fictional-slot", "price": 2.5,
+                    "creative": "<div>b</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize response b"),
         );
@@ -6218,12 +6213,14 @@ mod tests {
         for body in request_bodies {
             let value: serde_json::Value =
                 serde_json::from_slice(&body).expect("should parse planned request");
-            let tmax = value["tmax"].as_u64().expect("should include logical tmax");
+            let tmax = value["timeout_ms"]
+                .as_u64()
+                .expect("should include the logical budget");
             assert!(
                 (750..=777).contains(&tmax),
                 "logical budget should remain near the auction budget, got {tmax}"
             );
-            assert_eq!(value["imp"].as_array().map(Vec::len), Some(1));
+            assert_eq!(value["slots"].as_array().map(Vec::len), Some(1));
         }
         let specs = backend.specs.lock().expect("should lock specs");
         assert_eq!(specs.len(), 2);
@@ -6238,10 +6235,10 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "first", "bid": [{
-                    "id": "first-bid", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "<div>first</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "first", "id": "first-bid", "slot": "fictional-slot", "price": 2.0,
+                    "creative": "<div>first</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize first response"),
         );
@@ -6399,8 +6396,8 @@ mod tests {
             &plan,
             None,
         );
-        let provider_a = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let provider_b = GenericOpenRtbProvider::new(plan.providers()[1].clone());
+        let provider_a = RoutedDemandProvider::new(plan.providers()[0].clone());
+        let provider_b = RoutedDemandProvider::new(plan.providers()[1].clone());
         let parse_state = provider_a.parse_state_for_test(routed.inputs()[0].clone());
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
@@ -6441,8 +6438,8 @@ mod tests {
             &plan,
             None,
         );
-        let provider_a = GenericOpenRtbProvider::new(plan.providers()[0].clone());
-        let provider_b = GenericOpenRtbProvider::new(plan.providers()[1].clone());
+        let provider_a = RoutedDemandProvider::new(plan.providers()[0].clone());
+        let provider_b = RoutedDemandProvider::new(plan.providers()[1].clone());
         let parse_state = provider_a.parse_state_for_test(routed.inputs()[0].clone());
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
@@ -6512,7 +6509,7 @@ mod tests {
         let request_body = &http.recorded_request_bodies()[0];
         let request_value: serde_json::Value =
             serde_json::from_slice(request_body).expect("should parse request body");
-        assert_eq!(request_value["imp"].as_array().map(Vec::len), Some(1));
+        assert_eq!(request_value["slots"].as_array().map(Vec::len), Some(1));
     }
 
     #[tokio::test]
@@ -6607,13 +6604,13 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "below_floor", "bid": [{
-                    "id": "below", "impid": "fictional-slot", "price": 0.5,
-                    "adm": "<div>below</div>", "w": 300, "h": 250
+                "bids": [{
+                    "seat": "below_floor", "id": "below", "slot": "fictional-slot", "price": 0.5,
+                    "creative": "<div>below</div>", "w": 300, "h": 250
                 }, {
-                    "id": "below-only", "impid": "below-only-slot", "price": 0.5,
-                    "adm": "<div>below only</div>", "w": 300, "h": 250
-                }]}]
+                    "seat": "below_floor", "id": "below-only", "slot": "below-only-slot", "price": 0.5,
+                    "creative": "<div>below only</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize below-floor response"),
         );
@@ -6622,10 +6619,10 @@ mod tests {
         http.push_response(
             200,
             serde_json::to_vec(&serde_json::json!({
-                "seatbid": [{"seat": "winner", "bid": [{
-                    "id": "winner", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "<div>winner</div>", "w": 300, "h": 250
-                }]}]
+                "bids": [{
+                    "seat": "winner", "id": "winner", "slot": "fictional-slot", "price": 2.0,
+                    "creative": "<div>winner</div>", "w": 300, "h": 250
+                }]
             }))
             .expect("should serialize winner response"),
         );
@@ -6837,7 +6834,9 @@ mod tests {
 
         let body: serde_json::Value = serde_json::from_slice(&http.recorded_request_bodies()[0])
             .expect("should parse signed request");
-        let tmax = body["tmax"].as_u64().expect("should include tmax");
+        let tmax = body["timeout_ms"]
+            .as_u64()
+            .expect("should include the budget");
         assert!(
             (100..=175).contains(&tmax),
             "signer delay should reduce logical budget, got {tmax}"
@@ -6915,7 +6914,7 @@ mod tests {
             let value: serde_json::Value =
                 serde_json::from_slice(&body).expect("should parse signed provider request");
             assert!(
-                value["ext"]["trusted_server"]["signature"].is_string(),
+                value["signature"]["signature"].is_string(),
                 "should sign every request"
             );
         }

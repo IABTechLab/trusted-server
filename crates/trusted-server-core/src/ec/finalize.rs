@@ -619,8 +619,8 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::eids::{Eid, Uid};
     use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY};
-    use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
