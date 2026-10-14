@@ -30,6 +30,26 @@ import prepare
 
 RELEASE = Path(__file__).resolve().parent
 ROOT = RELEASE.parents[1]
+sys.path.insert(0, str(RELEASE / "qualification"))
+_BOUNDARY_SOURCE = RELEASE / "qualification/boundaries.py"
+_BOUNDARY_MODULE = sys.modules.get("boundaries")
+if _BOUNDARY_MODULE is None:
+    _boundary_spec = importlib.util.spec_from_file_location("boundaries", _BOUNDARY_SOURCE)
+    if _boundary_spec is None or _boundary_spec.loader is None:
+        raise ValueError("source-owned qualification boundary module unavailable")
+    _BOUNDARY_MODULE = importlib.util.module_from_spec(_boundary_spec)
+    sys.modules["boundaries"] = _BOUNDARY_MODULE
+    try:
+        _boundary_spec.loader.exec_module(_BOUNDARY_MODULE)
+    except BaseException:
+        sys.modules.pop("boundaries", None)
+        raise
+if Path(getattr(_BOUNDARY_MODULE, "__file__", "")).resolve() != _BOUNDARY_SOURCE:
+    raise ValueError("source-owned qualification boundary module mismatch")
+DOCKER_EXECUTABLE = _BOUNDARY_MODULE.DOCKER_EXECUTABLE
+LinuxBoundary = _BOUNDARY_MODULE.LinuxBoundary
+MacBoundary = _BOUNDARY_MODULE.MacBoundary
+probe_controls = _BOUNDARY_MODULE.probe_controls
 MAX_CAPTURE = 134217728
 PROFILES = preflight.ambient_profiles()
 CARGO_REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,7 +547,6 @@ def candidate_selection(asset, commit):
     if set(selected["tools"]) != required_tools:
         raise ValueError("candidate acquisition tool closure incomplete")
     if environment_id == "gnu-builder-x86_64":
-        from boundaries import DOCKER_EXECUTABLE
         if selected["tools"]["docker"]["path"] != DOCKER_EXECUTABLE:
             raise ValueError("candidate must bind the actual source-owned Docker executable")
     for name, tool in selected["tools"].items():
@@ -588,7 +607,6 @@ def vendor_configuration(lock_bytes, vendor):
 
 def write_vendor_configuration(lock_bytes, vendor, configuration, boundary):
     """Write source-owned Cargo replacement paths in the execution namespace."""
-    from boundaries import LinuxBoundary
     directory = boundary.map_path(vendor) if isinstance(boundary, LinuxBoundary) else str(vendor)
     Path(configuration).write_bytes(vendor_configuration(lock_bytes, directory))
 
@@ -776,7 +794,6 @@ def _native_startup(final, artifact, selection, workspace, environment):
         for identity, image in sorted(selection["runtime"].items()):
             if not isinstance(image, str) or not re.fullmatch(r"[a-z0-9./_-]+@sha256:[a-f0-9]{64}", image):
                 raise ValueError("authenticated clean native OCI runtime digest required")
-            from boundaries import LinuxBoundary
             control = workspace / ("native-control-" + identity)
             control.mkdir(mode=0o755)
             generated = control / "output"
@@ -889,8 +906,6 @@ def verify_download_fixture(boundary, workspace, tools, environment, *, executio
     count as a download denial because the build-script marker must exist and
     contain the actual network syscall's permission errno.
     """
-    sys.path.insert(0, str(RELEASE / "qualification"))
-    from boundaries import LinuxBoundary
     workspace = Path(workspace)
     fixture = workspace / "download-fixture"
     log_root = Path(log_root) if log_root is not None else workspace
@@ -980,8 +995,6 @@ def _build_recipe(request, selection):
     bindings before this entry. No JSON commands, fixture bypass, transforms,
     publication authority or network-enabled compile path exist here.
     """
-    sys.path.insert(0, str(RELEASE / "qualification"))
-    from boundaries import MacBoundary, LinuxBoundary, probe_controls
     from qualify import validate_socket_pair
     artifact = artifact_selection(request.asset)
     role = ambient_profile(request.role)

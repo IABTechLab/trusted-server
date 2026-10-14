@@ -6,6 +6,7 @@ import os
 import platform
 import importlib.util
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -439,6 +440,50 @@ class SafeLogTests(unittest.TestCase):
             with self.assertRaises((OSError, ValueError)):
                 recipe.capture([sys.executable, "-I", "-c", "print('changed')"], {}, root, root / "cargo", timeout=10)
             self.assertEqual(original.read_bytes(), b"original example")
+
+class IsolatedQualificationImportTests(unittest.TestCase):
+    def test_direct_candidate_selection_uses_source_owned_boundary_in_fresh_python(self):
+        script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import rust_recipe as recipe
+names = {"python", "git", "cargo", "rustc", "cc", "cxx", "linker", "ar", "cmake", "shell", "docker"}
+policy = {key: None for key in ("environment_id", "tools", "readonly", "trees", "tool_trees", "archive_pool", "cargo_seed", "rustup", "sdk", "variation", "image", "runtime")}
+policy.update(environment_id="gnu-builder-x86_64", tools={name: {"path": "/example/selected-tool", "sha256": "a" * 64, "acquisition_sha256": "b" * 64} for name in names})
+recipe.CANDIDATE_ACQUISITIONS["gnu-builder-x86_64"] = policy
+try:
+    recipe.candidate_selection("ts-x86_64-unknown-linux-gnu", "a" * 40)
+except ValueError as error:
+    assert "actual source-owned Docker executable" in str(error), str(error)
+else:
+    raise AssertionError("wrong Docker executable accepted")
+import boundaries
+assert recipe.LinuxBoundary is boundaries.LinuxBoundary
+print("source-owned import closed")
+"""
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(RELEASE)], capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout.strip(), b"source-owned import closed")
+
+    def test_preloaded_foreign_boundary_module_is_rejected(self):
+        script = """
+import sys, types
+sys.path.insert(0, sys.argv[1])
+foreign = types.ModuleType("boundaries")
+foreign.__file__ = "/example/foreign/boundaries.py"
+sys.modules["boundaries"] = foreign
+try:
+    import rust_recipe
+except ValueError as error:
+    assert "source-owned qualification" in str(error), str(error)
+else:
+    raise AssertionError("foreign boundary module accepted")
+print("foreign module rejected")
+"""
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(RELEASE)], capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout.strip(), b"foreign module rejected")
+
 
 class SourceContextTests(unittest.TestCase):
     def test_actual_executing_source_commit_and_helpers_are_bound(self):
