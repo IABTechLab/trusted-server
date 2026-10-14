@@ -3783,14 +3783,11 @@ fn rewritten_origin_redirect(
     }
 
     // Compared with the port, because `origin.example` and
-    // `origin.example:8443` are different origins and `host_str` leaves the
-    // port off.
-    let host = target.host_str()?;
-    let target_host = match target.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    };
-    if !target_host.eq_ignore_ascii_case(origin_host) {
+    // `origin.example:8443` are different origins. The origin's name is read
+    // on the scheme of the `Location`, so a port that is the usual one for it
+    // counts as no port on both sides, as `url` writes the `Location`.
+    let origin = url::Url::parse(&format!("{}://{origin_host}", target.scheme())).ok()?;
+    if target.host_str()? != origin.host_str()? || target.port() != origin.port() {
         return None;
     }
 
@@ -24426,6 +24423,13 @@ mod tests {
                     "https://publisher.example/news",
                 ),
                 (
+                    "a Host header override written with the scheme's own port is \
+                     the same name",
+                    "https://www.example.com/news",
+                    "www.example.com:443",
+                    "https://publisher.example/news",
+                ),
+                (
                     "a Host header override is compared in any letter case",
                     "https://www.example.com/news",
                     "WWW.Example.COM",
@@ -24532,6 +24536,11 @@ mod tests {
                      host on one",
                     "https://origin.example:8443/news",
                     "origin.example",
+                ),
+                (
+                    "a port that is the usual one for another scheme is a port",
+                    "http://origin.example/news",
+                    "origin.example:443",
                 ),
                 (
                     "with a Host header override set, the host connected to is not \
