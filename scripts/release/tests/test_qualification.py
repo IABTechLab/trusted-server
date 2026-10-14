@@ -77,6 +77,23 @@ def observation():
     }
 
 
+class RuntimeClosureTests(unittest.TestCase):
+    def test_runtime_gate_source_inputs_change_candidate_fingerprint(self):
+        tools = json.loads((RELEASE / "release-tools.json").read_text())
+        for changed in ("edgezero.toml", "crates/trusted-server-core/src/integrations/registry.rs"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in (*qualify.SHARED_CLOSURE, *qualify.RUST_CLOSURE):
+                    target = root / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes((ROOT / name).read_bytes())
+                before = qualify.candidate_fingerprints(root, tools, "trusted-server-fastly.wasm")
+                target = root / changed
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / changed).read_bytes() + b"\n# Changed fixture input\n")
+                self.assertNotEqual(qualify.candidate_fingerprints(root, tools, "trusted-server-fastly.wasm"), before)
+
+
 class QualificationTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(qualify, "should provide local qualification framework")
@@ -207,7 +224,7 @@ class QualificationTests(unittest.TestCase):
     def test_full_recipe_gate_stops_before_creating_work(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "work"
-            with self.assertRaisesRegex(ValueError, "Task 9|production recipe"):
+            with self.assertRaisesRegex(ValueError, "Task 9|production recipe|authenticated candidate staging"):
                 qualify.check_execution_prerequisites(ROOT, output)
             self.assertFalse(output.exists(), "should fail before materializing work")
 
@@ -282,8 +299,9 @@ class QualificationTests(unittest.TestCase):
     def test_source_owned_complete_closure_refuses_missing_recipe_files(self):
         self.assertTrue(hasattr(qualify, "candidate_fingerprints"), "should define reviewed closure")
         import preflight
-        with self.assertRaisesRegex(ValueError, "Task 9|missing.*closure"):
-            qualify.candidate_fingerprints(ROOT, preflight.fixed_tools(), "ts-aarch64-apple-darwin")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "Task 9|missing.*closure"):
+                qualify.candidate_fingerprints(Path(directory), preflight.fixed_tools(), "ts-aarch64-apple-darwin")
 
     def test_linux_profile_restricts_socket_domains_on_pinned_default_baseline(self):
         self.assertIsNotNone(importlib.util.find_spec("boundaries"), "should provide real profiles")

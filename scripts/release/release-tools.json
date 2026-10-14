@@ -70,15 +70,43 @@
       "qualification": "pending",
       "script": "scripts/release/build.sh",
       "settings": {
+        "ambient_profiles": {
+          "A": {
+            "checkout_root": "external-release-A",
+            "execution_user": "qualification-selected",
+            "jobs": 4,
+            "locale": "C",
+            "timezone": "UTC",
+            "umask": "022"
+          },
+          "B": {
+            "checkout_root": "external-release-B",
+            "execution_user": "qualified-alternate-or-unsupported",
+            "jobs": 2,
+            "locale": "qualification-selected-alternate",
+            "timezone": "qualification-selected-alternate",
+            "umask": "027"
+          }
+        },
         "aws_lc_target_selector": true,
         "aws_lc_use_system": false,
         "cargo_config": ".cargo/config.toml",
+        "cargo_frozen": true,
         "cargo_home": "private-prepared",
         "cargo_locked": true,
+        "cargo_message_format": "json-render-diagnostics",
+        "download_control": "actual-cargo-build-script-required",
         "fresh_target": true,
         "network_boundary": "qualification-pending",
+        "normalized_inputs": [
+          "compiler-locale-C",
+          "compiler-timezone-UTC",
+          "source-commit-epoch",
+          "remapped-paths"
+        ],
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
+        "release_strip": "none",
         "rust_toolchain": "1.95.0",
         "sqlite_features": [
           "bundled"
@@ -98,15 +126,43 @@
       "qualification": "pending",
       "script": "scripts/release/build.sh",
       "settings": {
+        "ambient_profiles": {
+          "A": {
+            "checkout_root": "external-release-A",
+            "execution_user": "qualification-selected",
+            "jobs": 4,
+            "locale": "C",
+            "timezone": "UTC",
+            "umask": "022"
+          },
+          "B": {
+            "checkout_root": "external-release-B",
+            "execution_user": "qualified-alternate-or-unsupported",
+            "jobs": 2,
+            "locale": "qualification-selected-alternate",
+            "timezone": "qualification-selected-alternate",
+            "umask": "027"
+          }
+        },
         "aws_lc_target_selector": true,
         "aws_lc_use_system": false,
         "cargo_config": ".cargo/config.toml",
+        "cargo_frozen": true,
         "cargo_home": "private-prepared",
         "cargo_locked": true,
+        "cargo_message_format": "json-render-diagnostics",
+        "download_control": "actual-cargo-build-script-required",
         "fresh_target": true,
         "network_boundary": "qualification-pending",
+        "normalized_inputs": [
+          "compiler-locale-C",
+          "compiler-timezone-UTC",
+          "source-commit-epoch",
+          "remapped-paths"
+        ],
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
+        "release_strip": "none",
         "rust_toolchain": "1.95.0",
         "sqlite_features": [
           "bundled"
@@ -126,15 +182,43 @@
       "qualification": "pending",
       "script": "scripts/release/build.sh",
       "settings": {
+        "ambient_profiles": {
+          "A": {
+            "checkout_root": "external-release-A",
+            "execution_user": "qualification-selected",
+            "jobs": 4,
+            "locale": "C",
+            "timezone": "UTC",
+            "umask": "022"
+          },
+          "B": {
+            "checkout_root": "external-release-B",
+            "execution_user": "qualified-alternate-or-unsupported",
+            "jobs": 2,
+            "locale": "qualification-selected-alternate",
+            "timezone": "qualification-selected-alternate",
+            "umask": "027"
+          }
+        },
         "aws_lc_target_selector": true,
         "aws_lc_use_system": false,
         "cargo_config": ".cargo/config.toml",
+        "cargo_frozen": true,
         "cargo_home": "private-prepared",
         "cargo_locked": true,
+        "cargo_message_format": "json-render-diagnostics",
+        "download_control": "actual-cargo-build-script-required",
         "fresh_target": true,
         "network_boundary": "qualification-pending",
+        "normalized_inputs": [
+          "compiler-locale-C",
+          "compiler-timezone-UTC",
+          "source-commit-epoch",
+          "remapped-paths"
+        ],
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
+        "release_strip": "none",
         "rust_toolchain": "1.95.0",
         "sqlite_features": [
           "bundled"
@@ -154,15 +238,43 @@
       "qualification": "pending",
       "script": "scripts/release/build.sh",
       "settings": {
+        "ambient_profiles": {
+          "A": {
+            "checkout_root": "external-release-A",
+            "execution_user": "qualification-selected",
+            "jobs": 4,
+            "locale": "C",
+            "timezone": "UTC",
+            "umask": "022"
+          },
+          "B": {
+            "checkout_root": "external-release-B",
+            "execution_user": "qualified-alternate-or-unsupported",
+            "jobs": 2,
+            "locale": "qualification-selected-alternate",
+            "timezone": "qualification-selected-alternate",
+            "umask": "027"
+          }
+        },
         "aws_lc_target_selector": true,
         "aws_lc_use_system": false,
         "cargo_config": ".cargo/config.toml",
+        "cargo_frozen": true,
         "cargo_home": "private-prepared",
         "cargo_locked": true,
+        "cargo_message_format": "json-render-diagnostics",
+        "download_control": "actual-cargo-build-script-required",
         "fresh_target": true,
         "network_boundary": "qualification-pending",
+        "normalized_inputs": [
+          "compiler-locale-C",
+          "compiler-timezone-UTC",
+          "source-commit-epoch",
+          "remapped-paths"
+        ],
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
+        "release_strip": "none",
         "rust_toolchain": "1.95.0",
         "sqlite_features": [
           "bundled"

@@ -171,6 +171,23 @@ def recipe_settings():
         "vite_env_loading": False,
         "vite_config_loading": False,
         "npm_lifecycle": "reviewed-preparation-only",
+        "ambient_profiles": ambient_profiles(),
+        "normalized_inputs": ["compiler-locale-C", "compiler-timezone-UTC", "source-commit-epoch", "remapped-paths"],
+        "cargo_message_format": "json-render-diagnostics",
+        "cargo_frozen": True,
+        "release_strip": "none",
+        "download_control": "actual-cargo-build-script-required",
+    }
+
+
+def ambient_profiles():
+    """Return source-owned A/B selections without inventing qualified alternates."""
+    return {
+        "A": {"checkout_root": "external-release-A", "umask": "022", "jobs": 4,
+              "locale": "C", "timezone": "UTC", "execution_user": "qualification-selected"},
+        "B": {"checkout_root": "external-release-B", "umask": "027", "jobs": 2,
+              "locale": "qualification-selected-alternate", "timezone": "qualification-selected-alternate",
+              "execution_user": "qualified-alternate-or-unsupported"},
     }
 
 

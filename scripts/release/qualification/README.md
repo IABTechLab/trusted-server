@@ -10,6 +10,29 @@ checks, source-owned candidate socket boundaries and an inert hosted workflow
 proposal. It creates no repository, dispatches no job, registers no workflow,
 publishes no tag, signs no release and deploys no publisher service.
 
+## Task 9 local recipe status
+
+Task 9 is **partial local implementation**. The closed Rust recipe, immutable
+material checks, Cargo JSON final selection, native parsing and final-byte Fastly
+runtime gates are reviewable. Actual local socket/Cargo download-attempt and tiny
+Mach-O fixtures provide diagnostic evidence only. They do not establish selected
+macOS 15/GNU startup, native dependency closure, or a canonical application build.
+
+The public selectors still refuse pending qualification. Before measuring the
+executable closure, the focused Task 8 integration must supply independently
+authenticated bootstrap/acquisition selection, a data-driven reviewed receipt
+adapter, and the shared-JS producer/current-run transfer binding. An inventory's
+source labels and byte hashes alone do not authenticate its producer. The private
+candidate tool policy has no self-referencing source commit; independent caller
+approval must match the actual executing checkout and loaded helper bytes.
+
+The central recipe has not yet executed vendor preparation, the complete product
+compile, final-byte acceptance and output copying together. Those integration
+paths require the authenticated adapters above; helper-level local tests must not
+be reported as canonical build proof. Task 10 must also capture metadata/tree
+messages through the same source-owned environment and boundary before hosted
+qualification. Native selected runtimes and Fastly A/B acceptance remain pending.
+
 ## Local checks
 
 Use a private Python 3.11+ environment and install the complete locked validator

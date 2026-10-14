@@ -1,9 +1,14 @@
 """Source-owned candidate boundaries; local probes never qualify hosted builds."""
 
 import copy
+import os
+import selectors
+import signal
+import time
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 RELEASE = Path(__file__).resolve().parents[1]
@@ -39,6 +44,40 @@ def linux_seccomp_profile():
                   "args": [{"index": 0, "value": 1, "op": "SCMP_CMP_EQ"}]})
     profile["syscalls"] = rules
     return profile
+
+
+def bounded_process(argv, environment, *, timeout=30, maximum=65536):
+    """Drain both pipes while running, bounded in time and retained bytes."""
+    process = subprocess.Popen(argv, env=environment, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               close_fds=True, start_new_session=True)
+    selector = selectors.DefaultSelector()
+    outputs = [bytearray(), bytearray()]
+    for index, stream in enumerate((process.stdout, process.stderr)):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, index)
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            if time.monotonic() >= deadline:
+                raise ValueError("bounded process timeout")
+            for key, _ in selector.select(min(0.1, max(0, deadline - time.monotonic()))):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if len(outputs[key.data]) + len(chunk) > maximum:
+                    raise ValueError("bounded process output bound exceeded")
+                outputs[key.data].extend(chunk)
+        process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        return subprocess.CompletedProcess(argv, process.returncode, bytes(outputs[0]), bytes(outputs[1]))
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def _roots(private_root, readonly):
@@ -94,7 +133,7 @@ class MacBoundary:
         self.profile = macos_profile(private_root, readonly, immutable=immutable)
         self.sha256 = sha256_bytes(self.profile.encode())
 
-    def command(self, command):
+    def command(self, command, *, environment=None, cwd=None):
         """Wrap source-owned argv, closing descriptors in the caller."""
         return ["/usr/bin/sandbox-exec", "-p", self.profile, *map(str, command)]
 
@@ -107,8 +146,26 @@ class LinuxBoundary:
     Preparation must create writable ownership for the fixed unprivileged UID.
     """
 
-    def __init__(self, private_root, readonly, image):
+    def __init__(self, private_root, readonly, image, *, immutable=(), python=None, execution_umask=0o022):
         self.private_root, self.readonly = _roots(private_root, readonly)
+        if type(execution_umask) is not int or execution_umask not in {0o022, 0o027}:
+            raise ValueError("source-owned release umask required")
+        if python is not None and (not Path(python).is_absolute() or ".." in Path(python).parts):
+            raise ValueError("explicit authenticated container Python required")
+        self.python, self.execution_umask = python, execution_umask
+        self.containers = set()
+        self.docker_config = self.private_root / "docker-config"
+        self.docker_config.mkdir(mode=0o755)
+        (self.docker_config / "config.json").write_bytes(b"{}\n")
+        self.docker_prefix = ["/usr/bin/docker", "--host", "unix:///var/run/docker.sock",
+                              "--config", str(self.docker_config)]
+        self.immutable = []
+        for path in immutable:
+            path = Path(path)
+            resolved = path.resolve(strict=True)
+            if path.is_symlink() or resolved == self.private_root or not resolved.is_relative_to(self.private_root):
+                raise ValueError("immutable source must be a real member of the private workspace")
+            self.immutable.append(resolved)
         if not isinstance(image, str) or not re.fullmatch(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", image):
             raise ValueError("selected OCI manifest digest required; tags are forbidden")
         self.image = image
@@ -128,26 +185,69 @@ class LinuxBoundary:
                 if path.is_socket():
                     raise ValueError("host Unix/daemon sockets must not enter container mounts")
 
-    def command(self, command):
+    def command(self, command, *, environment=None, cwd=None):
         """Use no host namespace, daemon socket, privileges or writable tools."""
-        return self._container_command(command, confined=True)
+        return self._container_command(command, confined=True, environment=environment, cwd=cwd)
 
-    def _container_command(self, command, *, confined):
-        for path in [self.private_root, *self.readonly]:
+    def map_path(self, path):
+        """Map internal source-owned workspace paths to the private container."""
+        pattern = r"(?<![A-Za-z0-9_./-])" + re.escape(str(self.private_root)) + r"(?=/|$|=|[\x1f\s:])"
+        return re.sub(pattern, "/work", str(path))
+
+    def cleanup_command(self, command):
+        """Construct cleanup only for an identity allocated by this boundary."""
+        if (len(command) < 8 or command[:6] != [*self.docker_prefix, "run"]
+                or command.count("--name") != 1):
+            raise ValueError("unknown private container identity")
+        name = command[command.index("--name") + 1]
+        if name not in self.containers or not re.fullmatch(r"ts-release-[a-f0-9]{32}", name):
+            raise ValueError("unknown private container identity")
+        return [*self.docker_prefix, "rm", "--force", name]
+
+    def cleanup(self, command):
+        """Bound daemon-side forced removal even after a Docker client timeout."""
+        argv = self.cleanup_command(command)
+        result = bounded_process(argv, {"PATH": "/usr/bin:/bin", "HOME": str(self.private_root),
+                                        "LANG": "C", "LC_ALL": "C"})
+        if result.returncode and b"No such container" not in result.stderr:
+            raise ValueError("private container cleanup failed; recipe cannot accept output")
+        self.containers.remove(argv[-1])
+
+    def _container_command(self, command, *, confined, environment=None, cwd=None):
+        for path in [self.private_root, *self.readonly, *self.immutable]:
             if "," in str(path) or "\n" in str(path):
                 raise ValueError("unsupported bind mount pathname")
-        result = ["/usr/bin/docker", "run", "--rm", "--pull=never", "--platform=linux/amd64",
+        name = "ts-release-" + uuid.uuid4().hex
+        self.containers.add(name)
+        result = [*self.docker_prefix, "run", "--name", name, "--rm", "--pull=never", "--platform=linux/amd64",
                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges=true",
                   "--security-opt", f"seccomp={self.profile_path if confined else self.control_profile_path}",
                   "--read-only", "--ipc=private",
                   "--pid=private", "--user", "65532:65532", "--pids-limit", "512", "--memory", "6g",
-                  "--cpus", "4", "--workdir", "/work", "--env", "HOME=/work/home", "--env", "TMPDIR=/work/tmp",
+                  "--cpus", "4", "--workdir", self.map_path(cwd) if cwd else "/work",
                   "--mount", f"type=bind,src={self.private_root},dst=/work"]
+        if environment is None:
+            environment = {"HOME": "/work/home", "TMPDIR": "/work/tmp"}
+        if not isinstance(environment, dict) or len(environment) > 256:
+            raise ValueError("closed controlled container environment required")
+        for key, value in sorted(environment.items()):
+            if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                    or not isinstance(value, str) or len(value) > 65536 or "\0" in value or "\n" in value):
+                raise ValueError("unsupported controlled environment entry")
+            result.extend(["--env", key + "=" + self.map_path(value)])
         if confined:
             result.extend(["--network", "none"])
         for path in self.readonly:
             result.extend(["--mount", f"type=bind,src={path},dst={path},readonly"])
-        return [*result, self.image, *map(str, command)]
+        for path in self.immutable:
+            result.extend(["--mount", f"type=bind,src={path},dst={self.map_path(path)},readonly"])
+        argv = [self.map_path(value) for value in command]
+        if self.python is not None:
+            # Docker does not inherit its client's umask. Apply it to the actual
+            # container process before exec; no shell evaluation is involved.
+            driver = f"import os,sys;os.umask({self.execution_umask});os.execve(sys.argv[1],sys.argv[1:],dict(os.environ))"
+            argv = [str(self.python), "-I", "-B", "-c", driver, *argv]
+        return [*result, self.image, *argv]
 
 
 def probe_commands(boundary, private_root, python):
@@ -189,9 +289,11 @@ def probe_controls(boundary, private_root, python):
         raise ValueError("explicit prepared Python executable required")
     observations = {}
     for phase, argv in probe_commands(boundary, root, python).items():
-        result = subprocess.run(argv, env={"HOME": str(root), "TMPDIR": str(root), "LANG": "C", "LC_ALL": "C"},
-                                stdin=subprocess.DEVNULL, close_fds=True, capture_output=True,
-                                timeout=30, check=False)
+        try:
+            result = bounded_process(argv, {"HOME": str(root), "TMPDIR": str(root), "LANG": "C", "LC_ALL": "C"})
+        finally:
+            if isinstance(boundary, LinuxBoundary):
+                boundary.cleanup(argv)
         if result.returncode or len(result.stdout) > 65536 or len(result.stderr) > 65536:
             raise ValueError(f"{phase} probe failed; actual local boundary unavailable")
         observations[phase] = load_json_bytes(result.stdout, max_bytes=65536)
