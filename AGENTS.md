@@ -293,6 +293,11 @@ impl core::error::Error for MyError {}
 - Do not write or commit real domains, customer names, credentials,
   configuration values, or other potentially sensitive real-world information in
   comments, tests, docs, or examples.
+- The one exception is hosts. A real host may appear when the URL-host
+  allowlist in `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
+  covers it or the line carries a `// allow-domain: <host>` suppression. New
+  allowlist entries and suppressions need review; see the URL-host linter
+  section of `CONTRIBUTING.md`.
 
 ---
 
