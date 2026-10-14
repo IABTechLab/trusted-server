@@ -78,6 +78,7 @@ use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
@@ -271,6 +272,12 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
+    /// EIDs the route resolved from the current request: the `/auction` JSON
+    /// body, or the `ts-eids` cookie when the body carried none. Carried to
+    /// response finalization so KV ingestion can use the full set the client
+    /// sent instead of being limited to whatever fits in the size-capped
+    /// `ts-eids` cookie.
+    client_eids: Option<Vec<Eid>>,
     /// Browser-carried proof of recent pull-partner completeness.
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
@@ -354,6 +361,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
         })
@@ -556,6 +564,18 @@ impl EcContext {
         self.recovery_eligible
     }
 
+    /// Records the current request's own EIDs (e.g. an `/auction` body) for
+    /// use by response finalization's KV ingestion.
+    pub(crate) fn set_client_eids(&mut self, eids: Vec<Eid>) {
+        self.client_eids = Some(eids);
+    }
+
+    /// Returns the current request's own EIDs, if the route captured any.
+    #[must_use]
+    pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
+        self.client_eids.as_deref()
+    }
+
     /// Validates a browser completeness marker against the active EC and partner set.
     pub(crate) fn validate_pull_sync_marker(
         &mut self,
@@ -642,6 +662,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -666,6 +687,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -693,6 +715,7 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
+            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -721,6 +744,21 @@ pub(crate) fn checked_current_timestamp() -> Option<u64> {
             log::error!("SystemTime::now() failed: {err}");
         })
         .ok()
+}
+
+/// Returns the current time as a [`std::time::SystemTime`] without calling
+/// `std::time::SystemTime::now()`, which panics on `wasm32-unknown-unknown`.
+///
+/// Use this for APIs that only accept the std type, such as `httpdate` or
+/// chrono's `DateTime::from`. It reads the wasm-safe [`web_time::SystemTime`]
+/// clock and adds the elapsed time to [`std::time::UNIX_EPOCH`], which is pure
+/// arithmetic. On native and `wasm32-wasip1`, [`web_time`] delegates to the
+/// std clock, so this equals `std::time::SystemTime::now()` there.
+pub(crate) fn std_system_time_now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH
+        + web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1123,6 +1161,19 @@ mod tests {
             ec.existing_cookie_ec_id(),
             Some(cookie_ec2.as_str()),
             "should return cookie value for revocation even when header is present"
+        );
+    }
+
+    #[test]
+    fn std_system_time_now_tracks_std_clock() {
+        let before = std::time::SystemTime::now();
+
+        let now = std_system_time_now();
+
+        let after = std::time::SystemTime::now();
+        assert!(
+            before <= now && now <= after,
+            "should fall between std clock reads taken before and after"
         );
     }
 }
