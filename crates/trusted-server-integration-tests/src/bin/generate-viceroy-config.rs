@@ -125,9 +125,11 @@ fn build_app_config_envelope(
         origin.url = origin_url.to_string();
         settings.set_origin_source(&origin);
     }
-    // The fixture selects modules a stock build ships, so validation needs
-    // the stock list as the adapters and the `ts` tool have it.
-    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
+    // The fixture selects modules the adapters link, so validation needs the
+    // list as the adapters and the `ts` tool have it.
+    trusted_server_core::config::register_deploy_integrations(
+        trusted_server_adapter_axum::app::shipped_module_builders(),
+    );
     let app_config = TrustedServerAppConfig::new(settings)
         .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
 
@@ -324,7 +326,7 @@ mod tests {
             &envelope,
             &integration_secret_store(),
             &StoreName::from("trusted_server_secrets"),
-            &trusted_server_modules::builders(),
+            &trusted_server_adapter_axum::app::shipped_module_builders(),
         )
         .expect("should verify blob");
 

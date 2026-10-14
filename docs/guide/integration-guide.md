@@ -395,8 +395,8 @@ status = "vendor owned"
 `status` is `vendor owned` once the vendor has adopted the crate,
 `seeking vendor owner` while the Trusted Server maintainers hold it for a
 vendor, and `project owned` for a crate that is the project's own, such as a
-test module. A test in `crates/trusted-server-modules` fails for a crate in
-this repository that leaves the declaration out.
+test module. A test of the Axum adapter fails for a crate in this repository
+that leaves the declaration out.
 
 ### What a registration can declare
 
@@ -783,17 +783,43 @@ The round-trip tests in
 `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` drive the
 probe through the Fastly adapter under Viceroy.
 
-### The modules a stock build ships
+### The modules an adapter links
 
-`crates/trusted-server-modules` lists the modules a stock build ships from
-crates of their own, in the order their request hooks run. Every adapter
-builds its state with that list followed by the builders a deployment added,
-and loads its settings against the same list. The `ts` tool registers it for
-deploy validation. A module joins a stock build by adding its crate and its
-builder to that list, in the place its request hooks should run. The order of
-the list does not order page changes, which run in the order an entry names
-them. Offering a module does not run it, because the registry builds a module
-only when a section of the settings selects it.
+Each adapter lists the module builders it links in its own `app.rs`, in the
+order their request hooks run, the way it lists the permission signal schemes
+it links. It builds its state with that list followed by the builders a
+deployment added, and loads its settings against the same list. The `ts` tool
+lists the builders it links the same way, for deploy validation and for the
+configuration `ts audit` writes. A module joins a build by adding its crate
+and its builder to the list of each adapter that links it, in the place its
+request hooks should run, and a deployment that wants a different set links a
+different set. The order of the list does not order page changes, which run
+in the order an entry names them. Offering a module does not run it, because
+the registry builds a module only when a section of the settings selects it.
+
+A module describes the page changes it supplies on its builder, with
+`.with_middleware(...)`, each as a `SuppliedMiddleware` naming the middleware,
+the phase an entry names it in and the media type the entry covers. A
+middleware that runs in either phase is described in the one a generated
+configuration places it in. `ts audit` asks
+`trusted_server_core::integrations::supplied_middleware` for what the builders
+it links describe, in the order the registry registers them, and writes the
+entries from that, so a module's page changes are placed without a table
+anywhere else. The registry refuses a registration whose middleware
+contradicts the description.
+
+```rust
+const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] = &[
+    SuppliedMiddleware::on_html(MODULE, MiddlewarePhase::Fetch),
+    SuppliedMiddleware::on_html(TAG_MIDDLEWARE, MiddlewarePhase::Serve),
+];
+
+pub fn builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(ID, env!("CARGO_PKG_NAME"), register, validate)
+        .with_module_name(MODULE)
+        .with_middleware(SUPPLIED_MIDDLEWARE)
+}
+```
 
 ### Giving the deployment its prefixes
 

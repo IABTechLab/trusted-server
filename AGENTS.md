@@ -21,7 +21,6 @@ crates/
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
-  trusted-server-modules/               # the modules a stock build ships, in the order their hooks run
   ad-server/                            # ad server implementation crates (iabtl)
   ads-txt/                              # ads.txt line module crates (iabtl)
   ad-tag/                               # ad tag module crates (google, which holds its diagnostics module too)
